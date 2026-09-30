@@ -1,0 +1,3 @@
+{
+  imports = [ ./xiaomi-sheng ];
+}

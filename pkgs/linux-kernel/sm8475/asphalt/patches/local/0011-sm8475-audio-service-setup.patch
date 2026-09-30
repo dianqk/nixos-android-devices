@@ -1,0 +1,37 @@
+From: Y700 kernel integration <y700-integration@localhost>
+Date: Wed, 23 Sep 2026 21:30:00 +0800
+Subject: [PATCH 11/11] arm64: dts and soc: enable SM8475 audio service setup
+
+Enable the QUP wrapper that owns the Y700 speaker amplifier I2C bus. Map
+SM8475 to the same ADSP protection domains as SM8450 so the in-kernel PD
+mapper can announce audio_pd and allow the GPR AudioReach services to probe.
+The running rc4 image otherwise logs that PDM does not support this platform.
+
+---
+diff --git a/arch/arm64/boot/dts/qcom/sm8475-lenovo-asphalt.dts b/arch/arm64/boot/dts/qcom/sm8475-lenovo-asphalt.dts
+index 5af8133be..1544f49e8 100644
+--- a/arch/arm64/boot/dts/qcom/sm8475-lenovo-asphalt.dts
++++ b/arch/arm64/boot/dts/qcom/sm8475-lenovo-asphalt.dts
+@@ -516,6 +516,10 @@ eusb2_repeater: phy@4f {
+ 	};
+ };
+ 
++&qupv3_id_1 {
++	status = "okay";
++};
++
+ &i2c13 {
+ 	clock-frequency = <400000>;
+ 	status = "okay";
+diff --git a/drivers/soc/qcom/qcom_pd_mapper.c b/drivers/soc/qcom/qcom_pd_mapper.c
+index 64ca99d7f..710e94912 100644
+--- a/drivers/soc/qcom/qcom_pd_mapper.c
++++ b/drivers/soc/qcom/qcom_pd_mapper.c
+@@ -660,6 +660,7 @@ static const struct of_device_id qcom_pdm_domains[] __maybe_unused = {
+ 	{ .compatible = "qcom,sm8250", .data = sm8250_domains, },
+ 	{ .compatible = "qcom,sm8350", .data = sm8350_domains, },
+ 	{ .compatible = "qcom,sm8450", .data = sm8350_domains, },
++	{ .compatible = "qcom,sm8475", .data = sm8350_domains, },
+ 	{ .compatible = "qcom,sm8550", .data = sm8550_domains, },
+ 	{ .compatible = "qcom,sm8650", .data = sm8550_domains, },
+ 	{ .compatible = "qcom,sm8750", .data = sm8550_domains, },

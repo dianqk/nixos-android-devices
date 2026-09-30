@@ -1,0 +1,26 @@
+[
+  ./patches/7.3/0001-sm8550-prerequisites.patch
+  ./patches/7.3/0002-sheng-board.patch
+  ./patches/7.3/0003-sheng-bt-address.patch
+  ./patches/7.3/0004-sheng-sensor-pd.patch
+  ./patches/7.3/0005-dsi-command-sync.patch
+  ./patches/7.3/0006-dsi-bonded-pll.patch
+  ./patches/7.3/0007-nt36532e-panel.patch
+  ./patches/7.3/0008-ktz8866-pair.patch
+  ./patches/7.3/0009-nt36532e-touch.patch
+  ./patches/7.3/0010-nanosic-keyboard.patch
+  ./patches/7.3/0011-xiaomi-battmgr.patch
+  ./patches/7.3/0012-cs35l43-codec.patch
+  ./patches/7.3/0013-sheng-audio.patch
+  ./patches/7.3/0014-ov02b1b-sensor.patch
+  ./patches/7.3/0015-ov32d40-sensor.patch
+  ./patches/7.3/0016-s5kjn1-sheng-sensor.patch
+  ./patches/7.3/0017-sheng-camera-integration.patch
+  ./patches/7.3/0018-ps5169-redriver.patch
+  ./patches/7.3/0019-dp-sst-metadata.patch
+  ./patches/7.3/0020-dp-dsc-fec.patch
+  ./patches/7.3/0021-ath12k-wcn7850-mac.patch
+  ./patches/7.3/0022-ath12k-sheng-firmware.patch
+  ./patches/7.3/0023-ath12k-single-pdev-reg.patch
+  ./patches/7.3/0024-sheng-fingerprint.patch
+]

@@ -1,0 +1,148 @@
+From: NixOS Android devices contributors <nixos-android-devices@localhost>
+Date: Mon, 28 Sep 2026 14:00:00 +0800
+Subject: [PATCH] phy: connect the NXP repeater to the Qualcomm eUSB2 PHY
+
+Implement the device-mode register sequence from the TB320FC Linux port
+using U-Boot driver-model I2C and GPIO APIs. Propagate bus/PHY errors.
+Retain the ABL power votes, as the existing U-Boot UFS PHY also does.
+
+Source: https://github.com/lenovo-basements/linux/blob/d792042c0c9561c0f32a8f6eb9f0aca325fc0350/drivers/phy/qualcomm/phy-qcom-i2c-eusb2-repeater.c
+Board overrides: pkgs/linux-kernel/sm8475/asphalt/patches/local/0006-asphalt-board-dts.patch
+This is a local U-Boot adaptation, not an unmodified upstream patch.
+---
+diff --git a/drivers/phy/qcom/phy-nxp-eusb2.c b/drivers/phy/qcom/phy-nxp-eusb2.c
+--- /dev/null
++++ b/drivers/phy/qcom/phy-nxp-eusb2.c
+@@ -0,0 +1,76 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * NXP eUSB2 repeater used by Lenovo TB320FC.
++ * Register sequence and reset polarity follow the board's Linux driver/DT.
++ * The preceding ABL stage supplies the 1.8 V and 3.0 V rails.
++ */
++#include <dm.h>
++#include <dm/device_compat.h>
++#include <generic-phy.h>
++#include <i2c.h>
++#include <asm/gpio.h>
++#include <linux/delay.h>
++
++struct nxp_eusb2_priv {
++	struct gpio_desc reset;
++};
++
++static int nxp_eusb2_init(struct phy *phy)
++{
++	struct udevice *dev = phy->dev;
++	struct nxp_eusb2_priv *priv = dev_get_priv(dev);
++	u32 seq[32];
++	int count, i, ret;
++
++	/* The board calls this reset, but HIGH releases the NXP repeater. */
++	ret = dm_gpio_set_value(&priv->reset, 1);
++	if (ret)
++		return ret;
++	udelay(100);
++	ret = dm_i2c_reg_read(dev, 0x13);
++	if (ret < 0)
++		return ret;
++	dev_info(dev, "NXP eUSB2 revision 0x%02x\n", ret);
++
++	count = dev_read_size(dev, "qcom,param-override-seq");
++	if (count <= 0 || count > sizeof(seq) || count % (2 * sizeof(u32)))
++		return -EINVAL;
++	count /= sizeof(u32);
++	ret = dev_read_u32_array(dev, "qcom,param-override-seq", seq, count);
++	if (ret)
++		return ret;
++	for (i = 0; i < count; i += 2) {
++		if (seq[i] > 0xff || seq[i + 1] > 0xff)
++			return -EINVAL;
++		ret = dm_i2c_reg_write(dev, seq[i + 1], seq[i]);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++static int nxp_eusb2_probe(struct udevice *dev)
++{
++	struct nxp_eusb2_priv *priv = dev_get_priv(dev);
++
++	return gpio_request_by_name(dev, "reset-gpios", 0, &priv->reset,
++				    GPIOD_IS_OUT | GPIOD_IS_OUT_ACTIVE);
++}
++
++static const struct phy_ops nxp_eusb2_ops = {
++	.init = nxp_eusb2_init,
++};
++
++static const struct udevice_id nxp_eusb2_ids[] = {
++	{ .compatible = "nxp,eusb2-repeater" },
++	{ }
++};
++
++U_BOOT_DRIVER(nxp_eusb2) = {
++	.name = "nxp_eusb2",
++	.id = UCLASS_PHY,
++	.of_match = nxp_eusb2_ids,
++	.ops = &nxp_eusb2_ops,
++	.probe = nxp_eusb2_probe,
++	.priv_auto = sizeof(struct nxp_eusb2_priv),
++};
+diff --git a/drivers/phy/qcom/Makefile b/drivers/phy/qcom/Makefile
+--- a/drivers/phy/qcom/Makefile
++++ b/drivers/phy/qcom/Makefile
+@@ -8,3 +8,4 @@
+ obj-$(CONFIG_PHY_QCOM_SNPS_EUSB2) += phy-qcom-snps-eusb2.o
+ obj-$(CONFIG_PHY_QCOM_USB_HS_28NM) += phy-qcom-usb-hs-28nm.o
+ obj-$(CONFIG_PHY_QCOM_USB_SS) += phy-qcom-usb-ss.o
++obj-$(CONFIG_PHY_NXP_EUSB2) += phy-nxp-eusb2.o
+diff --git a/drivers/phy/qcom/Kconfig b/drivers/phy/qcom/Kconfig
+--- a/drivers/phy/qcom/Kconfig
++++ b/drivers/phy/qcom/Kconfig
+@@ -70,3 +70,9 @@
+ 	help
+ 	  Enable this to support the Super-Speed USB transceiver on various
+ 	  Qualcomm chipsets.
++
++config PHY_NXP_EUSB2
++	bool "NXP I2C eUSB2 repeater"
++	depends on PHY && DM_I2C && DM_GPIO
++	help
++	  Configure the NXP repeater on Lenovo TB320FC after ABL supplies power.
+diff --git a/drivers/phy/qcom/phy-qcom-snps-eusb2.c b/drivers/phy/qcom/phy-qcom-snps-eusb2.c
+--- a/drivers/phy/qcom/phy-qcom-snps-eusb2.c
++++ b/drivers/phy/qcom/phy-qcom-snps-eusb2.c
+@@ -126,6 +126,7 @@
+ 	void __iomem *base;
+ 	struct clk *ref_clk;
+ 	struct reset_ctl_bulk resets;
++	struct phy repeater;
+ };
+ 
+ static void qcom_snps_eusb2_hsphy_write_mask(void __iomem *base, u32 offset,
+@@ -295,7 +296,9 @@
+ 	struct qcom_snps_eusb2_phy_priv *qcom_snps_eusb2 = dev_get_priv(phy->dev);
+ 	int ret;
+ 
+-	/* TODO Repeater */
++	ret = generic_phy_init(&qcom_snps_eusb2->repeater);
++	if (ret)
++		return ret;
+ 
+ 	clk_prepare_enable(qcom_snps_eusb2->ref_clk);
+ 
+@@ -334,6 +337,12 @@
+ 		ret = PTR_ERR(qcom_snps_eusb2->ref_clk);
+ 		printf("%s: failed to get ref clk %d\n", __func__, ret);
+ 		return ret;
++	}
++
++	if (dev_read_prop(dev, "phys", NULL)) {
++		ret = generic_phy_get_by_index(dev, 0, &qcom_snps_eusb2->repeater);
++		if (ret)
++			return ret;
+ 	}
+ 
+ 	ret = reset_get_bulk(dev, &qcom_snps_eusb2->resets);

@@ -1,0 +1,176 @@
+Local integration for usb-signaller v0.4.2.
+Upstream: https://codeberg.org/DylanVanAssche/usb-signaller/src/tag/v0.4.2
+
+Scope mode changes to the configured controller and owned gadgets, provide stable
+USB identities, restrict advertised modes to installed backends, serialize mode
+changes, and report failures. Nix store executable paths are substituted separately.
+
+--- a/src/udc.rs
++++ b/src/udc.rs
+@@ -59,6 +59,9 @@
+     let mut udcs: Vec<String> = vec![];
+ 
+     for entry in dir_entries(PathBuf::from(SYSFS_CLASS_BASE_PATH).join(UDC_PATH)) {
++        if std::env::var("USB_SIGNALLER_UDC").is_ok_and(|name| name != entry) {
++            continue;
++        }
+         udcs.push(entry);
+     }
+ 
+@@ -129,11 +132,12 @@
+         println!("Preparing gadget mode switch");
+         let name;
+         let binding = sysfs_read(PathBuf::from(DEVICE_TREE_BASE_PATH).join(COMPATIBLE_NODE))?;
+-        let serialnumber = binding
++        let serial_override = std::env::var("USB_SIGNALLER_SERIAL").ok();
++        let serialnumber = serial_override.as_deref().unwrap_or_else(|| binding
+             .split("\0")
+             .collect::<Vec<&str>>()
+             .first()
+-            .map_or("usb-signaller", |v| v);
++            .map_or("usb-signaller", |v| v));
+         let vendor;
+         let product;
+         let id_vendor;
+--- a/src/gadget.rs
++++ b/src/gadget.rs
+@@ -71,7 +71,10 @@
+     let mut gadgets: Vec<String> = vec![];
+ 
+     for entry in dir_entries(PathBuf::from(CONFIGFS_BASE_PATH).join(USB_GADGET_PATH)) {
+-        gadgets.push(entry);
++        // This daemon owns only its own gadgets, not arbitrary configfs users.
++        if entry.starts_with("usb-signaller-") {
++            gadgets.push(entry);
++        }
+     }
+ 
+     return gadgets;
+@@ -219,6 +222,19 @@
+                 .join(FUNCTIONS_PATH)
+                 .join(default_function),
+         )?;
++
++        if default_function.starts_with("ncm.") {
++            for (attribute, variable) in [
++                ("dev_addr", "USB_SIGNALLER_DEV_ADDR"),
++                ("host_addr", "USB_SIGNALLER_HOST_ADDR"),
++                ("ifname", "USB_SIGNALLER_IFNAME"),
++            ] {
++                if let Ok(value) = std::env::var(variable) {
++                    sysfs_write(Self::configfs_base_path(gadget_name)
++                        .join(FUNCTIONS_PATH).join(default_function).join(attribute), &value)?;
++                }
++            }
++        }
+ 
+         /* Create configuration */
+         sysfs_mkdir(
+--- a/src/urs.rs
++++ b/src/urs.rs
+@@ -48,6 +48,9 @@
+     let mut urss: Vec<String> = vec![];
+ 
+     for entry in dir_entries(PathBuf::from(SYSFS_CLASS_BASE_PATH).join(USB_ROLE_PATH)) {
++        if std::env::var("USB_SIGNALLER_ROLE_SWITCH").is_ok_and(|name| name != entry) {
++            continue;
++        }
+         urss.push(entry);
+     }
+ 
+@@ -79,7 +82,7 @@
+     pub fn set_role(role: &URSRole) -> anyhow::Result<Self> {
+         println!("Setting USB role: {role:?}");
+ 
+-        for switch_name in dir_entries(PathBuf::from(SYSFS_CLASS_BASE_PATH).join(USB_ROLE_PATH)) {
++        for switch_name in discover_urss() {
+             /* Read current role */
+             let current_role = sysfs_read(
+                 PathBuf::from(SYSFS_CLASS_BASE_PATH)
+@@ -131,9 +134,17 @@
+                         return URS::load(&switch_name);
+                     }
+                 },
+-                _ => {
+-                    eprintln!("Unknown role: {current_role}");
++                "none" => {
++                    let requested = match role {
++                        URSRole::Host => "host",
++                        URSRole::Device => "device",
++                        URSRole::Unknown => return Err(anyhow::anyhow!("Invalid requested role")),
++                    };
++                    sysfs_write(PathBuf::from(SYSFS_CLASS_BASE_PATH)
++                        .join(USB_ROLE_PATH).join(&switch_name).join(ROLE_NODE), requested)?;
++                    Self::wait_for_role(&switch_name, requested)?;
+                 }
++                _ => return Err(anyhow::anyhow!("Unknown role: {current_role}")),
+             }
+ 
+             return URS::load(&switch_name);
+--- a/src/dbus.rs
++++ b/src/dbus.rs
+@@ -9,6 +9,7 @@
+ use crate::utils::{string_to_udcmode, udcmode_to_string};
+ 
+ pub struct UsbModedDBus;
++static MODE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+ 
+ pub async fn create_usbmoded_connection() -> Result<Connection> {
+     return Ok(connection::Builder::system()?
+@@ -29,7 +30,13 @@
+         mode: &str,
+         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+     ) -> Result<String, zbus::fdo::Error> {
++        let _guard = MODE_LOCK.lock().await;
+         println!("ℹ️  DBus: set_mode({mode})");
++        if let Ok(modes) = std::env::var("USB_SIGNALLER_MODES") {
++            if !modes.split(',').any(|allowed| allowed == mode) {
++                return Err(zbus::fdo::Error::InvalidArgs(format!("Unsupported mode: {mode}")));
++            }
++        }
+ 
+         /* Netboot mode may never be interrupted */
+         if mode == "netboot_mode" {
+@@ -48,7 +55,9 @@
+                 };
+ 
+                 /* Configure role */
+-                if let Ok(urs) = URS::set_role(&role) {
++                {
++                    let urs = URS::set_role(&role)
++                        .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+                     println!("URS reconfigured:");
+                     println!("  Name: {}", urs.name);
+                     println!("  Role: {:?}", urs.role);
+@@ -81,6 +90,10 @@
+                 Ok(udc) => {
+                     match UDC::set_mode(udc, target_mode.clone()) {
+                         Ok(udc) => {
++                            if udc.mode != target_mode {
++                                return Err(zbus::fdo::Error::Failed(format!(
++                                    "Requested {target_mode:?}, observed {:?}", udc.mode)));
++                            }
+                             println!("UDC reconfigured:");
+                             println!("  Name: {}", udc.name);
+                             println!("  Enabled: {}", udc.enabled);
+@@ -192,6 +205,9 @@
+ 
+     #[zbus(name = "get_modes")]
+     pub async fn get_modes(&self) -> String {
++        if let Ok(modes) = std::env::var("USB_SIGNALLER_MODES") {
++            return modes;
++        }
+         /*
+          * Netboot mode is never available for users.
+          * Unknown and disconnected modes are internal modes.
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -108,7 +108,7 @@
+         println!("ℹ️  Applying default mode: {default_mode}");
+         let emitter = SignalEmitter::new(&connection.clone(), "/com/meego/usb_moded")?;
+         if let Err(error) = UsbModedDBus::set_mode(&UsbModedDBus, &default_mode, emitter).await {
+-            eprintln!("⚠️  Failed to set default mode: {error:?}");
++            return Err(error.into());
+         };
+     }
+ 

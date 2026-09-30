@@ -1,0 +1,108 @@
+From: NixOS Android devices contributors <nixos-android-devices@localhost>
+Date: Tue, 29 Sep 2026 05:00:00 +0800
+Subject: [PATCH] arm64: dts: qcom: wire Asphalt DisplayPort and track DP orientation
+
+Local adaptation against Linux v7.3-rc4 and this board's patch queue.
+The preserved stock live DT selects GLINK altmode port 0 and i2c5 FSA4480
+at 0x43 for DP AUX. Connect those endpoints and enable the existing DP0
+controller. Both USB ports still share DWC3 without assigning its role
+switch to only one connector. Do not attach the secondary FSA4480 at
+0x42, which is not the AUX switch selected by the stock DP controller.
+
+Retain hardware COM port selection for USB, but accept orientation updates
+for DP's lane power and PHY_MODE programming. Rejecting these notifications
+also aborts the typec switch chain before the AUX mux can be configured.
+
+Stock driver reference (DP AUX CC1/CC2 settings, local implementation):
+https://github.com/lolipuru/kernel_lenovo_sm8475/blob/9b7833ce5db1a9914dc5e5e06d1a0cccfdd5c73b/drivers/soc/qcom/fsa4480-i2c.c
+Upstream graph reference:
+https://github.com/torvalds/linux/blob/v7.3-rc4/arch/arm64/boot/dts/qcom/sm8450-hdk.dts
+---
+diff --git a/arch/arm64/boot/dts/qcom/sm8475-lenovo-asphalt.dts b/arch/arm64/boot/dts/qcom/sm8475-lenovo-asphalt.dts
+index bd11263cf..78a862a72 100644
+--- a/arch/arm64/boot/dts/qcom/sm8475-lenovo-asphalt.dts
++++ b/arch/arm64/boot/dts/qcom/sm8475-lenovo-asphalt.dts
+@@ -87,6 +87,26 @@ connector@0 {
+ 			reg = <0>;
+ 			power-role = "dual";
+ 			data-role = "dual";
++
++			/* Stock DP altmode client 0 uses the primary FSA4480. */
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@1 {
++					reg = <1>;
++					pmic_glink_dp_ss: endpoint {
++						remote-endpoint = <&usb_1_qmpphy_out>;
++					};
++				};
++
++				port@2 {
++					reg = <2>;
++					pmic_glink_dp_sbu: endpoint {
++						remote-endpoint = <&fsa4480_sbu>;
++					};
++				};
++			};
+ 		};
+ 
+ 		connector@1 {
+@@ -501,6 +521,20 @@ backlight: backlight@11 {
+ &i2c5 {
+ 	status = "okay";
+ 
++	/* Powered by the board; downstream does not control a supply here. */
++	typec-mux@43 {
++		compatible = "fcs,fsa4480";
++		reg = <0x43>;
++		mode-switch;
++		orientation-switch;
++
++		port {
++			fsa4480_sbu: endpoint {
++				remote-endpoint = <&pmic_glink_dp_sbu>;
++			};
++		};
++	};
++
+ 	eusb2_repeater: phy@4f {
+ 		compatible = "nxp,eusb2-repeater";
+ 		reg = <0x4f>;
+@@ -1132,3 +1166,16 @@ camera_mclk2: camera-mclk2-state {
+   bias-disable;
+  };
+ };
++
++/* DisplayPort is wired to the primary Type-C connector (GLINK port 0). */
++&mdss_dp0 {
++	status = "okay";
++};
++
++&mdss_dp0_out {
++	data-lanes = <0 1 2 3>;
++};
++
++&usb_1_qmpphy_out {
++	remote-endpoint = <&pmic_glink_dp_ss>;
++};
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+index 91db9130c..119b07ab5 100644
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+@@ -4785,9 +4785,11 @@ static int qmp_combo_typec_switch_set(struct typec_switch_dev *sw,
+ 	struct qmp_combo *qmp = typec_switch_get_drvdata(sw);
+ 	const struct qmp_phy_cfg *cfg = qmp->cfg;
+ 
+-	if (qmp->hardware_port_select)
+-		return -EOPNOTSUPP;
+-
++	/*
++	 * Even with hardware COM port selection, DP lane power and PHY_MODE
++	 * still need the connector orientation. Keep the ordinary state update;
++	 * qmp_combo_com_init() continues to select the hardware input.
++	 */
+ 	if (orientation == qmp->orientation || orientation == TYPEC_ORIENTATION_NONE)
+ 		return 0;
+ 

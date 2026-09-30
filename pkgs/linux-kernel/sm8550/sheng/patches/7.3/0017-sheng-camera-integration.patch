@@ -1,0 +1,649 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 29 Sep 2026 00:00:00 +0800
+Subject: [PATCH] media: wire Sheng camera sensors, focus and activity LED
+
+Porting notes: Apply the fork camera integration as hunks on 7.3. Extend the existing lens schema only for GT9764 and its additional properties; preserve the DW9768/GT9769 AAC timing limit. Keep activity LED handling because Sheng board sensors explicitly use the shared activity LED. Limit custom focus stepping to GT9764, preserve upstream DW9768/GT9769 movement, and finish at the exact requested focus.
+
+Original author dates, messages, and trailers: patches/ORIGINS.md.
+Source-Commit: https://github.com/ianchb/sm8550-mainline/commit/cbe4cd84372fa2040153885fa73d3e4aa30c6385
+Source-Commit: https://github.com/ianchb/sm8550-mainline/commit/43f26d07947b0ab05553561e850d6a916ad80908
+Source-Commit: https://github.com/ianchb/sm8550-mainline/commit/1acf0452e7e24f686d5695b62ca1d366c9369519
+Source-Commit: https://github.com/ianchb/sm8550-mainline/commit/db6fc1a0862887c53e0b14c3f73056a5b11dc695
+Source-Commit: https://github.com/ianchb/sm8550-mainline/commit/95d63f921e24c5a4b21b31fccbf9e9c390065ea8
+Source-Commit: https://github.com/ianchb/sm8550-mainline/commit/b230434fb3ffc4c6d27c1b32585669628a6145a2
+---
+diff --git a/Documentation/devicetree/bindings/media/i2c/dongwoon,dw9768.yaml b/Documentation/devicetree/bindings/media/i2c/dongwoon,dw9768.yaml
+index a0855d3..eead518 100644
+--- a/Documentation/devicetree/bindings/media/i2c/dongwoon,dw9768.yaml
++++ b/Documentation/devicetree/bindings/media/i2c/dongwoon,dw9768.yaml
+@@ -22,6 +22,7 @@ properties:
+   compatible:
+     enum:
+       - dongwoon,dw9768 # for DW9768 VCM
++      - giantec,gt9764  # for GT9764 VCM
+       - giantec,gt9769  # for GT9769 VCM
+ 
+   reg:
+@@ -53,7 +54,7 @@ properties:
+     $ref: /schemas/types.yaml#/definitions/uint32
+     default: 0x20
+     minimum: 0x00
+-    maximum: 0x3f
++    maximum: 0xff
+ 
+   dongwoon,clock-presc:
+     description:
+@@ -69,6 +70,26 @@ properties:
+       - 5    #  Dividing Rate -  4
+     default: 1
+ 
++  dongwoon,initial-focus:
++    description: Initial focus position used when powering up and parking the lens.
++    $ref: /schemas/types.yaml#/definitions/uint32
++    maximum: 1023
++
++  dongwoon,move-delay-us:
++    description: Delay in microseconds between focus position steps.
++
++allOf:
++  - if:
++      properties:
++        compatible:
++          not:
++            contains:
++              const: giantec,gt9764
++    then:
++      properties:
++        dongwoon,aac-timing:
++          maximum: 0x3f
++
+ required:
+   - compatible
+   - reg
+diff --git a/Documentation/devicetree/bindings/media/video-interface-devices.yaml b/Documentation/devicetree/bindings/media/video-interface-devices.yaml
+index a81d2a1..1c6ac70 100644
+--- a/Documentation/devicetree/bindings/media/video-interface-devices.yaml
++++ b/Documentation/devicetree/bindings/media/video-interface-devices.yaml
+@@ -18,13 +18,22 @@ properties:
+       driver device node.
+ 
+   leds:
++    $ref: /schemas/types.yaml#/definitions/phandle-array
+     minItems: 1
+     maxItems: 1
+ 
+   led-names:
+     enum:
++      - activity
+       - privacy
+ 
++  activity-led-brightness:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    minimum: 1
++    description:
++      Brightness used for the activity LED while the video device is
++      streaming. The LED remains available for userspace control while active.
++
+   lens-focus:
+     $ref: /schemas/types.yaml#/definitions/phandle
+     description:
+@@ -405,6 +414,18 @@ properties:
+         # attached in a way that allows it to move freely.
+       - 2
+ 
++allOf:
++  - if:
++      required:
++        - activity-led-brightness
++    then:
++      properties:
++        led-names:
++          const: activity
++      required:
++        - leds
++        - led-names
++
+ additionalProperties: true
+ 
+ ...
+diff --git a/drivers/media/i2c/Kconfig b/drivers/media/i2c/Kconfig
+index 5c52007..a7eeefc 100644
+--- a/drivers/media/i2c/Kconfig
++++ b/drivers/media/i2c/Kconfig
+@@ -425,6 +425,16 @@ config VIDEO_OV02A10
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called ov02a10.
+ 
++config VIDEO_OV02B1B
++	tristate "OmniVision OV02B1B sensor support"
++	select V4L2_CCI_I2C
++	help
++	  This is a Video4Linux2 sensor driver for the OmniVision
++	  OV02B1B camera.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called ov02b1b.
++
+ config VIDEO_OV02E10
+ 	tristate "OmniVision OV02E10 sensor support"
+ 	select V4L2_CCI_I2C
+@@ -475,6 +485,16 @@ config VIDEO_OV13B10
+ 	  This is a Video4Linux2 sensor driver for the OmniVision
+ 	  OV13B10 camera.
+ 
++config VIDEO_OV32D40
++	tristate "OmniVision OV32D40 sensor support"
++	select V4L2_CCI_I2C
++	help
++	  This is a Video4Linux2 sensor driver for the OmniVision
++	  OV32D40 camera.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called ov32d40.
++
+ config VIDEO_OV2640
+ 	tristate "OmniVision OV2640 sensor support"
+ 	help
+@@ -826,6 +846,17 @@ config VIDEO_S5KJN1
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called s5kjn1.
+ 
++config VIDEO_S5KJN1_SHENG
++	tristate "Samsung S5KJN1 sensor support for sheng"
++	select V4L2_CCI_I2C
++	depends on VIDEO_S5KJN1=n
++	help
++	  This is a Video4Linux2 sensor driver for the Samsung
++	  S5KJN1 camera.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called s5kjn1-sheng.
++
+ config VIDEO_T4KA3
+ 	tristate "Toshiba T4KA3 sensor support"
+ 	depends on ACPI || COMPILE_TEST
+diff --git a/drivers/media/i2c/Makefile b/drivers/media/i2c/Makefile
+index d04bd57..9dde824 100644
+--- a/drivers/media/i2c/Makefile
++++ b/drivers/media/i2c/Makefile
+@@ -89,12 +89,14 @@ obj-$(CONFIG_VIDEO_OG0VE1B) += og0ve1b.o
+ obj-$(CONFIG_VIDEO_OS05B10) += os05b10.o
+ obj-$(CONFIG_VIDEO_OV01A10) += ov01a10.o
+ obj-$(CONFIG_VIDEO_OV02A10) += ov02a10.o
++obj-$(CONFIG_VIDEO_OV02B1B) += ov02b1b.o
+ obj-$(CONFIG_VIDEO_OV02C10) += ov02c10.o
+ obj-$(CONFIG_VIDEO_OV02E10) += ov02e10.o
+ obj-$(CONFIG_VIDEO_OV08D10) += ov08d10.o
+ obj-$(CONFIG_VIDEO_OV08X40) += ov08x40.o
+ obj-$(CONFIG_VIDEO_OV13858) += ov13858.o
+ obj-$(CONFIG_VIDEO_OV13B10) += ov13b10.o
++obj-$(CONFIG_VIDEO_OV32D40) += ov32d40.o
+ obj-$(CONFIG_VIDEO_OV2640) += ov2640.o
+ obj-$(CONFIG_VIDEO_OV2659) += ov2659.o
+ obj-$(CONFIG_VIDEO_OV2680) += ov2680.o
+@@ -133,6 +135,7 @@ obj-$(CONFIG_VIDEO_S5K3M5) += s5k3m5.o
+ obj-$(CONFIG_VIDEO_S5K5BAF) += s5k5baf.o
+ obj-$(CONFIG_VIDEO_S5K6A3) += s5k6a3.o
+ obj-$(CONFIG_VIDEO_S5KJN1) += s5kjn1.o
++obj-$(CONFIG_VIDEO_S5KJN1_SHENG) += s5kjn1-sheng.o
+ obj-$(CONFIG_VIDEO_SAA6588) += saa6588.o
+ obj-$(CONFIG_VIDEO_SAA6752HS) += saa6752hs.o
+ obj-$(CONFIG_VIDEO_SAA7110) += saa7110.o
+diff --git a/drivers/media/i2c/dw9768.c b/drivers/media/i2c/dw9768.c
+index d037d30..835fd4d 100644
+--- a/drivers/media/i2c/dw9768.c
++++ b/drivers/media/i2c/dw9768.c
+@@ -4,6 +4,7 @@
+ #include <linux/delay.h>
+ #include <linux/i2c.h>
+ #include <linux/module.h>
++#include <linux/of.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/regulator/consumer.h>
+ #include <media/v4l2-async.h>
+@@ -107,7 +108,9 @@ struct dw9768 {
+ 	u32 aac_mode;
+ 	u32 aac_timing;
+ 	u32 clock_presc;
++	u32 initial_focus;
+ 	u32 move_delay_us;
++	bool gt9764;
+ };
+ 
+ static inline struct dw9768 *sd_to_dw9768(struct v4l2_subdev *subdev)
+@@ -263,10 +266,36 @@ static int dw9768_init(struct dw9768 *dw9768)
+ 			return ret;
+ 	}
+ 
+-	for (val = dw9768->focus->val % DW9768_MOVE_STEPS;
+-	     val <= dw9768->focus->val;
++	if (!dw9768->gt9764) {
++		for (val = dw9768->focus->val % DW9768_MOVE_STEPS;
++		     val <= dw9768->focus->val;
++		     val += DW9768_MOVE_STEPS) {
++			ret = dw9768_set_dac(dw9768, val);
++			if (ret) {
++				dev_err(&client->dev, "I2C failure: %d", ret);
++				return ret;
++			}
++			usleep_range(dw9768->move_delay_us,
++				     dw9768->move_delay_us + 1000);
++		}
++
++		return 0;
++	}
++
++	val = dw9768->initial_focus;
++	for ( ; val > round_down(dw9768->focus->val, DW9768_MOVE_STEPS);
++	     val -= DW9768_MOVE_STEPS) {
++		ret = dw9768_set_dac(dw9768, val-DW9768_MOVE_STEPS);
++		if (ret) {
++			dev_err(&client->dev, "I2C failure: %d", ret);
++			return ret;
++		}
++		usleep_range(dw9768->move_delay_us,
++			     dw9768->move_delay_us + 1000);
++	}
++	for ( ; val < round_down(dw9768->focus->val, DW9768_MOVE_STEPS);
+ 	     val += DW9768_MOVE_STEPS) {
+-		ret = dw9768_set_dac(dw9768, val);
++		ret = dw9768_set_dac(dw9768, val+DW9768_MOVE_STEPS);
+ 		if (ret) {
+ 			dev_err(&client->dev, "I2C failure: %d", ret);
+ 			return ret;
+@@ -274,6 +303,13 @@ static int dw9768_init(struct dw9768 *dw9768)
+ 		usleep_range(dw9768->move_delay_us,
+ 			     dw9768->move_delay_us + 1000);
+ 	}
++	ret = dw9768_set_dac(dw9768, dw9768->focus->val);
++	if (ret) {
++		dev_err(&client->dev, "I2C failure: %d", ret);
++		return ret;
++	}
++	usleep_range(dw9768->move_delay_us,
++		     dw9768->move_delay_us + 1000);
+ 
+ 	return 0;
+ }
+@@ -284,8 +320,30 @@ static int dw9768_release(struct dw9768 *dw9768)
+ 	int ret, val;
+ 
+ 	val = round_down(dw9768->focus->val, DW9768_MOVE_STEPS);
+-	for ( ; val >= 0; val -= DW9768_MOVE_STEPS) {
+-		ret = dw9768_set_dac(dw9768, val);
++	if (!dw9768->gt9764) {
++		for ( ; val >= 0; val -= DW9768_MOVE_STEPS) {
++			ret = dw9768_set_dac(dw9768, val);
++			if (ret) {
++				dev_err(&client->dev, "I2C write fail: %d", ret);
++				return ret;
++			}
++			usleep_range(dw9768->move_delay_us,
++				     dw9768->move_delay_us + 1000);
++		}
++		goto power_down;
++	}
++
++	for ( ; val > dw9768->initial_focus; val -= DW9768_MOVE_STEPS) {
++		ret = dw9768_set_dac(dw9768, val-DW9768_MOVE_STEPS);
++		if (ret) {
++			dev_err(&client->dev, "I2C write fail: %d", ret);
++			return ret;
++		}
++		usleep_range(dw9768->move_delay_us,
++			     dw9768->move_delay_us + 1000);
++	}
++	for ( ; val < dw9768->initial_focus; val += DW9768_MOVE_STEPS) {
++		ret = dw9768_set_dac(dw9768, val+DW9768_MOVE_STEPS);
+ 		if (ret) {
+ 			dev_err(&client->dev, "I2C write fail: %d", ret);
+ 			return ret;
+@@ -293,7 +351,15 @@ static int dw9768_release(struct dw9768 *dw9768)
+ 		usleep_range(dw9768->move_delay_us,
+ 			     dw9768->move_delay_us + 1000);
+ 	}
++	ret = dw9768_set_dac(dw9768, dw9768->initial_focus);
++	if (ret) {
++		dev_err(&client->dev, "I2C write fail: %d", ret);
++		return ret;
++	}
++	usleep_range(dw9768->move_delay_us,
++		     dw9768->move_delay_us + 1000);
+ 
++power_down:
+ 	ret = i2c_smbus_write_byte_data(client, DW9768_RING_PD_CONTROL_REG,
+ 					DW9768_PD_MODE_EN);
+ 	if (ret < 0)
+@@ -395,7 +461,7 @@ static int dw9768_init_controls(struct dw9768 *dw9768)
+ 
+ 	dw9768->focus = v4l2_ctrl_new_std(hdl, ops, V4L2_CID_FOCUS_ABSOLUTE, 0,
+ 					  DW9768_MAX_FOCUS_POS,
+-					  DW9768_FOCUS_STEPS, 0);
++					  DW9768_FOCUS_STEPS, dw9768->initial_focus);
+ 
+ 	if (hdl->error)
+ 		return hdl->error;
+@@ -423,6 +489,9 @@ static int dw9768_probe(struct i2c_client *client)
+ 	dw9768->aac_mode = DW9768_AAC_MODE_DEFAULT;
+ 	dw9768->aac_timing = DW9768_AAC_TIME_DEFAULT;
+ 	dw9768->clock_presc = DW9768_CLOCK_PRE_SCALE_DEFAULT;
++	dw9768->gt9764 = of_device_is_compatible(dev->of_node, "giantec,gt9764");
++	dw9768->initial_focus = 0;
++	dw9768->move_delay_us = 0;
+ 
+ 	/* Optional indication of AAC mode select */
+ 	fwnode_property_read_u32(dev_fwnode(dev), "dongwoon,aac-mode",
+@@ -436,9 +505,21 @@ static int dw9768_probe(struct i2c_client *client)
+ 	fwnode_property_read_u32(dev_fwnode(dev), "dongwoon,aac-timing",
+ 				 &dw9768->aac_timing);
+ 
+-	dw9768->move_delay_us = dw9768_cal_move_delay(dw9768->aac_mode,
+-						      dw9768->clock_presc,
+-						      dw9768->aac_timing);
++	fwnode_property_read_u32(dev_fwnode(dev), "dongwoon,initial-focus",
++				 &dw9768->initial_focus);
++
++	fwnode_property_read_u32(dev_fwnode(dev), "dongwoon,move-delay-us",
++				 &dw9768->move_delay_us);
++
++	dw9768->initial_focus = round_down(dw9768->initial_focus, DW9768_MOVE_STEPS);
++
++	if (dw9768->initial_focus > round_down(DW9768_MAX_FOCUS_POS, DW9768_MOVE_STEPS))
++		dw9768->initial_focus = round_down(DW9768_MAX_FOCUS_POS, DW9768_MOVE_STEPS);
++
++	if (!dw9768->move_delay_us)
++		dw9768->move_delay_us = dw9768_cal_move_delay(dw9768->aac_mode,
++							       dw9768->clock_presc,
++							       dw9768->aac_timing);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(dw9768_supply_names); i++)
+ 		dw9768->supplies[i].supply = dw9768_supply_names[i];
+@@ -529,6 +610,7 @@ static void dw9768_remove(struct i2c_client *client)
+ 
+ static const struct of_device_id dw9768_of_table[] = {
+ 	{ .compatible = "dongwoon,dw9768" },
++	{ .compatible = "giantec,gt9764" },
+ 	{ .compatible = "giantec,gt9769" },
+ 	{}
+ };
+diff --git a/drivers/media/v4l2-core/v4l2-async.c b/drivers/media/v4l2-core/v4l2-async.c
+index 460bf3d..943faa7 100644
+--- a/drivers/media/v4l2-core/v4l2-async.c
++++ b/drivers/media/v4l2-core/v4l2-async.c
+@@ -887,6 +887,7 @@ void v4l2_async_unregister_subdev(struct v4l2_subdev *sd)
+ 	if (!sd->async_list.next)
+ 		return;
+ 
++	v4l2_subdev_put_activity_led(sd);
+ 	v4l2_subdev_put_privacy_led(sd);
+ 
+ 	mutex_lock(&list_lock);
+diff --git a/drivers/media/v4l2-core/v4l2-fwnode.c b/drivers/media/v4l2-core/v4l2-fwnode.c
+index 570df3c..914f895 100644
+--- a/drivers/media/v4l2-core/v4l2-fwnode.c
++++ b/drivers/media/v4l2-core/v4l2-fwnode.c
+@@ -1276,6 +1276,10 @@ int __v4l2_async_register_subdev_sensor(struct v4l2_subdev *sd, struct module *m
+ 	if (ret < 0)
+ 		goto out_cleanup;
+ 
++	ret = v4l2_subdev_get_activity_led(sd);
++	if (ret < 0)
++		goto out_cleanup;
++
+ 	ret = v4l2_async_nf_parse_fwnode_sensor(sd->dev, notifier);
+ 	if (ret < 0)
+ 		goto out_cleanup;
+@@ -1296,6 +1300,7 @@ int __v4l2_async_register_subdev_sensor(struct v4l2_subdev *sd, struct module *m
+ 	v4l2_async_nf_unregister(notifier);
+ 
+ out_cleanup:
++	v4l2_subdev_put_activity_led(sd);
+ 	v4l2_subdev_put_privacy_led(sd);
+ 	v4l2_async_nf_cleanup(notifier);
+ 	kfree(notifier);
+diff --git a/drivers/media/v4l2-core/v4l2-subdev-priv.h b/drivers/media/v4l2-core/v4l2-subdev-priv.h
+index 52391d6..a2789c1 100644
+--- a/drivers/media/v4l2-core/v4l2-subdev-priv.h
++++ b/drivers/media/v4l2-core/v4l2-subdev-priv.h
+@@ -10,5 +10,7 @@
+ 
+ int v4l2_subdev_get_privacy_led(struct v4l2_subdev *sd);
+ void v4l2_subdev_put_privacy_led(struct v4l2_subdev *sd);
++int v4l2_subdev_get_activity_led(struct v4l2_subdev *sd);
++void v4l2_subdev_put_activity_led(struct v4l2_subdev *sd);
+ 
+ #endif
+diff --git a/drivers/media/v4l2-core/v4l2-subdev.c b/drivers/media/v4l2-core/v4l2-subdev.c
+index e9f81b9..f8f0fbc 100644
+--- a/drivers/media/v4l2-core/v4l2-subdev.c
++++ b/drivers/media/v4l2-core/v4l2-subdev.c
+@@ -14,6 +14,7 @@
+ #include <linux/mm.h>
+ #include <linux/module.h>
+ #include <linux/overflow.h>
++#include <linux/property.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
+ #include <linux/types.h>
+@@ -170,20 +171,50 @@ static int subdev_close(struct file *file)
+ }
+ #endif /* CONFIG_VIDEO_V4L2_SUBDEV_API */
+ 
+-static void v4l2_subdev_enable_privacy_led(struct v4l2_subdev *sd)
++#if IS_REACHABLE(CONFIG_LEDS_CLASS)
++struct v4l2_subdev_activity_led {
++	struct list_head list;
++	struct led_classdev *led;
++	unsigned int brightness;
++	unsigned int consumers;
++	unsigned int active;
++};
++
++static DEFINE_MUTEX(v4l2_subdev_activity_led_lock);
++static LIST_HEAD(v4l2_subdev_activity_leds);
++#endif
++
++static void v4l2_subdev_enable_leds(struct v4l2_subdev *sd)
+ {
+ #if IS_REACHABLE(CONFIG_LEDS_CLASS)
+ 	if (!IS_ERR_OR_NULL(sd->privacy_led))
+ 		led_set_brightness(sd->privacy_led,
+ 				   sd->privacy_led->max_brightness);
++
++	mutex_lock(&v4l2_subdev_activity_led_lock);
++	if (sd->activity_led_state && !sd->activity_led_enabled) {
++		sd->activity_led_enabled = true;
++		if (!sd->activity_led_state->active++)
++			led_set_brightness(sd->activity_led,
++					   sd->activity_led_state->brightness);
++	}
++	mutex_unlock(&v4l2_subdev_activity_led_lock);
+ #endif
+ }
+ 
+-static void v4l2_subdev_disable_privacy_led(struct v4l2_subdev *sd)
++static void v4l2_subdev_disable_leds(struct v4l2_subdev *sd)
+ {
+ #if IS_REACHABLE(CONFIG_LEDS_CLASS)
+ 	if (!IS_ERR_OR_NULL(sd->privacy_led))
+ 		led_set_brightness(sd->privacy_led, 0);
++
++	mutex_lock(&v4l2_subdev_activity_led_lock);
++	if (sd->activity_led_state && sd->activity_led_enabled) {
++		sd->activity_led_enabled = false;
++		if (!--sd->activity_led_state->active)
++			led_set_brightness(sd->activity_led, 0);
++	}
++	mutex_unlock(&v4l2_subdev_activity_led_lock);
+ #endif
+ }
+ 
+@@ -495,9 +526,9 @@ static int call_s_stream(struct v4l2_subdev *sd, int enable)
+ 		sd->s_stream_enabled = enable;
+ 
+ 		if (enable)
+-			v4l2_subdev_enable_privacy_led(sd);
++			v4l2_subdev_enable_leds(sd);
+ 		else
+-			v4l2_subdev_disable_privacy_led(sd);
++			v4l2_subdev_disable_leds(sd);
+ 	}
+ 
+ 	return ret;
+@@ -2396,7 +2427,7 @@ int v4l2_subdev_enable_streams(struct v4l2_subdev *sd, u32 pad,
+ 	 * for all cases.
+ 	 */
+ 	if (!use_s_stream && !already_streaming)
+-		v4l2_subdev_enable_privacy_led(sd);
++		v4l2_subdev_enable_leds(sd);
+ 
+ done:
+ 	if (!use_s_stream)
+@@ -2490,7 +2521,7 @@ int v4l2_subdev_disable_streams(struct v4l2_subdev *sd, u32 pad,
+ done:
+ 	if (!use_s_stream) {
+ 		if (!v4l2_subdev_is_streaming(sd))
+-			v4l2_subdev_disable_privacy_led(sd);
++			v4l2_subdev_disable_leds(sd);
+ 
+ 		v4l2_subdev_unlock_state(state);
+ 	}
+@@ -2687,6 +2718,9 @@ void v4l2_subdev_init(struct v4l2_subdev *sd, const struct v4l2_subdev_ops *ops)
+ 	sd->dev_priv = NULL;
+ 	sd->host_priv = NULL;
+ 	sd->privacy_led = NULL;
++	sd->activity_led = NULL;
++	sd->activity_led_state = NULL;
++	sd->activity_led_enabled = false;
+ 	INIT_LIST_HEAD(&sd->async_subdev_endpoint_list);
+ #if defined(CONFIG_MEDIA_CONTROLLER)
+ 	sd->entity.name = sd->name;
+@@ -2761,3 +2795,96 @@ void v4l2_subdev_put_privacy_led(struct v4l2_subdev *sd)
+ #endif
+ }
+ EXPORT_SYMBOL_GPL(v4l2_subdev_put_privacy_led);
++
++int v4l2_subdev_get_activity_led(struct v4l2_subdev *sd)
++{
++#if IS_REACHABLE(CONFIG_LEDS_CLASS)
++	struct v4l2_subdev_activity_led *activity_led;
++	u32 brightness;
++
++	sd->activity_led = led_get(sd->dev, "activity");
++	if (IS_ERR(sd->activity_led)) {
++		if (PTR_ERR(sd->activity_led) == -ENOENT) {
++			sd->activity_led = NULL;
++			return 0;
++		}
++
++		return dev_err_probe(sd->dev, PTR_ERR(sd->activity_led),
++				     "getting activity LED\n");
++	}
++
++	brightness = sd->activity_led->max_brightness;
++	device_property_read_u32(sd->dev, "activity-led-brightness", &brightness);
++	if (!brightness || brightness > sd->activity_led->max_brightness) {
++		dev_err(sd->dev, "invalid activity LED brightness %u\n", brightness);
++		led_put(sd->activity_led);
++		sd->activity_led = NULL;
++		return -EINVAL;
++	}
++
++	mutex_lock(&v4l2_subdev_activity_led_lock);
++	list_for_each_entry(activity_led, &v4l2_subdev_activity_leds, list) {
++		if (activity_led->led != sd->activity_led)
++			continue;
++
++		if (activity_led->brightness != brightness) {
++			mutex_unlock(&v4l2_subdev_activity_led_lock);
++			dev_err(sd->dev, "conflicting activity LED brightness %u\n",
++				brightness);
++			led_put(sd->activity_led);
++			sd->activity_led = NULL;
++			return -EINVAL;
++		}
++
++		activity_led->consumers++;
++		sd->activity_led_state = activity_led;
++		mutex_unlock(&v4l2_subdev_activity_led_lock);
++		return 0;
++	}
++
++	activity_led = kzalloc_obj(*activity_led);
++	if (!activity_led) {
++		mutex_unlock(&v4l2_subdev_activity_led_lock);
++		led_put(sd->activity_led);
++		sd->activity_led = NULL;
++		return -ENOMEM;
++	}
++
++	activity_led->led = sd->activity_led;
++	activity_led->brightness = brightness;
++	activity_led->consumers = 1;
++	list_add(&activity_led->list, &v4l2_subdev_activity_leds);
++	sd->activity_led_state = activity_led;
++	mutex_unlock(&v4l2_subdev_activity_led_lock);
++#endif
++	return 0;
++}
++EXPORT_SYMBOL_GPL(v4l2_subdev_get_activity_led);
++
++void v4l2_subdev_put_activity_led(struct v4l2_subdev *sd)
++{
++#if IS_REACHABLE(CONFIG_LEDS_CLASS)
++	struct v4l2_subdev_activity_led *activity_led = sd->activity_led_state;
++
++	if (!activity_led)
++		return;
++
++	mutex_lock(&v4l2_subdev_activity_led_lock);
++	if (sd->activity_led_enabled) {
++		sd->activity_led_enabled = false;
++		if (!--activity_led->active)
++			led_set_brightness(sd->activity_led, 0);
++	}
++
++	if (!--activity_led->consumers) {
++		list_del(&activity_led->list);
++		kfree(activity_led);
++	}
++	sd->activity_led_state = NULL;
++	mutex_unlock(&v4l2_subdev_activity_led_lock);
++
++	led_put(sd->activity_led);
++	sd->activity_led = NULL;
++#endif
++}
++EXPORT_SYMBOL_GPL(v4l2_subdev_put_activity_led);
+diff --git a/include/media/v4l2-subdev.h b/include/media/v4l2-subdev.h
+index d256b7e..a02e071 100644
+--- a/include/media/v4l2-subdev.h
++++ b/include/media/v4l2-subdev.h
+@@ -40,6 +40,7 @@ struct v4l2_subdev_stream_config;
+ struct tuner_setup;
+ struct v4l2_mbus_frame_desc;
+ struct led_classdev;
++struct v4l2_subdev_activity_led;
+ 
+ /**
+  * struct v4l2_decode_vbi_line - used to decode_vbi_line
+@@ -1032,6 +1033,9 @@ struct v4l2_subdev_platform_data {
+  *		driver. This is	optional. If NULL, each state instance will get
+  *		a lock of its own.
+  * @privacy_led: Optional pointer to a LED classdev for the privacy LED for sensors.
++ * @activity_led: Optional pointer to a LED classdev for the activity LED for sensors.
++ * @activity_led_state: Shared state for an activity LED used by multiple sensors.
++ * @activity_led_enabled: Whether this sub-device currently uses the activity LED.
+  * @active_state: Active state for the subdev (NULL for subdevs tracking the
+  *		  state internally). Initialized by calling
+  *		  v4l2_subdev_init_finalize().
+@@ -1079,6 +1083,9 @@ struct v4l2_subdev {
+ 	 */
+ 
+ 	struct led_classdev *privacy_led;
++	struct led_classdev *activity_led;
++	struct v4l2_subdev_activity_led *activity_led_state;
++	bool activity_led_enabled;
+ 
+ 	/*
+ 	 * TODO: active_state should most likely be changed from a pointer to an

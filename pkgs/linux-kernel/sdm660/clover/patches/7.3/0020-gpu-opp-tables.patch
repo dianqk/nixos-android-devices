@@ -1,0 +1,240 @@
+From e9de12916b5ad2e15c340112ac77418139382ac4 Mon Sep 17 00:00:00 2001
+From: Alexey Minnekhanov <alexeymin@postmarketos.org>
+Date: Mon, 28 Apr 2025 00:11:02 +0300
+Subject: [PATCH] arm64: dts: qcom: sdm630/660: Fix GPU opp-tables
+
+After gpucc-sdm660 rework, make frequencies list in opp-tables
+match the ones in GPU clock controller driver for each of SDM630
+and SDM660 platforms. They should match to avoid error messages
+in dmesg like:
+
+  dev_pm_opp_set_rate: failed to find OPP for freq 500000000 (-34)
+
+Previous authors left highest frequencies commented due to some
+issues with interconnect framework and missing support for the
+GPU regulator; keep them commented, uncomment all others, add
+19.2 MHz one, specify correct opp-supported-hw values for each
+one of them.
+
+Since list of frequencies supported by GPUCC is different between
+SDM630 and SDM660, and there is also difference in frequencies
+supported on bin 135:
+
+ * SDM660, bin 135: 647000000, 588000000, 465000000, 370000000,
+                    266000000, 160000000, 19200000
+ * SDM630, bin 135: 647000000, 588000000, 465000000, 370000000,
+                    240000000, 160000000, 19200000
+
+(266 MHz vs 240 MHz), so we have to delete the opp-table inherited
+from sdm630.dtsi and write new one for sdm660/636 from scratch.
+
+P.S. Maybe we can uncomment all high OPPs, because they are not
+available due to speedbin values?
+
+Signed-off-by: Alexey Minnekhanov <alexeymin@postmarketos.org>
+
+Source-Commit: https://github.com/sdm660-mainline/linux/commit/e9de12916b5ad2e15c340112ac77418139382ac4
+Scope: SDM630/660-common
+Porting notes: Original OPP reconstruction applies unchanged; later 0023 caps the reconstructed SDM660 table at nominal speed. Pristine 7.3 comments its local high OPPs but still inherits SDM630 OPP nodes.
+---
+diff --git a/arch/arm64/boot/dts/qcom/sdm630.dtsi b/arch/arm64/boot/dts/qcom/sdm630.dtsi
+index a41ba0da380bb9..1f5f0a67498ebc 100644
+--- a/arch/arm64/boot/dts/qcom/sdm630.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm630.dtsi
+@@ -1129,48 +1129,79 @@
+ 
+ 			gpu_sdm630_opp_table: opp-table {
+ 				compatible = "operating-points-v2";
++
++				/*
++				 * 775MHz is only available on default speed bin
++				 * or 162 (bit 3). Though it cannot be used for now
++				 * due to interconnect framework not supporting
++				 * multiple frequencies at the same opp-level.
++				 *
+ 				opp-775000000 {
+ 					opp-hz = /bits/ 64 <775000000>;
+ 					opp-level = <RPM_SMD_LEVEL_TURBO>;
+ 					opp-peak-kBps = <5412000>;
+-					opp-supported-hw = <0xa2>;
++					opp-supported-hw = <0x8>;
++				}; */
++
++				/* bins 162, 146 -> bits 3, 2 */
++				opp-700000000 {
++					opp-hz = /bits/ 64 <700000000>;
++					opp-level = <RPM_SMD_LEVEL_TURBO>;
++					opp-peak-kBps = <5184000>;
++					opp-supported-hw = <0xc>;
+ 				};
++
++				/* bins 162, 146, 135 -> bits 3, 2, 1 */
+ 				opp-647000000 {
+ 					opp-hz = /bits/ 64 <647000000>;
+ 					opp-level = <RPM_SMD_LEVEL_NOM_PLUS>;
+ 					opp-peak-kBps = <4068000>;
+-					opp-supported-hw = <0xff>;
++					opp-supported-hw = <0xe>;
+ 				};
++
++				/* 588 MHz and below are supported by all bins */
+ 				opp-588000000 {
+ 					opp-hz = /bits/ 64 <588000000>;
+ 					opp-level = <RPM_SMD_LEVEL_NOM>;
+ 					opp-peak-kBps = <3072000>;
+ 					opp-supported-hw = <0xff>;
+ 				};
++
+ 				opp-465000000 {
+ 					opp-hz = /bits/ 64 <465000000>;
+ 					opp-level = <RPM_SMD_LEVEL_SVS_PLUS>;
+ 					opp-peak-kBps = <2724000>;
+ 					opp-supported-hw = <0xff>;
+ 				};
++
+ 				opp-370000000 {
+ 					opp-hz = /bits/ 64 <370000000>;
+ 					opp-level = <RPM_SMD_LEVEL_SVS>;
+ 					opp-peak-kBps = <2188000>;
+ 					opp-supported-hw = <0xff>;
+ 				};
++
+ 				opp-240000000 {
+ 					opp-hz = /bits/ 64 <240000000>;
+ 					opp-level = <RPM_SMD_LEVEL_LOW_SVS>;
+ 					opp-peak-kBps = <1648000>;
+ 					opp-supported-hw = <0xff>;
+ 				};
++
+ 				opp-160000000 {
+ 					opp-hz = /bits/ 64 <160000000>;
+ 					opp-level = <RPM_SMD_LEVEL_MIN_SVS>;
+ 					opp-peak-kBps = <1200000>;
+ 					opp-supported-hw = <0xff>;
+ 				};
++
++				/* Idle, parented to gpucc_cxo */
++				opp-19200000 {
++					opp-hz = /bits/ 64 <19200000>;
++					opp-level = <RPM_SMD_LEVEL_MIN_SVS>;
++					opp-peak-kBps = <1200000>;
++					opp-supported-hw = <0xff>;
++				};
+ 			};
+ 
+ 			adreno_gpu_zap: zap-shader {
+diff --git a/arch/arm64/boot/dts/qcom/sdm660.dtsi b/arch/arm64/boot/dts/qcom/sdm660.dtsi
+index 0fca9662c64a1c..fa9c6f596537a2 100644
+--- a/arch/arm64/boot/dts/qcom/sdm660.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm660.dtsi
+@@ -44,61 +44,82 @@
+ 	compatible = "qcom,adreno-512.0", "qcom,adreno";
+ 	operating-points-v2 = <&gpu_sdm660_opp_table>;
+ 
++	/*
++	 * Delete the whole OPP table inherited from SDM630 - we need to
++	 * rewrite it cleanly from scratch, because frequency tables in gpucc
++	 * are different between sdm630 - sdm660, and the same bin (135) has
++	 * different meaning (unlocks different frequencies) on sdm660,
++	 * compared to sdm630.
++	 */
++	/delete-node/ opp-table;
++
+ 	gpu_sdm660_opp_table: opp-table {
+ 		compatible = "operating-points-v2";
+ 
+ 		/*
+-		 * 775MHz is only available on the highest speed bin
++		 * 750 MHz is only available on the highest speed bin
+ 		 * Though it cannot be used for now due to interconnect
+ 		 * framework not supporting multiple frequencies
+-		 * at the same opp-level
++		 * at the same opp-level.
++		 * These OPPs are correct, but we are lacking support for the
++		 * GPU regulator. Hence, disable them for now to prevent the
++		 * platform from hanging on high graphics loads.
+ 
++		 * bin 157 -> bit 6 *
+ 		opp-750000000 {
+ 			opp-hz = /bits/ 64 <750000000>;
+ 			opp-level = <RPM_SMD_LEVEL_TURBO>;
+ 			opp-peak-kBps = <5412000>;
+-			opp-supported-hw = <0xCHECKME>;
+-		};
+-
+-		* These OPPs are correct, but we are lacking support for the
+-		* GPU regulator. Hence, disable them for now to prevent the
+-		* platform from hanging on high graphics loads.
++			opp-supported-hw = <0x40>;
++		}; */
+ 
++		/* bins 157,146 -> bits 6,5 */
+ 		opp-700000000 {
+ 			opp-hz = /bits/ 64 <700000000>;
+ 			opp-level = <RPM_SMD_LEVEL_TURBO>;
+ 			opp-peak-kBps = <5184000>;
+-			opp-supported-hw = <0xff>;
++			opp-supported-hw = <0x60>;
+ 		};
+ 
++		/* bins 157,146,135 -> bits 6,5,4 */
+ 		opp-647000000 {
+ 			opp-hz = /bits/ 64 <647000000>;
+ 			opp-level = <RPM_SMD_LEVEL_NOM_PLUS>;
+ 			opp-peak-kBps = <4068000>;
+-			opp-supported-hw = <0xff>;
++			opp-supported-hw = <0x70>;
+ 		};
+ 
++		/* bins 157,146,135 -> bits 6,5,4 */
+ 		opp-588000000 {
+ 			opp-hz = /bits/ 64 <588000000>;
+ 			opp-level = <RPM_SMD_LEVEL_NOM>;
+ 			opp-peak-kBps = <3072000>;
+-			opp-supported-hw = <0xff>;
++			opp-supported-hw = <0x70>;
+ 		};
+ 
++		/* bins 157,146,135,122 -> bits 6,5,4,3 */
+ 		opp-465000000 {
+ 			opp-hz = /bits/ 64 <465000000>;
+ 			opp-level = <RPM_SMD_LEVEL_SVS_PLUS>;
+ 			opp-peak-kBps = <2724000>;
+-			opp-supported-hw = <0xff>;
++			opp-supported-hw = <0x78>;
++		};
++
++		/* this one is for SDM636 with bin 90, bit 2 */
++		opp-430000000 {
++			opp-hz = /bits/ 64 <430000000>;
++			opp-level = <RPM_SMD_LEVEL_SVS_PLUS>;
++			opp-peak-kBps = <2724000>;
++			opp-supported-hw = <0x4>;
+ 		};
+ 
++		/* 370 MHz and below are supported in all bins */
+ 		opp-370000000 {
+ 			opp-hz = /bits/ 64 <370000000>;
+ 			opp-level = <RPM_SMD_LEVEL_SVS>;
+ 			opp-peak-kBps = <2188000>;
+ 			opp-supported-hw = <0xff>;
+ 		};
+-		*/
+ 
+ 		opp-266000000 {
+ 			opp-hz = /bits/ 64 <266000000>;
+@@ -113,6 +134,14 @@
+ 			opp-peak-kBps = <1200000>;
+ 			opp-supported-hw = <0xff>;
+ 		};
++
++		/* Idle, parented to gpucc_cxo */
++		opp-19200000 {
++			opp-hz = /bits/ 64 <19200000>;
++			opp-level = <RPM_SMD_LEVEL_MIN_SVS>;
++			opp-peak-kBps = <1200000>;
++			opp-supported-hw = <0xff>;
++		};
+ 	};
+ };
+ 

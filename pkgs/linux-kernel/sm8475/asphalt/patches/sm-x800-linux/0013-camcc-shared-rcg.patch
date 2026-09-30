@@ -1,0 +1,380 @@
+From 04f99a725bc63343683b54dea1aa8f698c4c3b13 Mon Sep 17 00:00:00 2001
+From: Aaron Bockelie <aaronsb@gmail.com>
+Date: 2026-09-21T22:40:50Z
+Subject: [PATCH] camera stage 2: Hi847 ultrawide streams, session after session (kernel r23)
+
+hi847-of.patch converts the ACPI-only Hi847 driver to device tree on the
+hi846 pattern: hynix,hi847 compatible, vddio/vdda/vddd regulators, reset
+and shutdown GPIOs, runtime-PM power on/off around MCLK with the stock
+sequence (rails, 5 ms, MCLK 19.2 MHz, 8 ms, reset, 11 ms), a binding.
+The board DTS adds the shared I/O LDO (gpio117) and the ultrawide LDO
+(gpio109, vin from the I/O LDO), the MCLK1 pin state, cci0, the sensor on
+cci0_i2c0 at 0x21 with both link frequencies, and the csiphy2 endpoint.
+CONFIG_VIDEO_HI847=m. The sensor probes as hi847 5-0021 and tools/camtest.sh
+captures 3264x2448 RAW10 at 30 fps; tools/raw2png.py decodes it. First
+frame in docs/media/camera-uw-first-frame.jpg.
+
+Only the first session per boot worked. The camera GDSC that collapsed
+after a session never powered up again (status stuck at 'off', GDSCR
+0x68282800, CFG_GDSCR 0x010e0000). A runtime bisect of the VFE power cycle
+isolated vfe_set_clock_rates(): camcc-sm8450 registers every RCG with
+clk_rcg2_ops, so after a session ife_0_clk_src, csid_clk_src, cphy_rx and
+camnoc_axi still select PLL0/PLL3 outputs that are powered down, and the
+GDSC power-up waits on clocks that never toggle, the case described on
+clk_rcg2_shared_init(). camcc-sm8450-shared-rcg.patch switches all 35 RCGs
+to clk_rcg2_shared_ops as camcc-sm8550 and camcc-sm8650 do; the RCGs park
+on XO when disabled. Verified on r23: five consecutive sessions on VFE0 and
+VFE1 at 30 fps, RCG CFG 0 after each. camcc-sm8450-retain-ff.patch adds
+RETAIN_FF_ENABLE to the nine camera GDSCs, matching stock qcom,retain-regs.
+
+Also: device-facts/camss-gdsc-2026-09-21 (camcc register dumps in three
+states, diff, helpers), docs/11-camera.md, README Cameras row and two
+flashing gotchas (modules live in the rootfs; a camera register touched
+without its clock hangs the SoC), ADR-001 set Accepted (first frame on a
+V4L2 node, its graduation rule). Measurement record in issue #27.
+
+Source: https://github.com/aaronsb/sm-x800-linux/commit/04f99a725bc63343683b54dea1aa8f698c4c3b13
+Local integration: extract only camcc-sm8450-shared-rcg.patch; kernel diff unchanged.
+
+---
+clk: qcom: camcc-sm8450: park the RCGs on XO when disabled (shared RCG ops)
+
+On the Galaxy Tab S8+ (SM8450) the first camera stream through CAMSS works
+and every later one fails: the camera GDSC that collapsed after the session
+(TITAN_TOP, or IFE_0 if TITAN_TOP was held up) never reaches power-up
+complete ("status stuck at 'off'", GDSCR 0x68282800, CFG_GDSCR 0x010e0000).
+A domain that collapsed after CCI traffic alone recovers.
+
+Bisecting the VFE power cycle at runtime isolated vfe_set_clock_rates():
+with the rate setting skipped in a throwaway power cycle, the following
+stream works. The camcc register dumps show why. camcc-sm8450 registers
+all 35 RCGs with clk_rcg2_ops, so when their branches are disabled the RCGs
+keep their last configuration: ife_0_clk_src, csid_clk_src, cphy_rx_clk_src
+and camnoc_axi_clk_src stay selected onto PLL0 and PLL3 outputs after the
+PLLs have been powered down. The GDSC power-up sequence then waits on
+domain clocks that never toggle. camcc-sm8550 and camcc-sm8650 use
+clk_rcg2_shared_ops for every RCG, which parks the RCG on the XO source
+(SRC_SEL 0 in every parent map here) while disabled and restores the
+configuration on enable; downstream's 5.10 clock framework parks as well.
+
+Switch every RCG in camcc-sm8450 to clk_rcg2_shared_ops.
+
+diff --git a/drivers/clk/qcom/camcc-sm8450.c b/drivers/clk/qcom/camcc-sm8450.c
+index d7c99e4b5..ff33c6978 100644
+--- a/drivers/clk/qcom/camcc-sm8450.c
++++ b/drivers/clk/qcom/camcc-sm8450.c
+@@ -834,7 +834,7 @@ static struct clk_rcg2 cam_cc_bps_clk_src = {
+ 		.parent_data = cam_cc_parent_data_0,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_0),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -856,7 +856,7 @@ static struct clk_rcg2 cam_cc_camnoc_axi_clk_src = {
+ 		.parent_data = cam_cc_parent_data_0,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_0),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -877,7 +877,7 @@ static struct clk_rcg2 cam_cc_cci_0_clk_src = {
+ 		.parent_data = cam_cc_parent_data_0,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_0),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -892,7 +892,7 @@ static struct clk_rcg2 cam_cc_cci_1_clk_src = {
+ 		.parent_data = cam_cc_parent_data_0,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_0),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -914,7 +914,7 @@ static struct clk_rcg2 cam_cc_cphy_rx_clk_src = {
+ 		.parent_data = cam_cc_parent_data_0,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_0),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -935,7 +935,7 @@ static struct clk_rcg2 cam_cc_csi0phytimer_clk_src = {
+ 		.parent_data = cam_cc_parent_data_0,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_0),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -950,7 +950,7 @@ static struct clk_rcg2 cam_cc_csi1phytimer_clk_src = {
+ 		.parent_data = cam_cc_parent_data_0,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_0),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -965,7 +965,7 @@ static struct clk_rcg2 cam_cc_csi2phytimer_clk_src = {
+ 		.parent_data = cam_cc_parent_data_0,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_0),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -980,7 +980,7 @@ static struct clk_rcg2 cam_cc_csi3phytimer_clk_src = {
+ 		.parent_data = cam_cc_parent_data_0,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_0),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -995,7 +995,7 @@ static struct clk_rcg2 cam_cc_csi4phytimer_clk_src = {
+ 		.parent_data = cam_cc_parent_data_0,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_0),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1010,7 +1010,7 @@ static struct clk_rcg2 cam_cc_csi5phytimer_clk_src = {
+ 		.parent_data = cam_cc_parent_data_0,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_0),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1031,7 +1031,7 @@ static struct clk_rcg2 cam_cc_csid_clk_src = {
+ 		.parent_data = cam_cc_parent_data_0,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_0),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1055,7 +1055,7 @@ static struct clk_rcg2 cam_cc_fast_ahb_clk_src = {
+ 		.parent_data = cam_cc_parent_data_0,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_0),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1078,7 +1078,7 @@ static struct clk_rcg2 cam_cc_icp_clk_src = {
+ 		.parent_data = cam_cc_parent_data_0,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_0),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1102,7 +1102,7 @@ static struct clk_rcg2 cam_cc_ife_0_clk_src = {
+ 		.parent_data = cam_cc_parent_data_2,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_2),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1126,7 +1126,7 @@ static struct clk_rcg2 cam_cc_ife_1_clk_src = {
+ 		.parent_data = cam_cc_parent_data_3,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_3),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1149,7 +1149,7 @@ static struct clk_rcg2 cam_cc_ife_2_clk_src = {
+ 		.parent_data = cam_cc_parent_data_4,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_4),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1170,7 +1170,7 @@ static struct clk_rcg2 cam_cc_ife_lite_clk_src = {
+ 		.parent_data = cam_cc_parent_data_0,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_0),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1185,7 +1185,7 @@ static struct clk_rcg2 cam_cc_ife_lite_csid_clk_src = {
+ 		.parent_data = cam_cc_parent_data_0,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_0),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1208,7 +1208,7 @@ static struct clk_rcg2 cam_cc_ipe_nps_clk_src = {
+ 		.parent_data = cam_cc_parent_data_5,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_5),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1223,7 +1223,7 @@ static struct clk_rcg2 cam_cc_jpeg_clk_src = {
+ 		.parent_data = cam_cc_parent_data_0,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_0),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1245,7 +1245,7 @@ static struct clk_rcg2 cam_cc_mclk0_clk_src = {
+ 		.parent_data = cam_cc_parent_data_1,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_1),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1260,7 +1260,7 @@ static struct clk_rcg2 cam_cc_mclk1_clk_src = {
+ 		.parent_data = cam_cc_parent_data_1,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_1),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1275,7 +1275,7 @@ static struct clk_rcg2 cam_cc_mclk2_clk_src = {
+ 		.parent_data = cam_cc_parent_data_1,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_1),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1290,7 +1290,7 @@ static struct clk_rcg2 cam_cc_mclk3_clk_src = {
+ 		.parent_data = cam_cc_parent_data_1,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_1),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1305,7 +1305,7 @@ static struct clk_rcg2 cam_cc_mclk4_clk_src = {
+ 		.parent_data = cam_cc_parent_data_1,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_1),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1320,7 +1320,7 @@ static struct clk_rcg2 cam_cc_mclk5_clk_src = {
+ 		.parent_data = cam_cc_parent_data_1,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_1),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1335,7 +1335,7 @@ static struct clk_rcg2 cam_cc_mclk6_clk_src = {
+ 		.parent_data = cam_cc_parent_data_1,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_1),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1350,7 +1350,7 @@ static struct clk_rcg2 cam_cc_mclk7_clk_src = {
+ 		.parent_data = cam_cc_parent_data_1,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_1),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1373,7 +1373,7 @@ static struct clk_rcg2 cam_cc_qdss_debug_clk_src = {
+ 		.parent_data = cam_cc_parent_data_0,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_0),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1396,7 +1396,7 @@ static struct clk_rcg2 cam_cc_sfe_0_clk_src = {
+ 		.parent_data = cam_cc_parent_data_6,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_6),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1419,7 +1419,7 @@ static struct clk_rcg2 cam_cc_sfe_1_clk_src = {
+ 		.parent_data = cam_cc_parent_data_7,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_7),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1439,7 +1439,7 @@ static struct clk_rcg2 cam_cc_sleep_clk_src = {
+ 		.parent_data = cam_cc_parent_data_8,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_8),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1460,7 +1460,7 @@ static struct clk_rcg2 cam_cc_slow_ahb_clk_src = {
+ 		.parent_data = cam_cc_parent_data_0,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_0),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 
+@@ -1480,7 +1480,7 @@ static struct clk_rcg2 cam_cc_xo_clk_src = {
+ 		.parent_data = cam_cc_parent_data_9_ao,
+ 		.num_parents = ARRAY_SIZE(cam_cc_parent_data_9_ao),
+ 		.flags = CLK_SET_RATE_PARENT,
+-		.ops = &clk_rcg2_ops,
++		.ops = &clk_rcg2_shared_ops,
+ 	},
+ };
+ 

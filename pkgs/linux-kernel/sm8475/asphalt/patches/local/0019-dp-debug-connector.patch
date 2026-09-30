@@ -1,0 +1,24 @@
+From: NixOS Android devices contributors <nixos-android-devices@localhost>
+Date: Tue, 29 Sep 2026 05:00:00 +0800
+Subject: [PATCH] drm/msm/dp: retain connector in debugfs private state
+
+Local fix against Linux v7.3-rc4. Reading dp_test_active on Asphalt
+triggered a NULL pointer dereference in msm_dp_test_active_show().
+msm_dp_debug_init() receives the connector but never stores it, leaving
+all three compliance-test readers and the writer with a NULL pointer.
+Retain it alongside the link and panel before publishing the files.
+
+Source: https://github.com/torvalds/linux/blob/v7.3-rc4/drivers/gpu/drm/msm/dp/dp_debug.c
+---
+diff --git a/drivers/gpu/drm/msm/dp/dp_debug.c b/drivers/gpu/drm/msm/dp/dp_debug.c
+index cf3838fcd..00fb1a7ba 100644
+--- a/drivers/gpu/drm/msm/dp/dp_debug.c
++++ b/drivers/gpu/drm/msm/dp/dp_debug.c
+@@ -216,6 +216,7 @@ int msm_dp_debug_init(struct device *dev, struct msm_dp_panel *panel,
+ 
+ 	debug->link = link;
+ 	debug->panel = panel;
++	debug->connector = connector;
+ 
+ 	debugfs_create_file("dp_debug", 0444, root,
+ 			debug, &msm_dp_debug_fops);

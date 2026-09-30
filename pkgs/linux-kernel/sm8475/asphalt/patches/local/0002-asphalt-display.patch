@@ -1,0 +1,1443 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Y700 kernel rebase <y700-rebase@localhost>
+Date: Wed, 23 Sep 2026 14:47:34 +0800
+Subject: [PATCH 02/10] drm: qcom: integrate Y700 display and panel support
+
+Consolidate the TB320FC display driver, panel, backlight, SM8475 PHY,
+timing and bonded PLL fixes from the tested 7.2.6 queue. Initial bring-up
+was recorded by Codex; the following later local commits name dianqk.
+
+Component-source: local 749fd6a8e067e90dfe31267ad1a7613fdf696519
+Component-source: local 9de7d49e889ce4ad9dfa02877d7b2240d0f8bd62
+Component-source: local 6ebe5712750fcb8c7d559b2b836f26d56ab4e164
+Component-source: local 0c70d01548638699cd55bf3d4b5298fc4440c2c7
+Component-source: local 66ffede5c091a1eec007611b6f65aacffc201494
+Component-source: local 4b43689643c44ef22fbbf58c00415a68ffb804df
+---
+diff --git a/Documentation/devicetree/bindings/display/msm/qcom,sm8450-mdss.yaml b/Documentation/devicetree/bindings/display/msm/qcom,sm8450-mdss.yaml
+index 747a2e966..05c07d375 100644
+--- a/Documentation/devicetree/bindings/display/msm/qcom,sm8450-mdss.yaml
++++ b/Documentation/devicetree/bindings/display/msm/qcom,sm8450-mdss.yaml
+@@ -70,7 +70,9 @@ patternProperties:
+ 
+     properties:
+       compatible:
+-        const: qcom,sm8450-dsi-phy-5nm
++        enum:
++          - qcom,sm8450-dsi-phy-5nm
++          - qcom,sm8475-dsi-phy-4nm
+ 
+ required:
+   - compatible
+diff --git a/Documentation/devicetree/bindings/phy/qcom,dsi-phy-7nm.yaml b/Documentation/devicetree/bindings/phy/qcom,dsi-phy-7nm.yaml
+index f397ba3fa..517c3ca0a 100644
+--- a/Documentation/devicetree/bindings/phy/qcom,dsi-phy-7nm.yaml
++++ b/Documentation/devicetree/bindings/phy/qcom,dsi-phy-7nm.yaml
+@@ -27,6 +27,7 @@ properties:
+               - qcom,sm6375-dsi-phy-7nm
+               - qcom,sm8350-dsi-phy-5nm
+               - qcom,sm8450-dsi-phy-5nm
++              - qcom,sm8475-dsi-phy-4nm
+               - qcom,sm8550-dsi-phy-4nm
+               - qcom,sm8650-dsi-phy-4nm
+               - qcom,sm8750-dsi-phy-3nm
+@@ -61,6 +62,15 @@ properties:
+     enum: [ 10, 11 ]
+     default: 10
+ 
++  qcom,cphy-timing:
++    $ref: /schemas/types.yaml#/definitions/uint8-array
++    minItems: 7
++    maxItems: 7
++    description:
++      Optional board and mode specific C-PHY values for timing control
++      registers 4 through 10. Use only when values characterized by the
++      hardware vendor differ from the calculated timings.
++
+ required:
+   - compatible
+   - reg
+diff --git a/drivers/gpu/drm/drm_mipi_dsi.c b/drivers/gpu/drm/drm_mipi_dsi.c
+index 3ac1dd5ad..330ce3b22 100644
+--- a/drivers/gpu/drm/drm_mipi_dsi.c
++++ b/drivers/gpu/drm/drm_mipi_dsi.c
+@@ -908,6 +908,40 @@ u32 drm_mipi_dsi_get_input_bus_fmt(enum mipi_dsi_pixel_format dsi_format)
+ }
+ EXPORT_SYMBOL(drm_mipi_dsi_get_input_bus_fmt);
+ 
++/**
++ * mipi_dsi_dcs_write_buffer_type() - transmit a DCS command with an explicit
++ * packet data type
++ * @dsi: DSI peripheral device
++ * @type: one of the MIPI DSI DCS write packet data types
++ * @data: buffer containing data to be transmitted
++ * @len: size of transmission buffer
++ *
++ * Some panels require a long-write packet for short command payloads. Unlike
++ * mipi_dsi_dcs_write_buffer(), this function preserves the caller's packet
++ * type instead of deriving it from @len.
++ *
++ * Return: The number of bytes successfully transmitted or a negative error
++ * code on failure.
++ */
++ssize_t mipi_dsi_dcs_write_buffer_type(struct mipi_dsi_device *dsi, u8 type,
++				       const void *data, size_t len)
++{
++	struct mipi_dsi_msg msg = {
++		.channel = dsi->channel,
++		.type = type,
++		.tx_buf = data,
++		.tx_len = len,
++	};
++
++	if (type != MIPI_DSI_DCS_SHORT_WRITE &&
++	    type != MIPI_DSI_DCS_SHORT_WRITE_PARAM &&
++	    type != MIPI_DSI_DCS_LONG_WRITE)
++		return -EINVAL;
++
++	return mipi_dsi_device_transfer(dsi, &msg);
++}
++EXPORT_SYMBOL(mipi_dsi_dcs_write_buffer_type);
++
+ /**
+  * mipi_dsi_dcs_write_buffer() - transmit a DCS command with payload
+  * @dsi: DSI peripheral device
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
+index ba810f26e..e1007aeb9 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
+@@ -134,8 +134,9 @@ static void drm_mode_to_intf_timing_params(
+ 		 * TODO: replace drm_dsc_get_bpp_int with logic to handle
+ 		 * fractional part if there is fraction
+ 		 */
+-		timing->width = timing->width * drm_dsc_get_bpp_int(dsc) /
+-				(dsc->bits_per_component * 3);
++		timing->width = DIV_ROUND_UP(timing->width *
++				drm_dsc_get_bpp_int(dsc),
++				dsc->bits_per_component * 3);
+ 		timing->xres = timing->width;
+ 		timing->dce_bytes_per_line = msm_dsc_get_bytes_per_line(dsc);
+ 	}
+diff --git a/drivers/gpu/drm/msm/dsi/phy/dsi_phy.c b/drivers/gpu/drm/msm/dsi/phy/dsi_phy.c
+index 1fb3899b8..d07b8c143 100644
+--- a/drivers/gpu/drm/msm/dsi/phy/dsi_phy.c
++++ b/drivers/gpu/drm/msm/dsi/phy/dsi_phy.c
+@@ -571,6 +571,8 @@ static const struct of_device_id dsi_phy_dt_match[] = {
+ 	  .data = &dsi_phy_5nm_8350_cfgs },
+ 	{ .compatible = "qcom,sm8450-dsi-phy-5nm",
+ 	  .data = &dsi_phy_5nm_8450_cfgs },
++	{ .compatible = "qcom,sm8475-dsi-phy-4nm",
++	  .data = &dsi_phy_4nm_8475_cfgs },
+ 	{ .compatible = "qcom,milos-dsi-phy-4nm",
+ 	  .data = &dsi_phy_4nm_milos_cfgs },
+ 	{ .compatible = "qcom,sm8550-dsi-phy-4nm",
+@@ -645,6 +647,17 @@ static int dsi_phy_driver_probe(struct platform_device *pdev)
+ 	if (!of_property_read_u32(dev->of_node, "phy-type", &phy_type))
+ 		phy->cphy_mode = (phy_type == PHY_TYPE_CPHY);
+ 
++	if (of_find_property(dev->of_node, "qcom,cphy-timing", NULL)) {
++		ret = of_property_read_u8_array(dev->of_node, "qcom,cphy-timing",
++						phy->cphy_timing,
++						DSI_CPHY_TIMING_COUNT);
++		if (ret)
++			return dev_err_probe(dev, ret,
++					     "Invalid qcom,cphy-timing property\n");
++
++		phy->has_cphy_timing = true;
++	}
++
+ 	phy->base = msm_ioremap_size(pdev, "dsi_phy", &phy->base_size);
+ 	if (IS_ERR(phy->base))
+ 		return dev_err_probe(dev, PTR_ERR(phy->base),
+diff --git a/drivers/gpu/drm/msm/dsi/phy/dsi_phy.h b/drivers/gpu/drm/msm/dsi/phy/dsi_phy.h
+index f5d3e806f..037b62d00 100644
+--- a/drivers/gpu/drm/msm/dsi/phy/dsi_phy.h
++++ b/drivers/gpu/drm/msm/dsi/phy/dsi_phy.h
+@@ -59,6 +59,7 @@ extern const struct msm_dsi_phy_cfg dsi_phy_7nm_8150_cfgs;
+ extern const struct msm_dsi_phy_cfg dsi_phy_7nm_7280_cfgs;
+ extern const struct msm_dsi_phy_cfg dsi_phy_5nm_8350_cfgs;
+ extern const struct msm_dsi_phy_cfg dsi_phy_5nm_8450_cfgs;
++extern const struct msm_dsi_phy_cfg dsi_phy_4nm_8475_cfgs;
+ extern const struct msm_dsi_phy_cfg dsi_phy_5nm_8775p_cfgs;
+ extern const struct msm_dsi_phy_cfg dsi_phy_5nm_sar2130p_cfgs;
+ extern const struct msm_dsi_phy_cfg dsi_phy_4nm_milos_cfgs;
+@@ -93,6 +94,7 @@ struct msm_dsi_dphy_timing {
+ #define NUM_PROVIDED_CLKS		(DSI_PIXEL_PLL_CLK + 1)
+ 
+ #define DSI_LANE_MAX			5
++#define DSI_CPHY_TIMING_COUNT		7
+ 
+ struct msm_dsi_phy {
+ 	struct platform_device *pdev;
+@@ -116,6 +118,8 @@ struct msm_dsi_phy {
+ 	enum msm_dsi_phy_usecase usecase;
+ 	bool regulator_ldo_mode;
+ 	bool cphy_mode;
++	bool has_cphy_timing;
++	u8 cphy_timing[DSI_CPHY_TIMING_COUNT];
+ 
+ 	struct clk_hw *vco_hw;
+ 	bool pll_on;
+diff --git a/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c b/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
+index 5d805a797..377e749c7 100644
+--- a/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
++++ b/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
+@@ -53,6 +53,8 @@
+ #define DSI_PHY_7NM_QUIRK_V5_2		BIT(4)
+ /* Hardware is V7.2 */
+ #define DSI_PHY_7NM_QUIRK_V7_2		BIT(5)
++/* Hardware is V4.3.2 (SM8475 4nm) */
++#define DSI_PHY_7NM_QUIRK_V4_3_2	BIT(6)
+ 
+ struct dsi_pll_config {
+ 	bool enable_ssc;
+@@ -395,6 +397,13 @@ static int dsi_pll_7nm_lock_status(struct dsi_pll_7nm *pll)
+ 	return rc;
+ }
+ 
++static bool dsi_pll_7nm_needs_bonded_bias_fix(struct dsi_pll_7nm *pll)
++{
++	return (pll->phy->usecase == MSM_DSI_PHY_MASTER ||
++		pll->phy->usecase == MSM_DSI_PHY_SLAVE) &&
++	       (pll->phy->cfg->quirks & DSI_PHY_7NM_QUIRK_V4_3_2);
++}
++
+ static void dsi_pll_disable_pll_bias(struct dsi_pll_7nm *pll)
+ {
+ 	unsigned long flags;
+@@ -426,11 +435,13 @@ static void dsi_pll_enable_pll_bias(struct dsi_pll_7nm *pll)
+ 	u32 data;
+ 
+ 	spin_lock_irqsave(&pll->pll_enable_lock, flags);
+-	if (pll->pll_enable_cnt++) {
++	if (pll->pll_enable_cnt++ &&
++	    !dsi_pll_7nm_needs_bonded_bias_fix(pll)) {
+ 		spin_unlock_irqrestore(&pll->pll_enable_lock, flags);
+ 		WARN_ON(pll->pll_enable_cnt == INT_MAX);
+ 		return;
+ 	}
++	WARN_ON(pll->pll_enable_cnt == INT_MAX);
+ 
+ 	data = readl(pll->phy->base + REG_DSI_7nm_PHY_CMN_CTRL_0);
+ 	data |= DSI_7nm_PHY_CMN_CTRL_0_PLL_SHUTDOWNB;
+@@ -1090,8 +1101,20 @@ static int dsi_7nm_phy_enable(struct msm_dsi_phy *phy,
+ 		glbl_rescode_bot_ctrl = 0x3c;
+ 	}
+ 
++	/* SM8475 v4.3.2 retains v4.3 settings except for the PHY LDO. */
++	if (phy->cfg->quirks & DSI_PHY_7NM_QUIRK_V4_3_2) {
++		if (phy->cphy_mode) {
++			vreg_ctrl_0 = 0x45;
++			vreg_ctrl_1 = 0x41;
++		} else {
++			vreg_ctrl_0 = 0x44;
++			vreg_ctrl_1 = 0x19;
++		}
++	}
++
+ 	spin_lock_irqsave(&pll->pll_enable_lock, flags);
+-	pll->pll_enable_cnt = 1;
++	if (!dsi_pll_7nm_needs_bonded_bias_fix(pll))
++		pll->pll_enable_cnt = 1;
+ 	/* de-assert digital and pll power down */
+ 	data = DSI_7nm_PHY_CMN_CTRL_0_DIGTOP_PWRDN_B |
+ 	       DSI_7nm_PHY_CMN_CTRL_0_PLL_SHUTDOWNB;
+@@ -1155,15 +1178,23 @@ static int dsi_7nm_phy_enable(struct msm_dsi_phy *phy,
+ 	/* DSI PHY timings */
+ 	if (phy->cphy_mode) {
+ 		writel(0x00, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_0);
+-		writel(timing->hs_exit, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_4);
+-		writel(timing->shared_timings.clk_pre,
++		writel(phy->has_cphy_timing ? phy->cphy_timing[0] : timing->hs_exit,
++		       base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_4);
++		writel(phy->has_cphy_timing ? phy->cphy_timing[1] :
++		       timing->shared_timings.clk_pre,
+ 		       base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_5);
+-		writel(timing->clk_prepare, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_6);
+-		writel(timing->shared_timings.clk_post,
++		writel(phy->has_cphy_timing ? phy->cphy_timing[2] :
++		       timing->clk_prepare,
++		       base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_6);
++		writel(phy->has_cphy_timing ? phy->cphy_timing[3] :
++		       timing->shared_timings.clk_post,
+ 		       base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_7);
+-		writel(timing->hs_rqst, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_8);
+-		writel(0x02, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_9);
+-		writel(0x04, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_10);
++		writel(phy->has_cphy_timing ? phy->cphy_timing[4] : timing->hs_rqst,
++		       base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_8);
++		writel(phy->has_cphy_timing ? phy->cphy_timing[5] : 0x02,
++		       base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_9);
++		writel(phy->has_cphy_timing ? phy->cphy_timing[6] : 0x04,
++		       base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_10);
+ 		writel(0x00, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_11);
+ 	} else {
+ 		writel(0x00, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_0);
+@@ -1239,7 +1270,8 @@ static void dsi_7nm_phy_disable(struct msm_dsi_phy *phy)
+ 	writel(0, base + REG_DSI_7nm_PHY_CMN_LANE_CTRL0);
+ 
+ 	spin_lock_irqsave(&pll->pll_enable_lock, flags);
+-	pll->pll_enable_cnt = 0;
++	if (!dsi_pll_7nm_needs_bonded_bias_fix(pll))
++		pll->pll_enable_cnt = 0;
+ 	/* Turn off all PHY blocks */
+ 	writel(0x00, base + REG_DSI_7nm_PHY_CMN_CTRL_0);
+ 	spin_unlock_irqrestore(&pll->pll_enable_lock, flags);
+@@ -1404,6 +1436,29 @@ const struct msm_dsi_phy_cfg dsi_phy_5nm_8450_cfgs = {
+ 	.quirks = DSI_PHY_7NM_QUIRK_V4_3,
+ };
+ 
++const struct msm_dsi_phy_cfg dsi_phy_4nm_8475_cfgs = {
++	.has_phy_lane = true,
++	.regulator_data = dsi_phy_7nm_97800uA_regulators,
++	.num_regulators = ARRAY_SIZE(dsi_phy_7nm_97800uA_regulators),
++	.ops = {
++		.enable = dsi_7nm_phy_enable,
++		.disable = dsi_7nm_phy_disable,
++		.pll_init = dsi_pll_7nm_init,
++		.save_pll_state = dsi_7nm_pll_save_state,
++		.restore_pll_state = dsi_7nm_pll_restore_state,
++		.set_continuous_clock = dsi_7nm_set_continuous_clock,
++	},
++	.min_pll_rate = 600000000UL,
++#ifdef CONFIG_64BIT
++	.max_pll_rate = 5000000000UL,
++#else
++	.max_pll_rate = ULONG_MAX,
++#endif
++	.io_start = { 0xae94400, 0xae96400 },
++	.num_dsi_phy = 2,
++	.quirks = DSI_PHY_7NM_QUIRK_V4_3 | DSI_PHY_7NM_QUIRK_V4_3_2,
++};
++
+ const struct msm_dsi_phy_cfg dsi_phy_5nm_8775p_cfgs = {
+ 	.has_phy_lane = true,
+ 	.regulator_data = dsi_phy_7nm_48000uA_regulators,
+diff --git a/drivers/gpu/drm/panel/panel-novatek-nt36523.c b/drivers/gpu/drm/panel/panel-novatek-nt36523.c
+index 34b9123d3..44c1e8a4a 100644
+--- a/drivers/gpu/drm/panel/panel-novatek-nt36523.c
++++ b/drivers/gpu/drm/panel/panel-novatek-nt36523.c
+@@ -15,6 +15,8 @@
+ 
+ #include <video/mipi_display.h>
+ 
++#include <drm/display/drm_dsc.h>
++#include <drm/display/drm_dsc_helper.h>
+ #include <drm/drm_connector.h>
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_mipi_dsi.h>
+@@ -26,6 +28,7 @@
+ 
+ struct panel_info {
+ 	struct drm_panel panel;
++	struct drm_dsc_config dsc;
+ 	struct mipi_dsi_device *dsi[2];
+ 	const struct panel_desc *desc;
+ 	enum drm_panel_orientation orientation;
+@@ -45,12 +48,15 @@ struct panel_desc {
+ 	enum mipi_dsi_pixel_format format;
+ 
+ 	const struct drm_display_mode *modes;
++	const struct drm_dsc_config *dsc_cfg;
+ 	unsigned int num_modes;
+ 	const struct mipi_dsi_device_info dsi_info;
+ 	int (*init_sequence)(struct panel_info *pinfo);
++	int (*off_sequence)(struct panel_info *pinfo);
+ 
+ 	bool is_dual_dsi;
+ 	bool has_dcs_backlight;
++	bool has_y700_reset;
+ };
+ 
+ static inline struct panel_info *to_panel_info(struct drm_panel *panel)
+@@ -58,6 +64,540 @@ static inline struct panel_info *to_panel_info(struct drm_panel *panel)
+ 	return container_of(panel, struct panel_info, panel);
+ }
+ 
++
++struct nt36523_cmd {
++	u8 type;
++	u8 data[17];
++	u8 len;
++	u8 wait_ms;
++};
++
++/* qcom,mdss-dsi-on-command: 459 records, 4519 encoded bytes. */
++static const struct nt36523_cmd y700_on_cmds[] = {
++	{ .type = 0x39, .data = { 0xff, 0xd0 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xfb, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x00, 0x30 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x09, 0xee }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x1c, 0x99 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x1d, 0x09 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xff, 0x20 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xfb, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x05, 0x09 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x06, 0xc0 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x07, 0x3a }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x08, 0x1e }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x0d, 0x63 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x0e, 0x55 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x0f, 0x37 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x30, 0x10 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x31, 0x02 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x32, 0x42 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x58, 0x43 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x60, 0xbb }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x62, 0x36 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x63, 0xa6 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x65, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x69, 0x98 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x6d, 0x66 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x6e, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x75, 0xc4 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x77, 0x3b }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x7c, 0x44 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x94, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x95, 0xd7 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x96, 0xd7 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xff, 0x24 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xfb, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x00, 0x23 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x01, 0x03 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x02, 0x22 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x03, 0x22 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x04, 0x03 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x05, 0x13 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x06, 0x12 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x07, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x08, 0x10 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x09, 0x0f }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x0a, 0x0e }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x0b, 0x0d }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x0c, 0x0c }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x0d, 0x03 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x0e, 0x04 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x0f, 0x28 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x10, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x11, 0x03 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x12, 0x26 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x13, 0x03 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x14, 0x27 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x15, 0x27 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x16, 0x23 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x17, 0x03 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x18, 0x22 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x19, 0x22 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x1a, 0x03 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x1b, 0x13 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x1c, 0x12 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x1d, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x1e, 0x10 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x1f, 0x0f }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x20, 0x0e }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x21, 0x0d }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x22, 0x0c }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x23, 0x03 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x24, 0x04 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x25, 0x28 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x26, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x27, 0x03 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x28, 0x26 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x29, 0x03 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x2a, 0x27 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x2b, 0x27 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x2f, 0x04 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x30, 0x03 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x33, 0x04 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x34, 0x04 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x37, 0x44 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x3a, 0x3d }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x3b, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x3d, 0x02 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x4d, 0x43 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x4e, 0x65 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x4f, 0x87 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x50, 0x21 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x51, 0x56 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x52, 0x34 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x53, 0x12 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x54, 0x78 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x55, 0x04, 0x04 }, .len = 3, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x56, 0x08 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x58, 0x10 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x59, 0x10 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x5a, 0x08 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x5b, 0x3e }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x5c, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x5d, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x5e, 0x00, 0x04 }, .len = 3, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x60, 0xc8 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x61, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x63, 0xa0 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x91, 0x40 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x92, 0xc8, 0x00, 0xc8 }, .len = 4, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x93, 0x1e, 0x00 }, .len = 3, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x94, 0x04, 0x01 }, .len = 3, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x95, 0x81 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x96, 0x62 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x97, 0xc2 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x98, 0x80 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xaa, 0x4d }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xab, 0x44 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb6, 0x05, 0x00, 0x05, 0x00, 0x00, 0x00, 0x05, 0x05, 0x05, 0x05, 0x00, 0x00 }, .len = 13, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xbb, 0x80 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xbc, 0x00, 0x00, 0x40, 0x00, 0x00 }, .len = 6, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xc2, 0xc6, 0x00, 0x08 }, .len = 4, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xc3, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xc4, 0x2f }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xdb, 0x71 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xdc, 0x4e }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xdf, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xe0, 0x4e }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xe1, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xe2, 0x4e }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xe5, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xe6, 0x4e }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xff, 0x25 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xfb, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x05, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x13, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x14, 0xa5 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xdb, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xdc, 0x4c }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x15, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x16, 0xa5 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xdd, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xde, 0x4c }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xbc, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xbd, 0x65 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xf6, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xf7, 0x14 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x19, 0x07 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x1b, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x1e, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x1f, 0x08 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x20, 0x3e }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x25, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x26, 0x08 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x27, 0x3e }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x3f, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x40, 0x02 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x43, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x48, 0x08 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x49, 0x3e }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x5b, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xc0, 0x0c }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xc2, 0x40 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xc5, 0x17 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xc8, 0x04 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xf1, 0x10 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xff, 0x26 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xfb, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x00, 0x81 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x06, 0x80 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x04, 0x96 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x0a, 0xf5 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x0c, 0x08 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x0d, 0x10 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x0f, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x11, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x12, 0x51 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x13, 0x18 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x14, 0x1d }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x16, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x19, 0x1d }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x1a, 0x82 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x1b, 0x1b }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x1c, 0xd3 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x1d, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x1e, 0x4d }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x1f, 0x4d }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x20, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x21, 0x07 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x2a, 0x1d }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x2b, 0x82 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x2f, 0x08 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x30, 0x4d }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x31, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x32, 0x4d }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x39, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x33, 0x67 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x34, 0x89 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x35, 0x67 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x36, 0x89 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x37, 0x78 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x38, 0x06 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x8c, 0x04 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x8d, 0x10 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x8f, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x91, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x92, 0x51 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x93, 0x7c }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x94, 0xc1 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x96, 0x12 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x99, 0x25 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x9a, 0xf7 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x9b, 0x24 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x9c, 0x47 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x9d, 0x25 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x9e, 0xf7 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x3f, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x40, 0x49 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x41, 0x49 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x42, 0x49 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x45, 0x0b }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x46, 0x49 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x47, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x48, 0x49 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x4c, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x4d, 0x39 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x4e, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x51, 0x08 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x52, 0x3a }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x55, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x56, 0x08 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x58, 0x3a }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x5b, 0x08 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x5c, 0x3a }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x5f, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x64, 0x08 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x65, 0x3a }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x49, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x80, 0x66 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x81, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x8b, 0x96 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xc7, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xc8, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xcd, 0x76, 0x8a }, .len = 3, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xce, 0x74, 0x8a }, .len = 3, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xcf, 0x24, 0x00, 0x20 }, .len = 4, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xd0, 0x00, 0x00 }, .len = 3, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xd1, 0x00, 0x00 }, .len = 3, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xd2, 0x30 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xf7, 0x04 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xff, 0x27 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xfb, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x56, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x78, 0x80 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x79, 0x1d }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x7a, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x7b, 0x1c }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x7c, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x7d, 0x24 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x7e, 0x20 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x7f, 0x10 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x80, 0x96 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x81, 0x76 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x82, 0x96 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x83, 0x10 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x84, 0x8a }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x85, 0x74 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x86, 0x96 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x87, 0x10 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x88, 0x8a }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x95, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x96, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x97, 0x08 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x00, 0x80 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x01, 0x1d }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x02, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x03, 0x20 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x04, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x05, 0x09 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x06, 0x20 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x07, 0x10 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x08, 0x96 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x09, 0x58 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x0a, 0x96 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x0b, 0x10 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x0c, 0xa8 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x0d, 0x57 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x0e, 0x96 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x0f, 0x10 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x10, 0xa8 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x2f, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x30, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x31, 0x08 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xc0, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xd0, 0x02 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xd1, 0x54 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xd2, 0x30 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xde, 0x03 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xdf, 0x02 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xff, 0x2a }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xfb, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x22, 0x1f }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x23, 0x14 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x24, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x25, 0x4d }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x27, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x28, 0x1e }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x29, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x2a, 0x1e }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x2b, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x2d, 0x1e }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x2f, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x30, 0x4d }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x32, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x33, 0x1e }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x34, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x35, 0x1e }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x36, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x37, 0x1e }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x38, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x39, 0x48 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x3b, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x3d, 0x1e }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x3f, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x40, 0x1e }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x41, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x42, 0x1e }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x64, 0x41 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x6a, 0x41 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x79, 0x41 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x7c, 0x41 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x7f, 0x41 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x82, 0x41 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x85, 0x41 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x97, 0x3c }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x98, 0x02 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x99, 0x95 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x9a, 0x03 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x9b, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x9c, 0x0b }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x9d, 0x0a }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x9e, 0x90 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xf2, 0x3c }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xf3, 0x02 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xf4, 0x95 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xf5, 0x03 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xf6, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xf7, 0x0b }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xf8, 0x0a }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xf9, 0x90 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xa2, 0x30 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xa3, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xa4, 0x30 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xe8, 0x15 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xff, 0x22 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xfb, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x9f, 0x96 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xff, 0x23 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xfb, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xa3, 0x96 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x00, 0x80 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x07, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x08, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x09, 0x87 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x11, 0x02 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x12, 0x80 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x15, 0x83 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x16, 0x0c }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x29, 0x80 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x30, 0xff }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x31, 0xfc }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x32, 0xf9 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x33, 0xf6 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x34, 0xf3 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x35, 0xf1 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x36, 0xee }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x37, 0xeb }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x38, 0xe9 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x39, 0xe6 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x3a, 0xe4 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x3b, 0xe1 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x3d, 0xdf }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x3f, 0xdd }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x40, 0xdb }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x41, 0xd9 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xff, 0x20 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xfb, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x95, 0xeb }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x96, 0xeb }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb0, 0x00, 0x3e, 0x00, 0x4e, 0x00, 0x7c, 0x00, 0xa1, 0x00, 0xbf, 0x00, 0xd8, 0x00, 0xee, 0x01, 0x02 }, .len = 17, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb1, 0x01, 0x13, 0x01, 0x4d, 0x01, 0x76, 0x01, 0xb7, 0x01, 0xe4, 0x02, 0x2d, 0x02, 0x62, 0x02, 0x64 }, .len = 17, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb2, 0x02, 0x9a, 0x02, 0xd4, 0x02, 0xfd, 0x03, 0x2c, 0x03, 0x4e, 0x03, 0x78, 0x03, 0x88, 0x03, 0x96 }, .len = 17, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb3, 0x03, 0xa6, 0x03, 0xb4, 0x03, 0xd6, 0x03, 0xf2, 0x03, 0xfe, 0x03, 0xff }, .len = 13, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb4, 0x00, 0x3e, 0x00, 0x4e, 0x00, 0x7c, 0x00, 0xa1, 0x00, 0xbf, 0x00, 0xd8, 0x00, 0xee, 0x01, 0x02 }, .len = 17, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb5, 0x01, 0x13, 0x01, 0x4d, 0x01, 0x76, 0x01, 0xb7, 0x01, 0xe4, 0x02, 0x2d, 0x02, 0x62, 0x02, 0x64 }, .len = 17, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb6, 0x02, 0x9a, 0x02, 0xd4, 0x02, 0xfd, 0x03, 0x2c, 0x03, 0x4e, 0x03, 0x78, 0x03, 0x88, 0x03, 0x96 }, .len = 17, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb7, 0x03, 0xa6, 0x03, 0xb4, 0x03, 0xd6, 0x03, 0xf2, 0x03, 0xfe, 0x03, 0xff }, .len = 13, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb8, 0x00, 0x3e, 0x00, 0x4e, 0x00, 0x7c, 0x00, 0xa1, 0x00, 0xbf, 0x00, 0xd8, 0x00, 0xee, 0x01, 0x02 }, .len = 17, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb9, 0x01, 0x13, 0x01, 0x4d, 0x01, 0x76, 0x01, 0xb7, 0x01, 0xe4, 0x02, 0x2d, 0x02, 0x62, 0x02, 0x64 }, .len = 17, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xba, 0x02, 0x9a, 0x02, 0xd4, 0x02, 0xfd, 0x03, 0x2c, 0x03, 0x4e, 0x03, 0x78, 0x03, 0x88, 0x03, 0x96 }, .len = 17, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xbb, 0x03, 0xa6, 0x03, 0xb4, 0x03, 0xd6, 0x03, 0xf2, 0x03, 0xfe, 0x03, 0xff }, .len = 13, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xc6, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xc7, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xc8, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xc9, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xca, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xcb, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xcc, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xcd, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xce, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xcf, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xd0, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xd1, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xd2, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xd3, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xd4, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xd5, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xd6, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xd7, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xd8, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xd9, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xda, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xdb, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xdc, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xdd, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xde, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xdf, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xe0, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xe1, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xe2, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xe3, 0x11 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xff, 0x21 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xfb, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb0, 0x00, 0x1a, 0x00, 0x46, 0x00, 0x74, 0x00, 0x99, 0x00, 0xb7, 0x00, 0xd0, 0x00, 0xe6, 0x00, 0xfa }, .len = 17, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb1, 0x01, 0x0b, 0x01, 0x45, 0x01, 0x6e, 0x01, 0xaf, 0x01, 0xdc, 0x02, 0x25, 0x02, 0x5a, 0x02, 0x5c }, .len = 17, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb2, 0x02, 0x92, 0x02, 0xcc, 0x02, 0xf5, 0x03, 0x24, 0x03, 0x46, 0x03, 0x70, 0x03, 0x80, 0x03, 0x8e }, .len = 17, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb3, 0x03, 0x9e, 0x03, 0xac, 0x03, 0xce, 0x03, 0xea, 0x03, 0xf6, 0x03, 0xf7 }, .len = 13, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb4, 0x00, 0x1a, 0x00, 0x46, 0x00, 0x74, 0x00, 0x99, 0x00, 0xb7, 0x00, 0xd0, 0x00, 0xe6, 0x00, 0xfa }, .len = 17, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb5, 0x01, 0x0b, 0x01, 0x45, 0x01, 0x6e, 0x01, 0xaf, 0x01, 0xdc, 0x02, 0x25, 0x02, 0x5a, 0x02, 0x5c }, .len = 17, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb6, 0x02, 0x92, 0x02, 0xcc, 0x02, 0xf5, 0x03, 0x24, 0x03, 0x46, 0x03, 0x70, 0x03, 0x80, 0x03, 0x8e }, .len = 17, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb7, 0x03, 0x9e, 0x03, 0xac, 0x03, 0xce, 0x03, 0xea, 0x03, 0xf6, 0x03, 0xf7 }, .len = 13, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb8, 0x00, 0x1a, 0x00, 0x46, 0x00, 0x74, 0x00, 0x99, 0x00, 0xb7, 0x00, 0xd0, 0x00, 0xe6, 0x00, 0xfa }, .len = 17, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb9, 0x01, 0x0b, 0x01, 0x45, 0x01, 0x6e, 0x01, 0xaf, 0x01, 0xdc, 0x02, 0x25, 0x02, 0x5a, 0x02, 0x5c }, .len = 17, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xba, 0x02, 0x92, 0x02, 0xcc, 0x02, 0xf5, 0x03, 0x24, 0x03, 0x46, 0x03, 0x70, 0x03, 0x80, 0x03, 0x8e }, .len = 17, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xbb, 0x03, 0x9e, 0x03, 0xac, 0x03, 0xce, 0x03, 0xea, 0x03, 0xf6, 0x03, 0xf7 }, .len = 13, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xff, 0x10 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xfb, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x35, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x51, 0x00, 0x00 }, .len = 3, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x53, 0x2c }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x55, 0x00 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x68, 0x03, 0x01 }, .len = 3, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x90, 0x03 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x91, 0x89, 0xa8, 0x00, 0x14, 0xd2, 0x00, 0x02, 0xb2, 0x02, 0x2b, 0x00, 0x0b, 0x05, 0x7a, 0x03, 0x68 }, .len = 17, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x92, 0x10, 0xe0 }, .len = 3, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb2, 0x91 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xb3, 0x01 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0xbb, 0x13 }, .len = 2, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x3b, 0x03, 0x04, 0x1e, 0x04, 0x04, 0x01 }, .len = 7, .wait_ms = 0 },
++	{ .type = 0x39, .data = { 0x11, 0x00 }, .len = 2, .wait_ms = 100 },
++	{ .type = 0x39, .data = { 0x29, 0x00 }, .len = 2, .wait_ms = 10 },
++};
++/* qcom,mdss-dsi-off-command: 2 records, 18 encoded bytes. */
++static const struct nt36523_cmd y700_off_cmds[] = {
++	{ .type = 0x05, .data = { 0x28, 0x00 }, .len = 2, .wait_ms = 5 },
++	{ .type = 0x05, .data = { 0x10, 0x00 }, .len = 2, .wait_ms = 70 },
++};
++
++
++static int y700_run_cmds(struct panel_info *pinfo,
++			 const struct nt36523_cmd *cmds, size_t count)
++{
++	size_t i;
++	int j;
++
++	for (i = 0; i < count; i++) {
++		size_t len = cmds[i].len;
++
++		/* Downstream encodes no-parameter DCS writes with a dummy zero. */
++		if (cmds[i].type == MIPI_DSI_DCS_SHORT_WRITE && len == 2 &&
++		    cmds[i].data[1] == 0)
++			len = 1;
++
++		for (j = 0; j < 2; j++) {
++			ssize_t ret;
++
++			ret = mipi_dsi_dcs_write_buffer_type(pinfo->dsi[j],
++							     cmds[i].type,
++							     cmds[i].data, len);
++			if (ret < 0) {
++				dev_err(&pinfo->dsi[j]->dev,
++					"failed to send Y700 DCS command: %zd\n", ret);
++				return ret;
++			}
++		}
++
++		if (cmds[i].wait_ms)
++			msleep(cmds[i].wait_ms);
++	}
++
++	return 0;
++}
++
++static int y700_init_sequence(struct panel_info *pinfo)
++{
++	return y700_run_cmds(pinfo, y700_on_cmds, ARRAY_SIZE(y700_on_cmds));
++}
++
++static int y700_off_sequence(struct panel_info *pinfo)
++{
++	unsigned long flags[2];
++	int i, ret;
++
++	for (i = 0; i < 2; i++) {
++		flags[i] = pinfo->dsi[i]->mode_flags;
++		pinfo->dsi[i]->mode_flags &= ~MIPI_DSI_MODE_LPM;
++	}
++
++	ret = y700_run_cmds(pinfo, y700_off_cmds, ARRAY_SIZE(y700_off_cmds));
++
++	for (i = 0; i < 2; i++)
++		pinfo->dsi[i]->mode_flags = flags[i];
++
++	return ret;
++}
++
+ static int elish_boe_init_sequence(struct panel_info *pinfo)
+ {
+ 	struct mipi_dsi_device *dsi0 = pinfo->dsi[0];
+@@ -887,6 +1427,55 @@ static int j606f_boe_init_sequence(struct panel_info *pinfo)
+ 	return dsi_ctx.accum_err;
+ }
+ 
++
++static const struct drm_dsc_config y700_dsc_cfg = {
++	.dsc_version_major = 1,
++	.dsc_version_minor = 1,
++	.slice_height = 20,
++	.slice_width = 800,
++	.slice_count = 1,
++	.bits_per_component = 8,
++	.bits_per_pixel = 8 << 4,
++	.block_pred_enable = true,
++};
++
++static const struct drm_display_mode y700_modes[] = {
++	{
++		.clock = (800 + 137 + 20 + 54) * 2 *
++			 (2560 + 30 + 4 + 256) * 120 / 1000,
++		.hdisplay = 800 * 2,
++		.hsync_start = (800 + 137) * 2,
++		.hsync_end = (800 + 137 + 20) * 2,
++		.htotal = (800 + 137 + 20 + 54) * 2,
++		.vdisplay = 2560,
++		.vsync_start = 2560 + 30,
++		.vsync_end = 2560 + 30 + 4,
++		.vtotal = 2560 + 30 + 4 + 256,
++	},
++};
++
++static const struct panel_desc y700_desc = {
++	.modes = y700_modes,
++	.num_modes = ARRAY_SIZE(y700_modes),
++	.dsc_cfg = &y700_dsc_cfg,
++	.dsi_info = {
++		.type = "NT36523N-Y700",
++		.channel = 0,
++		.node = NULL,
++	},
++	.width_mm = 118,
++	.height_mm = 190,
++	.bpc = 8,
++	.lanes = 3,
++	.format = MIPI_DSI_FMT_RGB888,
++	.mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST |
++		      MIPI_DSI_CLOCK_NON_CONTINUOUS | MIPI_DSI_MODE_LPM,
++	.init_sequence = y700_init_sequence,
++	.off_sequence = y700_off_sequence,
++	.is_dual_dsi = true,
++	.has_y700_reset = true,
++};
++
+ static const struct drm_display_mode elish_boe_modes[] = {
+ 	{
+ 		.clock = (1600 + 60 + 8 + 60) * (2560 + 26 + 4 + 168) * 120 / 1000,
+@@ -983,6 +1572,19 @@ static const struct panel_desc j606f_boe_desc = {
+ 
+ static void nt36523_reset(struct panel_info *pinfo)
+ {
++	if (pinfo->desc->has_y700_reset) {
++		/* Stock physical levels: low 10 ms, high 10 ms, low 10 ms, high 11 ms. */
++		gpiod_set_value_cansleep(pinfo->reset_gpio, 1);
++		msleep(10);
++		gpiod_set_value_cansleep(pinfo->reset_gpio, 0);
++		msleep(10);
++		gpiod_set_value_cansleep(pinfo->reset_gpio, 1);
++		msleep(10);
++		gpiod_set_value_cansleep(pinfo->reset_gpio, 0);
++		msleep(11);
++		return;
++	}
++
+ 	gpiod_set_value_cansleep(pinfo->reset_gpio, 1);
+ 	usleep_range(12000, 13000);
+ 	gpiod_set_value_cansleep(pinfo->reset_gpio, 0);
+@@ -1003,16 +1605,40 @@ static int nt36523_prepare(struct drm_panel *panel)
+ 		dev_err(panel->dev, "failed to enable vddio regulator: %d\n", ret);
+ 		return ret;
+ 	}
++	if (pinfo->desc->has_y700_reset)
++		msleep(20);
+ 
+ 	nt36523_reset(pinfo);
+ 
+ 	ret = pinfo->desc->init_sequence(pinfo);
+ 	if (ret < 0) {
++		gpiod_set_value_cansleep(pinfo->reset_gpio, 1);
+ 		regulator_disable(pinfo->vddio);
+ 		dev_err(panel->dev, "failed to initialize panel: %d\n", ret);
+ 		return ret;
+ 	}
+ 
++	if (pinfo->desc->dsc_cfg) {
++		struct drm_dsc_picture_parameter_set pps;
++		int i;
++
++		drm_dsc_pps_payload_pack(&pps, &pinfo->dsc);
++		for (i = 0; i < DSI_NUM_MIN + pinfo->desc->is_dual_dsi; i++) {
++			struct mipi_dsi_multi_context dsi_ctx = { .dsi = pinfo->dsi[i] };
++
++			mipi_dsi_picture_parameter_set_multi(&dsi_ctx, &pps);
++			mipi_dsi_compression_mode_multi(&dsi_ctx, true);
++			if (dsi_ctx.accum_err) {
++				gpiod_set_value_cansleep(pinfo->reset_gpio, 1);
++				regulator_disable(pinfo->vddio);
++				dev_err(panel->dev,
++					"failed to enable panel DSC: %d\n",
++					dsi_ctx.accum_err);
++				return dsi_ctx.accum_err;
++			}
++		}
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1021,6 +1647,9 @@ static int nt36523_disable(struct drm_panel *panel)
+ 	struct panel_info *pinfo = to_panel_info(panel);
+ 	int i;
+ 
++	if (pinfo->desc->off_sequence)
++		return 0;
++
+ 	for (i = 0; i < DSI_NUM_MIN + pinfo->desc->is_dual_dsi; i++) {
+ 		struct mipi_dsi_multi_context dsi_ctx = { .dsi = pinfo->dsi[i]};
+ 
+@@ -1041,11 +1670,18 @@ static int nt36523_disable(struct drm_panel *panel)
+ static int nt36523_unprepare(struct drm_panel *panel)
+ {
+ 	struct panel_info *pinfo = to_panel_info(panel);
++	int ret = 0;
++
++	if (pinfo->desc->off_sequence) {
++		ret = pinfo->desc->off_sequence(pinfo);
++		if (ret < 0)
++			dev_err(panel->dev, "failed to turn panel off: %d\n", ret);
++	}
+ 
+ 	gpiod_set_value_cansleep(pinfo->reset_gpio, 1);
+ 	regulator_disable(pinfo->vddio);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static void nt36523_remove(struct mipi_dsi_device *dsi)
+@@ -1182,6 +1818,9 @@ static int nt36523_probe(struct mipi_dsi_device *dsi)
+ 	if (!pinfo->desc)
+ 		return -ENODEV;
+ 
++	if (pinfo->desc->dsc_cfg)
++		pinfo->dsc = *pinfo->desc->dsc_cfg;
++
+ 	/* If the panel is dual dsi, register DSI1 */
+ 	if (pinfo->desc->is_dual_dsi) {
+ 		info = &pinfo->desc->dsi_info;
+@@ -1232,6 +1871,7 @@ static int nt36523_probe(struct mipi_dsi_device *dsi)
+ 		pinfo->dsi[i]->lanes = pinfo->desc->lanes;
+ 		pinfo->dsi[i]->format = pinfo->desc->format;
+ 		pinfo->dsi[i]->mode_flags = pinfo->desc->mode_flags;
++		pinfo->dsi[i]->dsc = pinfo->desc->dsc_cfg ? &pinfo->dsc : NULL;
+ 
+ 		ret = devm_mipi_dsi_attach(dev, pinfo->dsi[i]);
+ 		if (ret < 0)
+@@ -1242,6 +1882,10 @@ static int nt36523_probe(struct mipi_dsi_device *dsi)
+ }
+ 
+ static const struct of_device_id nt36523_of_match[] = {
++	{
++		.compatible = "lenovo,y700-nt36523n",
++		.data = &y700_desc,
++	},
+ 	{
+ 		.compatible = "lenovo,j606f-boe-nt36523w",
+ 		.data = &j606f_boe_desc,
+diff --git a/drivers/video/backlight/ktz8866.c b/drivers/video/backlight/ktz8866.c
+index 53c1301db..1675e9873 100644
+--- a/drivers/video/backlight/ktz8866.c
++++ b/drivers/video/backlight/ktz8866.c
+@@ -6,12 +6,14 @@
+  */
+ 
+ #include <linux/backlight.h>
++#include <linux/delay.h>
+ #include <linux/err.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/i2c.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/regmap.h>
++#include <linux/regulator/consumer.h>
+ 
+ #define DEFAULT_BRIGHTNESS 1500
+ #define MAX_BRIGHTNESS 2047
+@@ -42,11 +44,23 @@
+ #define BL_EN_BIT BIT(6)
+ #define LCD_BIAS_EN 0x9F
+ #define PWM_HYST 0x5
++#define DEVICE_ID_VENDOR_MASK GENMASK(5, 3)
++#define DEVICE_ID_VENDOR_KINETIC BIT(5)
++
++struct ktz8866_chip_data {
++	const struct reg_sequence *init_sequence;
++	size_t init_sequence_size;
++	unsigned int default_brightness;
++};
+ 
+ struct ktz8866 {
+ 	struct i2c_client *client;
++	const struct ktz8866_chip_data *chip_data;
+ 	struct regmap *regmap;
++	struct regulator *vddpos;
++	struct regulator *vddneg;
+ 	bool led_on;
++	bool powered;
+ 	struct gpio_desc *enable_gpio;
+ };
+ 
+@@ -56,6 +70,27 @@ static const struct regmap_config ktz8866_regmap_config = {
+ 	.max_register = REG_MAX,
+ };
+ 
++static const struct reg_sequence y700_init_sequence[] = {
++	/* Keep the LEDs off while replacing their POR brightness of 2047. */
++	{ BL_EN, 0x0f },
++	{ BL_BRT_LSB, 0x00 },
++	{ BL_BRT_MSB, 0x00 },
++	{ BL_CFG1, 0x5a },
++	{ BL_CFG2, 0xcd },
++	{ BL_OPTION2, 0xb7 },
++	{ PWM_RAMP_TIME, 0xa8 },
++	{ LCD_BOOST_CFG, 0x26 },
++	{ OUTP_CFG, 0x1e },
++	{ OUTN_CFG, 0x1e },
++	{ LCD_BIAS_CFG1, 0x9f },
++};
++
++static const struct ktz8866_chip_data y700_chip_data = {
++	.init_sequence = y700_init_sequence,
++	.init_sequence_size = ARRAY_SIZE(y700_init_sequence),
++	.default_brightness = 0,
++};
++
+ static int ktz8866_write(struct ktz8866 *ktz, unsigned int reg,
+ 			 unsigned int val)
+ {
+@@ -72,18 +107,37 @@ static int ktz8866_backlight_update_status(struct backlight_device *backlight_de
+ {
+ 	struct ktz8866 *ktz = bl_get_data(backlight_dev);
+ 	unsigned int brightness = backlight_get_brightness(backlight_dev);
++	int ret;
++
++	if (brightness == 0) {
++		ret = ktz8866_update_bits(ktz, BL_EN, BL_EN_BIT, 0);
++		if (ret)
++			return ret;
+ 
+-	if (!ktz->led_on && brightness > 0) {
+-		ktz8866_update_bits(ktz, BL_EN, BL_EN_BIT, BL_EN_BIT);
+-		ktz->led_on = true;
+-	} else if (brightness == 0) {
+-		ktz8866_update_bits(ktz, BL_EN, BL_EN_BIT, 0);
+ 		ktz->led_on = false;
++	} else {
++		/* Replace the old brightness before allowing current to flow. */
++		ret = ktz8866_write(ktz, BL_BRT_LSB, brightness & 0x7);
++		if (ret)
++			return ret;
++		ret = ktz8866_write(ktz, BL_BRT_MSB, (brightness >> 3) & 0xff);
++		if (ret)
++			return ret;
++		ret = ktz8866_update_bits(ktz, BL_EN, BL_EN_BIT, BL_EN_BIT);
++		if (ret)
++			return ret;
++
++		ktz->led_on = true;
+ 	}
+ 
+-	/* Set brightness */
+-	ktz8866_write(ktz, BL_BRT_LSB, brightness & 0x7);
+-	ktz8866_write(ktz, BL_BRT_MSB, (brightness >> 3) & 0xFF);
++	if (brightness == 0) {
++		ret = ktz8866_write(ktz, BL_BRT_LSB, 0);
++		if (ret)
++			return ret;
++		ret = ktz8866_write(ktz, BL_BRT_MSB, 0);
++		if (ret)
++			return ret;
++	}
+ 
+ 	return 0;
+ }
+@@ -93,35 +147,104 @@ static const struct backlight_ops ktz8866_backlight_ops = {
+ 	.update_status = ktz8866_backlight_update_status,
+ };
+ 
+-static void ktz8866_init(struct ktz8866 *ktz)
++static int ktz8866_init(struct ktz8866 *ktz)
+ {
+ 	unsigned int val = 0;
++	int ret;
++
++	if (ktz->chip_data) {
++		ret = regmap_read(ktz->regmap, DEVICE_ID, &val);
++		if (ret)
++			return ret;
++		if ((val & DEVICE_ID_VENDOR_MASK) != DEVICE_ID_VENDOR_KINETIC)
++			return -ENODEV;
++
++		return regmap_multi_reg_write(ktz->regmap,
++					      ktz->chip_data->init_sequence,
++					      ktz->chip_data->init_sequence_size);
++	}
+ 
+ 	if (!of_property_read_u32(ktz->client->dev.of_node, "current-num-sinks", &val))
+-		ktz8866_write(ktz, BL_EN, BIT(val) - 1);
++		ret = ktz8866_write(ktz, BL_EN, BIT(val) - 1);
+ 	else
+ 		/* Enable all 6 current sinks if the number of current sinks isn't specified. */
+-		ktz8866_write(ktz, BL_EN, BIT(6) - 1);
++		ret = ktz8866_write(ktz, BL_EN, BIT(6) - 1);
++	if (ret)
++		return ret;
+ 
+ 	if (!of_property_read_u32(ktz->client->dev.of_node, "kinetic,current-ramp-delay-ms", &val)) {
+ 		if (val <= 128)
+-			ktz8866_write(ktz, BL_CFG2, BIT(7) | (ilog2(val) << 3) | PWM_HYST);
++			ret = ktz8866_write(ktz, BL_CFG2,
++					    BIT(7) | (ilog2(val) << 3) | PWM_HYST);
+ 		else
+-			ktz8866_write(ktz, BL_CFG2, BIT(7) | ((5 + val / 64) << 3) | PWM_HYST);
++			ret = ktz8866_write(ktz, BL_CFG2,
++					    BIT(7) | ((5 + val / 64) << 3) | PWM_HYST);
++		if (ret)
++			return ret;
+ 	}
+ 
+ 	if (!of_property_read_u32(ktz->client->dev.of_node, "kinetic,led-enable-ramp-delay-ms", &val)) {
+ 		if (val == 0)
+-			ktz8866_write(ktz, BL_DIMMING, 0);
++			ret = ktz8866_write(ktz, BL_DIMMING, 0);
+ 		else {
+ 			unsigned int ramp_off_time = ilog2(val) + 1;
+ 			unsigned int ramp_on_time = ramp_off_time << 4;
+-			ktz8866_write(ktz, BL_DIMMING, ramp_on_time | ramp_off_time);
++			ret = ktz8866_write(ktz, BL_DIMMING,
++					    ramp_on_time | ramp_off_time);
+ 		}
++		if (ret)
++			return ret;
++	}
++
++	if (of_property_read_bool(ktz->client->dev.of_node, "kinetic,enable-lcd-bias")) {
++		ret = ktz8866_write(ktz, LCD_BIAS_CFG1, LCD_BIAS_EN);
++		if (ret)
++			return ret;
+ 	}
+ 
+-	if (of_property_read_bool(ktz->client->dev.of_node, "kinetic,enable-lcd-bias"))
+-		ktz8866_write(ktz, LCD_BIAS_CFG1, LCD_BIAS_EN);
++	return 0;
++}
++
++static void ktz8866_y700_power_off(struct ktz8866 *ktz)
++{
++	if (!ktz->powered)
++		return;
++
++	/* Best effort: hardware disable below remains authoritative on I2C failure. */
++	ktz8866_update_bits(ktz, BL_EN, BL_EN_BIT, 0);
++	ktz8866_write(ktz, BL_BRT_LSB, 0);
++	ktz8866_write(ktz, BL_BRT_MSB, 0);
++	ktz8866_write(ktz, LCD_BIAS_CFG1, 0);
++	regulator_disable(ktz->vddneg);
++	regulator_disable(ktz->vddpos);
++	gpiod_set_value_cansleep(ktz->enable_gpio, 0);
++	ktz->led_on = false;
++	ktz->powered = false;
++}
++
++static int ktz8866_y700_power_on(struct ktz8866 *ktz)
++{
++	int ret;
++
++	gpiod_set_value_cansleep(ktz->enable_gpio, 1);
++	usleep_range(3500, 4000);
++
++	ret = regulator_enable(ktz->vddpos);
++	if (ret)
++		goto disable_hwen;
++
++	ret = regulator_enable(ktz->vddneg);
++	if (ret)
++		goto disable_vddpos;
++
++	ktz->powered = true;
++	return 0;
++
++disable_vddpos:
++	regulator_disable(ktz->vddpos);
++disable_hwen:
++	gpiod_set_value_cansleep(ktz->enable_gpio, 0);
++	return ret;
+ }
+ 
+ static int ktz8866_probe(struct i2c_client *client)
+@@ -136,46 +259,95 @@ static int ktz8866_probe(struct i2c_client *client)
+ 		return -ENOMEM;
+ 
+ 	ktz->client = client;
++	ktz->chip_data = device_get_match_data(&client->dev);
+ 	ktz->regmap = devm_regmap_init_i2c(client, &ktz8866_regmap_config);
+ 	if (IS_ERR(ktz->regmap))
+ 		return dev_err_probe(&client->dev, PTR_ERR(ktz->regmap), "failed to init regmap\n");
+ 
+-	ret = devm_regulator_get_enable(&client->dev, "vddpos");
+-	if (ret)
+-		return dev_err_probe(&client->dev, ret, "get regulator vddpos failed\n");
+-	ret = devm_regulator_get_enable(&client->dev, "vddneg");
+-	if (ret)
+-		return dev_err_probe(&client->dev, ret, "get regulator vddneg failed\n");
++	if (ktz->chip_data) {
++		ktz->enable_gpio = devm_gpiod_get(&client->dev, "enable", GPIOD_OUT_LOW);
++		if (IS_ERR(ktz->enable_gpio))
++			return PTR_ERR(ktz->enable_gpio);
++
++		ktz->vddpos = devm_regulator_get(&client->dev, "vddpos");
++		if (IS_ERR(ktz->vddpos))
++			return dev_err_probe(&client->dev, PTR_ERR(ktz->vddpos),
++					     "get regulator vddpos failed\n");
++		ktz->vddneg = devm_regulator_get(&client->dev, "vddneg");
++		if (IS_ERR(ktz->vddneg))
++			return dev_err_probe(&client->dev, PTR_ERR(ktz->vddneg),
++					     "get regulator vddneg failed\n");
++
++		ret = ktz8866_y700_power_on(ktz);
++		if (ret)
++			return dev_err_probe(&client->dev, ret,
++					     "failed to power on Y700 backlight\n");
++	} else {
++		ret = devm_regulator_get_enable(&client->dev, "vddpos");
++		if (ret)
++			return dev_err_probe(&client->dev, ret,
++					     "get regulator vddpos failed\n");
++		ret = devm_regulator_get_enable(&client->dev, "vddneg");
++		if (ret)
++			return dev_err_probe(&client->dev, ret,
++					     "get regulator vddneg failed\n");
++
++		ktz->enable_gpio = devm_gpiod_get_optional(&client->dev, "enable",
++						       GPIOD_OUT_HIGH);
++		if (IS_ERR(ktz->enable_gpio))
++			return PTR_ERR(ktz->enable_gpio);
++	}
+ 
+-	ktz->enable_gpio = devm_gpiod_get_optional(&client->dev, "enable", GPIOD_OUT_HIGH);
+-	if (IS_ERR(ktz->enable_gpio))
+-		return PTR_ERR(ktz->enable_gpio);
++	ret = ktz8866_init(ktz);
++	if (ret) {
++		dev_err_probe(&client->dev, ret, "failed to initialize backlight\n");
++		goto err_power_off;
++	}
+ 
+ 	memset(&props, 0, sizeof(props));
+ 	props.type = BACKLIGHT_RAW;
+ 	props.max_brightness = MAX_BRIGHTNESS;
+-	props.brightness = DEFAULT_BRIGHTNESS;
++	props.brightness = ktz->chip_data ? ktz->chip_data->default_brightness :
++					       DEFAULT_BRIGHTNESS;
+ 	props.scale = BACKLIGHT_SCALE_LINEAR;
+ 
+ 	backlight_dev = devm_backlight_device_register(&client->dev, "ktz8866-backlight",
+ 					&client->dev, ktz, &ktz8866_backlight_ops, &props);
+ 	if (IS_ERR(backlight_dev))
+-		return dev_err_probe(&client->dev, PTR_ERR(backlight_dev),
+-				"failed to register backlight device\n");
+-
+-	ktz8866_init(ktz);
++		goto err_register;
+ 
+ 	i2c_set_clientdata(client, backlight_dev);
+-	backlight_update_status(backlight_dev);
++	ret = backlight_update_status(backlight_dev);
++	if (ret) {
++		dev_err_probe(&client->dev, ret, "failed to set initial brightness\n");
++		goto err_power_off;
++	}
+ 
+ 	return 0;
++
++err_register:
++	ret = dev_err_probe(&client->dev, PTR_ERR(backlight_dev),
++			    "failed to register backlight device\n");
++err_power_off:
++	if (ktz->chip_data)
++		ktz8866_y700_power_off(ktz);
++	return ret;
+ }
+ 
+ static void ktz8866_remove(struct i2c_client *client)
+ {
+ 	struct backlight_device *backlight_dev = i2c_get_clientdata(client);
++	struct ktz8866 *ktz = bl_get_data(backlight_dev);
++
+ 	backlight_dev->props.brightness = 0;
+ 	backlight_update_status(backlight_dev);
++	if (ktz->chip_data)
++		ktz8866_y700_power_off(ktz);
++}
++
++static void ktz8866_shutdown(struct i2c_client *client)
++{
++	ktz8866_remove(client);
+ }
+ 
+ static const struct i2c_device_id ktz8866_ids[] = {
+@@ -185,6 +357,10 @@ static const struct i2c_device_id ktz8866_ids[] = {
+ MODULE_DEVICE_TABLE(i2c, ktz8866_ids);
+ 
+ static const struct of_device_id ktz8866_match_table[] = {
++	{
++		.compatible = "lenovo,y700-ktz8866",
++		.data = &y700_chip_data,
++	},
+ 	{
+ 		.compatible = "kinetic,ktz8866",
+ 	},
+@@ -199,6 +375,7 @@ static struct i2c_driver ktz8866_driver = {
+ 	},
+ 	.probe = ktz8866_probe,
+ 	.remove = ktz8866_remove,
++	.shutdown = ktz8866_shutdown,
+ 	.id_table = ktz8866_ids,
+ };
+ 
+diff --git a/include/drm/drm_mipi_dsi.h b/include/drm/drm_mipi_dsi.h
+index 7ff439672..f9cedcc13 100644
+--- a/include/drm/drm_mipi_dsi.h
++++ b/include/drm/drm_mipi_dsi.h
+@@ -336,6 +336,8 @@ enum mipi_dsi_dcs_tear_mode {
+ 
+ ssize_t mipi_dsi_dcs_write_buffer(struct mipi_dsi_device *dsi,
+ 				  const void *data, size_t len);
++ssize_t mipi_dsi_dcs_write_buffer_type(struct mipi_dsi_device *dsi, u8 type,
++				       const void *data, size_t len);
+ int mipi_dsi_dcs_write_buffer_chatty(struct mipi_dsi_device *dsi,
+ 				     const void *data, size_t len);
+ void mipi_dsi_dcs_write_buffer_multi(struct mipi_dsi_multi_context *ctx,

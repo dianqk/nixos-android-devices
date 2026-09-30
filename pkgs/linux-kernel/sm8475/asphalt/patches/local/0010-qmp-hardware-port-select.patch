@@ -1,0 +1,83 @@
+From 0be55156e913fd1eeeaa97839ebf5aa483e6078f Mon Sep 17 00:00:00 2001
+From: Y700 kernel rebase <y700-rebase@localhost>
+Date: Wed, 23 Sep 2026 08:40:26 +0800
+Subject: [PATCH 10/10] phy: qcom: support hardware Type-C port selection
+
+Source-commit: local 0be55156e913fd1eeeaa97839ebf5aa483e6078f
+---
+diff --git a/Documentation/devicetree/bindings/phy/qcom,sc8280xp-qmp-usb43dp-phy.yaml b/Documentation/devicetree/bindings/phy/qcom,sc8280xp-qmp-usb43dp-phy.yaml
+index 8adfc7810..5b45e8963 100644
+--- a/Documentation/devicetree/bindings/phy/qcom,sc8280xp-qmp-usb43dp-phy.yaml
++++ b/Documentation/devicetree/bindings/phy/qcom,sc8280xp-qmp-usb43dp-phy.yaml
+@@ -90,6 +90,12 @@ properties:
+   mode-switch: true
+   orientation-switch: true
+ 
++  qcom,hardware-port-select:
++    type: boolean
++    description:
++      Use the PHY's dedicated hardware Type-C orientation input rather than
++      software port selection. The board must pinmux that input to the PHY.
++
+   ports:
+     $ref: /schemas/graph.yaml#/properties/ports
+ 
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+index c39ced168..91db9130c 100644
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+@@ -2604,6 +2604,7 @@ struct qmp_combo {
+ 
+ 	struct typec_switch_dev *sw;
+ 	enum typec_orientation orientation;
++	bool hardware_port_select;
+ 
+ 	struct typec_mux_dev *mux;
+ };
+@@ -4061,15 +4062,20 @@ static int qmp_combo_com_init(struct qmp_combo *qmp, bool force)
+ 		qphy_clrbits(aon_toggle, cfg->regs[QPHY_DP_AON_TOGGLE_ENABLE], 0x1);
+ 	}
+ 
+-	/* Use software based port select and switch on typec orientation */
+-	val = SW_PORTSELECT_MUX;
+-	if (qmp->orientation == TYPEC_ORIENTATION_REVERSE)
+-		val |= SW_PORTSELECT_VAL;
++	if (qmp->hardware_port_select) {
++		/* This board wires CC orientation to the QMP hardware select pin. */
++		qphy_clrbits(com, QPHY_V3_DP_COM_TYPEC_CTRL, SW_PORTSELECT_MUX);
++	} else {
++		/* Use software based port select and switch on typec orientation */
++		val = SW_PORTSELECT_MUX;
++		if (qmp->orientation == TYPEC_ORIENTATION_REVERSE)
++			val |= SW_PORTSELECT_VAL;
+ 
+-	if (cfg->invert_cc_polarity)
+-		val |= INVERT_CC_POLARITY;
++		if (cfg->invert_cc_polarity)
++			val |= INVERT_CC_POLARITY;
+ 
+-	writel(val, com + QPHY_V3_DP_COM_TYPEC_CTRL);
++		writel(val, com + QPHY_V3_DP_COM_TYPEC_CTRL);
++	}
+ 
+ 	switch (qmp->qmpphy_mode) {
+ 	case QMPPHY_MODE_USB3DP:
+@@ -4779,6 +4785,9 @@ static int qmp_combo_typec_switch_set(struct typec_switch_dev *sw,
+ 	struct qmp_combo *qmp = typec_switch_get_drvdata(sw);
+ 	const struct qmp_phy_cfg *cfg = qmp->cfg;
+ 
++	if (qmp->hardware_port_select)
++		return -EOPNOTSUPP;
++
+ 	if (orientation == qmp->orientation || orientation == TYPEC_ORIENTATION_NONE)
+ 		return 0;
+ 
+@@ -5212,6 +5221,8 @@ static int qmp_combo_probe(struct platform_device *pdev)
+ 	dev_set_drvdata(dev, qmp);
+ 
+ 	qmp->orientation = TYPEC_ORIENTATION_NORMAL;
++	qmp->hardware_port_select = of_property_read_bool(dev->of_node,
++						      "qcom,hardware-port-select");
+ 
+ 	qmp->cfg = of_device_get_match_data(dev);
+ 	if (!qmp->cfg)

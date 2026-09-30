@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 29 Sep 2026 18:05:00 +0800
+Subject: [PATCH] drm/msm/a5xx: free GPU on speedbin setup error
+
+The imported speedbin setup runs after the A5xx GPU allocation. Free it
+when reading the fuse or registering supported hardware defers or fails.
+
+Fixes: d189a463e1af ("drm/msm/a5xx: Setup opp-table supported frequencies")
+Source-Commit: https://github.com/sdm660-mainline/linux/commit/d189a463e1afb5407261b7e0a0f2c673f2002b88
+Scope: SDM630/660-common
+Porting notes: Local migration review correction; 0022 retains the original source hunk.
+---
+diff --git a/drivers/gpu/drm/msm/adreno/a5xx_gpu.c b/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
+--- a/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
+@@ -1806,6 +1806,7 @@
+ 		ret = a5xx_set_supported_hw(&pdev->dev, config->info);
+ 		if (ret) {
+ 			dev_err(&pdev->dev, "Failed to set opp-supported-hw: %d\n", ret);
++			kfree(a5xx_gpu);
+ 			return ERR_PTR(ret);
+ 		}
+ 	} else {

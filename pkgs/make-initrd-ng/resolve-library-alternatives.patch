@@ -1,0 +1,160 @@
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -78,6 +78,18 @@
+     fn pop_front(&mut self) -> Option<T> {
+         self.queue.pop_front()
+     }
++}
++
++// A dlopen note lists alternative SONAMEs in preference order (UAPI.12).
++// Keep DT_NEEDED entries as singleton groups: each one is required separately.
++fn find_dependency(source: &Path, alternatives: &[String], rpaths: &[Box<Path>]) -> Option<PathBuf> {
++    alternatives.iter().find_map(|name| {
++        rpaths.iter().map(|dir| dir.join(name))
++            // Toolchain libraries can omit their own directory from RUNPATH.
++            // Include an existing sibling rather than merely hiding its warning.
++            .chain(source.parent().map(|dir| dir.join(name)))
++            .find(|candidate| candidate.is_file())
++    })
+ }
+ 
+ fn add_dependencies<P: AsRef<Path> + AsRef<OsStr> + std::fmt::Debug>(
+@@ -109,7 +121,7 @@
+                 .position(|x| *x == 0)
+                 .unwrap_or(note.desc.len())];
+             let parsed = serde_json::from_slice::<Vec<DLOpenNote>>(payload)?;
+-            for mut parsed_note in parsed {
++            for parsed_note in parsed {
+                 if dlopen.use_priority
+                     >= parsed_note.priority.unwrap_or(DLOpenPriority::Recommended)
+                     || parsed_note
+@@ -117,7 +129,7 @@
+                         .map(|f| dlopen.features.contains(&f))
+                         .unwrap_or(false)
+                 {
+-                    dlopen_libraries.append(&mut parsed_note.soname);
++                    dlopen_libraries.push(parsed_note.soname);
+                 }
+             }
+         }
+@@ -137,39 +149,31 @@
+         .map(|p| Box::<Path>::from(Path::new(p)))
+         .collect::<Vec<_>>();
+ 
+-    for line in elf
++    for alternatives in elf
+         .libraries
+         .into_iter()
+-        .map(|s| s.to_string())
++        .map(|s| vec![s.to_string()])
+         .chain(dlopen_libraries)
+     {
+-        let mut found = false;
+-        for path in &rpaths_as_path {
+-            let lib = path.join(&line);
+-            if lib.exists() {
+-                // No need to recurse. The queue will bring it back round.
+-                queue.push_back(StorePath {
+-                    path: Box::from(lib.as_path()),
+-                    dlopen: dlopen.clone(),
+-                });
+-                found = true;
+-                break;
+-            }
+-        }
+-        if !found {
++        if let Some(lib) = find_dependency(AsRef::<Path>::as_ref(&source), &alternatives, &rpaths_as_path) {
++            queue.push_back(StorePath {
++                path: Box::from(lib.as_path()),
++                dlopen: dlopen.clone(),
++            });
++        } else {
+             // In Nix, glibc's own libraries lack rpath entries pointing to
+             // themselves, so the dynamic linker (ld-linux-*.so.*) and libc.so.*
+             // can never be resolved through rpath alone. They are always present
+             // in the initrd: the linker via elf.interpreter above, and libc via
+             // at least one binary's rpath. Suppress these known-benign cases.
+             // See also: the ld*.so.? skip in stage-1.nix findLibs.
+-            let is_glibc_runtime = (line.starts_with("ld-") && line.contains(".so"))
+-                || line.starts_with("libc.so");
++            let is_glibc_runtime = alternatives.iter().all(|line|
++                (line.starts_with("ld-") && line.contains(".so")) || line.starts_with("libc.so"));
+ 
+             if !is_glibc_runtime {
+                 eprintln!(
+                     "Warning: Couldn't satisfy dependency {} for {:?}",
+-                    line,
++                    alternatives.join(" or "),
+                     OsStr::new(&source)
+                 );
+             }
+@@ -355,3 +359,69 @@
+ 
+     Ok(())
+ }
++
++#[cfg(test)]
++mod dependency_tests {
++    use super::*;
++    use std::sync::atomic::{AtomicU64, Ordering};
++    static NEXT: AtomicU64 = AtomicU64::new(0);
++
++    struct Fixture(PathBuf);
++    impl Fixture {
++        fn new() -> Self {
++            let dir = env::temp_dir().join(format!("make-initrd-dependencies-{}-{}",
++                std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
++            fs::create_dir(&dir).unwrap();
++            Self(dir)
++        }
++        fn file(&self, name: &str) -> PathBuf {
++            let file = self.0.join(name);
++            fs::create_dir_all(file.parent().unwrap()).unwrap();
++            fs::write(&file, b"fixture").unwrap();
++            file
++        }
++        fn rpaths(&self) -> Vec<Box<Path>> { vec![self.0.join("lib").into_boxed_path()] }
++    }
++    impl Drop for Fixture {
++        fn drop(&mut self) { fs::remove_dir_all(&self.0).unwrap(); }
++    }
++    fn names(values: &[&str]) -> Vec<String> { values.iter().map(|s| s.to_string()).collect() }
++
++    #[test]
++    fn available_dlopen_alternative_satisfies_group() {
++        let f = Fixture::new();
++        let expected = f.file("lib/libcrypto.so.3");
++        assert_eq!(find_dependency(&f.0.join("bin/tool"), &names(&["libcrypto.so.3", "libcrypto.so.4"]), &f.rpaths()), Some(expected));
++    }
++    #[test]
++    fn fallback_dlopen_alternative_is_included() {
++        let f = Fixture::new();
++        let expected = f.file("lib/libssl.so.4");
++        assert_eq!(find_dependency(&f.0.join("bin/tool"), &names(&["libssl.so.3", "libssl.so.4"]), &f.rpaths()), Some(expected));
++    }
++    #[test]
++    fn only_first_available_alternative_is_selected() {
++        let f = Fixture::new();
++        let expected = f.file("lib/libbpf.so.1");
++        f.file("lib/libbpf.so.0");
++        assert_eq!(find_dependency(&f.0.join("bin/tool"), &names(&["libbpf.so.1", "libbpf.so.0"]), &f.rpaths()), Some(expected));
++    }
++    #[test]
++    fn missing_dependency_is_not_satisfied() {
++        let f = Fixture::new();
++        assert_eq!(find_dependency(&f.0.join("bin/tool"), &names(&["missing.so.1", "missing.so.2"]), &f.rpaths()), None);
++    }
++    #[test]
++    fn needed_toolchain_sibling_is_included() {
++        let f = Fixture::new();
++        let expected = f.file("toolchain/libgcc_s.so.1");
++        assert_eq!(find_dependency(&f.0.join("toolchain/libstdc++.so.6"), &names(&["libgcc_s.so.1"]), &f.rpaths()), Some(expected));
++    }
++    #[test]
++    fn runpath_takes_precedence_over_sibling() {
++        let f = Fixture::new();
++        let expected = f.file("lib/libgcc_s.so.1");
++        f.file("toolchain/libgcc_s.so.1");
++        assert_eq!(find_dependency(&f.0.join("toolchain/libstdc++.so.6"), &names(&["libgcc_s.so.1"]), &f.rpaths()), Some(expected));
++    }
++}

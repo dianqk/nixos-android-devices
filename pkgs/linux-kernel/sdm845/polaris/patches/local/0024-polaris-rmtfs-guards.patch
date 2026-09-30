@@ -1,0 +1,66 @@
+From e60fd5ac1f6851be5b2c042b39584bfcf8a66f57 Mon Sep 17 00:00:00 2001
+From: Caleb Connolly <caleb@connolly.tech>
+Date: Sun, 2 May 2021 01:42:57 +0000
+Subject: [PATCH] arm64: dts: qcom: sdm845-oneplus-common: guard rmtfs-mem
+
+The rmtfs_mem region is a weird one, downstream allocates it
+dynamically, and supports a "qcom,guard-memory" property which when set
+will reserve 4k above and below the rmtfs memory.
+
+A common from qcom 4.9 kernel msm_sharedmem driver:
+
+/*
+ * If guard_memory is set, then the shared memory region
+ * will be guarded by SZ_4K at the start and at the end.
+ * This is needed to overcome the XPU limitation on few
+ * MSM HW, so as to make this memory not contiguous with
+ * other allocations that may possibly happen from other
+ * clients in the system.
+*/
+
+When the kernel tries to touch memory that is too close the
+rmtfs region it may cause an XPU violation. Such is the case on the
+OnePlus 6 where random crashes would occur usually after boot.
+
+Reserve 4k above and below the rmtfs_mem to avoid hitting these XPU
+Violations.
+
+This doesn't entirely solve the random crashes on the OnePlus 6/6T but
+it does seem to prevent the ones which happen shortly after modem
+bringup.
+
+Fixes: 288ef8a42612 ("arm64: dts: sdm845: add oneplus6/6t devices")
+Signed-off-by: Caleb Connolly <caleb@connolly.tech>
+Link: https://lore.kernel.org/r/20210502014146.85642-4-caleb@connolly.tech
+Signed-off-by: Bjorn Andersson <bjorn.andersson@linaro.org>
+---
+Source: https://github.com/torvalds/linux/commit/e60fd5ac1f6851be5b2c042b39584bfcf8a66f57
+Local adaptation for Polaris on Linux 7.3:
+- Apply the SDM845 XPU guard policy to Polaris, whose downstream SDM845 DT
+  also requires qcom,guard-memory.
+- Use the current qcom,use-guard-pages binding instead of separate nodes.
+  Reserve 4 KiB on each side while keeping the existing RMTFS payload at
+  0xf6301000 with size 0x200000. No firmware/calibration data is changed.
+- Downstream reference: https://github.com/LineageOS/android_kernel_xiaomi_sdm845/blob/aa8adfe9bf212c6e93238a86980b4024da4f819a/drivers/uio/msm_sharedmem/msm_sharedmem.c#L151
+The original commit message and trailers above describe the OnePlus change;
+Polaris validation confirms the unchanged effective payload address/size,
+non-overlapping reservations, modem startup and WLAN scanning. The guards
+alone did not resolve the separate modem shutdown reset.
+
+--- a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-polaris.dts
++++ b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-polaris.dts
+@@ -103,10 +103,11 @@
+ 			no-map;
+ 		};
+ 
+-		rmtfs_mem: memory@f6301000 {
++		rmtfs_mem: memory@f6300000 {
+ 			compatible = "qcom,rmtfs-mem";
+-			reg = <0 0xf6301000 0 0x200000>;
+-			no-map;
++			reg = <0 0xf6300000 0 0x202000>;
++			no-map;
++			qcom,use-guard-pages;
+ 
+ 			qcom,client-id = <1>;
+ 			qcom,vmid = <QCOM_SCM_VMID_MSS_MSA>;

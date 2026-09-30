@@ -1,0 +1,40 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 29 Sep 2026 00:00:00 +0800
+Subject: [PATCH] wifi: ath12k: apply Sheng WCN7850 firmware workarounds
+
+Porting notes: Scope the fork rfkill-pin bypass and single-chip MLO workaround to the Sheng WCN7850. The packaged amss.bin identifies itself as WLAN.HMT.1.1.c2-00259, the firmware version named by the MLO source commit. Other machines retain 7.3 behavior.
+
+Original author dates, messages, and trailers: patches/ORIGINS.md.
+Source-Commit: https://github.com/ianchb/sm8550-mainline/commit/980c62590f0f883647fa13a80d0be27e61c654e5
+Source-Commit: https://github.com/ianchb/sm8550-mainline/commit/65ff5f4fe0963dcf91e6e94c6d0d6d38432dfb50
+---
+diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/ath12k/core.c
+index 262a204..8a52422 100644
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -82,6 +82,10 @@ static int ath12k_core_rfkill_config(struct ath12k_base *ab)
+ 
+ 	if (ath12k_acpi_get_disable_rfkill(ab))
+ 		return 0;
++	/* Sheng's WCN7850 has no working rfkill GPIO; preserve other boards. */
++	if (ab->hw_rev == ATH12K_HW_WCN7850_HW20 &&
++	    of_machine_is_compatible("xiaomi,sheng"))
++		return 0;
+ 
+ 	for (i = 0; i < ab->num_radios; i++) {
+ 		ar = ab->pdevs[i].ar;
+diff --git a/drivers/net/wireless/ath/ath12k/qmi.c b/drivers/net/wireless/ath/ath12k/qmi.c
+index 280e50a..46ff515 100644
+--- a/drivers/net/wireless/ath/ath12k/qmi.c
++++ b/drivers/net/wireless/ath/ath12k/qmi.c
+@@ -2357,7 +2357,9 @@ static void ath12k_qmi_phy_cap_send(struct ath12k_base *ab)
+ 		goto out;
+ 	}
+ 
+-	if (resp.single_chip_mlo_support_valid && resp.single_chip_mlo_support)
++	if ((resp.single_chip_mlo_support_valid && resp.single_chip_mlo_support) ||
++	    (ab->hw_rev == ATH12K_HW_WCN7850_HW20 &&
++	     of_machine_is_compatible("xiaomi,sheng")))
+ 		ab->single_chip_mlo_support = true;
+ 
+ 	if (!resp.num_phy_valid) {

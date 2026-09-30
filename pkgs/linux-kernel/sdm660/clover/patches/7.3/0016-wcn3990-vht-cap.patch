@@ -1,0 +1,37 @@
+From 07bd3e17ad95439dce0d7d7042657feb6c33acca Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 23 Sep 2026 09:08:06 +0800
+Subject: [PATCH] wifi: ath10k: mask unsupported WCN3990 VHT capabilities
+
+Apply the WCN3990 VHT capability mask fix to Linux 7.3-rc5.
+
+Source-Patch: pkgs/linux-kernel/sdm845/polaris/patches/local/0011-wcn3990-vht.patch
+Scope: Shared-driver
+Porting notes: Use the Polaris 7.3 port on 7.3-rc5.
+---
+ drivers/net/wireless/ath/ath10k/mac.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/drivers/net/wireless/ath/ath10k/mac.c b/drivers/net/wireless/ath/ath10k/mac.c
+index 8e604697d..23ab70fcf 100644
+--- a/drivers/net/wireless/ath/ath10k/mac.c
++++ b/drivers/net/wireless/ath/ath10k/mac.c
+@@ -4901,6 +4901,16 @@ static struct ieee80211_sta_vht_cap ath10k_create_vht_cap(struct ath10k *ar)
+ 	vht_cap.vht_supported = 1;
+ 	vht_cap.cap = ar->vht_cap_info;
+ 
++	/* The WCN3990 firmware uses a WMI VHT capability layout that defines
++	 * bits only through TX_FIXED_ANT (bit 29).  Qualcomm's qcacld driver
++	 * rebuilds the IEEE capability field member by member and consequently
++	 * drops bits 30-31.  Copying the complete WMI word instead interprets
++	 * firmware bit 30 as Extended NSS BW and can form a reserved IEEE
++	 * channel-width/NSS combination that some access points reject.
++	 */
++	if (QCA_REV_WCN3990(ar))
++		vht_cap.cap &= ~IEEE80211_VHT_CAP_EXT_NSS_BW_MASK;
++
+ 	if (ar->vht_cap_info & (IEEE80211_VHT_CAP_SU_BEAMFORMEE_CAPABLE |
+ 				IEEE80211_VHT_CAP_MU_BEAMFORMEE_CAPABLE)) {
+ 		val = ath10k_mac_get_vht_cap_bf_sts(ar);
+-- 
+2.55.0

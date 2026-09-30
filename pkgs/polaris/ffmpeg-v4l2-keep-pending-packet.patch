@@ -1,0 +1,82 @@
+diff --git a/libavcodec/v4l2_m2m_dec.c b/libavcodec/v4l2_m2m_dec.c
+--- a/libavcodec/v4l2_m2m_dec.c
++++ b/libavcodec/v4l2_m2m_dec.c
+@@ -21,7 +21,9 @@
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ 
++#include <errno.h>
+ #include <linux/videodev2.h>
++#include <poll.h>
+ #include <sys/ioctl.h>
+ #include "libavutil/pixfmt.h"
+ #include "libavutil/pixdesc.h"
+@@ -58,8 +60,14 @@
+     capture->format.type = capture->type;
+     ret = ioctl(s->fd, VIDIOC_G_FMT, &capture->format);
+     if (ret) {
++        int err = AVERROR(errno);
++
+         av_log(avctx, AV_LOG_WARNING, "VIDIOC_G_FMT ioctl\n");
+-        return ret;
++        /* CAPTURE format may be unavailable until enough INPUT packets
++         * have been processed. Keep feeding them and try again. */
++        if (err == AVERROR(EINVAL) || err == AVERROR(EAGAIN))
++            return AVERROR(EAGAIN);
++        return err;
+     }
+ 
+     /* 2.1 update the AVCodecContext */
+@@ -140,6 +148,7 @@
+     V4L2Context *const output = &s->output;
+     int ret;
+ 
++retry:
+     if (!s->buf_pkt.size) {
+         ret = ff_decode_get_packet(avctx, &s->buf_pkt);
+         if (ret < 0) {
+@@ -164,9 +173,41 @@
+     if (!s->draining) {
+         ret = v4l2_try_start(avctx);
+         if (ret) {
+-            /* can't recover */
+-            if (ret != AVERROR(ENOMEM))
+-                ret = 0;
++            if (ret == AVERROR(EAGAIN)) {
++                struct pollfd pfd = {
++                    .fd = s->fd,
++                    .events = POLLIN | POLLRDNORM | POLLPRI | POLLOUT | POLLWRNORM,
++                };
++
++                /* A submitted packet needs no retry; let the caller feed
++                 * more input to obtain the initial CAPTURE format. */
++                if (!s->buf_pkt.size)
++                    return AVERROR(EAGAIN);
++
++                /* The OUTPUT queue is full. Keep the pending packet while
++                 * waiting for a completion or SOURCE_CHANGE, then retry. */
++                do {
++                    ret = poll(&pfd, 1, -1);
++                } while (ret < 0 && errno == EINTR);
++                if (ret < 0) {
++                    ret = AVERROR(errno);
++                    goto fail;
++                }
++                if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
++                    ret = AVERROR(EIO);
++                    goto fail;
++                }
++                if ((pfd.revents & POLLPRI) ||
++                    (capture->streamon &&
++                     (pfd.revents & (POLLIN | POLLRDNORM)))) {
++                    ret = ff_v4l2_context_dequeue_frame(capture, frame, 0);
++                    if (ret != AVERROR(EAGAIN))
++                        return ret;
++                }
++                goto retry;
++            }
++            /* Propagate a permanent startup error instead of reporting
++             * success for a frame that was never decoded. */
+             goto fail;
+         }
+     }

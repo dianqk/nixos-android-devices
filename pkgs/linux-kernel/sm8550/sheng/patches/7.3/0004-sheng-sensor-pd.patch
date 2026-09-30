@@ -1,0 +1,47 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 29 Sep 2026 00:00:00 +0800
+Subject: [PATCH] soc: qcom: pmic_glink: register Sheng sensor protection domain
+
+Sheng's ADSP exposes the sensor service through msm/adsp/sensor_pd. Register
+the lookup only on Sheng, and filter unrelated PDR notifications from the
+charger/Type-C client state.
+---
+diff --git a/drivers/soc/qcom/pmic_glink.c b/drivers/soc/qcom/pmic_glink.c
+index 3042261..152eb1c 100644
+--- a/drivers/soc/qcom/pmic_glink.c
++++ b/drivers/soc/qcom/pmic_glink.c
+@@ -14,6 +14,7 @@
+ #include <linux/soc/qcom/pdr.h>
+ #include <linux/soc/qcom/pmic_glink.h>
+ #include <linux/spinlock.h>
++#include <linux/string.h>
+ 
+ #define PMIC_GLINK_SEND_TIMEOUT (5 * HZ)
+ 
+@@ -237,6 +238,11 @@ static void pmic_glink_pdr_callback(int state, char *svc_path, void *priv)
+ {
+ 	struct pmic_glink *pg = priv;
+ 
++	/* Sensor PD notifications must not change charger/Type-C client state. */
++	if (pg->data->charger_pdr_service_path &&
++	    strcmp(svc_path, pg->data->charger_pdr_service_path))
++		return;
++
+ 	guard(mutex)(&pg->state_lock);
+ 	pg->pdr_state = state;
+ 
+@@ -351,6 +357,14 @@ static int pmic_glink_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++	if (of_machine_is_compatible("xiaomi,sheng")) {
++		/* Sheng needs the sensor PD lookup for SSC userspace clients. */
++		service = pdr_add_lookup(pg->pdr, "tms/servreg", "msm/adsp/sensor_pd");
++		if (IS_ERR(service))
++			dev_warn(&pdev->dev, "failed adding pdr lookup for sensor_pd: %pe\n",
++				 service);
++	}
++
+ 	mutex_lock(&__pmic_glink_lock);
+ 	__pmic_glink = pg;
+ 	mutex_unlock(&__pmic_glink_lock);

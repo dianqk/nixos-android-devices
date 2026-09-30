@@ -1,0 +1,51 @@
+From 13f7d09adf2582b9527ed21a16e262d5d61f40f5 Mon Sep 17 00:00:00 2001
+From: Richard Acayan <mailingradian@gmail.com>
+Date: Mon, 2 Oct 2023 20:42:15 -0400
+Subject: [PATCH] arm64: dts: qcom: sdm630: add clocks for digital and
+ analog audio codecs
+
+The digital and analog codecs communicate with each other, synchronized
+by an MCLK, which cannot turn off before the codecs power down. The bit
+clock is better managed by the sound card driver instead of the digital
+codec, since it (to my knowledge) does not power down the clock. Add the
+Q6AFE clock controller to connect the MCLK with the codecs, and a fixed
+clock to model a fake bit clock for consumption by the digital codec.
+
+Signed-off-by: Richard Acayan <mailingradian@gmail.com>
+
+Source-Commit: https://github.com/sdm660-mainline/linux/commit/13f7d09adf2582b9527ed21a16e262d5d61f40f5
+Scope: SDM630/660-common
+Porting notes: Original audio clock nodes apply unchanged to Linux 7.3-rc5 and supply labels used by the Clover codec node.
+---
+diff --git a/arch/arm64/boot/dts/qcom/sdm630.dtsi b/arch/arm64/boot/dts/qcom/sdm630.dtsi
+index 1f5f0a67498ebc..f1ba02913e10f2 100644
+--- a/arch/arm64/boot/dts/qcom/sdm630.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm630.dtsi
+@@ -31,6 +31,13 @@
+ 	chosen { };
+ 
+ 	clocks {
++		int_cdc_bclk: int-cdc-bclk {
++			compatible = "fixed-clock";
++			#clock-cells = <0>;
++			clock-frequency = <1536000>;
++			clock-output-names = "int_cdc_bclk";
++		};
++
+ 		xo_board: xo-board {
+ 			compatible = "fixed-clock";
+ 			#clock-cells = <0>;
+@@ -2455,6 +2462,12 @@
+ 					q6afe: service@4 {
+ 						compatible = "qcom,q6afe";
+ 						reg = <APR_SVC_AFE>;
++
++						q6afecc: clock-controller {
++							compatible = "qcom,q6afe-clocks";
++							#clock-cells = <2>;
++						};
++
+ 						q6afedai: dais {
+ 							compatible = "qcom,q6afe-dais";
+ 							#address-cells = <1>;
+

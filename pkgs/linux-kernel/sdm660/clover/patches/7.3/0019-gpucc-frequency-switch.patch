@@ -1,0 +1,192 @@
+From 0a875c3ff39c5e81cd0a8b176bcab29bb30c2ac6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Barnab=C3=A1s=20Cz=C3=A9m=C3=A1n?=
+ <barnabas.czeman@mainlining.org>
+Date: Wed, 30 Apr 2025 21:50:09 +0300
+Subject: [PATCH] clk: qcom: gpucc-sdm660: Add support for real
+ frequency switching
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+For platforms without GMU frequency for gfx3d clock needs to be
+managed by GPU devfreq withing adreno driver. Currently there is
+a problem: there is no frequency table specified for gfx3d_clk_src
+and gfx3d clock is running on some "random" 500 MHz frequency, as
+can be seen on SDM630/660 devices:
+
+ $ grep -i -E '(gpu|gfx)' /sys/kernel/debug/clk/clk_summary
+ $ cat /sys/kernel/debug/devfreq/devfreq_summary
+
+Will output: (extra columns removed to fit)
+
+ gpu_pll1_pll_out_main    740000000
+ gpu_pll0_pll_out_main   1000000000
+    gfx3d_clk_src         500000000
+       gpucc_gfx3d_clk    500000000
+
+ dev          cur_freq_Hz  min_freq_Hz  max_freq_Hz
+ --------------------------------------------------
+ 5000000.gpu  700000000    700000000    700000000
+
+And additionally, the following errors can be seen in dmesg:
+
+ devfreq 5000000.gpu: Couldn't update frequency transition information.
+
+As you can see, gf3d_clk is running on some weird 500 Mhz
+frequency, which is not even present in GPU opp-tables, with
+parent gpu_pll on 1 GHz. And additionally, devfreq thinks it's
+running on 700 MHz (output is from SDM630 device).
+
+Lucky SDM660 can function this way, since most speedbins allow
+frequencies up to 647 MHz, and on SDM630 700 MHz max is commonly
+seen. Can function, but constantly only on 500 MHz. Unlucky SDM636
+devices, however, can't probe GPU at all: observing either system
+freeze during boot, or GPU hangs. Sometimes it can randomly probe
+with gx3d_clk parented to gpucc_cxo running at 19.2 MHz and producing
+2-5 FPS in GUI mobile shells like phosh. Which currently puts all
+SDM636 devices into the category of "barely functioning bricks".
+
+To solve all this, we need:
+ * add freq table to gfx3d_clk_src;
+ * switch to new clk_gfx3d_src_ops to support all this.
+
+With this change, SDM636 phones turn from unusable bricks to
+almost functional linux mobile devices (given the other missing
+parts of the platform support); and SDM630/660 phones receive
+the ability to run sometimes at slightly higher speeds, giving
+slightly more FPS in SuperTuxKart and more points in glmark2.
+Additionally on all of the SDM630/636/660 gpucc_gfx3d_clk will
+be able to run on the lowest speeds (down to "idle" 19.2 MHz)
+which I believe should help power savings.
+
+Also, there will be no discrepancy between GPU devfreq and real
+clock frequency, and no errors about missing frequencies from
+opp tables.
+
+Co-developed-by: Barnabás Czémán <barnabas.czeman@mainlining.org>
+Signed-off-by: Barnabás Czémán <barnabas.czeman@mainlining.org>
+Co-developed-by: Alexey Minnekhanov <alexeymin@postmarketos.org>
+Signed-off-by: Alexey Minnekhanov <alexeymin@postmarketos.org>
+
+Source-Commit: https://github.com/sdm660-mainline/linux/commit/0a875c3ff39c5e81cd0a8b176bcab29bb30c2ac6
+Scope: SDM630/660-common
+Porting notes: Original GPUCC frequency table applies unchanged; enables devfreq to set actual GPU clock rates.
+---
+diff --git a/drivers/clk/qcom/gpucc-sdm660.c b/drivers/clk/qcom/gpucc-sdm660.c
+index 6d37b3d8d1a40d..a78a9e51f2cac5 100644
+--- a/drivers/clk/qcom/gpucc-sdm660.c
++++ b/drivers/clk/qcom/gpucc-sdm660.c
+@@ -18,7 +18,6 @@
+ #include "clk-alpha-pll.h"
+ #include "common.h"
+ #include "clk-regmap.h"
+-#include "clk-pll.h"
+ #include "clk-rcg.h"
+ #include "clk-branch.h"
+ #include "gdsc.h"
+@@ -99,18 +98,65 @@ static const struct clk_parent_data gpucc_parent_data_1[] = {
+ 	{ .fw_name = "gcc_gpu_gpll0_clk" },
+ };
+ 
++/*
++ * Frequencies and PLL configuration
++ * The PLL source would be doing ping-pong between
++ * GPU-PLL0 and GPU-PLL1.
++ *  ====================================================
++ *  | F         | PLL SRC Freq | PLL postdiv | RCG Div |
++ *  ====================================================
++ *  | 160000000 | 640000000    |    2        |    2    |
++ *  | 266000000 | 532000000    |    1        |    2    |
++ *  | 370000000 | 740000000    |    1        |    2    |
++ *  | 465000000 | 930000000    |    1        |    2    |
++ *  | 588000000 | 1176000000   |    1        |    2    |
++ *  | 647000000 | 1294000000   |    1        |    2    |
++ *  | 700000000 | 1400000000   |    1        |    2    |
++ *  | 750000000 | 1500000000   |    1        |    2    |
++ *  ====================================================
++*/
++
++static const struct freq_tbl ftbl_gfx3d_clk_src_660[] = {
++	F( 19200000, 0,  1, 0, 0),
++	F(160000000, 0,  4, 0, 0),
++	F(266000000, 0,  2, 0, 0),
++	F(370000000, 0,  2, 0, 0),
++	F(430000000, 0,  2, 0, 0),
++	F(465000000, 0,  2, 0, 0),
++	F(585000000, 0,  2, 0, 0),
++	F(588000000, 0,  2, 0, 0),
++	F(647000000, 0,  2, 0, 0),
++	F(700000000, 0,  2, 0, 0),
++	F(750000000, 0,  2, 0, 0),
++	{ }
++};
++
++static const struct freq_tbl ftbl_gfx3d_clk_src_630[] = {
++	F( 19200000, 0,  1, 0, 0),
++	F(160000000, 0,  4, 0, 0),
++	F(240000000, 0,  2, 0, 0),
++	F(370000000, 0,  2, 0, 0),
++	F(465000000, 0,  2, 0, 0),
++	F(588000000, 0,  2, 0, 0),
++	F(647000000, 0,  2, 0, 0),
++	F(648000000, 0,  2, 0, 0),
++	F(700000000, 0,  2, 0, 0),
++	F(775000000, 0,  2, 0, 0),
++	{ }
++};
++
+ static struct clk_rcg2_gfx3d gfx3d_clk_src = {
+-	.div = 2,
+ 	.rcg = {
+ 		.cmd_rcgr = 0x1070,
+ 		.mnd_width = 0,
+ 		.hid_width = 5,
+ 		.parent_map = gpucc_parent_map_1,
++		.freq_tbl = ftbl_gfx3d_clk_src_660,
+ 		.clkr.hw.init = &(struct clk_init_data){
+ 			.name = "gfx3d_clk_src",
+ 			.parent_data = gpucc_parent_data_1,
+ 			.num_parents = ARRAY_SIZE(gpucc_parent_data_1),
+-			.ops = &clk_gfx3d_ops,
++			.ops = &clk_gfx3d_src_ops,
+ 			.flags = CLK_SET_RATE_PARENT | CLK_OPS_PARENT_ENABLE,
+ 		},
+ 	},
+@@ -305,27 +351,28 @@ MODULE_DEVICE_TABLE(of, gpucc_sdm660_match_table);
+ static int gpucc_sdm660_probe(struct platform_device *pdev)
+ {
+ 	struct regmap *regmap;
+-	struct alpha_pll_config gpu_pll_config = {
++	/* 800MHz configuration for GPU PLLs */
++	const struct alpha_pll_config gpu_pll_config = {
+ 		.config_ctl_val = 0x4001055b,
+ 		.alpha = 0xaaaaab00,
+ 		.alpha_en_mask = BIT(24),
+ 		.vco_val = 0x2 << 20,
+ 		.vco_mask = 0x3 << 20,
+ 		.main_output_mask = 0x1,
++		.l = 0x29,
++		.alpha_hi = 0xaa,
+ 	};
+ 
++	/* SDM630 uses slightly different frequency table */
++	if (of_device_is_compatible(pdev->dev.of_node, "qcom,gpucc-sdm630"))
++		gfx3d_clk_src.rcg.freq_tbl = ftbl_gfx3d_clk_src_630;
++
+ 	regmap = qcom_cc_map(pdev, &gpucc_sdm660_desc);
+ 	if (IS_ERR(regmap))
+ 		return PTR_ERR(regmap);
+ 
+-	/* 800MHz configuration for GPU PLL0 */
+-	gpu_pll_config.l = 0x29;
+-	gpu_pll_config.alpha_hi = 0xaa;
++	/* Apply initial 800 MHz configuration for both GPU PLLs */
+ 	clk_alpha_pll_configure(&gpu_pll0_pll_out_main, regmap, &gpu_pll_config);
+-
+-	/* 740MHz configuration for GPU PLL1 */
+-	gpu_pll_config.l = 0x26;
+-	gpu_pll_config.alpha_hi = 0x8a;
+ 	clk_alpha_pll_configure(&gpu_pll1_pll_out_main, regmap, &gpu_pll_config);
+ 
+ 	return qcom_cc_really_probe(&pdev->dev, &gpucc_sdm660_desc, regmap);
+

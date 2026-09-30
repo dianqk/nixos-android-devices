@@ -1,0 +1,24 @@
+From: NixOS Android devices contributors <nixos-android-devices@localhost>
+Date: Tue, 29 Sep 2026 00:10:00 +0800
+Subject: [PATCH] phy: qcom-qmp-ufs: retain SM8475 HS-B settings after gear overlay
+
+Local follow-up to the SM8475 PHY import and overlay adaptation.
+Linux applies the base table, gear overlay, then HS-B table:
+https://github.com/torvalds/linux/blob/v7.3-rc4/drivers/phy/qualcomm/phy-qcom-qmp-ufs.c
+
+The SM8475 Gear 4 table writes VCO_TUNE_MAP=0x04, overwriting the earlier
+HS-B table's 0x44. Hardware readback confirms 0x04 with the old ordering.
+Apply HS-B last for the SM8475 overlay path, matching Linux. Leave the
+existing initialization sequence of other configurations unchanged.
+---
+--- a/drivers/phy/qcom/phy-qcom-qmp-ufs.c
++++ b/drivers/phy/qcom/phy-qcom-qmp-ufs.c
+@@ -1496,6 +1496,8 @@
+ 	if (cfg->apply_g4_overlay) {
+ 		qmp_ufs_lanes_init(qmp, &cfg->tbls_hs_g4);
+ 		qmp_ufs_pcs_init(qmp, &cfg->tbls_hs_g4);
++		/* Series B overrides must follow the gear-specific defaults. */
++		qmp_ufs_serdes_init(qmp, &cfg->tbls_hs_b);
+ 	}
+ }
+ 

@@ -1,0 +1,76 @@
+From fd48c536d29d00a30fd85aadb101dac24f74c459 Mon Sep 17 00:00:00 2001
+From: Alexey Minnekhanov <alexeymin@minlexx.ru>
+Date: Thu, 11 Dec 2025 06:30:34 +0300
+Subject: [PATCH] clk: qcom: Treat different GDSCs differently
+
+In Linux driver, depending on which GDSC flags are set, different
+status register is checked when powering it on/off. And on top of
+that, different bit inside that register is tested. Currently qcom
+clk implementation in U-Boot lacks this functionality, so adjust
+logic when checking GDSC status to match one in Linux driver.
+
+This fixes problems on e.g. MSM8998 and SDM660's with USB_30_GDSC
+to be forever stuck during power on, since unlike e.g SDM845 one
+it doesn't have POLL_CFG_GDSCR flag (only VOTABLE).
+
+With this change all GDSCs that have POLL_CFG_GDSCR in their flags
+keep old behaviour (same as before this patch).
+
+Signed-off-by: Alexey Minnekhanov <alexeymin@minlexx.ru>
+---
+ drivers/clk/qcom/clock-qcom.c | 42 ++++++++++++++++++++++++-----------
+ 1 file changed, 29 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/clk/qcom/clock-qcom.c b/drivers/clk/qcom/clock-qcom.c
+index 6b46d9db744b..0a29f4130dfb 100644
+--- a/drivers/clk/qcom/clock-qcom.c
++++ b/drivers/clk/qcom/clock-qcom.c
+@@ -527,19 +527,35 @@ static int qcom_power_set(struct power_domain *pwr, bool on)
+ 
+ 	writel(value, base + map->reg);
+ 
+-	if (on)
+-		ret = readl_poll_timeout(base + map->reg + CFG_GDSCR_OFFSET,
+-					 value,
+-					 (value & GDSC_POWER_UP_COMPLETE) ||
+-					 (value & GDSC_PWR_ON_MASK),
+-					 GDSC_STATUS_POLL_TIMEOUT_US);
+-
+-	else
+-		ret = readl_poll_timeout(base + map->reg + CFG_GDSCR_OFFSET,
+-					 value,
+-					 (value & GDSC_POWER_DOWN_COMPLETE) ||
+-					 !(value & GDSC_PWR_ON_MASK),
+-					 GDSC_STATUS_POLL_TIMEOUT_US);
++	/*
++	 * Depending on the type of GDSC the status register is different,
++	 * and we need to check different status bit (condition passed to
++	 * readl_poll_timeout() is different too).
++	 * See Linux src: drivers/clk/qcom/gdsc.c @ gdsc_check_status() func
++	 */
++	if (map->flags & POLL_CFG_GDSCR) {
++		if (on)
++			ret = readl_poll_timeout(base + map->reg + CFG_GDSCR_OFFSET,
++						 value,
++						 (value & GDSC_POWER_UP_COMPLETE),
++						 GDSC_STATUS_POLL_TIMEOUT_US);
++		else
++			ret = readl_poll_timeout(base + map->reg + CFG_GDSCR_OFFSET,
++						 value,
++						 (value & GDSC_POWER_DOWN_COMPLETE),
++						 GDSC_STATUS_POLL_TIMEOUT_US);
++	} else {
++		if (on)
++			ret = readl_poll_timeout(base + map->reg,
++						 value,
++						 (value & GDSC_PWR_ON_MASK),
++						 GDSC_STATUS_POLL_TIMEOUT_US);
++		else
++			ret = readl_poll_timeout(base + map->reg,
++						 value,
++						 !(value & GDSC_PWR_ON_MASK),
++						 GDSC_STATUS_POLL_TIMEOUT_US);
++	}
+ 
+ 	if (ret == -ETIMEDOUT)
+ 		printf("WARNING: GDSC %lu is stuck during power on/off\n",

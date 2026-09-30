@@ -1,0 +1,88 @@
+From: Takashi Iwai <tiwai@suse.de>
+Date: Sun, 13 Sep 2026 10:39:47 +0200
+Message-Id: <878q55sfxo.wl-tiwai@suse.de>
+Subject: [PATCH] net: qrtr: Fix suspend/resume regression in HELLO handshake
+
+Commit 544d85de4dc2 ("net: qrtr: Send HELLO message on endpoint register")
+broke suspend/resume for ath12k (wcn7850 over MHI/QRTR).
+
+The new protocol from the commit works on first boot: the host sends a
+proactive HELLO at endpoint registration, firmware replies, and ath12k
+waits for fw_ready.  However, ath12k uses mhi_power_down_keep_dev()
+during suspend so that the MHI device (and the QRTR endpoint) remain
+registered across the power cycle.  This means qcom_mhi_qrtr_remove()
+and qcom_mhi_qrtr_probe() are never called on resume: qrtr_endpoint_
+register() never runs, and hello_sent stays true from the initial probe.
+
+On resume, the wcn7850 firmware restarts and sends a HELLO to the host NS,
+expecting a reply to re-establish the QRTR connection.  Without that reply,
+the firmware's handshake never completes, fw_ready is never sent, and
+ath12k_core_resume() times out waiting for restart_completed (-ETIMEDOUT).
+mac80211 then emits WARNINGs about hardware unavailability and cfg80211
+tries to stop interfaces that were never started.
+
+This patch fixes the regression by restoring say_hello() in
+ctrl_cmd_hello() so the NS again replies to an incoming HELLO from a
+remote node.  Also the patch removes the proactive HELLO from
+qrtr_endpoint_register(); with both the proactive HELLO and the NS
+reply active, the firmware receives two HELLOs from the host on first
+boot, which confuses its state machine.  Since wcn7850 always
+initiates the HELLO itself, the proactive HELLO is redundant.
+The retry machinery in qrtr_send_hello() is retained to handle the
+case where the HELLO reply fails transiently.
+
+Local adaptation: retain only the ns.c portion here. The companion local
+patch coalesces HELLO sends under ep_lock instead of removing proactive
+endpoint registration. The combined change targets the Polaris SMD boot
+race; it does not claim to fix all MHI suspend/resume races. The original
+commit message above describes the full upstream proposal.
+
+Link: https://lore.kernel.org/all/878q55sfxo.wl-tiwai@suse.de/
+Fixes: 544d85de4dc2 ("net: qrtr: Send HELLO message on endpoint register")
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+---
+ net/qrtr/ns.c | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/net/qrtr/ns.c b/net/qrtr/ns.c
+index bcb090ee79d4..fe2dfc05e380 100644
+--- a/net/qrtr/ns.c
++++ b/net/qrtr/ns.c
+@@ -327,8 +327,37 @@ static int server_del(struct qrtr_node *node, unsigned int port, bool bcast)
+ 	return 0;
+ }
+ 
++static int say_hello(struct sockaddr_qrtr *dest)
++{
++	struct qrtr_ctrl_pkt pkt;
++	struct msghdr msg = { };
++	struct kvec iv;
++	int ret;
++
++	iv.iov_base = &pkt;
++	iv.iov_len = sizeof(pkt);
++
++	memset(&pkt, 0, sizeof(pkt));
++	pkt.cmd = cpu_to_le32(QRTR_TYPE_HELLO);
++
++	msg.msg_name = (struct sockaddr *)dest;
++	msg.msg_namelen = sizeof(*dest);
++
++	ret = kernel_sendmsg(qrtr_ns.sock, &msg, &iv, 1, sizeof(pkt));
++	if (ret < 0)
++		pr_err("failed to send hello msg\n");
++
++	return ret;
++}
++
+ static int ctrl_cmd_hello(struct sockaddr_qrtr *sq)
+ {
++	int ret;
++
++	ret = say_hello(sq);
++	if (ret < 0)
++		return ret;
++
+ 	return announce_servers(sq);
+ }
+ 

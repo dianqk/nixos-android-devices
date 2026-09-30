@@ -1,0 +1,121 @@
+Local optional ACM console for usb-signaller v0.4.2.
+Upstream: https://codeberg.org/DylanVanAssche/usb-signaller/src/tag/v0.4.2
+
+USB_SIGNALLER_ACM=1 adds ACM only to developer mode, before binding the UDC.
+NCM stays present. Identify NCM independently of configfs directory order;
+ACM may be the first function. Generic deletion already unlinks all functions.
+
+--- a/src/gadget.rs
++++ b/src/gadget.rs
+@@ -202,6 +202,7 @@
+         serialnumber: &str,
+         default_function: &str,
+         configuration_description: &str,
++        enable_acm: bool,
+     ) -> anyhow::Result<Self> {
+         if Self::configfs_base_path(gadget_name).exists() {
+             //return Err(format!("Gadget already exists: {}", Self::configfs_base_path(gadget_name).display()).into());
+@@ -269,6 +270,15 @@
+                 .join(DEFAULT_CONFIG_PATH)
+                 .join(default_function),
+         )?;
++
++        // Keep ACM in the same configuration so NCM stays available.
++        if enable_acm {
++            let function = Self::configfs_base_path(gadget_name)
++                .join(FUNCTIONS_PATH).join("acm.console");
++            sysfs_mkdir(&function)?;
++            sysfs_symlink(&function, Self::configfs_base_path(gadget_name)
++                .join(CONFIGS_PATH).join(DEFAULT_CONFIG_PATH).join("acm.console"))?;
++        }
+ 
+         /* Write properties */
+         sysfs_write(
+@@ -445,6 +455,7 @@
+             "serialnumber",
+             "ncm.usb0",
+             "configuration-description",
++            false,
+         );
+ 
+         /* Properties */
+@@ -480,6 +491,7 @@
+             "serialnumber",
+             "ncm.usb0",
+             "configuration-description",
++            false,
+         );
+ 
+         /* Try to create the same gadget again */
+@@ -492,6 +504,7 @@
+             "serialnumber",
+             "ncm.usb0",
+             "configuration-description",
++            false,
+         );
+         assert!(result.is_ok());
+ 
+@@ -515,7 +528,8 @@
+                 "product",
+                 "serialnumber",
+                 "ncm.usb0",
+-                "configuration-description"
++                "configuration-description",
++                false,
+             )
+             .is_ok()
+         );
+@@ -540,6 +554,7 @@
+             "serialnumber",
+             "ncm.usb0",
+             "configuration-description",
++            false,
+         );
+ 
+         /* Load gadget */
+@@ -564,6 +579,7 @@
+             "serialnumber",
+             "ncm.usb0",
+             "configuration-description",
++            false,
+         );
+ 
+         /* Delete gadget */
+--- a/src/udc.rs
++++ b/src/udc.rs
+@@ -144,14 +144,16 @@
+         let id_product;
+         let default_function;
+         let configuration_description;
++        let enable_acm = mode == UDCMode::Developer
++            && std::env::var("USB_SIGNALLER_ACM").is_ok_and(|value| value == "1");
+ 
+         match mode {
+             UDCMode::Developer => {
+                 name = "usb-signaller-developer";
+                 vendor = "Linux Foundation";
+-                product = "NCM USB gadget (developer)";
++                product = if enable_acm { "NCM + ACM USB gadget (developer)" } else { "NCM USB gadget (developer)" };
+                 id_vendor = 0x1D6B; /* Linux Foundation */
+-                id_product = 0x0103; /* NCM gadget */
++                id_product = if enable_acm { 0x0104 } else { 0x0103 }; /* Composite or NCM */
+                 default_function = "ncm.usb0";
+                 configuration_description = "Developer mode";
+             }
+@@ -247,6 +249,7 @@
+             serialnumber,
+             default_function,
+             configuration_description,
++            enable_acm,
+         )?;
+ 
+         /* If all preparations went well, disable current gadget and enable new one */
+@@ -461,7 +464,7 @@
+             if udc_name == entry.udc {
+                 if entry.enabled {
+                     /* USB Ethernet NCM gadget */
+-                    if entry.configs[0].functions[0].name.starts_with("ncm.") {
++                    if entry.configs[0].functions.iter().any(|function| function.name.starts_with("ncm.")) {
+                         /* Tethering mode allows IP forwarding such as using mobile data */
+                         if Self::detect_tethering_mode()? {
+                             mode = UDCMode::Tethering;

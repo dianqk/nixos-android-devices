@@ -1,0 +1,172 @@
+From 87e0fb80bc3baead1c6f01f8067861ea726bd279 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 23 Sep 2026 09:07:22 +0800
+Subject: [PATCH] arm64: dts: qcom: restore Polaris installed hardware policy
+
+Port the final local 7.1 board patch state onto the 7.3-rc3 DTS. Keep the 7.3 IPA loader placement and corrected QMP USB PHY supply assignments. Enable the Polaris charger and fuel gauge with the generic upstream two-channel charger binding; do not add local battery-ID IIO policy. Source patch queue: polaris-debug, polaris-firmware-reservations, polaris-fuel-gauge, polaris-charger-enable, polaris-usb-role, polaris-bluetooth, polaris-wifi, and polaris-multimedia.
+---
+ .../boot/dts/qcom/sdm845-xiaomi-polaris.dts   | 94 ++++++++++++++++++-
+ 1 file changed, 90 insertions(+), 4 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-polaris.dts b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-polaris.dts
+index d3162e444..5fc5129a0 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-polaris.dts
++++ b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-polaris.dts
+@@ -40,7 +40,7 @@ / {
+ 
+ 	/* required for bootloader to select correct board */
+ 	qcom,msm-id = <QCOM_ID_SDM845 0x20001>;
+-	qcom,board-id = <0x2a 0x0>;
++	qcom,board-id = <0x2c 0x0>;
+ 
+ 	aliases {
+ 		serial0 = &uart9;
+@@ -144,6 +144,16 @@ vreg_s4a_1p8: vreg-s4a-1p8 {
+ 	};
+ };
+ 
++/* Match the factory Polaris MP v2.1 (board-id 0x2c) firmware carveouts. */
++&xbl_mem {
++	reg = <0 0x85d00000 0 0x200000>;
++};
++
++/* Downstream removed_region spans 0x85fc0000..0x8a8fffff. */
++&tz_mem {
++	reg = <0 0x86200000 0 0x4700000>;
++};
++
+ &apps_rsc {
+ 	regulators-0 {
+ 		compatible = "qcom,pm8998-rpmh-regulators";
+@@ -369,10 +379,11 @@ vreg_smp3c_0p6: smps3 {
+ 	};
+ };
+ 
++/* Keep CDSP disabled until its firmware and hardware path are validated. */
+ &cdsp_pas {
+ 	firmware-name = "qcom/sdm845/Xiaomi/polaris/cdsp.mbn";
+ 
+-	status = "okay";
++	status = "disabled";
+ };
+ 
+ &gcc {
+@@ -411,7 +422,7 @@ &ibb {
+ &ipa {
+ 	firmware-name = "qcom/sdm845/Xiaomi/polaris/ipa_fws.mbn";
+ 
+-	status = "okay";
++	status = "disabled";
+ };
+ 
+ &i2c14 {
+@@ -508,6 +519,16 @@ &mss_pil {
+ 	status = "okay";
+ };
+ 
++&pmi8998_fg {
++	monitored-battery = <&battery>;
++	status = "okay";
++};
++
++&pmi8998_charger {
++	monitored-battery = <&battery>;
++	status = "okay";
++};
++
+ &pmi8998_wled {
+ 	qcom,current-limit-microamp = <20000>;
+ 	qcom,current-boost-limit = <970>;
+@@ -642,7 +663,9 @@ &usb_1 {
+ };
+ 
+ &usb_1_dwc3 {
+-	dr_mode = "peripheral";
++	dr_mode = "otg";
++	usb-role-switch;
++	role-switch-default-mode = "peripheral";
+ 
+ 	/* Fastest mode for USB 2 */
+ 	maximum-speed = "high-speed";
+@@ -686,10 +709,72 @@ &ufs_mem_phy {
+ 
+ &venus {
+ 	firmware-name = "qcom/sdm845/Xiaomi/polaris/venus.mbn";
++	status = "okay";
++};
+ 
++/* Polaris wiring from the original board DT; keep CDSP and SLPI disabled. */
++&adsp_pas {
++	firmware-name = "qcom/sdm845/Xiaomi/polaris/adsp.mbn";
+ 	status = "okay";
+ };
+ 
++&i2c5 {
++	status = "okay";
++
++	tas2559_codec: amplifier@4c {
++		compatible = "ti,tas2559";
++		reg = <0x4c>;
++		#sound-dai-cells = <1>;
++		ti,tas2559-reset-gpios = <&tlmm 14 GPIO_ACTIVE_HIGH>;
++		ti,tas2560-reset-gpios = <&tlmm 25 GPIO_ACTIVE_HIGH>;
++		ti,tas2559-addr = <0x4c>;
++		ti,tas2560-addr = <0x4d>;
++	};
++};
++
++&q6afedai {
++	dai@22 {
++		reg = <QUATERNARY_MI2S_RX>;
++		qcom,sd-lines = <0>;
++	};
++};
++
++&q6asmdai {
++	dai@0 { reg = <MSM_FRONTEND_DAI_MULTIMEDIA1>; };
++	dai@1 { reg = <MSM_FRONTEND_DAI_MULTIMEDIA2>; };
++};
++
++&sound {
++	compatible = "qcom,db845c-sndcard", "qcom,sdm845-sndcard";
++	model = "Xiaomi Mi MIX 2S";
++	pinctrl-names = "default";
++	pinctrl-0 = <&quat_mi2s_active &quat_mi2s_sd0_active>;
++	audio-routing = "RX_BIAS", "MCLK",
++			"AMIC1", "MIC BIAS1",
++			"AMIC3", "MIC BIAS3";
++
++	mm1-dai-link {
++		link-name = "MultiMedia1";
++		cpu { sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA1>; };
++	};
++	mm2-dai-link {
++		link-name = "MultiMedia2";
++		cpu { sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA2>; };
++	};
++	speaker-dai-link {
++		link-name = "Primary Spkr Playback";
++		cpu { sound-dai = <&q6afedai QUATERNARY_MI2S_RX>; };
++		platform { sound-dai = <&q6routing>; };
++		codec { sound-dai = <&tas2559_codec 0>; };
++	};
++	capture-dai-link {
++		link-name = "SLIM WCD Capture";
++		cpu { sound-dai = <&q6afedai SLIMBUS_0_TX>; };
++		platform { sound-dai = <&q6routing>; };
++		codec { sound-dai = <&wcd9340 1>; };
++	};
++};
++
+ &wcd9340 {
+ 	reset-gpios = <&tlmm 64 GPIO_ACTIVE_HIGH>;
+ 	vdd-buck-sido-supply = <&vreg_s4a_1p8>;
+@@ -710,5 +795,6 @@ &wifi {
+ 	vdd-1.3-rfa-supply = <&vreg_l17a_1p3>;
+ 	vdd-3.3-ch0-supply = <&vreg_l25a_3p3>;
+ 	vdd-3.3-ch1-supply = <&vreg_l23a_3p3>;
++	qcom,snoc-host-cap-skip-quirk;
+ 	status = "okay";
+ };
+-- 
+2.55.0

@@ -1,0 +1,168 @@
+From 17faad3bec42585223c6370d160db1a32f479d74 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 23 Sep 2026 09:07:52 +0800
+Subject: [PATCH] power: supply: pmi8998: preserve Polaris status and notifier
+ lifecycle
+
+Port local pmi8998-current-status.patch and pmi8998-fg-lifecycle.patch onto the cherry-picked fuel gauge.
+---
+ drivers/power/supply/pmi8998_fg.c | 106 ++++++++++++++++++------------
+ 1 file changed, 63 insertions(+), 43 deletions(-)
+
+diff --git a/drivers/power/supply/pmi8998_fg.c b/drivers/power/supply/pmi8998_fg.c
+index 4bad62235..af1a3f602 100644
+--- a/drivers/power/supply/pmi8998_fg.c
++++ b/drivers/power/supply/pmi8998_fg.c
+@@ -2,6 +2,7 @@
+ /* Copyright (c) 2020, The Linux Foundation. All rights reserved. */
+ 
+ #include <linux/device.h>
++#include <linux/devm-helpers.h>
+ #include <linux/interrupt.h>
+ #include <linux/kernel.h>
+ #include <linux/math64.h>
+@@ -344,9 +345,9 @@ static int pmi8998_fg_get_property(struct power_supply *psy,
+ 				val->intval = POWER_SUPPLY_STATUS_UNKNOWN;
+ 				break;
+ 			}
+-			if (temp < 0)
++			if (temp > 0)
+ 				val->intval = POWER_SUPPLY_STATUS_CHARGING;
+-			else if (temp > 0)
++			else if (temp < 0)
+ 				val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
+ 			else
+ 				val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
+@@ -510,42 +511,51 @@ static void pmi8998_fg_status_changed_worker(struct work_struct *work)
+ 	power_supply_changed(chip->batt_psy);
+ }
+ 
++static int pmi8998_fg_charger_status(struct power_supply *psy)
++{
++	union power_supply_propval propval = {
++		.intval = POWER_SUPPLY_STATUS_UNKNOWN,
++	};
++
++	if (power_supply_get_property(psy, POWER_SUPPLY_PROP_STATUS, &propval))
++		return POWER_SUPPLY_STATUS_UNKNOWN;
++
++	return propval.intval;
++}
++
+ static int pmi8998_fg_notifier_call(struct notifier_block *nb, unsigned long val, void *v)
+ {
+ 	struct pmi8998_fg_chip *chip = container_of(nb, struct pmi8998_fg_chip, nb);
+ 	struct power_supply *psy = v;
+-	union power_supply_propval propval;
+-	int ret;
+-
+-	if (psy == chip->chg_psy) {
+-		ret = power_supply_get_property(psy,
+-						POWER_SUPPLY_PROP_STATUS, &propval);
+-		if (ret)
+-			chip->status = POWER_SUPPLY_STATUS_UNKNOWN;
+ 
+-		chip->status = propval.intval;
++	if (val != PSY_EVENT_PROP_CHANGED || psy != chip->chg_psy)
++		return NOTIFY_OK;
+ 
+-		power_supply_changed(chip->batt_psy);
+-
+-		if (chip->status == POWER_SUPPLY_STATUS_UNKNOWN) {
+-			/*
+-			 * REVISIT: Find better solution or remove current-based
+-			 * status checking once checking is properly implemented
+-			 * in charger drivers
++	chip->status = pmi8998_fg_charger_status(psy);
++	power_supply_changed(chip->batt_psy);
+ 
+-			 * Sometimes it take a while for current to stabilize,
+-			 * so signal property change again later to make sure
+-			 * current-based status is properly detected.
+-			 */
+-			cancel_delayed_work_sync(&chip->status_changed_work);
+-			schedule_delayed_work(&chip->status_changed_work,
+-					      msecs_to_jiffies(1000));
+-		}
++	if (chip->status == POWER_SUPPLY_STATUS_UNKNOWN) {
++		/*
++		 * Sometimes it takes a while for current to stabilize, so
++		 * signal a property change again later to make sure the
++		 * current-based status is detected correctly.
++		 */
++		mod_delayed_work(system_wq, &chip->status_changed_work,
++				 msecs_to_jiffies(1000));
++	} else {
++		cancel_delayed_work(&chip->status_changed_work);
+ 	}
+ 
+ 	return NOTIFY_OK;
+ }
+ 
++static void pmi8998_fg_unregister_notifier(void *data)
++{
++	struct pmi8998_fg_chip *chip = data;
++
++	power_supply_unreg_notifier(&chip->nb);
++}
++
+ static int pmi8998_fg_probe(struct platform_device *pdev)
+ {
+ 	struct power_supply_config supply_config = {};
+@@ -639,26 +649,36 @@ static int pmi8998_fg_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
+-	/* Optional: Get charger power supply for status checking */
+-	chip->chg_psy = power_supply_get_by_reference(of_fwnode_handle(chip->dev->of_node),
+-						      "power-supplies");
+-	if (IS_ERR(chip->chg_psy)) {
+-		ret = PTR_ERR(chip->chg_psy);
+-		dev_warn(chip->dev, "Failed to get charger supply: %d\n", ret);
+-		chip->chg_psy = NULL;
+-	}
+-
+-	if (chip->chg_psy) {
+-		INIT_DELAYED_WORK(&chip->status_changed_work,
+-				  pmi8998_fg_status_changed_worker);
++	/* The charger link is optional, but a declared link must become ready. */
++	if (of_property_read_bool(chip->dev->of_node, "power-supplies")) {
++		chip->chg_psy = devm_power_supply_get_by_reference(chip->dev,
++								     "power-supplies");
++		if (IS_ERR(chip->chg_psy))
++			return dev_err_probe(chip->dev, PTR_ERR(chip->chg_psy),
++					     "Failed to get charger supply\n");
++		if (!chip->chg_psy)
++			return dev_err_probe(chip->dev, -EPROBE_DEFER,
++					     "Charger supply is not ready\n");
++
++		ret = devm_delayed_work_autocancel(chip->dev,
++						   &chip->status_changed_work,
++						   pmi8998_fg_status_changed_worker);
++		if (ret)
++			return dev_err_probe(chip->dev, ret,
++					     "Failed to initialize status work\n");
+ 
++		chip->status = pmi8998_fg_charger_status(chip->chg_psy);
+ 		chip->nb.notifier_call = pmi8998_fg_notifier_call;
+ 		ret = power_supply_reg_notifier(&chip->nb);
+-		if (ret) {
+-			dev_err(chip->dev,
+-				"Failed to register notifier: %d\n", ret);
+-			return ret;
+-		}
++		if (ret)
++			return dev_err_probe(chip->dev, ret,
++					     "Failed to register notifier\n");
++
++		ret = devm_add_action_or_reset(chip->dev,
++					       pmi8998_fg_unregister_notifier, chip);
++		if (ret)
++			return dev_err_probe(chip->dev, ret,
++					     "Failed to manage notifier\n");
+ 	}
+ 
+ 	return 0;
+-- 
+2.55.0
+

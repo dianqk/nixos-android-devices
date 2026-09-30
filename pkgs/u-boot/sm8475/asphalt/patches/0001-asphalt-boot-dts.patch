@@ -1,0 +1,157 @@
+From: NixOS Android devices contributors <nixos-android-devices@localhost>
+Date: Mon, 28 Sep 2026 14:00:00 +0800
+Subject: [PATCH] arm: dts: add Lenovo TB320FC ABL boot wiring
+
+Use the board identity, UFS v6 PHY, NXP repeater and framebuffer from
+the tested Linux board description. Limit firmware USB to USB2 gadget;
+Linux still uses its own full device tree. ABL supplies DRAM and power.
+
+Hardware sources (local adaptation, not an imported upstream patch):
+https://github.com/lenovo-basements/linux/commit/d792042c0c9561c0f32a8f6eb9f0aca325fc0350
+pkgs/linux-kernel/sm8475/asphalt/patches/local/0006-asphalt-board-dts.patch
+Use 300 MHz UniPro for firmware, the 19.2 MHz XO for eUSB2, and retain
+Lenovo's 0xb8000000 splash reservation. No Polaris addresses are reused.
+
+Keep the exact /reserved-memory/splash_region path required by ABL's
+UpdateSplashMemInfo(). Otherwise ABL powers off the panel and controller
+before entering U-Boot, leaving the generation menu invisible until Linux
+reinitializes the display. The device's captured ABL log confirms this path.
+Pair this with the Linux Lucid OLE PLL handoff fix (kernel patch 0020).
+---
+diff --git a/dts/upstream/src/arm64/qcom/sm8475-lenovo-asphalt.dts b/dts/upstream/src/arm64/qcom/sm8475-lenovo-asphalt.dts
+--- /dev/null
++++ b/dts/upstream/src/arm64/qcom/sm8475-lenovo-asphalt.dts
+@@ -0,0 +1,133 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Lenovo TB320FC boot-only wiring, derived from the repository's Linux DTS.
++ * Copyright (c) 2026, Saran Thongplong <banstellazz@gmail.com>
++ */
++/dts-v1/;
++#include "sm8450.dtsi"
++#include "pm8350.dtsi"
++#include "pm8350c.dtsi"
++#include "pmk8350.dtsi"
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/input/linux-event-codes.h>
++
++/delete-node/ &usb_1_hsphy;
++/delete-node/ &ufs_mem_phy;
++/delete-node/ &xbl_ramdump_mem;
++/delete-node/ &xbl_sc_mem;
++/delete-node/ &rmtfs_mem;
++
++/ {
++	model = "Lenovo Legion Y700 2nd gen";
++	compatible = "lenovo,asphalt", "qcom,sm8475";
++	/* Preserve the Lenovo region metadata from the working Linux DT. */
++	region_country = "ROW";
++	qcom,msm-id = <531 0x10000>;
++	qcom,board-id = <0x10008 0>;
++
++	chosen {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++		framebuffer@b8000000 {
++			compatible = "simple-framebuffer";
++			reg = <0 0xb8000000 0 0x2b00000>;
++			width = <1600>;
++			height = <2560>;
++			stride = <6400>;
++			format = "a8r8g8b8";
++		};
++	};
++
++	reserved-memory {
++		xbl_ramdump_mem: memory@80640000 {
++			reg = <0 0x80640000 0 0x1c0000>;
++			no-map;
++		};
++		xbl_sc_mem: memory@a6e00000 {
++			reg = <0 0xa6e00000 0 0x40000>;
++			no-map;
++		};
++		splash_region: splash_region {
++			reg = <0 0xb8000000 0 0x2b00000>;
++			no-map;
++		};
++	};
++
++	usb_ref_clk: usb-ref-clk {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <19200000>;
++	};
++
++	gpio-keys {
++		compatible = "gpio-keys";
++		key-volume-up {
++			label = "Volume Up";
++			gpios = <&pm8350_gpios 6 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_VOLUMEUP>;
++		};
++	};
++};
++
++&soc {
++	usb_1_hsphy: phy@88e3000 {
++		compatible = "qcom,sm8475-snps-eusb2-phy", "qcom,sm8550-snps-eusb2-phy";
++		reg = <0 0x088e3000 0 0x154>;
++		#phy-cells = <0>;
++		/* RPMh clock votes are inherited; use the real XO rate for PLL setup. */
++		clocks = <&usb_ref_clk>;
++		clock-names = "ref";
++		resets = <&gcc GCC_QUSB2PHY_PRIM_BCR>;
++		phys = <&eusb2_repeater>;
++		status = "okay";
++	};
++	ufs_mem_phy: phy@1d80000 {
++		compatible = "qcom,sm8475-qmp-ufs-phy";
++		reg = <0 0x01d80000 0 0x2000>;
++		clocks = <&rpmhcc RPMH_CXO_CLK>, <&gcc GCC_UFS_PHY_PHY_AUX_CLK>,
++			 <&gcc GCC_UFS_0_CLKREF_EN>;
++		clock-names = "ref", "ref_aux", "qref";
++		#clock-cells = <1>;
++		#phy-cells = <0>;
++		status = "okay";
++	};
++};
++
++&gcc { compatible = "qcom,sm8475-gcc"; };
++&tlmm { compatible = "qcom,sm8475-tlmm"; };
++&qupv3_id_0 { status = "okay"; };
++
++&i2c5 {
++	status = "okay";
++	clock-frequency = <100000>;
++	assigned-clocks = <&gcc GCC_QUPV3_WRAP0_S5_CLK>;
++	assigned-clock-rates = <19200000>;
++	eusb2_repeater: phy@4f {
++		compatible = "nxp,eusb2-repeater";
++		reg = <0x4f>;
++		#phy-cells = <0>;
++		reset-gpios = <&pm8350c_gpios 7 GPIO_ACTIVE_HIGH>;
++		qcom,param-override-seq = <0x44 0x06 0x33 0x07 0x66 0x08 0x02 0x09 0x03 0x0a>;
++	};
++};
++
++&pon_pwrkey { status = "okay"; };
++&pon_resin { linux,code = <KEY_VOLUMEDOWN>; status = "okay"; };
++
++&usb_1 {
++	qcom,select-utmi-as-pipe-clk;
++	dr_mode = "peripheral";
++	maximum-speed = "high-speed";
++	phys = <&usb_1_hsphy>;
++	phy-names = "usb2-phy";
++	status = "okay";
++};
++
++&ufs_mem_hc {
++	reset-gpios = <&tlmm 210 GPIO_ACTIVE_LOW>;
++	/* Firmware uses GPLL0 rates; Linux retains its full SM8475 policy. */
++	freq-table-hz = <75000000 300000000>, <0 0>, <0 0>,
++		       <75000000 300000000>, <0 0>, <0 0>, <0 0>, <0 0>;
++	status = "okay";
++};

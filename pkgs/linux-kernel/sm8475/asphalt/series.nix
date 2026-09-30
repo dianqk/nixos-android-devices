@@ -1,0 +1,22 @@
+[
+  ./patches/local/0001-sm8475-core.patch
+  ./patches/local/0002-asphalt-display.patch
+  ./patches/local/0003-asphalt-touch.patch
+  ./patches/local/0004-sm8475-pcie-wifi.patch
+  ./patches/local/0005-sm8475-ufs-clocks.patch
+  ./patches/local/0006-asphalt-board-dts.patch
+  ./patches/local/0007-sm8450-iris-video.patch
+  ./patches/local/0008-asphalt-usb-audio.patch
+  ./patches/local/0009-cs35l45-dsp-part-name.patch
+  ./patches/local/0010-qmp-hardware-port-select.patch
+  ./patches/local/0011-sm8475-audio-service-setup.patch
+  ./patches/sm-x800-linux/0012-sm8450-camss.patch
+  ./patches/sm-x800-linux/0013-camcc-shared-rcg.patch
+  ./patches/local/0014-wl2864c-regulators.patch
+  ./patches/local/0015-asphalt-sensors.patch
+  ./patches/local/0016-asphalt-camera-wiring.patch
+  ./patches/sm-x800-linux/0017-camcc-retain-ff.patch
+  ./patches/local/0018-asphalt-displayport.patch
+  ./patches/local/0019-dp-debug-connector.patch
+  ./patches/upstream/0020-lucid-ole-preserve-enabled-pll.patch
+]

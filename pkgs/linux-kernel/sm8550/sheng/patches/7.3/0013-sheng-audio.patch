@@ -1,0 +1,104 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 29 Sep 2026 00:00:00 +0800
+Subject: [PATCH] ASoC: adapt Sheng audio routing to 7.3
+
+Porting notes: Keep the WCD938x channel-mask correction. 7.3 sets the CPU and first codec I2S formats in hw_params; Sheng has six CS35L43 codecs on Secondary MI2S, so set the I2S format and component clock for each in a Sheng-only startup loop.
+
+Original author dates, messages, and trailers: patches/ORIGINS.md.
+Source-Commit: https://github.com/ianchb/sm8550-mainline/commit/6a0d5e86cedf541ec045a98bf11b67fd5ce7b6be
+Source-Commit: https://github.com/ianchb/sm8550-mainline/commit/28a018cdfcd2e6d0332c60dfe50329cecf5fe497
+---
+diff --git a/sound/soc/codecs/wcd938x.c b/sound/soc/codecs/wcd938x.c
+index 9a9ea37..06d1913 100644
+--- a/sound/soc/codecs/wcd938x.c
++++ b/sound/soc/codecs/wcd938x.c
+@@ -1848,14 +1848,19 @@ static int wcd938x_get_swr_port(struct snd_kcontrol *kcontrol,
+ 	struct wcd938x_priv *wcd938x = snd_soc_component_get_drvdata(comp);
+ 	struct wcd938x_sdw_priv *wcd;
+ 	struct soc_mixer_control *mixer = (struct soc_mixer_control *)kcontrol->private_value;
++	struct sdw_port_config *port_config;
+ 	int dai_id = mixer->shift;
+ 	int portidx, ch_idx = mixer->reg;
+ 
+ 
+ 	wcd = wcd938x->sdw_priv[dai_id];
+ 	portidx = wcd->ch_info[ch_idx].port_num;
++	port_config = &wcd->port_config[portidx - 1];
+ 
+-	ucontrol->value.integer.value[0] = wcd->port_enable[portidx];
++	if (port_config->ch_mask & wcd->ch_info[ch_idx].ch_mask)
++		ucontrol->value.integer.value[0] = true;
++	else
++		ucontrol->value.integer.value[0] = false;
+ 
+ 	return 0;
+ }
+@@ -1881,8 +1886,6 @@ static int wcd938x_set_swr_port(struct snd_kcontrol *kcontrol,
+ 	else
+ 		enable = false;
+ 
+-	wcd->port_enable[portidx] = enable;
+-
+ 	wcd938x_connect_port(wcd, portidx, ch_idx, enable);
+ 
+ 	return 1;
+diff --git a/sound/soc/codecs/wcd938x.h b/sound/soc/codecs/wcd938x.h
+index c186104..6650c37 100644
+--- a/sound/soc/codecs/wcd938x.h
++++ b/sound/soc/codecs/wcd938x.h
+@@ -639,7 +639,6 @@ struct wcd938x_sdw_priv {
+ 	struct sdw_stream_runtime *sruntime;
+ 	struct sdw_port_config port_config[WCD938X_MAX_SWR_PORTS];
+ 	const struct wcd_sdw_ch_info *ch_info;
+-	bool port_enable[WCD938X_MAX_SWR_CH_IDS];
+ 	int active_ports;
+ 	bool is_tx;
+ 	struct wcd938x_priv *wcd938x;
+diff --git a/sound/soc/qcom/sc8280xp.c b/sound/soc/qcom/sc8280xp.c
+index 4d48e10..1c0e54b 100644
+--- a/sound/soc/qcom/sc8280xp.c
++++ b/sound/soc/qcom/sc8280xp.c
+@@ -3,6 +3,7 @@
+ 
+ #include <dt-bindings/sound/qcom,q6afe.h>
+ #include <linux/module.h>
++#include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <sound/soc.h>
+ #include <sound/soc-dapm.h>
+@@ -368,8 +369,34 @@ static int sc8280xp_snd_hw_free(struct snd_pcm_substream *substream)
+ 	return qcom_snd_sdw_hw_free(substream, &data->stream_prepared[cpu_dai->id]);
+ }
+ 
++static int sc8280xp_snd_startup(struct snd_pcm_substream *substream)
++{
++	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
++	struct sc8280xp_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
++	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
++	struct snd_soc_dai *codec_dai;
++	int i, ret;
++
++	if (cpu_dai->id == SECONDARY_MI2S_RX &&
++	    of_machine_is_compatible("xiaomi,sheng")) {
++		for_each_rtd_codec_dais(rtd, i, codec_dai) {
++			ret = snd_soc_dai_set_fmt(codec_dai,
++						  data->priv->codec_dai_fmt);
++			if (ret && ret != -ENOTSUPP)
++				return ret;
++
++			ret = snd_soc_component_set_sysclk(codec_dai->component, 0, 0,
++							  1536000, SND_SOC_CLOCK_IN);
++			if (ret)
++				return ret;
++		}
++	}
++
++	return qcom_snd_sdw_startup(substream);
++}
++
+ static const struct snd_soc_ops sc8280xp_be_ops = {
+-	.startup = qcom_snd_sdw_startup,
++	.startup = sc8280xp_snd_startup,
+ 	.shutdown = qcom_snd_sdw_shutdown,
+ 	.hw_params = sc8280xp_snd_hw_params,
+ 	.hw_free = sc8280xp_snd_hw_free,

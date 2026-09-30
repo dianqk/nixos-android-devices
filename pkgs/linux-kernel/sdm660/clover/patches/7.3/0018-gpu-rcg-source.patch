@@ -1,0 +1,156 @@
+From f806ce1da3dabc5e045308a8444bbd0c4077b484 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Barnab=C3=A1s=20Cz=C3=A9m=C3=A1n?=
+ <barnabas.czeman@mainlining.org>
+Date: Wed, 30 Apr 2025 21:41:50 +0300
+Subject: [PATCH] clk: qcom: rcg2: Add new gfx3d_src ops for SDM630/660
+ GPUCC
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add new specific version of RCG2 ops (clk_gfx3d_src_ops) that is
+designed to support GPU clock controller driver for SDM630/660 SoCs.
+Already existing clk_gfx3d_ops doesn't support handling frequency
+tables for gfx3d_src_clk, which is fine for Adreno 530/540 with GMU,
+but is required for lower-end A508/509/512 without GMU.
+
+Co-developed-by: Barnabás Czémán <barnabas.czeman@mainlining.org>
+Signed-off-by: Barnabás Czémán <barnabas.czeman@mainlining.org>
+Co-developed-by: Alexey Minnekhanov <alexeymin@postmarketos.org>
+Signed-off-by: Alexey Minnekhanov <alexeymin@postmarketos.org>
+
+Source-Commit: https://github.com/sdm660-mainline/linux/commit/f806ce1da3dabc5e045308a8444bbd0c4077b484
+Scope: SDM630/660-common
+Porting notes: Original clock-source ops apply unchanged; required by SDM660 GPU frequency switching.
+---
+diff --git a/drivers/clk/qcom/clk-rcg.h b/drivers/clk/qcom/clk-rcg.h
+index 4fbdf4880d0308..8501cce9519091 100644
+--- a/drivers/clk/qcom/clk-rcg.h
++++ b/drivers/clk/qcom/clk-rcg.h
+@@ -198,6 +198,7 @@ extern const struct clk_ops clk_byte_ops;
+ extern const struct clk_ops clk_byte2_ops;
+ extern const struct clk_ops clk_pixel_ops;
+ extern const struct clk_ops clk_gfx3d_ops;
++extern const struct clk_ops clk_gfx3d_src_ops;
+ extern const struct clk_ops clk_rcg2_shared_ops;
+ extern const struct clk_ops clk_rcg2_shared_floor_ops;
+ extern const struct clk_ops clk_rcg2_shared_no_init_park_ops;
+diff --git a/drivers/clk/qcom/clk-rcg2.c b/drivers/clk/qcom/clk-rcg2.c
+index 6064a0e17d5190..8f6fd0597bb7a9 100644
+--- a/drivers/clk/qcom/clk-rcg2.c
++++ b/drivers/clk/qcom/clk-rcg2.c
+@@ -1319,6 +1319,113 @@ const struct clk_ops clk_gfx3d_ops = {
+ };
+ EXPORT_SYMBOL_GPL(clk_gfx3d_ops);
+ 
++static int clk_gfx3d_src_determine_rate(struct clk_hw *hw,
++					struct clk_rate_request *req)
++{
++	struct clk_rate_request parent_req = { .min_rate = 0, .max_rate = ULONG_MAX };
++	struct clk_rcg2_gfx3d *cgfx = to_clk_rcg2_gfx3d(hw);
++	struct clk_rcg2 *rcg = &cgfx->rcg;
++	struct clk_hw *xo, *p0, *p1, *curr_p;
++	const struct freq_tbl *f;
++	int ret;
++
++	xo = clk_hw_get_parent_by_index(hw, 0);
++	/*
++	 * When msm_gpu devfreq wants to put GPU to idle, it requests the rate
++	 * of 27 MHz (27000000) in function disable_clk() in
++	 * drivers/gpu/drm/msm/msm_gpu.c. It expects "rounding down to zero".
++	 * Check for any request below 30 MHz here and round it down to lowest:
++	 */
++	if (req->rate < 30000000) {
++		req->best_parent_hw = xo;
++		/* return 19.2 MHz even for 27 MHz requests */
++		req->best_parent_rate = clk_hw_get_rate(xo);
++		return 0;
++	}
++
++	f = qcom_find_freq(rcg->freq_tbl, req->rate);
++	if (!f || (req->rate != f->freq))
++		return -EINVAL;
++
++	/* Indexes of source from the parent map */
++	p0 = clk_hw_get_parent_by_index(hw, 1);
++	p1 = clk_hw_get_parent_by_index(hw, 2);
++
++	curr_p = clk_hw_get_parent(hw);
++
++	parent_req.rate = f->freq * (f->pre_div + 1) / 2;
++
++	if (curr_p == xo || curr_p == p1)
++		req->best_parent_hw = p0;
++	else if (curr_p == p0)
++		req->best_parent_hw = p1;
++
++	parent_req.best_parent_hw = clk_hw_get_parent(req->best_parent_hw);
++	parent_req.best_parent_rate = clk_hw_get_rate(parent_req.best_parent_hw);
++
++
++	ret = __clk_determine_rate(req->best_parent_hw, &parent_req);
++	if (ret)
++		return ret;
++
++	clk_hw_get_rate_range(req->best_parent_hw,
++	&parent_req.min_rate, &parent_req.max_rate);
++
++	if (req->min_rate > parent_req.min_rate)
++		parent_req.min_rate = req->min_rate;
++
++	if (req->max_rate < parent_req.max_rate)
++		parent_req.max_rate = req->max_rate;
++
++	req->best_parent_rate = parent_req.rate;
++
++	return 0;
++}
++
++static int clk_gfx3d_src_set_rate_and_parent(struct clk_hw *hw, unsigned long rate,
++					     unsigned long parent_rate, u8 index)
++{
++	struct clk_rcg2_gfx3d *cgfx = to_clk_rcg2_gfx3d(hw);
++	struct clk_rcg2 *rcg = &cgfx->rcg;
++	const struct freq_tbl *f;
++	u32 cfg;
++	int ret;
++
++	cfg = rcg->parent_map[index].cfg << CFG_SRC_SEL_SHIFT;
++
++	/*
++	 * For "idle" requests use parent_rate, which will be cxo rate of
++	 * 19.2 MHz, so that qcom_find_freq() call below can find the
++	 * actual correct entry in freq_tbl with the correct divider set.
++	 */
++	if (rate < 30000000)
++		rate = 19200000;
++
++	f = qcom_find_freq(rcg->freq_tbl, rate);
++	if (!f)
++		return -EINVAL;
++
++	/* Update the RCG-DIV */
++	cfg |= f->pre_div << CFG_SRC_DIV_SHIFT;
++
++	ret = regmap_write(rcg->clkr.regmap, rcg->cmd_rcgr + CFG_REG, cfg);
++	if (ret)
++		return ret;
++
++	return update_config(rcg);
++}
++
++const struct clk_ops clk_gfx3d_src_ops = {
++	.is_enabled = clk_rcg2_is_enabled,
++	.get_parent = clk_rcg2_get_parent,
++	.set_parent = clk_rcg2_set_parent,
++	.recalc_rate = clk_rcg2_recalc_rate,
++	.set_rate = clk_gfx3d_set_rate,
++	.set_rate_and_parent = clk_gfx3d_src_set_rate_and_parent,
++	.determine_rate = clk_gfx3d_src_determine_rate,
++};
++EXPORT_SYMBOL_GPL(clk_gfx3d_src_ops);
++
+ static int clk_rcg2_set_force_enable(struct clk_hw *hw)
+ {
+ 	struct clk_rcg2 *rcg = to_clk_rcg2(hw);
+

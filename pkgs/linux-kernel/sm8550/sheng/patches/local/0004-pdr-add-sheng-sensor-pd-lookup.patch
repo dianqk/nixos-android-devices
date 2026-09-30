@@ -1,0 +1,26 @@
+diff --git a/drivers/soc/qcom/pmic_glink.c b/drivers/soc/qcom/pmic_glink.c
+--- a/drivers/soc/qcom/pmic_glink.c
++++ b/drivers/soc/qcom/pmic_glink.c
+@@ -351,6 +351,22 @@ static int pmic_glink_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++	/*
++	 * Sheng's ADSP firmware exposes the sensor service as msm/adsp/sensor_pd
++	 * through adsps.jsn.  No in-tree Linux client subscribes to it yet, but
++	 * libssc/iio-sensor-proxy need the SSC QMI service provided by that PD.
++	 */
++	dev_dbg(&pdev->dev,
++		"%s: calling pdr_add_lookup for tms/servreg, msm/adsp/sensor_pd\n",
++		__func__);
++	service = pdr_add_lookup(pg->pdr, "tms/servreg", "msm/adsp/sensor_pd");
++	if (IS_ERR(service))
++		dev_warn(&pdev->dev, "failed adding pdr lookup for sensor_pd: %pe\n", service);
++	else
++		dev_dbg(&pdev->dev,
++			"%s: sensor_pd pdr_add_lookup successful\n",
++			__func__);
++
+ 	mutex_lock(&__pmic_glink_lock);
+ 	__pmic_glink = pg;
+ 	mutex_unlock(&__pmic_glink_lock);

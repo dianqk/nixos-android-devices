@@ -1,0 +1,198 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 29 Sep 2026 00:00:00 +0800
+Subject: [PATCH] backlight: ktz8866: support paired Sheng controllers and bias
+
+Porting notes: apply the fork backlight changes as hunks on top of the 7.3 driver; preserve the upstream file and generic supply behavior otherwise. Mirror register writes only for the paired primary.
+
+Original author dates, messages, and trailers: patches/ORIGINS.md.
+Source-Commit: https://github.com/ianchb/sm8550-mainline/commit/46e9e4604c44ef30544ff1cf18cb59f684906a51
+Source-Commit: https://github.com/ianchb/sm8550-mainline/commit/4405046ea1702b809b40edb1214f818060b6057d
+---
+diff --git a/drivers/video/backlight/ktz8866.c b/drivers/video/backlight/ktz8866.c
+index 53c1301..89f8b30 100644
+--- a/drivers/video/backlight/ktz8866.c
++++ b/drivers/video/backlight/ktz8866.c
+@@ -10,6 +10,7 @@
+ #include <linux/gpio/consumer.h>
+ #include <linux/i2c.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/regmap.h>
+ 
+@@ -48,6 +49,8 @@ struct ktz8866 {
+ 	struct regmap *regmap;
+ 	bool led_on;
+ 	struct gpio_desc *enable_gpio;
++	struct backlight_device *backlight;
++	bool paired_primary;
+ };
+ 
+ static const struct regmap_config ktz8866_regmap_config = {
+@@ -56,16 +59,37 @@ static const struct regmap_config ktz8866_regmap_config = {
+ 	.max_register = REG_MAX,
+ };
+ 
++static DEFINE_MUTEX(ktz8866_pair_lock);
++static struct ktz8866 *ktz_b;
++
+ static int ktz8866_write(struct ktz8866 *ktz, unsigned int reg,
+ 			 unsigned int val)
+ {
+-	return regmap_write(ktz->regmap, reg, val);
++	int ret = regmap_write(ktz->regmap, reg, val);
++
++	if (!ktz->paired_primary || ret)
++		return ret;
++	mutex_lock(&ktz8866_pair_lock);
++	if (ktz_b)
++		ret = regmap_write(ktz_b->regmap, reg, val);
++	mutex_unlock(&ktz8866_pair_lock);
++
++	return ret;
+ }
+ 
+ static int ktz8866_update_bits(struct ktz8866 *ktz, unsigned int reg,
+ 			       unsigned int mask, unsigned int val)
+ {
+-	return regmap_update_bits(ktz->regmap, reg, mask, val);
++	int ret = regmap_update_bits(ktz->regmap, reg, mask, val);
++
++	if (!ktz->paired_primary || ret)
++		return ret;
++	mutex_lock(&ktz8866_pair_lock);
++	if (ktz_b)
++		ret = regmap_update_bits(ktz_b->regmap, reg, mask, val);
++	mutex_unlock(&ktz8866_pair_lock);
++
++	return ret;
+ }
+ 
+ static int ktz8866_backlight_update_status(struct backlight_device *backlight_dev)
+@@ -121,31 +145,54 @@ static void ktz8866_init(struct ktz8866 *ktz)
+ 	}
+ 
+ 	if (of_property_read_bool(ktz->client->dev.of_node, "kinetic,enable-lcd-bias"))
+-		ktz8866_write(ktz, LCD_BIAS_CFG1, LCD_BIAS_EN);
++		regmap_write(ktz->regmap, LCD_BIAS_CFG1, LCD_BIAS_EN);
+ }
+ 
+ static int ktz8866_probe(struct i2c_client *client)
+ {
+-	struct backlight_device *backlight_dev;
++	const struct i2c_device_id *id = i2c_client_get_device_id(client);
+ 	struct backlight_properties props;
+ 	struct ktz8866 *ktz;
+ 	int ret = 0;
+ 
++	if (id->driver_data == 1) {
++		mutex_lock(&ktz8866_pair_lock);
++		ret = ktz_b ? 0 : -EPROBE_DEFER;
++		mutex_unlock(&ktz8866_pair_lock);
++		if (ret)
++			return ret;
++	}
++
+ 	ktz = devm_kzalloc(&client->dev, sizeof(*ktz), GFP_KERNEL);
+ 	if (!ktz)
+ 		return -ENOMEM;
+ 
+ 	ktz->client = client;
++	ktz->paired_primary = id->driver_data == 1;
++	i2c_set_clientdata(client, ktz);
+ 	ktz->regmap = devm_regmap_init_i2c(client, &ktz8866_regmap_config);
+ 	if (IS_ERR(ktz->regmap))
+ 		return dev_err_probe(&client->dev, PTR_ERR(ktz->regmap), "failed to init regmap\n");
+ 
+-	ret = devm_regulator_get_enable(&client->dev, "vddpos");
+-	if (ret)
+-		return dev_err_probe(&client->dev, ret, "get regulator vddpos failed\n");
+-	ret = devm_regulator_get_enable(&client->dev, "vddneg");
+-	if (ret)
+-		return dev_err_probe(&client->dev, ret, "get regulator vddneg failed\n");
++	if (id->driver_data) {
++		ret = devm_regulator_get_enable(&client->dev, "vin");
++		if (ret)
++			return dev_err_probe(&client->dev, ret, "get regulator vin failed\n");
++	} else {
++		ret = devm_regulator_get_enable(&client->dev, "vddpos");
++		if (ret)
++			return dev_err_probe(&client->dev, ret, "get regulator vddpos failed\n");
++		ret = devm_regulator_get_enable(&client->dev, "vddneg");
++		if (ret)
++			return dev_err_probe(&client->dev, ret, "get regulator vddneg failed\n");
++	}
++
++	if (id->driver_data == 2) {
++		mutex_lock(&ktz8866_pair_lock);
++		ktz_b = ktz;
++		mutex_unlock(&ktz8866_pair_lock);
++		goto end;
++	}
+ 
+ 	ktz->enable_gpio = devm_gpiod_get_optional(&client->dev, "enable", GPIOD_OUT_HIGH);
+ 	if (IS_ERR(ktz->enable_gpio))
+@@ -157,37 +204,51 @@ static int ktz8866_probe(struct i2c_client *client)
+ 	props.brightness = DEFAULT_BRIGHTNESS;
+ 	props.scale = BACKLIGHT_SCALE_LINEAR;
+ 
+-	backlight_dev = devm_backlight_device_register(&client->dev, "ktz8866-backlight",
+-					&client->dev, ktz, &ktz8866_backlight_ops, &props);
+-	if (IS_ERR(backlight_dev))
+-		return dev_err_probe(&client->dev, PTR_ERR(backlight_dev),
++	ktz->backlight = devm_backlight_device_register(&client->dev,
++						       "ktz8866-backlight",
++						       &client->dev, ktz,
++						       &ktz8866_backlight_ops,
++						       &props);
++	if (IS_ERR(ktz->backlight))
++		return dev_err_probe(&client->dev, PTR_ERR(ktz->backlight),
+ 				"failed to register backlight device\n");
+ 
+ 	ktz8866_init(ktz);
+ 
+-	i2c_set_clientdata(client, backlight_dev);
+-	backlight_update_status(backlight_dev);
++	backlight_update_status(ktz->backlight);
+ 
++end:
+ 	return 0;
+ }
+ 
+ static void ktz8866_remove(struct i2c_client *client)
+ {
+-	struct backlight_device *backlight_dev = i2c_get_clientdata(client);
+-	backlight_dev->props.brightness = 0;
+-	backlight_update_status(backlight_dev);
++	struct ktz8866 *ktz = i2c_get_clientdata(client);
++
++	mutex_lock(&ktz8866_pair_lock);
++	if (ktz_b == ktz)
++		ktz_b = NULL;
++	mutex_unlock(&ktz8866_pair_lock);
++
++	if (!ktz->backlight)
++		return;
++
++	ktz->backlight->props.brightness = 0;
++	backlight_update_status(ktz->backlight);
+ }
+ 
+ static const struct i2c_device_id ktz8866_ids[] = {
+ 	{ .name = "ktz8866" },
++	{ .name = "ktz8866a", .driver_data = 1 },
++	{ .name = "ktz8866b", .driver_data = 2 },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(i2c, ktz8866_ids);
+ 
+ static const struct of_device_id ktz8866_match_table[] = {
+-	{
+-		.compatible = "kinetic,ktz8866",
+-	},
++	{ .compatible = "kinetic,ktz8866", },
++	{ .compatible = "kinetic,ktz8866a", },
++	{ .compatible = "kinetic,ktz8866b", },
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(of, ktz8866_match_table);

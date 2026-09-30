@@ -1,0 +1,139 @@
+From: NixOS Android devices contributors <nixos-android-devices@localhost>
+Date: Mon, 28 Sep 2026 14:00:00 +0800
+Subject: [PATCH] qcom: wire SM8475 boot clocks and Asphalt GPIO functions
+
+Follow the original SM8450 drivers with the SM8475 compatibles, QUP5
+pinmux, and the UFS UniPro / USB clock rates needed for an ABL handoff.
+Keep UFS at a maximum 300 MHz during firmware execution; Linux configures
+its own rates. GPLL0 is initialized by the previous bootloader stage.
+Correct the inherited dynamic snprintf format separately from the import.
+
+Source for clock offsets and rates:
+https://github.com/torvalds/linux/blob/v7.3-rc4/drivers/clk/qcom/gcc-sm8450.c
+SM8475 pinmux source: pkgs/linux-kernel/sm8475/asphalt/patches/local/0001-sm8475-core.patch
+PMIC GPIO register subtypes are detected by the existing driver at probe.
+---
+diff --git a/drivers/clk/qcom/clock-sm8450.c b/drivers/clk/qcom/clock-sm8450.c
+--- a/drivers/clk/qcom/clock-sm8450.c
++++ b/drivers/clk/qcom/clock-sm8450.c
+@@ -40,12 +40,41 @@
+ 	{ }
+ };
+ 
++/* SM8475 retains the SM8450 GPLL0 600/300 MHz parent mapping. */
++static const struct freq_tbl ftbl_ufs[] = {
++	F(75000000, CFG_CLK_SRC_GPLL0_EVEN, 4, 0, 0),
++	F(150000000, CFG_CLK_SRC_GPLL0, 4, 0, 0),
++	F(300000000, CFG_CLK_SRC_GPLL0, 2, 0, 0),
++	{ }
++};
++
+ static ulong sm8450_set_rate(struct clk *clk, ulong rate)
+ {
+ 	struct msm_clk_priv *priv = dev_get_priv(clk->dev);
+ 	const struct freq_tbl *freq;
+ 
+ 	switch (clk->id) {
++	case GCC_UFS_PHY_UNIPRO_CORE_CLK:
++		if (rate > 300000000)
++			return -EINVAL;
++		freq = qcom_find_freq(ftbl_ufs, rate);
++		clk_rcg_set_rate(priv->base, 0x8708c, freq->pre_div, freq->src);
++		return freq->freq;
++	case GCC_USB30_PRIM_MASTER_CLK:
++		if (rate != 200000000)
++			return -EINVAL;
++		clk_rcg_set_rate(priv->base, 0x49028, 5, CFG_CLK_SRC_GPLL0);
++		return rate;
++	case GCC_USB30_PRIM_MOCK_UTMI_CLK:
++		if (rate != 19200000)
++			return -EINVAL;
++		clk_rcg_set_rate(priv->base, 0x49040, 1, CFG_CLK_SRC_CXO);
++		return rate;
++	case GCC_QUPV3_WRAP0_S5_CLK:
++		freq = qcom_find_freq(ftbl_gcc_qupv3_wrap0_s0_clk_src, rate);
++		clk_rcg_set_rate_mnd(priv->base, 0x27618,
++				     freq->pre_div, freq->m, freq->n, freq->src, 16);
++		return freq->freq;
+ 	case GCC_QUPV3_WRAP0_S7_CLK: /* UART7 */
+ 		freq = qcom_find_freq(ftbl_gcc_qupv3_wrap0_s0_clk_src, rate);
+ 		clk_rcg_set_rate_mnd(priv->base, 0x27880,
+@@ -255,6 +284,7 @@
+ };
+ 
+ static const struct udevice_id gcc_sm8450_of_match[] = {
++	{ .compatible = "qcom,sm8475-gcc", .data = (ulong)&sm8450_gcc_data },
+ 	{
+ 		.compatible = "qcom,gcc-sm8450",
+ 		.data = (ulong)&sm8450_gcc_data,
+diff --git a/drivers/pinctrl/qcom/pinctrl-sm8450.c b/drivers/pinctrl/qcom/pinctrl-sm8450.c
+--- a/drivers/pinctrl/qcom/pinctrl-sm8450.c
++++ b/drivers/pinctrl/qcom/pinctrl-sm8450.c
+@@ -15,6 +15,7 @@
+ 
+ static const struct pinctrl_function msm_pinctrl_functions[] = {
+ 	{"qup7", 1},
++	{"qup5", 1},
+ 	{"gpio", 0},
+ };
+ 
+@@ -59,7 +60,7 @@
+ 					unsigned int selector)
+ {
+ 	if (selector >= 210 && selector <= 213)
+-		snprintf(pin_name, MAX_PIN_NAME_LEN,
++		snprintf(pin_name, MAX_PIN_NAME_LEN, "%s",
+ 			 msm_special_pins_data[selector - 210].name);
+ 	else
+ 		snprintf(pin_name, MAX_PIN_NAME_LEN, "gpio%u", selector);
+@@ -67,7 +68,7 @@
+ 	return pin_name;
+ }
+ 
+-static unsigned int sm8450_get_function_mux(__maybe_unused unsigned int pin,
++static int sm8450_get_function_mux(__maybe_unused unsigned int pin,
+ 					    unsigned int selector)
+ {
+ 	return msm_pinctrl_functions[selector].val;
+@@ -86,6 +87,7 @@
+ };
+ 
+ static const struct udevice_id msm_pinctrl_ids[] = {
++	{ .compatible = "qcom,sm8475-tlmm", .data = (ulong)&sm8450_data },
+ 	{ .compatible = "qcom,sm8450-tlmm", .data = (ulong)&sm8450_data },
+ 	{ /* Sentinel */ }
+ };
+diff --git a/drivers/clk/clk-stub.c b/drivers/clk/clk-stub.c
+--- a/drivers/clk/clk-stub.c
++++ b/drivers/clk/clk-stub.c
+@@ -59,6 +59,7 @@
+ 	{ .compatible = "qcom,sm6350-rpmh-clk" },
+ 	{ .compatible = "qcom,sm8150-rpmh-clk" },
+ 	{ .compatible = "qcom,sm8250-rpmh-clk" },
++	{ .compatible = "qcom,sm8450-rpmh-clk" },
+ 	{ .compatible = "qcom,sm8550-rpmh-clk" },
+ 	{ .compatible = "qcom,sm8650-rpmh-clk" },
+ 	{ }
+diff --git a/drivers/gpio/qcom_pmic_gpio.c b/drivers/gpio/qcom_pmic_gpio.c
+--- a/drivers/gpio/qcom_pmic_gpio.c
++++ b/drivers/gpio/qcom_pmic_gpio.c
+@@ -347,6 +347,8 @@
+ 	{ .compatible = "qcom,pms405-gpio" },
+ 	{ .compatible = "qcom,pm6125-gpio" },
+ 	{ .compatible = "qcom,pm8150-gpio" },
++	{ .compatible = "qcom,pm8350-gpio" },
++	{ .compatible = "qcom,pm8350c-gpio" },
+ 	{ }
+ };
+ 
+diff --git a/drivers/iommu/qcom-hyp-smmu.c b/drivers/iommu/qcom-hyp-smmu.c
+--- a/drivers/iommu/qcom-hyp-smmu.c
++++ b/drivers/iommu/qcom-hyp-smmu.c
+@@ -392,6 +392,7 @@
+ 	{ .compatible = "qcom,sc7280-smmu-500" },
+ 	{ .compatible = "qcom,sdm845-smmu-500" },
+ 	{ .compatible = "qcom,sm6350-smmu-500" },
++	{ .compatible = "qcom,sm8450-smmu-500" },
+ 	{ .compatible = "qcom,smmu-500", },
+ 	{ /* sentinel */ }
+ };

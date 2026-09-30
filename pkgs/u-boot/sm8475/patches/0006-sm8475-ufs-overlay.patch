@@ -1,0 +1,58 @@
+From: NixOS Android devices contributors <nixos-android-devices@localhost>
+Date: Mon, 28 Sep 2026 14:00:00 +0800
+Subject: [PATCH] phy: qcom-qmp-ufs: execute SM8475 Gear 4 lane and PCS overlays
+
+Complete the U-Boot API adaptation separately from Danila Tikhonov's
+SM8475 register/configuration import. Copy the shared SM8550 Gear 4
+TX/RX register tables from Linux v7.3-rc4 (GPL-2.0, values unchanged),
+and execute lane/PCS overlays only for the new SM8475 configuration.
+Existing U-Boot boards retain their current initialization sequence.
+
+Source: https://github.com/torvalds/linux/blob/v7.3-rc4/drivers/phy/qualcomm/phy-qcom-qmp-ufs.c
+Local U-Boot follow-up; not an original upstream commit.
+---
+diff --git a/drivers/phy/qcom/phy-qcom-qmp-ufs.c b/drivers/phy/qcom/phy-qcom-qmp-ufs.c
+--- a/drivers/phy/qcom/phy-qcom-qmp-ufs.c
++++ b/drivers/phy/qcom/phy-qcom-qmp-ufs.c
+@@ -937,6 +937,14 @@
+ 	QMP_PHY_INIT_CFG(QPHY_V2_PCS_UFS_RX_MIN_HIBERN8_TIME, 0x9a), /* 8 us */
+ };
+ 
++static const struct qmp_ufs_init_tbl sm8550_ufsphy_g4_tx[] = {
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V6_TX_FR_DCC_CTRL, 0x4c),
++};
++
++static const struct qmp_ufs_init_tbl sm8550_ufsphy_g4_rx[] = {
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V6_RX_VGA_CAL_MAN_VAL, 0x0e),
++};
++
+ struct qmp_ufs_offsets {
+ 	u16 serdes;
+ 	u16 pcs;
+@@ -987,6 +995,7 @@
+ 
+ 	/* true, if PCS block has no separate SW_RESET register */
+ 	bool no_pcs_sw_reset;
++	bool apply_g4_overlay;
+ };
+ 
+ struct qmp_ufs_priv {
+@@ -1264,6 +1273,7 @@
+ 		.pcs		= sm8475_ufsphy_g4_pcs,
+ 		.pcs_num	= ARRAY_SIZE(sm8475_ufsphy_g4_pcs),
+ 	},
++	.apply_g4_overlay	= true,
+ 	.clk_list		= sm8450_ufs_phy_clk_l,
+ 	.num_clks		= ARRAY_SIZE(sm8450_ufs_phy_clk_l),
+ 	.vreg_list		= qmp_ufs_vreg_l,
+@@ -1483,6 +1493,10 @@
+ 	qmp_ufs_serdes_init(qmp, &cfg->tbls_hs_g4);
+ 	qmp_ufs_lanes_init(qmp, &cfg->tbls);
+ 	qmp_ufs_pcs_init(qmp, &cfg->tbls);
++	if (cfg->apply_g4_overlay) {
++		qmp_ufs_lanes_init(qmp, &cfg->tbls_hs_g4);
++		qmp_ufs_pcs_init(qmp, &cfg->tbls_hs_g4);
++	}
+ }
+ 
+ static int qmp_ufs_do_reset(struct qmp_ufs_priv *qmp)

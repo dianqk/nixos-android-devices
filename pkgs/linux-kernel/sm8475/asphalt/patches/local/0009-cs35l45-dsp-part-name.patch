@@ -1,0 +1,41 @@
+From 29bd9bab48211e41811352dff12c4070c34069e5 Mon Sep 17 00:00:00 2001
+From: Y700 kernel rebase <y700-rebase@localhost>
+Date: Wed, 23 Sep 2026 08:40:19 +0800
+Subject: [PATCH 09/10] ASoC: cs35l45: select per-speaker DSP firmware
+
+Source-commit: local 29bd9bab48211e41811352dff12c4070c34069e5
+---
+diff --git a/Documentation/devicetree/bindings/sound/cirrus,cs35l45.yaml b/Documentation/devicetree/bindings/sound/cirrus,cs35l45.yaml
+index 70f6c62ae..50267f26c 100644
+--- a/Documentation/devicetree/bindings/sound/cirrus,cs35l45.yaml
++++ b/Documentation/devicetree/bindings/sound/cirrus,cs35l45.yaml
+@@ -34,6 +34,10 @@ properties:
+   reset-gpios:
+     maxItems: 1
+ 
++  cirrus,dsp-part-name:
++    description: Firmware name prefix for boards with speaker-specific DSP coefficients.
++    $ref: /schemas/types.yaml#/definitions/string
++
+   vdd-a-supply:
+     description: voltage regulator phandle for the VDD_A supply
+ 
+diff --git a/sound/soc/codecs/cs35l45.c b/sound/soc/codecs/cs35l45.c
+index a032bb23b..005a4379b 100644
+--- a/sound/soc/codecs/cs35l45.c
++++ b/sound/soc/codecs/cs35l45.c
+@@ -1349,9 +1349,13 @@ static const struct cs_dsp_region cs35l45_dsp1_regions[] = {
+ static int cs35l45_dsp_init(struct cs35l45_private *cs35l45)
+ {
+ 	struct wm_adsp *dsp = &cs35l45->dsp;
++	const char *part;
+ 	int ret;
+ 
+-	dsp->part = "cs35l45";
++	/* Boards with separate speaker coefficients use a distinct DSP prefix. */
++	if (device_property_read_string(cs35l45->dev, "cirrus,dsp-part-name", &part))
++		part = "cs35l45";
++	dsp->part = part;
+ 	dsp->fw = 9; /* 9 is WM_ADSP_FW_SPK_PROT in wm_adsp.c */
+ 	dsp->toggle_preload = true;
+ 	dsp->cs_dsp.num = 1;

@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Y700 kernel rebase <y700-rebase@localhost>
+Date: Wed, 23 Sep 2026 14:47:34 +0800
+Subject: [PATCH 07/10] media: iris: integrate SM8450 VPU2 for Y700
+
+Adapt the SM8450 Iris VPU2 platform data and node from work by
+ZXlieC and Nazar Kompanets in Xlie-Electronic-Customs/linux. Add the
+binding and TB320FC firmware/protocol changes from local video bring-up.
+
+Component-source: Xlie-Electronic-Customs/linux f3d4329304417a1d599eb35dc3fcd9ae33113c43
+Component-source: Xlie-Electronic-Customs/linux 2c8ceef5cb549b48ad5a0f75fe701721d0abe559
+Component-source: Xlie-Electronic-Customs/linux 4bf7e05babfee38810420b9d0a7928479dcbce7c
+Component-source: local f03a3888684fc90bb4e9334ad00ddcaf7e695fcb
+Component-source: local 0d16d09405d5173dca54f883e69588e18b20045e
+---
+diff --git a/Documentation/devicetree/bindings/media/qcom,sm8250-venus.yaml b/Documentation/devicetree/bindings/media/qcom,sm8250-venus.yaml
+index aca748e42..7216b2aed 100644
+--- a/Documentation/devicetree/bindings/media/qcom,sm8250-venus.yaml
++++ b/Documentation/devicetree/bindings/media/qcom,sm8250-venus.yaml
+@@ -19,7 +19,9 @@ allOf:
+ properties:
+   compatible:
+     oneOf:
+-      - const: qcom,sm8250-venus
++      - enum:
++          - qcom,sm8250-venus
++          - qcom,sm8450-venus
+       - items:
+           - enum:
+               - qcom,sc8280xp-iris
+@@ -48,7 +50,8 @@ properties:
+       - const: vcodec0_core
+ 
+   iommus:
+-    maxItems: 1
++    minItems: 1
++    maxItems: 2
+ 
+   interconnects:
+     maxItems: 2
+diff --git a/arch/arm64/boot/dts/qcom/sm8450.dtsi b/arch/arm64/boot/dts/qcom/sm8450.dtsi
+index b8793482b..c31a5f5ef 100644
+--- a/arch/arm64/boot/dts/qcom/sm8450.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8450.dtsi
+@@ -3206,6 +3206,65 @@ IPCC_MPROC_SIGNAL_GLINK_QMP
+ 			};
+ 		};
+ 
++		iris: video-codec@aa00000 {
++			compatible = "qcom,sm8450-venus";
++			reg = <0 0x0aa00000 0 0xf0000>;
++			interrupts = <GIC_SPI 174 IRQ_TYPE_LEVEL_HIGH>;
++			power-domains = <&videocc VIDEO_CC_MVS0C_GDSC>,
++					<&videocc VIDEO_CC_MVS0_GDSC>,
++					<&rpmhpd RPMHPD_MX>,
++					<&rpmhpd RPMHPD_MMCX>;
++			power-domain-names = "venus", "vcodec0", "mx", "mmcx";
++			operating-points-v2 = <&venus_opp_table>;
++
++			clocks = <&gcc GCC_VIDEO_AXI0_CLK>,
++				 <&videocc VIDEO_CC_MVS0C_CLK>,
++				 <&videocc VIDEO_CC_MVS0_CLK>;
++			clock-names = "iface", "core", "vcodec0_core";
++
++			interconnects = <&gem_noc MASTER_APPSS_PROC 0 &config_noc SLAVE_VENUS_CFG 0>,
++					<&mmss_noc MASTER_VIDEO 0 &gem_noc SLAVE_LLCC 0>;
++			interconnect-names = "cpu-cfg", "video-mem";
++
++			iommus = <&apps_smmu 0x2180 0x0400>,
++				 <&apps_smmu 0x2187 0x0400>;
++			memory-region = <&video_mem>;
++
++			resets = <&gcc GCC_VIDEO_AXI0_CLK_ARES>,
++				 <&videocc VIDEO_CC_MVS0C_CLK_ARES>;
++			reset-names = "bus", "core";
++
++			status = "disabled";
++
++			venus_opp_table: opp-table {
++				compatible = "operating-points-v2";
++
++				opp-240000000 {
++					opp-hz = /bits/ 64 <239999999>;
++					required-opps = <&rpmhpd_opp_svs>,
++							<&rpmhpd_opp_low_svs>;
++				};
++
++				opp-338000000 {
++					opp-hz = /bits/ 64 <338000000>;
++					required-opps = <&rpmhpd_opp_svs>,
++							<&rpmhpd_opp_svs>;
++				};
++
++				opp-366000000 {
++					opp-hz = /bits/ 64 <366000000>;
++					required-opps = <&rpmhpd_opp_svs_l1>,
++							<&rpmhpd_opp_svs_l1>;
++				};
++
++				opp-444000000 {
++					opp-hz = /bits/ 64 <444000000>;
++					required-opps = <&rpmhpd_opp_svs_l1>,
++							<&rpmhpd_opp_nom>;
++				};
++			};
++		};
++
+ 		videocc: clock-controller@aaf0000 {
+ 			compatible = "qcom,sm8450-videocc";
+ 			reg = <0 0x0aaf0000 0 0x10000>;
+diff --git a/drivers/media/platform/qcom/iris/iris_hfi_gen2_command.c b/drivers/media/platform/qcom/iris/iris_hfi_gen2_command.c
+index 388a36ff2..a51081a21 100644
+--- a/drivers/media/platform/qcom/iris/iris_hfi_gen2_command.c
++++ b/drivers/media/platform/qcom/iris/iris_hfi_gen2_command.c
+@@ -7,6 +7,7 @@
+ 
+ #include "iris_hfi_gen2.h"
+ #include "iris_hfi_gen2_packet.h"
++#include "iris_platform_common.h"
+ 
+ #define UNSPECIFIED_COLOR_FORMAT 5
+ #define NUM_SYS_INIT_PACKETS 8
+@@ -1178,6 +1179,7 @@ static int iris_hfi_gen2_session_pause(struct iris_inst *inst, u32 plane)
+ static int iris_hfi_gen2_session_resume_drc(struct iris_inst *inst, u32 plane)
+ {
+ 	struct iris_inst_hfi_gen2 *inst_hfi_gen2 = to_iris_inst_hfi_gen2(inst);
++	bool legacy_resume = inst->core->iris_platform_data == &sm8450_data;
+ 	u32 payload = HFI_CMD_SETTINGS_CHANGE;
+ 
+ 	iris_hfi_gen2_packet_session_command(inst,
+@@ -1186,9 +1188,9 @@ static int iris_hfi_gen2_session_resume_drc(struct iris_inst *inst, u32 plane)
+ 					     HFI_HOST_FLAGS_INTR_REQUIRED),
+ 					     iris_hfi_gen2_get_port(inst, plane),
+ 					     inst->session_id,
+-					     HFI_PAYLOAD_U32,
+-					     &payload,
+-					     sizeof(u32));
++					     legacy_resume ? HFI_PAYLOAD_NONE : HFI_PAYLOAD_U32,
++					     legacy_resume ? NULL : &payload,
++					     legacy_resume ? 0 : sizeof(payload));
+ 
+ 	return iris_hfi_queue_cmd_write(inst->core, inst_hfi_gen2->packet,
+ 					inst_hfi_gen2->packet->size);
+diff --git a/drivers/media/platform/qcom/iris/iris_platform_common.h b/drivers/media/platform/qcom/iris/iris_platform_common.h
+index 974809509..bfcd136d3 100644
+--- a/drivers/media/platform/qcom/iris/iris_platform_common.h
++++ b/drivers/media/platform/qcom/iris/iris_platform_common.h
+@@ -58,6 +58,7 @@ extern const struct iris_platform_data milos_data;
+ extern const struct iris_platform_data qcs8300_data;
+ extern const struct iris_platform_data sc7280_data;
+ extern const struct iris_platform_data sm8250_data;
++extern const struct iris_platform_data sm8450_data;
+ extern const struct iris_platform_data sm8550_data;
+ extern const struct iris_platform_data sm8650_data;
+ extern const struct iris_platform_data sm8750_data;
+diff --git a/drivers/media/platform/qcom/iris/iris_platform_sm8450.h b/drivers/media/platform/qcom/iris/iris_platform_sm8450.h
+new file mode 100644
+index 000000000..c5f5301ab
+--- /dev/null
++++ b/drivers/media/platform/qcom/iris/iris_platform_sm8450.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#ifndef __IRIS_PLATFORM_SM8450_H__
++#define __IRIS_PLATFORM_SM8450_H__
++
++static struct platform_inst_caps platform_inst_cap_sm8450 = {
++	.min_frame_width = 96,
++	.max_frame_width = 8192,
++	.min_frame_height = 96,
++	.max_frame_height = 8192,
++	.max_mbpf = (8192 * 4352) / 256,
++	.mb_cycles_vsp = 25,
++	.mb_cycles_vpp = 200,
++	.mb_cycles_fw = 326389,
++	.mb_cycles_fw_vpp = 44156,
++	.max_frame_rate = MAXIMUM_FPS,
++	.max_operating_rate = MAXIMUM_FPS,
++};
++
++#endif
+diff --git a/drivers/media/platform/qcom/iris/iris_platform_vpu2.c b/drivers/media/platform/qcom/iris/iris_platform_vpu2.c
+index bbdbf2196..c708fb3cf 100644
+--- a/drivers/media/platform/qcom/iris/iris_platform_vpu2.c
++++ b/drivers/media/platform/qcom/iris/iris_platform_vpu2.c
+@@ -16,6 +16,7 @@
+ #include "iris_platform_milos.h"
+ #include "iris_platform_sc7280.h"
+ #include "iris_platform_sm8250.h"
++#include "iris_platform_sm8450.h"
+ 
+ static const struct iris_firmware_desc iris_milos_desc = {
+ 	.firmware_data = &iris_hfi_milos_data,
+@@ -41,6 +42,12 @@ static const struct iris_firmware_desc iris_vpu20_p4_gen1_desc = {
+ 	.fwname = "qcom/vpu/vpu20_p4.mbn",
+ };
+ 
++static const struct iris_firmware_desc iris_vpu20_p4_gen2_desc = {
++	.firmware_data = &iris_hfi_gen2_data,
++	.get_vpu_buffer_size = iris_vpu_buf_size,
++	.fwname = "qcom/vpu/vpu20_p4.mbn",
++};
++
+ static const u32 iris_fmts_vpu2_dec[] = {
+ 	[IRIS_FMT_H264] = V4L2_PIX_FMT_H264,
+ 	[IRIS_FMT_HEVC] = V4L2_PIX_FMT_HEVC,
+@@ -163,3 +170,32 @@ const struct iris_platform_data sm8250_data = {
+ 	.max_core_mbpf = NUM_MBS_8K,
+ 	.max_core_mbps = ((7680 * 4320) / 256) * 60,
+ };
++
++const struct iris_platform_data sm8450_data = {
++	.firmware_desc_gen1 = &iris_vpu20_p4_gen2_desc,
++	.vpu_ops = &iris_vpu2_ops,
++	.icc_tbl = iris_icc_info_vpu2,
++	.icc_tbl_size = ARRAY_SIZE(iris_icc_info_vpu2),
++	.clk_rst_tbl = iris_clk_reset_table_vpu2,
++	.clk_rst_tbl_size = ARRAY_SIZE(iris_clk_reset_table_vpu2),
++	.bw_tbl_dec = sm8250_bw_table_dec,
++	.bw_tbl_dec_size = ARRAY_SIZE(sm8250_bw_table_dec),
++	.pmdomain_tbl = iris_pmdomain_table_vpu2,
++	.pmdomain_tbl_size = ARRAY_SIZE(iris_pmdomain_table_vpu2),
++	.opp_pd_tbl = sm8250_opp_pd_table,
++	.opp_pd_tbl_size = ARRAY_SIZE(sm8250_opp_pd_table),
++	.clk_tbl = sm8250_clk_table,
++	.clk_tbl_size = ARRAY_SIZE(sm8250_clk_table),
++	.opp_clk_tbl = sm8250_opp_clk_table,
++	/* Upper bound of DMA address range */
++	.dma_mask = 0xe0000000 - 1,
++	.inst_iris_fmts = iris_fmts_vpu2_dec,
++	.inst_iris_fmts_size = ARRAY_SIZE(iris_fmts_vpu2_dec),
++	.inst_caps = &platform_inst_cap_sm8450,
++	.tz_cp_config_data = tz_cp_config_vpu2,
++	.tz_cp_config_data_size = ARRAY_SIZE(tz_cp_config_vpu2),
++	.num_vpp_pipe = 4,
++	.max_session_count = 16,
++	.max_core_mbpf = NUM_MBS_8K,
++	.max_core_mbps = ((7680 * 4320) / 256) * 60,
++};
+diff --git a/drivers/media/platform/qcom/iris/iris_probe.c b/drivers/media/platform/qcom/iris/iris_probe.c
+index e4acf4a74..3b56b0a2b 100644
+--- a/drivers/media/platform/qcom/iris/iris_probe.c
++++ b/drivers/media/platform/qcom/iris/iris_probe.c
+@@ -372,6 +372,10 @@ static const struct of_device_id iris_dt_match[] = {
+ 		.compatible = "qcom,sm8250-venus",
+ 		.data = &sm8250_data,
+ 	},
++	{
++		.compatible = "qcom,sm8450-venus",
++		.data = &sm8450_data,
++	},
+ 	{
+ 		.compatible = "qcom,sm8550-iris",
+ 		.data = &sm8550_data,

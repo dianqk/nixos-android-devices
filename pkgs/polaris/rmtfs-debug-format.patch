@@ -1,0 +1,34 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Mon, 28 Sep 2026 09:55:00 +0800
+Subject: [PATCH] rmtfs: fix verbose CLOSE logging argument types
+
+The CLOSE request carries an integer caller ID, not a path. Passing it to
+%s can dereference an invalid pointer, and the fourth conversion reads a
+missing argument. This happens before sending the CLOSE response when -v
+is enabled. Print the caller ID as unsigned and match the three arguments.
+Annotate the debug wrapper so the compiler checks its call sites.
+
+Source reviewed: https://github.com/linux-msm/rmtfs/blob/b30a3eb38f9af283f18dbd3c7755653efc52c094/rmtfs.c
+This is a local correction, not an imported upstream fix.
+
+--- a/rmtfs.c
++++ b/rmtfs.c
+@@ -30,7 +30,8 @@
+ static char slot_suffix[SLOT_SUFFIX_LEN];
+ 
+ static bool dbgprintf_enabled;
+-static void dbgprintf(const char *fmt, ...)
++static void __attribute__((format(printf, 1, 2)))
++dbgprintf(const char *fmt, ...)
+ {
+ 	va_list ap;
+ 
+@@ -127,7 +128,7 @@
+ 	rmtfs_mem_free(rmem);
+ 
+ respond:
+-	dbgprintf("[RMTFS] close %s => %d (%d:%d)\n",
++	dbgprintf("[RMTFS] close %u => (%d:%d)\n",
+ 		  req.caller_id, resp.result.result, resp.result.error);
+ 
+ 	len = qmi_encode_message(&resp_buf,

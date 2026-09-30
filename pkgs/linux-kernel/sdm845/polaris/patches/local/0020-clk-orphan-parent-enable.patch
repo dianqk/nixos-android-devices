@@ -1,0 +1,119 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 27 Sep 2026 14:37:18 +0800
+Subject: [PATCH] clk: avoid forcing idle parents on when adopting orphans
+
+Adopting an orphan only updates the software clock topology. It does not
+program a hardware mux, so CLK_OPS_PARENT_ENABLE must not force an idle
+parent on during this operation. On SDM845 with an early MDSS power-down,
+registering the DSI clock provider otherwise prepares its uninitialized
+PLL; the lock failure is followed by unbalanced clock cleanup warnings.
+
+Keep prepare/enable count migration for already prepared and critical
+orphans. All real parent/rate changes, including rollback, retain the
+existing forced-parent behavior.
+
+This is a local fix. Its distinction between hardware reparenting and
+orphan adoption follows Stephen Boyd's f8f8f1d04494 discussion, while
+retaining the reference migration required by Jerome Brunet's follow-up.
+Link: https://www.mail-archive.com/linux-kernel@vger.kernel.org/msg1630217.html
+Link: https://lkml.rescloud.iu.edu/1802.0/03657.html
+---
+diff --git a/drivers/clk/clk.c b/drivers/clk/clk.c
+--- a/drivers/clk/clk.c
++++ b/drivers/clk/clk.c
+@@ -2162,7 +2162,8 @@
+ }
+ 
+ static struct clk_core *__clk_set_parent_before(struct clk_core *core,
+-					   struct clk_core *parent)
++					   struct clk_core *parent,
++					   bool enable_parents)
+ {
+ 	unsigned long flags;
+ 	struct clk_core *old_parent = core->parent;
+@@ -2188,7 +2189,7 @@
+ 	 */
+ 
+ 	/* enable old_parent & parent if CLK_OPS_PARENT_ENABLE is set */
+-	if (core->flags & CLK_OPS_PARENT_ENABLE) {
++	if (enable_parents && (core->flags & CLK_OPS_PARENT_ENABLE)) {
+ 		clk_core_prepare_enable(old_parent);
+ 		clk_core_prepare_enable(parent);
+ 	}
+@@ -2209,7 +2210,8 @@
+ 
+ static void __clk_set_parent_after(struct clk_core *core,
+ 				   struct clk_core *parent,
+-				   struct clk_core *old_parent)
++				   struct clk_core *old_parent,
++				   bool enable_parents)
+ {
+ 	/*
+ 	 * Finish the migration of prepare state and undo the changes done
+@@ -2221,7 +2223,7 @@
+ 	}
+ 
+ 	/* re-balance ref counting if CLK_OPS_PARENT_ENABLE is set */
+-	if (core->flags & CLK_OPS_PARENT_ENABLE) {
++	if (enable_parents && (core->flags & CLK_OPS_PARENT_ENABLE)) {
+ 		clk_core_disable_unprepare(parent);
+ 		clk_core_disable_unprepare(old_parent);
+ 	}
+@@ -2234,7 +2236,7 @@
+ 	int ret = 0;
+ 	struct clk_core *old_parent;
+ 
+-	old_parent = __clk_set_parent_before(core, parent);
++	old_parent = __clk_set_parent_before(core, parent, true);
+ 
+ 	trace_clk_set_parent(core, parent);
+ 
+@@ -2249,12 +2251,12 @@
+ 		clk_reparent(core, old_parent);
+ 		clk_enable_unlock(flags);
+ 
+-		__clk_set_parent_after(core, old_parent, parent);
++		__clk_set_parent_after(core, old_parent, parent, true);
+ 
+ 		return ret;
+ 	}
+ 
+-	__clk_set_parent_after(core, parent, old_parent);
++	__clk_set_parent_after(core, parent, old_parent, true);
+ 
+ 	return 0;
+ }
+@@ -2481,7 +2483,7 @@
+ 	}
+ 
+ 	if (core->new_parent && core->new_parent != core->parent) {
+-		old_parent = __clk_set_parent_before(core, core->new_parent);
++		old_parent = __clk_set_parent_before(core, core->new_parent, true);
+ 		trace_clk_set_parent(core, core->new_parent);
+ 
+ 		if (core->ops->set_rate_and_parent) {
+@@ -2494,7 +2496,7 @@
+ 		}
+ 
+ 		trace_clk_set_parent_complete(core, core->new_parent);
+-		__clk_set_parent_after(core, core->new_parent, old_parent);
++		__clk_set_parent_after(core, core->new_parent, old_parent, true);
+ 	}
+ 
+ 	if (core->flags & CLK_OPS_PARENT_ENABLE)
+@@ -3939,11 +3941,13 @@
+ 		 * properly migrate any prepare/enable count of the orphan
+ 		 * clock. This is important for CLK_IS_CRITICAL clocks, which
+ 		 * are enabled during init but might not have a parent yet.
++		 * No hardware mux is changed here, so do not force idle parents
++		 * on merely because the orphan has CLK_OPS_PARENT_ENABLE.
+ 		 */
+ 		if (parent) {
+ 			/* update the clk tree topology */
+-			__clk_set_parent_before(orphan, parent);
+-			__clk_set_parent_after(orphan, parent, NULL);
++			__clk_set_parent_before(orphan, parent, false);
++			__clk_set_parent_after(orphan, parent, NULL, false);
+ 			__clk_recalc_accuracies(orphan);
+ 			__clk_recalc_rates(orphan, true, 0);
+ 

@@ -1,0 +1,183 @@
+Subject: [PATCH] arm64: dts: qcom: polaris: wire rear IMX363 and front OV5675
+
+Supply and GPIO assignments follow Xiaomi polaris-p1-camera-sensor-mtp.dtsi.
+Use the upstream OV5675 19.2 MHz mode table.
+
+--- a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-polaris.dts
++++ b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-polaris.dts
+@@ -798,3 +798,175 @@
+ 	qcom,snoc-host-cap-skip-quirk;
+ 	status = "okay";
+ };
++
++/* Polaris production-board camera supplies and CSI wiring. */
++/ {
++	cam_iovdd: regulator-camera-io {
++		compatible = "regulator-fixed";
++		regulator-name = "camera-iovdd";
++		regulator-min-microvolt = <1800000>;
++		regulator-max-microvolt = <1800000>;
++		gpio = <&tlmm 21 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <135>;
++		vin-supply = <&vreg_s4a_1p8>;
++	};
++
++	cam_rear_avdd: regulator-camera-rear-avdd {
++		compatible = "regulator-fixed";
++		regulator-name = "camera-rear-avdd";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&tlmm 87 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <100>;
++		vin-supply = <&vreg_bob>;
++	};
++
++	cam_front_avdd: regulator-camera-front-avdd {
++		compatible = "regulator-fixed";
++		regulator-name = "camera-front-avdd";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&tlmm 29 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <100>;
++		vin-supply = <&vreg_bob>;
++	};
++
++	cam_rear_dvdd: regulator-camera-rear-dvdd {
++		compatible = "regulator-fixed";
++		regulator-name = "camera-rear-dvdd";
++		regulator-min-microvolt = <1050000>;
++		regulator-max-microvolt = <1050000>;
++		gpio = <&pm8998_gpios 11 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <135>;
++		vin-supply = <&vreg_s3a_1p35>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&cam_rear_dvdd_en>;
++	};
++
++	cam_front_dvdd: regulator-camera-front-dvdd {
++		compatible = "regulator-fixed";
++		regulator-name = "camera-front-dvdd";
++		regulator-min-microvolt = <1050000>;
++		regulator-max-microvolt = <1050000>;
++		gpio = <&pm8998_gpios 9 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <233>;
++		vin-supply = <&vreg_s4a_1p8>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&cam_front_dvdd_en>;
++	};
++};
++
++&camss {
++	vdda-phy-supply = <&vreg_l1a_0p875>;
++	vdda-pll-supply = <&vreg_l26a_1p2>;
++	status = "okay";
++
++	ports {
++		port@0 {
++			csiphy0_ep: endpoint {
++				clock-lanes = <7>;
++				data-lanes = <0 1 2 3>;
++				remote-endpoint = <&imx363_ep>;
++			};
++		};
++		port@2 {
++			csiphy2_ep: endpoint {
++				clock-lanes = <7>;
++				data-lanes = <0 1>;
++				remote-endpoint = <&ov5675_ep>;
++			};
++		};
++	};
++};
++
++&cci {
++	status = "okay";
++};
++
++&cci_i2c0 {
++	clock-frequency = <400000>;
++	camera@1a {
++		compatible = "sony,imx363";
++		reg = <0x1a>;
++		reset-gpios = <&tlmm 80 GPIO_ACTIVE_LOW>;
++		enable-gpios = <&tlmm 102 GPIO_ACTIVE_HIGH>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&cam_rear_reset &cam_mclk0_default>;
++		clocks = <&clock_camcc CAM_CC_MCLK0_CLK>;
++		clock-names = "xvclk";
++		clock-frequency = <24000000>;
++		vif-supply = <&cam_iovdd>;
++		vana-supply = <&cam_rear_avdd>;
++		vdig-supply = <&cam_rear_dvdd>;
++		orientation = <1>;
++		rotation = <90>;
++		port {
++			imx363_ep: endpoint {
++				data-lanes = <1 2 3 4>;
++				link-frequencies = /bits/ 64 <636000000 321000000>;
++				remote-endpoint = <&csiphy0_ep>;
++			};
++		};
++	};
++};
++
++&cci_i2c1 {
++	clock-frequency = <400000>;
++	camera@36 {
++		compatible = "ovti,ov5675";
++		reg = <0x36>;
++		reset-gpios = <&tlmm 9 GPIO_ACTIVE_LOW>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&cam_front_reset &cam_mclk2_default>;
++		clocks = <&clock_camcc CAM_CC_MCLK2_CLK>;
++		assigned-clocks = <&clock_camcc CAM_CC_MCLK2_CLK>;
++		assigned-clock-rates = <19200000>;
++		dovdd-supply = <&cam_iovdd>;
++		avdd-supply = <&cam_front_avdd>;
++		dvdd-supply = <&cam_front_dvdd>;
++		orientation = <0>;
++		rotation = <270>;
++		port {
++			ov5675_ep: endpoint {
++				data-lanes = <1 2>;
++				link-frequencies = /bits/ 64 <450000000>;
++				remote-endpoint = <&csiphy2_ep>;
++			};
++		};
++	};
++};
++
++&pm8998_gpios {
++	cam_rear_dvdd_en: camera-rear-dvdd-state {
++		pins = "gpio11";
++		function = "normal";
++		power-source = <0>;
++		bias-disable;
++	};
++	cam_front_dvdd_en: camera-front-dvdd-state {
++		pins = "gpio9";
++		function = "normal";
++		power-source = <0>;
++		bias-disable;
++	};
++};
++
++&tlmm {
++	cam_rear_reset: camera-rear-reset-state {
++		pins = "gpio80";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++	cam_front_reset: camera-front-reset-state {
++		pins = "gpio9";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++};

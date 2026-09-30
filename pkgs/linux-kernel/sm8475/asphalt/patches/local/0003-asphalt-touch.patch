@@ -1,0 +1,1553 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Y700 kernel rebase <y700-rebase@localhost>
+Date: Wed, 23 Sep 2026 14:47:34 +0800
+Subject: [PATCH 03/10] input: touchscreen: integrate Y700 NT36523N driver
+
+Consolidate the validated NT36523N SPI binding and touchscreen
+driver from historical local patches 0020-0034 by dianqk. This keeps
+the staged firmware checks, panel lifecycle, input path and bounded
+recovery behavior.
+
+Component-source: local 192733258078a8615bd61f023247aa7af458f5ae
+Component-source: local fb567efa8696241d8fd250f19e2abaacc2531217
+Component-source: local 716baa6700b63abfc8bd5748188fe443fc51c5bf
+Component-source: local 6ed715a0a1da884e98485b0c1857317404b97de0
+Component-source: local fc63a4724e4a44358a1045c947a7ea06f21f60d4
+Component-source: local 5a90b7f1d17f8b046b9bf03c5f76e7a952e1c597
+Component-source: local d1bbd480db9349b4439ebb74291009333c799ad3
+Component-source: local 5555f8dd589f085767bf8fc116f0ab210c28ffc1
+Component-source: local bf95b331d5c47f2e1f3e2193ca182f8df7d1ee5c
+Component-source: local 3330ff9030a3a58a95542124707611a50ddae4cc
+Component-source: local a6a9ee9a717452a1800f185109b388e87ac6d879
+Component-source: local a76f2060f54d28da3423271df0f15f5a4b1cc0fd
+---
+diff --git a/Documentation/devicetree/bindings/input/touchscreen/novatek,nt36523n-spi.yaml b/Documentation/devicetree/bindings/input/touchscreen/novatek,nt36523n-spi.yaml
+new file mode 100644
+index 000000000..aed624661
+--- /dev/null
++++ b/Documentation/devicetree/bindings/input/touchscreen/novatek,nt36523n-spi.yaml
+@@ -0,0 +1,75 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/input/touchscreen/novatek,nt36523n-spi.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Novatek NT36523N SPI touchscreen controller
++
++maintainers:
++  - dianqk <dianqk@dianqk.net>
++
++allOf:
++  - $ref: touchscreen.yaml#
++  - $ref: /schemas/spi/spi-peripheral-props.yaml#
++
++properties:
++  compatible:
++    const: novatek,nt36523n-spi
++
++  reg:
++    maxItems: 1
++
++  interrupts:
++    maxItems: 1
++
++  reset-gpios:
++    maxItems: 1
++
++  firmware-name:
++    maxItems: 1
++
++  panel: true
++
++  spi-max-frequency:
++    maximum: 9600000
++
++  touchscreen-size-x: true
++  touchscreen-size-y: true
++  touchscreen-inverted-x: true
++  touchscreen-inverted-y: true
++  touchscreen-swapped-x-y: true
++
++required:
++  - compatible
++  - reg
++  - interrupts
++  - reset-gpios
++  - firmware-name
++  - panel
++  - spi-max-frequency
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/gpio/gpio.h>
++    #include <dt-bindings/interrupt-controller/irq.h>
++
++    spi {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        touchscreen@0 {
++            compatible = "novatek,nt36523n-spi";
++            reg = <0>;
++            spi-max-frequency = <9600000>;
++            interrupts-extended = <&tlmm 21 IRQ_TYPE_EDGE_RISING>;
++            reset-gpios = <&tlmm 20 GPIO_ACTIVE_LOW>;
++            firmware-name = "novatek/lenovo-tb320fc.bin";
++            panel = <&panel>;
++            touchscreen-size-x = <1600>;
++            touchscreen-size-y = <2560>;
++        };
++    };
++...
+diff --git a/drivers/input/touchscreen/Kconfig b/drivers/input/touchscreen/Kconfig
+index 9b9ae8ac3..dce80453f 100644
+--- a/drivers/input/touchscreen/Kconfig
++++ b/drivers/input/touchscreen/Kconfig
+@@ -701,6 +701,18 @@ config TOUCHSCREEN_NOVATEK_NVT_TS
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called novatek-nvt-ts.
+ 
++config TOUCHSCREEN_NOVATEK_NT36523N_SPI
++	tristate "Novatek NT36523N SPI touchscreen support"
++	depends on DRM
++	depends on SPI_MASTER
++	depends on GPIOLIB || COMPILE_TEST
++	help
++	  Say Y here if you have a Novatek NT36523N-family no-flash
++	  touchscreen controller connected over SPI.
++
++	  To compile this driver as a module, choose M here: the module will be
++	  called novatek-nt36523n-spi.
++
+ config TOUCHSCREEN_IMAGIS
+ 	tristate "Imagis touchscreen support"
+ 	depends on I2C
+diff --git a/drivers/input/touchscreen/Makefile b/drivers/input/touchscreen/Makefile
+index bfd9de833..f9b5bdcaa 100644
+--- a/drivers/input/touchscreen/Makefile
++++ b/drivers/input/touchscreen/Makefile
+@@ -69,6 +69,7 @@ obj-$(CONFIG_TOUCHSCREEN_MMS114)	+= mms114.o
+ obj-$(CONFIG_TOUCHSCREEN_MSG2638)	+= msg2638.o
+ obj-$(CONFIG_TOUCHSCREEN_MTOUCH)	+= mtouch.o
+ obj-$(CONFIG_TOUCHSCREEN_NOVATEK_NVT_TS)	+= novatek-nvt-ts.o
++obj-$(CONFIG_TOUCHSCREEN_NOVATEK_NT36523N_SPI) += novatek-nt36523n-spi.o
+ obj-$(CONFIG_TOUCHSCREEN_HP600)		+= hp680_ts_input.o
+ obj-$(CONFIG_TOUCHSCREEN_HP7XX)		+= jornada720_ts.o
+ obj-$(CONFIG_TOUCHSCREEN_IPAQ_MICRO)	+= ipaq-micro-ts.o
+diff --git a/drivers/input/touchscreen/novatek-nt36523n-spi.c b/drivers/input/touchscreen/novatek-nt36523n-spi.c
+new file mode 100644
+index 000000000..c3751300d
+--- /dev/null
++++ b/drivers/input/touchscreen/novatek-nt36523n-spi.c
+@@ -0,0 +1,1408 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Minimal Novatek NT36523N SPI touchscreen foundation
++ *
++ * Copyright (C) 2010-2021 Novatek, Inc.
++ * Copyright (C) 2026 dianqk
++ */
++
++#include <linux/delay.h>
++#include <linux/bits.h>
++#include <linux/firmware.h>
++#include <linux/gpio/consumer.h>
++#include <linux/input.h>
++#include <linux/input/mt.h>
++#include <linux/input/touchscreen.h>
++#include <linux/interrupt.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/property.h>
++#include <linux/sizes.h>
++#include <linux/slab.h>
++#include <linux/spi/spi.h>
++#include <linux/string.h>
++#include <linux/unaligned.h>
++#include <linux/workqueue.h>
++
++#include <drm/drm_panel.h>
++
++#define NVT_ENG_RESET_ADDR	0x7fff80
++#define NVT_CHIP_VER_TRIM_ADDR	0x03f004
++#define NVT_SWRST_SIF_ADDR	0x03f0fe
++
++#define NVT_ID_LEN		6
++#define NVT_XFER_MAX		110
++
++#define NVT_EVENT_BUF_ADDR	0x02fd00
++#define NVT_BOOT_READY_ADDR	0x03f10d
++#define NVT_G_ILM_CRC_ADDR	0x03f100
++#define NVT_G_DLM_CRC_ADDR	0x03f104
++#define NVT_BLD_DEST_ADDR	0x03f114
++#define NVT_ILM_LENGTH_ADDR	0x03f118
++#define NVT_R_ILM_CRC_ADDR	0x03f120
++#define NVT_R_DLM_CRC_ADDR	0x03f124
++#define NVT_ILM_DEST_ADDR	0x03f128
++#define NVT_DLM_DEST_ADDR	0x03f12c
++#define NVT_DLM_LENGTH_ADDR	0x03f130
++#define NVT_BLD_CRC_STATUS_ADDR	0x03f133
++#define NVT_DMA_CRC_STATUS_ADDR	0x03f134
++#define NVT_BLD_LENGTH_ADDR	0x03f138
++#define NVT_SPI_DMA_SETUP_ADDR	0x03f7d0
++#define NVT_TX_AUTO_COPY_ADDR	0x03f7e8
++#define NVT_SPI_DMA_TX_INFO_ADDR	0x03f7f1
++#define NVT_ACI_ERROR_FLAG_ADDR	0x03f705
++#define NVT_HISTORY_EVENT0_ADDR	0x038d54
++#define NVT_HISTORY_EVENT1_ADDR	0x038d94
++
++#define NVT_EVENT_HOST_CMD	0x50
++#define NVT_EVENT_RESET_COMPLETE	0x60
++#define NVT_EVENT_FWINFO		0x78
++
++#define NVT_FW_TRANSFER_MAX	(63 * SZ_1K)
++#define NVT_PID_TB320FC		0x6066
++#define NVT_MAX_TOUCHES		10
++#define NVT_POINT_DATA_LEN	108
++#define NVT_POINT_CHECKSUM_LEN	65
++#define NVT_TOUCH_RECORD_LEN	6
++#define NVT_TOUCH_MAX_X		16000
++#define NVT_TOUCH_MAX_Y		25600
++#define NVT_TOUCH_MAX_PRESSURE	1000
++#define NVT_WDT_FRAME_LIMIT	11
++
++#define NVT_FW_END_FLAG_LEN	3
++#define NVT_FW_HEADER_MIN	0x30
++#define NVT_FW_INFO_SIZE	0x10
++#define NVT_FW_MAX_PARTITIONS	64
++
++struct nvt_fw_partition {
++	u32 bin_addr;
++	u32 sram_addr;
++	u32 size;
++	u32 crc;
++};
++
++struct nvt_fw_layout {
++	struct nvt_fw_partition *partitions;
++	size_t size;
++	u32 header_size;
++	u8 version;
++	u8 num_partitions;
++	u8 num_nonempty;
++	bool cascade;
++};
++
++enum nvt_recovery_state {
++	NVT_RECOVERY_ELIGIBLE,
++	NVT_RECOVERY_PENDING,
++	NVT_RECOVERY_COMPLETE,
++	NVT_RECOVERY_STOPPED,
++};
++
++struct nvt_nt36523n {
++	struct spi_device *spi;
++	struct gpio_desc *reset_gpio;
++	struct drm_panel_follower panel_follower;
++	struct input_dev *input;
++	struct touchscreen_properties prop;
++	struct work_struct recovery_work;
++	/* Serializes panel lifecycle and teardown state. */
++	struct mutex state_lock;
++	const char *firmware_name;
++	u8 *tx_buf;
++	u8 *rx_buf;
++	bool input_registered;
++	bool running;
++	bool stopping;
++	bool logged_bad_packet;
++	bool wdt_fe_recovery;
++	u8 wdt_frames;
++	atomic_t recovery_state;
++};
++
++static int nvt_download_and_verify_firmware(struct nvt_nt36523n *nvt,
++					    const struct firmware *fw,
++					    const struct nvt_fw_layout *layout);
++
++static int nvt_fw_parse_partition(const struct firmware *fw,
++				  struct nvt_fw_partition *partition,
++				  size_t pos, bool ilm_dlm)
++{
++	u64 end;
++	u64 sram_end;
++
++	if (pos > fw->size || fw->size - pos < NVT_FW_INFO_SIZE)
++		return -EINVAL;
++
++	if (ilm_dlm) {
++		partition->bin_addr = get_unaligned_le32(&fw->data[pos]);
++		partition->sram_addr = get_unaligned_le32(&fw->data[pos + 4]);
++		partition->size = get_unaligned_le32(&fw->data[pos + 8]);
++		partition->crc = get_unaligned_le32(&fw->data[0x18 +
++							   pos / 12 * 4]);
++	} else {
++		partition->sram_addr = get_unaligned_le32(&fw->data[pos]);
++		partition->size = get_unaligned_le32(&fw->data[pos + 4]);
++		partition->bin_addr = get_unaligned_le32(&fw->data[pos + 8]);
++		partition->crc = get_unaligned_le32(&fw->data[pos + 12]);
++	}
++
++	/* A zero encoded size denotes a reserved partition in this format. */
++	if (!partition->size)
++		return 0;
++
++	end = (u64)partition->bin_addr + partition->size + 1;
++	sram_end = (u64)partition->sram_addr + partition->size + 1;
++	if (end > fw->size || sram_end > BIT(23))
++		return -EINVAL;
++
++	return 0;
++}
++
++static int nvt_parse_firmware(const struct firmware *fw,
++			      struct nvt_fw_layout *layout)
++{
++	u32 header_limit;
++	u32 info_sections;
++	u32 overlay_sections;
++	u32 i;
++	size_t pos;
++	bool found_cascade_header = false;
++
++	if (fw->size < SZ_4K || fw->size % SZ_4K ||
++	    memcmp(&fw->data[fw->size - NVT_FW_END_FLAG_LEN], "NVT",
++		   NVT_FW_END_FLAG_LEN))
++		return -EINVAL;
++
++	layout->size = fw->size;
++	layout->version = fw->data[fw->size - SZ_4K];
++	if ((u8)(layout->version + fw->data[fw->size - SZ_4K + 1]) != 0xff)
++		return -EINVAL;
++
++	layout->header_size = get_unaligned_le32(fw->data);
++	layout->cascade = !!(fw->data[0x20] & BIT(1));
++	if (layout->header_size < NVT_FW_HEADER_MIN ||
++	    layout->header_size > fw->size ||
++	    layout->header_size % NVT_FW_INFO_SIZE)
++		return -EINVAL;
++
++	header_limit = layout->cascade ? layout->header_size / 2 :
++					 layout->header_size;
++	if (header_limit < NVT_FW_HEADER_MIN ||
++	    header_limit % NVT_FW_INFO_SIZE)
++		return -EINVAL;
++
++	info_sections = (header_limit - NVT_FW_HEADER_MIN) /
++			NVT_FW_INFO_SIZE + layout->cascade;
++	overlay_sections = fw->data[0x28] & BIT(4) ? fw->data[0x28] & 0xf : 0;
++	if (2 + info_sections + overlay_sections > NVT_FW_MAX_PARTITIONS)
++		return -E2BIG;
++
++	layout->num_partitions = 2 + info_sections + overlay_sections;
++	layout->partitions = kcalloc(layout->num_partitions,
++				     sizeof(*layout->partitions), GFP_KERNEL);
++	if (!layout->partitions)
++		return -ENOMEM;
++
++	for (i = 0; i < layout->num_partitions; i++) {
++		if (i < 2) {
++			pos = i * 12;
++			if (nvt_fw_parse_partition(fw, &layout->partitions[i],
++						   pos, true))
++				goto invalid;
++		} else if (i < 2 + info_sections) {
++			if (found_cascade_header && layout->cascade)
++				pos = layout->header_size - NVT_FW_INFO_SIZE;
++			else
++				pos = NVT_FW_HEADER_MIN +
++				      NVT_FW_INFO_SIZE * (i - 2);
++
++			if (nvt_fw_parse_partition(fw, &layout->partitions[i],
++						   pos, false))
++				goto invalid;
++
++			if (!found_cascade_header &&
++			    layout->partitions[i].bin_addr < layout->header_size &&
++			    layout->partitions[i].size) {
++				if (layout->cascade &&
++				    i != 2 + info_sections - 2)
++					goto invalid;
++				found_cascade_header = true;
++			}
++		} else {
++			pos = layout->partitions[1].bin_addr +
++			      NVT_FW_INFO_SIZE * (i - 2 - info_sections);
++			if (nvt_fw_parse_partition(fw, &layout->partitions[i],
++						   pos, false))
++				goto invalid;
++		}
++
++		if (layout->partitions[i].size)
++			layout->num_nonempty++;
++	}
++	if (layout->cascade && !found_cascade_header)
++		goto invalid;
++	if (layout->size != 192 * SZ_1K || layout->version != 0x1d ||
++	    layout->header_size != 0x200 || !layout->cascade ||
++	    layout->num_partitions != 16 || layout->num_nonempty != 4 ||
++	    layout->partitions[0].bin_addr != 0x200 ||
++	    layout->partitions[0].sram_addr != 0 ||
++	    layout->partitions[0].size != 0x17f3f ||
++	    layout->partitions[0].crc != 0x4c0ce2ae ||
++	    layout->partitions[1].bin_addr != 0x21400 ||
++	    layout->partitions[1].sram_addr != 0x1f400 ||
++	    layout->partitions[1].size != 0xcb67 ||
++	    layout->partitions[1].crc != 0xd6850337 ||
++	    layout->partitions[14].bin_addr != 0 ||
++	    layout->partitions[14].sram_addr != 0x2bf68 ||
++	    layout->partitions[14].size != 0xff ||
++	    layout->partitions[14].crc != 0x417eeaa6 ||
++	    layout->partitions[15].bin_addr != 0x100 ||
++	    layout->partitions[15].sram_addr != 0x2c068 ||
++	    layout->partitions[15].size != 0xff ||
++	    layout->partitions[15].crc != 0xecb27187)
++		goto invalid;
++
++	return 0;
++
++invalid:
++	kfree(layout->partitions);
++	layout->partitions = NULL;
++	return -EINVAL;
++}
++
++static int nvt_test_firmware_download(struct nvt_nt36523n *nvt)
++{
++	const struct firmware *fw;
++	struct nvt_fw_layout layout = { };
++	struct device *dev = &nvt->spi->dev;
++	int error;
++
++	error = request_firmware(&fw, nvt->firmware_name, dev);
++	if (error)
++		return dev_err_probe(dev, error, "failed to load %s\n",
++				     nvt->firmware_name);
++
++	error = nvt_parse_firmware(fw, &layout);
++	if (error)
++		dev_err(dev, "invalid firmware %s: %d\n", nvt->firmware_name,
++			error);
++	else
++		dev_info(dev,
++			 "validated firmware %s: %zu bytes, version %#02x, %u/%u nonempty partitions, cascade=%u\n",
++			 nvt->firmware_name, layout.size, layout.version,
++			 layout.num_nonempty, layout.num_partitions, layout.cascade);
++	if (!error) {
++		error = nvt_download_and_verify_firmware(nvt, fw, &layout);
++		if (error)
++			dev_err(dev, "firmware download verification failed: %d\n",
++				error);
++	}
++
++	kfree(layout.partitions);
++	release_firmware(fw);
++
++	return error;
++}
++
++static int nvt_spi_write(struct nvt_nt36523n *nvt, u8 reg,
++			 const u8 *data, size_t len)
++{
++	if (len + 1 > NVT_XFER_MAX)
++		return -EINVAL;
++
++	nvt->tx_buf[0] = reg | BIT(7);
++	memcpy(&nvt->tx_buf[1], data, len);
++
++	return spi_write(nvt->spi, nvt->tx_buf, len + 1);
++}
++
++static int nvt_spi_read(struct nvt_nt36523n *nvt, u8 reg, u8 *data,
++			size_t len)
++{
++	struct spi_transfer xfer = { };
++	int error;
++
++	if (len + 2 > NVT_XFER_MAX)
++		return -EINVAL;
++
++	memset(nvt->tx_buf, 0, len + 2);
++	memset(nvt->rx_buf, 0, len + 2);
++	nvt->tx_buf[0] = reg & GENMASK(6, 0);
++	xfer.tx_buf = nvt->tx_buf;
++	xfer.rx_buf = nvt->rx_buf;
++	xfer.len = len + 2;
++
++	error = spi_sync_transfer(nvt->spi, &xfer, 1);
++	if (error)
++		return error;
++
++	memcpy(data, &nvt->rx_buf[2], len);
++
++	return 0;
++}
++
++static int nvt_set_page(struct nvt_nt36523n *nvt, u32 addr)
++{
++	u8 page[] = { addr >> 15, addr >> 7 };
++
++	return nvt_spi_write(nvt, 0x7f, page, sizeof(page));
++}
++
++static int nvt_write_addr(struct nvt_nt36523n *nvt, u32 addr, u8 value)
++{
++	int error;
++
++	error = nvt_set_page(nvt, addr);
++	if (error)
++		return error;
++
++	return nvt_spi_write(nvt, addr & GENMASK(6, 0), &value, 1);
++}
++
++static int nvt_read_trim_id(struct nvt_nt36523n *nvt, u8 *id)
++{
++	int error;
++
++	error = nvt_write_addr(nvt, NVT_SWRST_SIF_ADDR, 0x69);
++	if (error)
++		return error;
++
++	usleep_range(5000, 6000);
++
++	error = nvt_set_page(nvt, NVT_CHIP_VER_TRIM_ADDR);
++	if (error)
++		return error;
++
++	return nvt_spi_read(nvt, NVT_CHIP_VER_TRIM_ADDR & GENMASK(6, 0),
++			    id, NVT_ID_LEN);
++}
++
++static int nvt_write_data(struct nvt_nt36523n *nvt, u32 addr,
++			  const u8 *data, size_t len)
++{
++	int error;
++
++	error = nvt_set_page(nvt, addr);
++	if (error)
++		return error;
++
++	return nvt_spi_write(nvt, addr & GENMASK(6, 0), data, len);
++}
++
++static int nvt_read_data(struct nvt_nt36523n *nvt, u32 addr, u8 *data,
++			 size_t len)
++{
++	int error;
++
++	error = nvt_set_page(nvt, addr);
++	if (error)
++		return error;
++
++	return nvt_spi_read(nvt, addr & GENMASK(6, 0), data, len);
++}
++
++static int nvt_set_crc_bank(struct nvt_nt36523n *nvt, u32 dest_addr,
++			    u32 length_addr, u32 crc_addr,
++			    const struct nvt_fw_partition *partition)
++{
++	u8 value[4];
++	int error;
++
++	value[0] = partition->sram_addr;
++	value[1] = partition->sram_addr >> 8;
++	value[2] = partition->sram_addr >> 16;
++	error = nvt_write_data(nvt, dest_addr, value, 3);
++	if (error)
++		return error;
++
++	value[0] = partition->size;
++	value[1] = partition->size >> 8;
++	value[2] = partition->size >> 16;
++	error = nvt_write_data(nvt, length_addr, value, 3);
++	if (error)
++		return error;
++
++	put_unaligned_le32(partition->crc, value);
++	return nvt_write_data(nvt, crc_addr, value, sizeof(value));
++}
++
++static int nvt_prepare_crc(struct nvt_nt36523n *nvt,
++			   const struct nvt_fw_layout *layout)
++{
++	int error;
++
++	error = nvt_set_crc_bank(nvt, NVT_ILM_DEST_ADDR,
++				 NVT_ILM_LENGTH_ADDR, NVT_G_ILM_CRC_ADDR,
++				 &layout->partitions[0]);
++	if (error)
++		return error;
++
++	return nvt_set_crc_bank(nvt, NVT_DLM_DEST_ADDR,
++				NVT_DLM_LENGTH_ADDR, NVT_G_DLM_CRC_ADDR,
++				&layout->partitions[1]);
++}
++
++static int nvt_setup_cascade_dma(struct nvt_nt36523n *nvt,
++				 const struct nvt_fw_layout *layout,
++				 const struct firmware *fw)
++{
++	u8 zeros[32] = { };
++	u8 value[] = { 0x35, 0x32, 0xaa, 0x00 };
++	int error;
++
++	if (!(fw->data[0x29] & BIT(0)))
++		return 0;
++
++	error = nvt_write_data(nvt, layout->partitions[1].sram_addr,
++			       zeros, sizeof(zeros));
++	if (error)
++		return error;
++
++	return nvt_write_data(nvt, NVT_SPI_DMA_SETUP_ADDR, value,
++			      sizeof(value));
++}
++
++static int nvt_write_firmware(struct nvt_nt36523n *nvt,
++			      const struct firmware *fw,
++			      const struct nvt_fw_layout *layout)
++{
++	struct spi_device *spi = nvt->spi;
++	size_t max_transfer = min(spi_max_transfer_size(spi),
++				  spi_max_message_size(spi));
++	size_t max_payload;
++	u8 *buf;
++	u32 i;
++	int error = 0;
++
++	if (max_transfer <= 1)
++		return -EOPNOTSUPP;
++
++	max_payload = min_t(size_t, NVT_FW_TRANSFER_MAX, max_transfer - 1);
++	buf = kmalloc(max_payload + 1, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	for (i = 0; i < layout->num_partitions; i++) {
++		const struct nvt_fw_partition *partition = &layout->partitions[i];
++		size_t remaining;
++		u32 bin_addr;
++		u32 sram_addr;
++
++		if (!partition->size)
++			continue;
++
++		remaining = partition->size + 1;
++		bin_addr = partition->bin_addr;
++		sram_addr = partition->sram_addr;
++		while (remaining) {
++			size_t len = min(remaining, max_payload);
++
++			error = nvt_set_page(nvt, sram_addr);
++			if (error)
++				goto out_free;
++
++			buf[0] = (sram_addr & GENMASK(6, 0)) | BIT(7);
++			memcpy(&buf[1], &fw->data[bin_addr], len);
++			error = spi_write(spi, buf, len + 1);
++			if (error)
++				goto out_free;
++
++			remaining -= len;
++			bin_addr += len;
++			sram_addr += len;
++		}
++	}
++
++out_free:
++	kfree(buf);
++	return error;
++}
++
++static int nvt_poll_dma_copy(struct nvt_nt36523n *nvt)
++{
++	u8 value;
++	int error;
++	int retry;
++
++	for (retry = 0; retry < 200; retry++) {
++		error = nvt_read_data(nvt, NVT_SPI_DMA_TX_INFO_ADDR, &value, 1);
++		if (error)
++			return error;
++		if (!value)
++			return 0;
++		usleep_range(1000, 1100);
++	}
++
++	return -ETIMEDOUT;
++}
++
++static int nvt_prepare_firmware_boot(struct nvt_nt36523n *nvt)
++{
++	u8 clear[6] = { };
++	u8 command[] = { 0xae, 0x00 };
++	int error;
++
++	error = nvt_write_data(nvt, NVT_EVENT_BUF_ADDR +
++			       NVT_EVENT_RESET_COMPLETE, clear, sizeof(clear));
++	if (error)
++		return error;
++
++	return nvt_write_data(nvt, NVT_EVENT_BUF_ADDR + NVT_EVENT_HOST_CMD,
++			      command, sizeof(command));
++}
++
++static int nvt_poll_reset_complete(struct nvt_nt36523n *nvt)
++{
++	u8 state[5];
++	int error;
++	int retry;
++
++	for (retry = 0; retry <= 10; retry++) {
++		error = nvt_read_data(nvt, NVT_EVENT_BUF_ADDR +
++				      NVT_EVENT_RESET_COMPLETE,
++				      state, sizeof(state));
++		if (error)
++			return error;
++		if (state[0] >= 0xa0 && state[0] <= 0xaf)
++			return 0;
++		usleep_range(10000, 11000);
++	}
++
++	return -ETIMEDOUT;
++}
++
++static int nvt_verify_boot_crc(struct nvt_nt36523n *nvt,
++			       const struct nvt_fw_layout *layout)
++{
++	const struct nvt_fw_partition *cascade_header =
++		&layout->partitions[layout->num_partitions - 1];
++	u8 value[4];
++	u32 bld_dest;
++	u32 bld_len;
++	u32 crc;
++	u32 expected_bld_len = cascade_header->size - sizeof(cascade_header->crc);
++	int error;
++
++	error = nvt_read_data(nvt, NVT_BLD_CRC_STATUS_ADDR, value, 1);
++	if (error)
++		return error;
++	if ((value[0] & GENMASK(2, 0)) != BIT(2)) {
++		dev_err(&nvt->spi->dev, "boot CRC status is 0x%02x\n", value[0]);
++		return -EBADMSG;
++	}
++
++	error = nvt_read_data(nvt, NVT_DMA_CRC_STATUS_ADDR, value, 1);
++	if (error)
++		return error;
++	if ((value[0] & GENMASK(1, 0)) != BIT(1)) {
++		dev_err(&nvt->spi->dev, "DMA CRC status is 0x%02x\n", value[0]);
++		return -EBADMSG;
++	}
++
++	error = nvt_read_data(nvt, NVT_G_ILM_CRC_ADDR, value, sizeof(value));
++	if (error)
++		return error;
++	crc = get_unaligned_le32(value);
++	if (crc != layout->partitions[0].crc) {
++		dev_err(&nvt->spi->dev,
++			"ILM golden CRC is 0x%08x, expected 0x%08x\n", crc,
++			layout->partitions[0].crc);
++		return -EBADMSG;
++	}
++
++	error = nvt_read_data(nvt, NVT_R_ILM_CRC_ADDR, value, sizeof(value));
++	if (error)
++		return error;
++	crc = get_unaligned_le32(value);
++	if (crc != layout->partitions[0].crc) {
++		dev_err(&nvt->spi->dev,
++			"ILM result CRC is 0x%08x, expected 0x%08x\n", crc,
++			layout->partitions[0].crc);
++		return -EBADMSG;
++	}
++
++	error = nvt_read_data(nvt, NVT_G_DLM_CRC_ADDR, value, sizeof(value));
++	if (error)
++		return error;
++	crc = get_unaligned_le32(value);
++	if (crc != cascade_header->crc) {
++		dev_err(&nvt->spi->dev,
++			"cascade golden CRC is 0x%08x, expected 0x%08x\n",
++			crc, cascade_header->crc);
++		return -EBADMSG;
++	}
++
++	error = nvt_read_data(nvt, NVT_R_DLM_CRC_ADDR, value, sizeof(value));
++	if (error)
++		return error;
++	crc = get_unaligned_le32(value);
++	if (crc != cascade_header->crc) {
++		dev_err(&nvt->spi->dev,
++			"cascade result CRC is 0x%08x, expected 0x%08x\n",
++			crc, cascade_header->crc);
++		return -EBADMSG;
++	}
++
++	error = nvt_read_data(nvt, NVT_BLD_DEST_ADDR, value, 3);
++	if (error)
++		return error;
++	bld_dest = value[0] | value[1] << 8 | value[2] << 16;
++	error = nvt_read_data(nvt, NVT_BLD_LENGTH_ADDR, value, 3);
++	if (error)
++		return error;
++	bld_len = value[0] | value[1] << 8 | value[2] << 16;
++	if (bld_dest != cascade_header->sram_addr ||
++	    bld_len != expected_bld_len) {
++		dev_err(&nvt->spi->dev,
++			"cascade BLD range is 0x%06x/0x%06x, expected 0x%06x/0x%06x\n",
++			bld_dest, bld_len, cascade_header->sram_addr,
++			expected_bld_len);
++		return -EBADMSG;
++	}
++
++	return 0;
++}
++
++static int nvt_read_u24(struct nvt_nt36523n *nvt, u32 addr, u32 *value)
++{
++	u8 data[3];
++	int error;
++
++	error = nvt_read_data(nvt, addr, data, sizeof(data));
++	if (!error)
++		*value = data[0] | data[1] << 8 | data[2] << 16;
++
++	return error;
++}
++
++static int nvt_read_u32(struct nvt_nt36523n *nvt, u32 addr, u32 *value)
++{
++	u8 data[4];
++	int error;
++
++	error = nvt_read_data(nvt, addr, data, sizeof(data));
++	if (!error)
++		*value = get_unaligned_le32(data);
++
++	return error;
++}
++
++static void nvt_log_crc_snapshot(struct nvt_nt36523n *nvt, const char *stage)
++{
++	struct nvt_snapshot_reg {
++		u32 addr;
++		u32 *value;
++		u8 size;
++	};
++	struct device *dev = &nvt->spi->dev;
++	u32 g_ilm, g_dlm, r_ilm, r_dlm;
++	u32 ilm_dest, dlm_dest, bld_dest;
++	u32 ilm_len, dlm_len, bld_len;
++	struct nvt_snapshot_reg registers[] = {
++		{ NVT_G_ILM_CRC_ADDR, &g_ilm, 4 },
++		{ NVT_G_DLM_CRC_ADDR, &g_dlm, 4 },
++		{ NVT_R_ILM_CRC_ADDR, &r_ilm, 4 },
++		{ NVT_R_DLM_CRC_ADDR, &r_dlm, 4 },
++		{ NVT_ILM_DEST_ADDR, &ilm_dest, 3 },
++		{ NVT_DLM_DEST_ADDR, &dlm_dest, 3 },
++		{ NVT_BLD_DEST_ADDR, &bld_dest, 3 },
++		{ NVT_ILM_LENGTH_ADDR, &ilm_len, 3 },
++		{ NVT_DLM_LENGTH_ADDR, &dlm_len, 3 },
++		{ NVT_BLD_LENGTH_ADDR, &bld_len, 3 },
++	};
++	u8 reset_state[5];
++	u8 boot_status;
++	u8 dma_status;
++	int error;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(registers); i++) {
++		if (registers[i].size == 3)
++			error = nvt_read_u24(nvt, registers[i].addr,
++					     registers[i].value);
++		else
++			error = nvt_read_u32(nvt, registers[i].addr,
++					     registers[i].value);
++		if (error)
++			goto read_failed;
++	}
++
++	error = nvt_read_data(nvt, NVT_BLD_CRC_STATUS_ADDR, &boot_status, 1);
++	if (error)
++		goto read_failed;
++	error = nvt_read_data(nvt, NVT_DMA_CRC_STATUS_ADDR, &dma_status, 1);
++	if (error)
++		goto read_failed;
++	error = nvt_read_data(nvt, NVT_EVENT_BUF_ADDR + NVT_EVENT_RESET_COMPLETE,
++			      reset_state, sizeof(reset_state));
++	if (error)
++		goto read_failed;
++
++	dev_info(dev,
++		 "%s CRC snapshot: G=%08x/%08x R=%08x/%08x dest=%06x/%06x/%06x len=%06x/%06x/%06x status=%02x/%02x reset=%*ph\n",
++		 stage, g_ilm, g_dlm, r_ilm, r_dlm, ilm_dest, dlm_dest,
++		 bld_dest, ilm_len, dlm_len, bld_len, boot_status, dma_status,
++		 (int)sizeof(reset_state), reset_state);
++	return;
++
++read_failed:
++	dev_warn(dev, "%s CRC snapshot failed: %d\n", stage, error);
++}
++
++static int nvt_verify_fw_info(struct nvt_nt36523n *nvt,
++			      const struct nvt_fw_layout *layout)
++{
++	u8 info[38];
++	u16 pid;
++	u16 width;
++	u16 height;
++	int error;
++
++	error = nvt_read_data(nvt, NVT_EVENT_BUF_ADDR + NVT_EVENT_FWINFO,
++			      info, sizeof(info));
++	if (error)
++		return error;
++
++	pid = get_unaligned_le16(&info[34]);
++	width = get_unaligned_be16(&info[4]);
++	height = get_unaligned_be16(&info[6]);
++	if ((u8)(info[0] + info[1]) != 0xff ||
++	    info[0] != layout->version || pid != NVT_PID_TB320FC ||
++	    width != NVT_TOUCH_MAX_X || height != NVT_TOUCH_MAX_Y) {
++		dev_err(&nvt->spi->dev,
++			"unexpected firmware info: version 0x%02x/0x%02x, PID 0x%04x, %ux%u\n",
++			info[0], info[1], pid, width, height);
++		return -ENODEV;
++	}
++
++	dev_info(&nvt->spi->dev,
++		 "firmware running: version 0x%02x, PID 0x%04x, %ux%u\n",
++		 info[0], pid, width, height);
++
++	return 0;
++}
++
++static int nvt_set_default_pen_state(struct nvt_nt36523n *nvt)
++{
++	u8 command[] = { 0x7b, 0x00 };
++	u8 ack;
++	int error;
++	int retry;
++
++	for (retry = 0; retry < 5; retry++) {
++		error = nvt_write_data(nvt, NVT_EVENT_BUF_ADDR +
++				       NVT_EVENT_HOST_CMD, command,
++				       sizeof(command));
++		if (error)
++			return error;
++
++		msleep(20);
++		error = nvt_read_data(nvt, NVT_EVENT_BUF_ADDR +
++				      NVT_EVENT_HOST_CMD, &ack, 1);
++		if (error)
++			return error;
++		if (!ack) {
++			dev_info(&nvt->spi->dev,
++				 "default pen state acknowledged after %d attempt(s)\n",
++				 retry + 1);
++			return 0;
++		}
++	}
++
++	dev_err(&nvt->spi->dev,
++		"default pen state command was not acknowledged: 0x%02x\n",
++		ack);
++	return -ETIMEDOUT;
++}
++
++static int nvt_firmware_step_error(struct nvt_nt36523n *nvt, int error,
++				   const char *step)
++{
++	return dev_err_probe(&nvt->spi->dev, error,
++			     "firmware %s failed\n", step);
++}
++
++static int nvt_download_and_verify_firmware(struct nvt_nt36523n *nvt,
++					    const struct firmware *fw,
++					    const struct nvt_fw_layout *layout)
++{
++	u8 value = 0x69;
++	int error;
++
++	error = nvt_write_addr(nvt, NVT_SWRST_SIF_ADDR, 0x69);
++	if (error)
++		return nvt_firmware_step_error(nvt, error, "bootloader reset");
++	usleep_range(5000, 6000);
++
++	error = nvt_prepare_crc(nvt, layout);
++	if (error)
++		return nvt_firmware_step_error(nvt, error, "CRC setup");
++
++	error = nvt_setup_cascade_dma(nvt, layout, fw);
++	if (error)
++		return nvt_firmware_step_error(nvt, error, "cascade DMA setup");
++
++	error = nvt_write_data(nvt, NVT_TX_AUTO_COPY_ADDR, &value, 1);
++	if (error)
++		return nvt_firmware_step_error(nvt, error, "auto-copy setup");
++
++	error = nvt_write_firmware(nvt, fw, layout);
++	if (error)
++		return nvt_firmware_step_error(nvt, error, "SRAM transfer");
++
++	error = nvt_poll_dma_copy(nvt);
++	if (error)
++		return nvt_firmware_step_error(nvt, error, "cascade DMA copy");
++	nvt_log_crc_snapshot(nvt, "pre-boot");
++
++	error = nvt_prepare_firmware_boot(nvt);
++	if (error)
++		return nvt_firmware_step_error(nvt, error,
++				       "firmware boot preparation");
++
++	error = nvt_write_addr(nvt, NVT_BOOT_READY_ADDR, 1);
++	if (error)
++		return nvt_firmware_step_error(nvt, error, "boot-ready signal");
++	usleep_range(5000, 6000);
++
++	error = nvt_poll_reset_complete(nvt);
++	if (error)
++		return nvt_firmware_step_error(nvt, error, "reset-state poll");
++	nvt_log_crc_snapshot(nvt, "post-boot");
++
++	error = nvt_verify_boot_crc(nvt, layout);
++	if (error)
++		return nvt_firmware_step_error(nvt, error, "CRC verification");
++
++	error = nvt_verify_fw_info(nvt, layout);
++	if (error)
++		return nvt_firmware_step_error(nvt, error,
++					       "runtime-info verification");
++
++	error = nvt_set_default_pen_state(nvt);
++	if (error)
++		return nvt_firmware_step_error(nvt, error,
++					       "default pen state");
++
++	return 0;
++}
++
++static bool nvt_is_nt36523n(const u8 *id)
++{
++	return id[0] == 0x17 && id[3] == 0x23 && id[4] == 0x65 &&
++	       id[5] == 0x03;
++}
++
++static void nvt_nt36523n_release_contacts(struct nvt_nt36523n *nvt)
++{
++	if (!nvt->input_registered)
++		return;
++
++	input_mt_sync_frame(nvt->input);
++	input_sync(nvt->input);
++}
++
++static int nvt_nt36523n_read_history(struct nvt_nt36523n *nvt, u32 addr)
++{
++	u8 history[64];
++	int error;
++
++	error = nvt_read_data(nvt, addr, history, sizeof(history));
++	if (error)
++		return error;
++
++	dev_info(&nvt->spi->dev, "firmware history %#06x: %64phN\n",
++		 addr, history);
++	return 0;
++}
++
++static int nvt_nt36523n_recover_firmware(struct nvt_nt36523n *nvt)
++{
++	int error;
++
++	if (nvt->wdt_fe_recovery) {
++		error = nvt_write_addr(nvt, NVT_SWRST_SIF_ADDR, 0xaa);
++		if (error)
++			return nvt_firmware_step_error(nvt, error,
++					       "WDT reset-idle");
++		usleep_range(15000, 16000);
++
++		error = nvt_write_addr(nvt, NVT_ACI_ERROR_FLAG_ADDR, 0xa5);
++		if (error)
++			return nvt_firmware_step_error(nvt, error,
++					       "ACI error set");
++		error = nvt_write_addr(nvt, NVT_ACI_ERROR_FLAG_ADDR, 0);
++		if (error)
++			return nvt_firmware_step_error(nvt, error,
++					       "ACI error clear");
++	}
++
++	error = nvt_nt36523n_read_history(nvt, NVT_HISTORY_EVENT0_ADDR);
++	if (error)
++		return nvt_firmware_step_error(nvt, error, "history event 0 read");
++	error = nvt_nt36523n_read_history(nvt, NVT_HISTORY_EVENT1_ADDR);
++	if (error)
++		return nvt_firmware_step_error(nvt, error, "history event 1 read");
++
++	return nvt_test_firmware_download(nvt);
++}
++
++static void nvt_nt36523n_recovery_work(struct work_struct *work)
++{
++	struct nvt_nt36523n *nvt = container_of(work, struct nvt_nt36523n,
++						recovery_work);
++	struct device *dev = &nvt->spi->dev;
++	int error;
++	int reset_error;
++
++	mutex_lock(&nvt->state_lock);
++	if (nvt->stopping || !nvt->running)
++		goto unlock;
++
++	disable_irq(nvt->spi->irq);
++	nvt_nt36523n_release_contacts(nvt);
++	if (atomic_read(&nvt->recovery_state) == NVT_RECOVERY_STOPPED) {
++		dev_err(dev, "firmware WDT repeated after recovery; stopping touch\n");
++		goto stop;
++	}
++
++	dev_warn(dev, "attempting one firmware WDT recovery\n");
++	error = nvt_nt36523n_recover_firmware(nvt);
++	if (error)
++		goto stop;
++
++	error = nvt_set_page(nvt, NVT_EVENT_BUF_ADDR);
++	if (error) {
++		dev_err_probe(dev, error,
++			      "failed to select event page after recovery\n");
++		goto stop;
++	}
++
++	nvt->wdt_frames = 0;
++	nvt->logged_bad_packet = false;
++	atomic_set(&nvt->recovery_state, NVT_RECOVERY_COMPLETE);
++	enable_irq(nvt->spi->irq);
++	dev_info(dev, "firmware WDT recovery completed\n");
++	goto unlock;
++
++stop:
++	nvt->running = false;
++	atomic_set(&nvt->recovery_state, NVT_RECOVERY_STOPPED);
++	reset_error = gpiod_set_value_cansleep(nvt->reset_gpio, 1);
++	if (reset_error)
++		dev_err(dev, "failed to assert reset after WDT failure: %d\n",
++			reset_error);
++
++unlock:
++	mutex_unlock(&nvt->state_lock);
++}
++
++static bool nvt_nt36523n_is_wdt_frame(const u8 *points)
++{
++	int i;
++
++	for (i = 0; i < 6; i++)
++		if (points[i] != 0xfd && points[i] != 0xfe)
++			return false;
++
++	return true;
++}
++
++static bool nvt_nt36523n_queue_recovery(struct nvt_nt36523n *nvt,
++					const u8 *points)
++{
++	int state;
++
++	if (!nvt_nt36523n_is_wdt_frame(points)) {
++		nvt->wdt_frames = 0;
++		return false;
++	}
++	if (++nvt->wdt_frames < NVT_WDT_FRAME_LIMIT)
++		return false;
++
++	nvt->wdt_frames = 0;
++	state = atomic_cmpxchg(&nvt->recovery_state, NVT_RECOVERY_ELIGIBLE,
++			       NVT_RECOVERY_PENDING);
++	if (state == NVT_RECOVERY_ELIGIBLE)
++		nvt->wdt_fe_recovery = points[0] == 0xfe;
++	if (state == NVT_RECOVERY_COMPLETE)
++		state = atomic_cmpxchg(&nvt->recovery_state,
++				       NVT_RECOVERY_COMPLETE,
++				       NVT_RECOVERY_STOPPED);
++	if (state == NVT_RECOVERY_ELIGIBLE || state == NVT_RECOVERY_COMPLETE)
++		schedule_work(&nvt->recovery_work);
++
++	return true;
++}
++
++static irqreturn_t nvt_nt36523n_irq(int irq, void *data)
++{
++	struct nvt_nt36523n *nvt = data;
++	struct input_dev *input = nvt->input;
++	u8 points[NVT_POINT_DATA_LEN];
++	u8 checksum = 0;
++	int error;
++	int i;
++
++	error = nvt_spi_read(nvt, 0, points, sizeof(points));
++	if (error) {
++		dev_err_ratelimited(&nvt->spi->dev,
++				    "failed to read touch data: %d\n", error);
++		nvt_nt36523n_release_contacts(nvt);
++		return IRQ_HANDLED;
++	}
++	if (nvt_nt36523n_queue_recovery(nvt, points)) {
++		nvt_nt36523n_release_contacts(nvt);
++		return IRQ_HANDLED;
++	}
++
++	for (i = 0; i < NVT_POINT_CHECKSUM_LEN; i++)
++		checksum += points[i];
++	if (checksum) {
++		if (!nvt->logged_bad_packet) {
++			dev_err(&nvt->spi->dev,
++				"first invalid touch packet[0:64]: %64phN\n",
++				points);
++			dev_err(&nvt->spi->dev,
++				"first invalid touch packet[64:108]: %44phN\n",
++				&points[64]);
++			nvt->logged_bad_packet = true;
++		}
++		dev_err_ratelimited(&nvt->spi->dev,
++				    "touch packet checksum is 0x%02x\n",
++				    checksum);
++		nvt_nt36523n_release_contacts(nvt);
++		return IRQ_HANDLED;
++	}
++
++	for (i = 0; i < NVT_MAX_TOUCHES; i++) {
++		size_t pos = i * NVT_TOUCH_RECORD_LEN;
++		u8 id = points[pos] >> 3;
++		u8 status = points[pos] & GENMASK(2, 0);
++		u16 x;
++		u16 y;
++		u8 width;
++		u8 pressure;
++
++		if (!id || id > NVT_MAX_TOUCHES ||
++		    (status != 1 && status != 2))
++			continue;
++
++		x = get_unaligned_be16(&points[pos + 1]);
++		y = get_unaligned_be16(&points[pos + 3]);
++		if (x > NVT_TOUCH_MAX_X || y > NVT_TOUCH_MAX_Y)
++			continue;
++
++		width = max_t(u8, points[pos + 5], 1);
++		pressure = max_t(u8, points[98 + i], 1);
++
++		input_mt_slot(input, id - 1);
++		input_mt_report_slot_state(input, MT_TOOL_FINGER, true);
++		touchscreen_report_pos(input, &nvt->prop, x, y, true);
++		input_report_abs(input, ABS_MT_TOUCH_MAJOR, width);
++		input_report_abs(input, ABS_MT_PRESSURE, pressure);
++	}
++
++	input_mt_sync_frame(input);
++	input_sync(input);
++
++	return IRQ_HANDLED;
++}
++
++static int nvt_nt36523n_input_init(struct nvt_nt36523n *nvt)
++{
++	struct device *dev = &nvt->spi->dev;
++	struct input_dev *input;
++	int error;
++
++	if (nvt->input_registered)
++		return 0;
++
++	input = devm_input_allocate_device(dev);
++	if (!input)
++		return -ENOMEM;
++
++	input->name = "NT36523N Capacitive Touchscreen";
++	input->id.bustype = BUS_SPI;
++	input_set_drvdata(input, nvt);
++	input_set_capability(input, EV_KEY, BTN_TOUCH);
++	input_set_abs_params(input, ABS_MT_POSITION_X, 0, NVT_TOUCH_MAX_X,
++			     0, 0);
++	input_set_abs_params(input, ABS_MT_POSITION_Y, 0, NVT_TOUCH_MAX_Y,
++			     0, 0);
++	input_set_abs_params(input, ABS_MT_TOUCH_MAJOR, 0, U8_MAX, 0, 0);
++	input_set_abs_params(input, ABS_MT_PRESSURE, 0, NVT_TOUCH_MAX_PRESSURE,
++			     0, 0);
++	touchscreen_parse_properties(input, true, &nvt->prop);
++
++	error = input_mt_init_slots(input, NVT_MAX_TOUCHES,
++				    INPUT_MT_DIRECT | INPUT_MT_DROP_UNUSED);
++	if (error)
++		return error;
++
++	error = input_register_device(input);
++	if (error)
++		return error;
++
++	nvt->input = input;
++	nvt->input_registered = true;
++	return 0;
++}
++
++static int nvt_nt36523n_run_test(struct nvt_nt36523n *nvt)
++{
++	struct device *dev = &nvt->spi->dev;
++	u8 id[NVT_ID_LEN] = { };
++	int error;
++	int reset_error;
++	int retry;
++
++	/* The downstream host-download sequence performs this while reset is low. */
++	usleep_range(1000, 2000);
++	error = nvt_write_addr(nvt, NVT_ENG_RESET_ADDR, 0x5a);
++	if (error)
++		goto out_assert_reset;
++
++	usleep_range(1000, 2000);
++	error = gpiod_set_value_cansleep(nvt->reset_gpio, 0);
++	if (error) {
++		dev_err_probe(dev, error, "failed to deassert reset\n");
++		goto out_assert_reset;
++	}
++	usleep_range(10000, 11000);
++
++	for (retry = 0; retry < 3; retry++) {
++		error = nvt_read_trim_id(nvt, id);
++		if (!error && nvt_is_nt36523n(id))
++			break;
++	}
++
++	if (error)
++		dev_err_probe(dev, error, "failed to read trim ID\n");
++	else if (!nvt_is_nt36523n(id))
++		error = dev_err_probe(dev, -ENODEV,
++				      "unsupported trim ID %*ph\n", NVT_ID_LEN, id);
++	else
++		error = nvt_test_firmware_download(nvt);
++
++out_assert_reset:
++	if (!error)
++		return 0;
++
++	reset_error = gpiod_set_value_cansleep(nvt->reset_gpio, 1);
++	if (reset_error)
++		return dev_err_probe(dev, reset_error,
++				     "failed to assert reset after trim ID %*ph\n",
++				     NVT_ID_LEN, id);
++
++	return error;
++}
++
++static int nvt_nt36523n_panel_prepared(struct drm_panel_follower *follower)
++{
++	struct nvt_nt36523n *nvt = container_of(follower, struct nvt_nt36523n,
++						panel_follower);
++	int error;
++	int reset_error;
++
++	mutex_lock(&nvt->state_lock);
++	if (nvt->stopping) {
++		error = -ESHUTDOWN;
++		goto unlock;
++	}
++	if (nvt->running) {
++		error = 0;
++		goto unlock;
++	}
++
++	error = nvt_nt36523n_run_test(nvt);
++	if (error)
++		goto unlock;
++
++	error = nvt_nt36523n_input_init(nvt);
++	if (error) {
++		dev_err_probe(&nvt->spi->dev, error,
++			      "failed to register finger input\n");
++		goto assert_reset;
++	}
++	error = nvt_set_page(nvt, NVT_EVENT_BUF_ADDR);
++	if (error) {
++		dev_err_probe(&nvt->spi->dev, error,
++			      "failed to select event page\n");
++		goto assert_reset;
++	}
++
++	nvt->logged_bad_packet = false;
++	nvt->wdt_frames = 0;
++	atomic_set(&nvt->recovery_state, NVT_RECOVERY_ELIGIBLE);
++	nvt->running = true;
++	enable_irq(nvt->spi->irq);
++	dev_info(&nvt->spi->dev, "finger input ready\n");
++	mutex_unlock(&nvt->state_lock);
++	return 0;
++
++assert_reset:
++	reset_error = gpiod_set_value_cansleep(nvt->reset_gpio, 1);
++	if (reset_error) {
++		dev_err(&nvt->spi->dev,
++			"failed to assert reset after input error: %d\n",
++			reset_error);
++		error = reset_error;
++	}
++
++unlock:
++	mutex_unlock(&nvt->state_lock);
++	return error;
++}
++
++static int nvt_nt36523n_panel_unpreparing(struct drm_panel_follower *follower)
++{
++	struct nvt_nt36523n *nvt = container_of(follower, struct nvt_nt36523n,
++						panel_follower);
++	int error;
++
++	mutex_lock(&nvt->state_lock);
++	if (nvt->stopping) {
++		error = gpiod_set_value_cansleep(nvt->reset_gpio, 1);
++		goto unlock;
++	}
++
++	if (nvt->running) {
++		disable_irq(nvt->spi->irq);
++		nvt->running = false;
++		nvt_nt36523n_release_contacts(nvt);
++	}
++
++	error = gpiod_set_value_cansleep(nvt->reset_gpio, 1);
++	if (error)
++		dev_err(&nvt->spi->dev,
++			"failed to assert reset before panel unprepare\n");
++
++unlock:
++	mutex_unlock(&nvt->state_lock);
++	cancel_work_sync(&nvt->recovery_work);
++	return error;
++}
++
++static const struct drm_panel_follower_funcs nvt_nt36523n_panel_funcs = {
++	.panel_prepared = nvt_nt36523n_panel_prepared,
++	.panel_unpreparing = nvt_nt36523n_panel_unpreparing,
++};
++
++static int nvt_nt36523n_probe(struct spi_device *spi)
++{
++	struct device *dev = &spi->dev;
++	struct nvt_nt36523n *nvt;
++	int error;
++
++	nvt = devm_kzalloc(dev, sizeof(*nvt), GFP_KERNEL);
++	if (!nvt)
++		return -ENOMEM;
++
++	nvt->spi = spi;
++	mutex_init(&nvt->state_lock);
++	INIT_WORK(&nvt->recovery_work, nvt_nt36523n_recovery_work);
++	spi_set_drvdata(spi, nvt);
++	nvt->tx_buf = devm_kzalloc(dev, NVT_XFER_MAX, GFP_KERNEL);
++	if (!nvt->tx_buf)
++		return -ENOMEM;
++
++	nvt->rx_buf = devm_kzalloc(dev, NVT_XFER_MAX, GFP_KERNEL);
++	if (!nvt->rx_buf)
++		return -ENOMEM;
++
++	nvt->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(nvt->reset_gpio))
++		return dev_err_probe(dev, PTR_ERR(nvt->reset_gpio),
++				     "failed to get reset GPIO\n");
++
++	error = device_property_read_string(dev, "firmware-name",
++					    &nvt->firmware_name);
++	if (error)
++		return dev_err_probe(dev, error,
++				     "failed to read firmware-name\n");
++
++	spi->mode = SPI_MODE_0;
++	spi->bits_per_word = 8;
++	error = spi_setup(spi);
++	if (error)
++		return dev_err_probe(dev, error, "failed to configure SPI\n");
++	if (spi->irq <= 0)
++		return dev_err_probe(dev, -EINVAL, "invalid interrupt\n");
++
++	error = devm_request_threaded_irq(dev, spi->irq, NULL,
++					  nvt_nt36523n_irq,
++					  IRQF_ONESHOT | IRQF_NO_AUTOEN |
++					  IRQF_TRIGGER_RISING,
++					  dev_name(dev), nvt);
++	if (error)
++		return dev_err_probe(dev, error, "failed to request interrupt\n");
++
++	nvt->panel_follower.funcs = &nvt_nt36523n_panel_funcs;
++	return devm_drm_panel_add_follower(dev, &nvt->panel_follower);
++}
++
++static void nvt_nt36523n_remove(struct spi_device *spi)
++{
++	struct nvt_nt36523n *nvt = spi_get_drvdata(spi);
++
++	mutex_lock(&nvt->state_lock);
++	nvt->stopping = true;
++	if (nvt->running) {
++		disable_irq(spi->irq);
++		nvt->running = false;
++		nvt_nt36523n_release_contacts(nvt);
++	}
++
++	if (gpiod_set_value_cansleep(nvt->reset_gpio, 1))
++		dev_err(&spi->dev, "failed to assert reset on remove\n");
++	mutex_unlock(&nvt->state_lock);
++	cancel_work_sync(&nvt->recovery_work);
++}
++
++static void nvt_nt36523n_shutdown(struct spi_device *spi)
++{
++	struct nvt_nt36523n *nvt = spi_get_drvdata(spi);
++
++	mutex_lock(&nvt->state_lock);
++	nvt->stopping = true;
++	if (nvt->running) {
++		disable_irq(spi->irq);
++		nvt->running = false;
++		nvt_nt36523n_release_contacts(nvt);
++	}
++
++	if (gpiod_set_value_cansleep(nvt->reset_gpio, 1))
++		dev_err(&spi->dev, "failed to assert reset on shutdown\n");
++	mutex_unlock(&nvt->state_lock);
++	cancel_work_sync(&nvt->recovery_work);
++}
++
++static const struct of_device_id nvt_nt36523n_of_match[] = {
++	{ .compatible = "novatek,nt36523n-spi" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, nvt_nt36523n_of_match);
++
++static const struct spi_device_id nvt_nt36523n_spi_ids[] = {
++	{ "nt36523n-spi" },
++	{ }
++};
++MODULE_DEVICE_TABLE(spi, nvt_nt36523n_spi_ids);
++
++static struct spi_driver nvt_nt36523n_driver = {
++	.probe = nvt_nt36523n_probe,
++	.remove = nvt_nt36523n_remove,
++	.shutdown = nvt_nt36523n_shutdown,
++	.id_table = nvt_nt36523n_spi_ids,
++	.driver = {
++		.name = "novatek-nt36523n-spi",
++		.of_match_table = nvt_nt36523n_of_match,
++	},
++};
++module_spi_driver(nvt_nt36523n_driver);
++
++MODULE_AUTHOR("dianqk");
++MODULE_DESCRIPTION("Novatek NT36523N SPI touchscreen driver");
++MODULE_LICENSE("GPL");

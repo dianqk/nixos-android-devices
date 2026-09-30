@@ -1,0 +1,319 @@
+From 5570e21a25542615c92e079972e64fcbec69a10d Mon Sep 17 00:00:00 2001
+From: Y700 kernel rebase <y700-rebase@localhost>
+Date: Wed, 23 Sep 2026 08:40:15 +0800
+Subject: [PATCH 08/10] arm64: dts and ASoC: add Y700 USB and audio integration
+
+Source-commit: local 5570e21a25542615c92e079972e64fcbec69a10d
+---
+diff --git a/Documentation/devicetree/bindings/sound/qcom,sm8250.yaml b/Documentation/devicetree/bindings/sound/qcom,sm8250.yaml
+index 1536fcd96..7665e73b4 100644
+--- a/Documentation/devicetree/bindings/sound/qcom,sm8250.yaml
++++ b/Documentation/devicetree/bindings/sound/qcom,sm8250.yaml
+@@ -23,6 +23,7 @@ properties:
+           - const: qcom,sdm845-sndcard
+       - items:
+           - enum:
++              - lenovo,y700-sndcard
+               - qcom,eliza-sndcard
+               - qcom,hawi-sndcard
+               - qcom,kaanapali-sndcard
+diff --git a/arch/arm64/boot/dts/qcom/sm8475-lenovo-asphalt.dts b/arch/arm64/boot/dts/qcom/sm8475-lenovo-asphalt.dts
+index 96dabcbdc..5af8133be 100644
+--- a/arch/arm64/boot/dts/qcom/sm8475-lenovo-asphalt.dts
++++ b/arch/arm64/boot/dts/qcom/sm8475-lenovo-asphalt.dts
+@@ -75,6 +75,28 @@ vph_pwr: regulator-vph-pwr {
+ 		regulator-boot-on;
+ 	};
+ 
++	/* Both physical Type-C ports report CC state through the stock ADSP. */
++	pmic-glink {
++		compatible = "qcom,sm8450-pmic-glink", "qcom,pmic-glink";
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		/* The two connectors share DWC3; neither owns its role switch. */
++		connector@0 {
++			compatible = "usb-c-connector";
++			reg = <0>;
++			power-role = "dual";
++			data-role = "dual";
++		};
++
++		connector@1 {
++			compatible = "usb-c-connector";
++			reg = <1>;
++			power-role = "dual";
++			data-role = "dual";
++		};
++	};
++
+ 	wcn6855-pmu {
+ 		compatible = "qcom,wcn6855-pmu";
+ 
+@@ -282,6 +304,12 @@ pm8350_s12: smps12 {
+ 			regulator-max-microvolt = <1256000>;
+ 		};
+ 
++		pm8350_l1: ldo1 {
++			regulator-name = "pm8350_l1";
++			regulator-min-microvolt = <830000>;
++			regulator-max-microvolt = <920000>;
++		};
++
+ 		pm8350_l2: ldo2 {
+ 			regulator-name = "pm8350_l2";
+ 			regulator-min-microvolt = <2700000>;
+@@ -488,6 +516,132 @@ eusb2_repeater: phy@4f {
+ 	};
+ };
+ 
++&i2c13 {
++	clock-frequency = <400000>;
++	status = "okay";
++
++	spk1: speaker-amp@30 {
++		compatible = "cirrus,cs35l45";
++		reg = <0x30>;
++		interrupts-extended = <&tlmm 172 IRQ_TYPE_LEVEL_LOW>;
++		pinctrl-0 = <&spk1_irq_default>;
++		pinctrl-names = "default";
++		reset-gpios = <&tlmm 123 GPIO_ACTIVE_HIGH>;
++		#sound-dai-cells = <1>;
++		sound-name-prefix = "SPK1";
++		cirrus,dsp-part-name = "spk1-cs35l45";
++		cirrus,asp-sdout-hiz-ctrl = <3>;
++
++		cirrus,gpio-ctrl1 {
++			gpio-ctrl = <2>;
++		};
++	};
++
++	spk2: speaker-amp@31 {
++		compatible = "cirrus,cs35l45";
++		reg = <0x31>;
++		interrupts-extended = <&tlmm 1 IRQ_TYPE_LEVEL_LOW>;
++		pinctrl-0 = <&spk2_irq_default>;
++		pinctrl-names = "default";
++		reset-gpios = <&tlmm 123 GPIO_ACTIVE_HIGH>;
++		#sound-dai-cells = <1>;
++		sound-name-prefix = "SPK2";
++		cirrus,dsp-part-name = "spk2-cs35l45";
++		cirrus,asp-sdout-hiz-ctrl = <3>;
++
++		cirrus,gpio-ctrl1 {
++			gpio-ctrl = <2>;
++		};
++	};
++};
++
++&q6apmbedai {
++	#address-cells = <1>;
++	#size-cells = <0>;
++
++	dai@10 {
++		reg = <PRIMARY_MI2S_RX>;
++		clocks = <&q6prmcc LPASS_CLK_ID_PRI_MI2S_IBIT
++				   LPASS_CLK_ATTRIBUTE_COUPLE_NO>;
++		clock-names = "bclk";
++	};
++};
++
++&remoteproc_adsp {
++	firmware-name = "qcom/sm8475/lenovo/tb320fc/adsp.mdt";
++	status = "okay";
++};
++
++&sound {
++	compatible = "lenovo,y700-sndcard", "qcom,sm8450-sndcard";
++	model = "Lenovo-Y700";
++	pinctrl-0 = <&mi2s0_sck_default>, <&mi2s0_ws_default>,
++		    <&mi2s0_data0_default>;
++	pinctrl-names = "default";
++	audio-routing = "Speaker Left", "SPK1 SPK",
++			"Speaker Right", "SPK2 SPK";
++
++	speaker-playback-dai-link {
++		link-name = "Speaker Playback";
++
++		cpu {
++			sound-dai = <&q6apmbedai PRIMARY_MI2S_RX>;
++		};
++
++		codec {
++			sound-dai = <&spk1 0>, <&spk2 0>;
++		};
++
++		platform {
++			sound-dai = <&q6apm>;
++		};
++	};
++};
++
++&tlmm {
++	usb3_orientation_default: usb3-orientation-default-state {
++		pins = "gpio91";
++		function = "usb_phy";
++		drive-strength = <2>;
++		bias-disable;
++	};
++
++	spk1_irq_default: spk1-irq-default-state {
++		pins = "gpio172";
++		function = "gpio";
++		bias-pull-up;
++		input-enable;
++	};
++
++	spk2_irq_default: spk2-irq-default-state {
++		pins = "gpio1";
++		function = "gpio";
++		bias-pull-up;
++		input-enable;
++	};
++
++	mi2s0_sck_default: mi2s0-sck-default-state {
++		pins = "gpio126";
++		function = "mi2s0_sck";
++		drive-strength = <8>;
++		bias-disable;
++	};
++
++	mi2s0_ws_default: mi2s0-ws-default-state {
++		pins = "gpio129";
++		function = "mi2s0_ws";
++		drive-strength = <8>;
++		bias-disable;
++	};
++
++	mi2s0_data0_default: mi2s0-data0-default-state {
++		pins = "gpio127";
++		function = "mi2s0_data0";
++		drive-strength = <8>;
++		bias-disable;
++	};
++};
++
+ 
+ &mdss {
+ 	status = "okay";
+@@ -712,11 +866,9 @@ bluetooth {
+ };
+ 
+ &usb_1 {
+-	qcom,select-utmi-as-pipe-clk;
+-	dr_mode = "peripheral";
+-	maximum-speed = "high-speed";
+-	phys = <&usb_1_hsphy>;
+-	phy-names = "usb2-phy";
++	dr_mode = "otg";
++	role-switch-default-mode = "peripheral";
++	maximum-speed = "super-speed-plus";
+ 	status = "okay";
+ };
+ 
+@@ -727,6 +879,16 @@ &usb_1_hsphy {
+ 	status = "okay";
+ };
+ 
++&usb_1_qmpphy {
++	compatible = "qcom,sm8475-qmp-usb3-dp-phy";
++	vdda-phy-supply = <&pm8350_l1>;
++	vdda-pll-supply = <&pm8350c_l10>;
++	pinctrl-0 = <&usb3_orientation_default>;
++	pinctrl-names = "default";
++	qcom,hardware-port-select;
++	status = "okay";
++};
++
+ &ufs_mem_hc {
+ 	/* TB320FC stock UFS core and UniPro clocks support 75--850 MHz. */
+ 	freq-table-hz =
+diff --git a/sound/soc/qcom/sc8280xp.c b/sound/soc/qcom/sc8280xp.c
+index 4d48e1012..43b18a2f1 100644
+--- a/sound/soc/qcom/sc8280xp.c
++++ b/sound/soc/qcom/sc8280xp.c
+@@ -58,6 +58,11 @@ static const struct snd_soc_dapm_widget max98090_dapm_widgets[] = {
+ 	SND_SOC_DAPM_SPK("Speaker", NULL),
+ };
+ 
++static const struct snd_soc_dapm_widget y700_dapm_widgets[] = {
++	SND_SOC_DAPM_SPK("Speaker Left", NULL),
++	SND_SOC_DAPM_SPK("Speaker Right", NULL),
++};
++
+ struct qcom_snd_soc_common {
+ 	const char *driver_name;
+ 	const struct snd_soc_dapm_widget *dapm_widgets;
+@@ -248,12 +253,13 @@ static int sc8280xp_snd_hw_params(struct snd_pcm_substream *substream,
+ 				  struct snd_pcm_hw_params *params)
+ {
+ 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+-	struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
++	struct snd_soc_dai *codec_dai;
+ 	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+ 	struct sc8280xp_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
+ 	int mclk_freq = sc8280xp_get_mclk_freq(params);
+ 	int bclk_freq = sc8280xp_get_bclk_freq(params);
+ 	int ret;
++	int i;
+ 
+ 	switch (cpu_dai->id) {
+ 	case PRIMARY_MI2S_RX ... QUATERNARY_MI2S_TX:
+@@ -265,10 +271,12 @@ static int sc8280xp_snd_hw_params(struct snd_pcm_substream *substream,
+ 			return ret;
+ 
+ 		if (data->priv->codec_dai_fmt) {
+-			ret = snd_soc_dai_set_fmt(codec_dai,
++			for_each_rtd_codec_dais(rtd, i, codec_dai) {
++				ret = snd_soc_dai_set_fmt(codec_dai,
+ 						  data->priv->codec_dai_fmt);
+-			if (ret && ret != -ENOTSUPP)
+-				return ret;
++				if (ret && ret != -ENOTSUPP)
++					return ret;
++			}
+ 		}
+ 
+ 		if (data->priv->mi2s_mclk_enable) {
+@@ -288,11 +296,12 @@ static int sc8280xp_snd_hw_params(struct snd_pcm_substream *substream,
+ 		}
+ 
+ 		if (data->priv->codec_sysclk_set) {
+-			ret = snd_soc_dai_set_sysclk(codec_dai,
+-						     0, mclk_freq,
++			for_each_rtd_codec_dais(rtd, i, codec_dai) {
++				ret = snd_soc_dai_set_sysclk(codec_dai, 0, mclk_freq,
+ 						     SND_SOC_CLOCK_IN);
+-			if (ret && ret != -ENOTSUPP)
+-				return ret;
++				if (ret && ret != -ENOTSUPP)
++					return ret;
++			}
+ 		}
+ 		break;
+ 	case PRIMARY_TDM_RX_0 ... QUINARY_TDM_TX_7:
+@@ -518,6 +527,16 @@ static const struct qcom_snd_soc_common sm8450_priv_data = {
+ 			 SND_SOC_DAIFMT_I2S,
+ };
+ 
++static const struct qcom_snd_soc_common y700_priv_data = {
++	.driver_name = "sm8475",
++	.dapm_widgets = y700_dapm_widgets,
++	.num_dapm_widgets = ARRAY_SIZE(y700_dapm_widgets),
++	.mi2s_bclk_enable = true,
++	.codec_dai_fmt = SND_SOC_DAIFMT_BC_FC |
++			 SND_SOC_DAIFMT_NB_NF |
++			 SND_SOC_DAIFMT_I2S,
++};
++
+ static const struct qcom_snd_soc_common sm8475_priv_data = {
+ 	.driver_name = "sm8475",
+ 	.dapm_widgets = sc8280xp_dapm_widgets,
+@@ -559,6 +578,7 @@ static const struct qcom_snd_soc_common sm8750_priv_data = {
+ };
+ 
+ static const struct of_device_id snd_sc8280xp_dt_match[] = {
++	{ .compatible = "lenovo,y700-sndcard", .data = &y700_priv_data },
+ 	{ .compatible = "ayaneo,pocket-s2-sndcard", .data = &ayaneo_ps2_priv_data },
+ 	{ .compatible = "qcom,eliza-sndcard", .data = &eliza_priv_data },
+ 	{ .compatible = "qcom,hawi-sndcard", .data = &hawi_priv_data },

@@ -1,0 +1,27 @@
+[
+  ./patches/sdm845-mainline/0001-nt35596s-panel.patch
+  ./patches/sdm845-mainline/0002-pmi8998-fuel-gauge.patch
+  ./patches/sdm845-mainline/0003-tas2559-codec.patch
+  ./patches/sdm845-mainline/0004-pmi8998-fg-binding.patch
+  ./patches/sdm845-mainline/0005-pmi8998-fg-node.patch
+  ./patches/sdm845-mainline/0006-ath10k-split-amsdu.patch
+  ./patches/local/0006-polaris-board.patch
+  ./patches/local/0007-tas2559-probe-error.patch
+  ./patches/local/0008-pmi8998-fg-lifecycle.patch
+  ./patches/local/0009-nt35596s-prepare.patch
+  ./patches/local/0011-wcn3990-vht.patch
+  ./patches/local/0012-panel-7.3-api.patch
+  ./patches/linux-rfc/0013-ath10k-split-amsdu-rfc-v3.patch
+  ./patches/local/0014-venus-mapped-eos-input.patch
+  ./patches/local/0015-q6asm-pcm-msb-alignment.patch
+  ./patches/sdm845-mainline/0016-imx363-sensor.patch
+  ./patches/local/0017-imx363-power-errors.patch
+  ./patches/local/0018-polaris-cameras.patch
+  ./patches/linux-rfc/0019-mdss-boot-power-domain.patch
+  ./patches/local/0020-clk-orphan-parent-enable.patch
+  ./patches/linux-rfc/0021-qrtr-hello-before-services.patch
+  ./patches/local/0022-qrtr-coalesce-hello.patch
+  ./patches/local/0023-polaris-ramoops.patch
+  ./patches/local/0024-polaris-rmtfs-guards.patch
+  ./patches/local/0025-polaris-ipa.patch
+]

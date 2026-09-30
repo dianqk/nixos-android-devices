@@ -1,0 +1,47 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 27 Sep 2026 14:53:00 +0800
+Subject: [PATCH] net: qrtr: coalesce HELLO senders under the endpoint lock
+
+The restored nameserver reply must precede service announcements, even
+when the incoming HELLO wins the race with proactive registration work.
+Keep proactive work for peers which wait for the host to initiate, but
+send only one HELLO per endpoint session. Takashi Iwai reported that
+sending both proactive and reply HELLO packets confuses firmware.
+
+Check hello_sent at the final transmit critical section, after verifying
+the endpoint still exists. Consume a coalesced skb and return success;
+the existing successful-send path sets hello_sent under the same lock.
+Keep the MHI resume reset and delayed retry behavior unchanged.
+
+This coalescing implementation is local, not part of Takashi's patch.
+It addresses initial SMD endpoint startup on Polaris, not every MHI reset
+race or transport-error announcement retry.
+
+Link: https://lore.kernel.org/all/878q55sfxo.wl-tiwai@suse.de/
+Fixes: 544d85de4dc2 ("net: qrtr: Send HELLO message on endpoint register")
+---
+ net/qrtr/af_qrtr.c | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/net/qrtr/af_qrtr.c b/net/qrtr/af_qrtr.c
+--- a/net/qrtr/af_qrtr.c
++++ b/net/qrtr/af_qrtr.c
+@@ -384,10 +384,15 @@
+ 	if (!rc) {
+ 		mutex_lock(&node->ep_lock);
+ 		rc = -ENODEV;
+-		if (node->ep)
++		if (!node->ep) {
++			kfree_skb(skb);
++		} else if (type == QRTR_TYPE_HELLO && node->hello_sent) {
++			/* Coalesce the NS reply and proactive handshake work. */
++			consume_skb(skb);
++			rc = 0;
++		} else {
+ 			rc = node->ep->xmit(node->ep, skb);
+-		else
+-			kfree_skb(skb);
++		}
+ 		if (!rc && type == QRTR_TYPE_HELLO)
+ 			node->hello_sent = true;
+ 		mutex_unlock(&node->ep_lock);

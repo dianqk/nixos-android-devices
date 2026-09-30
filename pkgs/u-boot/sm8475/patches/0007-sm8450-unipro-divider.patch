@@ -1,0 +1,27 @@
+From: NixOS Android devices contributors <nixos-android-devices@localhost>
+Date: Mon, 28 Sep 2026 22:50:00 +0800
+Subject: [PATCH] clk: qcom: preserve encoded SM8450 UniPro divider
+
+Local correction to the SM8475 boot dependency patch. Frequency table
+and RCGR layout follow Linux gcc-sm8450.c:
+https://github.com/torvalds/linux/blob/v7.3-rc4/drivers/clk/qcom/gcc-sm8450.c
+
+F() encodes divider 2 as HID=3. clk_rcg_set_rate() encodes this again
+as HID=5 and ORs it into the old divider. For old CFG=0x103 this yields
+0x107, which is 150 MHz, while ufs-qcom sets timers for 300 MHz.
+Asphalt runtime reads confirm CFG=0x107 and the 600 MHz GPLL0 parent.
+Replace divider/source/mode bits explicitly, using the encoded value.
+Only the SM8450 UniPro clock changes; retain existing PLL programming.
+---
+--- a/drivers/clk/qcom/clock-sm8450.c
++++ b/drivers/clk/qcom/clock-sm8450.c
+@@ -1,3 +1,8 @@
+ 		freq = qcom_find_freq(ftbl_ufs, rate);
+-		clk_rcg_set_rate(priv->base, 0x8708c, freq->pre_div, freq->src);
++		/* F() already encodes the HID divider; replace the old divider. */
++		clrsetbits_le32(priv->base + 0x87090,
++			       GENMASK(4, 0) | GENMASK(10, 8) |
++			       GENMASK(13, 12) | BIT(20),
++			       freq->pre_div | freq->src);
++		clk_bcr_update(priv->base + 0x8708c);
+ 		return freq->freq;

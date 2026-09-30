@@ -1,0 +1,150 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Mon, 28 Sep 2026 14:00:00 +0800
+Subject: [PATCH] video: allow integer scaling of bitmap console fonts
+
+Phone displays need larger glyphs than the existing bitmap font choices.
+Expand the selected font once rather than complicating each pixel renderer.
+Keep the existing default and use the scaled metrics for console
+dimensions, cursor movement and EFI Simple Text Output. Propagate
+allocation failures through font selection and release previous scaled
+buffers on reselection.
+
+Local patch against official U-Boot v2026.10-rc5 (no imported patch).
+Link: https://git.u-boot-project.org/u-boot/u-boot/-/blob/a06e89ab05eaa2b8344d521319399333cd760ae5/drivers/video/console_core.c
+Polaris selects the existing GPL-2.0+ 8x16 font at scale 3, yielding 24x48.
+No font bitmap or font license is replaced.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+diff --git a/drivers/video/Kconfig b/drivers/video/Kconfig
+index 15000e21..eaa28204 100644
+--- a/drivers/video/Kconfig
++++ b/drivers/video/Kconfig
+@@ -58,6 +58,16 @@ config VIDEO_FONT_16X32
+ 	  Provides character bitmap data in header file.
+ 	  When selecting multiple fonts, you may want to enable CMD_SELECT_FONT too.
+ 
++config VIDEO_FONT_SCALE
++	int "Integer bitmap console font scale"
++	default 1
++	range 1 4
++	help
++	  Enlarge bitmap console glyphs by this integer factor in both axes.
++	  The scaled font is allocated once on font selection; character drawing
++	  and EFI text-console dimensions use its actual pixel size. TrueType
++	  consoles are unaffected. A value of 1 keeps the original font.
++
+ config VIDEO_LOGO
+ 	bool "Show the U-Boot logo on the display"
+ 	default y if !SPLASH_SCREEN
+diff --git a/drivers/video/console_core.c b/drivers/video/console_core.c
+index 93936365..cdf52a43 100644
+--- a/drivers/video/console_core.c
++++ b/drivers/video/console_core.c
+@@ -9,9 +9,52 @@
+ #include <video.h>
+ #include <video_console.h>
+ #include <dm.h>
++#include <dm/devres.h>
+ #include <video_font.h>
+ #include "vidconsole_internal.h"
+ 
++/* Scale all 256 bitmap glyphs once, including fonts with padded byte rows. */
++static struct video_fontdata *console_scale_font(struct udevice *dev,
++						struct video_fontdata *font,
++						unsigned int scale)
++{
++	struct video_fontdata *scaled;
++	int width = font->width * scale;
++	int height = font->height * scale;
++	int stride = VIDEO_FONT_BYTE_WIDTH(width);
++	int glyph_bytes = height * stride;
++
++	scaled = devm_kzalloc(dev, sizeof(*scaled) + 256 * glyph_bytes,
++			     GFP_KERNEL);
++	if (!scaled)
++		return NULL;
++
++	*scaled = *font;
++	scaled->width = width;
++	scaled->height = height;
++	scaled->byte_width = stride;
++	scaled->char_pixel_bytes = glyph_bytes;
++	scaled->video_fontdata = (unsigned char *)(scaled + 1);
++	for (int glyph = 0; glyph < 256; glyph++) {
++		const unsigned char *src = font->video_fontdata +
++			glyph * font->char_pixel_bytes;
++		unsigned char *dst = scaled->video_fontdata + glyph * glyph_bytes;
++
++		for (int y = 0; y < height; y++) {
++			for (int x = 0; x < width; x++) {
++				int sx = x / scale;
++				int sy = y / scale;
++
++				if (src[sy * font->byte_width + sx / 8] &
++				    (0x80 >> (sx % 8)))
++					dst[y * stride + x / 8] |= 0x80 >> (x % 8);
++			}
++		}
++	}
++
++	return scaled;
++}
++
+ /**
+  * console_set_font() - prepare vidconsole for chosen font.
+  *
+@@ -24,6 +67,18 @@ static int console_set_font(struct udevice *dev, struct video_fontdata *fontdata
+ 	struct vidconsole_priv *vc_priv = dev_get_uclass_priv(dev);
+ 	struct video_priv *vid_priv = dev_get_uclass_priv(dev->parent);
+ 
++	if (CONFIG_VIDEO_FONT_SCALE > 1) {
++		struct video_fontdata *scaled;
++
++		scaled = console_scale_font(dev, fontdata, CONFIG_VIDEO_FONT_SCALE);
++		if (!scaled)
++			return -ENOMEM;
++		if (priv->scaled_font)
++			devm_kfree(dev, priv->scaled_font);
++		priv->scaled_font = scaled;
++		fontdata = scaled;
++	}
++
+ 	debug("console_simple: setting %s font\n", fontdata->name);
+ 	debug("width: %d\n", fontdata->width);
+ 	debug("byte width: %d\n", fontdata->byte_width);
+@@ -234,14 +289,13 @@ int console_simple_select_font(struct udevice *dev, const char *name, uint size)
+ 
+ 	if (!name) {
+ 		if (fonts->name)
+-			console_set_font(dev, fonts);
++			return console_set_font(dev, fonts);
+ 		return 0;
+ 	}
+ 
+ 	for (font = fonts; font->name; font++) {
+ 		if (!strcmp(name, font->name)) {
+-			console_set_font(dev, font);
+-			return 0;
++			return console_set_font(dev, font);
+ 		}
+ 	};
+ 	printf("no such font: %s, make sure it's name has <width>x<height> format\n", name);
+diff --git a/drivers/video/vidconsole_internal.h b/drivers/video/vidconsole_internal.h
+index bb0277ee..5b41b6aa 100644
+--- a/drivers/video/vidconsole_internal.h
++++ b/drivers/video/vidconsole_internal.h
+@@ -15,10 +15,12 @@
+ /**
+  * struct console_simple_priv - Private data for this driver
+  *
+- * @video_fontdata	font graphical representation data
++ * @fontdata		font graphical representation data
++ * @scaled_font		device-managed enlarged font, or NULL at native scale
+  */
+ struct console_simple_priv {
+ 	struct video_fontdata *fontdata;
++	struct video_fontdata *scaled_font;
+ };
+ 
+ /**

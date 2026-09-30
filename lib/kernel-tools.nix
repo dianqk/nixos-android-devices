@@ -1,0 +1,21 @@
+pkgs: with pkgs; [
+  bc
+  bison
+  ccache
+  cpio
+  dtc
+  flex
+  gnumake
+  gzip
+  llvmPackages_23.clang
+  llvmPackages_23.lld
+  llvmPackages_23.llvm
+  android-tools
+  openssl
+  pahole
+  pkg-config
+  python3
+  rsync
+  xz
+  zstd
+]

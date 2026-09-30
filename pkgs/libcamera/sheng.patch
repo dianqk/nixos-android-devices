@@ -1,0 +1,51 @@
+Subject: [PATCH] libcamera: add Sheng front and main sensor gain helpers
+
+The S5KJN1 driver exposes gain in units of 1/32 and OV32D40 in units
+of 1/256. Match those V4L2 control values so the software ISP can adjust
+exposure without interpreting the large driver defaults as unity gain.
+
+Gain control definitions from the pinned device kernel:
+https://github.com/ianchb/sm8550-mainline/blob/7.2.2/drivers/media/i2c/s5kjn1-sheng.c
+https://github.com/ianchb/sm8550-mainline/blob/7.2.2/drivers/media/i2c/ov32d40.c
+
+Leave black level to the software ISP estimator and sensor delays to
+libcamera defaults until calibrated measurements are available.
+This is a local integration patch, not an imported upstream commit.
+
+diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -781,6 +781,16 @@
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("ov5693", CameraSensorHelperOv5693)
+ 
++class CameraSensorHelperOv32d40 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperOv32d40()
++	{
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 256 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("ov32d40", CameraSensorHelperOv32d40)
++
+ class CameraSensorHelperOv64a40 : public CameraSensorHelper
+ {
+ public:
+@@ -827,6 +837,16 @@
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("ov13858", CameraSensorHelperOv13858)
+ 
++class CameraSensorHelperS5kjn1 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperS5kjn1()
++	{
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 32 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("s5kjn1", CameraSensorHelperS5kjn1)
++
+ class CameraSensorHelperVd55g1 : public CameraSensorHelper
+ {
+ public:

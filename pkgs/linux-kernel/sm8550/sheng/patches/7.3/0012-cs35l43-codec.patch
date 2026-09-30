@@ -1,0 +1,5126 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 29 Sep 2026 00:00:00 +0800
+Subject: [PATCH] ASoC: port CS35L43 amplifier codec
+
+Porting notes: Add the fork codec files and apply narrow 7.3 cs_dsp, Kconfig, and Makefile hunks. Convert the fork text binding to a 7.3 YAML schema for the implemented properties. Use a boolean VPBR property in the six Sheng amplifier nodes to match the driver.
+
+Original author dates, messages, and trailers: patches/ORIGINS.md.
+Source-Commit: https://github.com/ianchb/sm8550-mainline/commit/b4fb5849f227f0b0856cee9573a8d47cfcd1f545
+Source-Commit: https://github.com/ianchb/sm8550-mainline/commit/66828741c83c2929b68f57fce768a82382adc923
+---
+diff --git a/Documentation/devicetree/bindings/sound/cirrus,cs35l43.yaml b/Documentation/devicetree/bindings/sound/cirrus,cs35l43.yaml
+new file mode 100644
+index 0000000..5ab0c18
+--- /dev/null
++++ b/Documentation/devicetree/bindings/sound/cirrus,cs35l43.yaml
+@@ -0,0 +1,139 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/sound/cirrus,cs35l43.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Cirrus Logic CS35L43 speaker amplifier
++
++maintainers:
++  - map220v <map220v300@gmail.com>
++
++allOf:
++  - $ref: dai-common.yaml#
++
++properties:
++  compatible:
++    const: cirrus,cs35l43
++
++  reg:
++    maxItems: 1
++
++  interrupts:
++    maxItems: 1
++
++  reset-gpios:
++    maxItems: 1
++
++  '#sound-dai-cells':
++    const: 0
++
++  sound-name-prefix:
++    $ref: /schemas/types.yaml#/definitions/string
++
++  VA-supply: true
++  VP-supply: true
++
++  cirrus,dsp-part-name:
++    description: DSP firmware part name for this amplifier.
++    $ref: /schemas/types.yaml#/definitions/string
++
++  cirrus,asp-sdout-hiz:
++    description: ASP serial output high impedance mode.
++    $ref: /schemas/types.yaml#/definitions/uint32
++    maximum: 3
++
++  cirrus,boost-ctl-millivolt:
++    description: Boost converter output voltage in millivolts.
++    $ref: /schemas/types.yaml#/definitions/uint32
++    minimum: 2550
++    maximum: 11000
++
++  cirrus,bst-ipk-ma:
++    description: Boost converter peak current limit in milliamps.
++    $ref: /schemas/types.yaml#/definitions/uint32
++    minimum: 1600
++    maximum: 4500
++
++  cirrus,classh-disable:
++    description: Disable Class H tracking.
++    type: boolean
++
++  cirrus,low-pwr-mode-standby:
++    description: Use standby as the low power mode.
++    type: boolean
++
++  cirrus,dsp-noise-gate-enable:
++    description: Enable the DSP noise gate.
++    type: boolean
++
++  cirrus,gpio1-output-enable:
++    description: Enable GPIO1 as an output.
++    type: boolean
++
++  cirrus,gpio2-output-enable:
++    description: Enable GPIO2 as an output.
++    type: boolean
++
++  cirrus,hw-noise-gate-select:
++    description: Hardware noise gate source selection bit mask.
++    $ref: /schemas/types.yaml#/definitions/uint32
++
++  cirrus,hw-noise-gate-delay:
++    description: Hardware noise gate activation delay selector.
++    $ref: /schemas/types.yaml#/definitions/uint32
++
++  cirrus,hw-noise-gate-threshold:
++    description: Hardware noise gate threshold selector.
++    $ref: /schemas/types.yaml#/definitions/uint32
++
++  cirrus,dsp-noise-gate-threshold:
++    description: DSP noise gate threshold selector.
++    $ref: /schemas/types.yaml#/definitions/uint32
++
++  cirrus,dsp-noise-gate-delay:
++    description: DSP noise gate activation delay selector.
++    $ref: /schemas/types.yaml#/definitions/uint32
++
++  cirrus,gpio1-src-sel:
++    description: GPIO1 source selector.
++    $ref: /schemas/types.yaml#/definitions/uint32
++
++  cirrus,gpio2-src-sel:
++    description: GPIO2 source selector.
++    $ref: /schemas/types.yaml#/definitions/uint32
++
++  cirrus,vpbr-enable:
++    description: Enable VP brownout prevention.
++    type: boolean
++
++  cirrus,vpbr-rel-rate:
++    description: Brownout attenuation release rate selector.
++    $ref: /schemas/types.yaml#/definitions/uint32
++
++  cirrus,vpbr-wait:
++    description: Brownout attenuation release wait selector.
++    $ref: /schemas/types.yaml#/definitions/uint32
++
++  cirrus,vpbr-atk-rate:
++    description: Brownout attenuation attack rate selector.
++    $ref: /schemas/types.yaml#/definitions/uint32
++
++  cirrus,vpbr-atk-vol:
++    description: Brownout attenuation attack step selector.
++    $ref: /schemas/types.yaml#/definitions/uint32
++
++  cirrus,vpbr-max-att:
++    description: Maximum brownout attenuation selector.
++    $ref: /schemas/types.yaml#/definitions/uint32
++
++  cirrus,vpbr-thld:
++    description: VP brownout voltage threshold selector.
++    $ref: /schemas/types.yaml#/definitions/uint32
++
++required:
++  - compatible
++  - reg
++  - '#sound-dai-cells'
++
++unevaluatedProperties: false
+diff --git a/drivers/firmware/cirrus/cs_dsp.c b/drivers/firmware/cirrus/cs_dsp.c
+index bb93b24..ac7c68c 100644
+--- a/drivers/firmware/cirrus/cs_dsp.c
++++ b/drivers/firmware/cirrus/cs_dsp.c
+@@ -2214,7 +2214,7 @@ static int cs_dsp_halo_setup_algs(struct cs_dsp *dsp)
+ 	return ret;
+ }
+ 
+-static int cs_dsp_load_coeff(struct cs_dsp *dsp, const struct firmware *firmware,
++int cs_dsp_load_coeff(struct cs_dsp *dsp, const struct firmware *firmware,
+ 			     const char *file)
+ {
+ 	LIST_HEAD(buf_list);
+@@ -2428,6 +2428,7 @@ static int cs_dsp_load_coeff(struct cs_dsp *dsp, const struct firmware *firmware
+ 
+ 	return ret;
+ }
++EXPORT_SYMBOL_GPL(cs_dsp_load_coeff);
+ 
+ static int cs_dsp_create_name(struct cs_dsp *dsp)
+ {
+diff --git a/include/linux/firmware/cirrus/cs_dsp.h b/include/linux/firmware/cirrus/cs_dsp.h
+index 4e3baa5..8044126 100644
+--- a/include/linux/firmware/cirrus/cs_dsp.h
++++ b/include/linux/firmware/cirrus/cs_dsp.h
+@@ -261,6 +261,8 @@ int cs_dsp_read_raw_data_block(struct cs_dsp *dsp, int mem_type, unsigned int me
+ int cs_dsp_read_data_word(struct cs_dsp *dsp, int mem_type, unsigned int mem_addr, u32 *data);
+ int cs_dsp_write_data_word(struct cs_dsp *dsp, int mem_type, unsigned int mem_addr, u32 data);
+ void cs_dsp_remove_padding(u32 *buf, int nwords);
++int cs_dsp_load_coeff(struct cs_dsp *dsp, const struct firmware *firmware,
++			     const char *file);
+ 
+ struct cs_dsp_alg_region *cs_dsp_find_alg_region(struct cs_dsp *dsp,
+ 						 int type, unsigned int id);
+diff --git a/include/sound/cs35l43.h b/include/sound/cs35l43.h
+new file mode 100644
+index 0000000..80adb53
+--- /dev/null
++++ b/include/sound/cs35l43.h
+@@ -0,0 +1,156 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++/*
++ * linux/sound/cs35l43.h -- Platform data for CS35L43
++ *
++ * Copyright (c) 2021 Cirrus Logic Inc.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#ifndef __CS35L43_H
++#define __CS35L43_H
++
++
++#define CS35L43_RX_FORMATS (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE)
++#define CS35L43_TX_FORMATS (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE \
++				| SNDRV_PCM_FMTBIT_S32_LE)
++
++#define CS35L43_VALID_PDATA		0x80000000
++#define CS35L43_NUM_DEFAULTS	41
++
++struct cs35l43_platform_data {
++	bool gpio1_out_enable;
++	bool gpio2_out_enable;
++	bool classh_disable;
++	bool dsp_ng_enable;
++	bool vpbr_enable;
++	int asp_sdout_hiz;
++	int dsp_ng_pcm_thld;
++	int dsp_ng_delay;
++	int dout_hiz;
++	int bst_vctrl;
++	int bst_ipk;
++	int hw_ng_sel;
++	int hw_ng_delay;
++	int hw_ng_thld;
++	int gpio1_src_sel;
++	int gpio2_src_sel;
++	int vpbr_rel_rate;
++	int vpbr_wait;
++	int vpbr_atk_rate;
++	int vpbr_atk_vol;
++	int vpbr_max_att;
++	int vpbr_thld;
++	const char *dsp_part_name;
++};
++
++struct cs35l43_pll_sysclk_config {
++	int freq;
++	int clk_cfg;
++};
++
++struct cs35l43_fs_mon_config {
++	int freq;
++	unsigned int fs1;
++	unsigned int fs2;
++};
++
++extern const struct cs35l43_pll_sysclk_config cs35l43_pll_sysclk[64];
++extern const struct cs35l43_fs_mon_config cs35l43_fs_mon[7];
++extern const unsigned int cs35l43_hibernate_update_regs[CS35L43_POWER_SEQ_LENGTH];
++extern const u8 cs35l43_write_seq_op_sizes[CS35L43_POWER_SEQ_NUM_OPS][2];
++
++enum cs35l43_hibernate_state {
++	CS35L43_HIBERNATE_AWAKE		= 0,
++	CS35L43_HIBERNATE_STANDBY	= 1,
++	CS35L43_HIBERNATE_UPDATE	= 2,
++	CS35L43_HIBERNATE_NOT_LOADED	= 3,
++	CS35L43_HIBERNATE_DISABLED	= 4,
++};
++
++struct cs35l43_write_seq_elem {
++	u8 size;
++	u16 offset; /* offset in words from pseq_base */
++	u8 operation;
++	u32 *words;
++	struct list_head list;
++};
++
++struct cs35l43_write_seq {
++	const char *name;
++	struct list_head list_head;
++	unsigned int num_ops;
++	unsigned int length;
++};
++
++struct cs35l43_dsp_reg {
++	const char *name;
++	unsigned int id;
++	unsigned int check_value;
++};
++
++enum cs35l43_hibernate_mode {
++	CS35L43_ULTRASONIC_MODE_DISABLED = 0,
++	CS35L43_ULTRASONIC_MODE_INBAND = 1,
++	CS35L43_ULTRASONIC_MODE_OUT_OF_BAND = 2,
++};
++
++enum cs35l43_low_pwr_mode {
++	CS35L43_LOW_PWR_MODE_HIBERNATE = 0,
++	CS35L43_LOW_PWR_MODE_STANDBY = 1,
++};
++
++struct cs35l43_private {
++	struct wm_adsp dsp; /* needs to be first member */
++	struct snd_soc_component *component;
++	struct cs35l43_platform_data pdata;
++	struct device *dev;
++	struct regmap *regmap;
++	struct regulator_bulk_data supplies[2];
++	int num_supplies;
++	int irq;
++	int extclk_cfg;
++	int clk_id;
++	int lrclk_fmt;
++	int sclk_fmt;
++	int asp_fmt;
++	int hibernate_state;
++	int hibernate_delay_ms;
++	int ultrasonic_mode;
++	int slot_width;
++	int delta_requested;
++	int delta_applied;
++	int low_pwr_mode;
++	bool first_event;
++	bool write_seq_initialized;
++	unsigned int max_spi_freq;
++	struct gpio_desc *reset_gpio;
++	struct mutex hb_lock;
++	struct workqueue_struct *mbox_wq;
++	struct work_struct mbox_work;
++	struct mutex err_lock;
++	struct workqueue_struct *err_wq;
++	struct work_struct err_work;
++	struct cs35l43_write_seq power_on_seq;
++	void (*limit_spi_clock)(struct cs35l43_private *cs35l43, bool state);
++};
++
++int cs35l43_probe(struct cs35l43_private *cs35l43,
++				struct cs35l43_platform_data *pdata);
++int cs35l43_remove(struct cs35l43_private *cs35l43);
++
++bool cs35l43_readable_reg(struct device *dev, unsigned int reg);
++bool cs35l43_precious_reg(struct device *dev, unsigned int reg);
++bool cs35l43_volatile_reg(struct device *dev, unsigned int reg);
++
++/* Power management */
++int cs35l43_suspend_runtime(struct device *dev);
++int cs35l43_resume_runtime(struct device *dev);
++
++extern const struct dev_pm_ops cs35l43_pm_ops;
++extern const struct reg_default cs35l43_reg[CS35L43_NUM_DEFAULTS];
++
++#endif /* __CS35L43_H */
+diff --git a/sound/soc/codecs/Kconfig b/sound/soc/codecs/Kconfig
+index d88593c..22f90d7 100644
+--- a/sound/soc/codecs/Kconfig
++++ b/sound/soc/codecs/Kconfig
+@@ -407,7 +407,6 @@ config SND_SOC_WM_ADSP
+ 	tristate "Cirrus Logic wm_adsp driver" if KUNIT
+ 	select FW_CS_DSP
+ 	select SND_SOC_COMPRESS
+-
+ config SND_SOC_WM_ADSP_TEST
+ 	tristate "KUnit tests for Cirrus Logic wm_adsp" if !KUNIT_ALL_TESTS
+ 	depends on KUNIT
+@@ -839,6 +838,22 @@ config SND_SOC_CS35L41_I2C
+ 	select SND_SOC_CS35L41
+ 	select REGMAP_I2C
+ 
++config SND_SOC_CS35L43
++	tristate "Cirrus Logic CS35L43 CODEC"
++	select SND_SOC_WM_ADSP
++
++config SND_SOC_CS35L43_I2C
++	tristate "Cirrus Logic CS35L43 CODEC (I2C)"
++	depends on I2C
++	select REGMAP_I2C
++	select SND_SOC_CS35L43
++
++config SND_SOC_CS35L43_SPI
++	tristate "Cirrus Logic CS35L43 CODEC (SPI)"
++	depends on SPI_MASTER
++	select REGMAP_SPI
++	select SND_SOC_CS35L43
++
+ config SND_SOC_CS35L45
+ 	tristate
+ 	select REGMAP_IRQ
+diff --git a/sound/soc/codecs/Makefile b/sound/soc/codecs/Makefile
+index 3d122ac..50da0cc 100644
+--- a/sound/soc/codecs/Makefile
++++ b/sound/soc/codecs/Makefile
+@@ -73,6 +73,8 @@ snd-soc-cs35l41-lib-y := cs35l41-lib.o
+ snd-soc-cs35l41-y := cs35l41.o
+ snd-soc-cs35l41-spi-y := cs35l41-spi.o
+ snd-soc-cs35l41-i2c-y := cs35l41-i2c.o
++snd-soc-cs35l43-i2c-y := cs35l43-i2c.o cs35l43.o cs35l43-tables.o
++snd-soc-cs35l43-spi-y := cs35l43-spi.o cs35l43.o cs35l43-tables.o
+ snd-soc-cs35l45-y := cs35l45.o cs35l45-tables.o
+ snd-soc-cs35l45-spi-y := cs35l45-spi.o
+ snd-soc-cs35l45-i2c-y := cs35l45-i2c.o
+@@ -517,6 +519,8 @@ obj-$(CONFIG_SND_SOC_CS35L41)	+= snd-soc-cs35l41.o
+ obj-$(CONFIG_SND_SOC_CS35L41_LIB)	+= snd-soc-cs35l41-lib.o
+ obj-$(CONFIG_SND_SOC_CS35L41_SPI)	+= snd-soc-cs35l41-spi.o
+ obj-$(CONFIG_SND_SOC_CS35L41_I2C)	+= snd-soc-cs35l41-i2c.o
++obj-$(CONFIG_SND_SOC_CS35L43_I2C)	+= snd-soc-cs35l43-i2c.o
++obj-$(CONFIG_SND_SOC_CS35L43_SPI)	+= snd-soc-cs35l43-spi.o
+ obj-$(CONFIG_SND_SOC_CS35L45)	+= snd-soc-cs35l45.o
+ obj-$(CONFIG_SND_SOC_CS35L45_SPI)	+= snd-soc-cs35l45-spi.o
+ obj-$(CONFIG_SND_SOC_CS35L45_I2C)	+= snd-soc-cs35l45-i2c.o
+diff --git a/sound/soc/codecs/cs35l43-i2c.c b/sound/soc/codecs/cs35l43-i2c.c
+new file mode 100644
+index 0000000..aca426a
+--- /dev/null
++++ b/sound/soc/codecs/cs35l43-i2c.c
+@@ -0,0 +1,114 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * cs35l43-i2c.c -- CS35l41 I2C driver
++ *
++ * Copyright 2020 Cirrus Logic, Inc.
++ *
++ * Author:	David Rhodes	<david.rhodes@cirrus.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/version.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/delay.h>
++#include <linux/i2c.h>
++#include <linux/slab.h>
++#include <linux/workqueue.h>
++#include <linux/platform_device.h>
++#include <linux/regulator/consumer.h>
++#include <linux/gpio/consumer.h>
++#include <linux/of_device.h>
++#include <linux/regmap.h>
++#include <linux/gpio.h>
++
++#include "wm_adsp.h"
++#include "cs35l43.h"
++#include <sound/cs35l43.h>
++
++static struct regmap_config cs35l43_regmap_i2c = {
++	.reg_bits = 32,
++	.val_bits = 32,
++	.reg_stride = 4,
++	.reg_format_endian = REGMAP_ENDIAN_BIG,
++	.val_format_endian = REGMAP_ENDIAN_BIG,
++	.max_register = CS35L43_DSP1_PMEM_5114,
++	.reg_defaults = cs35l43_reg,
++	.num_reg_defaults = CS35L43_NUM_DEFAULTS,
++	.volatile_reg = cs35l43_volatile_reg,
++	.readable_reg = cs35l43_readable_reg,
++	.precious_reg = cs35l43_precious_reg,
++	.cache_type = REGCACHE_RBTREE,
++};
++
++static const struct i2c_device_id cs35l43_id_i2c[] = {
++	{"cs35l43", 0},
++	{}
++};
++
++MODULE_DEVICE_TABLE(i2c, cs35l43_id_i2c);
++
++static int cs35l43_i2c_probe(struct i2c_client *client)
++{
++	struct cs35l43_private *cs35l43;
++	struct device *dev = &client->dev;
++	struct cs35l43_platform_data *pdata = dev_get_platdata(dev);
++	const struct regmap_config *regmap_config = &cs35l43_regmap_i2c;
++	int ret;
++
++	cs35l43 = devm_kzalloc(dev, sizeof(struct cs35l43_private), GFP_KERNEL);
++
++	if (cs35l43 == NULL)
++		return -ENOMEM;
++
++	cs35l43->dev = dev;
++	cs35l43->irq = client->irq;
++
++	i2c_set_clientdata(client, cs35l43);
++	cs35l43->regmap = devm_regmap_init_i2c(client, regmap_config);
++	if (IS_ERR(cs35l43->regmap)) {
++		ret = PTR_ERR(cs35l43->regmap);
++		dev_err(cs35l43->dev, "Failed to allocate register map: %d\n",
++			ret);
++		return ret;
++	}
++
++	return cs35l43_probe(cs35l43, pdata);
++}
++
++static void cs35l43_i2c_remove(struct i2c_client *client)
++{
++	struct cs35l43_private *cs35l43 = i2c_get_clientdata(client);
++
++	cs35l43_remove(cs35l43);
++}
++
++static const struct of_device_id cs35l43_of_match[] = {
++	{.compatible = "cirrus,cs35l43"},
++	{},
++};
++MODULE_DEVICE_TABLE(of, cs35l43_of_match);
++
++static struct i2c_driver cs35l43_i2c_driver = {
++	.driver = {
++		.name		= "cs35l43",
++		.of_match_table = cs35l43_of_match,
++		.pm = &cs35l43_pm_ops,
++	},
++	.id_table	= cs35l43_id_i2c,
++	.probe		= cs35l43_i2c_probe,
++	.remove		= cs35l43_i2c_remove,
++};
++
++module_i2c_driver(cs35l43_i2c_driver);
++
++MODULE_DESCRIPTION("I2C CS35L43 driver");
++MODULE_AUTHOR("David Rhodes, Cirrus Logic Inc, <david.rhodes@cirrus.com>");
++MODULE_LICENSE("GPL");
+diff --git a/sound/soc/codecs/cs35l43-spi.c b/sound/soc/codecs/cs35l43-spi.c
+new file mode 100644
+index 0000000..8018e36
+--- /dev/null
++++ b/sound/soc/codecs/cs35l43-spi.c
+@@ -0,0 +1,136 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * cs35l43-spi.c -- CS35l41 SPI driver
++ *
++ * Copyright 2017 Cirrus Logic, Inc.
++ *
++ * Author:	David Rhodes	<david.rhodes@cirrus.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/version.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/delay.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/gpio.h>
++#include <linux/spi/spi.h>
++#include <linux/regulator/consumer.h>
++
++#include "wm_adsp.h"
++#include "cs35l43.h"
++#include <sound/cs35l43.h>
++
++static struct regmap_config cs35l43_regmap_spi = {
++	.reg_bits = 32,
++	.val_bits = 32,
++	.pad_bits = 16,
++	.reg_stride = 4,
++	.reg_format_endian = REGMAP_ENDIAN_BIG,
++	.val_format_endian = REGMAP_ENDIAN_BIG,
++	.max_register = CS35L43_DSP1_PMEM_5114,
++	.reg_defaults = cs35l43_reg,
++	.num_reg_defaults = CS35L43_NUM_DEFAULTS,
++	.volatile_reg = cs35l43_volatile_reg,
++	.readable_reg = cs35l43_readable_reg,
++	.precious_reg = cs35l43_precious_reg,
++	.cache_type = REGCACHE_RBTREE,
++};
++
++static const struct spi_device_id cs35l43_id_spi[] = {
++	{"cs35l43", 0},
++	{}
++};
++
++MODULE_DEVICE_TABLE(spi, cs35l43_id_spi);
++
++static void cs35l43_limit_spi_clock(struct cs35l43_private *cs35l43, bool state)
++{
++	struct spi_device *spi;
++
++	spi = to_spi_device(cs35l43->dev);
++	if (!spi) {
++		dev_err(cs35l43->dev, "%s: No SPI device\n", __func__);
++		return;
++	}
++
++	if (state)
++		spi->max_speed_hz = CS35L43_SPI_MAX_FREQ_NO_PLL;
++	else
++		spi->max_speed_hz = cs35l43->max_spi_freq;
++
++	dev_dbg(&spi->dev, "Set SPI freq: %d\n", spi->max_speed_hz);
++	spi_setup(spi);
++}
++
++static int cs35l43_spi_probe(struct spi_device *spi)
++{
++	const struct regmap_config *regmap_config = &cs35l43_regmap_spi;
++	struct cs35l43_platform_data *pdata =
++					dev_get_platdata(&spi->dev);
++	struct cs35l43_private *cs35l43;
++	int ret;
++
++	cs35l43 = devm_kzalloc(&spi->dev,
++			       sizeof(struct cs35l43_private),
++			       GFP_KERNEL);
++	if (cs35l43 == NULL)
++		return -ENOMEM;
++
++	spi_set_drvdata(spi, cs35l43);
++	cs35l43->regmap = devm_regmap_init_spi(spi, regmap_config);
++	if (IS_ERR(cs35l43->regmap)) {
++		ret = PTR_ERR(cs35l43->regmap);
++		dev_err(&spi->dev, "Failed to allocate register map: %d\n",
++			ret);
++		return ret;
++	}
++
++	cs35l43->dev = &spi->dev;
++	cs35l43->irq = spi->irq;
++	cs35l43->max_spi_freq = spi->max_speed_hz;
++
++	cs35l43->limit_spi_clock = cs35l43_limit_spi_clock;
++
++	cs35l43_limit_spi_clock(cs35l43, true);
++
++	return cs35l43_probe(cs35l43, pdata);
++}
++
++static void cs35l43_spi_remove(struct spi_device *spi)
++{
++	struct cs35l43_private *cs35l43 = spi_get_drvdata(spi);
++
++	cs35l43_remove(cs35l43);
++}
++
++static const struct of_device_id cs35l43_of_match[] = {
++	{.compatible = "cirrus,cs35l43"},
++	{},
++};
++MODULE_DEVICE_TABLE(of, cs35l43_of_match);
++
++static struct spi_driver cs35l43_spi_driver = {
++	.driver = {
++		.name		= "cs35l43",
++		.of_match_table = cs35l43_of_match,
++		.pm = &cs35l43_pm_ops,
++	},
++	.id_table	= cs35l43_id_spi,
++	.probe		= cs35l43_spi_probe,
++	.remove		= cs35l43_spi_remove,
++};
++
++module_spi_driver(cs35l43_spi_driver);
++
++MODULE_DESCRIPTION("SPI CS35L43 driver");
++MODULE_AUTHOR("David Rhodes, Cirrus Logic Inc, <david.rhodes@cirrus.com>");
++MODULE_LICENSE("GPL");
+diff --git a/sound/soc/codecs/cs35l43-tables.c b/sound/soc/codecs/cs35l43-tables.c
+new file mode 100644
+index 0000000..e3d5f05
+--- /dev/null
++++ b/sound/soc/codecs/cs35l43-tables.c
+@@ -0,0 +1,543 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * cs35l43-tables.c -- CS35L43 ALSA SoC audio driver
++ *
++ * Copyright 2021 Cirrus Logic, Inc.
++ *
++ * Author: David Rhodes <david.rhodes@cirrus.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#include <linux/regmap.h>
++#include <linux/regulator/consumer.h>
++#include "wm_adsp.h"
++#include "cs35l43.h"
++#include <sound/cs35l43.h>
++
++bool cs35l43_readable_reg(struct device *dev, unsigned int reg)
++{
++	switch (reg) {
++	case CS35L43_DEVID:
++	case CS35L43_REVID:
++	case CS35L43_FABID:
++	case CS35L43_RELID:
++	case CS35L43_OTPID:
++	case CS35L43_SFT_RESET:
++	case CS35L43_TEST_KEY_CTRL:
++	case CS35L43_USER_KEY_CTRL:
++	case CS35L43_CTRL_ASYNC0:
++	case CS35L43_CTRL_ASYNC1:
++	case CS35L43_CTRL_ASYNC2:
++	case CS35L43_CTRL_ASYNC3:
++	case CS35L43_CTRL_IF_CONFIG1:
++	case CS35L43_CTRL_IF_STATUS1:
++	case CS35L43_CTRL_IF_STATUS2:
++	case CS35L43_CTRL_IF_CONFIG2:
++	case CS35L43_CTRL_IF_DEBUG1:
++	case CS35L43_CTRL_IF_DEBUG2:
++	case CS35L43_CTRL_IF_DEBUG3:
++	case CS35L43_CIF_MON1:
++	case CS35L43_CIF_MON2:
++	case CS35L43_CIF_MON_PADDR:
++	case CS35L43_CTRL_IF_SPARE1:
++	case CS35L43_CTRL_IF_I2C:
++	case CS35L43_CTRL_IF_I2C_1_CONTROL:
++	case CS35L43_CTRL_IF_I2C_1_BROADCAST:
++	case CS35L43_APB_MSTR_DSP_BRIDGE_ERR:
++	case CS35L43_CIF1_BRIDGE_ERR:
++	case CS35L43_CIF2_BRIDGE_ERR:
++	case CS35L43_OTP_MEM0 ... CS35L43_OTP_MEM31:
++	case CS35L43_OTP_CTRL0:
++	case CS35L43_OTP_CTRL1:
++	case CS35L43_OTP_CTRL3:
++	case CS35L43_OTP_CTRL4:
++	case CS35L43_OTP_CTRL5:
++	case CS35L43_OTP_CTRL6:
++	case CS35L43_OTP_CTRL7:
++	case CS35L43_OTP_CTRL8:
++	case CS35L43_DEVICE_ID:
++	case CS35L43_FAB_ID:
++	case CS35L43_REV_ID:
++	case CS35L43_GLOBAL_ENABLES:
++	case CS35L43_BLOCK_ENABLES:
++	case CS35L43_BLOCK_ENABLES2:
++	case CS35L43_GLOBAL_OVERRIDES:
++	case CS35L43_GLOBAL_SYNC:
++	case CS35L43_GLOBAL_STATUS:
++	case CS35L43_DISCH_FILT:
++	case CS35L43_OSC_TRIM:
++	case CS35L43_ERROR_RELEASE:
++	case CS35L43_PLL_OVERRIDE:
++	case CS35L43_CHIP_STATUS:
++	case CS35L43_CHIP_STATUS2:
++	case CS35L43_TST_OSC:
++	case CS35L43_LRCK_PAD_CONTROL:
++	case CS35L43_SCLK_PAD_CONTROL:
++	case CS35L43_SDIN_PAD_CONTROL:
++	case CS35L43_SDOUT_PAD_CONTROL:
++	case CS35L43_GPIO_PAD_CONTROL:
++	case CS35L43_GPIO_GLOBAL_ENABLE_CONTROL:
++	case CS35L43_PWRMGT_CTL:
++	case CS35L43_WAKESRC_CTL:
++	case CS35L43_WAKEI2C_CTL:
++	case CS35L43_PWRMGT_STS:
++	case CS35L43_PWRMGT_RST:
++	case CS35L43_TEST_CTL:
++	case CS35L43_REFCLK_INPUT:
++	case CS35L43_DSP_CLOCK_GEARING:
++	case CS35L43_GLOBAL_SAMPLE_RATE:
++	case CS35L43_FS_MON_0:
++	case CS35L43_DSP1_SAMPLE_RATE_RX1:
++	case CS35L43_DSP1_SAMPLE_RATE_RX2:
++	case CS35L43_DSP1_SAMPLE_RATE_TX1:
++	case CS35L43_DSP1_SAMPLE_RATE_TX2:
++	case CS35L43_LDOA_CTRL:
++	case CS35L43_SYNC_TX_RX_ENABLES:
++	case CS35L43_VBST_CTL_1:
++	case CS35L43_VBST_CTL_2:
++	case CS35L43_BST_IPK_CTL:
++	case CS35L43_SOFT_RAMP:
++	case CS35L43_BST_LOOP_COEFF:
++	case CS35L43_LBST_SLOPE:
++	case CS35L43_BST_SW_FREQ:
++	case CS35L43_BST_DCM_CTL:
++	case CS35L43_DCM_FORCE:
++	case CS35L43_VBST_OVP:
++	case CS35L43_BST_RSVD_1:
++	case CS35L43_MONITOR_FILT:
++	case CS35L43_WARN_LIMIT_THRESHOLD:
++	case CS35L43_CONFIGURATION:
++	case CS35L43_STATUS:
++	case CS35L43_ENABLES_AND_CODES_ANA:
++	case CS35L43_ENABLES_AND_CODES_DIG:
++	case CS35L43_ASP_ENABLES1:
++	case CS35L43_ASP_CONTROL1:
++	case CS35L43_ASP_CONTROL2:
++	case CS35L43_ASP_CONTROL3:
++	case CS35L43_ASP_FRAME_CONTROL1:
++	case CS35L43_ASP_FRAME_CONTROL5:
++	case CS35L43_ASP_DATA_CONTROL1:
++	case CS35L43_ASP_DATA_CONTROL5:
++	case CS35L43_DACPCM1_INPUT:
++	case CS35L43_DACPCM2_INPUT:
++	case CS35L43_ASPTX1_INPUT:
++	case CS35L43_ASPTX2_INPUT:
++	case CS35L43_ASPTX3_INPUT:
++	case CS35L43_ASPTX4_INPUT:
++	case CS35L43_DSP1RX1_INPUT:
++	case CS35L43_DSP1RX2_INPUT:
++	case CS35L43_DSP1RX3_INPUT:
++	case CS35L43_DSP1RX4_INPUT:
++	case CS35L43_DSP1RX5_INPUT:
++	case CS35L43_DSP1RX6_INPUT:
++	case CS35L43_NGATE1_INPUT:
++	case CS35L43_NGATE2_INPUT:
++	case CS35L43_AMP_CTRL:
++	case CS35L43_HPF_TST:
++	case CS35L43_VC_TST1:
++	case CS35L43_VC_TST2:
++	case CS35L43_INTP_TST:
++	case CS35L43_SRC_MAGCOMP_TST:
++	case CS35L43_SRC_MAGCOMP_B0_OVERRIDE:
++	case CS35L43_SRC_MAGCOMP_B1_OVERRIDE:
++	case CS35L43_SRC_MAGCOMP_A1_N_OVERRIDE:
++	case CS35L43_VPBR_CONFIG:
++	case CS35L43_VBBR_CONFIG:
++	case CS35L43_VPBR_STATUS:
++	case CS35L43_VBBR_STATUS:
++	case CS35L43_OTW_CONFIG:
++	case CS35L43_AMP_ERROR_VOL_SEL:
++	case CS35L43_VOL_STATUS_TO_DSP:
++	case CS35L43_CLASSH_CONFIG:
++	case CS35L43_WKFET_AMP_CONFIG:
++	case CS35L43_NG_CONFIG:
++	case CS35L43_AMP_GAIN:
++	case CS35L43_DAC_MSM_CONFIG:
++	case CS35L43_TST_DAC_MSM_CONFIG:
++	case CS35L43_ALIVE_DCIN_WD:
++	case CS35L43_IRQ1_CFG:
++	case CS35L43_IRQ1_STATUS:
++	case CS35L43_IRQ1_EINT_1:
++	case CS35L43_IRQ1_EINT_2:
++	case CS35L43_IRQ1_EINT_3:
++	case CS35L43_IRQ1_EINT_4:
++	case CS35L43_IRQ1_EINT_5:
++	case CS35L43_IRQ1_STS_1:
++	case CS35L43_IRQ1_STS_2:
++	case CS35L43_IRQ1_STS_3:
++	case CS35L43_IRQ1_STS_4:
++	case CS35L43_IRQ1_STS_5:
++	case CS35L43_IRQ1_MASK_1:
++	case CS35L43_IRQ1_MASK_2:
++	case CS35L43_IRQ1_MASK_3:
++	case CS35L43_IRQ1_MASK_4:
++	case CS35L43_IRQ1_MASK_5:
++	case CS35L43_IRQ1_FRC_1:
++	case CS35L43_IRQ1_FRC_2:
++	case CS35L43_IRQ1_FRC_3:
++	case CS35L43_IRQ1_FRC_4:
++	case CS35L43_IRQ1_FRC_5:
++	case CS35L43_IRQ1_EDGE_1:
++	case CS35L43_IRQ1_EDGE_4:
++	case CS35L43_IRQ1_POL_1:
++	case CS35L43_IRQ1_POL_2:
++	case CS35L43_IRQ1_POL_3:
++	case CS35L43_IRQ1_POL_4:
++	case CS35L43_IRQ1_DB_2:
++	case CS35L43_GPIO_STATUS1:
++	case CS35L43_GPIO_FORCE:
++	case CS35L43_GPIO1_CTRL1:
++	case CS35L43_GPIO2_CTRL1:
++	case CS35L43_GPIO3_CTRL1:
++	case CS35L43_GPIO4_CTRL1:
++	case CS35L43_MIXER_NGATE_CFG:
++	case CS35L43_MIXER_NGATE_CH1_CFG:
++	case CS35L43_MIXER_NGATE_CH2_CFG:
++	case CS35L43_DSP_MBOX_1:
++	case CS35L43_DSP_MBOX_2:
++	case CS35L43_DSP_MBOX_3:
++	case CS35L43_DSP_MBOX_4:
++	case CS35L43_DSP_MBOX_5:
++	case CS35L43_DSP_MBOX_6:
++	case CS35L43_DSP_MBOX_7:
++	case CS35L43_DSP_MBOX_8:
++	case CS35L43_DSP_VIRTUAL1_MBOX_1:
++	case CS35L43_DSP_VIRTUAL1_MBOX_2:
++	case CS35L43_DSP_VIRTUAL1_MBOX_3:
++	case CS35L43_DSP_VIRTUAL1_MBOX_4:
++	case CS35L43_DSP_VIRTUAL1_MBOX_5:
++	case CS35L43_DSP_VIRTUAL1_MBOX_6:
++	case CS35L43_DSP_VIRTUAL1_MBOX_7:
++	case CS35L43_DSP_VIRTUAL1_MBOX_8:
++	case CS35L43_DSP_VIRTUAL2_MBOX_1:
++	case CS35L43_DSP_VIRTUAL2_MBOX_2:
++	case CS35L43_DSP_VIRTUAL2_MBOX_3:
++	case CS35L43_DSP_VIRTUAL2_MBOX_4:
++	case CS35L43_DSP_VIRTUAL2_MBOX_5:
++	case CS35L43_DSP_VIRTUAL2_MBOX_6:
++	case CS35L43_DSP_VIRTUAL2_MBOX_7:
++	case CS35L43_DSP_VIRTUAL2_MBOX_8:
++	case CS35L43_DSP1_SYS_INFO_ID:
++	case CS35L43_DSP1_CLOCK_FREQ:
++	case CS35L43_DSP1_CORE_SOFT_RESET:
++	case CS35L43_DSP1_SCRATCH1:
++	case CS35L43_DSP1_SCRATCH2:
++	case CS35L43_DSP1_SCRATCH3:
++	case CS35L43_DSP1_SCRATCH4:
++	case CS35L43_DSP1_CCM_CORE_CONTROL:
++	case CS35L43_DSP1_MPU_LOCK_STATE:
++	case CS35L43_DSP1_MPU_XM_VIO_STATUS:
++	case CS35L43_DSP1_MPU_YM_VIO_STATUS:
++	case CS35L43_DSP1_MPU_PM_VIO_STATUS:
++	case CS35L43_DSP1_WDT_CONTROL:
++	case CS35L43_DSP1_WDT_STATUS:
++	case CS35L43_DSP1_XMEM_PACKED_0 ... CS35L43_DSP1_XMEM_PACKED_6143:
++	case CS35L43_DSP1_XMEM_UNPACKED32_0 ...
++					CS35L43_DSP1_XMEM_UNPACKED32_4095:
++	case CS35L43_DSP1_XMEM_UNPACKED24_0 ...
++					CS35L43_DSP1_XMEM_UNPACKED24_8191:
++	case CS35L43_DSP1_XROM_UNPACKED24_0 ...
++					CS35L43_DSP1_XROM_UNPACKED24_6141:
++	case CS35L43_DSP1_YMEM_PACKED_0 ... CS35L43_DSP1_YMEM_PACKED_1532:
++	case CS35L43_DSP1_YMEM_UNPACKED32_0 ...
++					CS35L43_DSP1_YMEM_UNPACKED32_1022:
++	case CS35L43_DSP1_YMEM_UNPACKED24_0 ...
++					CS35L43_DSP1_YMEM_UNPACKED24_2045:
++	case CS35L43_DSP1_PMEM_0 ... CS35L43_DSP1_PMEM_5114:
++		return true;
++	default:
++		return false;
++	}
++}
++
++bool cs35l43_precious_reg(struct device *dev, unsigned int reg)
++{
++
++	switch (reg) {
++	case CS35L43_DSP1_XMEM_PACKED_0 ... CS35L43_DSP1_XMEM_PACKED_6143:
++	case CS35L43_DSP1_XMEM_UNPACKED32_0 ...
++					CS35L43_DSP1_XMEM_UNPACKED32_4095:
++	case CS35L43_DSP1_XROM_UNPACKED24_0 ...
++					CS35L43_DSP1_XROM_UNPACKED24_6141:
++	case CS35L43_DSP1_YMEM_PACKED_0 ... CS35L43_DSP1_YMEM_PACKED_1532:
++	case CS35L43_DSP1_YMEM_UNPACKED32_0 ...
++					CS35L43_DSP1_YMEM_UNPACKED32_1022:
++	case CS35L43_DSP1_PMEM_0 ... CS35L43_DSP1_PMEM_5114:
++		return true;
++	default:
++		return false;
++	}
++
++	return false;
++}
++
++bool cs35l43_volatile_reg(struct device *dev, unsigned int reg)
++{
++	switch (reg) {
++	case CS35L43_GLOBAL_STATUS:
++	case CS35L43_CHIP_STATUS:
++	case CS35L43_CHIP_STATUS2:
++	case CS35L43_STATUS:
++	case CS35L43_ENABLES_AND_CODES_ANA:
++	case CS35L43_ENABLES_AND_CODES_DIG:
++	case CS35L43_VPBR_STATUS:
++	case CS35L43_VBBR_STATUS:
++	case CS35L43_IRQ1_STATUS:
++	case CS35L43_IRQ1_EINT_1:
++	case CS35L43_IRQ1_EINT_2:
++	case CS35L43_IRQ1_EINT_3:
++	case CS35L43_IRQ1_EINT_4:
++	case CS35L43_IRQ1_EINT_5:
++	case CS35L43_IRQ1_STS_1:
++	case CS35L43_IRQ1_STS_2:
++	case CS35L43_IRQ1_STS_3:
++	case CS35L43_IRQ1_STS_4:
++	case CS35L43_IRQ1_STS_5:
++	case CS35L43_GPIO_STATUS1:
++	case CS35L43_DSP_MBOX_1:
++	case CS35L43_DSP_MBOX_2:
++	case CS35L43_DSP_MBOX_3:
++	case CS35L43_DSP_MBOX_4:
++	case CS35L43_DSP_MBOX_5:
++	case CS35L43_DSP_MBOX_6:
++	case CS35L43_DSP_MBOX_7:
++	case CS35L43_DSP_MBOX_8:
++	case CS35L43_DSP_VIRTUAL1_MBOX_1:
++	case CS35L43_DSP_VIRTUAL1_MBOX_2:
++	case CS35L43_DSP_VIRTUAL1_MBOX_3:
++	case CS35L43_DSP_VIRTUAL1_MBOX_4:
++	case CS35L43_DSP_VIRTUAL1_MBOX_5:
++	case CS35L43_DSP_VIRTUAL1_MBOX_6:
++	case CS35L43_DSP_VIRTUAL1_MBOX_7:
++	case CS35L43_DSP_VIRTUAL1_MBOX_8:
++	case CS35L43_DSP_VIRTUAL2_MBOX_1:
++	case CS35L43_DSP_VIRTUAL2_MBOX_2:
++	case CS35L43_DSP_VIRTUAL2_MBOX_3:
++	case CS35L43_DSP_VIRTUAL2_MBOX_4:
++	case CS35L43_DSP_VIRTUAL2_MBOX_5:
++	case CS35L43_DSP_VIRTUAL2_MBOX_6:
++	case CS35L43_DSP_VIRTUAL2_MBOX_7:
++	case CS35L43_DSP_VIRTUAL2_MBOX_8:
++	case CS35L43_DSP1_CORE_SOFT_RESET:
++	case CS35L43_DSP1_SCRATCH1:
++	case CS35L43_DSP1_SCRATCH2:
++	case CS35L43_DSP1_SCRATCH3:
++	case CS35L43_DSP1_SCRATCH4:
++	case CS35L43_DSP1_MPU_LOCK_STATE:
++	case CS35L43_DSP1_MPU_XM_VIO_STATUS:
++	case CS35L43_DSP1_MPU_YM_VIO_STATUS:
++	case CS35L43_DSP1_MPU_PM_VIO_STATUS:
++	case CS35L43_DSP1_WDT_STATUS:
++	case CS35L43_DSP1_XMEM_PACKED_0 ...
++		CS35L43_DSP1_XMEM_PACKED_6143:
++	case CS35L43_DSP1_XMEM_UNPACKED32_0 ...
++		CS35L43_DSP1_XMEM_UNPACKED32_4095:
++	case CS35L43_DSP1_XMEM_UNPACKED24_0 ...
++		CS35L43_DSP1_XMEM_UNPACKED24_8191:
++	case CS35L43_DSP1_XROM_UNPACKED24_0 ...
++		CS35L43_DSP1_XROM_UNPACKED24_6141:
++	case CS35L43_DSP1_YMEM_PACKED_0 ...
++		CS35L43_DSP1_YMEM_PACKED_1532:
++	case CS35L43_DSP1_YMEM_UNPACKED32_0 ...
++		CS35L43_DSP1_YMEM_UNPACKED32_1022:
++	case CS35L43_DSP1_YMEM_UNPACKED24_0 ...
++		CS35L43_DSP1_YMEM_UNPACKED24_2045:
++	case CS35L43_DSP1_PMEM_0 ...
++		CS35L43_DSP1_PMEM_5114:
++		return true;
++	default:
++		return false;
++	}
++}
++
++const struct reg_default cs35l43_reg[CS35L43_NUM_DEFAULTS] = {
++	{ CS35L43_CTRL_ASYNC0,			0x00000000 },
++	{ CS35L43_CTRL_ASYNC1,			0x00000004 },
++	{ CS35L43_CTRL_ASYNC2,			0x00000000 },
++	{ CS35L43_CTRL_ASYNC3,			0x00000000 },
++	{ CS35L43_CTRL_IF_CONFIG1,		0x00020002 },
++	{ CS35L43_CTRL_IF_STATUS1,		0x00000000 },
++	{ CS35L43_CTRL_IF_STATUS2,		0x00000000 },
++	{ CS35L43_CTRL_IF_CONFIG2,		0x00000000 },
++	{ CS35L43_CTRL_IF_DEBUG1,		0x00000000 },
++	{ CS35L43_CTRL_IF_DEBUG2,		0x00000000 },
++	{ CS35L43_CTRL_IF_DEBUG3,		0x00000000 },
++	{ CS35L43_CIF_MON1,			0x00002003 },
++	{ CS35L43_CIF_MON2,			0x00000000 },
++	{ CS35L43_CIF_MON_PADDR,		0x00000000 },
++	{ CS35L43_CTRL_IF_SPARE1,		0x00000000 },
++	{ CS35L43_CTRL_IF_I2C,			0x00000004 },
++	{ CS35L43_CTRL_IF_I2C_1_CONTROL,	0x00000040 },
++	{ CS35L43_CTRL_IF_I2C_1_BROADCAST,	0x00000088 },
++	{ CS35L43_APB_MSTR_DSP_BRIDGE_ERR,	0x00000000 },
++	{ CS35L43_CIF1_BRIDGE_ERR,		0x00000000 },
++	{ CS35L43_CIF2_BRIDGE_ERR,		0x00000000 },
++	{ CS35L43_LRCK_PAD_CONTROL,		0x00000007 },
++	{ CS35L43_SCLK_PAD_CONTROL,		0x00000007 },
++	{ CS35L43_SDIN_PAD_CONTROL,		0x00000007 },
++	{ CS35L43_HPF_TST,			0x00000000 },
++	{ CS35L43_VC_TST1,			0x00000000 },
++	{ CS35L43_VC_TST2,			0x00000000 },
++	{ CS35L43_INTP_TST,			0x00000680 },
++	{ CS35L43_SRC_MAGCOMP_TST,		0x0000000D },
++	{ CS35L43_SRC_MAGCOMP_B0_OVERRIDE,	0x00000000 },
++	{ CS35L43_SRC_MAGCOMP_B1_OVERRIDE,	0x00000000 },
++	{ CS35L43_SRC_MAGCOMP_A1_N_OVERRIDE,	0x00000000 },
++	{ CS35L43_OTW_CONFIG,			0x00000001 },
++	{ CS35L43_AMP_ERROR_VOL_SEL,		0x00000000 },
++	{ CS35L43_VOL_STATUS_TO_DSP,		0x00000000 },
++	{ CS35L43_IRQ1_POL_1,			0x00000000 },
++	{ CS35L43_IRQ1_POL_2,			0x00000000 },
++	{ CS35L43_IRQ1_POL_3,			0x00000000 },
++	{ CS35L43_IRQ1_POL_4,			0x00000000 },
++	{ CS35L43_GPIO3_CTRL1,			0x80000001 },
++	{ CS35L43_GPIO4_CTRL1,			0x80000001 },
++};
++
++const unsigned int cs35l43_hibernate_update_regs[CS35L43_POWER_SEQ_LENGTH] = {
++	CS35L43_ASPTX1_INPUT,
++	CS35L43_ASPTX2_INPUT,
++	CS35L43_ASPTX3_INPUT,
++	CS35L43_ASPTX4_INPUT,
++	CS35L43_DSP1RX1_INPUT,
++	CS35L43_DSP1RX2_INPUT,
++	CS35L43_DSP1RX3_INPUT,
++	CS35L43_DSP1RX4_INPUT,
++	CS35L43_DSP1RX5_INPUT,
++	CS35L43_DSP1RX6_INPUT,
++	CS35L43_DACPCM1_INPUT,
++	CS35L43_DACPCM2_INPUT,
++	CS35L43_ASP_FRAME_CONTROL1,
++	CS35L43_ASP_FRAME_CONTROL5,
++	CS35L43_AMP_CTRL,
++	CS35L43_AMP_GAIN,
++	CS35L43_GLOBAL_SAMPLE_RATE,
++	CS35L43_DSP1_SAMPLE_RATE_RX1,
++	CS35L43_DSP1_SAMPLE_RATE_RX2,
++	CS35L43_DSP1_SAMPLE_RATE_TX1,
++	CS35L43_DSP1_SAMPLE_RATE_TX2,
++	CS35L43_ALIVE_DCIN_WD,
++	CS35L43_MONITOR_FILT,
++	CS35L43_DAC_MSM_CONFIG,
++	CS35L43_ASP_CONTROL2,
++	CS35L43_ASP_CONTROL3,
++	CS35L43_ASP_DATA_CONTROL1,
++	CS35L43_ASP_DATA_CONTROL5,
++	CS35L43_GPIO_PAD_CONTROL,
++	CS35L43_VBST_CTL_1,
++	CS35L43_VBST_CTL_2,
++	CS35L43_BST_IPK_CTL,
++	CS35L43_VPBR_CONFIG,
++	CS35L43_BLOCK_ENABLES2,
++	CS35L43_NG_CONFIG,
++	CS35L43_MIXER_NGATE_CH1_CFG,
++	CS35L43_MIXER_NGATE_CH2_CFG,
++	CS35L43_IRQ1_MASK_1,
++	CS35L43_FS_MON_0,
++	CS35L43_TST_DAC_MSM_CONFIG,
++};
++
++const struct cs35l43_pll_sysclk_config cs35l43_pll_sysclk[64] = {
++	{ 32768,	0x00 },
++	{ 8000,		0x01 },
++	{ 11025,	0x02 },
++	{ 12000,	0x03 },
++	{ 16000,	0x04 },
++	{ 22050,	0x05 },
++	{ 24000,	0x06 },
++	{ 32000,	0x07 },
++	{ 44100,	0x08 },
++	{ 48000,	0x09 },
++	{ 88200,	0x0A },
++	{ 96000,	0x0B },
++	{ 128000,	0x0C },
++	{ 176400,	0x0D },
++	{ 192000,	0x0E },
++	{ 256000,	0x0F },
++	{ 352800,	0x10 },
++	{ 384000,	0x11 },
++	{ 512000,	0x12 },
++	{ 705600,	0x13 },
++	{ 750000,	0x14 },
++	{ 768000,	0x15 },
++	{ 1000000,	0x16 },
++	{ 1024000,	0x17 },
++	{ 1200000,	0x18 },
++	{ 1411200,	0x19 },
++	{ 1500000,	0x1A },
++	{ 1536000,	0x1B },
++	{ 2000000,	0x1C },
++	{ 2048000,	0x1D },
++	{ 2400000,	0x1E },
++	{ 2822400,	0x1F },
++	{ 3000000,	0x20 },
++	{ 3072000,	0x21 },
++	{ 3200000,	0x22 },
++	{ 4000000,	0x23 },
++	{ 4096000,	0x24 },
++	{ 4800000,	0x25 },
++	{ 5644800,	0x26 },
++	{ 6000000,	0x27 },
++	{ 6144000,	0x28 },
++	{ 6250000,	0x29 },
++	{ 6400000,	0x2A },
++	{ 6500000,	0x2B },
++	{ 6750000,	0x2C },
++	{ 7526400,	0x2D },
++	{ 8000000,	0x2E },
++	{ 8192000,	0x2F },
++	{ 9600000,	0x30 },
++	{ 11289600,	0x31 },
++	{ 12000000,	0x32 },
++	{ 12288000,	0x33 },
++	{ 12500000,	0x34 },
++	{ 12800000,	0x35 },
++	{ 13000000,	0x36 },
++	{ 13500000,	0x37 },
++	{ 19200000,	0x38 },
++	{ 22579200,	0x39 },
++	{ 24000000,	0x3A },
++	{ 24576000,	0x3B },
++	{ 25000000,	0x3C },
++	{ 25600000,	0x3D },
++	{ 26000000,	0x3E },
++	{ 27000000,	0x3F },
++};
++
++const struct cs35l43_fs_mon_config cs35l43_fs_mon[7] = {
++	{ 705600,	154,	244 },
++	{ 768000,	141,	224 },
++	{ 1411200,	77,	125 },
++	{ 1536000,	71,	115 },
++	{ 2822400,	39,	65 },
++	{ 3072000,	36,	60 },
++	{ 5644800,	20,	35 },
++};
++
++const u8 cs35l43_write_seq_op_sizes[CS35L43_POWER_SEQ_NUM_OPS][2] = {
++	{	CS35L43_POWER_SEQ_OP_WRITE_REG_FULL,
++		CS35L43_POWER_SEQ_OP_WRITE_REG_FULL_WORDS},
++	{	CS35L43_POWER_SEQ_OP_WRITE_FIELD,
++		CS35L43_POWER_SEQ_OP_WRITE_FIELD_WORDS},
++	{	CS35L43_POWER_SEQ_OP_WRITE_REG_ADDR8,
++		CS35L43_POWER_SEQ_OP_WRITE_REG_ADDR8_WORDS},
++	{	CS35L43_POWER_SEQ_OP_WRITE_REG_INCR,
++		CS35L43_POWER_SEQ_OP_WRITE_REG_INCR_WORDS},
++	{	CS35L43_POWER_SEQ_OP_WRITE_REG_L16,
++		CS35L43_POWER_SEQ_OP_WRITE_REG_L16_WORDS},
++	{	CS35L43_POWER_SEQ_OP_WRITE_REG_H16,
++		CS35L43_POWER_SEQ_OP_WRITE_REG_H16_WORDS},
++	{	CS35L43_POWER_SEQ_OP_DELAY,
++		CS35L43_POWER_SEQ_OP_DELAY_WORDS},
++	{	CS35L43_POWER_SEQ_OP_END,
++		CS35L43_POWER_SEQ_OP_END_WORDS},
++};
++
++const struct dev_pm_ops cs35l43_pm_ops = {
++	SET_RUNTIME_PM_OPS(cs35l43_suspend_runtime, cs35l43_resume_runtime, NULL)
++};
+diff --git a/sound/soc/codecs/cs35l43.c b/sound/soc/codecs/cs35l43.c
+new file mode 100644
+index 0000000..5de4786
+--- /dev/null
++++ b/sound/soc/codecs/cs35l43.c
+@@ -0,0 +1,2849 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * cs35l43.c -- CS35l43 ALSA SoC audio driver
++ *
++ * Copyright 2021 Cirrus Logic, Inc.
++ *
++ * Author:	David Rhodes	<david.rhodes@cirrus.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/version.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/delay.h>
++#include <linux/i2c.h>
++#include <linux/slab.h>
++#include <linux/platform_device.h>
++#include <linux/regulator/consumer.h>
++#include <linux/gpio/consumer.h>
++#include <linux/of_device.h>
++#include <linux/regmap.h>
++#include <linux/pm_runtime.h>
++#include <sound/core.h>
++#include <sound/pcm.h>
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++#include <sound/soc-dapm.h>
++#include <linux/gpio.h>
++#include <sound/initval.h>
++#include <sound/tlv.h>
++#include <linux/of_irq.h>
++#include <linux/completion.h>
++#include <linux/spi/spi.h>
++#include <linux/err.h>
++#include <linux/firmware.h>
++#include <linux/timekeeping.h>
++
++#include "wm_adsp.h"
++#include "cs35l43.h"
++#include <sound/cs35l43.h>
++
++#define DRV_NAME "cs35l43"
++
++static const char * const cs35l43_supplies[] = {
++	"VA",
++	"VP",
++};
++
++static int cs35l43_exit_hibernate(struct cs35l43_private *cs35l43);
++static void cs35l43_pm_runtime_setup(struct cs35l43_private *cs35l43);
++static void cs35l43_log_status(struct cs35l43_private *cs35l43);
++static int cs35l43_check_dsp_regs(struct cs35l43_private *cs35l43);
++
++static const DECLARE_TLV_DB_SCALE(dig_vol_tlv, -10225, 25, true);
++static DECLARE_TLV_DB_SCALE(amp_gain_tlv, 0, 1, 1);
++
++static const struct snd_kcontrol_new amp_enable_ctrl =
++	SOC_DAPM_SINGLE("Switch", SND_SOC_NOPM, 0, 1, 0);
++
++static const char * const cs35l43_pcm_sftramp_text[] =  {
++	"Off", ".5ms", "1ms", "2ms", "4ms", "8ms", "15ms", "30ms"};
++
++static SOC_ENUM_SINGLE_DECL(pcm_sft_ramp,
++			    CS35L43_AMP_CTRL, 0,
++			    cs35l43_pcm_sftramp_text);
++
++static const char * const cs35l43_tx_input_texts[] = {
++	"Zero", "ASPRX1", "ASPRX2", "ASPRX3", "VMON", "IMON",
++	"VMON FS2", "IMON FS2", "VPMON", "VBSTMON", "DSP", "DSP FS2"};
++
++static const unsigned int cs35l43_tx_input_values[] = {0x00,
++						CS35L43_INPUT_SRC_ASPRX1,
++						CS35L43_INPUT_SRC_ASPRX2,
++						CS35L43_INPUT_SRC_ASPRX3,
++						CS35L43_INPUT_SRC_VMON,
++						CS35L43_INPUT_SRC_IMON,
++						CS35L43_INPUT_SRC_VMON_FS2,
++						CS35L43_INPUT_SRC_IMON_FS2,
++						CS35L43_INPUT_SRC_VPMON,
++						CS35L43_INPUT_SRC_VBSTMON,
++						CS35L43_INPUT_DSP_TX5,
++						CS35L43_INPUT_DSP_TX6};
++
++static SOC_VALUE_ENUM_SINGLE_DECL(cs35l43_asptx1_enum,
++				CS35L43_ASPTX1_INPUT,
++				0, CS35L43_INPUT_MASK,
++				cs35l43_tx_input_texts,
++				cs35l43_tx_input_values);
++
++static const struct snd_kcontrol_new asp_tx1_mux =
++	SOC_DAPM_ENUM("ASPTX1 SRC", cs35l43_asptx1_enum);
++
++static SOC_VALUE_ENUM_SINGLE_DECL(cs35l43_asptx2_enum,
++				CS35L43_ASPTX2_INPUT,
++				0, CS35L43_INPUT_MASK,
++				cs35l43_tx_input_texts,
++				cs35l43_tx_input_values);
++
++static const struct snd_kcontrol_new asp_tx2_mux =
++	SOC_DAPM_ENUM("ASPTX2 SRC", cs35l43_asptx2_enum);
++
++static SOC_VALUE_ENUM_SINGLE_DECL(cs35l43_asptx3_enum,
++				CS35L43_ASPTX3_INPUT,
++				0, CS35L43_INPUT_MASK,
++				cs35l43_tx_input_texts,
++				cs35l43_tx_input_values);
++
++static const struct snd_kcontrol_new asp_tx3_mux =
++	SOC_DAPM_ENUM("ASPTX3 SRC", cs35l43_asptx3_enum);
++
++static SOC_VALUE_ENUM_SINGLE_DECL(cs35l43_asptx4_enum,
++				CS35L43_ASPTX4_INPUT,
++				0, CS35L43_INPUT_MASK,
++				cs35l43_tx_input_texts,
++				cs35l43_tx_input_values);
++
++static const struct snd_kcontrol_new asp_tx4_mux =
++	SOC_DAPM_ENUM("ASPTX4 SRC", cs35l43_asptx4_enum);
++
++static SOC_VALUE_ENUM_SINGLE_DECL(cs35l43_dsprx1_enum,
++				CS35L43_DSP1RX1_INPUT,
++				0, CS35L43_INPUT_MASK,
++				cs35l43_tx_input_texts,
++				cs35l43_tx_input_values);
++
++static const struct snd_kcontrol_new dsp_rx1_mux =
++	SOC_DAPM_ENUM("DSPRX1 SRC", cs35l43_dsprx1_enum);
++
++static SOC_VALUE_ENUM_SINGLE_DECL(cs35l43_dsprx2_enum,
++				CS35L43_DSP1RX2_INPUT,
++				0, CS35L43_INPUT_MASK,
++				cs35l43_tx_input_texts,
++				cs35l43_tx_input_values);
++
++static const struct snd_kcontrol_new dsp_rx2_mux =
++	SOC_DAPM_ENUM("DSPRX2 SRC", cs35l43_dsprx2_enum);
++
++static SOC_VALUE_ENUM_SINGLE_DECL(cs35l43_dsprx3_enum,
++				CS35L43_DSP1RX3_INPUT,
++				0, CS35L43_INPUT_MASK,
++				cs35l43_tx_input_texts,
++				cs35l43_tx_input_values);
++
++static const struct snd_kcontrol_new dsp_rx3_mux =
++	SOC_DAPM_ENUM("DSPRX3 SRC", cs35l43_dsprx3_enum);
++
++static SOC_VALUE_ENUM_SINGLE_DECL(cs35l43_dacpcm_enum,
++				CS35L43_DACPCM1_INPUT,
++				0, CS35L43_INPUT_MASK,
++				cs35l43_tx_input_texts,
++				cs35l43_tx_input_values);
++
++static const struct snd_kcontrol_new dacpcm_mux =
++	SOC_DAPM_ENUM("PCM Source", cs35l43_dacpcm_enum);
++
++static SOC_VALUE_ENUM_SINGLE_DECL(cs35l43_dacpcm2_enum,
++				CS35L43_DACPCM2_INPUT,
++				0, CS35L43_INPUT_MASK,
++				cs35l43_tx_input_texts,
++				cs35l43_tx_input_values);
++
++static const struct snd_kcontrol_new dacpcm2_mux =
++	SOC_DAPM_ENUM("High Rate PCM Source", cs35l43_dacpcm2_enum);
++
++static const char * const cs35l43_ultrasonic_mode_texts[] = {
++	"Disabled", "In Band", "Out of Band"
++};
++static SOC_ENUM_SINGLE_DECL(cs35l43_ultrasonic_mode_enum, SND_SOC_NOPM, 0,
++				cs35l43_ultrasonic_mode_texts);
++
++static const char * const cs35l43_wd_mode_texts[] = {"Normal", "Mute"};
++static const unsigned int cs35l43_wd_mode_values[] = {0x0, 0x3};
++static SOC_VALUE_ENUM_SINGLE_DECL(cs35l43_dc_wd_mode_enum, CS35L43_ALIVE_DCIN_WD,
++			CS35L43_WD_MODE_SHIFT, 0x3,
++			cs35l43_wd_mode_texts, cs35l43_wd_mode_values);
++
++static int cs35l43_delta_select_get(struct snd_kcontrol *kcontrol,
++			   struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component;
++	struct cs35l43_private *cs35l43;
++
++	component = snd_kcontrol_chip(kcontrol);
++	cs35l43 = snd_soc_component_get_drvdata(component);
++
++	ucontrol->value.integer.value[0] = cs35l43->delta_applied;
++
++	return 0;
++}
++
++static int cs35l43_apply_delta_tuning(struct cs35l43_private *cs35l43)
++{
++	const struct firmware *firmware;
++	struct wm_adsp *dsp = &cs35l43->dsp;
++	int ret = 0;
++	char filename[NAME_MAX];
++
++	if (!cs35l43->delta_requested ||
++	     cs35l43->delta_applied == cs35l43->delta_requested)
++		return 0;
++
++	dev_dbg(cs35l43->dev, "Applying delta file %d\n", cs35l43->delta_requested);
++
++	snprintf(filename, NAME_MAX, "%s-delta-%d-spk-prot.bin",
++			cs35l43->pdata.dsp_part_name, cs35l43->delta_requested);
++
++	ret = request_firmware(&firmware, filename, cs35l43->dev);
++	if (ret != 0) {
++		dev_err(cs35l43->dev, "Failed to request '%s'\n", filename);
++		return -EINVAL;
++	}
++
++	ret = cs_dsp_load_coeff(&dsp->cs_dsp, firmware, filename);
++	if (ret)
++		dev_err(cs35l43->dev, "Error applying delta file %s: %d\n",
++				filename, ret);
++	else
++		cs35l43->delta_applied = cs35l43->delta_requested;
++
++	return ret;
++}
++
++static int cs35l43_delta_select_put(struct snd_kcontrol *kcontrol,
++			   struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	struct cs35l43_private *cs35l43 =
++				 snd_soc_component_get_drvdata(component);
++
++	cs35l43->delta_requested = ucontrol->value.integer.value[0];
++
++	mutex_lock(&cs35l43->hb_lock);
++	if (cs35l43->hibernate_state == CS35L43_HIBERNATE_AWAKE)
++		cs35l43_apply_delta_tuning(cs35l43);
++	mutex_unlock(&cs35l43->hb_lock);
++
++	return 0;
++}
++
++static int cs35l43_ultrasonic_mode_get(struct snd_kcontrol *kcontrol,
++				   struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component;
++	struct cs35l43_private *cs35l43;
++
++	component = snd_soc_dapm_kcontrol_to_component(kcontrol);
++	cs35l43 = snd_soc_component_get_drvdata(component);
++
++	ucontrol->value.integer.value[0] = cs35l43->ultrasonic_mode;
++
++	return 0;
++}
++
++static int cs35l43_ultrasonic_mode_put(struct snd_kcontrol *kcontrol,
++				   struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component;
++	struct cs35l43_private *cs35l43;
++	unsigned int mon_rates, rx_rates, tx_rates, high_rate_enable;
++
++	component = snd_soc_dapm_kcontrol_to_component(kcontrol);
++	cs35l43 = snd_soc_component_get_drvdata(component);
++
++	cs35l43->ultrasonic_mode = ucontrol->value.integer.value[0];
++
++	switch (cs35l43->ultrasonic_mode) {
++	case CS35L43_ULTRASONIC_MODE_INBAND:
++		mon_rates = CS35L43_BASE_RATE;
++		rx_rates = CS35L43_HIGH_RATE;
++		tx_rates = CS35L43_HIGH_RATE;
++		high_rate_enable = 1;
++
++		break;
++	case CS35L43_ULTRASONIC_MODE_OUT_OF_BAND:
++		mon_rates = CS35L43_BASE_RATE;
++		rx_rates = CS35L43_HIGH_RATE;
++		tx_rates = CS35L43_HIGH_RATE;
++		high_rate_enable = 1;
++		break;
++	case CS35L43_ULTRASONIC_MODE_DISABLED:
++	default:
++		mon_rates = CS35L43_BASE_RATE;
++		rx_rates = CS35L43_BASE_RATE;
++		tx_rates = CS35L43_BASE_RATE;
++		high_rate_enable = 0;
++		break;
++	}
++
++	pm_runtime_get_sync(cs35l43->dev);
++
++	regmap_update_bits(cs35l43->regmap,
++			CS35L43_DSP1_SAMPLE_RATE_RX1,
++			CS35L43_DSP_RX1_RATE_MASK,
++			rx_rates << CS35L43_DSP_RX1_RATE_SHIFT);
++	regmap_update_bits(cs35l43->regmap,
++			CS35L43_DSP1_SAMPLE_RATE_RX1,
++			CS35L43_DSP_RX2_RATE_MASK,
++			rx_rates << CS35L43_DSP_RX2_RATE_SHIFT);
++	regmap_update_bits(cs35l43->regmap,
++			CS35L43_DSP1_SAMPLE_RATE_RX1,
++			CS35L43_DSP_RX3_RATE_MASK,
++			rx_rates << CS35L43_DSP_RX3_RATE_SHIFT);
++	regmap_update_bits(cs35l43->regmap,
++			CS35L43_DSP1_SAMPLE_RATE_RX1,
++			CS35L43_DSP_RX4_RATE_MASK,
++			mon_rates << CS35L43_DSP_RX4_RATE_SHIFT);
++	regmap_update_bits(cs35l43->regmap,
++			CS35L43_DSP1_SAMPLE_RATE_RX2,
++			CS35L43_DSP_RX5_RATE_MASK,
++			mon_rates << CS35L43_DSP_RX5_RATE_SHIFT);
++	regmap_update_bits(cs35l43->regmap,
++			CS35L43_DSP1_SAMPLE_RATE_RX2,
++			CS35L43_DSP_RX6_RATE_MASK,
++			mon_rates << CS35L43_DSP_RX6_RATE_SHIFT);
++
++	regmap_update_bits(cs35l43->regmap,
++			CS35L43_DSP1_SAMPLE_RATE_TX1,
++			CS35L43_DSP_TX1_RATE_MASK,
++			tx_rates << CS35L43_DSP_TX1_RATE_SHIFT);
++	regmap_update_bits(cs35l43->regmap,
++			CS35L43_DSP1_SAMPLE_RATE_TX1,
++			CS35L43_DSP_TX2_RATE_MASK,
++			tx_rates << CS35L43_DSP_TX2_RATE_SHIFT);
++	regmap_update_bits(cs35l43->regmap,
++			CS35L43_DSP1_SAMPLE_RATE_TX1,
++			CS35L43_DSP_TX3_RATE_MASK,
++			tx_rates << CS35L43_DSP_TX3_RATE_SHIFT);
++	regmap_update_bits(cs35l43->regmap,
++			CS35L43_DSP1_SAMPLE_RATE_TX1,
++			CS35L43_DSP_TX4_RATE_MASK,
++			tx_rates << CS35L43_DSP_TX4_RATE_SHIFT);
++	regmap_update_bits(cs35l43->regmap,
++			CS35L43_DSP1_SAMPLE_RATE_TX2,
++			CS35L43_DSP_TX5_RATE_MASK,
++			CS35L43_BASE_RATE << CS35L43_DSP_TX5_RATE_SHIFT);
++	regmap_update_bits(cs35l43->regmap,
++			CS35L43_DSP1_SAMPLE_RATE_TX2,
++			CS35L43_DSP_TX6_RATE_MASK,
++			tx_rates << CS35L43_DSP_TX6_RATE_SHIFT);
++
++	if (high_rate_enable) {
++		regmap_update_bits(cs35l43->regmap, CS35L43_DAC_MSM_CONFIG,
++				CS35L43_AMP_PCM_FSX2_EN_MASK,
++				CS35L43_AMP_PCM_FSX2_EN_MASK);
++		regmap_update_bits(cs35l43->regmap, CS35L43_MONITOR_FILT,
++				CS35L43_VIMON_DUAL_RATE_MASK,
++				CS35L43_VIMON_DUAL_RATE_MASK);
++	} else {
++		regmap_update_bits(cs35l43->regmap, CS35L43_DAC_MSM_CONFIG,
++				CS35L43_AMP_PCM_FSX2_EN_MASK, 0);
++		regmap_update_bits(cs35l43->regmap, CS35L43_MONITOR_FILT,
++				CS35L43_VIMON_DUAL_RATE_MASK, 0);
++	}
++
++	regmap_write(cs35l43->regmap, CS35L43_DSP_VIRTUAL1_MBOX_1,
++			CS35L43_MBOX_CMD_AUDIO_REINIT);
++
++	pm_runtime_mark_last_busy(cs35l43->dev);
++	pm_runtime_put_autosuspend(cs35l43->dev);
++
++	return 0;
++}
++
++static int cs35l43_reinit_get(struct snd_kcontrol *kcontrol,
++				   struct snd_ctl_elem_value *ucontrol)
++{
++	ucontrol->value.integer.value[0] = 0;
++
++	return 0;
++}
++
++static int cs35l43_reinit_put(struct snd_kcontrol *kcontrol,
++				   struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component;
++	struct cs35l43_private *cs35l43;
++	int ret = 0;
++
++	component = snd_kcontrol_chip(kcontrol);
++	cs35l43 = snd_soc_component_get_drvdata(component);
++
++	if (ucontrol->value.integer.value[0]) {
++		pm_runtime_get_sync(cs35l43->dev);
++
++		ret = regmap_write(cs35l43->regmap, CS35L43_DSP_VIRTUAL1_MBOX_1,
++					CS35L43_MBOX_CMD_AUDIO_REINIT);
++
++		pm_runtime_mark_last_busy(cs35l43->dev);
++		pm_runtime_put_autosuspend(cs35l43->dev);
++	}
++
++	return ret;
++}
++
++static const struct snd_kcontrol_new ultra_mux =
++	SOC_DAPM_ENUM_EXT("Ultrasonic Mode", cs35l43_ultrasonic_mode_enum,
++			cs35l43_ultrasonic_mode_get, cs35l43_ultrasonic_mode_put);
++
++static const struct snd_kcontrol_new cs35l43_aud_controls[] = {
++	SOC_SINGLE("DC Watchdog Enable", CS35L43_ALIVE_DCIN_WD,
++			CS35L43_DCIN_WD_EN_SHIFT, 1, 0),
++	SOC_SINGLE("DC Watchdog Threshold", CS35L43_ALIVE_DCIN_WD,
++			CS35L43_DCIN_WD_THLD_SHIFT, 0x28, 0),
++	SOC_SINGLE("DC Watchdog Duration", CS35L43_ALIVE_DCIN_WD,
++			CS35L43_DCIN_WD_DUR_SHIFT, 0x7, 0),
++	SOC_ENUM("DC Watchdog Mode", cs35l43_dc_wd_mode_enum),
++	/* Ignore bit 0: it is beyond the resolution of TLV_DB_SCALE */
++	SOC_SINGLE_S_TLV("Digital PCM Volume",
++			 CS35L43_AMP_CTRL,
++			 CS35L43_AMP_VOL_PCM_SHIFT + 1,
++			 -409, 48,
++			 (11 - 1) - 1,
++			 0, dig_vol_tlv),
++	SOC_SINGLE_TLV("Amp Gain", CS35L43_AMP_GAIN,
++			CS35L43_AMP_GAIN_PCM_SHIFT, 20, 0,
++			amp_gain_tlv),
++	SOC_SINGLE_EXT("Reinit", SND_SOC_NOPM, 0, 1, 0,
++			cs35l43_reinit_get, cs35l43_reinit_put),
++	SOC_ENUM("PCM Soft Ramp", pcm_sft_ramp),
++	SOC_SINGLE_RANGE("ASPTX1 Slot Position", CS35L43_ASP_FRAME_CONTROL1, 0, 0, 7, 0),
++	SOC_SINGLE_RANGE("ASPTX2 Slot Position", CS35L43_ASP_FRAME_CONTROL1, 8, 0, 7, 0),
++	SOC_SINGLE_RANGE("ASPTX3 Slot Position", CS35L43_ASP_FRAME_CONTROL1, 16, 0, 7, 0),
++	SOC_SINGLE_RANGE("ASPTX4 Slot Position", CS35L43_ASP_FRAME_CONTROL1, 24, 0, 7, 0),
++	SOC_SINGLE_RANGE("ASPRX1 Slot Position", CS35L43_ASP_FRAME_CONTROL5, 0, 0, 7, 0),
++	SOC_SINGLE_RANGE("ASPRX2 Slot Position", CS35L43_ASP_FRAME_CONTROL5, 8, 0, 7, 0),
++	SOC_SINGLE_RANGE("ASPRX3 Slot Position", CS35L43_ASP_FRAME_CONTROL5, 16, 0, 7, 0),
++	SOC_SINGLE_EXT("Delta Select", SND_SOC_NOPM, 0, 10, 0,
++			cs35l43_delta_select_get, cs35l43_delta_select_put),
++	WM_ADSP2_PRELOAD_SWITCH("DSP1", 1),
++	WM_ADSP_FW_CONTROL("DSP1", 0),
++};
++
++static int cs35l43_dsp_preload_ev(struct snd_soc_dapm_widget *w,
++		struct snd_kcontrol *kcontrol, int event);
++static int cs35l43_dsp_audio_ev(struct snd_soc_dapm_widget *w,
++		struct snd_kcontrol *kcontrol, int event);
++static int cs35l43_main_amp_event(struct snd_soc_dapm_widget *w,
++		struct snd_kcontrol *kcontrol, int event);
++
++static int cs35l43_write_seq_elem_update(struct cs35l43_write_seq_elem *write_seq_elem,
++						unsigned int addr, unsigned int value)
++{
++	switch (write_seq_elem->operation) {
++	case CS35L43_POWER_SEQ_OP_WRITE_REG_FULL:
++		write_seq_elem->words[0] = (addr & 0xFFFF0000) >> 16;
++		write_seq_elem->words[1] = ((addr & 0xFFFF) << 8) |
++						((value & 0xFF000000) >> 24);
++		write_seq_elem->words[2] = (value & 0xFFFFFF);
++
++		break;
++	case CS35L43_POWER_SEQ_OP_WRITE_REG_ADDR8:
++		write_seq_elem->words[0] = (CS35L43_POWER_SEQ_OP_WRITE_REG_ADDR8 << 16) |
++						((addr & 0xFF) << 8) |
++						((value & 0xFF000000) >> 24);
++		write_seq_elem->words[1] = (value & 0xFFFFFF);
++		break;
++	case CS35L43_POWER_SEQ_OP_WRITE_REG_L16:
++		write_seq_elem->words[0] = (CS35L43_POWER_SEQ_OP_WRITE_REG_L16 << 16) |
++						((addr & 0xFFFF00) >> 8);
++		write_seq_elem->words[1] = ((addr & 0xFF) << 16) | (value & 0xFFFF);
++		break;
++	default:
++		break;
++	}
++
++	return 0;
++}
++
++static int cs35l43_write_seq_add(struct cs35l43_private *cs35l43,
++				struct cs35l43_write_seq *sequence,
++				unsigned int update_reg, unsigned int update_value,
++				bool read)
++{
++	struct device *dev = cs35l43->dev;
++	u32 *buf, *op_words, addr = 0, prev_addr = 0, value = 0;
++	u8 operation;
++	unsigned int i, j, num_words, ret = 0;
++	struct cs35l43_write_seq_elem *write_seq_elem;
++
++	buf = kzalloc(sizeof(u32) * sequence->length, GFP_KERNEL);
++	if (!buf) {
++		dev_err(cs35l43->dev, "%s: failed to alloc write seq\n",
++			__func__);
++		return -ENOMEM;
++	}
++
++	ret = wm_adsp_read_ctl(&cs35l43->dsp, sequence->name,
++			WMFW_ADSP2_XM, CS35L43_ALG_ID_PM, (void *)buf,
++			sequence->length * sizeof(u32));
++	if (ret != 0) {
++		dev_err(dev, "%s: Failed to read control\n", __func__);
++		goto exit;
++	}
++
++	for (i = 0; i < sequence->length; i++) {
++		buf[i] = be32_to_cpu(buf[i]);
++		dev_dbg(dev, "%s[%d] = 0x%x\n", sequence->name, i, buf[i]);
++	}
++
++	list_for_each_entry(write_seq_elem, &sequence->list_head, list) {
++		switch (write_seq_elem->operation) {
++		case CS35L43_POWER_SEQ_OP_WRITE_REG_FULL:
++			addr = ((write_seq_elem->words[0] & 0xFFFF) << 16) |
++				((write_seq_elem->words[1] & 0xFFFF00) >> 8);
++			value = ((write_seq_elem->words[1] & 0xFF) << 24) |
++				(write_seq_elem->words[2] & 0xFFFFFF);
++			break;
++		case CS35L43_POWER_SEQ_OP_WRITE_REG_ADDR8:
++			addr = (prev_addr & 0xFFFFFF00) |
++				((write_seq_elem->words[0] & 0xFF00) >> 8);
++			value = ((write_seq_elem->words[0] & 0xFF) << 24) |
++				(write_seq_elem->words[1] & 0xFFFFFF);
++			break;
++		case CS35L43_POWER_SEQ_OP_WRITE_REG_L16:
++			addr = ((write_seq_elem->words[0] & 0xFFFF) << 8) |
++				((write_seq_elem->words[1] & 0xFF0000) >> 16);
++			value = (write_seq_elem->words[1] & 0xFFFF);
++			break;
++		default:
++			break;
++		}
++		dev_dbg(dev, "write seq elem: addr=0x%x, prev_addr=0x%x, val=0x%x\n",
++								addr, prev_addr, value);
++		prev_addr = addr;
++
++		if (addr == update_reg) {
++			if (read)
++				regmap_read(cs35l43->regmap, addr, &update_value);
++
++			dev_dbg(dev, "%s: Updating register 0x%x with value 0x%x\n",
++					__func__, addr, update_value);
++			cs35l43_write_seq_elem_update(write_seq_elem, update_reg, update_value);
++			memcpy(buf + write_seq_elem->offset, write_seq_elem->words,
++					write_seq_elem->size * sizeof(u32));
++			goto write_exit;
++		}
++	}
++
++	i = 0;
++	while (i < sequence->length) {
++		operation = (buf[i] & CS35L43_POWER_SEQ_OP_MASK) >>
++			CS35L43_POWER_SEQ_OP_SHIFT;
++
++		if (operation == CS35L43_POWER_SEQ_OP_END)
++			break;
++
++		/* get num words for given operation */
++		for (j = 0; j < CS35L43_POWER_SEQ_NUM_OPS; j++) {
++			if (cs35l43_write_seq_op_sizes[j][0] == operation) {
++				num_words = cs35l43_write_seq_op_sizes[j][1];
++				break;
++			}
++		}
++
++		i += num_words;
++	}
++
++	if (operation != CS35L43_POWER_SEQ_OP_END ||
++		i + CS35L43_POWER_SEQ_OP_WRITE_REG_FULL_WORDS +
++		CS35L43_POWER_SEQ_OP_END_WORDS > sequence->length) {
++		dev_err(dev, "WRITE SEQ END_OF_SCRIPT not found or sequence full\n");
++		ret = -E2BIG;
++		goto exit;
++	}
++
++	write_seq_elem = devm_kzalloc(dev, sizeof(*write_seq_elem), GFP_KERNEL);
++	if (!write_seq_elem) {
++		ret = -ENOMEM;
++		goto exit;
++	}
++
++	write_seq_elem->size = CS35L43_POWER_SEQ_OP_WRITE_REG_FULL_WORDS;
++	write_seq_elem->offset = i;
++	write_seq_elem->operation = CS35L43_POWER_SEQ_OP_WRITE_REG_FULL;
++
++	op_words = kzalloc(write_seq_elem->size * sizeof(u32), GFP_KERNEL);
++	if (!op_words) {
++		ret =  -ENOMEM;
++		goto err_elem;
++	}
++
++	write_seq_elem->words = op_words;
++
++	if (read)
++		regmap_read(cs35l43->regmap, update_reg, &update_value);
++
++	cs35l43_write_seq_elem_update(write_seq_elem, update_reg, update_value);
++	list_add_tail(&write_seq_elem->list, &sequence->list_head);
++
++	sequence->num_ops++;
++
++	memcpy(&buf[i], op_words, write_seq_elem->size * sizeof(u32));
++
++	dev_dbg(dev, "%s: Added register 0x%x with value 0x%x\n",
++			__func__, update_reg, update_value);
++	for (i = 0; i < write_seq_elem->size; i++)
++		dev_dbg(dev, "elem[%d]: 0x%x\n", i, write_seq_elem->words[i]);
++
++	buf[write_seq_elem->offset + write_seq_elem->size] = 0xFFFFFFFF;
++
++write_exit:
++	for (i = 0; i < sequence->length; i++) {
++		dev_dbg(dev, "%s[%d] = 0x%x\n", sequence->name, i, buf[i]);
++		buf[i] = cpu_to_be32(buf[i]);
++	}
++
++	ret = wm_adsp_write_ctl(&cs35l43->dsp, sequence->name,
++		WMFW_ADSP2_XM, CS35L43_ALG_ID_PM, (void *)buf,
++		sequence->length * sizeof(u32));
++	goto exit;
++
++err_elem:
++	kfree(write_seq_elem);
++exit:
++	kfree(buf);
++	return ret;
++}
++
++static int cs35l43_write_seq_update(struct cs35l43_private *cs35l43,
++					struct cs35l43_write_seq *sequence)
++{
++	struct device *dev = cs35l43->dev;
++	u32 *buf;
++	u32 addr = 0, prev_addr = 0, value = 0, reg_value = 0;
++	unsigned int ret = 0, i;
++	struct cs35l43_write_seq_elem *write_seq_elem;
++
++	buf = kzalloc(sizeof(u32) * sequence->length, GFP_KERNEL);
++	if (!buf) {
++		dev_err(cs35l43->dev, "%s: failed to alloc write seq\n",
++			__func__);
++		return -ENOMEM;
++	}
++
++	ret = wm_adsp_read_ctl(&cs35l43->dsp, sequence->name,
++			WMFW_ADSP2_XM, CS35L43_ALG_ID_PM, (void *)buf,
++			sequence->length * sizeof(u32));
++	if (ret != 0) {
++		dev_err(dev, "%s: Failed to read control\n", __func__);
++		goto err_free;
++	}
++
++	for (i = 0; i < sequence->length; i++) {
++		buf[i] = be32_to_cpu(buf[i]);
++		dev_dbg(dev, "%s[%d] = 0x%x\n", sequence->name, i, buf[i]);
++	}
++
++	dev_dbg(dev, "%s num ops: %d\n", sequence->name, sequence->num_ops);
++	dev_dbg(dev, "offset\tsize\twords\n");
++	list_for_each_entry(write_seq_elem, &sequence->list_head, list) {
++		switch (write_seq_elem->operation) {
++		case CS35L43_POWER_SEQ_OP_WRITE_REG_FULL:
++			addr = ((write_seq_elem->words[0] & 0xFFFF) << 16) |
++				((write_seq_elem->words[1] & 0xFFFF00) >> 8);
++			value = ((write_seq_elem->words[1] & 0xFF) << 24) |
++				(write_seq_elem->words[2] & 0xFFFFFF);
++			break;
++		case CS35L43_POWER_SEQ_OP_WRITE_REG_ADDR8:
++			addr = (prev_addr & 0xFFFFFF00) |
++				((write_seq_elem->words[0] & 0xFF00) >> 8);
++			value = ((write_seq_elem->words[0] & 0xFF) << 24) |
++				(write_seq_elem->words[1] & 0xFFFFFF);
++			break;
++		case CS35L43_POWER_SEQ_OP_WRITE_REG_L16:
++			addr = ((write_seq_elem->words[0] & 0xFFFF) << 8) |
++				((write_seq_elem->words[1] & 0xFF0000) >> 16);
++			value = (write_seq_elem->words[1] & 0xFFFF);
++			break;
++		default:
++			break;
++		}
++		dev_dbg(dev, "write seq elem: addr=0x%x, prev_addr=0x%x, val=0x%x\n",
++								addr, prev_addr, value);
++		prev_addr = addr;
++
++		regmap_read(cs35l43->regmap, addr, &reg_value);
++
++		if (reg_value != value && addr != CS35L43_TEST_KEY_CTRL &&
++					cs35l43_readable_reg(dev, addr)) {
++			dev_dbg(dev,
++				"%s: Updating register 0x%x with value 0x%x\t(prev value: 0x%x)\n",
++					__func__, addr, reg_value, value);
++			cs35l43_write_seq_elem_update(write_seq_elem, addr, reg_value);
++			memcpy(buf + write_seq_elem->offset, write_seq_elem->words,
++					write_seq_elem->size * sizeof(u32));
++			for (i = 0; i < write_seq_elem->size; i++)
++				dev_dbg(dev, "elem[%d]: 0x%x\n", i, write_seq_elem->words[i]);
++		}
++	}
++
++	for (i = 0; i < sequence->length; i++) {
++		dev_dbg(dev, "%s[%d] = 0x%x\n", sequence->name, i, buf[i]);
++		buf[i] = cpu_to_be32(buf[i]);
++	}
++
++	ret = wm_adsp_write_ctl(&cs35l43->dsp, sequence->name,
++			WMFW_ADSP2_XM, CS35L43_ALG_ID_PM, (void *)buf,
++			sequence->length * sizeof(u32));
++
++err_free:
++	kfree(buf);
++	return ret;
++
++}
++
++static int cs35l43_write_seq_init(struct cs35l43_private *cs35l43,
++					struct cs35l43_write_seq *sequence)
++{
++	struct device *dev = cs35l43->dev;
++	u32 *buf, *op_words;
++	u8 operation;
++	unsigned int i, j, num_words, ret = 0;
++	struct cs35l43_write_seq_elem *write_seq_elem;
++
++	INIT_LIST_HEAD(&sequence->list_head);
++	sequence->num_ops = 0;
++
++	buf = kzalloc(sizeof(u32) * sequence->length, GFP_KERNEL);
++	if (!buf) {
++		dev_err(cs35l43->dev, "%s: failed to alloc write seq\n",
++			__func__);
++		return -ENOMEM;
++	}
++
++	ret = wm_adsp_read_ctl(&cs35l43->dsp, sequence->name,
++			WMFW_ADSP2_XM, CS35L43_ALG_ID_PM, (void *)buf,
++			sequence->length * sizeof(u32));
++	if (ret != 0) {
++		dev_err(dev, "%s: Failed to read control\n", __func__);
++		goto err_free;
++	}
++
++
++	for (i = 0; i < sequence->length; i++) {
++		buf[i] = be32_to_cpu(buf[i]);
++		dev_dbg(dev, "%s[%d] = 0x%x\n", sequence->name, i, buf[i]);
++	}
++
++	i = 0;
++	while (i < sequence->length) {
++		operation = (buf[i] & CS35L43_POWER_SEQ_OP_MASK) >>
++			CS35L43_POWER_SEQ_OP_SHIFT;
++
++		if (operation == CS35L43_POWER_SEQ_OP_END)
++			break;
++
++		/* get num words for given operation */
++		for (j = 0; j < CS35L43_POWER_SEQ_NUM_OPS; j++) {
++			if (cs35l43_write_seq_op_sizes[j][0] == operation) {
++				num_words = cs35l43_write_seq_op_sizes[j][1];
++				break;
++			}
++		}
++
++		if (j == CS35L43_POWER_SEQ_NUM_OPS) {
++			dev_err(dev, "Failed to determine op size\n");
++			ret = -EINVAL;
++			goto err_free;
++		}
++
++		op_words = kzalloc(num_words * sizeof(u32), GFP_KERNEL);
++		if (!op_words) {
++			ret = -ENOMEM;
++			goto err_free;
++		}
++
++		memcpy(op_words, &buf[i], num_words * sizeof(u32));
++
++		write_seq_elem = devm_kzalloc(dev, sizeof(*write_seq_elem), GFP_KERNEL);
++		if (!write_seq_elem) {
++			ret = -ENOMEM;
++			goto err_parse;
++		}
++
++		write_seq_elem->size = num_words;
++		write_seq_elem->offset = i;
++		write_seq_elem->operation = operation;
++		write_seq_elem->words = op_words;
++		list_add_tail(&write_seq_elem->list, &sequence->list_head);
++
++		sequence->num_ops++;
++		i += num_words;
++	}
++
++	dev_dbg(dev, "%s num ops: %d\n", sequence->name, sequence->num_ops);
++	dev_dbg(dev, "offset\tsize\twords\n");
++	list_for_each_entry(write_seq_elem, &sequence->list_head, list) {
++		dev_dbg(dev, "0x%04X\t%d", write_seq_elem->offset,
++							write_seq_elem->size);
++		for (j = 0; j < write_seq_elem->size; j++)
++			dev_dbg(dev, "0x%08X", *(write_seq_elem->words + j));
++	}
++
++	if (operation != CS35L43_POWER_SEQ_OP_END) {
++		dev_err(dev, "WRITE SEQ END_OF_SCRIPT not found\n");
++		ret = -E2BIG;
++	}
++
++	kfree(buf);
++	return ret;
++
++err_parse:
++	kfree(op_words);
++err_free:
++	kfree(buf);
++	return ret;
++}
++
++static int cs35l43_dsp_reset(struct cs35l43_private *cs35l43)
++{
++	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(cs35l43->component);
++	struct snd_soc_dapm_widget fake_dapm_widget = {.dapm = dapm};
++
++	unsigned int val = 0;
++	int ret, retry = 10;
++
++	if (!dapm || !cs35l43->component || !cs35l43->dsp.cs_dsp.booted)
++		return -EINVAL;
++
++	dev_dbg(cs35l43->dev, "%s\n", __func__);
++
++	if (pm_runtime_enabled(cs35l43->dev))
++		pm_runtime_get_sync(cs35l43->dev);
++
++	regmap_write(cs35l43->regmap, CS35L43_DSP_VIRTUAL1_MBOX_1,
++					CS35L43_MBOX_CMD_PREVENT_HIBERNATE);
++	regmap_write(cs35l43->regmap, CS35L43_DSP_VIRTUAL1_MBOX_1,
++					CS35L43_MBOX_CMD_AUDIO_PAUSE);
++	usleep_range(5000, 5100);
++
++	/* Disable DSP and reset state variables */
++	regmap_write(cs35l43->regmap, CS35L43_DSP1_CCM_CORE_CONTROL, 0x80);
++	regmap_write(cs35l43->regmap, CS35L43_PWRMGT_CTL, 0);
++
++	/* Disable WDT */
++	regmap_write(cs35l43->regmap, CS35L43_DSP1_WDT_CONTROL, 0x111000);
++
++	/* Clear WDT status */
++	regmap_write(cs35l43->regmap, CS35L43_DSP1_WDT_STATUS, 0x03);
++
++	ret = wm_adsp_write_ctl(&cs35l43->dsp, "CALL_RAM_INIT", WMFW_ADSP2_XM,
++				cs35l43->dsp.cs_dsp.fw_id,
++				&val, sizeof(u32));
++	if (ret < 0)
++		dev_err(cs35l43->dev, "Failed to clear CALL_RAM_INIT\n");
++
++	ret = wm_adsp_write_ctl(&cs35l43->dsp, "HALO_STATE", WMFW_ADSP2_XM,
++				cs35l43->dsp.cs_dsp.fw_id,
++				&val, sizeof(u32));
++	if (ret < 0)
++		dev_err(cs35l43->dev, "Failed to clear HALO_STATE\n");
++
++	ret = wm_adsp_write_ctl(&cs35l43->dsp, "AUDIO_STATE", WMFW_ADSP2_XM, 0x5f212,
++				&val, sizeof(u32));
++	if (ret < 0)
++		dev_err(cs35l43->dev, "Failed to clear AUDIO_STATE\n");
++
++	regmap_write(cs35l43->regmap, CS35L43_DSP1_MPU_LOCK_STATE, 0x5555);
++	regmap_write(cs35l43->regmap, CS35L43_DSP1_MPU_LOCK_STATE, 0xAAAA);
++
++	regmap_read(cs35l43->regmap, CS35L43_DSP1_MPU_XM_VIO_STATUS, &val);
++	regmap_write(cs35l43->regmap, CS35L43_DSP1_MPU_XM_VIO_STATUS, val);
++	regmap_read(cs35l43->regmap, CS35L43_DSP1_MPU_YM_VIO_STATUS, &val);
++	regmap_write(cs35l43->regmap, CS35L43_DSP1_MPU_YM_VIO_STATUS, val);
++	regmap_read(cs35l43->regmap, CS35L43_DSP1_MPU_PM_VIO_STATUS, &val);
++	regmap_write(cs35l43->regmap, CS35L43_DSP1_MPU_PM_VIO_STATUS, val);
++
++	regmap_write(cs35l43->regmap, CS35L43_DSP1_CCM_CORE_CONTROL, 0x281);
++
++	do {
++		usleep_range(10000, 10100);
++		wm_adsp_read_ctl(&cs35l43->dsp, "HALO_STATE",
++			WMFW_ADSP2_XM, cs35l43->dsp.cs_dsp.fw_id, &val, sizeof(u32));
++		val = be32_to_cpu(val);
++		dev_dbg(cs35l43->dev, "halo_state: %x\n", val);
++	} while (val != 2 && retry-- >= 0);
++
++	if (retry < 0)
++		dev_err(cs35l43->dev, "%s: Cold boot failed\n", __func__);
++
++	regmap_write(cs35l43->regmap, CS35L43_DSP_VIRTUAL1_MBOX_1,
++					CS35L43_MBOX_CMD_PREVENT_HIBERNATE);
++	regmap_write(cs35l43->regmap, CS35L43_DSP_VIRTUAL1_MBOX_1,
++					CS35L43_MBOX_CMD_AUDIO_PAUSE);
++	usleep_range(5000, 5100);
++
++	cs35l43_log_status(cs35l43);
++
++	/* Disable WDT */
++	regmap_write(cs35l43->regmap, CS35L43_DSP1_WDT_CONTROL, 0x111000);
++
++	/* Clear WDT status */
++	regmap_write(cs35l43->regmap, CS35L43_DSP1_WDT_STATUS, 0x03);
++
++	val = 0;
++	ret = wm_adsp_write_ctl(&cs35l43->dsp, "AUDIO_STATE", WMFW_ADSP2_XM, 0x5f212,
++				&val, sizeof(u32));
++	if (ret < 0)
++		dev_err(cs35l43->dev, "Failed to clear AUDIO_STATE\n");
++
++
++	regmap_write(cs35l43->regmap, CS35L43_DSP1_CCM_CORE_CONTROL, 0x80);
++
++	val = cpu_to_be32(1);
++	ret = wm_adsp_write_ctl(&cs35l43->dsp, "CALL_RAM_INIT", WMFW_ADSP2_XM,
++				cs35l43->dsp.cs_dsp.fw_id,
++				&val, sizeof(u32));
++	if (ret < 0)
++		dev_err(cs35l43->dev, "Failed to set CALL_RAM_INIT\n");
++
++	cs35l43->dsp.preloaded = 0;
++	cs35l43_dsp_audio_ev(&fake_dapm_widget, NULL, SND_SOC_DAPM_PRE_PMD);
++	cs35l43_main_amp_event(&fake_dapm_widget, NULL, SND_SOC_DAPM_POST_PMD);
++	cs35l43_dsp_preload_ev(&fake_dapm_widget, NULL, SND_SOC_DAPM_PRE_PMD);
++	regmap_write(cs35l43->regmap, CS35L43_GLOBAL_ENABLES, 0);
++	usleep_range(5000, 5100);
++	cs35l43_dsp_preload_ev(&fake_dapm_widget, NULL, SND_SOC_DAPM_PRE_PMU);
++	cs35l43_dsp_preload_ev(&fake_dapm_widget, NULL, SND_SOC_DAPM_POST_PMU);
++	cs35l43_dsp_audio_ev(&fake_dapm_widget, NULL, SND_SOC_DAPM_POST_PMU);
++	cs35l43_main_amp_event(&fake_dapm_widget, NULL, SND_SOC_DAPM_POST_PMU);
++	cs35l43->dsp.preloaded = 1;
++
++	if (cs35l43_check_dsp_regs(cs35l43) != 0)
++		dev_err(cs35l43->dev, "Failed to reset DSP\n");
++
++	if (pm_runtime_enabled(cs35l43->dev))
++		pm_runtime_put_autosuspend(cs35l43->dev);
++
++	return ret;
++}
++
++static void cs35l43_error_work(struct work_struct *wk)
++{
++	struct cs35l43_private *cs35l43;
++
++	cs35l43 = container_of(wk, struct cs35l43_private, err_work);
++
++	mutex_lock(&cs35l43->err_lock);
++	cs35l43_dsp_reset(cs35l43);
++	mutex_unlock(&cs35l43->err_lock);
++}
++
++static int cs35l43_dsp_preload_ev(struct snd_soc_dapm_widget *w,
++		       struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *component =
++		snd_soc_dapm_to_component(w->dapm);
++	struct cs35l43_private *cs35l43 =
++		snd_soc_component_get_drvdata(component);
++
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		if (cs35l43->dsp.cs_dsp.booted)
++			return 0;
++		if (cs35l43->limit_spi_clock) {
++			regmap_update_bits(cs35l43->regmap,
++					   CS35L43_REFCLK_INPUT,
++					   CS35L43_PLL_FORCE_EN_MASK,
++					   CS35L43_PLL_FORCE_EN_MASK);
++			cs35l43->limit_spi_clock(cs35l43, false);
++		}
++		wm_adsp_early_event(w, kcontrol, event);
++		break;
++	case SND_SOC_DAPM_POST_PMU:
++		if (cs35l43->dsp.cs_dsp.running)
++			return 0;
++		regmap_write(cs35l43->regmap, CS35L43_PWRMGT_CTL, CS35L43_MEM_RDY);
++		wm_adsp_event(w, kcontrol, event);
++
++		if (cs35l43->low_pwr_mode == CS35L43_LOW_PWR_MODE_STANDBY)
++			regmap_write(cs35l43->regmap, CS35L43_DSP_VIRTUAL1_MBOX_1,
++					CS35L43_MBOX_CMD_PREVENT_HIBERNATE);
++
++
++		cs35l43->first_event = 0;
++		cs35l43->delta_applied = 0;
++		if (cs35l43->limit_spi_clock) {
++			cs35l43->limit_spi_clock(cs35l43, true);
++			regmap_update_bits(cs35l43->regmap,
++					   CS35L43_REFCLK_INPUT,
++					   CS35L43_PLL_FORCE_EN_MASK,
++					   0);
++		}
++		break;
++	case SND_SOC_DAPM_PRE_PMD:
++		if (cs35l43->dsp.preloaded)
++			return 0;
++
++		wm_adsp_early_event(w, kcontrol, event);
++		wm_adsp_event(w, kcontrol, event);
++		cs35l43->hibernate_state = CS35L43_HIBERNATE_NOT_LOADED;
++		break;
++	default:
++		break;
++	}
++
++	return 0;
++}
++
++static int cs35l43_dsp_audio_ev(struct snd_soc_dapm_widget *w,
++		       struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *component =
++		snd_soc_dapm_to_component(w->dapm);
++	struct cs35l43_private *cs35l43 =
++		snd_soc_component_get_drvdata(component);
++	unsigned int audio_state;
++
++	dev_dbg(cs35l43->dev, "%s\n", __func__);
++
++	if (!cs35l43->dsp.cs_dsp.running)
++		return 0;
++
++	switch (event) {
++	case SND_SOC_DAPM_POST_PMU:
++
++		if (!cs35l43->first_event) {
++			regmap_update_bits(cs35l43->regmap, CS35L43_IRQ1_MASK_1,
++				CS35L43_DSP_VIRTUAL2_MBOX_WR_EINT1_MASK, 0);
++			cs35l43->first_event = true;
++		}
++
++		regmap_write(cs35l43->regmap, CS35L43_DSP_VIRTUAL1_MBOX_1,
++				CS35L43_MBOX_CMD_AUDIO_PLAY);
++		usleep_range(2000, 2200);
++		wm_adsp_read_ctl(&cs35l43->dsp, "AUDIO_STATE",
++			WMFW_ADSP2_XM, 0x5f212, &audio_state, sizeof(u32));
++		audio_state = be32_to_cpu(audio_state);
++		dev_dbg(cs35l43->dev, "PMU audio state post: 0x%x\n", audio_state);
++		if (audio_state != CS35L43_AUDIO_STATE_WAITING &&
++			audio_state != CS35L43_AUDIO_STATE_RUNNING &&
++			audio_state != CS35L43_AUDIO_STATE_RAMPDOWN &&
++			audio_state != CS35L43_AUDIO_STATE_AUX_NG_MUTED)
++			dev_err(cs35l43->dev, "Failed to set MBOX cmd PLAY\n");
++
++		if (cs35l43_check_dsp_regs(cs35l43) != 0) {
++			if (!mutex_is_locked(&cs35l43->err_lock))
++				queue_work(cs35l43->err_wq, &cs35l43->err_work);
++		}
++		break;
++	case SND_SOC_DAPM_PRE_PMD:
++		regmap_write(cs35l43->regmap, CS35L43_DSP_VIRTUAL1_MBOX_1,
++				CS35L43_MBOX_CMD_AUDIO_PAUSE);
++		usleep_range(2000, 2200);
++		wm_adsp_read_ctl(&cs35l43->dsp, "AUDIO_STATE",
++			WMFW_ADSP2_XM, 0x5f212, &audio_state, sizeof(u32));
++		audio_state = be32_to_cpu(audio_state);
++		dev_dbg(cs35l43->dev, "PMD audio state post: 0x%x\n", audio_state);
++		if (audio_state != CS35L43_AUDIO_STATE_READY &&
++			audio_state != CS35L43_AUDIO_STATE_RUNNING &&
++			audio_state != CS35L43_AUDIO_STATE_RAMPDOWN)
++			dev_err(cs35l43->dev, "Failed to set MBOX cmd PAUSE\n");
++
++		if (cs35l43_check_dsp_regs(cs35l43) != 0) {
++			if (!mutex_is_locked(&cs35l43->err_lock))
++				queue_work(cs35l43->err_wq, &cs35l43->err_work);
++		}
++		break;
++	default:
++		break;
++	}
++
++	return 0;
++}
++
++static int cs35l43_check_dsp_regs(struct cs35l43_private *cs35l43)
++{
++	int ret = 0;
++	unsigned int val;
++
++	ret = wm_adsp_read_ctl(&cs35l43->dsp, "HALO_STATE", WMFW_ADSP2_XM,
++				cs35l43->dsp.cs_dsp.fw_id,
++				&val, sizeof(u32));
++	if (ret < 0) {
++		dev_err(cs35l43->dev, "Failed to read HALO_STATE\n");
++		return ret;
++	}
++
++	val = be32_to_cpu(val);
++	if (val != 2) {
++		dev_err(cs35l43->dev, "%s: Error HALO_STATE = %u\n", __func__, val);
++		return -EINVAL;
++	}
++
++	ret = wm_adsp_read_ctl(&cs35l43->dsp, "ERROR", WMFW_ADSP2_XM, 0x5f212,
++				&val, sizeof(u32));
++	if (ret < 0) {
++		dev_err(cs35l43->dev, "Failed to read AUDIO_SYSTEM ERROR\n");
++		return ret;
++	}
++
++	val = be32_to_cpu(val);
++	if (val != 0) {
++		dev_err(cs35l43->dev, "%s: Error AUDIO_SYSTEM ERROR = %u\n", __func__, val);
++		return -EINVAL;
++	}
++
++	regmap_read(cs35l43->regmap, CS35L43_DSP1_SCRATCH1, &val);
++	if (val)
++		ret = -EINVAL;
++	regmap_read(cs35l43->regmap, CS35L43_DSP1_SCRATCH2, &val);
++	if (val)
++		ret = -EINVAL;
++	regmap_read(cs35l43->regmap, CS35L43_DSP1_SCRATCH3, &val);
++	if (val)
++		ret = -EINVAL;
++	regmap_read(cs35l43->regmap, CS35L43_DSP1_SCRATCH4, &val);
++	if (val)
++		ret = -EINVAL;
++	if (ret) {
++		dev_err(cs35l43->dev, "%s: Error DSP SCRATCH\n", __func__);
++		return ret;
++	}
++
++	return 0;
++}
++
++static int cs35l43_log_dsp_err(struct cs35l43_private *cs35l43)
++{
++	int i;
++	unsigned int reg;
++	struct cs35l43_dsp_reg regs[] = {
++		{ "PM_CUR_STATE",	CS35L43_ALG_ID_PM },
++		{ "AUDIO_STATE",	0x5f212 },
++		{ "ERROR",		0x5f212 },
++		{ "HALO_STATE",		cs35l43->dsp.cs_dsp.fw_id },
++		{ "HALO_HEARTBEAT",	cs35l43->dsp.cs_dsp.fw_id },
++		{ "AUDIO_BLK_SIZE",	cs35l43->dsp.cs_dsp.fw_id },
++		{ "RAM_INIT_COUNT",	0x5f224 },
++		{ "HIBER_COUNT",	0x5f224 },
++		{ "WDT_WARN_COUNT",	0x5f224 },
++		{ "MIPS_OVERRUN_FLG",	0x5f224 } };
++
++	dev_info(cs35l43->dev, "%s\n", __func__);
++
++	for (i = 0; i < ARRAY_SIZE(regs); i++) {
++		wm_adsp_read_ctl(&cs35l43->dsp, regs[i].name,
++				WMFW_ADSP2_XM, regs[i].id, &reg, sizeof(u32));
++		dev_info(cs35l43->dev, "%s (0x%x): 0x%x\n",
++				regs[i].name, regs[i].id, reg);
++	}
++
++	regmap_read(cs35l43->regmap, CS35L43_DSP1_MPU_XM_VIO_STATUS, &reg);
++	dev_info(cs35l43->dev, "%s: CS35L43_DSP1_MPU_XM_VIO_STATUS 0x%x\n", __func__, reg);
++	regmap_read(cs35l43->regmap, CS35L43_DSP1_MPU_YM_VIO_STATUS, &reg);
++	dev_info(cs35l43->dev, "%s: CS35L43_DSP1_MPU_YM_VIO_STATUS 0x%x\n", __func__, reg);
++	regmap_read(cs35l43->regmap, CS35L43_DSP1_MPU_PM_VIO_STATUS, &reg);
++	dev_info(cs35l43->dev, "%s: CS35L43_DSP1_MPU_PM_VIO_STATUS 0x%x\n", __func__, reg);
++
++	return 0;
++}
++
++static void cs35l43_pll_config(struct cs35l43_private *cs35l43)
++{
++
++	regmap_update_bits(cs35l43->regmap, CS35L43_REFCLK_INPUT,
++			CS35L43_PLL_OPEN_LOOP_MASK,
++			CS35L43_PLL_OPEN_LOOP_MASK);
++	regmap_update_bits(cs35l43->regmap, CS35L43_REFCLK_INPUT,
++			CS35L43_PLL_REFCLK_FREQ_MASK,
++			cs35l43->extclk_cfg << CS35L43_PLL_REFCLK_FREQ_SHIFT);
++	regmap_update_bits(cs35l43->regmap, CS35L43_REFCLK_INPUT,
++			CS35L43_PLL_REFCLK_EN_MASK, 0);
++	regmap_update_bits(cs35l43->regmap, CS35L43_REFCLK_INPUT,
++			CS35L43_PLL_REFCLK_SEL_MASK, cs35l43->clk_id);
++	regmap_update_bits(cs35l43->regmap, CS35L43_REFCLK_INPUT,
++			CS35L43_PLL_OPEN_LOOP_MASK,
++			0);
++	regmap_update_bits(cs35l43->regmap, CS35L43_REFCLK_INPUT,
++			CS35L43_PLL_REFCLK_EN_MASK,
++			CS35L43_PLL_REFCLK_EN_MASK);
++}
++
++static int cs35l43_check_mailbox(struct cs35l43_private *cs35l43)
++{
++	unsigned int *mbox;
++	unsigned int write_ptr, read_ptr, read_idx, write_idx, type, msg;
++	int i, ret;
++
++	mbox = kmalloc_array(8, sizeof(*mbox), GFP_KERNEL);
++	if (!mbox)
++		return -ENOMEM;
++
++	regmap_bulk_read(cs35l43->regmap, CS35L43_DSP_MBOX_1, mbox, 8);
++	for (i = 0; i < 8; i++)
++		dev_dbg(cs35l43->dev, "mbox[%d]: 0x%x\n", i + 1, mbox[i]);
++
++	ret = wm_adsp_read_ctl(&cs35l43->dsp, "QUEUE_WT",
++		WMFW_ADSP2_XM, CS35L43_ALG_ID_MAILBOX, &write_ptr, sizeof(u32));
++	if (ret < 0)
++		return ret;
++	ret = wm_adsp_read_ctl(&cs35l43->dsp, "QUEUE_RD",
++		WMFW_ADSP2_XM, CS35L43_ALG_ID_MAILBOX, &read_ptr, sizeof(u32));
++	if (ret < 0)
++		return ret;
++
++	write_ptr = be32_to_cpu(write_ptr);
++	read_ptr = be32_to_cpu(read_ptr);
++
++	dev_dbg(cs35l43->dev, "QUEUE_WT: 0x%x\n", write_ptr);
++	dev_dbg(cs35l43->dev, "QUEUE_RD: 0x%x\n", read_ptr);
++	read_idx = (read_ptr & 0x1F) / 4;
++	write_idx = (write_ptr & 0x1F) / 4;
++
++	if (write_idx == 0 || write_idx == read_idx)
++		goto exit;
++
++	do {
++		dev_dbg(cs35l43->dev, "MESSAGE: 0x%x\n", mbox[read_idx]);
++
++		type = mbox[read_idx] >> 24;
++		msg = mbox[read_idx];
++
++		switch (type) {
++		case CS35L43_MBOX_TYPE_PWR:
++			if (msg == CS35L43_MBOX_MSG_AWAKE)
++				dev_dbg(cs35l43->dev, "AWAKE\n");
++			break;
++		case CS35L43_MBOX_TYPE_SYS:
++			if (msg == CS35L43_MBOX_MSG_ACK)
++				dev_dbg(cs35l43->dev, "ACK\n");
++			break;
++		case CS35L43_MBOX_TYPE_AUDIO:
++			break;
++		case CS35L43_MBOX_TYPE_ERROR:
++			dev_err(cs35l43->dev, "Mailbox error: 0x%x\n", msg);
++			cs35l43_log_dsp_err(cs35l43);
++			break;
++		case CS35L43_MBOX_TYPE_MEM_VAL:
++			dev_err(cs35l43->dev, "Memory Validation error: 0x%x\n", msg);
++			break;
++		case CS35L43_MBOX_TYPE_EVENT:
++			dev_dbg(cs35l43->dev, "Mailbox Event: 0x%x\n", msg);
++			break;
++		case CS35L43_MBOX_TYPE_WDT:
++			dev_dbg(cs35l43->dev, "WDT Warn: 0x%x\n", msg);
++			break;
++		default:
++			dev_err(cs35l43->dev, "Unknown msg type: 0x%x\n", type);
++		}
++
++		read_idx++;
++		read_idx = read_idx % 8;
++		if (read_idx == 0)
++			read_idx++;
++	}  while (read_idx != write_idx);
++
++	write_ptr = cpu_to_be32(write_ptr);
++	wm_adsp_write_ctl(&cs35l43->dsp, "QUEUE_RD",
++		WMFW_ADSP2_XM, CS35L43_ALG_ID_MAILBOX, &write_ptr, sizeof(u32));
++
++exit:
++	kfree(mbox);
++	return 0;
++}
++
++static void cs35l43_mbox_work(struct work_struct *wk)
++{
++	struct cs35l43_private *cs35l43;
++
++	cs35l43 = container_of(wk, struct cs35l43_private, mbox_work);
++
++	cs35l43_check_mailbox(cs35l43);
++}
++
++static const struct reg_sequence cs35l43_pup_patch[] = {
++	{0x00000040, 0x00000055},
++	{0x00000040, 0x000000AA},
++	{0x00002084, 0x000F1AA0},
++	{0x00000040, 0x000000CC},
++	{0x00000040, 0x00000033},
++};
++
++static const struct reg_sequence cs35l43_pdn_patch[] = {
++	{0x00000040, 0x00000055},
++	{0x00000040, 0x000000AA},
++	{0x00002084, 0x000F1AA3},
++	{0x00000040, 0x000000CC},
++	{0x00000040, 0x00000033},
++};
++
++static void cs35l43_log_status(struct cs35l43_private *cs35l43)
++{
++	unsigned int pm_state, audio_state, reg;
++
++	dev_dbg(cs35l43->dev, "%s\n", __func__);
++
++	cs35l43_check_mailbox(cs35l43);
++
++	wm_adsp_read_ctl(&cs35l43->dsp, "PM_CUR_STATE",
++		WMFW_ADSP2_XM, CS35L43_ALG_ID_PM, &pm_state, sizeof(u32));
++	wm_adsp_read_ctl(&cs35l43->dsp, "AUDIO_STATE",
++		WMFW_ADSP2_XM, 0x5f212, &audio_state, sizeof(u32));
++
++	dev_dbg(cs35l43->dev, "PM_STATE: 0x%x\tAUDIO_STATE: 0x%x\n",
++			       pm_state, audio_state);
++
++	regmap_read(cs35l43->regmap, CS35L43_DACPCM1_INPUT, &reg);
++	dev_dbg(cs35l43->dev, "DACPCM1_INPUT: 0x%x\n", reg);
++
++	regmap_read(cs35l43->regmap, CS35L43_AMP_GAIN, &reg);
++	dev_dbg(cs35l43->dev, "AMP_GAIN: 0x%x\n", reg);
++
++	regmap_read(cs35l43->regmap, CS35L43_AMP_CTRL, &reg);
++	dev_dbg(cs35l43->dev, "AMP_CTRL: 0x%x\n", reg);
++
++	regmap_read(cs35l43->regmap, CS35L43_IRQ1_EINT_1, &reg);
++	dev_dbg(cs35l43->dev, "IRQ1_EINT1: 0x%x\n", reg);
++}
++
++static int cs35l43_enter_hibernate(struct cs35l43_private *cs35l43)
++{
++	if (cs35l43->hibernate_state != CS35L43_HIBERNATE_AWAKE)
++		return 0;
++
++	dev_dbg(cs35l43->dev, "%s\n", __func__);
++
++
++	regmap_write(cs35l43->regmap, CS35L43_IRQ1_MASK_1, 0xFFFFFFFF);
++	regmap_write(cs35l43->regmap, CS35L43_IRQ1_MASK_2, 0xFFFFFFFF);
++	regmap_write(cs35l43->regmap, CS35L43_IRQ1_MASK_3, 0xFFFFFFFF);
++
++	if (cs35l43->limit_spi_clock)
++		regmap_write(cs35l43->regmap, CS35L43_WAKESRC_CTL,
++						CS35L43_WKSRC_SPI);
++	else
++		regmap_write(cs35l43->regmap, CS35L43_WAKESRC_CTL,
++						CS35L43_WKSRC_I2C);
++
++	if (cs35l43->write_seq_initialized)
++		cs35l43_write_seq_update(cs35l43, &cs35l43->power_on_seq);
++
++	regmap_write(cs35l43->regmap, CS35L43_GLOBAL_ENABLES, 0);
++
++	regmap_write(cs35l43->regmap, CS35L43_DSP_VIRTUAL1_MBOX_1,
++					CS35L43_MBOX_CMD_ALLOW_HIBERNATE);
++	regmap_write(cs35l43->regmap, CS35L43_DSP_VIRTUAL1_MBOX_1,
++					CS35L43_MBOX_CMD_HIBERNATE);
++
++	cs35l43->hibernate_state = CS35L43_HIBERNATE_STANDBY;
++	/* Do changes in cache during hibernation */
++	regcache_cache_only(cs35l43->regmap, true);
++	regcache_mark_dirty(cs35l43->regmap);
++
++	return 0;
++}
++
++static int cs35l43_exit_hibernate(struct cs35l43_private *cs35l43)
++{
++	int timeout = 10, ret  = 0;
++	unsigned int status;
++
++	if (cs35l43->hibernate_state != CS35L43_HIBERNATE_STANDBY &&
++		cs35l43->hibernate_state != CS35L43_HIBERNATE_UPDATE)
++		return 0;
++
++	dev_dbg(cs35l43->dev, "%s\n", __func__);
++
++	regcache_cache_only(cs35l43->regmap, false);
++
++	do {
++		ret = regmap_write(cs35l43->regmap, CS35L43_DSP_VIRTUAL1_MBOX_1,
++					CS35L43_MBOX_CMD_WAKEUP);
++	} while (ret < 0 && timeout-- > 0);
++
++
++	if (timeout == 0)
++		dev_err(cs35l43->dev, "Timeout at MBOX_CMD_WAKEUP\n");
++	else if (ret == 0)
++		dev_dbg(cs35l43->dev, "%s wakeup command success: %d\n",
++						__func__, 10 - timeout);
++
++	regmap_write(cs35l43->regmap, CS35L43_DSP_VIRTUAL1_MBOX_1,
++					CS35L43_MBOX_CMD_PREVENT_HIBERNATE);
++
++	usleep_range(2000, 2100);
++
++	ret = regmap_read(cs35l43->regmap, CS35L43_PWRMGT_STS, &status);
++	if (ret < 0 || !(status & CS35L43_WKSRC_STS_MASK))
++		dev_err(cs35l43->dev, "Error during wakeup, PWRMGT_STS = 0x%x\n", status);
++
++	/* PM_CUR_STATE should be non-zero */
++	wm_adsp_read_ctl(&cs35l43->dsp, "PM_CUR_STATE",
++		WMFW_ADSP2_XM, CS35L43_ALG_ID_PM, &status, sizeof(u32));
++	if (!status)
++		dev_err(cs35l43->dev, "Error during wakeup, PM_CUR_STATE = 0x%x\n", status);
++
++	/* First MBOX outbound message should be AWAKE = CMD_WAKEUP */
++	ret = regmap_read(cs35l43->regmap, CS35L43_DSP_MBOX_2, &status);
++	if (ret < 0 || (status != CS35L43_MBOX_CMD_WAKEUP))
++		dev_err(cs35l43->dev, "Error during wakeup, MBOX2 = 0x%x\n", status);
++
++	/*
++	 * At this point FW applies register values stored in the sequencer
++	 * Do sync to apply register values changed in cache during hibernation
++	 */
++	regcache_sync_region(cs35l43->regmap,  CS35L43_DEVID,
++					CS35L43_MIXER_NGATE_CH2_CFG);
++
++	/* Update write seq with values that could have changed in the cache */
++	if (cs35l43->write_seq_initialized)
++		cs35l43_write_seq_update(cs35l43, &cs35l43->power_on_seq);
++
++	cs35l43->hibernate_state = CS35L43_HIBERNATE_AWAKE;
++
++	regmap_write(cs35l43->regmap, CS35L43_IRQ1_MASK_1, 0xFFFFFFFF);
++	regmap_update_bits(cs35l43->regmap, CS35L43_IRQ1_MASK_1,
++				CS35L43_AMP_ERR_EINT1_MASK |
++				CS35L43_BST_SHORT_ERR_EINT1_MASK |
++				CS35L43_BST_DCM_UVP_ERR_EINT1_MASK |
++				CS35L43_BST_OVP_ERR_EINT1_MASK |
++				CS35L43_DSP_VIRTUAL2_MBOX_WR_EINT1_MASK |
++				CS35L43_DC_WATCHDOG_IRQ_RISE_EINT1_MASK |
++				CS35L43_WKSRC_STATUS6_EINT1_MASK |
++				CS35L43_WKSRC_STATUS_ANY_EINT1_MASK, 0);
++	regmap_write(cs35l43->regmap, CS35L43_IRQ1_MASK_2, 0xFFFFFFFF);
++	regmap_update_bits(cs35l43->regmap, CS35L43_IRQ1_MASK_2,
++				CS35L43_PLL_UNLOCK_FLAG_RISE_EINT1_MASK |
++				CS35L43_PLL_LOCK_EINT1_MASK, 0);
++	regmap_write(cs35l43->regmap, CS35L43_IRQ1_MASK_3, 0xFFFFFFFF);
++	regmap_update_bits(cs35l43->regmap, CS35L43_IRQ1_MASK_3,
++				CS35L43_DSP1_NMI_ERR_EINT1_MASK |
++				CS35L43_DSP1_MPU_ERR_EINT1_MASK |
++				CS35L43_DSP1_STRM_ARB_ERR_EINT1_MASK, 0);
++
++	regmap_multi_reg_write_bypassed(cs35l43->regmap,
++				cs35l43_pdn_patch,
++				ARRAY_SIZE(cs35l43_pdn_patch));
++
++	return 0;
++}
++
++int cs35l43_suspend_runtime(struct device *dev)
++{
++	struct cs35l43_private *cs35l43 = dev_get_drvdata(dev);
++	int i, ret = 0;
++
++	mutex_lock(&cs35l43->hb_lock);
++
++	if (!cs35l43->write_seq_initialized && cs35l43->first_event &&
++						cs35l43->dsp.cs_dsp.running) {
++		cs35l43->power_on_seq.name = "PM_PWR_ON_SEQ";
++		cs35l43->power_on_seq.length = CS35L43_POWER_SEQ_MAX_WORDS;
++		ret = cs35l43_write_seq_init(cs35l43, &cs35l43->power_on_seq);
++		if (ret == -EINVAL) {
++			/* Fall back to control used before 7.15.3 */
++			cs35l43->power_on_seq.name = "POWER_ON_SEQUENCE";
++			ret = cs35l43_write_seq_init(cs35l43,
++							&cs35l43->power_on_seq);
++		}
++
++		if (ret)
++			goto err;
++
++		cs35l43_write_seq_update(cs35l43, &cs35l43->power_on_seq);
++
++		for (i = 0; i < ARRAY_SIZE(cs35l43_hibernate_update_regs); i++) {
++			if (cs35l43_hibernate_update_regs[i] == 0)
++				break;
++			cs35l43_write_seq_add(cs35l43, &cs35l43->power_on_seq,
++					cs35l43_hibernate_update_regs[i],
++					0, true);
++		}
++		cs35l43->write_seq_initialized = true;
++	}
++
++	if (cs35l43->hibernate_state == CS35L43_HIBERNATE_NOT_LOADED &&
++						cs35l43->dsp.cs_dsp.running)
++		cs35l43->hibernate_state = CS35L43_HIBERNATE_AWAKE;
++
++	if (cs35l43->dsp.cs_dsp.running)
++		ret = cs35l43_enter_hibernate(cs35l43);
++err:
++	mutex_unlock(&cs35l43->hb_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(cs35l43_suspend_runtime);
++
++int cs35l43_resume_runtime(struct device *dev)
++{
++	struct cs35l43_private *cs35l43 = dev_get_drvdata(dev);
++	int ret = 0;
++
++	mutex_lock(&cs35l43->hb_lock);
++	if (cs35l43->dsp.cs_dsp.running)
++		ret = cs35l43_exit_hibernate(cs35l43);
++	mutex_unlock(&cs35l43->hb_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(cs35l43_resume_runtime);
++
++static int cs35l43_hibernate_dapm(struct snd_soc_dapm_widget *w,
++		struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *component =
++		snd_soc_dapm_to_component(w->dapm);
++	struct cs35l43_private *cs35l43 =
++		snd_soc_component_get_drvdata(component);
++	int ret = 0;
++
++	if (cs35l43->low_pwr_mode == CS35L43_LOW_PWR_MODE_STANDBY)
++		return 0;
++
++
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		if (pm_runtime_suspended(cs35l43->dev)) {
++			dev_dbg(cs35l43->dev, "resume from hibernate dapm\n");
++			pm_runtime_resume(cs35l43->dev);
++		}
++		break;
++
++	default:
++		dev_err(cs35l43->dev, "Invalid event = 0x%x\n", event);
++		ret = -EINVAL;
++	}
++	return ret;
++}
++
++static int cs35l43_main_amp_event(struct snd_soc_dapm_widget *w,
++		struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *component =
++				snd_soc_dapm_to_component(w->dapm);
++	struct cs35l43_private *cs35l43 =
++				snd_soc_component_get_drvdata(component);
++	int ret = 0;
++
++	dev_dbg(cs35l43->dev, "%s\n", __func__);
++
++	switch (event) {
++	case SND_SOC_DAPM_POST_PMU:
++		dev_dbg(cs35l43->dev, "%s PMU\n", __func__);
++		if (cs35l43->dsp.cs_dsp.running)
++			cs35l43_apply_delta_tuning(cs35l43);
++		regmap_multi_reg_write_bypassed(cs35l43->regmap,
++					cs35l43_pup_patch,
++					ARRAY_SIZE(cs35l43_pup_patch));
++		regmap_write(cs35l43->regmap, CS35L43_GLOBAL_ENABLES, 1);
++		regmap_update_bits(cs35l43->regmap, CS35L43_BLOCK_ENABLES,
++				CS35L43_AMP_EN_MASK, CS35L43_AMP_EN_MASK);
++		if (cs35l43->limit_spi_clock)
++			cs35l43->limit_spi_clock(cs35l43, false);
++
++		cs35l43_log_status(cs35l43);
++		break;
++	case SND_SOC_DAPM_POST_PMD:
++		dev_dbg(cs35l43->dev, "%s PMD\n", __func__);
++		if (cs35l43->limit_spi_clock)
++			cs35l43->limit_spi_clock(cs35l43, true);
++		regmap_update_bits(cs35l43->regmap, CS35L43_BLOCK_ENABLES,
++				CS35L43_AMP_EN_MASK, 0);
++		regmap_multi_reg_write_bypassed(cs35l43->regmap,
++					cs35l43_pdn_patch,
++					ARRAY_SIZE(cs35l43_pdn_patch));
++		if (cs35l43->low_pwr_mode == CS35L43_LOW_PWR_MODE_STANDBY) {
++			usleep_range(1000, 1100);
++			regmap_write(cs35l43->regmap, CS35L43_GLOBAL_ENABLES, 0);
++		}
++
++		break;
++	default:
++		dev_err(cs35l43->dev, "Invalid event = 0x%x\n", event);
++		ret = -EINVAL;
++	}
++	return ret;
++}
++
++static const struct snd_soc_dapm_widget cs35l43_dapm_widgets[] = {
++
++	SND_SOC_DAPM_OUT_DRV_E("Main AMP", SND_SOC_NOPM, 0, 0, NULL, 0,
++			cs35l43_main_amp_event,
++			SND_SOC_DAPM_POST_PMD |	SND_SOC_DAPM_POST_PMU),
++	SND_SOC_DAPM_SUPPLY("Hibernate",  SND_SOC_NOPM, 0, 0,
++			    cs35l43_hibernate_dapm, SND_SOC_DAPM_PRE_PMU),
++	SND_SOC_DAPM_OUTPUT("SPK"),
++
++	SND_SOC_DAPM_SPK("DSP1 Preload", NULL),
++	SND_SOC_DAPM_SUPPLY_S("DSP1 Preloader", 100,
++				SND_SOC_NOPM, 0, 0, cs35l43_dsp_preload_ev,
++				SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU |
++				SND_SOC_DAPM_PRE_PMD),
++	SND_SOC_DAPM_OUT_DRV_E("DSP1", SND_SOC_NOPM, 0, 0, NULL, 0,
++				cs35l43_dsp_audio_ev, SND_SOC_DAPM_POST_PMU |
++				SND_SOC_DAPM_PRE_PMD),
++
++	SND_SOC_DAPM_AIF_IN("ASPRX1", NULL, 0, CS35L43_ASP_ENABLES1,
++					CS35L43_ASP_RX1_EN_SHIFT, 0),
++	SND_SOC_DAPM_AIF_IN("ASPRX2", NULL, 0, CS35L43_ASP_ENABLES1,
++					CS35L43_ASP_RX2_EN_SHIFT, 0),
++	SND_SOC_DAPM_AIF_IN("ASPRX3", NULL, 0, CS35L43_ASP_ENABLES1,
++					CS35L43_ASP_RX3_EN_SHIFT, 0),
++	SND_SOC_DAPM_AIF_OUT("ASPTX1", NULL, 0, CS35L43_ASP_ENABLES1,
++					CS35L43_ASP_TX1_EN_SHIFT, 0),
++	SND_SOC_DAPM_AIF_OUT("ASPTX2", NULL, 0, CS35L43_ASP_ENABLES1,
++					CS35L43_ASP_TX2_EN_SHIFT, 0),
++	SND_SOC_DAPM_AIF_OUT("ASPTX3", NULL, 0, CS35L43_ASP_ENABLES1,
++					CS35L43_ASP_TX3_EN_SHIFT, 0),
++	SND_SOC_DAPM_AIF_OUT("ASPTX4", NULL, 0, CS35L43_ASP_ENABLES1,
++					CS35L43_ASP_TX4_EN_SHIFT, 0),
++
++	SND_SOC_DAPM_MUX("ASP TX1 Source", SND_SOC_NOPM, 0, 0, &asp_tx1_mux),
++	SND_SOC_DAPM_MUX("ASP TX2 Source", SND_SOC_NOPM, 0, 0, &asp_tx2_mux),
++	SND_SOC_DAPM_MUX("ASP TX3 Source", SND_SOC_NOPM, 0, 0, &asp_tx3_mux),
++	SND_SOC_DAPM_MUX("ASP TX4 Source", SND_SOC_NOPM, 0, 0, &asp_tx4_mux),
++	SND_SOC_DAPM_MUX("DSP RX1 Source", SND_SOC_NOPM, 0, 0, &dsp_rx1_mux),
++	SND_SOC_DAPM_MUX("DSP RX2 Source", SND_SOC_NOPM, 0, 0, &dsp_rx2_mux),
++	SND_SOC_DAPM_MUX("DSP RX3 Source", SND_SOC_NOPM, 0, 0, &dsp_rx3_mux),
++	SND_SOC_DAPM_MUX("PCM Source", SND_SOC_NOPM, 0, 0, &dacpcm_mux),
++	SND_SOC_DAPM_MUX("High Rate PCM Source", SND_SOC_NOPM, 0, 0, &dacpcm2_mux),
++	SND_SOC_DAPM_MUX("Ultrasonic Mode", SND_SOC_NOPM, 0, 0, &ultra_mux),
++
++	SND_SOC_DAPM_ADC("VMON ADC", NULL, CS35L43_BLOCK_ENABLES,
++					CS35L43_VMON_EN_SHIFT, 0),
++	SND_SOC_DAPM_ADC("IMON ADC", NULL, CS35L43_BLOCK_ENABLES,
++					CS35L43_IMON_EN_SHIFT, 0),
++	SND_SOC_DAPM_ADC("VPMON ADC", NULL, CS35L43_BLOCK_ENABLES,
++					CS35L43_VPMON_EN_SHIFT, 0),
++	SND_SOC_DAPM_ADC("VBSTMON ADC", NULL, CS35L43_BLOCK_ENABLES,
++					CS35L43_VBSTMON_EN_SHIFT, 0),
++	SND_SOC_DAPM_ADC("TEMPMON ADC", NULL, CS35L43_BLOCK_ENABLES,
++					CS35L43_TEMPMON_EN_SHIFT, 0),
++	SND_SOC_DAPM_SWITCH("AMP Enable", SND_SOC_NOPM, 0, 1, &amp_enable_ctrl),
++};
++
++static const struct snd_soc_dapm_route cs35l43_audio_map[] = {
++
++
++	{ "DSP1", NULL, "DSP1 Preloader" },
++	{ "DSP1 Preload", NULL, "DSP1 Preloader" },
++
++	{"DSP1", NULL, "DSP RX1 Source"},
++	{"DSP1", NULL, "DSP RX2 Source"},
++	{"DSP1", NULL, "DSP RX3 Source"},
++
++	{"PCM Source", "ASPRX1", "ASPRX1"},
++	{"PCM Source", "ASPRX2", "ASPRX2"},
++	{"PCM Source", "ASPRX3", "ASPRX3"},
++	{"PCM Source", "DSP", "DSP1"},
++	{"PCM Source", "DSP FS2", "DSP1"},
++	{"High Rate PCM Source", "ASPRX1", "ASPRX1"},
++	{"High Rate PCM Source", "ASPRX2", "ASPRX2"},
++	{"High Rate PCM Source", "ASPRX3", "ASPRX3"},
++	{"High Rate PCM Source", "DSP", "DSP1"},
++	{"High Rate PCM Source", "DSP FS2", "DSP1"},
++	{"Ultrasonic Mode", "In Band", "High Rate PCM Source"},
++	{"Ultrasonic Mode", "Out of Band", "High Rate PCM Source"},
++	{"Main AMP", NULL, "Ultrasonic Mode"},
++	{"Main AMP", NULL, "PCM Source"},
++	{"SPK", NULL, "Main AMP"},
++	{"SPK", NULL, "Hibernate"},
++
++	{"ASP TX1 Source", "ASPRX1", "ASPRX1"},
++	{"ASP TX2 Source", "ASPRX1", "ASPRX1"},
++	{"ASP TX3 Source", "ASPRX1", "ASPRX1"},
++	{"ASP TX4 Source", "ASPRX1", "ASPRX1"},
++	{"DSP RX1 Source", "ASPRX1", "ASPRX1"},
++	{"DSP RX2 Source", "ASPRX1", "ASPRX1"},
++	{"DSP RX3 Source", "ASPRX1", "ASPRX1"},
++	{"ASP TX1 Source", "ASPRX2", "ASPRX2"},
++	{"ASP TX2 Source", "ASPRX2", "ASPRX2"},
++	{"ASP TX3 Source", "ASPRX2", "ASPRX2"},
++	{"ASP TX4 Source", "ASPRX2", "ASPRX2"},
++	{"DSP RX1 Source", "ASPRX2", "ASPRX2"},
++	{"DSP RX2 Source", "ASPRX2", "ASPRX2"},
++	{"DSP RX3 Source", "ASPRX2", "ASPRX2"},
++	{"ASP TX1 Source", "ASPRX3", "ASPRX3"},
++	{"ASP TX2 Source", "ASPRX3", "ASPRX3"},
++	{"ASP TX3 Source", "ASPRX3", "ASPRX3"},
++	{"ASP TX4 Source", "ASPRX3", "ASPRX3"},
++	{"DSP RX1 Source", "ASPRX3", "ASPRX3"},
++	{"DSP RX2 Source", "ASPRX3", "ASPRX3"},
++	{"DSP RX3 Source", "ASPRX3", "ASPRX3"},
++	{"ASP TX1 Source", "VMON", "VMON ADC"},
++	{"ASP TX2 Source", "VMON", "VMON ADC"},
++	{"ASP TX3 Source", "VMON", "VMON ADC"},
++	{"ASP TX4 Source", "VMON", "VMON ADC"},
++	{"DSP RX1 Source", "VMON", "VMON ADC"},
++	{"DSP RX2 Source", "VMON", "VMON ADC"},
++	{"DSP RX3 Source", "VMON", "VMON ADC"},
++	{"ASP TX1 Source", "VMON FS2", "VMON ADC"},
++	{"ASP TX2 Source", "VMON FS2", "VMON ADC"},
++	{"ASP TX3 Source", "VMON FS2", "VMON ADC"},
++	{"ASP TX4 Source", "VMON FS2", "VMON ADC"},
++	{"DSP RX1 Source", "VMON FS2", "VMON ADC"},
++	{"DSP RX2 Source", "VMON FS2", "VMON ADC"},
++	{"DSP RX3 Source", "VMON FS2", "VMON ADC"},
++	{"ASP TX1 Source", "IMON", "IMON ADC"},
++	{"ASP TX2 Source", "IMON", "IMON ADC"},
++	{"ASP TX3 Source", "IMON", "IMON ADC"},
++	{"ASP TX4 Source", "IMON", "IMON ADC"},
++	{"DSP RX1 Source", "IMON", "IMON ADC"},
++	{"DSP RX2 Source", "IMON", "IMON ADC"},
++	{"DSP RX3 Source", "IMON", "IMON ADC"},
++	{"ASP TX1 Source", "IMON FS2", "IMON ADC"},
++	{"ASP TX2 Source", "IMON FS2", "IMON ADC"},
++	{"ASP TX3 Source", "IMON FS2", "IMON ADC"},
++	{"ASP TX4 Source", "IMON FS2", "IMON ADC"},
++	{"DSP RX1 Source", "IMON FS2", "IMON ADC"},
++	{"DSP RX2 Source", "IMON FS2", "IMON ADC"},
++	{"DSP RX3 Source", "IMON FS2", "IMON ADC"},
++	{"ASP TX1 Source", "VPMON", "VPMON ADC"},
++	{"ASP TX2 Source", "VPMON", "VPMON ADC"},
++	{"ASP TX3 Source", "VPMON", "VPMON ADC"},
++	{"ASP TX4 Source", "VPMON", "VPMON ADC"},
++	{"DSP RX1 Source", "VPMON", "VPMON ADC"},
++	{"DSP RX2 Source", "VPMON", "VPMON ADC"},
++	{"DSP RX3 Source", "VPMON", "VPMON ADC"},
++	{"ASP TX1 Source", "VBSTMON", "VBSTMON ADC"},
++	{"ASP TX2 Source", "VBSTMON", "VBSTMON ADC"},
++	{"ASP TX3 Source", "VBSTMON", "VBSTMON ADC"},
++	{"ASP TX4 Source", "VBSTMON", "VBSTMON ADC"},
++	{"DSP RX1 Source", "VBSTMON", "VBSTMON ADC"},
++	{"DSP RX2 Source", "VBSTMON", "VBSTMON ADC"},
++	{"DSP RX3 Source", "VBSTMON", "VBSTMON ADC"},
++	{"ASP TX1 Source", "DSP", "DSP1"},
++	{"ASP TX2 Source", "DSP", "DSP1"},
++	{"ASP TX3 Source", "DSP", "DSP1"},
++	{"ASP TX4 Source", "DSP", "DSP1"},
++	{"ASP TX1 Source", "DSP FS2", "DSP1"},
++	{"ASP TX2 Source", "DSP FS2", "DSP1"},
++	{"ASP TX3 Source", "DSP FS2", "DSP1"},
++	{"ASP TX4 Source", "DSP FS2", "DSP1"},
++	{"ASPTX1", NULL, "ASP TX1 Source"},
++	{"ASPTX2", NULL, "ASP TX2 Source"},
++	{"ASPTX3", NULL, "ASP TX3 Source"},
++	{"ASPTX4", NULL, "ASP TX4 Source"},
++	{"AMP Capture", NULL, "ASPTX1"},
++	{"AMP Capture", NULL, "ASPTX2"},
++	{"AMP Capture", NULL, "ASPTX3"},
++	{"AMP Capture", NULL, "ASPTX4"},
++
++	{"DSP1", NULL, "IMON ADC"},
++	{"DSP1", NULL, "VMON ADC"},
++	{"DSP1", NULL, "VBSTMON ADC"},
++	{"DSP1", NULL, "VPMON ADC"},
++	{"DSP1", NULL, "TEMPMON ADC"},
++
++	{"AMP Enable", "Switch", "AMP Playback"},
++
++	{"ASPRX1", NULL, "AMP Enable"},
++	{"ASPRX2", NULL, "AMP Enable"},
++	{"ASPRX3", NULL, "AMP Enable"},
++	{"VMON ADC", NULL, "AMP Enable"},
++	{"IMON ADC", NULL, "AMP Enable"},
++	{"VPMON ADC", NULL, "AMP Enable"},
++	{"VBSTMON ADC", NULL, "AMP Enable"},
++	{"TEMPMON ADC", NULL, "AMP Enable"},
++};
++
++
++static irqreturn_t cs35l43_irq(int irq, void *data)
++{
++	struct cs35l43_private *cs35l43 = data;
++	unsigned int status[3], masks[3];
++	int ret = IRQ_NONE, i;
++
++	pm_runtime_get_sync(cs35l43->dev);
++
++	for (i = 0; i < ARRAY_SIZE(status); i++) {
++		regmap_read(cs35l43->regmap,
++			    CS35L43_IRQ1_EINT_1 + (i * 4),
++			    &status[i]);
++		regmap_read(cs35l43->regmap,
++			    CS35L43_IRQ1_MASK_1 + (i * 4),
++			    &masks[i]);
++	}
++
++	/* Check to see if unmasked bits are active */
++	if (!(status[0] & ~masks[0]) &&
++		!(status[1] & ~masks[1]) &&
++		!(status[2] & ~masks[2])) {
++		ret = IRQ_NONE;
++		goto done;
++	}
++
++	/*
++	 * The following interrupts require a
++	 * protection release cycle to get the
++	 * speaker out of Safe-Mode.
++	 */
++	if (status[0] & CS35L43_AMP_ERR_EINT1_MASK) {
++		dev_crit(cs35l43->dev, "Amp short error\n");
++		regmap_write(cs35l43->regmap, CS35L43_IRQ1_EINT_1,
++					CS35L43_AMP_ERR_EINT1_MASK);
++		regmap_write(cs35l43->regmap, CS35L43_ERROR_RELEASE, 0);
++		regmap_update_bits(cs35l43->regmap, CS35L43_ERROR_RELEASE,
++					CS35L43_AMP_SHORT_ERR_RLS_MASK,
++					CS35L43_AMP_SHORT_ERR_RLS_MASK);
++		regmap_update_bits(cs35l43->regmap, CS35L43_ERROR_RELEASE,
++					CS35L43_AMP_SHORT_ERR_RLS_MASK, 0);
++	}
++
++	if (status[0] & CS35L43_BST_OVP_ERR_EINT1_MASK) {
++		dev_crit(cs35l43->dev, "VBST Over Voltage error\n");
++		regmap_update_bits(cs35l43->regmap, CS35L43_BLOCK_ENABLES,
++					CS35L43_BST_EN_MASK <<
++					CS35L43_BST_EN_SHIFT, 0);
++		regmap_write(cs35l43->regmap, CS35L43_IRQ1_EINT_1,
++					CS35L43_BST_OVP_ERR_EINT1_MASK);
++		regmap_write(cs35l43->regmap, CS35L43_ERROR_RELEASE, 0);
++		regmap_update_bits(cs35l43->regmap, CS35L43_ERROR_RELEASE,
++					CS35L43_BST_OVP_ERR_RLS_MASK,
++					CS35L43_BST_OVP_ERR_RLS_MASK);
++		regmap_update_bits(cs35l43->regmap, CS35L43_ERROR_RELEASE,
++					CS35L43_BST_OVP_ERR_RLS_MASK, 0);
++		regmap_update_bits(cs35l43->regmap, CS35L43_BLOCK_ENABLES,
++					CS35L43_BST_EN_MASK <<
++					CS35L43_BST_EN_SHIFT,
++					CS35L43_BST_EN_DEFAULT <<
++					CS35L43_BST_EN_SHIFT);
++	}
++
++	if (status[0] & CS35L43_BST_DCM_UVP_ERR_EINT1_MASK) {
++		dev_crit(cs35l43->dev, "DCM VBST Under Voltage Error\n");
++		regmap_update_bits(cs35l43->regmap, CS35L43_BLOCK_ENABLES,
++					CS35L43_BST_EN_MASK <<
++					CS35L43_BST_EN_SHIFT, 0);
++		regmap_write(cs35l43->regmap, CS35L43_IRQ1_EINT_1,
++					CS35L43_BST_DCM_UVP_ERR_EINT1_MASK);
++		regmap_write(cs35l43->regmap, CS35L43_ERROR_RELEASE, 0);
++		regmap_update_bits(cs35l43->regmap, CS35L43_ERROR_RELEASE,
++					CS35L43_BST_UVP_ERR_RLS_MASK,
++					CS35L43_BST_UVP_ERR_RLS_MASK);
++		regmap_update_bits(cs35l43->regmap, CS35L43_ERROR_RELEASE,
++					CS35L43_BST_UVP_ERR_RLS_MASK, 0);
++		regmap_update_bits(cs35l43->regmap, CS35L43_BLOCK_ENABLES,
++					CS35L43_BST_EN_MASK <<
++					CS35L43_BST_EN_SHIFT,
++					CS35L43_BST_EN_DEFAULT <<
++					CS35L43_BST_EN_SHIFT);
++	}
++
++	if (status[0] & CS35L43_BST_SHORT_ERR_EINT1_MASK) {
++		dev_crit(cs35l43->dev, "LBST error: powering off!\n");
++		regmap_update_bits(cs35l43->regmap, CS35L43_BLOCK_ENABLES,
++					CS35L43_BST_EN_MASK <<
++					CS35L43_BST_EN_SHIFT, 0);
++		regmap_write(cs35l43->regmap, CS35L43_IRQ1_EINT_1,
++					CS35L43_BST_SHORT_ERR_EINT1_MASK);
++		regmap_write(cs35l43->regmap, CS35L43_ERROR_RELEASE, 0);
++		regmap_update_bits(cs35l43->regmap, CS35L43_ERROR_RELEASE,
++					CS35L43_BST_SHORT_ERR_RLS_MASK,
++					CS35L43_BST_SHORT_ERR_RLS_MASK);
++		regmap_update_bits(cs35l43->regmap, CS35L43_ERROR_RELEASE,
++					CS35L43_BST_SHORT_ERR_RLS_MASK, 0);
++		regmap_update_bits(cs35l43->regmap, CS35L43_BLOCK_ENABLES,
++					CS35L43_BST_EN_MASK <<
++					CS35L43_BST_EN_SHIFT,
++					CS35L43_BST_EN_DEFAULT <<
++					CS35L43_BST_EN_SHIFT);
++	}
++
++	if (status[0] & CS35L43_DC_WATCHDOG_IRQ_RISE_EINT1_MASK) {
++		dev_err(cs35l43->dev, "DC Detect INT\n");
++		regmap_write(cs35l43->regmap, CS35L43_IRQ1_EINT_1,
++				CS35L43_DC_WATCHDOG_IRQ_RISE_EINT1_MASK);
++		regmap_write(cs35l43->regmap, CS35L43_IRQ1_EINT_1,
++				CS35L43_DC_WATCHDOG_IRQ_RISE_EINT1_MASK);
++	}
++
++	if (status[0] & CS35L43_WKSRC_STATUS_ANY_EINT1_MASK ||
++		status[0] & CS35L43_WKSRC_STATUS6_EINT1_MASK) {
++		dev_dbg(cs35l43->dev, "Wakeup INT\n");
++		regmap_write(cs35l43->regmap, CS35L43_IRQ1_EINT_1,
++				CS35L43_WKSRC_STATUS_ANY_EINT1_MASK);
++		regmap_write(cs35l43->regmap, CS35L43_IRQ1_EINT_1,
++				CS35L43_WKSRC_STATUS6_EINT1_MASK);
++	}
++
++
++	if (status[0] & CS35L43_DSP_VIRTUAL2_MBOX_WR_EINT1_MASK) {
++		dev_dbg(cs35l43->dev, "Received Mailbox INT\n");
++		regmap_write(cs35l43->regmap, CS35L43_IRQ1_EINT_1,
++				CS35L43_DSP_VIRTUAL2_MBOX_WR_EINT1_MASK);
++		queue_work(cs35l43->mbox_wq, &cs35l43->mbox_work);
++	}
++
++	if (status[1] & CS35L43_PLL_UNLOCK_FLAG_RISE_EINT1_MASK) {
++		dev_dbg(cs35l43->dev, "PLL Unlock INT\n");
++		regmap_write(cs35l43->regmap, CS35L43_IRQ1_EINT_2,
++				CS35L43_PLL_UNLOCK_FLAG_RISE_EINT1_MASK);
++	}
++
++	if (status[1] & CS35L43_PLL_LOCK_EINT1_MASK) {
++		dev_dbg(cs35l43->dev, "PLL Lock INT\n");
++		regmap_write(cs35l43->regmap, CS35L43_IRQ1_EINT_2,
++				CS35L43_PLL_LOCK_EINT1_MASK);
++	}
++
++	if (status[2] & CS35L43_DSP1_NMI_ERR_EINT1_MASK) {
++		dev_err(cs35l43->dev, "NMI Error INT\n");
++		regmap_write(cs35l43->regmap, CS35L43_IRQ1_EINT_3,
++				CS35L43_DSP1_NMI_ERR_EINT1_MASK);
++		cs35l43_log_dsp_err(cs35l43);
++
++		if (!mutex_is_locked(&cs35l43->err_lock))
++			queue_work(cs35l43->err_wq, &cs35l43->err_work);
++	}
++
++	if (status[2] & CS35L43_DSP1_MPU_ERR_EINT1_MASK) {
++		dev_err(cs35l43->dev, "MPU Error INT\n");
++		regmap_write(cs35l43->regmap, CS35L43_IRQ1_EINT_3,
++				CS35L43_DSP1_MPU_ERR_EINT1_MASK);
++		cs35l43_log_dsp_err(cs35l43);
++
++		if (!mutex_is_locked(&cs35l43->err_lock))
++			queue_work(cs35l43->err_wq, &cs35l43->err_work);
++	}
++
++	if (status[2] & CS35L43_DSP1_STRM_ARB_ERR_EINT1_MASK) {
++		dev_err(cs35l43->dev, "Stream Arb Error INT\n");
++		regmap_write(cs35l43->regmap, CS35L43_IRQ1_EINT_3,
++				CS35L43_DSP1_STRM_ARB_ERR_EINT1_MASK);
++		cs35l43_log_dsp_err(cs35l43);
++
++		if (!mutex_is_locked(&cs35l43->err_lock))
++			queue_work(cs35l43->err_wq, &cs35l43->err_work);
++	}
++
++	ret = IRQ_HANDLED;
++
++done:
++	pm_runtime_mark_last_busy(cs35l43->dev);
++	pm_runtime_put_autosuspend(cs35l43->dev);
++
++	return ret;
++}
++
++static int cs35l43_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
++{
++	struct cs35l43_private *cs35l43 =
++			snd_soc_component_get_drvdata(codec_dai->component);
++
++	dev_dbg(cs35l43->dev, "%s\n", __func__);
++
++	switch (fmt & SND_SOC_DAIFMT_MASTER_MASK) {
++	case SND_SOC_DAIFMT_CBC_CFC:
++		break;
++	default:
++		dev_warn(cs35l43->dev,
++			"%s: Master mode unsupported\n", __func__);
++		return -EINVAL;
++	}
++
++	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
++	case SND_SOC_DAIFMT_DSP_A:
++		cs35l43->asp_fmt = 0;
++		break;
++	case SND_SOC_DAIFMT_I2S:
++		cs35l43->asp_fmt = 2;
++		break;
++	default:
++		dev_warn(cs35l43->dev,
++			"%s: Invalid or unsupported DAI format\n", __func__);
++		return -EINVAL;
++	}
++
++	switch (fmt & SND_SOC_DAIFMT_INV_MASK) {
++	case SND_SOC_DAIFMT_NB_IF:
++		cs35l43->lrclk_fmt = 1;
++		cs35l43->sclk_fmt = 0;
++		break;
++	case SND_SOC_DAIFMT_IB_NF:
++		cs35l43->lrclk_fmt = 0;
++		cs35l43->sclk_fmt = 1;
++		break;
++	case SND_SOC_DAIFMT_IB_IF:
++		cs35l43->lrclk_fmt = 1;
++		cs35l43->sclk_fmt = 1;
++		break;
++	case SND_SOC_DAIFMT_NB_NF:
++		cs35l43->lrclk_fmt = 0;
++		cs35l43->sclk_fmt = 0;
++		break;
++	default:
++		dev_warn(cs35l43->dev,
++			"%s: Invalid DAI clock INV\n", __func__);
++		return -EINVAL;
++	}
++
++	regmap_update_bits(cs35l43->regmap, CS35L43_ASP_CONTROL2,
++				CS35L43_ASP_FMT_MASK | CS35L43_ASP_BCLK_INV_MASK |
++				CS35L43_ASP_FSYNC_INV_MASK,
++				(cs35l43->asp_fmt << CS35L43_ASP_FMT_SHIFT) |
++				(cs35l43->lrclk_fmt << CS35L43_ASP_FSYNC_INV_SHIFT) |
++				(cs35l43->sclk_fmt << CS35L43_ASP_BCLK_INV_SHIFT));
++	return 0;
++}
++
++struct cs35l43_global_fs_config {
++	int rate;
++	int fs_cfg;
++};
++
++static const struct cs35l43_global_fs_config cs35l43_fs_rates[] = {
++	{ 12000,	0x01 },
++	{ 24000,	0x02 },
++	{ 48000,	0x03 },
++	{ 96000,	0x04 },
++	{ 192000,	0x05 },
++	{ 11025,	0x09 },
++	{ 22050,	0x0A },
++	{ 44100,	0x0B },
++	{ 88200,	0x0C },
++	{ 176400,	0x0D },
++	{ 8000,		0x11 },
++	{ 16000,	0x12 },
++	{ 32000,	0x13 },
++};
++
++static int cs35l43_pcm_hw_params(struct snd_pcm_substream *substream,
++				 struct snd_pcm_hw_params *params,
++				 struct snd_soc_dai *dai)
++{
++	int i;
++	unsigned int rate = params_rate(params);
++	u8 asp_width, asp_wl;
++	struct cs35l43_private *cs35l43 =
++				snd_soc_component_get_drvdata(dai->component);
++
++	dev_dbg(cs35l43->dev, "%s\n", __func__);
++
++	for (i = 0; i < ARRAY_SIZE(cs35l43_fs_rates); i++) {
++		if (rate == cs35l43_fs_rates[i].rate)
++			break;
++	}
++
++	if (i < ARRAY_SIZE(cs35l43_fs_rates) &&
++			cs35l43->ultrasonic_mode == CS35L43_ULTRASONIC_MODE_DISABLED)
++		regmap_update_bits(cs35l43->regmap, CS35L43_GLOBAL_SAMPLE_RATE,
++			CS35L43_GLOBAL_FS_MASK, cs35l43_fs_rates[i].fs_cfg);
++	else if (cs35l43->ultrasonic_mode != CS35L43_ULTRASONIC_MODE_DISABLED)
++		/* Assume 48k base rate */
++		regmap_update_bits(cs35l43->regmap, CS35L43_GLOBAL_SAMPLE_RATE,
++			CS35L43_GLOBAL_FS_MASK, 0x03);
++	else {
++		dev_err(cs35l43->dev, "%s: Unsupported rate\n", __func__);
++		return -EINVAL;
++	}
++
++	asp_wl = params_width(params);
++	asp_width = cs35l43->slot_width ?
++			    cs35l43->slot_width : params_physical_width(params);
++	dev_dbg(cs35l43->dev, "%s\n wl=%d, width=%d, rate=%d", __func__,
++				asp_wl, asp_width, rate);
++
++	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
++		regmap_update_bits(cs35l43->regmap, CS35L43_ASP_CONTROL2,
++				CS35L43_ASP_RX_WIDTH_MASK, asp_width <<
++				CS35L43_ASP_RX_WIDTH_SHIFT);
++		regmap_update_bits(cs35l43->regmap, CS35L43_ASP_DATA_CONTROL5,
++				CS35L43_ASP_RX_WL_MASK, asp_wl);
++	} else {
++		regmap_update_bits(cs35l43->regmap, CS35L43_ASP_CONTROL2,
++				CS35L43_ASP_TX_WIDTH_MASK, asp_width <<
++				CS35L43_ASP_TX_WIDTH_SHIFT);
++		regmap_update_bits(cs35l43->regmap, CS35L43_ASP_DATA_CONTROL1,
++				CS35L43_ASP_TX_WL_MASK, asp_wl);
++	}
++
++	return 0;
++}
++
++static int cs35l43_get_clk_config(int freq)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(cs35l43_pll_sysclk); i++) {
++		if (cs35l43_pll_sysclk[i].freq == freq)
++			return cs35l43_pll_sysclk[i].clk_cfg;
++	}
++
++	return -EINVAL;
++}
++
++static const unsigned int cs35l43_src_rates[] = {
++	8000, 12000, 11025, 16000, 22050, 24000, 32000,
++	44100, 48000, 88200, 96000, 176400, 192000
++};
++
++static const struct snd_pcm_hw_constraint_list cs35l43_constraints = {
++	.count = ARRAY_SIZE(cs35l43_src_rates),
++	.list = cs35l43_src_rates,
++};
++
++static int cs35l43_pcm_startup(struct snd_pcm_substream *substream,
++			       struct snd_soc_dai *dai)
++{
++	struct cs35l43_private *cs35l43 =
++				snd_soc_component_get_drvdata(dai->component);
++	int ret = 0;
++
++	dev_dbg(cs35l43->dev, "%s\n", __func__);
++
++	if (substream->runtime)
++		return snd_pcm_hw_constraint_list(substream->runtime, 0,
++				SNDRV_PCM_HW_PARAM_RATE, &cs35l43_constraints);
++	return ret;
++}
++
++static int cs35l43_get_fs_mon_config_index(int freq)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(cs35l43_fs_mon); i++) {
++		if (cs35l43_fs_mon[i].freq == freq)
++			return i;
++	}
++
++	return -EINVAL;
++}
++
++static int cs35l43_component_set_sysclk(struct snd_soc_component *component,
++				int clk_id, int source, unsigned int freq,
++				int dir)
++{
++	struct cs35l43_private *cs35l43 =
++				snd_soc_component_get_drvdata(component);
++	bool update_required = true;
++	unsigned int extclk_cfg_new;
++	unsigned int fs1_val;
++	unsigned int fs2_val;
++	unsigned int val;
++	int fsIndex;
++
++	dev_dbg(cs35l43->dev, "%s\n", __func__);
++	dev_dbg(cs35l43->dev, "%s id = %d, freq=%d\n", __func__, clk_id, freq);
++
++	extclk_cfg_new = cs35l43_get_clk_config(freq);
++	update_required = (cs35l43->extclk_cfg != extclk_cfg_new);
++	cs35l43->extclk_cfg = extclk_cfg_new;
++	cs35l43->clk_id = clk_id;
++
++	if (freq <= 6000000) {
++		/* Use the lookup table */
++		fsIndex = cs35l43_get_fs_mon_config_index(freq);
++		if (fsIndex < 0) {
++			dev_err(cs35l43->dev, "Invalid CLK Config freq: %u\n", freq);
++			return -EINVAL;
++		}
++
++		fs1_val = cs35l43_fs_mon[fsIndex].fs1;
++		fs2_val = cs35l43_fs_mon[fsIndex].fs2;
++	} else {
++		/* Use hard-coded values */
++		fs1_val = 18;
++		fs2_val = 33;
++	}
++
++	val = fs1_val;
++	val |= (fs2_val << CS35L43_FS2_START_WINDOW_SHIFT) & CS35L43_FS2_START_WINDOW_MASK;
++
++	if (cs35l43->extclk_cfg < 0) {
++		dev_err(cs35l43->dev, "Invalid CLK Config: %d, freq: %u\n",
++			cs35l43->extclk_cfg, freq);
++		return -EINVAL;
++	}
++
++	if (cs35l43->hibernate_state != CS35L43_HIBERNATE_STANDBY) {
++		if (update_required) {
++			cs35l43_pll_config(cs35l43);
++			regmap_write(cs35l43->regmap, CS35L43_FS_MON_0, val);
++		}
++		if (cs35l43->limit_spi_clock)
++			cs35l43->limit_spi_clock(cs35l43, false);
++	}
++
++	return 0;
++}
++
++static int cs35l43_dai_set_sysclk(struct snd_soc_dai *dai,
++					int clk_id, unsigned int freq, int dir)
++{
++	struct cs35l43_private *cs35l43 =
++				snd_soc_component_get_drvdata(dai->component);
++
++	dev_dbg(cs35l43->dev, "%s\n", __func__);
++
++	return 0;
++}
++
++static int cs35l43_component_write(struct snd_soc_component *component,
++				unsigned int reg, unsigned int val)
++{
++	struct cs35l43_private *cs35l43 =
++				snd_soc_component_get_drvdata(component);
++	int ret = 0;
++
++	mutex_lock(&cs35l43->hb_lock);
++	ret = regmap_write(cs35l43->regmap, reg, val);
++	mutex_unlock(&cs35l43->hb_lock);
++
++	return ret;
++}
++
++static unsigned int cs35l43_component_read(struct snd_soc_component *component,
++				unsigned int reg)
++{
++	struct cs35l43_private *cs35l43 =
++				snd_soc_component_get_drvdata(component);
++	unsigned int val;
++
++	regmap_read(cs35l43->regmap, reg, &val);
++
++	return val;
++}
++
++static int cs35l43_irq_gpio_config(struct cs35l43_private *cs35l43)
++{
++	int irq_pol = IRQF_TRIGGER_NONE;
++
++	if (cs35l43->pdata.gpio1_out_enable)
++		regmap_update_bits(cs35l43->regmap,
++					CS35L43_GPIO1_CTRL1,
++					CS35L43_GP1_DIR_MASK,
++					0);
++	if (cs35l43->pdata.gpio1_src_sel)
++		regmap_update_bits(cs35l43->regmap,
++					CS35L43_GPIO_PAD_CONTROL,
++					CS35L43_GP1_CTRL_MASK,
++					cs35l43->pdata.gpio1_src_sel <<
++					CS35L43_GP1_CTRL_SHIFT);
++
++	if (cs35l43->pdata.gpio2_out_enable)
++			regmap_update_bits(cs35l43->regmap,
++						CS35L43_GPIO2_CTRL1,
++						CS35L43_GP2_DIR_MASK,
++						0);
++	if (cs35l43->pdata.gpio2_src_sel)
++		regmap_update_bits(cs35l43->regmap,
++					CS35L43_GPIO_PAD_CONTROL,
++					CS35L43_GP2_CTRL_MASK,
++					cs35l43->pdata.gpio2_src_sel <<
++					CS35L43_GP2_CTRL_SHIFT);
++
++	if (cs35l43->pdata.gpio2_src_sel ==
++		  (CS35L43_GP2_CTRL_OPEN_DRAIN_ACTV_LO | CS35L43_VALID_PDATA) ||
++		  cs35l43->pdata.gpio2_src_sel ==
++		  (CS35L43_GP2_CTRL_PUSH_PULL_ACTV_LO | CS35L43_VALID_PDATA))
++		irq_pol = IRQF_TRIGGER_LOW;
++	else if (cs35l43->pdata.gpio2_src_sel ==
++		     (CS35L43_GP2_CTRL_PUSH_PULL_ACTV_HI | CS35L43_VALID_PDATA))
++		irq_pol = IRQF_TRIGGER_HIGH;
++
++	return irq_pol;
++}
++
++static int cs35l43_set_pdata(struct cs35l43_private *cs35l43)
++{
++	if (cs35l43->pdata.bst_vctrl)
++		regmap_update_bits(cs35l43->regmap, CS35L43_VBST_CTL_1,
++				CS35L43_BST_CTL_MASK, cs35l43->pdata.bst_vctrl);
++
++	if (cs35l43->pdata.classh_disable)
++		regmap_update_bits(cs35l43->regmap, CS35L43_VBST_CTL_2,
++				CS35L43_BST_CTL_SEL_MASK, 0);
++	else {
++		if (cs35l43->pdata.bst_vctrl)
++			regmap_update_bits(cs35l43->regmap, CS35L43_VBST_CTL_2,
++				CS35L43_BST_CTL_LIM_EN_MASK,
++				CS35L43_BST_CTL_LIM_EN_MASK);
++	}
++
++	if (cs35l43->pdata.bst_ipk) {
++		regmap_update_bits(cs35l43->regmap,
++				CS35L43_BST_IPK_CTL,
++				CS35L43_BST_IPK_MASK,
++				cs35l43->pdata.bst_ipk);
++	}
++
++	if (cs35l43->pdata.dsp_ng_enable) {
++		regmap_update_bits(cs35l43->regmap,
++				CS35L43_MIXER_NGATE_CH1_CFG,
++				CS35L43_AUX_NGATE_CH1_EN_MASK,
++				CS35L43_AUX_NGATE_CH1_EN_MASK);
++		regmap_update_bits(cs35l43->regmap,
++				CS35L43_MIXER_NGATE_CH2_CFG,
++				CS35L43_AUX_NGATE_CH2_EN_MASK,
++				CS35L43_AUX_NGATE_CH2_EN_MASK);
++
++		if (cs35l43->pdata.dsp_ng_pcm_thld) {
++			regmap_update_bits(cs35l43->regmap,
++				CS35L43_MIXER_NGATE_CH1_CFG,
++				CS35L43_AUX_NGATE_CH1_THR_MASK,
++				cs35l43->pdata.dsp_ng_pcm_thld);
++			regmap_update_bits(cs35l43->regmap,
++				CS35L43_MIXER_NGATE_CH2_CFG,
++				CS35L43_AUX_NGATE_CH2_THR_MASK,
++				cs35l43->pdata.dsp_ng_pcm_thld);
++		}
++
++		if (cs35l43->pdata.dsp_ng_delay) {
++			regmap_update_bits(cs35l43->regmap,
++				CS35L43_MIXER_NGATE_CH1_CFG,
++				CS35L43_AUX_NGATE_CH1_HOLD_MASK,
++				cs35l43->pdata.dsp_ng_delay <<
++				CS35L43_AUX_NGATE_CH1_HOLD_SHIFT);
++			regmap_update_bits(cs35l43->regmap,
++				CS35L43_MIXER_NGATE_CH2_CFG,
++				CS35L43_AUX_NGATE_CH2_HOLD_MASK,
++				cs35l43->pdata.dsp_ng_delay <<
++				CS35L43_AUX_NGATE_CH2_HOLD_SHIFT);
++		}
++	}
++
++	if (cs35l43->pdata.asp_sdout_hiz)
++		regmap_update_bits(cs35l43->regmap,
++				CS35L43_ASP_CONTROL3,
++				CS35L41_ASP_DOUT_HIZ_CTRL_MASK,
++				cs35l43->pdata.asp_sdout_hiz);
++
++	if (cs35l43->pdata.hw_ng_sel)
++		regmap_update_bits(cs35l43->regmap,
++				CS35L43_NG_CONFIG,
++				CS35L43_NG_EN_SEL_MASK,
++				cs35l43->pdata.hw_ng_sel <<
++				CS35L43_NG_EN_SEL_SHIFT);
++
++	if (cs35l43->pdata.hw_ng_thld)
++		regmap_update_bits(cs35l43->regmap,
++				CS35L43_NG_CONFIG,
++				CS35L43_NG_PCM_THLD_MASK,
++				cs35l43->pdata.hw_ng_thld <<
++				CS35L43_NG_PCM_THLD_SHIFT);
++
++	if (cs35l43->pdata.hw_ng_delay)
++		regmap_update_bits(cs35l43->regmap,
++				CS35L43_NG_CONFIG,
++				CS35L43_NG_DELAY_MASK,
++				cs35l43->pdata.hw_ng_delay <<
++				CS35L43_NG_DELAY_SHIFT);
++
++	if (cs35l43->pdata.vpbr_rel_rate)
++		regmap_update_bits(cs35l43->regmap,
++				CS35L43_VPBR_CONFIG,
++				CS35L43_VPBR_REL_RATE_MASK,
++				cs35l43->pdata.vpbr_rel_rate <<
++				CS35L43_VPBR_REL_RATE_SHIFT);
++	if (cs35l43->pdata.vpbr_wait)
++		regmap_update_bits(cs35l43->regmap,
++				CS35L43_VPBR_CONFIG,
++				CS35L43_VPBR_WAIT_MASK,
++				cs35l43->pdata.vpbr_wait <<
++				CS35L43_VPBR_WAIT_SHIFT);
++	if (cs35l43->pdata.vpbr_atk_rate)
++		regmap_update_bits(cs35l43->regmap,
++				CS35L43_VPBR_CONFIG,
++				CS35L43_VPBR_ATK_RATE_MASK,
++				cs35l43->pdata.vpbr_atk_rate <<
++				CS35L43_VPBR_ATK_RATE_SHIFT);
++	if (cs35l43->pdata.vpbr_atk_vol)
++		regmap_update_bits(cs35l43->regmap,
++				CS35L43_VPBR_CONFIG,
++				CS35L43_VPBR_ATK_VOL_MASK,
++				cs35l43->pdata.vpbr_atk_vol <<
++				CS35L43_VPBR_ATK_VOL_SHIFT);
++	if (cs35l43->pdata.vpbr_max_att)
++		regmap_update_bits(cs35l43->regmap,
++				CS35L43_VPBR_CONFIG,
++				CS35L43_VPBR_MAX_ATT_MASK,
++				cs35l43->pdata.vpbr_max_att <<
++				CS35L43_VPBR_MAX_ATT_SHIFT);
++	if (cs35l43->pdata.vpbr_thld)
++		regmap_update_bits(cs35l43->regmap,
++				CS35L43_VPBR_CONFIG,
++				CS35L43_VPBR_THLD1_MASK,
++				cs35l43->pdata.vpbr_thld <<
++				CS35L43_VPBR_THLD1_SHIFT);
++	if (cs35l43->pdata.vpbr_enable)
++		regmap_update_bits(cs35l43->regmap,
++				CS35L43_BLOCK_ENABLES2,
++				CS35L43_VPBR_EN_MASK,
++				CS35L43_VPBR_EN_MASK);
++
++	return 0;
++}
++
++static int cs35l43_handle_of_data(struct device *dev,
++				  struct cs35l43_platform_data *pdata,
++				  struct cs35l43_private *cs35l43)
++{
++	struct device_node *np = dev->of_node;
++	int ret, val;
++
++	if (!np)
++		return 0;
++
++	pdata->dsp_ng_enable = of_property_read_bool(np,
++					"cirrus,dsp-noise-gate-enable");
++	if (of_property_read_u32(np,
++				"cirrus,dsp-noise-gate-threshold", &val) >= 0)
++		pdata->dsp_ng_pcm_thld = val | CS35L43_VALID_PDATA;
++	if (of_property_read_u32(np, "cirrus,dsp-noise-gate-delay", &val) >= 0)
++		pdata->dsp_ng_delay = val | CS35L43_VALID_PDATA;
++
++	if (of_property_read_u32(np, "cirrus,hw-noise-gate-select", &val) >= 0)
++		pdata->hw_ng_sel = val | CS35L43_VALID_PDATA;
++	if (of_property_read_u32(np,
++				"cirrus,hw-noise-gate-threshold", &val) >= 0)
++		pdata->hw_ng_thld = val | CS35L43_VALID_PDATA;
++	if (of_property_read_u32(np, "cirrus,hw-noise-gate-delay", &val) >= 0)
++		pdata->hw_ng_delay = val | CS35L43_VALID_PDATA;
++
++	if (of_property_read_u32(np, "cirrus,gpio1-src-sel", &val) >= 0)
++		pdata->gpio1_src_sel = val | CS35L43_VALID_PDATA;
++	if (of_property_read_u32(np, "cirrus,gpio2-src-sel", &val) >= 0)
++		pdata->gpio2_src_sel = val | CS35L43_VALID_PDATA;
++	pdata->gpio1_out_enable = of_property_read_bool(np,
++					"cirrus,gpio1-output-enable");
++	pdata->gpio2_out_enable = of_property_read_bool(np,
++					"cirrus,gpio2-output-enable");
++
++	pdata->vpbr_enable = of_property_read_bool(np,
++					"cirrus,vpbr-enable");
++	if (of_property_read_u32(np, "cirrus,vpbr-rel-rate", &val) >= 0)
++		pdata->vpbr_rel_rate = val | CS35L43_VALID_PDATA;
++	if (of_property_read_u32(np, "cirrus,vpbr-wait", &val) >= 0)
++		pdata->vpbr_wait = val | CS35L43_VALID_PDATA;
++	if (of_property_read_u32(np, "cirrus,vpbr-atk-rate", &val) >= 0)
++		pdata->vpbr_atk_rate = val | CS35L43_VALID_PDATA;
++	if (of_property_read_u32(np, "cirrus,vpbr-atk-vol", &val) >= 0)
++		pdata->vpbr_atk_vol = val | CS35L43_VALID_PDATA;
++	if (of_property_read_u32(np, "cirrus,vpbr-max-att", &val) >= 0)
++		pdata->vpbr_max_att = val | CS35L43_VALID_PDATA;
++	if (of_property_read_u32(np, "cirrus,vpbr-thld", &val) >= 0)
++		pdata->vpbr_thld = val | CS35L43_VALID_PDATA;
++
++	if (of_property_read_u32(np, "cirrus,asp-sdout-hiz", &val) >= 0)
++		pdata->asp_sdout_hiz = val | CS35L43_VALID_PDATA;
++
++	if (of_property_read_u32(np, "cirrus,bst-ipk-ma", &val) >= 0) {
++		if ((val < 1600) || (val > 4500)) {
++			dev_err(dev, "Invalid boost inductor peak current: %d mA\n",
++					val);
++			return -EINVAL;
++		}
++		pdata->bst_ipk = ((val - 1600) / 50) + 0x10;
++	}
++
++	pdata->classh_disable = of_property_read_bool(np,
++						"cirrus,classh-disable");
++	ret = of_property_read_u32(np, "cirrus,boost-ctl-millivolt", &val);
++	if (ret >= 0) {
++		if (val < 2550 || val > 11000) {
++			dev_err(dev,
++				"Invalid Boost Voltage %u mV\n", val);
++			return -EINVAL;
++		}
++		pdata->bst_vctrl = ((val - 2550) / 100) + 1;
++	}
++
++	ret = of_property_read_string(np, "cirrus,dsp-part-name",
++						&pdata->dsp_part_name);
++	if (ret < 0)
++		pdata->dsp_part_name = "cs35l43";
++
++	cs35l43->low_pwr_mode = of_property_read_bool(np, "cirrus,low-pwr-mode-standby");
++
++	return 0;
++}
++
++
++static int cs35l43_component_probe(struct snd_soc_component *component)
++{
++	int ret = 0;
++	struct cs35l43_private *cs35l43 =
++		snd_soc_component_get_drvdata(component);
++
++	cs35l43_set_pdata(cs35l43);
++	cs35l43->component = component;
++	wm_adsp2_component_probe(&cs35l43->dsp, component);
++
++
++	return ret;
++}
++
++static void cs35l43_component_remove(struct snd_soc_component *component)
++{
++
++}
++
++static const struct cs_dsp_region cs35l43_dsp1_regions[] = {
++	{ .type = WMFW_HALO_PM_PACKED,	.base = CS35L43_DSP1_PMEM_0 },
++	{ .type = WMFW_HALO_XM_PACKED,	.base = CS35L43_DSP1_XMEM_PACKED_0 },
++	{ .type = WMFW_HALO_YM_PACKED,	.base = CS35L43_DSP1_YMEM_PACKED_0 },
++	{. type = WMFW_ADSP2_XM,	.base = CS35L43_DSP1_XMEM_UNPACKED24_0},
++	{. type = WMFW_ADSP2_YM,	.base = CS35L43_DSP1_YMEM_UNPACKED24_0},
++};
++
++static int cs35l43_dsp_init(struct cs35l43_private *cs35l43)
++{
++	struct wm_adsp *dsp;
++	int ret;
++
++	dsp = &cs35l43->dsp;
++	dsp->part = cs35l43->pdata.dsp_part_name;
++	dsp->cs_dsp.num = 1;
++	dsp->cs_dsp.type = WMFW_HALO;
++	dsp->cs_dsp.rev = 0;
++	dsp->fw = 9; /* 9 is WM_ADSP_FW_SPK_PROT in wm_adsp.c */
++	dsp->cs_dsp.dev = cs35l43->dev;
++	dsp->cs_dsp.regmap = cs35l43->regmap;
++	dsp->cs_dsp.base = CS35L43_DSP1_CLOCK_FREQ;
++	dsp->cs_dsp.base_sysinfo = CS35L43_DSP1_SYS_INFO_ID;
++	dsp->cs_dsp.mem = cs35l43_dsp1_regions;
++	dsp->cs_dsp.num_mems = ARRAY_SIZE(cs35l43_dsp1_regions);
++	dsp->cs_dsp.lock_regions = 0xFFFFFFFF;
++	dsp->toggle_preload = true;
++
++	ret = wm_halo_init(dsp);
++	if (ret != 0) {
++		dev_err(cs35l43->dev, "wm_halo_init failed\n");
++		goto err;
++	}
++
++	cs_dsp_stop(&dsp->cs_dsp);
++
++	regmap_write(cs35l43->regmap, CS35L43_DSP1RX3_INPUT, CS35L43_INPUT_SRC_VBSTMON);
++	regmap_write(cs35l43->regmap, CS35L43_DSP1RX4_INPUT, CS35L43_INPUT_SRC_IMON);
++	regmap_write(cs35l43->regmap, CS35L43_DSP1RX5_INPUT, CS35L43_INPUT_SRC_VMON);
++	regmap_write(cs35l43->regmap, CS35L43_DSP1RX6_INPUT, CS35L43_INPUT_SRC_VPMON);
++
++	return 0;
++
++err:
++	return ret;
++}
++
++static int cs35l43_dai_set_tdm_slot(struct snd_soc_dai *dai,
++				    unsigned int tx_mask, unsigned int rx_mask,
++				    int slots, int slot_width)
++{
++	struct cs35l43_private *cs35l43 =
++			snd_soc_component_get_drvdata(dai->component);
++
++	cs35l43->slot_width = slot_width;
++
++	return 0;
++}
++
++static int cs35l43_compr_open(struct snd_soc_component *component,
++			       struct snd_compr_stream *stream)
++{
++	struct snd_soc_pcm_runtime *rtd = stream->private_data;
++	struct cs35l43_private *cs35l43 =
++			snd_soc_component_get_drvdata(component);
++	struct snd_soc_dai *codec_dai = NULL;
++	int i;
++
++	for_each_rtd_dais(rtd, i, codec_dai) {
++		if (!strcmp(codec_dai->name, "cs35l43-dsp-textlog"))
++			return wm_adsp_compr_open(&cs35l43->dsp, stream);
++	}
++
++	dev_err(cs35l43->dev, "No DSP log DAI found\n");
++
++	return -EINVAL;
++}
++
++static const struct snd_soc_dai_ops cs35l43_ops = {
++	.startup = cs35l43_pcm_startup,
++	.set_fmt = cs35l43_set_dai_fmt,
++	.hw_params = cs35l43_pcm_hw_params,
++	.set_sysclk = cs35l43_dai_set_sysclk,
++	.set_tdm_slot = cs35l43_dai_set_tdm_slot,
++};
++
++static const struct snd_soc_dai_ops cs35l43_compress_ops = {
++	.compress_new = &snd_soc_new_compress,
++};
++
++static struct snd_soc_dai_driver cs35l43_dai[] = {
++	{
++		.name = "cs35l43-pcm",
++		.id = 0,
++		.playback = {
++			.stream_name = "AMP Playback",
++			.channels_min = 1,
++			.channels_max = 2,
++			.rates = SNDRV_PCM_RATE_KNOT,
++			.formats = CS35L43_RX_FORMATS,
++		},
++		.capture = {
++			.stream_name = "AMP Capture",
++			.channels_min = 1,
++			.channels_max = 8,
++			.rates = SNDRV_PCM_RATE_KNOT,
++			.formats = CS35L43_TX_FORMATS,
++		},
++		.ops = &cs35l43_ops,
++		.symmetric_rate = 1,
++	},
++	{
++		.name = "cs35l43-cpu-textlog",
++		.capture = {
++			.stream_name = "Audio Log CPU",
++			.channels_min = 1,
++			.channels_max = 1,
++			.rates = SNDRV_PCM_RATE_KNOT,
++			.formats = CS35L43_RX_FORMATS,
++		},
++		.ops = &cs35l43_compress_ops,
++	},
++	{
++		.name = "cs35l43-dsp-textlog",
++		.capture = {
++			.stream_name = "Audio Log DSP",
++			.channels_min = 1,
++			.channels_max = 1,
++			.rates = SNDRV_PCM_RATE_KNOT,
++			.formats = CS35L43_RX_FORMATS,
++		},
++	}
++};
++
++static const struct snd_compress_ops cs35l43_compr_ops = {
++	.open = &cs35l43_compr_open,
++	.free = &wm_adsp_compr_free,
++	.set_params = &wm_adsp_compr_set_params,
++	.get_caps = &wm_adsp_compr_get_caps,
++	.trigger = &wm_adsp_compr_trigger,
++	.pointer = &wm_adsp_compr_pointer,
++	.copy = &wm_adsp_compr_copy,
++};
++
++static const struct snd_soc_component_driver soc_component_dev_cs35l43 = {
++	.name = DRV_NAME,
++	.probe = cs35l43_component_probe,
++	.remove = cs35l43_component_remove,
++
++	.dapm_widgets = cs35l43_dapm_widgets,
++	.num_dapm_widgets = ARRAY_SIZE(cs35l43_dapm_widgets),
++	.dapm_routes = cs35l43_audio_map,
++	.num_dapm_routes = ARRAY_SIZE(cs35l43_audio_map),
++
++	.controls = cs35l43_aud_controls,
++	.num_controls = ARRAY_SIZE(cs35l43_aud_controls),
++
++	.set_sysclk = cs35l43_component_set_sysclk,
++
++	.write = cs35l43_component_write,
++	.read = cs35l43_component_read,
++
++	.compress_ops = &cs35l43_compr_ops,
++};
++
++static struct reg_sequence cs35l43_errata_patch[] = {
++	{ CS35L43_TST_DAC_MSM_CONFIG,	0x11330000 },
++	{ CS35L43_BST_RSVD_1,		0x50000802 },
++};
++
++int cs35l43_probe(struct cs35l43_private *cs35l43,
++				struct cs35l43_platform_data *pdata)
++{
++	int ret, i;
++	unsigned int regid, revid;
++	int irq_pol = IRQF_TRIGGER_HIGH;
++
++	for (i = 0; i < ARRAY_SIZE(cs35l43_supplies); i++)
++		cs35l43->supplies[i].supply = cs35l43_supplies[i];
++
++	cs35l43->num_supplies = ARRAY_SIZE(cs35l43_supplies);
++
++	ret = devm_regulator_bulk_get(cs35l43->dev, cs35l43->num_supplies,
++					cs35l43->supplies);
++	if (ret != 0) {
++		dev_err(cs35l43->dev,
++			"Failed to request core supplies: %d\n",
++			ret);
++		return ret;
++	}
++
++	if (pdata) {
++		cs35l43->pdata = *pdata;
++	} else if (cs35l43->dev->of_node) {
++		ret = cs35l43_handle_of_data(cs35l43->dev, &cs35l43->pdata,
++					     cs35l43);
++		if (ret != 0)
++			return ret;
++	} else {
++		ret = -EINVAL;
++		goto err;
++	}
++
++	ret = regulator_bulk_enable(cs35l43->num_supplies, cs35l43->supplies);
++	if (ret != 0) {
++		dev_err(cs35l43->dev,
++			"Failed to enable core supplies: %d\n", ret);
++		return ret;
++	}
++
++	/* returning NULL can be an option if in stereo mode */
++	cs35l43->reset_gpio = devm_gpiod_get_optional(cs35l43->dev, "reset",
++							GPIOD_OUT_LOW);
++	if (IS_ERR(cs35l43->reset_gpio)) {
++		ret = PTR_ERR(cs35l43->reset_gpio);
++		cs35l43->reset_gpio = NULL;
++		if (ret == -EBUSY) {
++			dev_info(cs35l43->dev,
++				 "Reset line busy, assuming shared reset\n");
++		} else {
++			dev_err(cs35l43->dev,
++				"Failed to get reset GPIO: %d\n", ret);
++			goto err;
++		}
++	}
++	if (cs35l43->reset_gpio) {
++		/* satisfy minimum reset pulse width spec */
++		usleep_range(2000, 2100);
++		gpiod_set_value_cansleep(cs35l43->reset_gpio, 1);
++	}
++
++	usleep_range(2000, 2100);
++
++	ret = regmap_read(cs35l43->regmap, CS35L43_DEVID, &regid);
++	if (ret < 0) {
++		dev_err(cs35l43->dev, "Get Device ID failed\n");
++		goto err;
++	}
++
++	ret = regmap_read(cs35l43->regmap, CS35L43_REVID, &revid);
++	if (ret < 0) {
++		dev_err(cs35l43->dev, "Get Revision ID failed\n");
++		goto err;
++	}
++
++	ret = regmap_register_patch(cs35l43->regmap,
++			cs35l43_errata_patch,
++			ARRAY_SIZE(cs35l43_errata_patch));
++	if (ret < 0) {
++		dev_err(cs35l43->dev, "Failed to apply errata patch %d\n", ret);
++		goto err;
++	}
++
++	cs35l43->hibernate_state = CS35L43_HIBERNATE_NOT_LOADED;
++	mutex_init(&cs35l43->hb_lock);
++	mutex_init(&cs35l43->err_lock);
++
++	cs35l43->mbox_wq = create_singlethread_workqueue("cs35l43_mbox");
++	INIT_WORK(&cs35l43->mbox_work, cs35l43_mbox_work);
++
++	cs35l43->err_wq = create_singlethread_workqueue("cs35l43_err");
++	INIT_WORK(&cs35l43->err_work, cs35l43_error_work);
++
++	irq_pol = cs35l43_irq_gpio_config(cs35l43);
++	regmap_write(cs35l43->regmap, CS35L43_IRQ1_MASK_1, 0xFFFFFFFF);
++	regmap_update_bits(cs35l43->regmap, CS35L43_IRQ1_MASK_1,
++				CS35L43_AMP_ERR_EINT1_MASK |
++				CS35L43_BST_SHORT_ERR_EINT1_MASK |
++				CS35L43_BST_DCM_UVP_ERR_EINT1_MASK |
++				CS35L43_BST_OVP_ERR_EINT1_MASK |
++				CS35L43_DC_WATCHDOG_IRQ_RISE_EINT1_MASK |
++				CS35L43_WKSRC_STATUS6_EINT1_MASK |
++				CS35L43_WKSRC_STATUS_ANY_EINT1_MASK, 0);
++	regmap_write(cs35l43->regmap, CS35L43_IRQ1_MASK_2, 0xFFFFFFFF);
++	regmap_update_bits(cs35l43->regmap, CS35L43_IRQ1_MASK_2,
++				CS35L43_PLL_UNLOCK_FLAG_RISE_EINT1_MASK |
++				CS35L43_PLL_LOCK_EINT1_MASK, 0);
++	regmap_write(cs35l43->regmap, CS35L43_IRQ1_MASK_3, 0xFFFFFFFF);
++	regmap_update_bits(cs35l43->regmap, CS35L43_IRQ1_MASK_3,
++				CS35L43_DSP1_NMI_ERR_EINT1_MASK |
++				CS35L43_DSP1_MPU_ERR_EINT1_MASK |
++				CS35L43_DSP1_STRM_ARB_ERR_EINT1_MASK, 0);
++
++	regmap_update_bits(cs35l43->regmap, CS35L43_ALIVE_DCIN_WD,
++				CS35L43_DCIN_WD_EN_MASK,
++				CS35L43_DCIN_WD_EN_MASK);
++	regmap_update_bits(cs35l43->regmap, CS35L43_ALIVE_DCIN_WD,
++				CS35L43_DCIN_WD_THLD_MASK,
++				1 << CS35L43_DCIN_WD_THLD_SHIFT);
++
++	/* ACK core wakeup message before core disabled in dsp_init */
++	regmap_write(cs35l43->regmap, CS35L43_IRQ1_EINT_1,
++					CS35L43_DSP_VIRTUAL2_MBOX_WR_EINT1_MASK);
++
++	ret = devm_request_threaded_irq(cs35l43->dev, cs35l43->irq, NULL,
++				cs35l43_irq, IRQF_ONESHOT | IRQF_SHARED |
++				irq_pol, "cs35l43", cs35l43);
++
++	cs35l43_dsp_init(cs35l43);
++
++	if (cs35l43->low_pwr_mode == CS35L43_LOW_PWR_MODE_HIBERNATE)
++		cs35l43_pm_runtime_setup(cs35l43);
++
++	ret = snd_soc_register_component(cs35l43->dev,
++					&soc_component_dev_cs35l43,
++					cs35l43_dai, ARRAY_SIZE(cs35l43_dai));
++	if (ret < 0) {
++		dev_err(cs35l43->dev, "%s: Register codec failed\n", __func__);
++		goto err_pm;
++	}
++
++	if (cs35l43->low_pwr_mode == CS35L43_LOW_PWR_MODE_HIBERNATE)
++		pm_runtime_put_autosuspend(cs35l43->dev);
++
++	dev_info(cs35l43->dev, "Cirrus Logic cs35l43 (%x), Revision: %02X\n",
++			regid, revid);
++
++	return 0;
++
++err_pm:
++	pm_runtime_disable(cs35l43->dev);
++	pm_runtime_put_noidle(cs35l43->dev);
++	wm_adsp2_remove(&cs35l43->dsp);
++	mutex_destroy(&cs35l43->hb_lock);
++err:
++	regulator_bulk_disable(cs35l43->num_supplies, cs35l43->supplies);
++	return ret;
++}
++
++int cs35l43_remove(struct cs35l43_private *cs35l43)
++{
++	pm_runtime_get_sync(cs35l43->dev);
++	pm_runtime_disable(cs35l43->dev);
++	regulator_bulk_disable(cs35l43->num_supplies, cs35l43->supplies);
++	snd_soc_unregister_component(cs35l43->dev);
++	wm_adsp2_remove(&cs35l43->dsp);
++	pm_runtime_put_noidle(cs35l43->dev);
++	mutex_destroy(&cs35l43->hb_lock);
++
++	return 0;
++}
++
++static void cs35l43_pm_runtime_setup(struct cs35l43_private *cs35l43)
++{
++	struct device *dev = cs35l43->dev;
++
++	pm_runtime_set_autosuspend_delay(dev, 3000);
++	pm_runtime_use_autosuspend(dev);
++	pm_runtime_mark_last_busy(dev);
++	pm_runtime_set_active(dev);
++	pm_runtime_get_noresume(dev);
++	pm_runtime_enable(dev);
++}
++
++MODULE_DESCRIPTION("ASoC CS35L43 driver");
++MODULE_AUTHOR("David Rhodes, Cirrus Logic Inc, <david.rhodes@cirrus.com>");
++MODULE_LICENSE("GPL");
++MODULE_IMPORT_NS("FW_CS_DSP");
+diff --git a/sound/soc/codecs/cs35l43.h b/sound/soc/codecs/cs35l43.h
+new file mode 100644
+index 0000000..ea42e45
+--- /dev/null
++++ b/sound/soc/codecs/cs35l43.h
+@@ -0,0 +1,989 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++/************************************************/
++/* Software Reset and Hardware ID		*/
++/************************************************/
++#define CS35L43_DEVID				0x0000000
++#define CS35L43_REVID				0x0000004
++#define CS35L43_FABID				0x0000008
++#define CS35L43_RELID				0x000000C
++#define CS35L43_OTPID				0x0000010
++#define CS35L43_SFT_RESET			0x0000020
++
++/************************************************/
++/* Test Register Access				*/
++/************************************************/
++#define CS35L43_TEST_KEY_CTRL			0x0000040
++#define CS35L43_USER_KEY_CTRL			0x0000044
++
++/************************************************/
++/* CTRL_ASYNC					*/
++/************************************************/
++#define CS35L43_CTRL_ASYNC0			0x0000050
++#define CS35L43_CTRL_ASYNC1			0x0000054
++#define CS35L43_CTRL_ASYNC2			0x0000058
++#define CS35L43_CTRL_ASYNC3			0x000005C
++
++/************************************************/
++/* Control Interface Configuration		*/
++/************************************************/
++#define CS35L43_CTRL_IF_CONFIG1			0x0000100
++#define CS35L43_CTRL_IF_STATUS1			0x0000104
++#define CS35L43_CTRL_IF_STATUS2			0x0000108
++#define CS35L43_CTRL_IF_CONFIG2			0x0000110
++#define CS35L43_CTRL_IF_DEBUG1			0x0000120
++#define CS35L43_CTRL_IF_DEBUG2			0x0000124
++#define CS35L43_CTRL_IF_DEBUG3			0x0000128
++#define CS35L43_CIF_MON1			0x0000140
++#define CS35L43_CIF_MON2			0x0000144
++#define CS35L43_CIF_MON_PADDR			0x0000148
++#define CS35L43_CTRL_IF_SPARE1			0x0000154
++#define CS35L43_CTRL_IF_I2C			0x0000158
++#define CS35L43_CTRL_IF_I2C_1_CONTROL		0x0000160
++#define CS35L43_CTRL_IF_I2C_1_BROADCAST		0x0000164
++#define CS35L43_APB_MSTR_DSP_BRIDGE_ERR		0x0000174
++#define CS35L43_CIF1_BRIDGE_ERR			0x0000178
++#define CS35L43_CIF2_BRIDGE_ERR			0x000017C
++
++/************************************************/
++/* OTP_IF_MEM					*/
++/************************************************/
++#define CS35L43_OTP_MEM0			0x0000400
++#define CS35L43_OTP_MEM31			0x000047C
++
++/************************************************/
++/* One-Time Programmable (OTP) Control		*/
++/************************************************/
++#define CS35L43_OTP_CTRL0			0x0000500
++#define CS35L43_OTP_CTRL1			0x0000504
++#define CS35L43_OTP_CTRL3			0x0000508
++#define CS35L43_OTP_CTRL4			0x000050C
++#define CS35L43_OTP_CTRL5			0x0000510
++#define CS35L43_OTP_CTRL6			0x0000514
++#define CS35L43_OTP_CTRL7			0x0000518
++#define CS35L43_OTP_CTRL8			0x000051C
++
++/************************************************/
++/* Power, Global, and Release Control		*/
++/************************************************/
++#define CS35L43_DEVICE_ID			0x0002004
++#define CS35L43_FAB_ID				0x0002008
++#define CS35L43_REV_ID				0x000200C
++#define CS35L43_GLOBAL_ENABLES			0x0002014
++#define CS35L43_BLOCK_ENABLES			0x0002018
++#define CS35L43_BLOCK_ENABLES2			0x000201C
++#define CS35L43_GLOBAL_OVERRIDES		0x0002020
++#define CS35L43_GLOBAL_SYNC			0x0002024
++#define CS35L43_GLOBAL_STATUS			0x0002028
++#define CS35L43_DISCH_FILT			0x000202C
++#define CS35L43_OSC_TRIM			0x0002030
++#define CS35L43_ERROR_RELEASE			0x0002034
++#define CS35L43_PLL_OVERRIDE			0x0002038
++#define CS35L43_CHIP_STATUS			0x0002040
++#define CS35L43_CHIP_STATUS2			0x0002044
++#define CS35L43_TST_OSC				0x0002084
++
++/************************************************/
++/* Digital I/O Pad Control			*/
++/************************************************/
++#define CS35L43_LRCK_PAD_CONTROL		0x0002418
++#define CS35L43_SCLK_PAD_CONTROL		0x000241C
++#define CS35L43_SDIN_PAD_CONTROL		0x0002420
++#define CS35L43_SDOUT_PAD_CONTROL		0x0002424
++#define CS35L43_GPIO_PAD_CONTROL		0x000242C
++#define CS35L43_GPIO_GLOBAL_ENABLE_CONTROL	0x0002440
++
++/************************************************/
++/* Hibernation Power Management			 */
++/************************************************/
++#define CS35L43_PWRMGT_CTL			0x0002900
++#define CS35L43_WAKESRC_CTL			0x0002904
++#define CS35L43_WAKEI2C_CTL			0x0002908
++#define CS35L43_PWRMGT_STS			0x000290C
++#define CS35L43_PWRMGT_RST			0x0002910
++#define CS35L43_TEST_CTL			0x0002914
++
++#define CS35L43_WKSRC_SPI			0x200
++#define CS35L43_WKSRC_I2C			0x400
++
++/************************************************/
++/* Device Clocking and Sample Rate Control	*/
++/************************************************/
++#define CS35L43_REFCLK_INPUT			0x0002C04
++#define CS35L43_DSP_CLOCK_GEARING		0x0002C08
++#define CS35L43_GLOBAL_SAMPLE_RATE		0x0002C0C
++#define CS35L43_FS_MON_0			0x0002D10
++#define CS35L43_DSP1_SAMPLE_RATE_RX1		0x0002D3C
++#define CS35L43_DSP1_SAMPLE_RATE_RX2		0x0002D40
++#define CS35L43_DSP1_SAMPLE_RATE_TX1		0x0002D60
++#define CS35L43_DSP1_SAMPLE_RATE_TX2		0x0002D64
++#define CS35L43_LDOA_CTRL			0x000300C
++
++/************************************************/
++/* Multidevice Synchronization			*/
++/************************************************/
++#define CS35L43_SYNC_TX_RX_ENABLES		0x0003400
++
++/************************************************/
++/* Digital Boost Converter			*/
++/************************************************/
++#define CS35L43_VBST_CTL_1			0x0003800
++#define CS35L43_VBST_CTL_2			0x0003804
++#define CS35L43_BST_IPK_CTL			0x0003808
++#define CS35L43_SOFT_RAMP			0x000380C
++#define CS35L43_BST_LOOP_COEFF			0x0003810
++#define CS35L43_LBST_SLOPE			0x0003814
++#define CS35L43_BST_SW_FREQ			0x0003818
++#define CS35L43_BST_DCM_CTL			0x000381C
++#define CS35L43_DCM_FORCE			0x0003820
++#define CS35L43_VBST_OVP			0x0003830
++#define CS35L43_BST_RSVD_1			0x0003850
++
++/************************************************/
++/* VMON and IMON Signal Monitoring		*/
++/************************************************/
++#define CS35L43_MONITOR_FILT			0x0004008
++
++/************************************************/
++/* Die Temperature Monitoring			*/
++/************************************************/
++#define CS35L43_WARN_LIMIT_THRESHOLD		0x0004220
++#define CS35L43_CONFIGURATION			0x0004224
++#define CS35L43_STATUS				0x0004300
++#define CS35L43_ENABLES_AND_CODES_ANA		0x0004304
++#define CS35L43_ENABLES_AND_CODES_DIG		0x0004308
++
++/************************************************/
++/* ASP Data Interface				*/
++/************************************************/
++#define CS35L43_ASP_ENABLES1			0x0004800
++#define CS35L43_ASP_CONTROL1			0x0004804
++#define CS35L43_ASP_CONTROL2			0x0004808
++#define CS35L43_ASP_CONTROL3			0x000480C
++#define CS35L43_ASP_FRAME_CONTROL1		0x0004810
++#define CS35L43_ASP_FRAME_CONTROL5		0x0004820
++#define CS35L43_ASP_DATA_CONTROL1		0x0004830
++#define CS35L43_ASP_DATA_CONTROL5		0x0004840
++
++/************************************************/
++/* Data Routing					*/
++/************************************************/
++#define CS35L43_DACPCM1_INPUT			0x0004C00
++#define CS35L43_DACPCM2_INPUT			0x0004C08
++#define CS35L43_ASPTX1_INPUT			0x0004C20
++#define CS35L43_ASPTX2_INPUT			0x0004C24
++#define CS35L43_ASPTX3_INPUT			0x0004C28
++#define CS35L43_ASPTX4_INPUT			0x0004C2C
++#define CS35L43_DSP1RX1_INPUT			0x0004C40
++#define CS35L43_DSP1RX2_INPUT			0x0004C44
++#define CS35L43_DSP1RX3_INPUT			0x0004C48
++#define CS35L43_DSP1RX4_INPUT			0x0004C4C
++#define CS35L43_DSP1RX5_INPUT			0x0004C50
++#define CS35L43_DSP1RX6_INPUT			0x0004C54
++#define CS35L43_NGATE1_INPUT			0x0004C60
++#define CS35L43_NGATE2_INPUT			0x0004C64
++
++/************************************************/
++/* Amplifier Volume Control			*/
++/************************************************/
++#define CS35L43_AMP_CTRL			0x0006000
++#define CS35L43_HPF_TST				0x0006004
++#define CS35L43_VC_TST1				0x0006008
++#define CS35L43_VC_TST2				0x000600C
++#define CS35L43_INTP_TST			0x0006010
++
++/************************************************/
++/* SRC_MAGCOMP					*/
++/************************************************/
++#define CS35L43_SRC_MAGCOMP_TST			0x0006200
++#define CS35L43_SRC_MAGCOMP_B0_OVERRIDE		0x0006204
++#define CS35L43_SRC_MAGCOMP_B1_OVERRIDE		0x0006208
++#define CS35L43_SRC_MAGCOMP_A1_N_OVERRIDE	0x000620C
++
++/************************************************/
++/* VP and VBST Brownout Prevention + Temp Warning */
++/************************************************/
++#define CS35L43_VPBR_CONFIG			0x0006404
++#define CS35L43_VBBR_CONFIG			0x0006408
++#define CS35L43_VPBR_STATUS			0x000640C
++#define CS35L43_VBBR_STATUS			0x0006410
++#define CS35L43_OTW_CONFIG			0x0006414
++#define CS35L43_AMP_ERROR_VOL_SEL		0x0006418
++#define CS35L43_VOL_STATUS_TO_DSP		0x0006450
++
++/************************************************/
++/* Power Management - Class H, Weak-FET, and Noise Gating */
++/************************************************/
++#define CS35L43_CLASSH_CONFIG			0x0006800
++#define CS35L43_WKFET_AMP_CONFIG		0x0006804
++#define CS35L43_NG_CONFIG			0x0006808
++
++/************************************************/
++/* Dynamic Range Enhancement			*/
++/************************************************/
++#define CS35L43_AMP_GAIN			0x0006C04
++
++/************************************************/
++/* Diagnostic Signal Generator			*/
++/************************************************/
++#define CS35L43_DAC_MSM_CONFIG			0x0007400
++#define CS35L43_TST_DAC_MSM_CONFIG		0x0007404
++#define CS35L43_ALIVE_DCIN_WD			0x0007424
++
++/************************************************/
++/* Interrupt Status and Mask Control		*/
++/************************************************/
++#define CS35L43_IRQ1_CFG			0x0010000
++#define CS35L43_IRQ1_STATUS			0x0010004
++#define CS35L43_IRQ1_EINT_1			0x0010010
++#define CS35L43_IRQ1_EINT_2			0x0010014
++#define CS35L43_IRQ1_EINT_3			0x0010018
++#define CS35L43_IRQ1_EINT_4			0x001001C
++#define CS35L43_IRQ1_EINT_5			0x0010020
++#define CS35L43_IRQ1_STS_1			0x0010090
++#define CS35L43_IRQ1_STS_2			0x0010094
++#define CS35L43_IRQ1_STS_3			0x0010098
++#define CS35L43_IRQ1_STS_4			0x001009C
++#define CS35L43_IRQ1_STS_5			0x00100A0
++#define CS35L43_IRQ1_MASK_1			0x0010110
++#define CS35L43_IRQ1_MASK_2			0x0010114
++#define CS35L43_IRQ1_MASK_3			0x0010118
++#define CS35L43_IRQ1_MASK_4			0x001011C
++#define CS35L43_IRQ1_MASK_5			0x0010120
++#define CS35L43_IRQ1_FRC_1			0x0010190
++#define CS35L43_IRQ1_FRC_2			0x0010194
++#define CS35L43_IRQ1_FRC_3			0x0010198
++#define CS35L43_IRQ1_FRC_4			0x001019C
++#define CS35L43_IRQ1_FRC_5			0x00101A0
++#define CS35L43_IRQ1_EDGE_1			0x0010210
++#define CS35L43_IRQ1_EDGE_4			0x001021C
++#define CS35L43_IRQ1_POL_1			0x0010290
++#define CS35L43_IRQ1_POL_2			0x0010294
++#define CS35L43_IRQ1_POL_3			0x0010298
++#define CS35L43_IRQ1_POL_4			0x001029C
++#define CS35L43_IRQ1_DB_2			0x0010314
++
++/************************************************/
++/* GPIO Control					*/
++/************************************************/
++#define CS35L43_GPIO_STATUS1			0x0011000
++#define CS35L43_GPIO_FORCE			0x0011004
++#define CS35L43_GPIO1_CTRL1			0x0011008
++#define CS35L43_GPIO2_CTRL1			0x001100C
++#define CS35L43_GPIO3_CTRL1			0x0011010
++#define CS35L43_GPIO4_CTRL1			0x0011014
++
++/************************************************/
++/* DSP Noise Gate Control			*/
++/************************************************/
++#define CS35L43_MIXER_NGATE_CFG			0x0012000
++#define CS35L43_MIXER_NGATE_CH1_CFG		0x0012004
++#define CS35L43_MIXER_NGATE_CH2_CFG		0x0012008
++
++/************************************************/
++/* DSP scratch space				*/
++/************************************************/
++#define CS35L43_DSP_MBOX_1			0x0013000
++#define CS35L43_DSP_MBOX_2			0x0013004
++#define CS35L43_DSP_MBOX_3			0x0013008
++#define CS35L43_DSP_MBOX_4			0x001300C
++#define CS35L43_DSP_MBOX_5			0x0013010
++#define CS35L43_DSP_MBOX_6			0x0013014
++#define CS35L43_DSP_MBOX_7			0x0013018
++#define CS35L43_DSP_MBOX_8			0x001301C
++
++/************************************************/
++/* DSP virtual 1 scratch space			*/
++/************************************************/
++#define CS35L43_DSP_VIRTUAL1_MBOX_1		0x0013020
++#define CS35L43_DSP_VIRTUAL1_MBOX_2		0x0013024
++#define CS35L43_DSP_VIRTUAL1_MBOX_3		0x0013028
++#define CS35L43_DSP_VIRTUAL1_MBOX_4		0x001302C
++#define CS35L43_DSP_VIRTUAL1_MBOX_5		0x0013030
++#define CS35L43_DSP_VIRTUAL1_MBOX_6		0x0013034
++#define CS35L43_DSP_VIRTUAL1_MBOX_7		0x0013038
++#define CS35L43_DSP_VIRTUAL1_MBOX_8		0x001303C
++
++/************************************************/
++/* DSP virtual 2 scratch space			*/
++/************************************************/
++#define CS35L43_DSP_VIRTUAL2_MBOX_1		0x0013040
++#define CS35L43_DSP_VIRTUAL2_MBOX_2		0x0013044
++#define CS35L43_DSP_VIRTUAL2_MBOX_3		0x0013048
++#define CS35L43_DSP_VIRTUAL2_MBOX_4		0x001304C
++#define CS35L43_DSP_VIRTUAL2_MBOX_5		0x0013050
++#define CS35L43_DSP_VIRTUAL2_MBOX_6		0x0013054
++#define CS35L43_DSP_VIRTUAL2_MBOX_7		0x0013058
++#define CS35L43_DSP_VIRTUAL2_MBOX_8		0x001305C
++
++/************************************************/
++/* Halo X Memory 				*/
++/************************************************/
++#define CS35L43_DSP1_XMEM_PACKED_0		0x2000000
++#define CS35L43_DSP1_XMEM_PACKED_6143		0x2005FFC
++#define CS35L43_DSP1_XMEM_UNPACKED32_0		0x2400000
++#define CS35L43_DSP1_XMEM_UNPACKED32_4095	0x2403FFC
++#define CS35L43_DSP1_XMEM_UNPACKED24_0		0x2800000
++#define CS35L43_DSP1_XMEM_UNPACKED24_8191	0x2807FFC
++
++#define CS35L43_DSP1_XROM_UNPACKED24_0		0x2808000
++#define CS35L43_DSP1_XROM_UNPACKED24_6141	0x280DFF4
++
++/************************************************/
++/* Halo Control 				*/
++/************************************************/
++#define CS35L43_DSP1_SYS_INFO_ID		0x25E0000
++#define CS35L43_DSP1_CLOCK_FREQ			0x2B80000
++#define CS35L43_DSP1_CORE_SOFT_RESET		0x2B80010
++#define CS35L43_DSP1_SCRATCH1			0x2B805C0
++#define CS35L43_DSP1_SCRATCH2			0x2B805C8
++#define CS35L43_DSP1_SCRATCH3			0x2B805D0
++#define CS35L43_DSP1_SCRATCH4			0x2B805D8
++#define CS35L43_DSP1_CCM_CORE_CONTROL		0x2BC1000
++#define CS35L43_DSP1_MPU_LOCK_STATE		0x2BC3140
++#define CS35L43_DSP1_MPU_XM_VIO_STATUS		0x2BC3104
++#define CS35L43_DSP1_MPU_YM_VIO_STATUS		0x2BC310C
++#define CS35L43_DSP1_MPU_PM_VIO_STATUS		0x2BC3114
++#define CS35L43_DSP1_WDT_CONTROL		0x2BC7000
++#define CS35L43_DSP1_WDT_STATUS			0x2BC7008
++
++/************************************************/
++/* Halo Y Memory 				*/
++/************************************************/
++#define CS35L43_DSP1_YMEM_PACKED_0		0x2C00000
++#define CS35L43_DSP1_YMEM_PACKED_1532		0x2C017F0
++#define CS35L43_DSP1_YMEM_UNPACKED32_0		0x3000000
++#define CS35L43_DSP1_YMEM_UNPACKED32_1022	0x3000FF8
++#define CS35L43_DSP1_YMEM_UNPACKED24_0		0x3400000
++#define CS35L43_DSP1_YMEM_UNPACKED24_2045	0x3401FF4
++
++/************************************************/
++/* Halo P Memory 				*/
++/************************************************/
++#define CS35L43_DSP1_PMEM_0			0x3800000
++#define CS35L43_DSP1_PMEM_5114			0x3804FE8
++
++/* #####################################################*/
++/* Fields						*/
++/* #####################################################*/
++
++/************************************************/
++/* Power Control 2				*/
++/************************************************/
++#define CS35L43_IMON_EN_MASK			0x00002000
++#define CS35L43_IMON_EN_SHIFT			13
++#define CS35L43_IMON_EN_WIDTH			1
++#define CS35L43_VMON_EN_MASK			0x00001000
++#define CS35L43_VMON_EN_SHIFT			12
++#define CS35L43_VMON_EN_WIDTH			1
++#define CS35L43_TEMPMON_EN_MASK			0x00000400
++#define CS35L43_TEMPMON_EN_SHIFT		10
++#define CS35L43_TEMPMON_EN_WIDTH		1
++#define CS35L43_VBSTMON_EN_MASK			0x00000200
++#define CS35L43_VBSTMON_EN_SHIFT		9
++#define CS35L43_VBSTMON_EN_WIDTH		1
++#define CS35L43_VPMON_EN_MASK			0x00000100
++#define CS35L43_VPMON_EN_SHIFT			8
++#define CS35L43_VPMON_EN_WIDTH			1
++#define CS35L43_BST_EN_MASK			0x00000030
++#define CS35L43_BST_EN_SHIFT			4
++#define CS35L43_BST_EN_WIDTH			2
++#define CS35L43_AMP_EN_MASK			0x00000001
++#define CS35L43_AMP_EN_SHIFT			0
++#define CS35L43_AMP_EN_WIDTH			1
++#define CS35L43_BST_EN_DEFAULT			2
++
++
++/************************************************/
++/* Power Control 3				*/
++/************************************************/
++#define CS35L43_WKFET_AMP_EN_MASK		0x01000000
++#define CS35L43_WKFET_AMP_EN_SHIFT		24
++#define CS35L43_AMP_DRE_EN_MASK			0x00100000
++#define CS35L43_AMP_DRE_EN_SHIFT		20
++#define CS35L43_VPI_LIM_EN_MASK			0x00010000
++#define CS35L43_VPI_LIM_EN_SHIFT		16
++#define CS35L43_VBBR_EN_MASK			0x00002000
++#define CS35L43_VBBR_EN_SHIFT			13
++#define CS35L43_VPBR_EN_MASK			0x00001000
++#define CS35L43_VPBR_EN_SHIFT			12
++#define CS35L43_SYNC_EN_MASK			0x00000100
++#define CS35L43_SYNC_EN_SHIFT			8
++#define CS35L43_CLASSH_EN_MASK			0x00000010
++#define CS35L43_CLASSH_EN_SHIFT			4
++
++/************************************************/
++/* Hibernation Control                          */
++/************************************************/
++#define CS35L43_MEM_RDY				0x00000002
++#define CS35L43_WKSRC_STS_MASK			0x000003F0
++
++/************************************************/
++/* Global Clocking Control			*/
++/************************************************/
++#define CS35L43_GLOBAL_FS_MASK			0x0000001F
++#define CS35L43_GLOBAL_FS_SHIFT			0
++#define CS35L43_GLOBAL_FS_WIDTH			5
++#define CS35L43_FS1_START_WINDOW_MASK		0x00000FFF
++#define CS35L43_FS2_START_WINDOW_SHIFT		12
++#define CS35L43_FS2_START_WINDOW_MASK		0x00FFF000
++
++/************************************************/
++/* PLL Clocking Control				*/
++/************************************************/
++#define CS35L43_PLL_FORCE_EN_MASK		0x00010000
++#define CS35L43_PLL_FORCE_EN_SHIFT		16
++#define CS35L43_PLL_FORCE_EN_WIDTH		1
++#define CS35L43_PLL_OPEN_LOOP_MASK		0x00000800
++#define CS35L43_PLL_OPEN_LOOP_SHIFT		11
++#define CS35L43_PLL_OPEN_LOOP_WIDTH		1
++#define CS35L43_PLL_REFCLK_FREQ_MASK		0x000007E0
++#define CS35L43_PLL_REFCLK_FREQ_SHIFT		5
++#define CS35L43_PLL_REFCLK_FREQ_WIDTH		6
++#define CS35L43_PLL_REFCLK_EN_MASK		0x00000010
++#define CS35L43_PLL_REFCLK_EN_SHIFT		4
++#define CS35L43_PLL_REFCLK_EN_WIDTH		1
++#define CS35L43_PLL_REFCLK_SEL_MASK		0x00000007
++#define CS35L43_PLL_REFCLK_SEL_SHIFT		0
++#define CS35L43_PLL_REFCLK_SEL_WIDTH		3
++
++/************************************************/
++/* GPIO Pad Interface Control			*/
++/************************************************/
++#define CS35L43_GP2_CTRL_MASK			0x07000000
++#define CS35L43_GP2_CTRL_SHIFT			24
++#define CS35L43_GP1_CTRL_MASK			0x00070000
++#define CS35L43_GP1_CTRL_SHIFT			16
++
++/************************************************/
++/* GPIO_GPIO1_CTRL1				*/
++/************************************************/
++#define CS35L43_GP1_DIR_MASK			0x80000000
++#define CS35L43_GP1_DIR_SHIFT			31
++#define CS35L43_GP1_DBTIME_MASK			0x000F0000
++#define CS35L43_GP1_DBTIME_SHIFT		16
++#define CS35L43_GP1_LVL_MASK			0x00008000
++#define CS35L43_GP1_LVL_SHIFT			15
++#define CS35L43_GP1_DB_MASK			0x00002000
++#define CS35L43_GP1_DB_SHIFT			13
++#define CS35L43_GP1_POL_MASK			0x00001000
++#define CS35L43_GP1_POL_SHIFT			12
++#define CS35L43_GP1_FN_MASK			0x0000007F
++#define CS35L43_GP1_FN_SHIFT			0
++
++/************************************************/
++/* GPIO_GPIO2_CTRL1				*/
++/************************************************/
++#define CS35L43_GP2_DIR_MASK			0x80000000
++#define CS35L43_GP2_DIR_SHIFT			31
++#define CS35L43_GP2_DBTIME_MASK			0x000F0000
++#define CS35L43_GP2_DBTIME_SHIFT		16
++#define CS35L43_GP2_LVL_MASK			0x00008000
++#define CS35L43_GP2_LVL_SHIFT			15
++#define CS35L43_GP2_DB_MASK			0x00002000
++#define CS35L43_GP2_DB_SHIFT			13
++#define CS35L43_GP2_POL_MASK			0x00001000
++#define CS35L43_GP2_POL_SHIFT			12
++#define CS35L43_GP2_FN_MASK			0x0000007F
++#define CS35L43_GP2_FN_SHIFT			0
++
++#define CS35L43_GP2_CTRL_OPEN_DRAIN_ACTV_LO	2
++#define CS35L43_GP2_CTRL_PUSH_PULL_ACTV_LO	4
++#define CS35L43_GP2_CTRL_PUSH_PULL_ACTV_HI	5
++
++/************************************************/
++/* Digital Boost Converter			*/
++/************************************************/
++
++/************************************************/
++/* Boost Converter Voltage Control 1		*/
++/************************************************/
++#define CS35L43_BST_CTL_MASK			0x000000FF
++#define CS35L43_BST_CTL_SHIFT			0
++
++/************************************************/
++/* Boost Converter Voltage Control 2		*/
++/************************************************/
++#define CS35L43_BST_CTL_EXT_EN_MASK		0x00000100
++#define CS35L43_BST_CTL_EXT_EN_SHIFT		8
++#define CS35L43_BST_CTL_LIM_EN_MASK		0x00000004
++#define CS35L43_BST_CTL_LIM_EN_SHIFT		2
++#define CS35L43_BST_CTL_SEL_MASK		0x00000003
++#define CS35L43_BST_CTL_SEL_SHIFT		0
++
++/************************************************/
++/* Boost Converter Peak Current			*/
++/************************************************/
++#define CS35L43_BST_IPK_MASK			0x0000007F
++#define CS35L43_BST_IPK_SHIFT			0
++
++/************************************************/
++/* DATAIF_ASP_ENABLES1				*/
++/************************************************/
++#define CS35L43_ASP_RX3_EN_MASK			0x00040000
++#define CS35L43_ASP_RX3_EN_SHIFT		18
++#define CS35L43_ASP_RX3_EN_WIDTH		1
++#define CS35L43_ASP_RX2_EN_MASK			0x00020000
++#define CS35L43_ASP_RX2_EN_SHIFT		17
++#define CS35L43_ASP_RX2_EN_WIDTH		1
++#define CS35L43_ASP_RX1_EN_MASK			0x00010000
++#define CS35L43_ASP_RX1_EN_SHIFT		16
++#define CS35L43_ASP_RX1_EN_WIDTH		1
++#define CS35L43_ASP_TX4_EN_MASK			0x00000008
++#define CS35L43_ASP_TX4_EN_SHIFT		3
++#define CS35L43_ASP_TX4_EN_WIDTH		1
++#define CS35L43_ASP_TX3_EN_MASK			0x00000004
++#define CS35L43_ASP_TX3_EN_SHIFT		2
++#define CS35L43_ASP_TX3_EN_WIDTH		1
++#define CS35L43_ASP_TX2_EN_MASK			0x00000002
++#define CS35L43_ASP_TX2_EN_SHIFT		1
++#define CS35L43_ASP_TX2_EN_WIDTH		1
++#define CS35L43_ASP_TX1_EN_MASK			0x00000001
++#define CS35L43_ASP_TX1_EN_SHIFT		0
++#define CS35L43_ASP_TX1_EN_WIDTH		1
++
++/************************************************/
++/* DATAIF_ASP_CONTROL1				*/
++/************************************************/
++#define CS35L43_ASP_BCLK_FREQ_MASK		0x0000003F
++#define CS35L43_ASP_BCLK_FREQ_SHIFT		0
++#define CS35L43_ASP_BCLK_FREQ_WIDTH		6
++
++/************************************************/
++/* DATAIF_ASP_CONTROL2				*/
++/************************************************/
++#define CS35L43_ASP_RX_WIDTH_MASK		0xFF000000
++#define CS35L43_ASP_RX_WIDTH_SHIFT		24
++#define CS35L43_ASP_RX_WIDTH_WIDTH		8
++#define CS35L43_ASP_TX_WIDTH_MASK		0x00FF0000
++#define CS35L43_ASP_TX_WIDTH_SHIFT		16
++#define CS35L43_ASP_TX_WIDTH_WIDTH		8
++#define CS35L43_ASP_FMT_MASK			0x00000700
++#define CS35L43_ASP_FMT_SHIFT			8
++#define CS35L43_ASP_FMT_WIDTH			3
++#define CS35L43_ASP_BCLK_INV_MASK		0x00000040
++#define CS35L43_ASP_BCLK_INV_SHIFT		6
++#define CS35L43_ASP_BCLK_INV_WIDTH		1
++#define CS35L43_ASP_BCLK_FRC_MASK		0x00000020
++#define CS35L43_ASP_BCLK_FRC_SHIFT		5
++#define CS35L43_ASP_BCLK_FRC_WIDTH		1
++#define CS35L43_ASP_BCLK_MSTR_MASK		0x00000010
++#define CS35L43_ASP_BCLK_MSTR_SHIFT		4
++#define CS35L43_ASP_BCLK_MSTR_WIDTH		1
++#define CS35L43_ASP_FSYNC_INV_MASK		0x00000004
++#define CS35L43_ASP_FSYNC_INV_SHIFT		2
++#define CS35L43_ASP_FSYNC_INV_WIDTH		1
++#define CS35L43_ASP_FSYNC_FRC_MASK		0x00000002
++#define CS35L43_ASP_FSYNC_FRC_SHIFT		1
++#define CS35L43_ASP_FSYNC_FRC_WIDTH		1
++#define CS35L43_ASP_FSYNC_MSTR_MASK		0x00000001
++#define CS35L43_ASP_FSYNC_MSTR_SHIFT		0
++#define CS35L43_ASP_FSYNC_MSTR_WIDTH		1
++
++/************************************************/
++/* DATAIF_ASP_CONTROL3				*/
++/************************************************/
++#define CS35L41_ASP_DOUT_HIZ_CTRL_SHIFT		0
++#define CS35L41_ASP_DOUT_HIZ_CTRL_MASK		0x00000003
++
++/************************************************/
++/* DATAIF_ASP_DATA_CONTROL1			*/
++/************************************************/
++#define CS35L43_ASP_TX_WL_MASK			0x0000003F
++#define CS35L43_ASP_TX_WL_SHIFT			0
++#define CS35L43_ASP_TX_WL_WIDTH			6
++
++/************************************************/
++/* DATAIF_ASP_DATA_CONTROL5			*/
++/************************************************/
++#define CS35L43_ASP_RX_WL_MASK			0x0000003F
++#define CS35L43_ASP_RX_WL_SHIFT			0
++#define CS35L43_ASP_RX_WL_WIDTH			6
++
++#define CS35L43_INPUT_SRC_ASPRX1		0x08
++#define CS35L43_INPUT_SRC_ASPRX2		0x09
++#define CS35L43_INPUT_SRC_ASPRX3		0x0A
++#define CS35L43_INPUT_SRC_VMON			0x18
++#define CS35L43_INPUT_SRC_IMON			0x19
++#define CS35L43_INPUT_SRC_VMON_FS2		0x1A
++#define CS35L43_INPUT_SRC_IMON_FS2		0x1B
++#define CS35L43_INPUT_SRC_CLASSH		0x21
++#define CS35L43_INPUT_SRC_VPMON			0x28
++#define CS35L43_INPUT_SRC_VBSTMON		0x29
++#define CS35L43_INPUT_SRC_TEMPMON		0x3A
++#define CS35L43_INPUT_DSP_TX1			0x32
++#define CS35L43_INPUT_DSP_TX2			0x33
++#define CS35L43_INPUT_DSP_TX3			0x34
++#define CS35L43_INPUT_DSP_TX4			0x35
++#define CS35L43_INPUT_DSP_TX5			0x36
++#define CS35L43_INPUT_DSP_TX6			0x37
++#define CS35L43_INPUT_MASK			0x3F
++
++/************************************************/
++/* DAC_MSM_ALIVE_DCIN_WD			*/
++/************************************************/
++#define CS35L43_WD_MODE_MASK			0x00000C00
++#define CS35L43_WD_MODE_SHIFT			10
++#define CS35L43_DCIN_WD_DUR_MASK		0x00000380
++#define CS35L43_DCIN_WD_DUR_SHIFT		7
++#define CS35L43_DCIN_WD_THLD_MASK		0x0000007E
++#define CS35L43_DCIN_WD_THLD_SHIFT		1
++#define CS35L43_DCIN_WD_EN_MASK			0x00000001
++#define CS35L43_DCIN_WD_EN_SHIFT		0
++
++
++/************************************************/
++/* VPBR Configuration				*/
++/************************************************/
++#define CS35L43_VPBR_REL_RATE_MASK		0x00E00000
++#define CS35L43_VPBR_REL_RATE_SHIFT		21
++#define CS35L43_VPBR_WAIT_MASK			0x00180000
++#define CS35L43_VPBR_WAIT_SHIFT			19
++#define CS35L43_VPBR_ATK_RATE_MASK		0x00070000
++#define CS35L43_VPBR_ATK_RATE_SHIFT		16
++#define CS35L43_VPBR_ATK_VOL_MASK		0x0000F000
++#define CS35L43_VPBR_ATK_VOL_SHIFT		12
++#define CS35L43_VPBR_MAX_ATT_MASK		0x00000F00
++#define CS35L43_VPBR_MAX_ATT_SHIFT		8
++#define CS35L43_VPBR_THLD1_MASK			0x0000001F
++#define CS35L43_VPBR_THLD1_SHIFT		0
++
++/************************************************/
++/* IRQ1_IRQ1_EINT_1				*/
++/************************************************/
++#define CS35L43_DSP_VIRTUAL2_MBOX_WR_EINT1_MASK		0x80000000
++#define CS35L43_DSP_VIRTUAL2_MBOX_WR_EINT1_SHIFT	31
++#define CS35L43_DSP_VIRTUAL1_MBOX_WR_EINT1_MASK		0x40000000
++#define CS35L43_DSP_VIRTUAL1_MBOX_WR_EINT1_SHIFT	30
++#define CS35L43_DC_WATCHDOG_IRQ_FALL_EINT1_MASK		0x20000000
++#define CS35L43_DC_WATCHDOG_IRQ_FALL_EINT1_SHIFT	29
++#define CS35L43_DC_WATCHDOG_IRQ_RISE_EINT1_MASK		0x10000000
++#define CS35L43_DC_WATCHDOG_IRQ_RISE_EINT1_SHIFT	28
++#define CS35L43_AMP_ERR_EINT1_MASK			0x08000000
++#define CS35L43_AMP_ERR_EINT1_SHIFT			27
++#define CS35L43_TEMP_ERR_EINT1_MASK			0x04000000
++#define CS35L43_TEMP_ERR_EINT1_SHIFT			26
++#define CS35L43_TEMP_WARN_FALL_EINT1_MASK		0x02000000
++#define CS35L43_TEMP_WARN_FALL_EINT1_SHIFT		25
++#define CS35L43_TEMP_WARN_RISE_EINT1_MASK		0x01000000
++#define CS35L43_TEMP_WARN_RISE_EINT1_SHIFT		24
++#define CS35L43_BST_IPK_FLAG_EINT1_MASK			0x00800000
++#define CS35L43_BST_IPK_FLAG_EINT1_SHIFT		23
++#define CS35L43_BST_SHORT_ERR_EINT1_MASK		0x00400000
++#define CS35L43_BST_SHORT_ERR_EINT1_SHIFT		22
++#define CS35L43_BST_DCM_UVP_ERR_EINT1_MASK		0x00200000
++#define CS35L43_BST_DCM_UVP_ERR_EINT1_SHIFT		21
++#define CS35L43_BST_OVP_ERR_EINT1_MASK			0x00100000
++#define CS35L43_BST_OVP_ERR_EINT1_SHIFT			20
++#define CS35L43_BST_OVP_FLAG_FALL_EINT1_MASK		0x00080000
++#define CS35L43_BST_OVP_FLAG_FALL_EINT1_SHIFT		19
++#define CS35L43_BST_OVP_FLAG_RISE_EINT1_MASK		0x00040000
++#define CS35L43_BST_OVP_FLAG_RISE_EINT1_SHIFT		18
++#define CS35L43_MSM_PUP_DONE_EINT1_MASK			0x00020000
++#define CS35L43_MSM_PUP_DONE_EINT1_SHIFT		17
++#define CS35L43_MSM_PDN_DONE_EINT1_MASK			0x00010000
++#define CS35L43_MSM_PDN_DONE_EINT1_SHIFT		16
++#define CS35L43_MSM_GLOBAL_EN_ASSERT_EINT1_MASK		0x00008000
++#define CS35L43_MSM_GLOBAL_EN_ASSERT_EINT1_SHIFT	15
++#define CS35L43_WKSRC_STATUS6_EINT1_MASK		0x00004000
++#define CS35L43_WKSRC_STATUS6_EINT1_SHIFT		14
++#define CS35L43_WKSRC_STATUS5_EINT1_MASK		0x00002000
++#define CS35L43_WKSRC_STATUS5_EINT1_SHIFT		13
++#define CS35L43_WKSRC_STATUS4_EINT1_MASK		0x00001000
++#define CS35L43_WKSRC_STATUS4_EINT1_SHIFT		12
++#define CS35L43_WKSRC_STATUS3_EINT1_MASK		0x00000800
++#define CS35L43_WKSRC_STATUS3_EINT1_SHIFT		11
++#define CS35L43_WKSRC_STATUS2_EINT1_MASK		0x00000400
++#define CS35L43_WKSRC_STATUS2_EINT1_SHIFT		10
++#define CS35L43_WKSRC_STATUS1_EINT1_MASK		0x00000200
++#define CS35L43_WKSRC_STATUS1_EINT1_SHIFT		9
++#define CS35L43_WKSRC_STATUS_ANY_EINT1_MASK		0x00000100
++#define CS35L43_WKSRC_STATUS_ANY_EINT1_SHIFT		8
++#define CS35L43_IRQ1_EINT_1_GPIO4_FALL_EINT1_MASK	0x00000080
++#define CS35L43_IRQ1_EINT_1_GPIO4_FALL_EINT1_SHIFT	7
++#define CS35L43_IRQ1_EINT_1_GPIO4_RISE_EINT1_MASK	0x00000040
++#define CS35L43_IRQ1_EINT_1_GPIO4_RISE_EINT1_SHIFT	6
++#define CS35L43_IRQ1_EINT_1_GPIO3_FALL_EINT1_MASK	0x00000020
++#define CS35L43_IRQ1_EINT_1_GPIO3_FALL_EINT1_SHIFT	5
++#define CS35L43_IRQ1_EINT_1_GPIO3_RISE_EINT1_MASK	0x00000010
++#define CS35L43_IRQ1_EINT_1_GPIO3_RISE_EINT1_SHIFT	4
++#define CS35L43_GPIO2_FALL_EINT1_MASK			0x00000008
++#define CS35L43_GPIO2_FALL_EINT1_SHIFT			3
++#define CS35L43_GPIO2_RISE_EINT1_MASK			0x00000004
++#define CS35L43_GPIO2_RISE_EINT1_SHIFT			2
++#define CS35L43_GPIO1_FALL_EINT1_MASK			0x00000002
++#define CS35L43_GPIO1_FALL_EINT1_SHIFT			1
++#define CS35L43_GPIO1_RISE_EINT1_MASK			0x00000001
++#define CS35L43_GPIO1_RISE_EINT1_SHIFT			0
++
++/************************************************/
++/* IRQ1_IRQ1_EINT_2				*/
++/************************************************/
++#define CS35L43_PWRMGT_SYNC_ERR_EINT1_MASK		0x20000000
++#define CS35L43_PWRMGT_SYNC_ERR_EINT1_SHIFT		29
++#define CS35L43_TIMER_CH2_EINT1_MASK			0x10000000
++#define CS35L43_TIMER_CH2_EINT1_SHIFT			28
++#define CS35L43_TIMER_CH1_EINT1_MASK			0x08000000
++#define CS35L43_TIMER_CH1_EINT1_SHIFT			27
++#define CS35L43_IMON_CLIPPED_EINT1_MASK			0x04000000
++#define CS35L43_IMON_CLIPPED_EINT1_SHIFT		26
++#define CS35L43_VMON_CLIPPED_EINT1_MASK			0x02000000
++#define CS35L43_VMON_CLIPPED_EINT1_SHIFT		25
++#define CS35L43_VBSTMON_CLIPPED_EINT1_MASK		0x01000000
++#define CS35L43_VBSTMON_CLIPPED_EINT1_SHIFT		24
++#define CS35L43_VPMON_CLIPPED_EINT1_MASK		0x00800000
++#define CS35L43_VPMON_CLIPPED_EINT1_SHIFT		23
++#define CS35L43_I2C_NACK_ERR_EINT1_MASK			0x00400000
++#define CS35L43_I2C_NACK_ERR_EINT1_SHIFT		22
++#define CS35L43_INTP_VC_DONE_EINT1_MASK			0x00200000
++#define CS35L43_INTP_VC_DONE_EINT1_SHIFT		21
++#define CS35L43_VBBR_ATT_CLR_EINT1_MASK			0x00100000
++#define CS35L43_VBBR_ATT_CLR_EINT1_SHIFT		20
++#define CS35L43_VBBR_FLAG_EINT1_MASK			0x00080000
++#define CS35L43_VBBR_FLAG_EINT1_SHIFT			19
++#define CS35L43_VPBR_ATT_CLR_EINT1_MASK			0x00040000
++#define CS35L43_VPBR_ATT_CLR_EINT1_SHIFT		18
++#define CS35L43_VPBR_FLAG_EINT1_MASK			0x00020000
++#define CS35L43_VPBR_FLAG_EINT1_SHIFT			17
++#define CS35L43_AMP_NG_ON_FALL_EINT1_MASK		0x00010000
++#define CS35L43_AMP_NG_ON_FALL_EINT1_SHIFT		16
++#define CS35L43_AMP_NG_ON_RISE_EINT1_MASK		0x00008000
++#define CS35L43_AMP_NG_ON_RISE_EINT1_SHIFT		15
++#define CS35L43_AUX_NG_CH2_EXIT_EINT1_MASK		0x00004000
++#define CS35L43_AUX_NG_CH2_EXIT_EINT1_SHIFT		14
++#define CS35L43_AUX_NG_CH2_ENTRY_EINT1_MASK		0x00002000
++#define CS35L43_AUX_NG_CH2_ENTRY_EINT1_SHIFT		13
++#define CS35L43_AUX_NG_CH1_EXIT_EINT1_MASK		0x00001000
++#define CS35L43_AUX_NG_CH1_EXIT_EINT1_SHIFT		12
++#define CS35L43_AUX_NG_CH1_ENTRY_EINT1_MASK		0x00000800
++#define CS35L43_AUX_NG_CH1_ENTRY_EINT1_SHIFT		11
++#define CS35L43_ASP_RXSLOT_CFG_ERR_EINT1_MASK		0x00000400
++#define CS35L43_ASP_RXSLOT_CFG_ERR_EINT1_SHIFT		10
++#define CS35L43_ASP_TXSLOT_CFG_ERR_EINT1_MASK		0x00000200
++#define CS35L43_ASP_TXSLOT_CFG_ERR_EINT1_SHIFT		9
++#define CS35L43_REFCLK_MISSING_RISE_EINT1_MASK		0x00000100
++#define CS35L43_REFCLK_MISSING_RISE_EINT1_SHIFT		8
++#define CS35L43_REFCLK_MISSING_FALL_EINT1_MASK		0x00000080
++#define CS35L43_REFCLK_MISSING_FALL_EINT1_SHIFT		7
++#define CS35L43_PLL_REFCLK_PRESENT_EINT1_MASK		0x00000040
++#define CS35L43_PLL_REFCLK_PRESENT_EINT1_SHIFT		6
++#define CS35L43_PLL_READY_RISE_EINT1_MASK		0x00000020
++#define CS35L43_PLL_READY_RISE_EINT1_SHIFT		5
++#define CS35L43_PLL_UNLOCK_FLAG_FALL_EINT1_MASK		0x00000010
++#define CS35L43_PLL_UNLOCK_FLAG_FALL_EINT1_SHIFT	4
++#define CS35L43_PLL_UNLOCK_FLAG_RISE_EINT1_MASK		0x00000008
++#define CS35L43_PLL_UNLOCK_FLAG_RISE_EINT1_SHIFT	3
++#define CS35L43_PLL_FREQ_LOCK_EINT1_MASK		0x00000004
++#define CS35L43_PLL_FREQ_LOCK_EINT1_SHIFT		2
++#define CS35L43_PLL_PHASE_LOCK_EINT1_MASK		0x00000002
++#define CS35L43_PLL_PHASE_LOCK_EINT1_SHIFT		1
++#define CS35L43_PLL_LOCK_EINT1_MASK			0x00000001
++#define CS35L43_PLL_LOCK_EINT1_SHIFT			0
++
++/************************************************/
++/* IRQ1_IRQ1_EINT_3				*/
++/************************************************/
++#define CS35L43_OTP_BOOT_ERR_EINT1_MASK			0x00040000
++#define CS35L43_OTP_BOOT_ERR_EINT1_SHIFT		18
++#define CS35L43_DSP1_NMI_ERR_EINT1_MASK			0x00000001
++#define CS35L43_DSP1_NMI_ERR_EINT1_SHIFT		0
++#define CS35L43_DSP1_MPU_ERR_EINT1_MASK			0x00000040
++#define CS35L43_DSP1_MPU_ERR_EINT1_SHIFT		6
++#define CS35L43_DSP1_STRM_ARB_ERR_EINT1_MASK		0x00000080
++#define CS35L43_DSP1_STRM_ARB_ERR_EINT1_SHIFT		7
++
++/************************************************/
++/* Protection Release and Error Ignore Control	*/
++/************************************************/
++#define CS35L43_CLK_ERR_IGNORE_MASK			0x80000000
++#define CS35L43_CLK_ERR_IGNORE_SHIFT			31
++#define CS35L43_TEMP_ERR_IGNORE_MASK			0x40000000
++#define CS35L43_TEMP_ERR_IGNORE_SHIFT			30
++#define CS35L43_TEMP_WARN_IGNORE_MASK			0x20000000
++#define CS35L43_TEMP_WARN_IGNORE_SHIFT			29
++#define CS35L43_BST_UVP_ERR_IGNORE_MASK			0x10000000
++#define CS35L43_BST_UVP_ERR_IGNORE_SHIFT		28
++#define CS35L43_BST_OVP_ERR_IGNORE_MASK			0x08000000
++#define CS35L43_BST_OVP_ERR_IGNORE_SHIFT		27
++#define CS35L43_BST_SHORT_ERR_IGNORE_MASK		0x04000000
++#define CS35L43_BST_SHORT_ERR_IGNORE_SHIFT		26
++#define CS35L43_AMP_SHORT_ERR_IGNORE_MASK		0x02000000
++#define CS35L43_AMP_SHORT_ERR_IGNORE_SHIFT		25
++#define CS35L43_AMP_CAL_ERR_IGNORE_MASK			0x01000000
++#define CS35L43_AMP_CAL_ERR_IGNORE_SHIFT		24
++#define CS35L43_ERROR_RELEASE_CLK_ERR_RLS_MASK		0x00000080
++#define CS35L43_ERROR_RELEASE_CLK_ERR_RLS_SHIFT		7
++#define CS35L43_TEMP_ERR_RLS_MASK			0x00000040
++#define CS35L43_TEMP_ERR_RLS_SHIFT			6
++#define CS35L43_TEMP_WARN_RLS_MASK			0x00000020
++#define CS35L43_TEMP_WARN_RLS_SHIFT			5
++#define CS35L43_BST_UVP_ERR_RLS_MASK			0x00000010
++#define CS35L43_BST_UVP_ERR_RLS_SHIFT			4
++#define CS35L43_BST_OVP_ERR_RLS_MASK			0x00000008
++#define CS35L43_BST_OVP_ERR_RLS_SHIFT			3
++#define CS35L43_BST_SHORT_ERR_RLS_MASK			0x00000004
++#define CS35L43_BST_SHORT_ERR_RLS_SHIFT			2
++#define CS35L43_AMP_SHORT_ERR_RLS_MASK			0x00000002
++#define CS35L43_AMP_SHORT_ERR_RLS_SHIFT			1
++#define CS35L43_AMP_CAL_ERR_RLS_MASK			0x00000001
++#define CS35L43_AMP_CAL_ERR_RLS_SHIFT			0
++
++/************************************************/
++/* Amplifier Gain Control			*/
++/************************************************/
++#define CS35L43_AMP_GAIN_ZC_MASK		0x00000400
++#define CS35L43_AMP_GAIN_ZC_SHIFT		10
++#define CS35L43_AMP_GAIN_PCM_MASK		0x000003E0
++#define CS35L43_AMP_GAIN_PCM_SHIFT		5
++
++/************************************************/
++/* Amplifier Digital Volume Control		*/
++/************************************************/
++#define CS35L43_AMP_HPF_PCM_EN_MASK		0x00008000
++#define CS35L43_AMP_HPF_PCM_EN_SHIFT		15
++#define CS35L43_AMP_INV_PCM_MASK		0x00004000
++#define CS35L43_AMP_INV_PCM_SHIFT		14
++#define CS35L43_AMP_VOL_PCM_MASK		0x00003FF8
++#define CS35L43_AMP_VOL_PCM_SHIFT		3
++#define CS35L43_AMP_RAMP_PCM_MASK		0x00000007
++#define CS35L43_AMP_RAMP_PCM_SHIFT		0
++
++/************************************************/
++/* Amplifier High Rate Control			*/
++/************************************************/
++#define CS35L43_VIMON_DUAL_RATE_MASK		0x00010000
++#define CS35L43_VIMON_DUAL_RATE_SHIFT		16
++#define CS35L43_AMP_PCM_FSX2_EN_MASK		0x00000001
++#define CS35L43_DSP_RX1_RATE_MASK		0x00000003
++#define CS35L43_DSP_RX2_RATE_MASK		0x00000300
++#define CS35L43_DSP_RX3_RATE_MASK		0x00030000
++#define CS35L43_DSP_RX4_RATE_MASK		0x03000000
++#define CS35L43_DSP_RX5_RATE_MASK		0x00000003
++#define CS35L43_DSP_RX6_RATE_MASK		0x00000300
++#define CS35L43_DSP_TX1_RATE_MASK		0x00000003
++#define CS35L43_DSP_TX2_RATE_MASK		0x00000300
++#define CS35L43_DSP_TX3_RATE_MASK		0x00030000
++#define CS35L43_DSP_TX4_RATE_MASK		0x03000000
++#define CS35L43_DSP_TX5_RATE_MASK		0x00000003
++#define CS35L43_DSP_TX6_RATE_MASK		0x00000300
++#define CS35L43_DSP_RX1_RATE_SHIFT		0
++#define CS35L43_DSP_RX2_RATE_SHIFT		8
++#define CS35L43_DSP_RX3_RATE_SHIFT		16
++#define CS35L43_DSP_RX4_RATE_SHIFT		24
++#define CS35L43_DSP_RX5_RATE_SHIFT		0
++#define CS35L43_DSP_RX6_RATE_SHIFT		8
++#define CS35L43_DSP_TX1_RATE_SHIFT		0
++#define CS35L43_DSP_TX2_RATE_SHIFT		8
++#define CS35L43_DSP_TX3_RATE_SHIFT		16
++#define CS35L43_DSP_TX4_RATE_SHIFT		24
++#define CS35L43_DSP_TX5_RATE_SHIFT		0
++#define CS35L43_DSP_TX6_RATE_SHIFT		8
++#define CS35L43_BASE_RATE			0x1
++#define CS35L43_HIGH_RATE			0x3
++
++/************************************************/
++/* DSP Noise Gate Control			*/
++/************************************************/
++
++/************************************************/
++/* NOISE_GATE_MIXER_NGATE_CFG			*/
++/************************************************/
++#define CS35L43_AUX_NGATE_FAST_MASK		0x00000001
++#define CS35L43_AUX_NGATE_FAST_SHIFT		0
++
++/************************************************/
++/* NOISE_GATE_MIXER_NGATE_CH1_CFG		*/
++/************************************************/
++#define CS35L43_AUX_NGATE_CH1_FRC_MASK		0x00020000
++#define CS35L43_AUX_NGATE_CH1_FRC_SHIFT		17
++#define CS35L43_AUX_NGATE_CH1_EN_MASK		0x00010000
++#define CS35L43_AUX_NGATE_CH1_EN_SHIFT		16
++#define CS35L43_AUX_NGATE_CH1_HOLD_MASK		0x00000F00
++#define CS35L43_AUX_NGATE_CH1_HOLD_SHIFT	8
++#define CS35L43_AUX_NGATE_CH1_THR_MASK		0x00000007
++#define CS35L43_AUX_NGATE_CH1_THR_SHIFT		0
++
++/************************************************/
++/* NOISE_GATE_MIXER_NGATE_CH2_CFG		*/
++/************************************************/
++#define CS35L43_AUX_NGATE_CH2_FRC_MASK		0x00020000
++#define CS35L43_AUX_NGATE_CH2_FRC_SHIFT		17
++#define CS35L43_AUX_NGATE_CH2_EN_MASK		0x00010000
++#define CS35L43_AUX_NGATE_CH2_EN_SHIFT		16
++#define CS35L43_AUX_NGATE_CH2_HOLD_MASK		0x00000F00
++#define CS35L43_AUX_NGATE_CH2_HOLD_SHIFT	8
++#define CS35L43_AUX_NGATE_CH2_THR_MASK		0x00000007
++#define CS35L43_AUX_NGATE_CH2_THR_SHIFT		0
++
++/************************************************/
++/* Noise Gate Configuration			*/
++/************************************************/
++#define CS35L43_NG_FRC_MASK			0x00008000
++#define CS35L43_NG_FRC_SHIFT			15
++#define CS35L43_NG_EN_SEL_MASK			0x00003F00
++#define CS35L43_NG_EN_SEL_SHIFT			8
++#define CS35L43_NG_DELAY_MASK			0x00000070
++#define CS35L43_NG_DELAY_SHIFT			4
++#define CS35L43_NG_PCM_THLD_MASK		0x00000007
++#define CS35L43_NG_PCM_THLD_SHIFT		0
++
++/* #####################################################*/
++/* Software Values					*/
++/* #####################################################*/
++
++#define CS35L43_MBOX_TYPE_PWR		0x2
++#define CS35L43_MBOX_TYPE_MEM_VAL	0x6
++#define CS35L43_MBOX_TYPE_SYS		0xA
++#define CS35L43_MBOX_TYPE_AUDIO		0xB
++#define CS35L43_MBOX_TYPE_ERROR		0xC
++#define CS35L43_MBOX_TYPE_EVENT		0xD
++#define CS35L43_MBOX_TYPE_WDT		0xE
++
++#define CS35L43_MBOX_MSG_ACK		0x0A000000
++#define CS35L43_MBOX_MSG_AWAKE		0x02000002
++
++#define CS35L43_MBOX_CMD_AUDIO_PLAY	0x0B000001
++#define CS35L43_MBOX_CMD_AUDIO_PAUSE	0x0B000002
++#define CS35L43_MBOX_CMD_AUDIO_REINIT	0x0B000003
++
++#define CS35L43_MBOX_CMD_HIBERNATE		0x02000001
++#define CS35L43_MBOX_CMD_WAKEUP			0x02000002
++#define CS35L43_MBOX_CMD_PREVENT_HIBERNATE	0x02000003
++#define CS35L43_MBOX_CMD_ALLOW_HIBERNATE	0x02000004
++#define CS35L43_MBOX_CMD_SHUTDOWN		0x02000005
++
++#define CS35L43_AUDIO_STATE_READY		0
++#define CS35L43_AUDIO_STATE_WAITING		1
++#define CS35L43_AUDIO_STATE_RUNNING		2
++#define CS35L43_AUDIO_STATE_ERROR		3
++#define CS35L43_AUDIO_STATE_MEM_ERR		4
++#define CS35L43_AUDIO_STATE_HW_ERR		5
++#define CS35L43_AUDIO_STATE_RAMPDOWN		6
++#define CS35L43_AUDIO_STATE_AUX_NG_MUTED	7
++
++#define CS35L43_ALG_ID_MAILBOX		0x5f203
++#define CS35L43_ALG_ID_PM		0x5f206
++
++#define CS35L43_POWER_SEQ_LENGTH			42
++#define CS35L43_POWER_SEQ_MAX_WORDS			129
++#define CS35L43_POWER_SEQ_NUM_OPS			8
++#define CS35L43_POWER_SEQ_OP_MASK			GENMASK(23, 16)
++#define CS35L43_POWER_SEQ_OP_SHIFT			16
++#define CS35L43_POWER_SEQ_OP_WRITE_REG_FULL		0x00
++#define CS35L43_POWER_SEQ_OP_WRITE_REG_FULL_WORDS	3
++#define CS35L43_POWER_SEQ_OP_WRITE_FIELD		0x01
++#define CS35L43_POWER_SEQ_OP_WRITE_FIELD_WORDS		4
++#define CS35L43_POWER_SEQ_OP_WRITE_REG_ADDR8		0x02
++#define CS35L43_POWER_SEQ_OP_WRITE_REG_ADDR8_WORDS	2
++#define CS35L43_POWER_SEQ_OP_WRITE_REG_INCR		0x03
++#define CS35L43_POWER_SEQ_OP_WRITE_REG_INCR_WORDS	2
++#define CS35L43_POWER_SEQ_OP_WRITE_REG_L16		0x04
++#define CS35L43_POWER_SEQ_OP_WRITE_REG_L16_WORDS	2
++#define CS35L43_POWER_SEQ_OP_WRITE_REG_H16		0x05
++#define CS35L43_POWER_SEQ_OP_WRITE_REG_H16_WORDS	2
++#define CS35L43_POWER_SEQ_OP_DELAY			0xFE
++#define CS35L43_POWER_SEQ_OP_DELAY_WORDS		1
++#define CS35L43_POWER_SEQ_OP_END			0xFF
++#define CS35L43_POWER_SEQ_OP_END_WORDS			1
++
++#define CS35L43_SPI_MAX_FREQ_NO_PLL			4000000
+diff --git a/arch/arm64/boot/dts/qcom/sm8550-xiaomi-sheng.dts b/arch/arm64/boot/dts/qcom/sm8550-xiaomi-sheng.dts
+--- a/arch/arm64/boot/dts/qcom/sm8550-xiaomi-sheng.dts
++++ b/arch/arm64/boot/dts/qcom/sm8550-xiaomi-sheng.dts
+@@ -1062,7 +1062,7 @@
+ 		cirrus,vpbr-atk-rate = <0>;
+ 		cirrus,vpbr-wait = <0>;
+ 		cirrus,vpbr-rel-rate = <0>;
+-		cirrus,vpbr-enable = <1>;
++		cirrus,vpbr-enable;
+ 		cirrus,gpio2-src-sel = <4>;
+ 		cirrus,asp-sdout-hiz = <3>;
+ 		cirrus,bst-ipk-ma = <4000>;
+@@ -1083,7 +1083,7 @@
+ 		cirrus,vpbr-atk-rate = <0>;
+ 		cirrus,vpbr-wait = <0>;
+ 		cirrus,vpbr-rel-rate = <0>;
+-		cirrus,vpbr-enable = <1>;
++		cirrus,vpbr-enable;
+ 		cirrus,gpio2-src-sel = <4>;
+ 		cirrus,asp-sdout-hiz = <3>;
+ 		cirrus,bst-ipk-ma = <4000>;
+@@ -1104,7 +1104,7 @@
+ 		cirrus,vpbr-atk-rate = <0>;
+ 		cirrus,vpbr-wait = <0>;
+ 		cirrus,vpbr-rel-rate = <0>;
+-		cirrus,vpbr-enable = <1>;
++		cirrus,vpbr-enable;
+ 		cirrus,gpio2-src-sel = <4>;
+ 		cirrus,asp-sdout-hiz = <3>;
+ 		cirrus,bst-ipk-ma = <4000>;
+@@ -1130,7 +1130,7 @@
+ 		cirrus,vpbr-atk-rate = <0>;
+ 		cirrus,vpbr-wait = <0>;
+ 		cirrus,vpbr-rel-rate = <0>;
+-		cirrus,vpbr-enable = <1>;
++		cirrus,vpbr-enable;
+ 		cirrus,gpio2-src-sel = <4>;
+ 		cirrus,asp-sdout-hiz = <3>;
+ 		cirrus,bst-ipk-ma = <4000>;
+@@ -1151,7 +1151,7 @@
+ 		cirrus,vpbr-atk-rate = <0>;
+ 		cirrus,vpbr-wait = <0>;
+ 		cirrus,vpbr-rel-rate = <0>;
+-		cirrus,vpbr-enable = <1>;
++		cirrus,vpbr-enable;
+ 		cirrus,gpio2-src-sel = <4>;
+ 		cirrus,asp-sdout-hiz = <3>;
+ 		cirrus,bst-ipk-ma = <4000>;
+@@ -1172,7 +1172,7 @@
+ 		cirrus,vpbr-atk-rate = <0>;
+ 		cirrus,vpbr-wait = <0>;
+ 		cirrus,vpbr-rel-rate = <0>;
+-		cirrus,vpbr-enable = <1>;
++		cirrus,vpbr-enable;
+ 		cirrus,gpio2-src-sel = <4>;
+ 		cirrus,asp-sdout-hiz = <3>;
+ 		cirrus,bst-ipk-ma = <4000>;

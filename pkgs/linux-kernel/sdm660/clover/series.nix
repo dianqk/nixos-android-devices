@@ -1,0 +1,30 @@
+[
+  ./patches/7.3/0001-pm660-fuel-gauge-node.patch
+  ./patches/7.3/0002-sdm630-codec-clocks.patch
+  ./patches/7.3/0003-sdm630-lpass-codec.patch
+  ./patches/7.3/0004-pm660l-analog-codec.patch
+  ./patches/7.3/0005-clover-lte-compatible.patch
+  ./patches/7.3/0006-clover-lte-dts.patch
+  ./patches/7.3/0007-pmi8998-fg-binding.patch
+  ./patches/7.3/0008-pmi8998-fg-driver.patch
+  ./patches/7.3/0009-pmi8998-fg-mfd-binding.patch
+  ./patches/7.3/0010-nt51021-binding.patch
+  ./patches/7.3/0011-nt51021-driver.patch
+  ./patches/7.3/0012-sdm660-mss-identity.patch
+  ./patches/7.3/0013-sdm630-sdm660-mdp5-identity.patch
+  ./patches/7.3/0014-qcom-wled-irq-balance.patch
+  ./patches/7.3/0015-ath10k-set-key-response.patch
+  ./patches/7.3/0016-wcn3990-vht-cap.patch
+  ./patches/7.3/0017-qcom-wled-track-initial-irq.patch
+  ./patches/7.3/0018-gpu-rcg-source.patch
+  ./patches/7.3/0019-gpucc-frequency-switch.patch
+  ./patches/7.3/0020-gpu-opp-tables.patch
+  ./patches/7.3/0021-a5xx-speedbins.patch
+  ./patches/7.3/0022-a5xx-supported-hw.patch
+  ./patches/7.3/0023-sdm660-gpu-nominal-cap.patch
+  ./patches/7.3/0024-a5xx-speedbin-error-cleanup.patch
+  ./patches/7.3/0025-gpu-clock-rate-parent-correction.patch
+  ./patches/7.3/0026-sdm630-audio-protection-domain.patch
+  ./patches/7.3/0027-ath10k-persistent-split-amsdu.patch
+  ./patches/7.3/0028-ath10k-split-amsdu-rfc-v3.patch
+]

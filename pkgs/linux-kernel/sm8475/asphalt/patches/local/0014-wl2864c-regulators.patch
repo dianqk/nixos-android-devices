@@ -1,0 +1,142 @@
+Subject: [PATCH] regulator: add WL2864C camera supplies
+
+Register layout and selector equations follow Will Semiconductor WL2864C
+Rev 1.4 (September 2019), sections 8 and 9:
+https://www.ovt.com/wp-content/uploads/2022/09/OV-WL2864C-v2.pdf
+Board control-supply wiring follows Lenovo's released cam_power_dev.c:
+https://github.com/lolipuru/kernel_lenovo_sm8475-modules/tree/0ba8898c
+No vendor driver code is copied; standard regulator regmap operations keep
+each output independently reference counted.
+
+---
+diff --git a/drivers/regulator/Kconfig b/drivers/regulator/Kconfig
+index 89789ac7a..94a0192cf 100644
+--- a/drivers/regulator/Kconfig
++++ b/drivers/regulator/Kconfig
+@@ -1896,4 +1896,11 @@ config REGULATOR_QCOM_LABIBB
+ 	  boost regulator and IBB can be used as a negative boost regulator
+ 	  for LCD display panel.
+ 
++config REGULATOR_WL2864C
++	tristate "Will Semiconductor WL2864C regulators"
++	depends on I2C
++	select REGMAP_I2C
++	help
++	  Seven independently controlled camera supply LDOs.
++
+ endif
+diff --git a/drivers/regulator/Makefile b/drivers/regulator/Makefile
+index 5a764cec8..e943ff3df 100644
+--- a/drivers/regulator/Makefile
++++ b/drivers/regulator/Makefile
+@@ -220,3 +220,5 @@ obj-$(CONFIG_REGULATOR_WM8400) += wm8400-regulator.o
+ obj-$(CONFIG_REGULATOR_WM8994) += wm8994-regulator.o
+ 
+ ccflags-$(CONFIG_REGULATOR_DEBUG) += -DDEBUG
++
++obj-$(CONFIG_REGULATOR_WL2864C) += wl2864c-regulator.o
+diff --git a/drivers/regulator/wl2864c-regulator.c b/drivers/regulator/wl2864c-regulator.c
+new file mode 100644
+index 000000000..0a39c2955
+--- /dev/null
++++ b/drivers/regulator/wl2864c-regulator.c
+@@ -0,0 +1,99 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* WL2864C: register interface from Will Semiconductor datasheet Rev 1.4. */
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/regmap.h>
++#include <linux/regulator/consumer.h>
++#include <linux/regulator/driver.h>
++
++static const struct regulator_ops wl2864c_ops = {
++	.enable = regulator_enable_regmap,
++	.disable = regulator_disable_regmap,
++	.is_enabled = regulator_is_enabled_regmap,
++	.list_voltage = regulator_list_voltage_linear,
++	.map_voltage = regulator_map_voltage_linear,
++	.get_voltage_sel = regulator_get_voltage_sel_regmap,
++	.set_voltage_sel = regulator_set_voltage_sel_regmap,
++};
++#define WL_LDO(n, min)                            \
++	{                                         \
++		.name = "ldo" #n,                 \
++		.of_match = "ldo" #n,             \
++		.regulators_node = "regulators",  \
++		.id = (n) - 1,                    \
++		.ops = &wl2864c_ops,              \
++		.type = REGULATOR_VOLTAGE,        \
++		.owner = THIS_MODULE,             \
++		.n_voltages = (n) < 3 ? 97 : 249, \
++		.min_uV = min,                    \
++		.uV_step = 12500,                 \
++		.vsel_reg = (n) + 2,              \
++		.vsel_mask = 0xff,                \
++		.enable_reg = 0x0e,               \
++		.enable_mask = BIT((n) - 1),      \
++		.enable_time = 1000,              \
++	}
++static const struct regulator_desc wl2864c_desc[] = {
++	WL_LDO(1, 600000),  WL_LDO(2, 600000),	WL_LDO(3, 1200000),
++	WL_LDO(4, 1200000), WL_LDO(5, 1200000), WL_LDO(6, 1200000),
++	WL_LDO(7, 1200000),
++};
++static const struct regmap_config wl2864c_regmap = {
++	.reg_bits = 8,
++	.val_bits = 8,
++	.max_register = 0x0f,
++};
++static int wl2864c_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct regulator_config config = { .dev = dev };
++	static const char *const supplies[] = { "vdd", "vio" };
++	struct regulator_dev *rdev;
++	unsigned int revision;
++	int ret, i;
++
++	/* Keep the control interface powered independently of individual outputs. */
++	ret = devm_regulator_bulk_get_enable(dev, ARRAY_SIZE(supplies),
++					     supplies);
++	if (ret)
++		return dev_err_probe(dev, ret, "control supplies\n");
++	config.regmap = devm_regmap_init_i2c(client, &wl2864c_regmap);
++	if (IS_ERR(config.regmap))
++		return PTR_ERR(config.regmap);
++	ret = regmap_read(config.regmap, 0, &revision);
++	if (ret)
++		return dev_err_probe(dev, ret, "chip revision\n");
++	/* Board-qualified output current limits and active discharge. */
++	ret = regmap_write(config.regmap, 0x01, 0x2f);
++	if (ret)
++		return ret;
++	ret = regmap_write(config.regmap, 0x02, 0);
++	if (ret)
++		return ret;
++	/* Independent software control, as in the board's vendor power driver. */
++	for (i = 0x0a; i <= 0x0e; i++) {
++		ret = regmap_write(config.regmap, i, 0);
++		if (ret)
++			return ret;
++	}
++	for (i = 0; i < ARRAY_SIZE(wl2864c_desc); i++) {
++		rdev = devm_regulator_register(dev, &wl2864c_desc[i], &config);
++		if (IS_ERR(rdev))
++			return dev_err_probe(dev, PTR_ERR(rdev),
++					     "register LDO%d\n", i + 1);
++	}
++	dev_info(dev, "WL2864C revision %#x\n", revision);
++	return 0;
++}
++static const struct of_device_id wl2864c_of_match[] = {
++	{ .compatible = "willsemi,wl2864c" },
++	{}
++};
++MODULE_DEVICE_TABLE(of, wl2864c_of_match);
++static struct i2c_driver wl2864c_driver = {
++	.driver = { .name = "wl2864c", .of_match_table = wl2864c_of_match },
++	.probe = wl2864c_probe,
++};
++module_i2c_driver(wl2864c_driver);
++MODULE_DESCRIPTION("Will Semiconductor WL2864C regulators");
++MODULE_LICENSE("GPL");

@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 29 Sep 2026 17:55:00 +0800
+Subject: [PATCH] backlight: qcom-wled: track initially disabled OVP IRQ
+
+The imported WLED IRQ balance fix tracks IRQ depth during brightness
+changes, but the pre-existing probe path also disables OVP IRQ when the
+module starts off. Record that transition so the first brightness
+change can re-enable it.
+
+Fixes: 5865d04a7b41 ("backlight: qcom-wled: fix unbalanced enable irq")
+Source-Commit: https://github.com/sdm660-mainline/linux/commit/5865d04a7b415e2ab0330089c3d8d34a0d6a9f6f
+Scope: Shared-driver
+Porting notes: Local correction found during 7.3-rc5 migration review; 0014 remains the original source hunk.
+---
+diff --git a/drivers/video/backlight/qcom-wled.c b/drivers/video/backlight/qcom-wled.c
+--- a/drivers/video/backlight/qcom-wled.c
++++ b/drivers/video/backlight/qcom-wled.c
+@@ -1656,8 +1656,10 @@
+ 		return rc;
+ 
+ 	/* Keep OVP irq disabled until module is enabled */
+-	if (!(val & WLED3_CTRL_REG_MOD_EN_MASK))
++	if (!(val & WLED3_CTRL_REG_MOD_EN_MASK)) {
+ 		disable_irq(wled->ovp_irq);
++		wled->ovp_irq_disabled = true;
++	}
+ 
+ 	return 0;
+ }
