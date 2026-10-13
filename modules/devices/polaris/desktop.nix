@@ -7,7 +7,7 @@
 {
   options.hardware.polaris.desktop-switch.enable = lib.mkOption {
     type = lib.types.bool;
-    default = false;
+    default = true;
     description = ''
       Provide desktop-switch to move the active seat session between Phosh
       and Sway. Both compositors run exclusively on tty1: stopping a
