@@ -8,6 +8,9 @@ mod display;
 mod input;
 mod menu;
 mod render;
+#[cfg(not(feature = "recovery-daemon"))]
+compile_error!("the recovery screen is a client of the recovery daemon");
+#[path = "status_daemon.rs"]
 mod status;
 
 #[cfg(test)]

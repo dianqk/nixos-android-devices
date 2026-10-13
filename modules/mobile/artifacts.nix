@@ -26,8 +26,11 @@ let
       kernel = "${kernel}/${android.kernelFile}";
       inherit (android)
         headerVersion
+        osVersion
+        osPatchLevel
         base
         kernelOffset
+        arm64LoadOffset
         ramdiskOffset
         secondOffset
         tagsOffset

@@ -11,6 +11,7 @@ let
     "asphalt"
     "clover"
     "sheng"
+    "aurora"
   ];
   recoveryDevices = devices;
 in
@@ -75,29 +76,40 @@ lib.genAttrs systems (
           "devices.asphalt.boot"
           "devices.asphalt.boot-files"
           "devices.asphalt.bootstrap-info"
-          "devices.asphalt.disabled-dtbo"
+          "devices.asphalt.charger"
           "devices.asphalt.kernel"
           "devices.asphalt.recovery"
+          "devices.asphalt.sensors"
           "devices.asphalt.system"
           "devices.asphalt.u-boot"
+          "devices.aurora.boot"
+          "devices.aurora.boot-files"
+          "devices.aurora.bootstrap-info"
+          "devices.aurora.firmware"
+          "devices.aurora.kernel"
+          "devices.aurora.recovery"
+          "devices.aurora.system"
+          "devices.aurora.touch"
+          "devices.aurora.u-boot"
           "devices.clover.boot"
           "devices.clover.boot-files"
           "devices.clover.boot-kernel"
           "devices.clover.bootstrap-info"
           "devices.clover.kernel"
-          "devices.clover.kernel-mainline"
           "devices.clover.recovery"
           "devices.clover.system"
           "devices.clover.u-boot"
           "devices.polaris.boot"
           "devices.polaris.boot-files"
           "devices.polaris.bootstrap-info"
+          "devices.polaris.charger"
           "devices.polaris.kernel"
           "devices.polaris.minimal.boot-files"
           "devices.polaris.minimal.bootstrap-info"
           "devices.polaris.minimal.rootfs"
           "devices.polaris.minimal.system"
           "devices.polaris.recovery"
+          "devices.polaris.sensors"
           "devices.polaris.system"
           "devices.polaris.u-boot"
           "devices.sheng.boot"
@@ -105,13 +117,19 @@ lib.genAttrs systems (
           "devices.sheng.boot-kernel"
           "devices.sheng.bootstrap-info"
           "devices.sheng.kernel"
-          "devices.sheng.kernel-mainline"
-          "devices.sheng.kernel-testing"
           "devices.sheng.recovery"
           "devices.sheng.system"
           "devices.sheng.u-boot"
+          "fastrpc"
           "kernel-tools"
+          "libva-v4l2"
+          "mink-modem-opener"
+          "minkipc"
+          "mobile-boot-action"
+          "mobile-charger"
+          "mobile-charger-host"
           "mobile-device"
+          "sensor-rotate"
           "usb-signaller"
         ];
       in
@@ -119,14 +137,37 @@ lib.genAttrs systems (
       assert
         builtins.attrNames packages == [
           "android-tools"
+          "fastrpc"
           "kernel-tools"
+          "libva-v4l2"
+          "mink-modem-opener"
+          "minkipc"
+          "mobile-boot-action"
+          "mobile-charger"
+          "mobile-charger-host"
           "mobile-device"
+          "sensor-rotate"
           "usb-signaller"
         ];
       builtins.attrNames allArtifacts;
     outputs = lib.mapAttrs (
       _: p:
-      assert p.system == (if lib.hasSuffix ".system" _ then "aarch64-linux" else buildSystem);
+      # The VA driver and QTEE userspace follow native upstream dependencies;
+      # project device executables and data use the selected compilation/packaging host.
+      assert
+        p.system == (
+          if
+            lib.hasSuffix ".system" _
+            || builtins.elem _ [
+              "libva-v4l2"
+              "minkipc"
+              "mink-modem-opener"
+            ]
+          then
+            "aarch64-linux"
+          else
+            buildSystem
+        );
       {
         inherit (p) drvPath system;
       }
@@ -237,10 +278,14 @@ lib.genAttrs systems (
 
         desktop =
           assert c.users.users.demo.hashedPassword == "";
-          assert !c.services.greetd.enable && c.services.getty.autologinUser == "demo";
+          assert !c.services.greetd.enable && c.services.getty.autologinUser == null;
+          assert lib.hasInfix "--autologin demo" (
+            lib.last c.systemd.services."getty@tty1".serviceConfig.ExecStart
+          );
           assert lib.hasInfix "/dev/tty1" c.programs.bash.loginShellInit;
-          assert lib.hasInfix "dbus-run-session" c.programs.bash.loginShellInit;
-          assert c.programs.sway.enable && c.programs.foot.enable;
+          assert lib.hasInfix "NIRI_CONFIG=/etc/niri/config.kdl" c.programs.bash.loginShellInit;
+          assert lib.hasInfix "/bin/niri-session -l" c.programs.bash.loginShellInit;
+          assert c.programs.niri.enable && !c.programs.sway.enable && c.programs.foot.enable;
           assert
             device != "polaris"
             || lib.all (name: builtins.elem name (map lib.getName c.androidDevices.initrdFirmware)) [
@@ -253,7 +298,24 @@ lib.genAttrs systems (
             || builtins.elem "polaris-multimedia-firmware" (map lib.getName c.environment.systemPackages);
           assert
             device != "polaris" || builtins.elem "/share/uncompressed-firmware" c.environment.pathsToLink;
-          assert lib.hasInfix "output DSI-1 transform 90" c.environment.etc."sway/config".text;
+          assert lib.hasInfix "touch { map-to-output \"DSI-1\"; }" c.environment.etc."niri/config.kdl".text;
+          assert
+            c.example.desktop.scale == (
+              if device == "aurora" then
+                "3"
+              else if
+                builtins.elem device [
+                  "asphalt"
+                  "sheng"
+                ]
+              then
+                "2"
+              else
+                "1"
+            );
+          assert lib.hasInfix ''/bin/wvkbd-mobintl"'' c.environment.etc."niri/config.kdl".text;
+          assert !lib.hasInfix "transform" c.environment.etc."niri/config.kdl".text;
+          assert !lib.hasInfix "mobile-sensor-rotate" c.environment.etc."niri/config.kdl".text;
           assert lib.hasInfix "(maximum + 2) / 4" c.systemd.services."getty@".preStart;
           assert !(builtins.elem "mobile-basic-test" (map lib.getName c.environment.systemPackages));
           assert lib.all (name: builtins.elem name (map lib.getName c.environment.systemPackages)) [
@@ -266,11 +328,10 @@ lib.genAttrs systems (
           assert builtins.elem (lib.getName (mkSystemConfig device).pkgs.fastfetch) (
             map lib.getName c.environment.systemPackages
           );
-          assert lib.hasInfix "for_window [app_id=\"example-terminal\"] fullscreen enable"
-            c.environment.etc."sway/config".text;
+          assert lib.hasInfix "--app-id=example-terminal" c.environment.etc."niri/config.kdl".text;
           {
             session = c.programs.bash.loginShellInit;
-            swayConfig = c.environment.etc."sway/config".text;
+            niriConfig = c.environment.etc."niri/config.kdl".text;
             fastfetch = (mkSystemConfig device).pkgs.fastfetch.drvPath;
           };
       }
@@ -286,17 +347,38 @@ lib.genAttrs systems (
             ];
           }).config;
       in
+      # One kernel per device: recovery uses the installed system's kernel.
+      assert
+        c.androidDevices.kernelPackage.drvPath
+        == (mkSystemConfig device).config.androidDevices.kernelPackage.drvPath;
+      assert
+        c.androidDevices.kernelPackage.drvPath
+        == f.legacyPackages.${buildSystem}.devices.${device}.kernel.drvPath;
       assert !c.boot.loader.systemd-boot.enable;
+      assert
+        c.boot.initrd.systemd.services.mobile-recovery-screen.serviceConfig.ExecStart
+        == "/bin/mobile-recovery-screen";
+      assert !(c.boot.initrd.systemd.contents ? "/etc/mobile-recovery-font.ttf");
+      assert lib.all c.androidDevices.kernelPackage.config.isYes [
+        "VT"
+        "FRAMEBUFFER_CONSOLE"
+        "DRM_FBDEV_EMULATION"
+      ];
       {
-        tools = c.androidDevices.recovery.tools.drvPath;
         utilities = c.system.build.mobileRecoveryUtils.drvPath;
-        help = c.boot.initrd.systemd.contents."/etc/recovery-help".source;
+        contract = builtins.fromJSON c.boot.initrd.systemd.contents."/etc/mobile-recovery.json".text;
         screen = c.boot.initrd.systemd.services.mobile-recovery-screen.serviceConfig.ExecStart;
         ready = c.boot.initrd.systemd.services.mobile-recovery-ready.script;
       }
     );
-    videoPackages = lib.genAttrs [ "asphalt" "polaris" ] (
-      device: (mkSystemConfig device).config.androidDevices.video.ffmpegPackage.drvPath
+    videoPackages = lib.genAttrs devices (
+      device:
+      let
+        system = mkSystemConfig device;
+        ffmpeg = system.config.androidDevices.video.ffmpegPackage;
+      in
+      assert ffmpeg.drvPath == system.pkgs.ffmpeg.drvPath;
+      ffmpeg.drvPath
     );
     optionalSheng = enabledSheng.config.system.build.toplevel.drvPath;
     shengInstalledUsb =

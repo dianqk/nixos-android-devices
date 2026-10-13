@@ -6,25 +6,25 @@
     ./hardware.nix
     ./persistent-core.nix
     ./recovery.nix
+    (lib.mkAliasOptionModule
+      [ "hardware" "clover" "storageRoles" ]
+      [ "androidDevices" "recovery" "daemon" "roles" ]
+    )
+    (lib.mkRenamedOptionModule
+      [ "hardware" "clover" "rootUUID" ]
+      [ "hardware" "clover" "storageRoles" "root" "fsUuid" ]
+    )
+    (lib.mkRemovedOptionModule [ "hardware" "clover" "storageRolesFile" ] ''
+      The Rust recovery daemon reads structured roles. Move this tablet's
+      measured values to hardware.clover.storageRoles.<root|firmware|recovery|misc>.{partuuid,number,offset,bytes}.
+    '')
   ];
 
   options.hardware.clover = {
-    storageRolesFile = lib.mkOption {
-      type = lib.types.path;
-      default = ../../../devices/clover/storage-roles-unconfigured.sh;
-      description = "Verified per-tablet GPT identity contract for recovery operations.";
-    };
     systemHostName = lib.mkOption {
       type = lib.types.strMatching "[a-z0-9][a-z0-9-]*";
       default = "clover";
       description = "Installed Clover system host name accepted by recovery.";
-    };
-    rootUUID = lib.mkOption {
-      type = lib.types.nullOr (
-        lib.types.strMatching "[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
-      );
-      default = null;
-      description = "Optional existing root UUID to preserve when formatting or checking userdata.";
     };
     bluetoothAddress = lib.mkOption {
       type = lib.types.nullOr (lib.types.strMatching "[0-9A-Fa-f:]{17}");

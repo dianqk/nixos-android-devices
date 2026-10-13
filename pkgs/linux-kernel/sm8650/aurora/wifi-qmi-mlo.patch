@@ -1,0 +1,59 @@
+From: Yoni Yang <yoni980807@gmail.com>
+Date: Tue, 29 Sep 2026 17:47:15 +0000
+Subject: [PATCH] wifi: ath12k: advertise Aurora OEM Kiwi-v2 MLO resources
+
+Original source commit f5c689be6e603b259a5a85774d78c9cbd7cfefa4:
+
+Add experimental Xiaomi 14 port with stock ABL boot
+
+Build Houji kernel, userspace and internal boot images from pinned public inputs and bundled stock firmware. Include the guarded installer, device integrations, regression tests and build/flash documentation. Hide the incompatible generic installer on Houji.
+
+The original 0013 patch is a bare diff without separate mail metadata or
+sign-off/review trailers. Author/date/message above come from its source
+commit. Local adaptation: rebase onto 7.3-rc5 and restrict the same resource
+advertisement to Xiaomi Aurora's OEM HMT2.0 firmware. Host MLO enablement,
+ring sizes and other boards retain upstream behavior.
+
+Aurora reaches WMI service-ready but its firmware enters RDDM immediately
+following WMI INIT when QMI host MLO capability is omitted. The vendor
+CNSS2 Kiwi path advertises one chip, links 0/1 and max_mlo_peer=32.
+
+Source: https://github.com/yoni13/armada-houji/blob/f5c689be6e603b259a5a85774d78c9cbd7cfefa4/ports/houji/patches/0013-ath12k-houji-stock-qmi-mlo.patch
+Vendor-reference: https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8650/blob/38d50357db2728300a61b6f757f2d3a09651c155/vendor/qcom/opensource/wlan/platform/cnss2/qmi.c#L275
+---
+--- a/drivers/net/wireless/ath/ath12k/qmi.c
++++ b/drivers/net/wireless/ath/ath12k/qmi.c
+@@ -2290,6 +2290,33 @@
+ 	ret = ath12k_host_cap_parse_mlo(ab, &req);
+ 	if (ret < 0)
+ 		goto out;
++	/* The pinned Xiaomi Kiwi v2 firmware expects the stock CNSS topology.
++	 * Stock CNSS advertises this single-chip topology before WMI INIT.
++	 * The mobile firmware allocates max_mlo_peer - 2 entries even when
++	 * the host does not expose MLO through mac80211.
++	 */
++	if (ab->hw_rev == ATH12K_HW_WCN7850_HW20 &&
++	    of_machine_is_compatible("xiaomi,aurora")) {
++		req.mlo_capable_valid = 1;
++		req.mlo_capable = 1;
++		req.mlo_chip_id_valid = 1;
++		req.mlo_chip_id = 0;
++		req.mlo_group_id_valid = 1;
++		req.mlo_group_id = 0;
++		req.max_mlo_peer_valid = 1;
++		req.max_mlo_peer = 32;
++		req.mlo_num_chips_valid = 1;
++		req.mlo_num_chips = 1;
++		req.mlo_chip_info_valid = 1;
++		memset(req.mlo_chip_info, 0, sizeof(req.mlo_chip_info));
++		req.mlo_chip_info[0].chip_id = 0;
++		req.mlo_chip_info[0].num_local_links = 2;
++		req.mlo_chip_info[0].hw_link_id[0] = 0;
++		req.mlo_chip_info[0].hw_link_id[1] = 1;
++		req.mlo_chip_info[0].valid_mlo_link_id[0] = 1;
++		req.mlo_chip_info[0].valid_mlo_link_id[1] = 1;
++	}
++
+ 
+ 	if (ab->qmi.dynamic_ddr_support) {
+ 		req.dynamic_mem_support_valid = 1;

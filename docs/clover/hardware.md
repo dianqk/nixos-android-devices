@@ -8,7 +8,7 @@
 
 | Area | Adaptation | Status |
 | --- | --- | --- |
-| Boot and storage | SDM660 kernel/DTB, Android boot/recovery, checked eMMC contract, ext4 `userdata` | Configured; first install on another tablet unverified |
+| Boot and storage | SDM660 kernel/DTB, Android boot/recovery, measured eMMC storage roles, ext4 `userdata` | Configured; not boot-tested |
 | Display and input | 8-inch LTE panel, FT5406 touch, recovery keys | Configured |
 | GPU and video | Adreno firmware and kernel drivers | Configured; end-to-end use unverified |
 | USB | NCM/SSH in the system; ACM+NCM/SSH in recovery; optional system ACM | Configured; validate the selected transport on hardware |

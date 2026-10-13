@@ -22,6 +22,14 @@ in
     usb.signaller.address = lib.mkDefault "172.16.43.1/24";
     persistentImage.rootfs.device = lib.mkDefault "/dev/disk/by-partlabel/linux";
     boot = {
+      actions = {
+        reboot = lib.mkDefault true;
+        poweroff = lib.mkDefault true;
+        bootloader = lib.mkDefault true;
+        recovery = lib.mkDefault true;
+        recoveryTarget = lib.mkDefault "slot-b";
+        android = lib.mkDefault true;
+      };
       firmwarePackage = lib.mkDefault (androidPackages.mkUBoot { device = "asphalt"; });
       directKernel.enable = lib.mkDefault false;
       uefi = {
@@ -30,9 +38,7 @@ in
       };
     };
     recovery = {
-      initialInstallAdapter = ../../../devices/asphalt/initial-install.sh;
       targetHostName = board.systemHostName;
-      bootPartitionLabel = "linux-boot";
     };
   };
 }

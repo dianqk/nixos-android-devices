@@ -22,9 +22,6 @@ override them. Omit values you do not use.
 
 ```toml
 serial = "YOUR_FASTBOOT_SERIAL"
-result_file = "/run/YOUR_INITIAL_INSTALL_RESULT"
-boot_image = "YOUR_BOOT_IMAGE_NAME"
-update_program = "YOUR_SYSTEM_UPDATER_NAME"
 target = "YOUR_SSH_HOST"
 ```
 
@@ -43,43 +40,98 @@ mobile-device --serial SERIAL fastboot flash ./recovery.img --partition recovery
 The check parses Android v0-v2 ARM64 boot images and their actual DTB root
 compatible, matches the connected fastboot product, and checks flash capacity.
 It accepts only `boot`/`recovery` on Clover/Polaris, or explicit `boot_b`/`recovery_b`
-with active slot B on Asphalt/Sheng. Recovery images must target the recovery
-partition. DTBO, rootfs, stock/vendor images without a supported DTB, and unknown
+with active slot B on Asphalt/Sheng/Aurora. Recovery images must target the recovery
+partition. Arbitrary DTBO, rootfs, stock/vendor images without a supported DTB, and unknown
 products are outside this command's scope. Image filenames and per-device serial
 allowlists are not used as board identity. Both check and execute validate again;
 only `--execute` sends the final boot/flash command. Size and SHA-256 are printed
 for review; these structural checks do not authenticate an image's publisher.
 
+Some Asphalt OEM bootloaders report the SoC product `taro`. That product alone
+does not identify a tablet. For Asphalt/taro, the CLI accepts the OEM
+`modelname` only when it is exactly `TB320FC`, with an explicit `--serial` matching
+fastboot `serialno`. It rechecks this model, serial, B slot, image and capacity
+on every check and execution. Other nonempty model names are refused, including
+when a recovery identity is supplied. Missing/unsupported modelname can use the
+trusted recovery observation below; malformed responses and transport errors
+are refused. No generic taro product allowlist is used.
+
+For a tablet already verified in independent NixOS RAM recovery, supply a trusted
+device identity JSON record
+with `--device-identity FILE` and an explicit `--serial`:
+
+```json
+{
+  "version": 1,
+  "serial": "YOUR_DEVICE_SERIAL",
+  "product": "taro",
+  "compatible": ["lenovo,asphalt", "qcom,sm8475"],
+  "source": "nixos-ram-recovery",
+  "collected_at": "2026-10-02T08:00:00+00:00",
+  "boot_id": "12345678-1234-1234-1234-123456789abc"
+}
+```
+
+Record the actual complete `/proc/device-tree/compatible` list, serial from
+`/proc/cmdline`, `/proc/sys/kernel/random/boot_id`, collection time and observed
+OEM product after confirming the matching tablet and RAM recovery. Replace all
+example values. This record is a trusted observation, not cryptographic hardware
+authentication; DT compatible originates in the boot image. The supported
+supplement is limited to Asphalt with product `taro`. Both check and execution
+match the explicit serial, record and current fastboot `serialno`, then retain
+the image, B slot, partition and capacity checks. Supplied invalid records are
+always refused.
+
+```sh
+mobile-device --serial YOUR_DEVICE_SERIAL fastboot flash ./u-boot.img \
+  --partition boot_b --device-identity ./device-identity.json
+# Repeat the same command with --execute after reviewing its checked target.
+```
+
+### Asphalt DTBO erase
+
+Asphalt's U-Boot/mainline B boot path requires disabling the stock `dtbo_b`
+overlay. Android/LineageOS installation may restore an incompatible overlay.
+Use this separate, explicit operation only when restoring that B boot path;
+preserve Android A and recovery. No zero image is needed.
+
+The CLI requires `--device asphalt`, live OEM product/modelname `taro`/`TB320FC`,
+an explicit matching serial, active B and exactly 24 MiB `dtbo_b` capacity.
+A recovery identity record cannot substitute for the live model in this operation.
+
+```sh
+mobile-device --serial SERIAL fastboot erase --device asphalt --partition dtbo_b
+# Review the checked target, then repeat with --execute.
+```
+
+Erase accepts no image. Other boards, slots and partition targets are unsupported.
+An erase failure is reported without automatically flashing a replacement image.
+
 ## RAM recovery
 
-Every device exposes `/bin/recovery`; the host tool calls it automatically.
-No command selector or TOML command setting is needed. Configure `target` for SSH.
-All four boards expose [shared `install-initial`](../../docs/initial-install.md),
-using `/run/mobile-initial-install.result` by default. Prepare the empty root and
-FAT boot partition separately; installation does not partition or format storage.
-All EFI recovery updates automatically use `/run/mobile-offline-deploy.result`.
-Follow the matching first-install guide before formatting:
+Every device's recovery runs the Rust recovery daemon and exposes the
+`/bin/recovery` client; the host tool calls it automatically and refuses a
+recovery without the daemon protocol. Configure `target` for SSH.
+All five boards expose [shared `install-initial`](../../docs/initial-install.md).
+Prepare the empty root and FAT boot partition separately; installation does not
+partition or format storage. Follow the matching first-install guide before
+formatting:
 [Asphalt](../../docs/asphalt/first-install.md),
 [Polaris](../../docs/polaris/first-install.md),
 [Sheng](../../docs/sheng/first-install.md),
+[Aurora](../../docs/aurora/README.md),
 [Clover](../../docs/clover/first-install.md).
-Polaris uses `format-userdata`; the other three devices use `format-root`.
 
-Polaris additionally uses physical `system` as FAT32 `/boot`. After preparing
-ext4 userdata, check `recovery prepare-boot`, then explicitly run
-`recovery prepare-boot --execute`. For an existing system, the complete Nix
-store must reside on userdata before repurposing system. GPT geometry is unchanged.
+Single-slot Polaris and Clover use physical `system` as FAT32 `/boot`. After
+`format-root`, check `recovery prepare-boot`, then explicitly run
+`recovery prepare-boot --execute`. GPT geometry is unchanged.
 
 ```sh
 mobile-device --config device.toml recovery status
 mobile-device --config device.toml recovery reboot system
 mobile-device --config device.toml recovery reboot system --execute
 
-# Only for a first installation: explicit ext4 format of existing userdata.
-mobile-device --config device.toml recovery format-userdata
-mobile-device --config device.toml recovery format-userdata --execute
-
-# For Y700 2023, Sheng, and Clover LTE, after checking the device guide.
+# Only for a first installation, after checking the device guide.
 mobile-device --config device.toml recovery format-root
 mobile-device --config device.toml recovery format-root --execute
 
@@ -92,47 +144,26 @@ mobile-device --config device.toml recovery install-initial /nix/store/...-nixos
 # Update an installed system.
 mobile-device --config device.toml recovery deploy /nix/store/...-nixos-system-device-version
 mobile-device --config device.toml recovery deploy /nix/store/...-nixos-system-device-version --execute
-
-# Optional Nix daemon socket copy with progress on the recovery screen.
-mobile-device --config device.toml recovery copy /nix/store/...-nixos-system-device-version
 ```
 
-For an installed system that needs a device-specific recovery request script:
+To enter recovery from an installed system, choose **Reboot to recovery** in
+the systemd-boot menu.
+
+Update a firmware or recovery image with the checked daemon operations:
 
 ```sh
-mobile-device recovery --target HOST enter \
-  --script ./request-recovery.sh \
-  --support-script ./storage-roles.sh --support-env STORAGE_ROLES
-mobile-device recovery --target HOST enter \
-  --script ./request-recovery.sh \
-  --support-script ./storage-roles.sh --support-env STORAGE_ROLES --execute
+mobile-device recovery --target HOST install-image ./recovery.img \
+  --partition /dev/disk/by-partlabel/recovery_b
+mobile-device recovery --target HOST install-image ./recovery.img \
+  --partition /dev/disk/by-partlabel/recovery_b --execute
 ```
 
-The script must accept `--check` and `--execute`. The support environment
-variable name is supplied by the caller; Polaris' scripts use
-`POLARIS_STORAGE_ROLES`.
+`--partition` is the `/dev/disk/by-partlabel/` path of `boot` or `recovery`
+(`boot_b`/`recovery_b` on A/B devices). The
+daemon validates the image identity, size and target before writing and reads
+it back.
 
-For a recovery image installer already supplied by the repository, use
-`recovery install-image IMAGE --installer SCRIPT --partition DEVICE_PATH`
-with the same optional `--support-script` and `--support-env` pair. The host
-calls the installer's `--check` or `--execute` mode. The installer must accept
-`MODE IMAGE IMAGE_SHA256 OLD_PARTITION_SHA256`.
-
-## Installed system update
-
-Supply a built NixOS system and the updater/boot-image names inside it. If the
-connection drops during an update, inspect the updater's systemd journal on
-the device.
-
-```sh
-mobile-device --config device.toml system update /nix/store/...-nixos-system-device-version
-mobile-device --config device.toml system update /nix/store/...-nixos-system-device-version --execute
-mobile-device --config device.toml system --via ssh update /nix/store/...-nixos-system-device-version --execute
-```
-
-Without a config, add `--boot-image NAME --update-program NAME` after the
-system path, and `--target HOST` before `update` for SSH. The default systemd
-unit is `mobile-device-update`; use `--unit NAME` for another update service.
+## Installed system scripts
 
 Run device-specific cleanup or diagnostics scripts through the same transport:
 

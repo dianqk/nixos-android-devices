@@ -1,4 +1,5 @@
 {
+  bootActionProfile = "qcom-ab";
   deviceTree = "qcom/sm8550-xiaomi-sheng";
   patches = [
     ../patches/0001-pm8550b-repeater.patch

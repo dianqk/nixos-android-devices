@@ -1,0 +1,30 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 04 Oct 2026 15:37:45 +0800
+Subject: [PATCH] arm64: dts: qcom: allow two Polaris SLPI FastRPC sessions
+
+The sensor listener keeps one FastRPC descriptor for coherent rpcmem
+allocation and opens a separate descriptor for its sensor-PD transport.
+The inherited SDM845 context bank defaults to a single session, so the
+second open fails with EBUSY. Sensor initialization never completes and
+the firmware watchdog eventually restarts SLPI.
+
+Allow both connections to share Polaris's existing SID 0 context bank
+using the existing qcom,nsessions binding. SSC clients use QRTR and do
+not need additional FastRPC sessions.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+
+--- a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-polaris.dts
++++ b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-polaris.dts
+@@ -6,6 +6,11 @@
+ 	glink-edge {
+ 		fastrpc {
+ 			qcom,protection-domain = "tms/servreg", "msm/slpi/sensor_pd";
++
++			compute-cb@0 {
++				/* Separate coherent allocator and sensor RPC connections. */
++				qcom,nsessions = <2>;
++			};
+ 		};
+ 	};
+ };

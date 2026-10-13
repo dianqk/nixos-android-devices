@@ -19,8 +19,11 @@
   maximumBytes ? null,
   avbFooter ? null,
   headerVersion ? 0,
+  osVersion ? null,
+  osPatchLevel ? null,
   dtbPlacement ? "append-to-kernel",
   dtbOffset ? "0x00000000",
+  arm64LoadOffset ? null,
 }:
 assert lib.assertMsg (
   dtbPlacement != "boot-image" || headerVersion == 2
@@ -30,22 +33,31 @@ assert lib.assertMsg (
 ) "Android boot-image DTB placement requires at least one DTB";
 runCommand name
   {
-    nativeBuildInputs = [ buildPackages.android-tools ];
+    nativeBuildInputs = [
+      buildPackages.android-tools
+    ]
+    ++ lib.optional (arm64LoadOffset != null) buildPackages.python3;
   }
   ''
     kernel_image="$TMPDIR/kernel-with-dtbs"
+    source_kernel=${kernel}
+    ${lib.optionalString (arm64LoadOffset != null) ''
+      source_kernel="$TMPDIR/aligned-kernel"
+      python3 ${./arm64-boot-wrapper.py} --load-offset ${toString arm64LoadOffset} \
+        ${kernel} "$source_kernel"
+    ''}
     dtb_args=()
     ${
       if dtbPlacement == "boot-image" then
         ''
-          cp ${kernel} "$kernel_image"
+          cp "$source_kernel" "$kernel_image"
           dtb_image="$TMPDIR/dtbs"
           cat ${lib.escapeShellArgs dtbs} > "$dtb_image"
           dtb_args=(--dtb "$dtb_image" --dtb_offset ${dtbOffset})
         ''
       else
         ''
-          cat ${kernel} ${lib.escapeShellArgs dtbs} > "$kernel_image"
+          cat "$source_kernel" ${lib.escapeShellArgs dtbs} > "$kernel_image"
         ''
     }
     header_args=(
@@ -60,7 +72,9 @@ runCommand name
     )
     mkbootimg "''${header_args[@]}" \
       "''${dtb_args[@]}" \
-      --header_version ${toString headerVersion} \
+      ${lib.optionalString (osVersion != null) "--os_version ${lib.escapeShellArg osVersion} "}${
+        lib.optionalString (osPatchLevel != null) "--os_patch_level ${lib.escapeShellArg osPatchLevel} "
+      }--header_version ${toString headerVersion} \
       --kernel "$kernel_image" \
       --ramdisk ${initrd} \
       --cmdline ${lib.escapeShellArg cmdline} \

@@ -2,7 +2,11 @@
 flake.inputs.nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ] (
   buildSystem:
   let
-    env = flake.lib.mkBuildEnvironment { inherit buildSystem; };
+    env = flake.lib.mkBuildEnvironment {
+      inherit buildSystem;
+      # The example enables the proprietary Asphalt sensor data.
+      config.allowUnfree = true;
+    };
     make =
       example:
       env.nixosSystem {

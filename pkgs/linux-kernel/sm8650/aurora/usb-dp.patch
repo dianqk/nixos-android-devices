@@ -1,0 +1,116 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 7 Oct 2026 23:20:00 +0800
+Subject: [PATCH] arm64: dts: qcom: aurora: connect USB SuperSpeed and DP mux
+
+Wire the connector's SuperSpeed and SBU endpoints using Android 14 Aurora
+board data: WCD9395 USBSS on QUP1 SE3 address 0x0e, reset GPIO152 and L15B.
+Read the OEM GPIO29 port-select signal for cable orientation.
+Correct swapped QMP supply references (L3G PHY, L3I PLL), enable DP0 and
+allow 5-Gbit USB operation. Keep analog headset routing separate from this
+USB/DP change.
+
+References:
+https://github.com/MiCode/Xiaomi_Kernel_OpenSource/tree/c7841217725ac8bed6c4bf790d149dde10444e3d
+https://github.com/torvalds/linux/blob/v7.3-rc5/arch/arm64/boot/dts/qcom/sm8650-hdk.dts
+https://github.com/torvalds/linux/blob/v7.3-rc5/Documentation/devicetree/bindings/usb/qcom,wcd939x-usbss.yaml
+
+Local board integration, not an imported upstream patch.
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+--- a/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
++++ b/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
+@@ -36,6 +36,7 @@
+ 			     "qcom,pmic-glink";
+ 		#address-cells = <1>;
+ 		#size-cells = <0>;
++		orientation-gpios = <&tlmm 29 GPIO_ACTIVE_HIGH>;
+ 
+ 		connector@0 {
+ 			compatible = "usb-c-connector";
+@@ -43,9 +44,27 @@
+ 			power-role = "dual";
+ 			data-role = "dual";
+ 
+-			port {
+-				pmic_glink_hs_in: endpoint {
+-					remote-endpoint = <&usb_1_dwc3_hs>;
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					pmic_glink_hs_in: endpoint {
++						remote-endpoint = <&usb_1_dwc3_hs>;
++					};
++				};
++				port@1 {
++					reg = <1>;
++					pmic_glink_ss_in: endpoint {
++						remote-endpoint = <&usb_dp_qmpphy_out>;
++					};
++				};
++				port@2 {
++					reg = <2>;
++					pmic_glink_sbu: endpoint {
++						remote-endpoint = <&wcd_usbss_sbu_mux>;
++					};
+ 				};
+ 			};
+ 		};
+@@ -146,15 +165,15 @@
+ 	status = "okay";
+ };
+ &usb_dp_qmpphy {
+-	vdda-phy-supply = <&vreg_l3i>;
+-	vdda-pll-supply = <&vreg_l3g>;
++	vdda-phy-supply = <&vreg_l3g>;
++	vdda-pll-supply = <&vreg_l3i>;
+ 	status = "okay";
+ };
+ &usb_1 {
+ 	dr_mode = "otg";
+ 	usb-role-switch;
+ 	role-switch-default-mode = "peripheral";
+-	maximum-speed = "high-speed";
++	maximum-speed = "super-speed";
+ 	status = "okay";
+ };
+ 
+@@ -800,3 +819,36 @@
+ 		input-enable;
+ 	};
+ };
++
++/* Android 14: WCD9395 USBSS at QUP1 SE3, GPIO152 reset, L15B 1.8 V. */
++&i2c3 {
++	clock-frequency = <400000>;
++	status = "okay";
++
++	wcd_usbss: typec-mux@e {
++		compatible = "qcom,wcd9395-usbss", "qcom,wcd9390-usbss";
++		reg = <0xe>;
++		vdd-supply = <&vreg_l15b>;
++		reset-gpios = <&tlmm 152 GPIO_ACTIVE_HIGH>;
++		mode-switch;
++		orientation-switch;
++		ports {
++			#address-cells = <1>;
++			#size-cells = <0>;
++			port@0 {
++				reg = <0>;
++				wcd_usbss_sbu_mux: endpoint {
++					remote-endpoint = <&pmic_glink_sbu>;
++				};
++			};
++		};
++	};
++};
++
++&usb_dp_qmpphy_out {
++	remote-endpoint = <&pmic_glink_ss_in>;
++};
++
++&mdss_dp0 {
++	status = "okay";
++};

@@ -1,0 +1,59 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Thu, 8 Oct 2026 05:00:00 +0800
+Subject: [PATCH] power: supply: publish events across firmware readiness
+
+A udev coldplug trigger can reach Qualcomm battery supplies before GLINK
+is ready. Their property getters correctly return EAGAIN; however, the
+uevent builder aborts the entire event, losing even supply identity and
+type and printing synthetic uevent errors.
+
+Skip temporarily unavailable properties only while composing the event.
+Direct sysfs reads retain EAGAIN. Once Qualcomm firmware acknowledges
+notification registration, publish a change for each registered supply
+so userspace receives the complete initial state even without an unrelated
+charger notification. Do not manufacture zero capacity or online values.
+Other errors still propagate. This is a local change, not an upstream patch.
+
+Reference: https://github.com/torvalds/linux/blob/v7.3-rc5/drivers/power/supply/qcom_battmgr.c
+Signed-off-by: dianqk <dianqk@dianqk.net>
+--- a/drivers/power/supply/power_supply_sysfs.c
++++ b/drivers/power/supply/power_supply_sysfs.c
+@@ -543,10 +543,12 @@
+ 	dev_attr = &pwr_attr->dev_attr;
+ 
+ 	ret = power_supply_format_property((struct device *)dev, true, dev_attr, prop_buf);
+-	if (ret == -ENODEV || ret == -ENODATA || ret == -EINVAL) {
++	if (ret == -ENODEV || ret == -ENODATA || ret == -EINVAL || ret == -EAGAIN) {
+ 		/*
+ 		 * When a battery is absent, we expect -ENODEV. Don't abort;
+-		 * send the uevent with at least the PRESENT=0 property
++		 * send the uevent with at least the PRESENT=0 property.
++		 * Firmware-backed supplies can also be temporarily unavailable;
++		 * omit those properties until the driver signals fresh data.
+ 		 */
+ 		return 0;
+ 	}
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -1628,8 +1628,20 @@
+ 	mutex_lock(&battmgr->lock);
+ 	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
+ 	mutex_unlock(&battmgr->lock);
+-	if (ret)
++	if (ret) {
+ 		dev_err(battmgr->dev, "failed to request power notifications\n");
++		return;
++	}
++
++	/* Replay initial properties that were unavailable before GLINK came up. */
++	if (battmgr->bat_psy)
++		power_supply_changed(battmgr->bat_psy);
++	if (battmgr->usb_psy)
++		power_supply_changed(battmgr->usb_psy);
++	if (battmgr->wls_psy)
++		power_supply_changed(battmgr->wls_psy);
++	if (battmgr->ac_psy)
++		power_supply_changed(battmgr->ac_psy);
+ }
+ 
+ static void qcom_battmgr_pdr_notify(void *priv, int state)

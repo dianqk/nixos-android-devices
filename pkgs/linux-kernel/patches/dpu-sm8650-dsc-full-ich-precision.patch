@@ -1,0 +1,95 @@
+From c34851380696717874435ca4c6d67c6271f01a91 Mon Sep 17 00:00:00 2001
+From: Nilaan Gunabalachandran <quic_ngunabal@quicinc.com>
+Date: Mon, 18 Jul 2022 17:08:25 -0400
+Subject: [PATCH] disp: msm: sde: enable dsc full ICH error precision
+
+This feature enables using all available bits when ICH
+error calculations are made. This improves precision and
+image quality when there are more than 8 bits per component.
+
+Change-Id: I851f05418283d0e731332d4069e3b6e57487b9a3
+Signed-off-by: Nilaan Gunabalachandran <quic_ngunabal@quicinc.com>
+Link: https://github.com/yaap/kernel_oneplus_sm8650-modules/commit/c34851380696717874435ca4c6d67c6271f01a91
+Reference: https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8650/blob/38d50357db2728300a61b6f757f2d3a09651c155/vendor/qcom/opensource/display-drivers/msm/sde/sde_hw_catalog.c
+
+Local adaptation for upstream DPU:
+- Preserve the original author, date, message and trailers above.
+- Express the hardware feature in the static SM8650 DSC catalog instead of
+  the downstream runtime major-version check. Older SoC catalogs are unchanged.
+- Use the upstream DRM DSC structure and DPU register API. Only ENC_DF_CTRL
+  bit 12 changes for >8-bpc input; panel commands, PPS and 8-bpc paths do not.
+
+---
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/catalog/dpu_10_0_sm8650.h b/drivers/gpu/drm/msm/disp/dpu1/catalog/dpu_10_0_sm8650.h
+index 2eef5f698..476cf8849 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/catalog/dpu_10_0_sm8650.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/catalog/dpu_10_0_sm8650.h
+@@ -286,30 +286,32 @@ static const struct dpu_dsc_cfg sm8650_dsc[] = {
+ 	{
+ 		.name = "dce_0_0", .id = DSC_0,
+ 		.base = 0x80000, .len = 0x6,
+-		.features = BIT(DPU_DSC_NATIVE_42x_EN),
++		.features = BIT(DPU_DSC_NATIVE_42x_EN) | BIT(DPU_DSC_FULL_ICH_PREC),
+ 		.sblk = &dsc_sblk_0,
+ 	}, {
+ 		.name = "dce_0_1", .id = DSC_1,
+ 		.base = 0x80000, .len = 0x6,
+-		.features = BIT(DPU_DSC_NATIVE_42x_EN),
++		.features = BIT(DPU_DSC_NATIVE_42x_EN) | BIT(DPU_DSC_FULL_ICH_PREC),
+ 		.sblk = &dsc_sblk_1,
+ 	}, {
+ 		.name = "dce_1_0", .id = DSC_2,
+ 		.base = 0x81000, .len = 0x6,
+-		.features = BIT(DPU_DSC_NATIVE_42x_EN),
++		.features = BIT(DPU_DSC_NATIVE_42x_EN) | BIT(DPU_DSC_FULL_ICH_PREC),
+ 		.sblk = &dsc_sblk_0,
+ 	}, {
+ 		.name = "dce_1_1", .id = DSC_3,
+ 		.base = 0x81000, .len = 0x6,
+-		.features = BIT(DPU_DSC_NATIVE_42x_EN),
++		.features = BIT(DPU_DSC_NATIVE_42x_EN) | BIT(DPU_DSC_FULL_ICH_PREC),
+ 		.sblk = &dsc_sblk_1,
+ 	}, {
+ 		.name = "dce_2_0", .id = DSC_4,
+ 		.base = 0x82000, .len = 0x6,
++		.features = BIT(DPU_DSC_FULL_ICH_PREC),
+ 		.sblk = &dsc_sblk_0,
+ 	}, {
+ 		.name = "dce_2_1", .id = DSC_5,
+ 		.base = 0x82000, .len = 0x6,
++		.features = BIT(DPU_DSC_FULL_ICH_PREC),
+ 		.sblk = &dsc_sblk_1,
+ 	},
+ };
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_catalog.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_catalog.h
+index f45faf873..4714be1f4 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_catalog.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_catalog.h
+@@ -143,10 +143,12 @@ enum {
+ /**
+  * DSC sub-blocks/features
+  * @DPU_DSC_NATIVE_42x_EN     Supports NATIVE_422_EN and NATIVE_420_EN encoding
++ * @DPU_DSC_FULL_ICH_PREC     Supports full ICH precision for >8-bpc input
+  * @DPU_DSC_MAX
+  */
+ enum {
+ 	DPU_DSC_NATIVE_42x_EN = 0x1,
++	DPU_DSC_FULL_ICH_PREC,
+ 	DPU_DSC_MAX
+ };
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc_1_2.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc_1_2.c
+index b3395e9c3..7fb203964 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc_1_2.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc_1_2.c
+@@ -124,6 +124,10 @@ static void dpu_hw_dsc_config_1_2(struct dpu_hw_dsc *hw_dsc,
+ 
+ 	data |= (_dsc_calc_output_buf_max_addr(hw_dsc, num_active_slice_per_enc) << 18);
+ 
++	if ((hw_dsc->caps->features & BIT(DPU_DSC_FULL_ICH_PREC)) &&
++	    dsc->bits_per_component > 8)
++		data |= BIT(12);
++
+ 	DPU_REG_WRITE(hw, sblk->enc.base + ENC_DF_CTRL, data);
+ 
+ 	data = (dsc->dsc_version_minor & 0xf) << 28;

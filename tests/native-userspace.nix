@@ -32,19 +32,33 @@ lib.genAttrs systems (
     p = env.pkgs.androidDevicePackages;
   in
   {
-    upstream = lib.genAttrs [ "bash" "coreutils" "systemd" "glibc" "sway" "foot" ] (
-      name:
-      assert env.pkgs.${name}.drvPath == upstream.${name}.drvPath;
-      check "aarch64-linux" env.pkgs.${name}
-    );
+    upstream =
+      lib.genAttrs
+        [
+          "bash"
+          "coreutils"
+          "systemd"
+          "glibc"
+          "niri"
+          "foot"
+          "ffmpeg"
+          "mpv-unwrapped"
+          "celluloid"
+        ]
+        (
+          name:
+          assert env.pkgs.${name}.drvPath == upstream.${name}.drvPath;
+          check "aarch64-linux" env.pkgs.${name}
+        );
     compiled = lib.genAttrs [
       "usb-signaller"
+      "mobile-boot-action"
       "libcamera"
       "pd-mapper"
       "umtp-responder"
       "mobile-tqftpserv"
     ] (name: check buildSystem p.${name});
-    devices = lib.genAttrs [ "polaris" "asphalt" "clover" "sheng" ] (
+    devices = lib.genAttrs [ "polaris" "asphalt" "clover" "sheng" "aurora" ] (
       device:
       let
         n = env.nixosSystem {
@@ -67,7 +81,7 @@ lib.genAttrs systems (
         uboot = check buildSystem boot.firmware;
         image = check buildSystem boot;
         screen = check buildSystem recovery.config.androidDevices.recovery.screenPackage;
-        tools = check buildSystem recovery.config.androidDevices.recovery.tools;
+        tools = check buildSystem recovery.config.system.build.mobileRecoveryUtils;
         bash =
           assert n.pkgs.bash.drvPath == native.bash.drvPath;
           check "aarch64-linux" n.pkgs.bash;

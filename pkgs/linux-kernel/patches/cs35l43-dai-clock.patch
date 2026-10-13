@@ -1,0 +1,28 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 7 Oct 2026 17:00:00 +0800
+Subject: [PATCH] ASoC: cs35l43: configure the PLL for DAI set_sysclk
+
+The shared Qualcomm TDM machine code calls the DAI clock operation, which
+previously returned success without configuring the amplifier. Forward it
+to the existing component operation, preserving the clock ID and frequency.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+diff --git a/sound/soc/codecs/cs35l43.c b/sound/soc/codecs/cs35l43.c
+index 5de478678..fab65f100 100644
+--- a/sound/soc/codecs/cs35l43.c
++++ b/sound/soc/codecs/cs35l43.c
+@@ -2181,12 +2181,7 @@ static int cs35l43_component_set_sysclk(struct snd_soc_component *component,
+ static int cs35l43_dai_set_sysclk(struct snd_soc_dai *dai,
+ 					int clk_id, unsigned int freq, int dir)
+ {
+-	struct cs35l43_private *cs35l43 =
+-				snd_soc_component_get_drvdata(dai->component);
+-
+-	dev_dbg(cs35l43->dev, "%s\n", __func__);
+-
+-	return 0;
++	return cs35l43_component_set_sysclk(dai->component, clk_id, 0, freq, dir);
+ }
+ 
+ static int cs35l43_component_write(struct snd_soc_component *component,

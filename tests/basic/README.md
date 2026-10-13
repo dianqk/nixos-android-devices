@@ -1,6 +1,6 @@
 # Basic hardware test
 
-Run on the host with Python 3 and OpenSSH; the example needs root SSH and a running Sway session:
+Run on the host with Python 3 and OpenSSH; the example needs root SSH and a running Niri session:
 
 ```sh
 python3 tests/basic/run.py --ssh DEVICE_HOST --media tmp/basic-media --output tmp/basic-results
@@ -26,7 +26,7 @@ logs and `results.json` stay on the host. Exit codes: 0 = selected tests passed,
 
 | Test | Checks |
 | --- | --- |
-| `display` | Sway output, resolution, refresh, scale, rotation, DRM connector/modes and backlight information. Physical visibility needs a separate screenshot and camera check. |
+| `display` | Niri output, resolution, refresh, scale, rotation, DRM connector/modes and backlight information. Physical visibility needs a separate screenshot and camera check. |
 | `wifi` | One fresh Wi-Fi scan; no connection. |
 | `bluetooth` | 15-second discovery of nearby devices; no pairing or connection. |
 | `audio` | Kernel ALSA sound card and physical PCM device nodes; no playback or recording. This does not verify sound or an inserted jack. |

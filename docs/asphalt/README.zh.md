@@ -6,6 +6,12 @@
 
 ## 配置与安装
 
+首次安装先准备 **ROW 版 ZUI 17.0.339（Android 15）底包**。具体版本与核对命令见
+[Android 底包说明](first-install.zh.md#安装前的-android-底包)，其中区分了
+联想底包与适配时运行的 Android 16 GSI。
+若 Android 替换了已有 NixOS 的启动路径，按[启动恢复](first-install.zh.md#恢复已有-efi-安装)
+保留 root/ESP 和数据，不要重新执行首次安装的破坏性准备。
+
 1. 按[配置指南](../configuration.zh.md)创建自己的 flake，将 `lib.mkSystem` 的
    `device` 设置为 `"asphalt"`，或导入 `nixosModules.asphalt`。
 2. 在已安装系统配置中填写下方设置，与独立 recovery 配置共享设备和存储身份；
@@ -25,21 +31,27 @@
 
 可选的身份文件是构建输入。Wi-Fi 文件保存出厂 MAC；蓝牙文件保存控制器字节序的
 Qualcomm NVM 地址，服务会转换为 BlueZ 使用的顺序。recovery 不运行这些身份服务。
-根文件系统位于独立的物理 `linux` 分区，不在 super 中。B 槽启动成功确认尚未自动化，
-依赖多次重启前请阅读[硬件限制](hardware.zh.md)。
+根文件系统位于独立的物理 `linux` 分区，不在 super 中。当前 U-Boot 在经验证的
+EFI 加载后确认 B 槽成功，这不是 Linux 健康检查。详见[硬件限制](hardware.zh.md)。
 
 Asphalt 已验证 U-Boot/EFI 启动、代际更新与回退。
 使用独立 1 GiB FAT `linux-boot` ESP 和 ext4 `linux`，固件位于 `boot_b`，保留 A 和 super。
 尚需手动完成的准备步骤见[安装准备](first-install.zh.md)。
 
+恢复 U-Boot/mainline B 启动路径时，需要擦除 `dtbo_b` 以禁用原厂 overlay；安装
+Android/LineageOS 可能恢复不兼容的 overlay。使用[显式检查的 DTBO 擦除](../../pkgs/mobile-device/README.zh.md#asphalt-dtbo-擦除)，
+保留 A 与 recovery，不把该操作作为普通系统更新的自动步骤。
+
 ## 使用与排障
+
+支持的启动路径见 [Android/U-Boot 兼容范围与 A/B 限制](../android-uboot-compatibility.zh.md)。
 
 自己的消费 flake 可构建 `.#system`、`.#bootstrap-info` 和 `.#recovery`；
 仓库演示产物使用 `.#devices.asphalt.<role>`，如 `.#devices.asphalt.system`。使用 `lib.mkArtifacts` 得到与配置匹配的产物，
 详见[产物说明](../configuration.zh.md#选择构建产物)。
 
-- 日常系统更新：[USB SSH](../usb-signaller.md)。
-- 启动失败与离线更新：[RAM recovery](../recovery.md)。
+- 日常系统更新：[USB SSH](../usb-signaller.zh.md)。
+- 启动失败与离线更新：[RAM recovery](../recovery.zh.md)。
 - Wi-Fi、音频、显示等支持程度：[硬件参考](hardware.zh.md)。
 - 构建/求值问题：[配置排障](../configuration.zh.md#更新恢复与排障)。
 - 相机命令与限制：[相机](hardware.zh.md#相机)。

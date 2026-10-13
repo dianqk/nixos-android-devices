@@ -1,19 +1,35 @@
 # 设备内核配置
 
-Polaris、Asphalt 和 Clover 默认使用 Nixpkgs Linux 7.3-rc5 及对应的有序补丁集。
-Sheng 的 7.3 版本在实机上无法初始化 Wi-Fi，因此默认使用固定版本的 Linux 7.2.6
-分支源码；`kernel-testing` 保留 Sheng 的 7.3 补丁集。Sheng 的 `kernel-mainline`
-是默认内核的别名；Clover 的 `kernel-mainline` 仍是单独的固定 7.2.3 回退包。
+每款设备只有一个内核 `devices.<device>.kernel`：锁定 Nixpkgs 输入提供的版本
+（`linuxPackages_testing`，当前为 7.3-rc6）加上该设备的有序补丁集。已安装系统与
+RAM recovery 使用同一内核，不保留固定版本或回退内核。构建平台由包输出选择：
+`x86_64-linux` 下全部交叉编译为 AArch64（只有 x86_64 机器也可构建），`aarch64-linux`
+下原生构建。同一构建平台内，设备的 system、recovery 和 `kernel` 输出共用同一内核
+derivation，平台求值检查会对两个平台验证这一点。
+
+所有补丁集都以 [`default.nix`](default.nix) 中的 `expectedVersion` 为目标。Nixpkgs
+升级到其他版本后，求值会报错并提示移植：将所有设备的补丁集移植到新版本（见
+[开发指南](../../docs/development.zh.md#kernel-patch-queues)）并更新 `expectedVersion`。
+`patchQueueStatus` 为工具提供 `expectedVersion` 和 `evaluatedVersion`。求值成功不代表
+构建或部署验证。
 配置按以下顺序叠加：
 
 1. 设备提交的 `configfile`。
-2. [通用裁剪](config/common.nix)。
+2. [共享能力与通用裁剪](config/common.nix)。
 3. SoC 的 `config.nix`。
 4. 设备定义中的 `configOverrides`。
 
 覆盖值使用 `lib.kernel.yes`、`module` 或 `no`。共享策略放在通用层，芯片需求
 放在 SoC 层，板级例外放在设备定义中。`olddefconfig` 解析依赖；`postConfigure`
-在编译前核对最终启用的 `PINCTRL` 符号。
+在编译前核对所有覆盖值及最终启用的 `PINCTRL` 符号。
+
+## nftables 支持
+
+所有 SoC 和内核变体均包含共享的 [nftables 配置](config/nftables.nix)。
+IPv4/IPv6、inet、ARP、bridge、netdev 表，以及连接跟踪、NAT/重定向、NFQUEUE、
+FIB 查询、socket 匹配、透明代理、日志、限速、集合与映射（nf_tables 核心能力）
+和流卸载支持均内建到内核，覆盖 TUN 自动重定向所需的内核能力。
+开启这些能力不会安装防火墙规则或启用代理服务。
 
 ## 外设与 pinctrl 策略
 

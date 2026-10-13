@@ -10,6 +10,17 @@ let
   wifiMacConfig = androidPackages.packaging.runCommand "asphalt-wifi-mac.conf" { } ''
     printf '[connection]\nwifi.cloned-mac-address=%s\n' "$(cat ${cfg.wifiAddressFile})" > "$out"
   '';
+  # NetworkManager ignores cloned-mac-address with its IWD backend, and IWD
+  # keeps the kernel interface, so udev must set the address when wlan0 appears.
+  # The 10- prefix takes precedence over IWD's 80-iwd.link, so keep its name policy.
+  wifiMacLink = androidPackages.packaging.runCommand "asphalt-wifi.link" { } ''
+    address=$(tr -d '[:space:]' < ${cfg.wifiAddressFile})
+    if ! [[ $address =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]]; then
+      echo "invalid Wi-Fi address in ${cfg.wifiAddressFile}" >&2
+      exit 1
+    fi
+    printf '[Match]\nPath=platform-1c00000.pcie-pci-0000:01:00.0\n\n[Link]\nMACAddressPolicy=none\nMACAddress=%s\nNamePolicy=keep kernel\n' "$address" > "$out"
+  '';
 in
 {
   options.hardware.asphalt.radio = {
@@ -28,6 +39,9 @@ in
     environment.etc."NetworkManager/conf.d/90-asphalt-wifi-mac.conf" = lib.mkIf (
       cfg.wifiAddressFile != null
     ) { source = wifiMacConfig; };
+    environment.etc."systemd/network/10-asphalt-wifi.link" = lib.mkIf (cfg.wifiAddressFile != null) {
+      source = wifiMacLink;
+    };
     systemd.services.asphalt-bluetooth-address = lib.mkIf (cfg.bluetoothAddressFile != null) {
       description = "Set the TB320FC factory Bluetooth address";
       after = [ "bluetooth.service" ];

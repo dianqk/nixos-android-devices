@@ -1,0 +1,89 @@
+From: NixOS Android devices contributors <nixos-android-devices@localhost>
+Date: Thu, 1 Oct 2026 18:00:00 +0800
+Subject: [PATCH] efi: confirm Qualcomm B after loading the configured ESP entry
+
+Local integration against U-Boot a06e89ab05eaa2b8344d521319399333cd760ae5:
+https://source.denx.de/u-boot/u-boot/-/blob/a06e89ab05eaa2b8344d521319399333cd760ae5/lib/efi_loader/efi_bootbin.c
+
+The shared adapter gates the real UFS ESP and configured image path before
+setting only boot_b's successful bit. This acknowledges EFI loading, before
+StartImage; it does not certify a rendered menu or a running Linux system.
+Failures are logged without preventing EFI execution. The hook covers the
+boards' fatload/bootefi path, not EFI boot-manager or nested LoadImage calls.
+
+Local extension: an explicit confirmation-only non-GPT LUN mask defaults to
+zero. The adapter verifies zero metadata on candidate LUNs. This option
+does not authorize Android or recovery exceptions; Android has its own policy.
+---
+--- a/lib/efi_loader/Kconfig
++++ b/lib/efi_loader/Kconfig
+@@ -647,5 +647,45 @@
+ 	  Independent of B confirmation; recovery retains full GPT checks.
+ 
++config EFI_MOBILE_QCOM_AB_CONFIRM
++	bool "Confirm Qualcomm B after loading the normal ESP EFI entry"
++	depends on EFI_MOBILE_BOOT_ACTION_QCOM_AB && CMD_BOOTEFI
++	help
++	  After successful LoadImage and load-options setup in bootefi, match
++	  the configured UFS ESP and file, then set only boot_b successful.
++	  Does not certify EFI execution or Linux startup. Write errors are
++	  restored when possible and reported without blocking EFI boot.
++
++config EFI_MOBILE_QCOM_AB_CONFIRM_ESP
++	string "GPT name of the ESP eligible for B confirmation"
++	depends on EFI_MOBILE_QCOM_AB_CONFIRM
++	default "linux-boot"
++
++config EFI_MOBILE_QCOM_AB_CONFIRM_PATH
++	string "EFI entry path eligible for B confirmation"
++	depends on EFI_MOBILE_QCOM_AB_CONFIRM
++	default "/EFI/BOOT/BOOTAA64.EFI"
++	help
++	  ASCII absolute path; FAT letter case and slash direction are ignored.
++
++config EFI_MOBILE_QCOM_AB_CONFIRM_CHARGER_PATH
++	string "Optional dedicated charger EFI entry eligible for B confirmation"
++	depends on EFI_MOBILE_QCOM_AB_CONFIRM
++	default ""
++	help
++	  Empty disables this second exact path. It uses the same strict ESP,
++	  GPT and UFS validation as the normal entry, never a prefix match.
++
++config EFI_MOBILE_QCOM_AB_CONFIRM_NON_GPT_LUN_MASK
++	int "Non-GPT LUN mask accepted only for B confirmation"
++	depends on EFI_MOBILE_QCOM_AB_CONFIRM
++	range 0 255
++	default 0
++	help
++	  Bit N permits a zero-metadata layout on candidate LUN N. LBA0,
++	  LBA1 and the final block must all read as zero to qualify. Nonzero
++	  metadata always goes through complete GPT validation.
++	  This exception never applies to Android or recovery reboot actions.
++
+ config BOOTEFI_HELLO_COMPILE
+ 	bool "Compile a standard EFI hello world binary for testing"
+ 	default y
+--- a/include/efi_loader.h
++++ b/include/efi_loader.h
+@@ -649,6 +649,9 @@
+ efi_status_t efi_root_node_register(void);
+ /* Non-runtime mobile OEM reboot targets. */
+ efi_status_t efi_mobile_boot_action_register(void);
++/* Optional confirmation of the configured UFS ESP entry after LoadImage. */
++void efi_mobile_qcom_ab_confirm(struct efi_device_path *source,
++			      struct efi_device_path *image);
+ /* Called by bootefi to initialize runtime */
+ efi_status_t efi_initialize_system_table(void);
+ /* Called by bootefi to initialize debug */
+--- a/lib/efi_loader/efi_bootbin.c
++++ b/lib/efi_loader/efi_bootbin.c
+@@ -192,6 +192,9 @@
+ 	if (ret != EFI_SUCCESS)
+ 		goto out;
+ 
++	if (IS_ENABLED(CONFIG_EFI_MOBILE_QCOM_AB_CONFIRM))
++		efi_mobile_qcom_ab_confirm(dp_dev, dp_img);
++
+ 	ret = do_bootefi_exec(handle, load_options);
+ 
+ out:

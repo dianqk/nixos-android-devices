@@ -1,0 +1,118 @@
+From b6fa71b818feaf64cddf3a587d31408cb45eef2a Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 9 Oct 2026 13:42:35 +0800
+Subject: [PATCH] drm/msm/dpu: align SM8650 command tearcheck programming
+
+Use the 32-bit counter range and connect external TE in the existing
+post-kickoff callback. Stop the counter while programming its single-
+buffered state, initialize WR_PTR and tear detection, and clear the
+extended threshold/write-count fields. Keep pre-SM8650 programming
+unchanged.
+
+Link: https://github.com/MiCode/vendor_opensource_display-drivers/blob/828d8a4fa074706bf087c5a22152309d29ea15c2/msm/sde/sde_hw_intf.c
+
+This is a local implementation of the register sequence, not an imported
+upstream patch. The matching command encoder uses the near-maximum
+tearcheck height to rely on panel TE rather than synthesized periodic TE.
+
+---
+ .../drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c  |  7 +++++
+ drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c   | 30 +++++++++++++++++--
+ 2 files changed, 34 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
+index a2ca10044..155093d35 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
+@@ -393,6 +393,13 @@ static void dpu_encoder_phys_cmd_tearcheck_config(
+ 	 */
+ 	tc_cfg.hw_vsync_mode = 1;
+ 	tc_cfg.sync_cfg_height = mode->vtotal * 2;
++	if (phys_enc->has_intf_te &&
++	    dpu_kms->catalog->mdss_ver->core_major_ver == 10) {
++		/* SM8650 uses a 32-bit counter: let panel TE reset it first. */
++		tc_cfg.sync_cfg_height = 0xfffffff0;
++		/* handle_post_kickoff connects external TE after CTL_START. */
++		tc_cfg.hw_vsync_mode = 0;
++	}
+ 	tc_cfg.vsync_init_val = mode->vdisplay;
+ 	tc_cfg.sync_threshold_start = DEFAULT_TEARCHECK_SYNC_THRESH_START;
+ 	tc_cfg.sync_threshold_continue = DEFAULT_TEARCHECK_SYNC_THRESH_CONTINUE;
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
+index ac82b69ae..2bff7fd34 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) 2015-2018, The Linux Foundation. All rights reserved.
+  */
+ 
++#include <linux/preempt.h>
+ #include "dpu_hwio.h"
+ #include "dpu_hw_catalog.h"
+ #include "dpu_hw_intf.h"
+@@ -91,6 +92,9 @@
+ #define INTF_TEAR_OUT_LINE_COUNT        0x2AC
+ #define INTF_TEAR_LINE_COUNT            0x2B0
+ #define INTF_TEAR_AUTOREFRESH_CONFIG    0x2B4
++#define INTF_TEAR_TEAR_DETECT_CTRL      0x2B8
++#define INTF_TEAR_SYNC_THRESH_EXT       0x2E0
++#define INTF_TEAR_SYNC_WRCOUNT_EXT      0x2E4
+ 
+ #define INTF_CFG_ACTIVE_H_EN	BIT(29)
+ #define INTF_CFG_ACTIVE_V_EN	BIT(30)
+@@ -370,20 +374,28 @@ static int dpu_hw_intf_enable_te(struct dpu_hw_intf *intf,
+ 		struct dpu_hw_tear_check *te)
+ {
+ 	struct dpu_hw_blk_reg_map *c;
+-	int cfg;
++	u32 cfg, write_count;
++	bool te_32bit;
+ 
+ 	if (!intf)
+ 		return -EINVAL;
+ 
+ 	c = &intf->hw;
+ 
+-	cfg = BIT(19); /* VSYNC_COUNTER_EN */
++	te_32bit = intf->mdss_ver->core_major_ver == 10;
++	write_count = te->start_pos + te->sync_threshold_start + 1;
++	/* Stop the SM8650 counter while updating its single-buffered registers. */
++	cfg = te_32bit ? 0 : BIT(19); /* VSYNC_COUNTER_EN */
+ 	if (te->hw_vsync_mode)
+ 		cfg |= BIT(20);
+ 
+ 	cfg |= te->vsync_count;
+ 
++	if (te_32bit)
++		preempt_disable();
+ 	DPU_REG_WRITE(c, INTF_TEAR_SYNC_CONFIG_VSYNC, cfg);
++	if (te_32bit)
++		wmb(); /* Stop the counter before changing its state. */
+ 	DPU_REG_WRITE(c, INTF_TEAR_SYNC_CONFIG_HEIGHT, te->sync_cfg_height);
+ 	DPU_REG_WRITE(c, INTF_TEAR_VSYNC_INIT_VAL, te->vsync_init_val);
+ 	DPU_REG_WRITE(c, INTF_TEAR_RD_PTR_IRQ, te->rd_ptr_irq);
+@@ -391,8 +403,20 @@ static int dpu_hw_intf_enable_te(struct dpu_hw_intf *intf,
+ 	DPU_REG_WRITE(c, INTF_TEAR_SYNC_THRESH,
+ 			((te->sync_threshold_continue << 16) |
+ 			 te->sync_threshold_start));
++	if (te_32bit) {
++		DPU_REG_WRITE(c, INTF_TEAR_WR_PTR_IRQ, 1);
++		DPU_REG_WRITE(c, INTF_TEAR_TEAR_DETECT_CTRL, te->vsync_init_val + 20);
++		DPU_REG_WRITE(c, INTF_TEAR_SYNC_THRESH_EXT,
++			(te->sync_threshold_continue & 0xffff0000) |
++			(te->sync_threshold_start >> 16));
++		DPU_REG_WRITE(c, INTF_TEAR_SYNC_CONFIG_VSYNC, cfg | BIT(19));
++		wmb(); /* Enable the counter before updating write count. */
++		DPU_REG_WRITE(c, INTF_TEAR_SYNC_WRCOUNT_EXT, write_count >> 16);
++	}
+ 	DPU_REG_WRITE(c, INTF_TEAR_SYNC_WRCOUNT,
+-			(te->start_pos + te->sync_threshold_start + 1));
++			te_32bit ? write_count & 0xffff : write_count);
++	if (te_32bit)
++		preempt_enable();
+ 
+ 	DPU_REG_WRITE(c, INTF_TEAR_TEAR_CHECK_EN, 1);
+ 
+-- 
+2.55.0
+

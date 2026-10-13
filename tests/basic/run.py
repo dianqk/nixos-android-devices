@@ -77,8 +77,8 @@ class Suite:
                          timeout=120, stdin=stream)
 
     def session(self, *args):
-        sockets = self.shell("sh", "-c", 'for f in /run/user/*/sway-ipc.*.sock; do [ ! -S "$f" ] || echo "$f"; done').splitlines()
-        require(len(sockets) == 1, "Exactly one running Sway session is required")
+        sockets = self.shell("sh", "-c", 'for f in /run/user/*/niri.*.sock; do [ ! -S "$f" ] || echo "$f"; done').splitlines()
+        require(len(sockets) == 1, "Exactly one running Niri session is required")
         socket = sockets[0]
         runtime = socket.rsplit("/", 1)[0]
         uid = self.shell("stat", "-c", "%u", socket).strip()
@@ -86,13 +86,15 @@ class Suite:
         windows = self.shell("sh", "-c", f'for f in {shlex.quote(runtime)}/wayland-*; do [ ! -S "$f" ] || echo "$f"; done').splitlines()
         require(len(windows) == 1, "Exactly one Wayland socket is required")
         return self.shell("runuser", "-u", user, "--", "env", f"XDG_RUNTIME_DIR={runtime}",
-                          f"SWAYSOCK={socket}", f"WAYLAND_DISPLAY={windows[0].rsplit('/', 1)[1]}", *args)
+                          f"NIRI_SOCKET={socket}", f"WAYLAND_DISPLAY={windows[0].rsplit('/', 1)[1]}", *args)
 
     def display(self):
-        outputs = json.loads(self.session("swaymsg", "-r", "-t", "get_outputs"))
+        outputs = json.loads(self.session("niri", "msg", "--json", "outputs"))
         (self.output / "outputs.json").write_text(json.dumps(outputs, indent=2) + "\n")
-        require(any(o.get("active") and o.get("power") and o["current_mode"]["width"] > 0
-                    and o["current_mode"]["height"] > 0 for o in outputs), "No active display")
+        require(any(o.get("logical") is not None and o.get("current_mode") is not None
+                    and o["modes"][o["current_mode"]]["width"] > 0
+                    and o["modes"][o["current_mode"]]["height"] > 0
+                    for o in outputs.values()), "No active display")
         self.shell("sh", "-ec", '''
 for d in /sys/class/drm/card*-*; do
   [ -f "$d/status" ] || continue
@@ -169,15 +171,23 @@ for f in /dev/snd/pcmC*D*[pc]; do [ ! -c "$f" ] || echo "$f"; done''')
                 f"Incomplete decode: expected {expected} frames")
 
     def gpu(self, api, *command):
-        workspaces = json.loads(self.session("swaymsg", "-r", "-t", "get_workspaces"))
-        focused = next(w["name"] for w in workspaces if w["focused"])
-        # Keep a fullscreen terminal from hiding/throttling the test window.
-        self.session("swaymsg", "workspace __mobile_basic_test")
+        workspaces = json.loads(self.session("niri", "msg", "--json", "workspaces"))
+        focused = next(w for w in workspaces if w["is_focused"])
+        windows = json.loads(self.session("niri", "msg", "--json", "windows"))
+        occupied = {w["workspace_id"] for w in windows}
+        # Use the trailing empty workspace so existing full-width windows cannot hide the benchmark.
+        empty = max((w for w in workspaces if w["output"] == focused["output"]
+                     and w["id"] not in occupied), key=lambda w: w["idx"])
+        self.session("niri", "msg", "action", "focus-workspace", str(empty["idx"]))
         try:
             result = self.session("timeout", "-k", "3", "30", *command)
             validate_gpu(result, api)
         finally:
-            self.session("swaymsg", "workspace " + json.dumps(focused))
+            # Empty workspace removal can renumber indices; resolve the original ID again.
+            current = json.loads(self.session("niri", "msg", "--json", "workspaces"))
+            previous = next(w for w in current if w["id"] == focused["id"])
+            self.session("niri", "msg", "action", "focus-monitor", previous["output"])
+            self.session("niri", "msg", "action", "focus-workspace", str(previous["idx"]))
 
     def opengl(self):
         self.gpu("opengl", "glmark2-wayland", "--size", "640x360", "--benchmark", "build:duration=3")

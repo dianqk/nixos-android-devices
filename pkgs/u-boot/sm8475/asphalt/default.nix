@@ -1,4 +1,10 @@
 {
+  bootActionProfile = "qcom-ab";
+  # Permit the observed zero-metadata layout on these LUNs for B confirmation.
+  # Valid GPTs remain supported and fully checked on other Asphalt units.
+  bootActionConfirmationNonGptLunMask = 192; # bits 6 and 7
+  bootActionAndroidNonGptLunMask = 192;
+  bootActionChargerConfirmationPath = "/EFI/android-devices/charger.efi";
   deviceTree = "qcom/sm8475-lenovo-asphalt";
   patches = [
     ../patches/0001-sm8450-gcc.patch
@@ -12,6 +18,7 @@
     ./patches/0001-asphalt-boot-dts.patch
     ./patches/0002-volume-up-pinctrl.patch
   ];
+  chargerEnvironment = true;
   environment = ./asphalt.env;
   compressKernel = false;
   # Preserve the larger payload extent used for repeated ABL boots.

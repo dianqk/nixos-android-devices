@@ -1,14 +1,14 @@
-{ lib, ... }:
+{ ... }:
 {
   imports = [
     ./baseline.nix
     ../desktop.nix
     ../usb-network.nix
   ];
+  example.desktop = {
+    scale = "2";
+  };
   networking.networkmanager.enable = true;
-  environment.etc."sway/config".text = lib.mkAfter ''
-    output DSI-1 transform normal scale 2
-  '';
   environment.etc."xdg/foot/foot.ini".text = ''
     [main]
     font=monospace:size=11

@@ -8,4 +8,6 @@ runCommand "polaris-alsa-ucm" { } ''
   cp ${./ucm2/HiFi.conf} $out/share/alsa/ucm2/Polaris/HiFi.conf
   ln -s ../../Polaris/Polaris.conf \
     "$out/share/alsa/ucm2/conf.d/sdm845/Xiaomi Mi MIX 2S.conf"
+  ln -s ../../Polaris/Polaris.conf \
+    "$out/share/alsa/ucm2/conf.d/sdm845/xiaomi-XiaomiMiMIX2S.conf"
 ''

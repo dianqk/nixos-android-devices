@@ -64,9 +64,8 @@ This local correction is in `sheng/patches/0002-usb2-pipe-clock.patch`.
 ## Build and device status
 
 ```sh
-nix build .#devices.sheng.u-boot --builders '' \
-  --out-link tmp/systemd-artifacts/devices.sheng.u-boot
-python tests/sheng-uboot.py "$(nix eval --raw .#devices.sheng.u-boot.firmware.outPath)" tmp/systemd-artifacts/devices.sheng.u-boot
+nix build .#devices.sheng.u-boot --out-link result-u-boot
+python tests/sheng-uboot.py "$(nix eval --raw .#devices.sheng.u-boot.firmware.outPath)" result-u-boot
 nix eval --impure --json --expr 'import ./tests/sheng-uefi.nix { flake = builtins.getFlake (toString ./.); }'
 python tests/sheng-repeater.py /path/to/patched/u-boot
 ```

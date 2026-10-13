@@ -10,6 +10,12 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
       device: modules:
       flake.lib.mkSystem {
         inherit device buildSystem;
+        nixpkgsConfig.allowUnfreePredicate =
+          package:
+          builtins.elem (lib.getName package) [
+            "aurora-firmware"
+            "aurora-firmware-zstd"
+          ];
         modules = [ { androidDevices.usbSerial = "release-check"; } ] ++ modules;
       };
     sheng = make "sheng" [
@@ -24,7 +30,7 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
     c = sheng.config;
   in
   {
-    storage = lib.genAttrs [ "asphalt" "sheng" "clover" ] (
+    storage = lib.genAttrs [ "asphalt" "sheng" "clover" "aurora" ] (
       device:
       let
         s = make device [
@@ -38,14 +44,15 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
         cfg = s.config;
       in
       assert lib.all (a: a.assertion) cfg.assertions;
-      assert lib.hasInfix "TARGET_ROOT_LABEL=MYROOT"
-        cfg.boot.initrd.systemd.contents."/etc/mobile-recovery-target".text;
-      assert lib.hasInfix "ROOT_LABEL=MYROOT" cfg.androidDevices.recovery.tools.buildCommand;
-      assert
-        device == "clover"
-        || lib.hasInfix "MOBILE_ESP_BYTES=536870912" cfg.androidDevices.recovery.tools.buildCommand;
       assert !(s.options.hardware.${device} ? rootLabel);
-      cfg.androidDevices.recovery.tools.drvPath
+      let
+        contract = builtins.fromJSON cfg.boot.initrd.systemd.contents."/etc/mobile-recovery.json".text;
+      in
+      assert contract.root_label == "MYROOT";
+      assert contract.esp_bytes == 536870912;
+      assert contract.minimum_root_bytes == 8589934592;
+      assert !(cfg.boot.initrd.systemd.contents ? "/etc/mobile-recovery-target");
+      cfg.system.build.mobileRecoveryUtils.drvPath
     );
     fingerprint =
       assert lib.all (a: a.assertion) c.assertions;

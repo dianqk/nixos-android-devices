@@ -1,0 +1,92 @@
+--- a/libavcodec/v4l2_buffers.c
++++ b/libavcodec/v4l2_buffers.c
+@@ -34,6 +34,7 @@
+ #include "v4l2_context.h"
+ #include "v4l2_buffers.h"
+ #include "v4l2_m2m.h"
++#include "v4l2_nv12_copy.h"
+ 
+ #ifndef USEC_PER_SEC
+ #define USEC_PER_SEC 1000000
+@@ -369,6 +370,27 @@
+     int height       = V4L2_TYPE_IS_MULTIPLANAR(fmt.type) ?
+                        fmt.fmt.pix_mp.height : fmt.fmt.pix.height;
+     int is_planar_format = 0;
++
++    if (pixel_format == V4L2_PIX_FMT_NV12 || pixel_format == V4L2_PIX_FMT_NV21) {
++        size_t used;
++        if (out->num_planes != 1 ||
++            (pixel_format == V4L2_PIX_FMT_NV12 && frame->format != AV_PIX_FMT_NV12) ||
++            (pixel_format == V4L2_PIX_FMT_NV21 && frame->format != AV_PIX_FMT_NV21))
++            return AVERROR(EINVAL);
++        ret = ff_v4l2_copy_nv12(out->plane_info[0].mm_addr,
++                               out->plane_info[0].length,
++                               out->plane_info[0].bytesperline, height,
++                               frame->data[0], frame->linesize[0],
++                               frame->data[1], frame->linesize[1],
++                               frame->width, frame->height, &used);
++        if (ret < 0)
++            return ret;
++        if (V4L2_TYPE_IS_MULTIPLANAR(out->buf.type))
++            out->planes[0].bytesused = used;
++        else
++            out->buf.bytesused = used;
++        return 0;
++    }
+ 
+     switch (pixel_format) {
+     case V4L2_PIX_FMT_YUV420M:
+--- /dev/null
++++ b/libavcodec/v4l2_nv12_copy.h
+@@ -0,0 +1,51 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#ifndef AVCODEC_V4L2_NV12_COPY_H
++#define AVCODEC_V4L2_NV12_COPY_H
++
++#include <errno.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++/* Source rows describe visible pixels; V4L2 stride/height describe storage.
++ * NV12 and NV21 each have one contiguous V4L2 plane and two AVFrame planes.
++ */
++static inline int ff_v4l2_copy_nv12(uint8_t *dst, size_t capacity,
++                                  int stride, int storage_height,
++                                  const uint8_t *y, int y_stride,
++                                  const uint8_t *uv, int uv_stride,
++                                  int width, int height, size_t *used)
++{
++    size_t y_size, uv_size, uv_rows;
++    int row, uv_width;
++
++    if (!dst || !y || !uv || !used || width <= 0 || height <= 0 ||
++        stride <= 0 || storage_height < height || width > stride)
++        return -EINVAL;
++    /* Avoid width + 1 overflow and permit an odd visible width. */
++    uv_width = width / 2 + width % 2;
++    if (uv_width > stride / 2)
++        return -EINVAL;
++    uv_width *= 2;
++    if ((y_stride < width && y_stride > -width) ||
++        (uv_stride < uv_width && uv_stride > -uv_width))
++        return -EINVAL;
++    if ((size_t)storage_height > capacity / stride)
++        return -ENOSPC;
++    y_size = (size_t)stride * storage_height;
++    uv_rows = (size_t)storage_height / 2 + storage_height % 2;
++    if (uv_rows > (capacity - y_size) / stride)
++        return -ENOSPC;
++    uv_size = uv_rows * stride;
++
++    memset(dst, 16, y_size);
++    memset(dst + y_size, 128, uv_size);
++    for (row = 0; row < height; row++)
++        memcpy(dst + (size_t)row * stride, y + (ptrdiff_t)row * y_stride, width);
++    for (row = 0; row < height / 2 + height % 2; row++)
++        memcpy(dst + y_size + (size_t)row * stride,
++               uv + (ptrdiff_t)row * uv_stride, uv_width);
++    *used = y_size + uv_size;
++    return 0;
++}
++#endif

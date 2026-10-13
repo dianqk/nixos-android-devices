@@ -1,0 +1,30 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 4 Oct 2026 10:35:00 +0800
+Subject: [PATCH] power: supply: qcom_battmgr: serialize notification enable
+
+Property requests hold battmgr->lock because firmware requests share a
+completion and error field. The notification-enable worker bypasses that
+lock and can overlap an early power-supply property request when the PDR
+service becomes available. An enable reply can then complete the wrong
+waiter and expose an uninitialized property value.
+
+Use the same request lock in the worker. Leave the PDR and response
+callbacks nonblocking and preserve service_up semantics. This does not
+claim to resolve responses arriving after a request timeout.
+
+Base driver:
+https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/power/supply/qcom_battmgr.c?h=v7.3-rc5
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -1594,7 +1594,9 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
+ 	};
+ 	int ret;
+ 
++	mutex_lock(&battmgr->lock);
+ 	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
++	mutex_unlock(&battmgr->lock);
+ 	if (ret)
+ 		dev_err(battmgr->dev, "failed to request power notifications\n");
+ }

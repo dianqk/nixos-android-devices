@@ -9,10 +9,11 @@
   imports = [
     ../../mobile
     ./boot.nix
-    ./video.nix
+    ./charger.nix
     ./hardware.nix
     ./radio.nix
     ./dsp.nix
+    ./sensors.nix
     ./storage.nix
     ./audio.nix
     ./recovery.nix

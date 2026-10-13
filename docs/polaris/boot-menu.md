@@ -1,10 +1,14 @@
 # Use the Polaris boot menu
 
-[Device guide](README.md) · [First installation](first-install.md)
+[Device guide](README.md) · [First installation](first-install.md) · [中文](boot-menu.zh.md)
 
 An installed EFI system keeps NixOS generations in FAT `/boot`. Ordinary
 system updates add generations there; they do not rewrite U-Boot in physical
 `boot`. Keep independent RAM recovery available for a failed startup.
+
+The module also enables [power and special reboot actions](../boot-actions.md).
+Bootloader/recovery entries need updated U-Boot and ask for confirmation; their
+hardware behavior remains unverified.
 
 ## Choose a generation
 
@@ -42,7 +46,7 @@ FAT partition has space for the retained kernel/initrd/DTB files and one update.
 The default is 10 generations; the EFI installer refuses insufficient capacity.
 Do not edit generated entry files as your configuration source of truth.
 
-The menu uses U-Boot's 24×48 bitmap glyphs. Linux `console.font`, Sway settings
+The menu uses U-Boot's 24×48 bitmap glyphs. Linux `console.font`, compositor settings
 and TrueType fonts do not change it. There is no runtime font-size option in the
 current firmware; changing glyph size requires rebuilding and validating U-Boot.
 See the [implementation reference](boot-menu-reference.md) for renderer, key and

@@ -2,7 +2,9 @@
 """Host-side Android and NixOS mobile maintenance tool."""
 
 import argparse
+from datetime import datetime
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -12,8 +14,9 @@ import sys
 import tempfile
 import time
 import tomllib
+import uuid
 
-from boot_image import inspect_image
+from boot_image import BOARDS, inspect_image
 
 
 RECOVERY_COMMAND = "recovery"
@@ -116,9 +119,6 @@ class Ssh:
         if self.shell("command", "-v", RECOVERY_COMMAND, check=False).returncode:
             raise ToolError(f"Recovery command is unavailable: {RECOVERY_COMMAND}")
 
-    def require_installed_system(self):
-        if self.script("test \"$(id -u)\" = 0 && test -e /run/current-system && test ! -e /etc/initrd-release").returncode:
-            raise ToolError("SSH target is not an installed NixOS system with root access")
 
 
 def stream_file(transport, path, *remote):
@@ -197,16 +197,127 @@ def fastboot_var(serial, name):
     return values[0]
 
 
+def fastboot_modelname(serial):
+    result = run(["fastboot", "-s", serial, "getvar", "modelname"], check=False, timeout=30)
+    text = (result.stdout + result.stderr).decode(errors="replace")
+    values = re.findall(r"^(?:\(bootloader\)\s*)?modelname:[ \t]*([^\r\n]*)$",
+                        text, re.MULTILINE)
+    if len(values) == 1 and not result.returncode:
+        return values[0].strip() or None
+    if (not values and not re.search(r"(?im)^(?:\(bootloader\)\s*)?modelname\b", text)
+            and result.returncode and re.search(
+            r"FAILED \(remote: ['\"](?:GetVar Variable Not found|Variable not found|unknown variable)['\"]\)",
+            text, re.IGNORECASE)):
+        return None
+    raise ToolError("Cannot verify fastboot modelname")
+
+
+def fastboot_identity(args, board, serial, product):
+    path = getattr(args, "device_identity", None)
+    if not path:
+        return False
+    if not getattr(args, "serial_explicit", False):
+        raise ToolError("A device identity record requires an explicit --serial")
+    def unique_fields(pairs):
+        fields = dict(pairs)
+        if len(fields) != len(pairs):
+            raise ValueError("duplicate identity fields")
+        return fields
+    try:
+        with local_file(path).open("rb") as stream:
+            blob = stream.read(16385)
+        if len(blob) > 16384:
+            raise ValueError("record is too large")
+        record = json.loads(blob, object_pairs_hook=unique_fields)
+        fields = {"version", "serial", "product", "compatible", "source", "collected_at", "boot_id"}
+        if not isinstance(record, dict) or set(record) != fields or type(record["version"]) is not int or record["version"] != 1:
+            raise ValueError("unsupported identity record")
+        if any(not isinstance(record[key], str) or not record[key] for key in fields - {"version", "compatible"}):
+            raise ValueError("invalid identity fields")
+        compatible = record["compatible"]
+        if not isinstance(compatible, list) or not compatible or any(not isinstance(c, str) or not c for c in compatible):
+            raise ValueError("invalid compatible list")
+        if record["source"] != "nixos-ram-recovery":
+            raise ValueError("identity must come from an observed RAM recovery")
+        if datetime.fromisoformat(record["collected_at"]).tzinfo is None:
+            raise ValueError("collection time requires a timezone")
+        uuid.UUID(record["boot_id"])
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        raise ToolError(f"Invalid device identity record: {error}") from error
+    if record["serial"] != serial or fastboot_var(serial, "serialno") != serial:
+        raise ToolError("Device identity serial does not match fastboot")
+    if record["product"] != product:
+        raise ToolError("Device identity product does not match fastboot")
+    if {BOARDS[c] for c in compatible if c in BOARDS} != {board}:
+        raise ToolError("Device identity compatible does not match the image")
+    # SoC product names need an independently observed, explicitly bound board.
+    if (board, product) != ("asphalt", "taro") or "lenovo,asphalt" not in compatible:
+        raise ToolError("This board/product identity supplement is unsupported")
+    print(f"Observed RAM recovery identity: {record['serial']}, {record['collected_at']}, boot {record['boot_id']}")
+    return True
+
+
+def fastboot_erase(args):
+    if (getattr(args, "device", None), args.partition) != ("asphalt", "dtbo_b"):
+        raise ToolError("Erase requires --device asphalt and --partition dtbo_b")
+    if args.image is not None:
+        raise ToolError("Erase does not accept an image")
+    if not getattr(args, "serial_explicit", False):
+        raise ToolError("Erase requires an explicit --serial")
+    serial = choose_serial("fastboot", args.serial, "fastboot")
+    product = fastboot_var(serial, "product").lower()
+    if product != "taro":
+        raise ToolError("Asphalt DTBO erase requires the verified taro/TB320FC OEM identity")
+    # Validate any supplied record; it cannot replace the required live model.
+    fastboot_identity(args, "asphalt", serial, product)
+    if fastboot_modelname(serial) != "TB320FC":
+        raise ToolError("Asphalt DTBO erase requires live fastboot modelname TB320FC")
+    if fastboot_var(serial, "serialno") != serial:
+        raise ToolError("OEM model identity serial does not match fastboot")
+    if fastboot_var(serial, "current-slot").removeprefix("_") != "b":
+        raise ToolError("Select slot B explicitly before erasing dtbo_b; slot A must be preserved")
+    capacity = fastboot_var(serial, "partition-size:dtbo_b")
+    if not re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)", capacity):
+        raise ToolError("Invalid fastboot partition size")
+    if int(capacity, 16 if capacity.lower().startswith("0x") else 10) != 25165824:
+        raise ToolError("Unexpected Asphalt dtbo_b capacity")
+    operation = ["fastboot", "-s", serial, "erase", "dtbo_b"]
+    print(shlex.join(operation))
+    print(f"Verified Asphalt DTBO erase: product {product}, model TB320FC, serial {serial}, slot B, 25165824 bytes")
+    if args.execute:
+        run(operation, capture=False, timeout=900)
+    else:
+        print("Check only; add --execute to send the fastboot command.")
+
+
 def fastboot(args):
+    if args.operation == "erase":
+        return fastboot_erase(args)
+    if getattr(args, "device", None) is not None or args.partition == "dtbo_b":
+        raise ToolError("Use fastboot erase --device asphalt --partition dtbo_b for Asphalt DTBO")
+    if not args.image:
+        raise ToolError("Fastboot boot and flash require an image")
     image = local_file(args.image)
     board, recovery = inspect_image(image.read_bytes())
     serial = choose_serial("fastboot", args.serial, "fastboot")
     product = fastboot_var(serial, "product").lower()
     products = {"clover": {"clover"}, "polaris": {"polaris"},
-                "sheng": {"sheng"}, "asphalt": {"asphalt", "tb320fc"}}
-    if product not in products[board]:
+                "aurora": {"aurora"}, "sheng": {"sheng"}, "asphalt": {"asphalt", "tb320fc"}}
+    identity = fastboot_identity(args, board, serial, product)
+    if (board, product) == ("asphalt", "taro"):
+        model = fastboot_modelname(serial)
+        if model is not None and model != "TB320FC":
+            raise ToolError(f"Asphalt requires fastboot modelname TB320FC, received {model}")
+        if model == "TB320FC":
+            if not getattr(args, "serial_explicit", False):
+                raise ToolError("The OEM model identity requires an explicit --serial")
+            if fastboot_var(serial, "serialno") != serial:
+                raise ToolError("OEM model identity serial does not match fastboot")
+            print(f"Verified OEM model identity: {model}, serial {serial}")
+            identity = True
+    if product not in products[board] and not identity:
         raise ToolError(f"Image is for {board}, connected fastboot product is {product}")
-    ab = board in ("asphalt", "sheng")
+    ab = board in ("asphalt", "sheng", "aurora")
     if ab and fastboot_var(serial, "current-slot").removeprefix("_") != "b":
         raise ToolError("Select slot B explicitly before using this image; slot A must be preserved")
     operation = ["fastboot", "-s", serial, args.operation]
@@ -223,7 +334,8 @@ def fastboot(args):
         operation.append(args.partition)
     operation.append(str(image))
     print(shlex.join(operation))
-    print(f"Verified {board} {'RAM recovery' if recovery else 'boot'} image and product {product}")
+    role = "RAM recovery" if recovery else "boot"
+    print(f"Verified {board} {role} image and product {product}")
     print(f"Image: {image.stat().st_size} bytes, SHA-256 {digest(image)}")
     if args.execute:
         run(operation, capture=False, timeout=900)
@@ -259,6 +371,42 @@ def closure_manifest(system):
     return paths, "".join(lines).encode()
 
 
+def recovery_daemon(transport):
+    """Require the Rust recovery daemon; every supported recovery runs it."""
+    probe = transport.shell("cat", "/etc/mobile-recovery-protocol", check=False)
+    if probe.returncode or not probe.stdout.strip():
+        raise ToolError("Recovery does not run the Rust recovery daemon; boot a current recovery image")
+    if probe.stdout.strip() != b"1":
+        raise ToolError("Unsupported recovery daemon protocol; update host tools")
+    return True
+
+
+def daemon_submit(transport, arguments):
+    response = json.loads(transport.text(RECOVERY_COMMAND, "submit", *arguments))
+    task = response.get("snapshot", {}).get("task", {})
+    if response.get("version") != 1 or response.get("error") or not isinstance(task.get("id"), int) or not response.get("token"):
+        raise ToolError("Invalid daemon submission response")
+    return task["id"], shlex.join([RECOVERY_COMMAND, "input", str(task["id"]), response["token"]])
+
+
+def daemon_wait(transport, task_id, *, timeout=3600):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = json.loads(transport.text(RECOVERY_COMMAND, "task", str(task_id)))
+        task = state.get("task", {})
+        if task.get("id") != task_id:
+            raise ToolError("Recovery returned another task identity")
+        if not task.get("active", True):
+            if task.get("error"):
+                raise ToolError(f"Recovery task {task_id} failed: {task['error']}")
+            if not isinstance(task.get("result"), str):
+                raise ToolError("Recovery task has no verified result")
+            print(task["result"])
+            return
+        time.sleep(2)
+    raise ToolError(f"Task {task_id} is still active; reconnect with recovery task {task_id}")
+
+
 def recovery_deploy(args, transport):
     transport.recovery()
     system = local_system(args.system)
@@ -268,7 +416,6 @@ def recovery_deploy(args, transport):
         source.write_bytes(manifest)
         remote = transport.temporary()
         remote_manifest = remote + "/manifest"
-        result_file = "/run/mobile-offline-deploy.result"
         writer_running = False
         try:
             transport.push(source, remote_manifest)
@@ -279,36 +426,17 @@ def recovery_deploy(args, transport):
             if not args.execute:
                 print("Query only; add --execute to import and select the system.")
                 return
-            transport.shell("rm", "-f", result_file)
-            command = shlex.join([RECOVERY_COMMAND, "deploy-offline", remote_manifest, str(system), str(len(missing)), "--confirm"])
+            recovery_daemon(transport)
+            task_id, command = daemon_submit(transport, ["deploy-offline", remote_manifest, str(system), str(len(missing)), "--confirm"])
             writer_running = True
-            transfer = stream_export(transport, missing, command)
-            expected = f"installed {digest(source)} {system}"
-            deadline = time.monotonic() + 3600
-            while time.monotonic() < deadline:
-                response = transport.shell("cat", result_file, check=False)
-                result = response.stdout.decode(errors="replace").strip().replace("\r", "")
-                if result == expected:
-                    writer_running = False
-                    print("Recovery installed the system and verified boot retransportack.")
-                    return
-                if result.startswith("failed "):
-                    writer_running = False
-                    raise ToolError(f"Recovery deployment failed: {result}")
-                time.sleep(5)
-            raise ToolError(f"Deployment did not finish (SSH transport exit {transfer})")
+            stream_export(transport, missing, command)
+            daemon_wait(transport, task_id)
+            writer_running = False
         finally:
             if writer_running:
                 print(f"Recovery may still be using deployment inputs: {remote}; inspect its result before retrying.")
             else:
                 transport.shell("rm", "-rf", remote, check=False)
-
-
-def recovery_format_userdata(args, transport):
-    transport.recovery()
-    transport.shell(RECOVERY_COMMAND, "format-userdata", "--check", capture=False)
-    if args.execute:
-        transport.shell(RECOVERY_COMMAND, "format-userdata", "--confirm", capture=False)
 
 
 def recovery_format_root(args, transport):
@@ -328,6 +456,8 @@ def recovery_install_initial(args, transport):
         raise ToolError("Initial system lacks its matching U-Boot image")
     paths, manifest = closure_manifest(system)
     registration, size = bootstrap_info(args.bootstrap_info, paths)
+    resume = getattr(args, "resume", False)
+    recovery_daemon(transport)
     with tempfile.TemporaryDirectory(prefix="mobile-device-") as directory:
         source = Path(directory) / "manifest"
         source.write_bytes(manifest)
@@ -340,30 +470,23 @@ def recovery_install_initial(args, transport):
             transport.push(registration, remote_registration)
             arguments = [RECOVERY_COMMAND, "install-initial", remote_manifest,
                          remote_registration, str(system), str(size)]
-            transport.shell(*arguments, "--check", capture=False)
+            transport.shell(*arguments, "--resume-check" if resume else "--check", capture=False)
             if not args.execute:
-                print("Check only; add --execute to stream and install the system closure.")
+                print("Check only; add --execute to install or resume the system closure.")
                 return
-            transport.shell("rm", "-f", args.result_file)
+            if resume:
+                writer_running = True
+                transport.shell(*arguments, "--resume-confirm", capture=False)
+                writer_running = False
+                return
+            task_id, command = daemon_submit(transport, [*arguments[1:], "--confirm"])
             writer_running = True
-            transfer = stream_closure_tar(transport, paths, shlex.join([*arguments, "--confirm"]))
-            expected = f"installed {digest(source)} {system}"
-            deadline = time.monotonic() + 1800
-            while time.monotonic() < deadline:
-                response = transport.shell("cat", args.result_file, check=False)
-                result = response.stdout.decode(errors="replace").strip().replace("\r", "")
-                if result == expected:
-                    writer_running = False
-                    print("First system closure, profile, and boot installed and verified.")
-                    return
-                if result.startswith("failed "):
-                    writer_running = False
-                    raise ToolError(f"First installation failed: {result}")
-                time.sleep(5)
-            raise ToolError(f"First installation did not finish (SSH transport exit {transfer})")
+            stream_closure_tar(transport, paths, command)
+            daemon_wait(transport, task_id)
+            writer_running = False
         finally:
             if writer_running:
-                print(f"Recovery may still be installing from {remote}; inspect {args.result_file} before retrying.")
+                print(f"Recovery may still be installing from {remote}; query the recovery task before retrying.")
             else:
                 transport.shell("rm", "-rf", remote, check=False)
 
@@ -386,57 +509,26 @@ def recovery_command(args, transport):
             print(f"Check only: {RECOVERY_COMMAND} reboot-{args.destination} --confirm")
 
 
-def upload_script(transport, script, remote):
-    source = local_file(script)
-    transport.push(source, remote)
-    return remote
-
-
-def recovery_enter(args, transport):
-    transport.require_installed_system()
-    remote = transport.temporary()
-    try:
-        script = upload_script(transport, args.script, remote + "/request.sh")
-        environment = []
-        if args.support_script:
-            if not args.support_env or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", args.support_env):
-                raise ToolError("--support-env must name the remote script path variable")
-            support = upload_script(transport, args.support_script, remote + "/support.sh")
-            environment.append(f"{args.support_env}={support}")
-        command = ["env", *environment, "bash", script]
-        transport.shell(*command, "--check", capture=False)
-        if args.execute:
-            transport.shell(*command, "--execute", capture=False)
-            # The connection normally drops as the device reboots.
-            transport.shell("systemctl", "reboot", check=False, capture=False)
-    finally:
-        # A reboot removes /tmp; ignore the expected disconnected transport.
-        try:
-            transport.shell("rm", "-rf", remote, check=False)
-        except ToolError:
-            pass
-
-
 def recovery_install_image(args, transport):
     transport.recovery()
     image = local_file(args.image)
     remote = transport.temporary()
     try:
         remote_image = remote + "/image"
-        installer = upload_script(transport, args.installer, remote + "/installer.sh")
+        recovery_daemon(transport)
+        operations = {"/dev/disk/by-partlabel/boot_b": "update-firmware",
+                      "/dev/disk/by-partlabel/recovery_b": "update-recovery",
+                      "/dev/disk/by-partlabel/boot": "update-firmware",
+                      "/dev/disk/by-partlabel/recovery": "update-recovery"}
+        operation = operations.get(args.partition)
+        if operation is None:
+            raise ToolError("Image updates require the boot or recovery PARTLABEL path of this device")
         transport.push(image, remote_image)
-        environment = []
-        if args.support_script:
-            if not args.support_env or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", args.support_env):
-                raise ToolError("--support-env must name the remote script path variable")
-            support = upload_script(transport, args.support_script, remote + "/support.sh")
-            environment.append(f"{args.support_env}={support}")
-        old_hash = transport.text("sha256sum", args.partition).split()[0]
-        command = ["env", *environment, "bash", installer]
-        parameters = [remote_image, digest(image), old_hash]
-        transport.shell(*command, "--check", *parameters, capture=False)
+        if transport.text("sha256sum", remote_image).split()[0] != digest(image):
+            raise ToolError("Uploaded image checksum mismatch")
+        transport.shell(RECOVERY_COMMAND, operation, remote_image, "--check", capture=False)
         if args.execute:
-            transport.shell(*command, "--execute", *parameters, capture=False)
+            transport.shell(RECOVERY_COMMAND, operation, remote_image, "--confirm", capture=False)
     finally:
         transport.shell("rm", "-rf", remote, check=False)
 
@@ -444,31 +536,6 @@ def recovery_install_image(args, transport):
 def ssh_command(target, *args, stdin=None, capture=True):
     return run(["ssh", "-o", "BatchMode=yes", target, shlex.join(map(str, args))],
                input_data=stdin, capture=capture)
-
-
-def system_update(args):
-    system = local_system(args.system)
-    boot = local_file(system / args.boot_image)
-    updater = system / args.update_program
-    if not updater.is_file():
-        raise ToolError(f"Missing system updater: {updater}")
-    update_args = [str(updater)]
-    if not args.execute:
-        update_args.append("--check")
-    update_args.extend([str(system), digest(boot)])
-    unit = args.unit
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", unit):
-        raise ToolError("Invalid systemd unit name")
-    service = ["systemd-run", f"--unit={unit}", "--service-type=exec", "--wait", "--collect",
-               "--setenv=PATH=/run/current-system/sw/bin:/run/wrappers/bin", *update_args]
-    if not args.target:
-        raise ToolError("SSH update requires --target")
-    ssh_command(args.target, "sudo", "-n", "true")
-    run(["nix", "copy", "--no-check-sigs", "--to", f"ssh-ng://{args.target}", str(system)], capture=False)
-    print(f"Device update: {system}")
-    ssh_command(args.target, "sudo", "-n", *service, capture=False)
-    ssh_command(args.target, "sudo", "-n", "journalctl", "-u", unit + ".service",
-                "-n", "35", "--no-pager", capture=False)
 
 
 def system_script(args):
@@ -506,11 +573,15 @@ def parser_for_cli():
     parser.add_argument("--config", type=Path, help="optional TOML defaults for one device")
     commands = parser.add_subparsers(dest="mode", required=True)
 
-    bootloader = commands.add_parser("fastboot", help="boot or flash an explicitly named image")
-    bootloader.add_argument("operation", choices=["boot", "flash"])
-    bootloader.add_argument("image")
-    bootloader.add_argument("--partition", help="partition name for flash")
+    bootloader = commands.add_parser("fastboot", help="boot/flash an image or erase supported Asphalt DTBO")
+    bootloader.add_argument("operation", choices=["boot", "flash", "erase"])
+    bootloader.add_argument("image", nargs="?")
+    bootloader.add_argument("--partition", help="partition name for flash or supported erase")
     bootloader.add_argument("--execute", action="store_true")
+    bootloader.add_argument("--device", choices=["asphalt"],
+                            help="explicit board for Asphalt dtbo_b erase only")
+    bootloader.add_argument("--device-identity", type=Path,
+                            help="observed RAM recovery identity record for supported OEM SoC product names")
 
     recovery = commands.add_parser("recovery", help="interact with a running RAM recovery")
     recovery.add_argument("--target", help="root SSH destination or configured alias")
@@ -535,41 +606,22 @@ def parser_for_cli():
     deploy = actions.add_parser("deploy", help="query or deploy a NixOS system from recovery")
     deploy.add_argument("system")
     deploy.add_argument("--execute", action="store_true")
-    format_root = actions.add_parser("format-userdata", help="explicitly format the existing userdata partition")
-    format_root.add_argument("--execute", action="store_true")
     format_linux = actions.add_parser("format-root", help="explicitly format the device's Linux root partition")
     format_linux.add_argument("--execute", action="store_true")
     initial = actions.add_parser("install-initial", help="stream a closure to an empty root and install its boot image")
     initial.add_argument("system")
     initial.add_argument("--bootstrap-info", required=True, help="matching flake bootstrap-info output")
-    initial.add_argument("--result-file", help="recovery's initial-install result file")
     initial.add_argument("--execute", action="store_true")
-    copy = actions.add_parser("copy", help="copy a Nix closure to recovery over forwarded sockets")
-    copy.add_argument("system")
-    copy.add_argument("--log", type=Path)
-    enter = actions.add_parser("enter", help="request recovery from the running system")
-    enter.add_argument("--script", help="device-specific request script")
-    enter.add_argument("--support-script")
-    enter.add_argument("--support-env")
-    enter.add_argument("--execute", action="store_true")
-    image = actions.add_parser("install-image", help="run a device-specific recovery image installer")
+    initial.add_argument("--resume", action="store_true", help="resume EFI finalization of the same fully transferred, registered system; reverify all contents")
+    image = actions.add_parser("install-image", help="write a checked firmware or recovery image from recovery")
     image.add_argument("image")
-    image.add_argument("--installer")
-    image.add_argument("--partition", help="device partition path used to check its old hash")
-    image.add_argument("--support-script")
-    image.add_argument("--support-env")
+    image.add_argument("--partition", help="target /dev/disk/by-partlabel path (boot[_b] or recovery[_b])")
     image.add_argument("--execute", action="store_true")
 
     system = commands.add_parser("system", help="interact with a running NixOS mobile system")
     system.add_argument("--via", choices=["ssh"], default="ssh")
     system.add_argument("--target", help="SSH target when --via ssh")
     system_actions = system.add_subparsers(dest="action", required=True)
-    update = system_actions.add_parser("update", help="copy a closure and run its updater")
-    update.add_argument("system")
-    update.add_argument("--boot-image", help="boot image path relative to SYSTEM")
-    update.add_argument("--update-program", help="updater path relative to SYSTEM")
-    update.add_argument("--unit", default="mobile-device-update")
-    update.add_argument("--execute", action="store_true")
     script = system_actions.add_parser("script", help="run a device-specific script under systemd")
     script.add_argument("script")
     script.add_argument("--unit", default="mobile-device-script")
@@ -580,13 +632,13 @@ def parser_for_cli():
 def main(argv=None):
     parser = parser_for_cli()
     args = parser.parse_args(argv)
+    args.serial_explicit = bool(args.serial)
     if args.config:
         try:
             profile = tomllib.loads(args.config.read_text())
         except (OSError, tomllib.TOMLDecodeError) as error:
             parser.error(f"Cannot read device config: {error}")
-        allowed = {"serial", "result_file", "boot_image", "update_program",
-                   "target", "ssh_config", "script", "installer", "partition", "support_script", "support_env"}
+        allowed = {"serial", "target", "ssh_config", "partition"}
         if not isinstance(profile, dict) or any(key not in allowed or not isinstance(value, str)
                                                    for key, value in profile.items()):
             parser.error("Device config must contain only supported string defaults")
@@ -596,30 +648,28 @@ def main(argv=None):
     if not args.serial:
         args.serial = os.environ.get("ANDROID_SERIAL")
     if args.mode == "fastboot":
+        if args.operation == "erase":
+            if args.image is not None or args.device != "asphalt" or args.partition != "dtbo_b" or not args.serial_explicit:
+                parser.error("fastboot erase requires explicit --serial, --device asphalt, --partition dtbo_b and no image")
+        elif not args.image:
+            parser.error("fastboot boot and flash require an image")
+        elif args.device is not None or args.partition == "dtbo_b":
+            parser.error("Use fastboot erase --device asphalt --partition dtbo_b for Asphalt DTBO")
         if args.operation == "flash" and not args.partition:
             parser.error("fastboot flash requires --partition")
         if args.operation == "boot" and args.partition:
             parser.error("fastboot boot has no partition")
     if args.mode == "recovery":
-        if args.action == "install-initial" and not args.result_file:
-            args.result_file = "/run/mobile-initial-install.result"
-        required = {"deploy": [], "install-initial": [], "enter": ["script"],
-                    "install-image": ["installer", "partition"]}.get(args.action, [])
+        required = {"deploy": [], "install-initial": [],
+                    "install-image": ["partition"]}.get(args.action, [])
         for field in required:
             if not getattr(args, field):
                 parser.error(f"recovery {args.action} requires --{field.replace('_', '-')}")
-    if args.mode == "system" and args.action == "update":
-        for field in ("boot_image", "update_program"):
-            if not getattr(args, field):
-                parser.error(f"system update requires --{field.replace('_', '-')}")
     try:
         if args.mode == "fastboot":
             fastboot(args)
         elif args.mode == "system":
-            if args.action == "update":
-                system_update(args)
-            else:
-                system_script(args)
+            system_script(args)
         else:
             transport = Ssh(args.target, args.ssh_config)
             if args.action in ("mount", "unmount", "target-status", "shell", "push", "pull", "exec", "rebuild"):
@@ -629,7 +679,10 @@ def main(argv=None):
                 elif args.action in ("unmount", "target-status"):
                     transport.shell(RECOVERY_COMMAND, "unmount-target" if args.action == "unmount" else "target-status", capture=False)
                 elif args.action == "shell":
-                    run([*transport.prefix[:-2], "-tt", transport.target], capture=False)
+                    recovery_daemon(transport)
+                    command = [*transport.prefix[:-2], "-tt", transport.target,
+                               shlex.join([RECOVERY_COMMAND, "shell"])]
+                    run(command, capture=False)
                 elif args.action == "exec":
                     if not args.arguments:
                         raise ToolError("exec requires a command")
@@ -653,20 +706,12 @@ def main(argv=None):
                 transport.shell(RECOVERY_COMMAND, "prepare-boot", "--confirm" if args.execute else "--check", capture=False)
             elif args.action == "deploy":
                 recovery_deploy(args, transport)
-            elif args.action == "format-userdata":
-                recovery_format_userdata(args, transport)
             elif args.action == "format-root":
                 recovery_format_root(args, transport)
             elif args.action == "install-initial":
                 recovery_install_initial(args, transport)
-            elif args.action == "enter":
-                recovery_enter(args, transport)
             elif args.action == "install-image":
                 recovery_install_image(args, transport)
-            elif args.action == "copy":
-                from recovery_copy import copy_closure
-                transport.recovery()
-                copy_closure(transport, local_system(args.system), args.log)
             else:
                 args.command_action = args.action
                 recovery_command(args, transport)

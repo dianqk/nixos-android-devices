@@ -2,20 +2,17 @@
 
 [中文](PATCHES.zh.md) · [Clover guide](../../../../docs/clover/README.md)
 
-`devices.clover.kernel` uses Nixpkgs Linux 7.3-rc5 plus the ordered
+The queue targets Linux 7.3-rc6. See the [shared kernel status](../../README.md).
+
+`devices.clover.kernel` has a Linux 7.3-rc6 patch queue with the ordered
 [patch series](series.nix). It cross-builds from x86_64 to AArch64 and is
-selected by the system and RAM recovery. Device boot testing remains pending.
-`devices.clover.kernel-mainline` retains the pinned
-[`sdm660-mainline/linux` 7.2.3 source](https://github.com/sdm660-mainline/linux/tree/e47d622cb6d2440a9eacdc8bb2df32c037bec7b8)
-and the original local WCN3990 patch as a fallback until 7.3 is verified on
-the device.
+selected by the system and RAM recovery. It has not been boot-tested on the device.
 
 Build the kernel from an x86_64 host with the repository's cross package
 scope:
 
 ```console
-nix build .#devices.clover.kernel --out-link tmp/systemd-artifacts/devices.clover.kernel
-nix build .#devices.clover.kernel-mainline --out-link tmp/systemd-artifacts/devices.clover.kernel-mainline
+nix build .#devices.clover.kernel --out-link result-kernel
 ```
 
 Each patch keeps the source author, date, message and trailers. Its

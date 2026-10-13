@@ -19,7 +19,7 @@ flake.inputs.nixpkgs.lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
   assert !config.services.xserver.enable && !config.programs.sway.enable;
   assert !config.hardware.bluetooth.enable && !config.services.pipewire.enable;
   assert !config.networking.networkmanager.enable && !config.networking.wireless.enable;
-  assert !(config.systemd.services ? polaris-rmtfs);
+  assert !(config.systemd.services ? modem-rmtfs);
   assert !(config.systemd.services ? polaris-pd-mapper);
   assert config.boot.loader.systemd-boot.enable;
   assert config.fileSystems."/".autoResize && !config.boot.growPartition;

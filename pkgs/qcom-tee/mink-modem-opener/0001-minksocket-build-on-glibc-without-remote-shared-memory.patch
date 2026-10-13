@@ -1,0 +1,82 @@
+From: nixos-android-devices <nixos-android-devices@users.noreply.github.com>
+Subject: [PATCH] MinkSocket: build on glibc without remote shared memory
+
+MinkSocket's Android build always defines REMOTE_SHAREMM. Guard the two
+confinement uses in Marshalling.c that were outside the REMOTE_SHAREMM blocks,
+fix the QRTR guard of the socklen_t in SockAgnostic_recvfrom (it tested
+SMCINVOKE_QRTR instead of VNDR_SMCINVOKE_QRTR), and include sys/socket.h for
+shutdown() in VmOsalUnix.c without VNDR_UNIXSOCK.
+---
+ libmink/Transport/MinkSocket/sock/Marshalling.c  | 9 +++++++++
+ libmink/Transport/MinkSocket/sock/SockAgnostic.c | 2 +-
+ libmink/Transport/MinkSocket/vmosal/VmOsalUnix.c | 2 +-
+ 3 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/libmink/Transport/MinkSocket/sock/Marshalling.c b/libmink/Transport/MinkSocket/sock/Marshalling.c
+index cb405b5..6c15252 100644
+--- a/libmink/Transport/MinkSocket/sock/Marshalling.c
++++ b/libmink/Transport/MinkSocket/sock/Marshalling.c
+@@ -590,12 +590,17 @@ int32_t MarshalOut_localGenericMem(MinkSocket *minksock, Object obj, lxcom_arg *
+   *fdCnts += 1;
+ 
+   if (version >= MINKSOCK_VER_INDIRECT_MEM) {
++#ifdef REMOTE_SHAREMM
+     conf = fdw->confinement;
+     if (Object_isNull(conf) || !ConfinementFromObject(conf) ||
+         Object_isERROR(IConfinement_getSpecialRules(conf, &specialRules))) {
+       LOG_TRACE("No valid confinement rules with fdw=%p. Passing default rules.\n", fdw);
+       specialRules = ITAccessPermissions_keepSelfAccess;
+     }
++#else
++    (void)conf;
++    specialRules = ITAccessPermissions_keepSelfAccess;
++#endif
+ 
+     for (int i = 0; i < NUM_EXTRA_ARGS_SPECIALRULES; i++) {
+       *pos += 1;
+@@ -672,6 +677,7 @@ int32_t MarshalIn_localGenericMem(MinkSocket *minksock, lxcom_arg *args, int *fd
+       specialRules |= ((uint64_t)handleChunk << i * 16);
+     }
+ 
++#ifdef REMOTE_SHAREMM
+     confRules = HEAP_ZALLOC_REC(ITAccessPermissions_rules);
+     if (!confRules) {
+       LOG_ERR("Failed to create confinementRules.\n");
+@@ -685,6 +691,9 @@ int32_t MarshalIn_localGenericMem(MinkSocket *minksock, lxcom_arg *args, int *fd
+       return Object_ERROR_UNAVAIL;
+     }
+     HEAP_FREE_PTR(confRules);
++#else
++    (void)confRules;
++#endif
+ 
+     LOG_TRACE("Marshalled local specialRules = %u%09u.\n",
+               UINT64_HIGH(specialRules), UINT64_LOW(specialRules));
+diff --git a/libmink/Transport/MinkSocket/sock/SockAgnostic.c b/libmink/Transport/MinkSocket/sock/SockAgnostic.c
+index 85287ec..fc648a4 100644
+--- a/libmink/Transport/MinkSocket/sock/SockAgnostic.c
++++ b/libmink/Transport/MinkSocket/sock/SockAgnostic.c
+@@ -698,7 +698,7 @@ int SockAgnostic_recvfrom(SockAgnostic *me, void *msg, size_t sizeMsgMax,
+                           int flags, void **srcAddr)
+ {
+     int sizeRecv = 0;
+-#if defined(SMCINVOKE_QRTR) || defined(VNDR_VSOCK)
++#if defined(VNDR_SMCINVOKE_QRTR) || defined(VNDR_VSOCK)
+     socklen_t sl = 0;
+ #endif
+ 
+diff --git a/libmink/Transport/MinkSocket/vmosal/VmOsalUnix.c b/libmink/Transport/MinkSocket/vmosal/VmOsalUnix.c
+index 227183e..bb656fb 100644
+--- a/libmink/Transport/MinkSocket/vmosal/VmOsalUnix.c
++++ b/libmink/Transport/MinkSocket/vmosal/VmOsalUnix.c
+@@ -1,9 +1,9 @@
+ // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ // SPDX-License-Identifier: BSD-3-Clause-Clear
+ 
++#include <sys/socket.h>
+ #ifdef VNDR_UNIXSOCK
+ #include <sys/un.h>
+-#include <sys/socket.h>
+ #endif
+ #include "VmOsal.h"
+ #ifdef REMOTE_SHAREMM

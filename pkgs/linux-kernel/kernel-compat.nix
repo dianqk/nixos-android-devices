@@ -31,8 +31,8 @@ let
   keepBaseLine =
     line:
     let
-      enabled = builtins.match "CONFIG_([A-Z0-9_]+)=.*" line;
-      disabled = builtins.match "# CONFIG_([A-Z0-9_]+) is not set" line;
+      enabled = builtins.match "CONFIG_([A-Za-z0-9_]+)=.*" line;
+      disabled = builtins.match "# CONFIG_([A-Za-z0-9_]+) is not set" line;
       match = if enabled != null then enabled else disabled;
     in
     match == null || !(builtins.hasAttr (builtins.head match) configOverrides);
@@ -53,7 +53,7 @@ let
     lib.concatMap (
       line:
       let
-        match = builtins.match "(CONFIG_[A-Z0-9_]+)=([ym])" line;
+        match = builtins.match "(CONFIG_[A-Za-z0-9_]+)=([ym])" line;
       in
       lib.optional (match != null) {
         name = builtins.elemAt match 0;
@@ -127,7 +127,7 @@ kernel.overrideAttrs (old: {
   postConfigure = postConfigure + ''
     # Check resolved Kconfig, not just the input fragment. Catch dependencies or
     # new defaults that resurrect unrelated drivers, and missing boot drivers.
-    grep -E '^CONFIG_PINCTRL(_[A-Z0-9_]+)?=[ym]$' build/.config | sort > build/pinctrl.config
+    grep -E '^CONFIG_PINCTRL(_[A-Za-z0-9_]+)?=[ym]$' build/.config | sort > build/pinctrl.config
     sort ${expectedPinctrlFile} > build/pinctrl-expected.config
     diff -u build/pinctrl-expected.config build/pinctrl.config
     # A dependency may select a driver back on, or make a retained driver

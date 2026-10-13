@@ -17,7 +17,7 @@ in
     video.ffmpegPackage = mkOption {
       type = types.package;
       default = pkgs.ffmpeg;
-      description = "FFmpeg with device decoder fixes, for use by media players and applications.";
+      description = "FFmpeg for media applications; defaults to upstream nixpkgs. Device-patched builds are opt-in.";
     };
     role = mkOption {
       type = types.enum [
@@ -50,8 +50,23 @@ in
         type = types.ints.between 0 4;
         default = 0;
       };
+      osVersion = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Android boot header OS version for bootloaders that require it; this is firmware compatibility metadata, not the Linux kernel version.";
+      };
+      osPatchLevel = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Android boot header security patch date (YYYY-MM-DD) matching the selected factory firmware baseline.";
+      };
       base = mkOption { type = types.str; };
       kernelOffset = mkOption { type = types.str; };
+      arm64LoadOffset = mkOption {
+        type = types.nullOr (types.ints.between 4096 2093056);
+        default = null;
+        description = "Legacy firmware load offset within a 2 MiB boundary. Wrap the arm64 payload so the unchanged kernel starts at the next boundary; direct Android boot only, not EFI.";
+      };
       ramdiskOffset = mkOption { type = types.str; };
       secondOffset = mkOption { type = types.str; };
       tagsOffset = mkOption { type = types.str; };

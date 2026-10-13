@@ -1,0 +1,172 @@
+Subject: [PATCH] arm64: dts: qcom: add Xiaomi aurora RAM recovery board
+
+Board wiring checked against stock aurora DT. SoC support uses upstream
+Linux 7.3-rc5. USB and UFS supplies follow the stock board.
+
+--- /dev/null
++++ b/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
+@@ -0,0 +1,164 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/* SM8650/PMIC topology follows the upstream Linaro SM8650 MTP description.
++ * Board supplies and reserved memory follow Xiaomi aurora firmware.
++ * RAM recovery: USB peripheral and UFS; remote processors remain disabled.
++ */
++/dts-v1/;
++#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
++#include <dt-bindings/gpio/gpio.h>
++#include "sm8650.dtsi"
++#include "pm8550.dtsi"
++#include "pm8550b.dtsi"
++#define PMK8550VE_SID 8
++#include "pm8550ve.dtsi"
++#include "pm8550vs.dtsi"
++#include "pmk8550.dtsi"
++
++/ {
++	model = "Xiaomi 14 Ultra";
++	compatible = "xiaomi,aurora", "qcom,sm8650";
++	qcom,msm-id = <557 0x20000>, <557 0x10000>;
++	qcom,board-id = <8 0>;
++	xiaomi,miboard-id = <4 0>;
++
++	/* Firmware hypervisor overlay targets this symbol to set always-on. */
++	arch_timer: timer { };
++
++	reserved-memory {
++		dump-display@816e0000 { reg = <0 0x816e0000 0 0x800>; no-map; };
++		xbl-ramdump@84a00000 { reg = <0 0x84a00000 0 0x200000>; no-map; };
++		xiaomi-buffer@84c00000 { reg = <0 0x84c00000 0 0x400000>; no-map; };
++		lost-reg@9b09c000 { reg = <0 0x9b09c000 0 0x4000>; no-map; };
++		oem-vm-shm@fb400000 { reg = <0 0xfb400000 0 0x400000>; no-map; };
++		/* Preserve the bootloader's framebuffer allocation and node name. */
++		splash_region { reg = <0 0xfc400000 0 0x2b00000>; no-map; };
++		ramoops@a7000000 {
++			compatible = "ramoops";
++			reg = <0 0xa7000000 0 0x400000>;
++			console-size = <0x200000>;
++			pmsg-size = <0x200000>;
++			mem-type = <2>;
++			no-map;
++		};
++	};
++};
++
++&adspslpi_mem { reg = <0 0x9df00000 0 0x4680000>; };
++&hwfence_shbuf { reg = <0 0xff100000 0 0x2dd000>; };
++&oem_vm_mem { reg = <0 0xf7c00000 0 0x3800000>; };
++/* Keep the reservation, but do not assign modem memory during USB bring-up. */
++&rmtfs_mem { status = "disabled"; };
++&xo_board { clock-frequency = <76800000>; };
++&sleep_clk { clock-frequency = <32000>; };
++
++/* Firmware-owned pins listed by the stock Aurora TLMM description. */
++&tlmm { gpio-reserved-ranges = <8 4>, <36 4>, <42 1>, <74 1>; };
++
++&apps_rsc {
++	regulators-0 {
++		compatible = "qcom,pm8550-rpmh-regulators";
++		qcom,pmic-id = "b";
++		vreg_l5b: ldo5 {
++			regulator-name = "vreg_l5b";
++			regulator-min-microvolt = <3104000>;
++			regulator-max-microvolt = <3104000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++		vreg_l17b: ldo17 {
++			regulator-name = "vreg_l17b";
++			regulator-min-microvolt = <2504000>;
++			regulator-max-microvolt = <2504000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++		vreg_l15b: ldo15 {
++			regulator-name = "vreg_l15b";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++	regulators-1 {
++		compatible = "qcom,pm8550ve-rpmh-regulators";
++		qcom,pmic-id = "i";
++		vreg_l1i: ldo1 {
++			regulator-name = "vreg_l1i";
++			regulator-min-microvolt = <880000>;
++			regulator-max-microvolt = <912000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++		vreg_l3i: ldo3 {
++			regulator-name = "vreg_l3i";
++			regulator-min-microvolt = <1200000>;
++			regulator-max-microvolt = <1200000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++	regulators-2 {
++		compatible = "qcom,pm8550vs-rpmh-regulators";
++		qcom,pmic-id = "g";
++		vreg_l3g: ldo3 {
++			regulator-name = "vreg_l3g";
++			regulator-min-microvolt = <880000>;
++			regulator-max-microvolt = <912000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++};
++
++&pm8550b_eusb2_repeater {
++	vdd18-supply = <&vreg_l15b>;
++	vdd3-supply = <&vreg_l5b>;
++};
++&usb_1_hsphy {
++	vdd-supply = <&vreg_l1i>;
++	vdda12-supply = <&vreg_l3i>;
++	phys = <&pm8550b_eusb2_repeater>;
++	status = "okay";
++};
++&usb_dp_qmpphy {
++	vdda-phy-supply = <&vreg_l3i>;
++	vdda-pll-supply = <&vreg_l3g>;
++	status = "okay";
++};
++&usb_1 {
++	dr_mode = "peripheral";
++	maximum-speed = "high-speed";
++	status = "okay";
++};
++
++&apps_rsc {
++	regulators-3 {
++		compatible = "qcom,pm8550vs-rpmh-regulators";
++		qcom,pmic-id = "c";
++		vreg_l1c: ldo1 {
++			regulator-name = "vreg_l1c";
++			regulator-min-microvolt = <1100000>;
++			regulator-max-microvolt = <1200000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++	regulators-4 {
++		compatible = "qcom,pm8550vs-rpmh-regulators";
++		qcom,pmic-id = "d";
++		vreg_l1d: ldo1 {
++			regulator-name = "vreg_l1d";
++			regulator-min-microvolt = <912000>;
++			regulator-max-microvolt = <920000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++};
++
++&ufs_mem_hc {
++	reset-gpios = <&tlmm 210 GPIO_ACTIVE_LOW>;
++	vcc-supply = <&vreg_l17b>;
++	vcc-max-microamp = <1300000>;
++	vccq-supply = <&vreg_l1c>;
++	vccq-max-microamp = <1200000>;
++	status = "okay";
++};
++&ufs_mem_phy {
++	vdda-phy-supply = <&vreg_l1d>;
++	vdda-pll-supply = <&vreg_l3i>;
++	status = "okay";
++};

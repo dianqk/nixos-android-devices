@@ -34,6 +34,7 @@ lib.genAttrs (
     "PINCTRL_SHIKRA"
   ]
 ) (_: lib.kernel.no)
+// import ./nftables.nix { inherit lib; }
 // {
   # All supported devices use Qualcomm TLMM and SPMI PMIC GPIO/MPP. Generic
   # pinmux/pinconf helpers are selected by these drivers and remain untouched.

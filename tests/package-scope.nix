@@ -8,7 +8,11 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
   let
     env = flake.lib.mkBuildEnvironment { inherit buildSystem; };
     packages = flake.lib.mkPackageSet { inherit (env) pkgs; };
-    hostPackages = flake.lib.mkPackageSet { pkgs = env.buildPackages; };
+    # Host tools use a plain native package set, matching the flake outputs:
+    # cross buildPackages would carry target-specific wrapper substitutions.
+    hostPackages = flake.lib.mkPackageSet {
+      pkgs = import flake.inputs.nixpkgs { system = buildSystem; };
+    };
     overlayEnv = flake.lib.mkBuildEnvironment {
       inherit buildSystem;
       overlays = [

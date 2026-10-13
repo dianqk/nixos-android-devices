@@ -5,7 +5,8 @@
 支持等级：Tier 2。具体含义见[支持范围](../README.zh.md#支持等级)。
 
 可选的 `boot-kernel` 镜像直接启动固定的一代 Linux 系统；默认使用 U-Boot。
-见[配置与使用说明](../configuration.zh.md#额外的内核直启镜像sheng--clover)。
+见[配置与使用说明](../configuration.zh.md#额外的内核直启镜像sheng--clover)及
+[Android/U-Boot 兼容范围与 A/B 限制](../android-uboot-compatibility.zh.md)。
 
 ## 配置与安装
 
@@ -33,14 +34,13 @@
 唤醒源与 Wi-Fi 重载 workaround，不代表休眠已经验证。recovery 的 ADSP 固件同时支持
 Type-C/USB，不能为了精简而随意替换整份固件列表。
 
-Sheng 默认内核及安装系统示例使用固定版本的 Linux 7.2.6。Nixpkgs 7.3-rc5
-补丁集保留为 `kernel-testing`；排查其 Wi-Fi 路径期间，RAM recovery 示例显式选择
-此内核。来源记录和构建命令见
-[内核说明](../../pkgs/linux-kernel/sm8550/sheng/PATCHES.zh.md)。
+Sheng 安装系统与 RAM recovery 打包 Nixpkgs Linux 7.3-rc6 内核。
+内核输出为 `devices.sheng.kernel`；下文硬件结果基于 7.3-rc5 取得。
+来源记录和构建命令见[内核说明](../../pkgs/linux-kernel/sm8550/sheng/PATCHES.zh.md)。
 
-Sheng 已通过刷入 B 槽的 U-Boot/EFI 启动 7.2.6 示例；普通重启后的 USB/SSH 与
-Wi-Fi 已验证。RAM 启动已验证 U-Boot 菜单显示和音量/电源选择，但进入 Linux
-后可能黑屏；无 USB 主机时的启动仍未验证，详见[已知限制](hardware.zh.md#已知限制)。
+7.3 已通过 B 槽 U-Boot/EFI 启动、直接显示桌面、Wi-Fi 及 USB/Wi-Fi SSH 验证。
+RAM 启动已验证 U-Boot 菜单显示和音量/电源选择，请保留可用的回退代。
+无 USB 主机时的启动仍未验证，详见[已知限制](hardware.zh.md#已知限制)。
 使用独立 1 GiB FAT `linux-boot` ESP 和 ext4 `linux`，固件位于 `boot_b`，保留 A 和 super。
 尚需手动完成的准备步骤见[安装准备](first-install.zh.md)。
 
@@ -50,8 +50,8 @@ Wi-Fi 已验证。RAM 启动已验证 U-Boot 菜单显示和音量/电源选择�
 仓库演示产物使用 `.#devices.sheng.<role>`，如 `.#devices.sheng.system`。使用 `lib.mkArtifacts` 得到与配置匹配的产物，
 详见[产物说明](../configuration.zh.md#选择构建产物)。
 
-- 日常系统更新：[USB SSH](../usb-signaller.md)。
-- 启动失败与离线更新：[RAM recovery](../recovery.md)。
+- 日常系统更新：[USB SSH](../usb-signaller.zh.md)。
+- 启动失败与离线更新：[RAM recovery](../recovery.zh.md)。
 - Wi-Fi、音频、显示等支持程度：[硬件参考](hardware.zh.md)。
 - 构建/求值问题：[配置排障](../configuration.zh.md#更新恢复与排障)。
 - recovery 更新：[recovery 操作](recovery.zh.md)。

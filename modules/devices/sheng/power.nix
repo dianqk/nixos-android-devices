@@ -1,4 +1,4 @@
-# Optional suspend workarounds used by the downstream Sheng system profile.
+# Optional, opt-in Sheng suspend workarounds (wake-source filtering and Wi-Fi reload).
 {
   config,
   lib,
@@ -41,21 +41,55 @@ let
     name = "sheng-ath12k-sleep";
     runtimeInputs = [
       pkgs.kmod
+      pkgs.coreutils
       pkgs.systemd
       shengWakePolicy
     ];
     text = ''
+      state_dir=/run/sheng-ath12k-sleep
+      restore_iwd() {
+        if [ -e "$state_dir/iwd-stopped" ]; then
+          rm -f "$state_dir/iwd-stopped"
+          systemctl start --no-block iwd.service
+        fi
+      }
       case "''${1:-}" in
         pre)
+          # A running IWD can raise a hotplugged interface before udev applies
+          # its .link MAC address (EBUSY). Prevent D-Bus reactivation until the
+          # reloaded interface has completed udev initialization.
+          if systemctl is-active --quiet iwd.service; then
+            mkdir -p "$state_dir"
+            touch "$state_dir/iwd-stopped"
+            trap 'restore_iwd' ERR
+            systemctl stop iwd.service
+          fi
           if [ -d /sys/module/ath12k_wifi7 ]; then
             echo "removing ath12k_wifi7 before suspend"
             modprobe --remove ath12k_wifi7
           fi
           ;;
         post)
+          trap 'restore_iwd' EXIT
           echo "loading ath12k_wifi7 after resume"
           modprobe ath12k_wifi7
-          udevadm settle --timeout=15 || true
+          # Firmware probing continues after modprobe returns. An empty udev
+          # queue alone does not mean the replacement network interface exists.
+          found=false
+          for ((attempt = 0; attempt < 100; attempt++)); do
+            for interface in /sys/bus/pci/devices/0000:01:00.0/net/*; do
+              if [ -e "$interface" ]; then
+                udevadm wait --initialized=yes --timeout=10 "$interface"
+                found=true
+                break 2
+              fi
+            done
+            sleep 0.1
+          done
+          if [ "$found" != true ]; then
+            echo "Sheng Wi-Fi interface did not reappear" >&2
+            exit 1
+          fi
           sheng-wake-policy
           ;;
         *)
@@ -81,6 +115,13 @@ in
             Type = "oneshot";
             ExecStart = "${shengWakePolicy}/bin/sheng-wake-policy";
           };
+        };
+
+        # NM may D-Bus-activate IWD even after an explicit stop. Keep it from
+        # racing udev on resume; the helper clears this runtime gate and starts
+        # IWD again only if it was active before the cold cycle.
+        systemd.services.iwd = lib.mkIf config.networking.wireless.iwd.enable {
+          unitConfig.ConditionPathExists = "!/run/sheng-ath12k-sleep/iwd-stopped";
         };
 
         systemd.services.sheng-ath12k-sleep = {

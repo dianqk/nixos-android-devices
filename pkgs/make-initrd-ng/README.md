@@ -1,5 +1,7 @@
 # Mobile initrd dependency collector
 
+[中文](README.zh.md)
+
 This wraps the pinned Nixpkgs `makeInitrdNGTool` with a small source patch.
 The mobile systemd-initrd module passes this native build-host tool to
 `makeInitrdNG`; systemd and device libraries are unchanged.

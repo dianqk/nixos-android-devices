@@ -1,4 +1,8 @@
 [
+  ./patches/upstream/0001-lucid-ole-preserve-enabled-pll.patch
+  ../../patches/iris-hfi-gen2-decode-order.patch
+  ../../patches/iris-hfi-gen2-capture-pool.patch
+  ../../patches/pcie-qcom-iommu-cells.patch
   ./patches/7.3/0001-sm8550-prerequisites.patch
   ./patches/7.3/0002-sheng-board.patch
   ./patches/7.3/0003-sheng-bt-address.patch
@@ -10,6 +14,7 @@
   ./patches/7.3/0009-nt36532e-touch.patch
   ./patches/7.3/0010-nanosic-keyboard.patch
   ./patches/7.3/0011-xiaomi-battmgr.patch
+  ../../patches/cs35l43-codec.patch
   ./patches/7.3/0012-cs35l43-codec.patch
   ./patches/7.3/0013-sheng-audio.patch
   ./patches/7.3/0014-ov02b1b-sensor.patch
@@ -21,6 +26,16 @@
   ./patches/7.3/0020-dp-dsc-fec.patch
   ./patches/7.3/0021-ath12k-wcn7850-mac.patch
   ./patches/7.3/0022-ath12k-sheng-firmware.patch
-  ./patches/7.3/0023-ath12k-single-pdev-reg.patch
+  ../../patches/ath12k-single-pdev-reg.patch
   ./patches/7.3/0024-sheng-fingerprint.patch
+  ./patches/7.3/0025-ath12k-sheng-mac-buffer-ring.patch
+  ../../patches/gmu-sync-state/0001.patch
+  ../../patches/gmu-sync-state/0002.patch
+  ../../patches/gmu-sync-state/0003.patch
+  ../../patches/gmu-sync-state/0004.patch
+  ../../patches/gmu-sync-state/0005.patch
+  ./patches/7.3/0026-sheng-unused-crypto.patch
+  ./patches/upstream/0002-gcc-sm8550-cx-binding.patch
+  ./patches/upstream/0003-gcc-sm8550-cx-runtime-pm.patch
+  ./patches/upstream/0004-sm8550-gcc-cx-domain.patch
 ]

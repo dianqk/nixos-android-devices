@@ -10,6 +10,8 @@
   ./patches/local/0008-pmi8998-fg-lifecycle.patch
   ./patches/local/0009-nt35596s-prepare.patch
   ./patches/local/0011-wcn3990-vht.patch
+  ../../patches/ath10k-tlv-dfs-cfreq2.patch
+  ../../patches/ath10k-tlv-peer-160mhz.patch
   ./patches/local/0012-panel-7.3-api.patch
   ./patches/linux-rfc/0013-ath10k-split-amsdu-rfc-v3.patch
   ./patches/local/0014-venus-mapped-eos-input.patch
@@ -19,9 +21,21 @@
   ./patches/local/0018-polaris-cameras.patch
   ./patches/linux-rfc/0019-mdss-boot-power-domain.patch
   ./patches/local/0020-clk-orphan-parent-enable.patch
-  ./patches/linux-rfc/0021-qrtr-hello-before-services.patch
-  ./patches/local/0022-qrtr-coalesce-hello.patch
+  ../../patches/qrtr-hello/0021-qrtr-hello-before-services.patch
+  ../../patches/qrtr-hello/0022-qrtr-coalesce-hello.patch
   ./patches/local/0023-polaris-ramoops.patch
   ./patches/local/0024-polaris-rmtfs-guards.patch
   ./patches/local/0025-polaris-ipa.patch
+  ../../patches/ssc-fastrpc-pdr.patch
+  ../../patches/fastrpc-sdsp-dmabuf-pool.patch
+  ./patches/local/0026-polaris-slpi.patch
+  ./patches/local/0027-polaris-fastrpc-sessions.patch
+  ./patches/sdm845-mainline/0028-wled-irq-balance.patch
+  ./patches/local/0029-wled-irq-state.patch
+  ../../patches/gmu-sync-state/0001.patch
+  ../../patches/gmu-sync-state/0002.patch
+  ../../patches/gmu-sync-state/0003.patch
+  ../../patches/gmu-sync-state/0004.patch
+  ../../patches/gmu-sync-state/0005.patch
+  ./patches/local/0030-polaris-unused-crypto.patch
 ]

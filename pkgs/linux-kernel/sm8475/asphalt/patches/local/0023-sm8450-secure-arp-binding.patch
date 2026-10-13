@@ -1,0 +1,64 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 3 Oct 2026 17:20:00 +0800
+Subject: [PATCH] dt-bindings: media: describe the SM8450 secure ARP stream
+
+The encoder accesses ARP through a dedicated nonpixel security stream even
+for ordinary sessions. Describe its separate SMMU identity and page ownership.
+
+Hardware reference:
+https://github.com/lolipuru/kernel_lenovo_sm8475-modules/blob/0ba8898cd4d9201c0942d4145813a98d1a93389a/qcom/opensource/video-driver/driver/msm_vidc_driver.c
+
+diff --git a/Documentation/devicetree/bindings/media/qcom,sm8250-venus.yaml b/Documentation/devicetree/bindings/media/qcom,sm8250-venus.yaml
+--- a/Documentation/devicetree/bindings/media/qcom,sm8250-venus.yaml
++++ b/Documentation/devicetree/bindings/media/qcom,sm8250-venus.yaml
+@@ -73,6 +73,26 @@
+       - const: bus
+       - const: core
+ 
++  secure-arp:
++    type: object
++    description: |
++      SM8450 encoder ARP traffic uses a separate protected SMMU stream even
++      for nonsecure sessions. Page tables are shared with CP_NON_PIXEL;
++      payload pages belong exclusively to that VMID.
++    properties:
++      compatible:
++        const: qcom,sm8450-iris-secure-arp
++      iommus:
++        maxItems: 1
++      qcom,iommu-vmid:
++        $ref: /schemas/types.yaml#/definitions/uint32
++        const: 11
++    required:
++      - compatible
++      - iommus
++      - qcom,iommu-vmid
++    additionalProperties: false
++
+   video-decoder:
+     type: object
+ 
+diff --git a/arch/arm64/boot/dts/qcom/sm8450.dtsi b/arch/arm64/boot/dts/qcom/sm8450.dtsi
+--- a/arch/arm64/boot/dts/qcom/sm8450.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8450.dtsi
+@@ -3228,6 +3228,7 @@
+ 
+ 			iommus = <&apps_smmu 0x2180 0x0400>,
+ 				 <&apps_smmu 0x2187 0x0400>;
++
+ 			memory-region = <&video_mem>;
+ 
+ 			resets = <&gcc GCC_VIDEO_AXI0_CLK_ARES>,
+@@ -3235,6 +3236,12 @@
+ 			reset-names = "bus", "core";
+ 
+ 			status = "disabled";
++
++			secure-arp {
++				compatible = "qcom,sm8450-iris-secure-arp";
++				iommus = <&apps_smmu 0x2184 0x0400>;
++				qcom,iommu-vmid = <11>;
++			};
+ 
+ 			venus_opp_table: opp-table {
+ 				compatible = "operating-points-v2";

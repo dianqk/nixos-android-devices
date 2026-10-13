@@ -63,10 +63,10 @@ in
       ]
       ++ cfg.platformKernelParams
       ++ [
-        # Keep the framebuffer console as the last console so kernel and
-        # systemd boot/shutdown logs are visible on the display; without it
-        # /dev/console is the serial port only.
-        "console=tty0"
+        # Full recovery owns tty2. Pin boot/status output to tty1: tty0 follows
+        # the foreground VT and would overwrite the menu after it takes over.
+        # Keep the display console last so /dev/console remains visible.
+        (if cfg.recovery.enable && !cfg.recovery.minimal then "console=tty1" else "console=tty0")
       ]
       ++ cfg.hardwareKernelParams;
     # Camera applications using the software ISP allocate from this DMA heap.

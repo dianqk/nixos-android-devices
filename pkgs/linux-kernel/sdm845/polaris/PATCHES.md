@@ -2,8 +2,11 @@
 
 [中文](PATCHES.zh.md) · [Polaris index](../../../../docs/polaris/README.md)
 
-The package uses `linuxPackages_testing.kernel` from the locked Nixpkgs input.
-It targets Linux 7.3-rc5. [`series.nix`](series.nix) lists active patches in
+The queue targets Linux 7.3-rc6; hardware results for this device were obtained
+with earlier 7.x kernels. See the [shared kernel status](../../README.md).
+
+The package selects `linuxPackages_testing.kernel` from Nixpkgs.
+It targets Linux 7.3-rc6. [`series.nix`](series.nix) lists active patches in
 application order. The package builds `qcom/sdm845-xiaomi-polaris.dtb` and
 Android-compatible `Image.gz` with LLVM 23.
 
@@ -19,7 +22,7 @@ The q6asm alignment patch declares that format and 24 significant bits.
 Camera support uses the SDM845 community IMX363 driver from
 [`dbc31cca7`](https://gitlab.com/sdm845-mainline/linux/-/commit/dbc31cca7cadbb97c2bee0ff7c8a3f86a7b25273)
 and the upstream OV5675 driver. The IMX363 import refreshes only Kconfig and
-Makefile context for Linux 7.3-rc5; its added code is unchanged. Local patches
+Makefile context for Linux 7.3; its added code is unchanged. Local patches
 hold IMX363 reset during probe,
 control the Polaris module-enable GPIO, propagate clock failures, and connect
 the front and main rear sensors to CAMSS.
@@ -38,7 +41,8 @@ The QRTR nameserver change retains the `ns.c` portion of
 [Takashi Iwai's HELLO proposal](https://lore.kernel.org/all/878q55sfxo.wl-tiwai@suse.de/),
 including original authorship and message, with the partial import documented.
 A separate local patch coalesces HELLO sends under the endpoint lock, retaining
-proactive registration while sending HELLO before service announcements.
+proactive registration while sending HELLO before service announcements. Both now live in the shared
+`pkgs/linux-kernel/patches/qrtr-hello/` directory, which Aurora also uses.
 These changes target Polaris initial SMD startup; MHI suspend/resume and arbitrary
 transport failure recovery are outside the verified scope.
 
@@ -74,3 +78,22 @@ These patches retain their original mail headers and commit messages.
   and completed resource reclaim; repeated isolated stop/start tests passed.
   This does not establish which IPA hardware or handshake dependency caused
   the failure, nor does it validate complete phone poweroff.
+
+- `0027-polaris-fastrpc-sessions.patch` enables two connections on the existing
+  SLPI context bank: the native listener holds a coherent-memory allocator
+  descriptor and a separate sensor RPC transport descriptor. The inherited
+  single-session limit makes its second open fail with `EBUSY`, preventing
+  registry initialization and eventually triggering the sensor watchdog.
+  SSC clients communicate over QRTR and do not require additional sessions.
+
+- `fastrpc-sdsp-dmabuf-pool.patch` allocates exported buffers for SDSP without
+  an IOMMU from its already shared reserved pool, matching RPC metadata.
+  Exporting ordinary CMA buffers otherwise stalls the listener's first data
+  request on Polaris. The complete allocation must stay inside the shared
+  region, including when the DMA allocator falls back after pool exhaustion.
+  Buffers retain their allocation device and original DMA handle until release.
+  VMIDs and subsystem-restart ownership policy are unchanged.
+
+## Sync state
+
+The [shared GMU series](../../patches/gmu-sync-state/README.md) binds a driver to the GMU, and the `unused-crypto` patch disables the unused QCE node (Linux 7.3 marks its driver BROKEN), so supplier `sync_state()` no longer waits for the whole boot.

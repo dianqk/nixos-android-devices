@@ -1,0 +1,23 @@
+Subject: [PATCH] power: supply: qcom_battmgr: default property protocol to charge units
+
+SM8350 and SM8550 firmware reports charge capacity through individual
+properties and never sends BATTMGR_BAT_INFO. Leaving the zero-initialized
+unit at mWh makes CHARGE_FULL and CHARGE_FULL_DESIGN return ENODATA even
+when the firmware has returned valid microamp-hour values.
+
+Default to mAh. The SC8280XP/X1E80100 information response still replaces
+this with the firmware's explicit unit before exposing capacity values.
+This applies to the shared protocol, not a particular board.
+
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -1646,6 +1646,9 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	psy_cfg.drv_data = battmgr;
+ 	psy_cfg.fwnode = dev_fwnode(&adev->dev);
+ 
++	/* Property-based firmware reports charge; info-based firmware overrides it. */
++	battmgr->unit = QCOM_BATTMGR_UNIT_mAh;
++
+ 	psy_cfg_supply.drv_data = battmgr;
+ 	psy_cfg_supply.fwnode = dev_fwnode(&adev->dev);
+ 	psy_cfg_supply.supplied_to = qcom_battmgr_battery;

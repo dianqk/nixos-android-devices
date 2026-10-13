@@ -9,6 +9,14 @@ finds outer-GPT `linux-boot` across UFS LUNs and loads
 Firmware operations target B only; A and `super` remain untouched. EFI capsule
 updates are disabled.
 
+When ABL supplies the exact `androidboot.mode=charger` boot argument, firmware
+loads the dedicated charger image `/EFI/android-devices/charger.efi` from the
+ESP; see [off-mode charging](../../../docs/asphalt/charging.md). Other startup
+modes, including ordinary startup with a USB cable connected, boot EFI
+automatically. The argument is read from U-Boot's control device tree before
+EFI replaces the operating system's boot arguments. Both paths keep the B-slot
+success confirmation.
+
 The firmware requires an installed kernel with the ABL splash reservation and
 Lucid OLE PLL preservation patch. That pair keeps the inherited display clocks
 running through the Linux handoff. The internal display and touch have been
@@ -40,9 +48,8 @@ compilation and resulting files must be checked when updating that baseline.
 ## Build and device status
 
 ```sh
-nix build .#devices.asphalt.u-boot --builders '' \
-  --out-link tmp/systemd-artifacts/devices.asphalt.u-boot
-python3 tests/asphalt-uboot.py FIRMWARE_DIRECTORY tmp/systemd-artifacts/devices.asphalt.u-boot
+nix build .#devices.asphalt.u-boot --out-link result-u-boot
+python3 tests/asphalt-uboot.py FIRMWARE_DIRECTORY result-u-boot
 ```
 
 The package cross-builds on x86_64 for AArch64. Hardware has booted through UFS,

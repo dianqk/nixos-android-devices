@@ -4,5 +4,5 @@ rustPlatform.buildRustPackage {
   version = "0.1.0";
   src = ./.;
   cargoLock.lockFile = ./Cargo.lock;
-  buildFeatures = [ "device-${device}" ] ++ features;
+  buildFeatures = [ "device-${device}" "host-key" ] ++ features;
 }

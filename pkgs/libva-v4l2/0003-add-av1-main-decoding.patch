@@ -1,0 +1,1210 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Mon, 5 Oct 2026 23:40:00 +0800
+Subject: [PATCH] Add AV1 Main reconstruction for AV1-capable Iris decoders
+
+Expose Profile0 only when the selected Iris device enumerates AV1. Select
+NV12/P010 from the VA surface, since both bit depths share this profile.
+Reconstruct sequence/frame/tile OBUs, segmentation, restoration and global
+motion from VA decode parameters; retain stock FFmpeg and mpv.
+
+VA omits refresh_frame_flags. Keep the DPB unchanged for the initial decode,
+then infer the exact refresh from the following picture's reference map and
+replay referenced pictures into internal discard surfaces. Observe replay
+errors before decoding dependent pictures. This trades extra decoding for
+correct eight-slot reference/CDF/motion state without guessing eviction.
+
+Film grain, superres, intrabc, hidden keyframes, switch frames, large-scale
+tiles and dynamic dimensions are explicitly rejected. Add pure header/state
+tests. Hardware throughput and playback require separate device validation.
+
+Original local implementation, against AV1 syntax and the libva ABI:
+https://aomediacodec.github.io/av1-spec/av1-spec.html
+https://github.com/intel/libva/blob/2.24.0/va/va_dec_av1.h
+---
+diff --git a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -49,6 +49,7 @@
+ 
+ sources = files(
+   'src/backend.cpp',
++  'src/av1.cpp',
+   'src/decoder.cpp',
+   'src/encoder.cpp',
+   'src/gpu-copy.cpp',
+@@ -92,3 +93,7 @@
+   run_target('format', command: [formatter, '-i', '--style=file', sources, headers])
+   run_target('format-check', command: [formatter, '--dry-run', '--Werror', '--style=file', sources, headers])
+ endif
++
++# Pure header/state tests; no Iris device or video fixtures required.
++av1_test = executable('av1-test', 'tests/av1.cpp', dependencies: [va, drm, threads])
++test('av1-header-state', av1_test)
+diff --git a/src/av1.cpp b/src/av1.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/av1.cpp
+@@ -0,0 +1,578 @@
++// SPDX-License-Identifier: MIT
++#include "internal.hpp"
++#include <array>
++
++namespace irisva {
++namespace {
++constexpr auto invalid = VA_STATUS_ERROR_INVALID_BUFFER;
++constexpr auto unsupported = VA_STATUS_ERROR_UNIMPLEMENTED;
++unsigned log2ceil(unsigned n) {
++    unsigned r = 0;
++    for (unsigned v = n ? n - 1 : 0; v; v >>= 1)
++        ++r;
++    return r;
++}
++unsigned tile_log(unsigned block, unsigned target) {
++    unsigned n = 0;
++    while ((block << n) < target)
++        ++n;
++    return n;
++}
++struct Bits {
++    std::vector<uint8_t> data;
++    unsigned pos = 0;
++    void bit(unsigned v) {
++        if (!(pos & 7))
++            data.push_back(0);
++        data.back() |= (v & 1) << (7 - (pos++ & 7));
++    }
++    void put(uint32_t v, unsigned n) {
++        check(n <= 32 && (n == 32 || (v >> n) == 0), "AV1 field width/range", invalid);
++        for (unsigned i = n; i; --i)
++            bit(v >> (i - 1));
++    }
++    void su(int v, unsigned n) {
++        check(n > 0 && n < 32 && v >= -(1 << (n - 1)) && v < (1 << (n - 1)),
++              "AV1 signed field range", invalid);
++        put(uint32_t(v) & ((1u << n) - 1), n);
++    }
++    void align() {
++        while (pos & 7)
++            bit(0);
++    }
++    void trailing() {
++        bit(1);
++        align();
++    }
++    void ns(unsigned v, unsigned n) {
++        check(n && v < n, "AV1 non-symmetric field", invalid);
++        if (n == 1)
++            return;
++        unsigned w = log2ceil(n), m = (1u << w) - n;
++        if (v < m)
++            put(v, w - 1);
++        else {
++            put((v + m) >> 1, w - 1);
++            bit((v + m) & 1);
++        }
++    }
++};
++void leb(std::vector<uint8_t> &out, size_t n) {
++    do {
++        uint8_t b = n & 127;
++        n >>= 7;
++        out.push_back(b | (n ? 128 : 0));
++    } while (n);
++}
++void obu(std::vector<uint8_t> &out, unsigned type, const std::vector<uint8_t> &payload) {
++    out.push_back(uint8_t((type << 3) | 2));
++    leb(out, payload.size());
++    out.insert(out.end(), payload.begin(), payload.end());
++}
++std::vector<uint8_t> sequence(const VADecPictureParameterBufferAV1 &p) {
++    const auto &s = p.seq_info_fields.fields;
++    Bits b;
++    b.put(0, 3);
++    b.bit(0);
++    b.bit(0); // Main, ordinary sequence
++    b.bit(0);
++    b.bit(0);
++    b.put(0, 5); // timing, initial delay, one operating point
++    b.put(0, 12);
++    b.put(17, 5);
++    b.bit(0); // level 6.1, main tier
++    b.put(15, 4);
++    b.put(15, 4);
++    b.put(p.frame_width_minus1, 16);
++    b.put(p.frame_height_minus1, 16);
++    b.bit(0); // No frame IDs: VA identifies references by surface instead.
++    b.bit(s.use_128x128_superblock);
++    b.bit(s.enable_filter_intra);
++    b.bit(s.enable_intra_edge_filter);
++    b.bit(s.enable_interintra_compound);
++    b.bit(s.enable_masked_compound);
++    b.bit(1); // warped motion permitted
++    b.bit(s.enable_dual_filter);
++    b.bit(s.enable_order_hint);
++    if (s.enable_order_hint) {
++        b.bit(s.enable_jnt_comp);
++        b.bit(1);
++    }
++    b.bit(1);
++    b.bit(1); // per-frame screen-content/integer-MV selection
++    if (s.enable_order_hint)
++        b.put(p.order_hint_bits_minus_1, 3);
++    b.bit(1);
++    b.bit(s.enable_cdef);
++    b.bit(1); // superres/restoration permission
++    b.bit(p.bit_depth_idx);
++    b.bit(0); // high-bitdepth, not monochrome
++    b.bit(1);
++    b.put(2, 8);
++    b.put(2, 8);
++    b.put(p.matrix_coefficients, 8);
++    b.bit(s.color_range);
++    b.put(0, 2);
++    b.bit(1); // 4:2:0 chroma position, separate UV deltas
++    b.bit(0); // film grain is explicitly rejected below
++    b.trailing();
++    return b.data;
++}
++void tiles(Bits &b, const VADecPictureParameterBufferAV1 &p) {
++    unsigned sb = p.seq_info_fields.fields.use_128x128_superblock ? 128 : 64;
++    unsigned cols = (p.frame_width_minus1 + sb) / sb, rows = (p.frame_height_minus1 + sb) / sb;
++    unsigned maxw = 4096 / sb, maxarea = (4096 * 2304) / (sb * sb);
++    unsigned mincols = tile_log(maxw, cols),
++             minall = std::max(mincols, tile_log(maxarea, cols * rows));
++    unsigned cl = log2ceil(p.tile_cols), rl = log2ceil(p.tile_rows);
++    b.bit(p.pic_info_fields.bits.uniform_tile_spacing_flag);
++    if (p.pic_info_fields.bits.uniform_tile_spacing_flag) {
++        unsigned maxcols = log2ceil(std::min(cols, 64u)), maxrows = log2ceil(std::min(rows, 64u));
++        check(cl >= mincols && cl <= maxcols, "AV1 tile columns", invalid);
++        for (unsigned i = mincols; i < cl; ++i)
++            b.bit(1);
++        if (cl < maxcols)
++            b.bit(0);
++        unsigned minrows = minall > cl ? minall - cl : 0;
++        check(rl >= minrows && rl <= maxrows, "AV1 tile rows", invalid);
++        for (unsigned i = minrows; i < rl; ++i)
++            b.bit(1);
++        if (rl < maxrows)
++            b.bit(0);
++        unsigned tile_width = (cols + (1u << cl) - 1) >> cl;
++        unsigned tile_height = (rows + (1u << rl) - 1) >> rl;
++        check(p.tile_cols == (cols + tile_width - 1) / tile_width &&
++                  p.tile_rows == (rows + tile_height - 1) / tile_height,
++              "AV1 uniform tile coverage", invalid);
++    } else {
++        unsigned remaining = cols, widest = 0;
++        for (unsigned i = 0; i < p.tile_cols; ++i) {
++            unsigned w = i + 1 == p.tile_cols ? remaining : unsigned(p.width_in_sbs_minus_1[i]) + 1;
++            check(w && w <= remaining, "AV1 tile width", invalid);
++            b.ns(w - 1, std::min(remaining, maxw));
++            remaining -= w;
++            widest = std::max(widest, w);
++        }
++        check(!remaining, "AV1 tile width coverage", invalid);
++        maxarea = minall ? (cols * rows) >> (minall + 1) : cols * rows;
++        unsigned maxh = std::max(maxarea / widest, 1u);
++        remaining = rows;
++        for (unsigned i = 0; i < p.tile_rows; ++i) {
++            unsigned h =
++                i + 1 == p.tile_rows ? remaining : unsigned(p.height_in_sbs_minus_1[i]) + 1;
++            check(h && h <= remaining, "AV1 tile height", invalid);
++            b.ns(h - 1, std::min(remaining, maxh));
++            remaining -= h;
++        }
++        check(!remaining, "AV1 tile height coverage", invalid);
++    }
++    if (cl + rl) {
++        check(p.context_update_tile_id < p.tile_cols * p.tile_rows, "AV1 context tile", invalid);
++        b.put(p.context_update_tile_id, cl + rl);
++        b.put(3, 2);
++    }
++}
++void deltaq(Bits &b, int v) {
++    b.bit(v != 0);
++    if (v)
++        b.su(v, 7);
++}
++bool quantization(Bits &b, const VADecPictureParameterBufferAV1 &p, unsigned primary) {
++    b.put(p.base_qindex, 8);
++    deltaq(b, p.y_dc_delta_q);
++    b.bit(1);
++    deltaq(b, p.u_dc_delta_q);
++    deltaq(b, p.u_ac_delta_q);
++    deltaq(b, p.v_dc_delta_q);
++    deltaq(b, p.v_ac_delta_q);
++    const auto &q = p.qmatrix_fields.bits;
++    b.bit(q.using_qmatrix);
++    if (q.using_qmatrix) {
++        b.put(q.qm_y, 4);
++        b.put(q.qm_u, 4);
++        b.put(q.qm_v, 4);
++    }
++    const auto &s = p.seg_info;
++    bool enabled = s.segment_info_fields.bits.enabled;
++    b.bit(enabled);
++    if (enabled) {
++        if (primary != 7) {
++            b.bit(s.segment_info_fields.bits.update_map);
++            if (s.segment_info_fields.bits.update_map)
++                b.bit(s.segment_info_fields.bits.temporal_update);
++            b.bit(1); // Send resolved feature values rather than relying on inherited header state.
++        }
++        const unsigned widths[] = {8, 6, 6, 6, 6, 3, 0, 0};
++        for (unsigned i = 0; i < 8; ++i)
++            for (unsigned j = 0; j < 8; ++j) {
++                bool on = s.feature_mask[i] & (1u << j);
++                b.bit(on);
++                if (on && widths[j]) {
++                    int v = s.feature_data[i][j];
++                    check(std::abs(v) < (1 << widths[j]), "AV1 segment feature range", invalid);
++                    if (j < 5) {
++                        b.su(v, widths[j] + 1);
++                    } else {
++                        check(v >= 0, "AV1 unsigned segment feature", invalid);
++                        b.put(v, widths[j]);
++                    }
++                }
++            }
++    }
++    bool lossless = true;
++    for (unsigned i = 0; i < 8; ++i) {
++        int qindex = p.base_qindex;
++        if (enabled && (s.feature_mask[i] & 1))
++            qindex = std::clamp(qindex + s.feature_data[i][0], 0, 255);
++        lossless &= !qindex && !p.y_dc_delta_q && !p.u_dc_delta_q && !p.u_ac_delta_q &&
++                    !p.v_dc_delta_q && !p.v_ac_delta_q;
++    }
++    const auto &m = p.mode_control_fields.bits;
++    if (p.base_qindex) {
++        b.bit(m.delta_q_present_flag);
++        if (m.delta_q_present_flag)
++            b.put(m.log2_delta_q_res, 2);
++    }
++    if (m.delta_q_present_flag && !p.pic_info_fields.bits.allow_intrabc) {
++        b.bit(m.delta_lf_present_flag);
++        if (m.delta_lf_present_flag) {
++            b.put(m.log2_delta_lf_res, 2);
++            b.bit(m.delta_lf_multi);
++        }
++    }
++    return lossless;
++}
++void filters(Bits &b, const VADecPictureParameterBufferAV1 &p, bool lossless) {
++    if (lossless || p.pic_info_fields.bits.allow_intrabc)
++        return;
++    b.put(p.filter_level[0], 6);
++    b.put(p.filter_level[1], 6);
++    if (p.filter_level[0] || p.filter_level[1]) {
++        b.put(p.filter_level_u, 6);
++        b.put(p.filter_level_v, 6);
++    }
++    b.put(p.loop_filter_info_fields.bits.sharpness_level, 3);
++    b.bit(p.loop_filter_info_fields.bits.mode_ref_delta_enabled);
++    if (p.loop_filter_info_fields.bits.mode_ref_delta_enabled) {
++        b.bit(1);
++        for (int d : p.ref_deltas) {
++            b.bit(1);
++            b.su(d, 7);
++        }
++        for (int d : p.mode_deltas) {
++            b.bit(1);
++            b.su(d, 7);
++        }
++    }
++    if (p.seq_info_fields.fields.enable_cdef) {
++        check(p.cdef_bits <= 3, "AV1 CDEF size", invalid);
++        b.put(p.cdef_damping_minus_3, 2);
++        b.put(p.cdef_bits, 2);
++        for (unsigned i = 0; i < (1u << p.cdef_bits); ++i) {
++            b.put(p.cdef_y_strengths[i], 6);
++            b.put(p.cdef_uv_strengths[i], 6);
++        }
++    }
++    const auto &r = p.loop_restoration_fields.bits;
++    unsigned t[] = {r.yframe_restoration_type, r.cbframe_restoration_type,
++                    r.crframe_restoration_type};
++    // VA stores AV1 semantic restoration type: NONE=0, WIENER=1, SGRPROJ=2, SWITCHABLE=3.
++    const unsigned syntax[] = {0, 2, 3, 1};
++    for (unsigned v : t)
++        b.put(syntax[v], 2);
++    if (t[0] || t[1] || t[2]) {
++        unsigned shift = r.lr_unit_shift;
++        check(shift <= 2, "AV1 restoration unit shift", invalid);
++        if (p.seq_info_fields.fields.use_128x128_superblock) {
++            check(shift >= 1, "AV1 restoration unit", invalid);
++            b.bit(shift - 1);
++        } else {
++            b.bit(shift > 0);
++            if (shift > 0)
++                b.bit(shift > 1);
++        }
++        if (t[1] || t[2])
++            b.bit(r.lr_uv_shift);
++    }
++}
++// AV1 section 5.9.24: signed reference-centered subexponential parameters.
++void subexp(Bits &b, unsigned value, unsigned count) {
++    unsigned i = 0, base = 0;
++    for (;;) {
++        unsigned width = i ? i + 2 : 3, step = 1u << width;
++        if (count <= base + 3 * step) {
++            b.ns(value - base, count - base);
++            return;
++        }
++        bool more = value >= base + step;
++        b.bit(more);
++        if (!more) {
++            b.put(value - base, width);
++            return;
++        }
++        base += step;
++        ++i;
++    }
++}
++void motion_parameter(Bits &b, int value, int reference, unsigned index, unsigned type,
++                      bool high_precision) {
++    unsigned precision = index < 2 ? (type == 1 ? 3 - !high_precision : 6) : 15;
++    unsigned magnitude = index < 2 ? (type == 1 ? 9 - !high_precision : 12) : 12;
++    unsigned shift = 16 - precision;
++    int offset = (index == 2 || index == 5) ? 1 << precision : 0;
++    int limit = 1 << magnitude;
++    int v = (value >> shift) - offset, r = (reference >> shift) - offset;
++    check(v >= -limit && v <= limit && r >= -limit && r <= limit, "AV1 global motion range",
++          invalid);
++    unsigned count = 2 * limit + 1, uv = v + limit, ur = r + limit;
++    if (2 * ur > count) {
++        uv = count - 1 - uv;
++        ur = count - 1 - ur;
++    }
++    unsigned code = uv > 2 * ur ? uv : uv >= ur ? 2 * (uv - ur) : 2 * (ur - uv) - 1;
++    subexp(b, code, count);
++}
++Av1Motion motion_values(const VADecPictureParameterBufferAV1 &p, bool intra) {
++    Av1Motion values{};
++    for (unsigned i = 0; i < 7; ++i) {
++        if (intra || p.wm[i].wmtype == VAAV1TransformationIdentity) {
++            values[i][2] = values[i][5] = 1 << 16;
++        } else
++            for (unsigned j = 0; j < 6; ++j)
++                values[i][j] = p.wm[i].wmmat[j];
++    }
++    return values;
++}
++void motion(Bits &b, const VADecPictureParameterBufferAV1 &p, const Av1Motion &current,
++            const Av1Motion &previous) {
++    for (unsigned i = 0; i < 7; ++i) {
++        unsigned type = p.wm[i].wmtype;
++        check(type <= 3 && !p.wm[i].invalid, "AV1 invalid global motion", invalid);
++        b.bit(type != 0);
++        if (!type)
++            continue;
++        b.bit(type == 2);
++        if (type != 2)
++            b.bit(type == 1);
++        auto write = [&](unsigned j) {
++            motion_parameter(b, current[i][j], previous[i][j], j, type,
++                             p.pic_info_fields.bits.allow_high_precision_mv);
++        };
++        if (type >= 2) {
++            write(2);
++            write(3);
++        }
++        if (type == 3) {
++            write(4);
++            write(5);
++        }
++        write(0);
++        write(1);
++    }
++}
++int relative(unsigned a, unsigned b, unsigned bits) {
++    unsigned m = 1u << (bits - 1), v = a - b;
++    return int(v & (m - 1)) - int(v & m);
++}
++bool skip_allowed(const VADecPictureParameterBufferAV1 &p, const Av1State &state,
++                  const std::array<unsigned, 7> &refs) {
++    if (!p.seq_info_fields.fields.enable_order_hint || !p.mode_control_fields.bits.reference_select)
++        return false;
++    int before = -1, after = -1, older = -1;
++    unsigned bits = p.order_hint_bits_minus_1 + 1;
++    for (unsigned i = 0; i < 7; ++i) {
++        int d = relative(state.slots[refs[i]].order_hint, p.order_hint, bits);
++        if (d < 0 && (before < 0 || relative(state.slots[refs[i]].order_hint,
++                                             state.slots[refs[before]].order_hint, bits) > 0))
++            before = i;
++        if (d > 0 && (after < 0 || relative(state.slots[refs[i]].order_hint,
++                                            state.slots[refs[after]].order_hint, bits) < 0))
++            after = i;
++    }
++    if (before < 0)
++        return false;
++    if (after >= 0)
++        return true;
++    for (unsigned i = 0; i < 7; ++i)
++        if (relative(state.slots[refs[i]].order_hint, state.slots[refs[before]].order_hint, bits) <
++            0)
++            older = i;
++    return older >= 0;
++}
++} // namespace
++
++Av1Packets av1_bitstream(const Av1Picture &picture, Av1State &state, unsigned fourcc) {
++    check(picture.has_params && picture.pending_slices.empty(), "AV1 incomplete picture", invalid);
++    const auto &p = picture.params;
++    const auto &f = p.pic_info_fields.bits;
++    const auto &s = p.seq_info_fields.fields;
++    check(p.profile == 0 && p.bit_depth_idx <= 1 && !s.mono_chrome && s.subsampling_x &&
++              s.subsampling_y,
++          "AV1 requires Main 8/10-bit 4:2:0", VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
++    check(fourcc == (p.bit_depth_idx ? VA_FOURCC_P010 : VA_FOURCC_NV12),
++          "AV1 bit depth differs from surface", VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
++    check(!p.film_grain_info.film_grain_info_fields.bits.apply_grain,
++          "AV1 film grain is not implemented", unsupported);
++    check(!f.large_scale_tile && !p.anchor_frames_num, "AV1 large-scale tiles are not implemented",
++          unsupported);
++    check(!f.use_superres && !f.allow_intrabc, "AV1 super-resolution/intrabc is not implemented",
++          unsupported);
++    check(p.tile_cols && p.tile_cols <= 64 && p.tile_rows && p.tile_rows <= 64 &&
++              unsigned(p.tile_cols) * p.tile_rows <= 512 &&
++              picture.slices.size() == unsigned(p.tile_cols) * p.tile_rows,
++          "AV1 tile count", invalid);
++    check(!s.enable_order_hint || p.order_hint_bits_minus_1 < 8, "AV1 order hint width", invalid);
++    bool intra = f.frame_type == 0 || f.frame_type == 2;
++    bool key = f.frame_type == 0;
++    check(f.frame_type != 3, "AV1 switch frames are not implemented", unsupported);
++    unsigned primary = (intra || f.error_resilient_mode) ? 7 : p.primary_ref_frame;
++    check(primary <= 7, "AV1 primary reference", invalid);
++    check(!key || f.show_frame, "AV1 hidden keyframes are not implemented", unsupported);
++    check(p.current_frame != VA_INVALID_SURFACE, "AV1 invalid current surface", invalid);
++    Av1Packets packets;
++    // VA omits refresh_frame_flags. Submit new pictures without refreshing the
++    // decoder's DPB, then infer the exact refresh mask from the next VA map.
++    // If referenced, replay the prior packet with that mask before the next
++    // picture. Its output is discarded. This keeps all eight references and
++    // their entropy/motion state intact without guessing a slot to evict.
++
++    if (!key && !state.pending_packet.empty()) {
++        unsigned refresh = 0;
++        for (unsigned i = 0; i < 8; ++i)
++            if (p.ref_frame_map[i] == state.pending_surface)
++                refresh |= 1u << i;
++        if (refresh) {
++            packets.replay = state.pending_packet;
++            for (unsigned i = 0; i < 8; ++i) {
++                size_t bit = state.refresh_bit + i;
++                packets.replay[bit / 8] = (packets.replay[bit / 8] & ~(1u << (7 - bit % 8))) |
++                                          (((refresh >> (7 - i)) & 1) << (7 - bit % 8));
++                if (refresh & (1u << i))
++                    state.slots[i] = {state.pending_surface, state.pending_order_hint,
++                                      state.pending_motion};
++            }
++        }
++    }
++    std::array<unsigned, 7> refs{};
++    if (!intra) {
++        for (unsigned i = 0; i < 7; ++i) {
++            check(p.ref_frame_idx[i] < 8, "AV1 reference index", invalid);
++            unsigned j = p.ref_frame_idx[i];
++            check(state.slots[j].surface == p.ref_frame_map[j] &&
++                      p.ref_frame_map[j] != VA_INVALID_SURFACE,
++                  "AV1 reference map mismatch", unsupported);
++            refs[i] = j;
++        }
++    }
++    auto seq = sequence(p);
++    check(!state.started || key || state.sequence == seq, "AV1 sequence change requires a keyframe",
++          unsupported);
++    if (!state.started)
++        check(key, "AV1 sequence must start with a keyframe", unsupported);
++    std::vector<uint8_t> out;
++    obu(out, 2, {});
++    if (!state.started || key) {
++        obu(out, 1, seq);
++        state.sequence = seq;
++    }
++    Bits b;
++    b.bit(0);
++    b.put(f.frame_type, 2);
++    b.bit(1); // Show reference-only frames too: VA requires completed surfaces.
++    if (!key)
++        b.bit(f.error_resilient_mode);
++    b.bit(f.disable_cdf_update);
++    b.bit(f.allow_screen_content_tools);
++    if (f.allow_screen_content_tools)
++        b.bit(f.force_integer_mv);
++    b.bit(0); // fixed frame size
++    if (s.enable_order_hint)
++        b.put(p.order_hint, p.order_hint_bits_minus_1 + 1);
++    if (!intra && !f.error_resilient_mode)
++        b.put(primary, 3);
++    unsigned refresh = key ? 255 : 0;
++    size_t refresh_bit = b.pos;
++    if (!key)
++        b.put(refresh, 8);
++    if ((!intra || refresh != 255) && f.error_resilient_mode && s.enable_order_hint)
++        for (const auto &slot : state.slots)
++            b.put(slot.order_hint, p.order_hint_bits_minus_1 + 1);
++    if (!intra) {
++        if (s.enable_order_hint)
++            b.bit(0);
++        for (unsigned v : refs)
++            b.put(v, 3);
++    }
++    b.bit(0);
++    b.bit(0); // superres disabled; render size equals frame size
++    if (intra && f.allow_screen_content_tools)
++        b.bit(0); // intrabc
++    if (!intra) {
++        if (!f.force_integer_mv)
++            b.bit(f.allow_high_precision_mv);
++        b.bit(p.interp_filter == 4);
++        if (p.interp_filter != 4)
++            b.put(p.interp_filter, 2);
++        b.bit(f.is_motion_mode_switchable);
++        if (!f.error_resilient_mode && s.enable_order_hint)
++            b.bit(f.use_ref_frame_mvs);
++    }
++    if (!f.disable_cdf_update)
++        b.bit(f.disable_frame_end_update_cdf);
++    tiles(b, p);
++    bool lossless = quantization(b, p, primary);
++    filters(b, p, lossless);
++    if (!lossless)
++        b.bit(p.mode_control_fields.bits.tx_mode == 2);
++    if (!intra)
++        b.bit(p.mode_control_fields.bits.reference_select);
++    if (!intra && skip_allowed(p, state, refs))
++        b.bit(p.mode_control_fields.bits.skip_mode_present);
++    if (!intra && !f.error_resilient_mode)
++        b.bit(f.allow_warped_motion);
++    b.bit(p.mode_control_fields.bits.reduced_tx_set_used);
++    auto current_motion = motion_values(p, intra);
++    if (!intra) {
++        auto previous = primary == 7 ? motion_values(p, true) : state.slots[refs[primary]].motion;
++        motion(b, p, current_motion, previous);
++    }
++    b.trailing();
++    obu(out, 3, b.data);
++    refresh_bit += (out.size() - b.data.size()) * 8;
++    std::vector<const Av1Slice *> ordered(picture.slices.size());
++    for (const auto &sl : picture.slices) {
++        check(sl.params.tile_row < p.tile_rows && sl.params.tile_column < p.tile_cols,
++              "AV1 tile coordinate", invalid);
++        unsigned i = sl.params.tile_row * p.tile_cols + sl.params.tile_column;
++        check(!ordered[i] && !sl.bytes.empty(), "AV1 duplicate/empty tile", invalid);
++        ordered[i] = &sl;
++    }
++    std::vector<uint8_t> payload;
++    if (ordered.size() > 1)
++        payload.push_back(0); // all tiles, zero alignment
++    for (unsigned i = 0; i < ordered.size(); ++i) {
++        check(ordered[i], "AV1 missing tile", invalid);
++        const auto &bytes = ordered[i]->bytes;
++        if (i + 1 < ordered.size()) {
++            check(bytes.size() <= UINT32_MAX, "AV1 tile too large", invalid);
++            for (unsigned j = 0; j < 4; ++j)
++                payload.push_back(uint8_t((bytes.size() - 1) >> (8 * j)));
++        }
++        payload.insert(payload.end(), bytes.begin(), bytes.end());
++    }
++    obu(out, 4, payload);
++    for (unsigned i = 0; i < 8; ++i)
++        if (refresh & (1u << i))
++            state.slots[i] = {p.current_frame, p.order_hint, current_motion};
++    state.pending_packet = key ? std::vector<uint8_t>{} : out;
++    state.refresh_bit = refresh_bit;
++    state.pending_surface = p.current_frame;
++    state.pending_order_hint = p.order_hint;
++    state.pending_motion = current_motion;
++    state.started = true;
++    trace("AV1 frame type=%u depth=%u show=%u order=%u refresh=%#x bytes=%zu", f.frame_type,
++          p.bit_depth_idx ? 10 : 8, f.show_frame, p.order_hint, refresh, out.size());
++    packets.picture = std::move(out);
++    return packets;
++}
++} // namespace irisva
+diff --git a/src/backend.cpp b/src/backend.cpp
+--- a/src/backend.cpp
++++ b/src/backend.cpp
+@@ -86,9 +86,9 @@
+     static VAStatus name args {                                                                    \
+         return guard(ctx, [&](Driver &d) -> VAStatus { __VA_ARGS__ });                             \
+     }
+-static bool supported(VAProfile p) {
++static bool supported(const Driver &d, VAProfile p) {
+     return p == VAProfileH264ConstrainedBaseline || p == VAProfileH264Main ||
+-           p == VAProfileH264High || is_hevc(p) || is_vp9(p);
++           p == VAProfileH264High || is_hevc(p) || is_vp9(p) || (is_av1(p) && d.av1_supported);
+ }
+ static bool encode_supported(const Driver &d, VAProfile p, VAEntrypoint e) {
+     return !d.encoder_device.empty() && e == VAEntrypointEncSlice &&
+@@ -147,10 +147,9 @@
+     }
+ }
+ static unsigned profile_format(VAProfile p) {
+-    return is_10bit(p) ? VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420;
+-}
+-static unsigned profile_fourcc(VAProfile p) {
+-    return is_10bit(p) ? VA_FOURCC_P010 : VA_FOURCC_NV12;
++    return is_av1(p)     ? VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10
++           : is_10bit(p) ? VA_RT_FORMAT_YUV420_10
++                         : VA_RT_FORMAT_YUV420;
+ }
+ static auto surface(Driver &d, VASurfaceID id) {
+     return lookup(d.surfaces, id, VA_STATUS_ERROR_INVALID_SURFACE);
+@@ -277,11 +276,12 @@
+     out[0] = VAProfileH264ConstrainedBaseline; out[1] = VAProfileH264Main;
+     out[2] = VAProfileH264High; out[3] = VAProfileHEVCMain; out[4] = VAProfileHEVCMain10;
+     out[5] = VAProfileVP9Profile0; out[6] = VAProfileVP9Profile2; *count = 7;
++    if (d.av1_supported) out[(*count)++] = VAProfileAV1Profile0;
+     if (vpp_supported(VAProfileNone, VAEntrypointVideoProc)) out[(*count)++] = VAProfileNone;
+     return VA_STATUS_SUCCESS;)
+ API(query_entrypoints, (VADriverContextP ctx, VAProfile profile, VAEntrypoint *out, int *count),
+     (void)d;
+-    check(supported(profile) || vpp_supported(profile, VAEntrypointVideoProc),
++    check(supported(d, profile) || vpp_supported(profile, VAEntrypointVideoProc),
+           "unsupported profile", VA_STATUS_ERROR_UNSUPPORTED_PROFILE);
+     check(out && count, "null entrypoints", VA_STATUS_ERROR_INVALID_PARAMETER);
+     out[0] = profile == VAProfileNone ? VAEntrypointVideoProc : VAEntrypointVLD; *count = 1;
+@@ -291,9 +291,9 @@
+     get_attributes,
+     (VADriverContextP ctx, VAProfile profile, VAEntrypoint entry, VAConfigAttrib *attrs, int count),
+     (void)d;
+-    check(supported(profile) || vpp_supported(profile, VAEntrypointVideoProc),
++    check(supported(d, profile) || vpp_supported(profile, VAEntrypointVideoProc),
+           "unsupported profile", VA_STATUS_ERROR_UNSUPPORTED_PROFILE);
+-    check((supported(profile) && entry == VAEntrypointVLD) || vpp_supported(profile, entry) ||
++    check((supported(d, profile) && entry == VAEntrypointVLD) || vpp_supported(profile, entry) ||
+               encode_supported(d, profile, entry),
+           "unsupported entrypoint", VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT);
+     for (int i = 0; i < count; ++i) {
+@@ -328,12 +328,13 @@
+     create_config,
+     (VADriverContextP ctx, VAProfile p, VAEntrypoint e, VAConfigAttrib *attrs, int count,
+      VAConfigID *id),
+-    check(supported(p) || vpp_supported(p, VAEntrypointVideoProc), "unsupported profile",
++    check(supported(d, p) || vpp_supported(p, VAEntrypointVideoProc), "unsupported profile",
+           VA_STATUS_ERROR_UNSUPPORTED_PROFILE);
+-    check((supported(p) && e == VAEntrypointVLD) || vpp_supported(p, e) ||
++    check((supported(d, p) && e == VAEntrypointVLD) || vpp_supported(p, e) ||
+               encode_supported(d, p, e),
+           "unsupported entrypoint", VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT);
+-    Config config{p, e, VA_RC_CQP}; check(id, "null config ID", VA_STATUS_ERROR_INVALID_PARAMETER);
++    Config config{p, e, VA_RC_CQP}; config.rt_format = profile_format(p);
++    check(id, "null config ID", VA_STATUS_ERROR_INVALID_PARAMETER);
+     for (int i = 0; i < count; ++i) {
+         if (e == VAEntrypointEncSlice) {
+             const auto type = attrs[i].type;
+@@ -350,10 +351,12 @@
+                       "select one encoder rate control mode", VA_STATUS_ERROR_ATTR_NOT_SUPPORTED);
+                 config.rate_control = attrs[i].value;
+             }
+-        } else if (attrs[i].type == VAConfigAttribRTFormat)
+-            check(attrs[i].value == profile_format(p), "unsupported render format",
++        } else if (attrs[i].type == VAConfigAttribRTFormat) {
++            unsigned value = attrs[i].value;
++            check(value && !(value & ~profile_format(p)), "unsupported render format",
+                   VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+-        else if (e == VAEntrypointVLD && attrs[i].type == VAConfigAttribDecSliceMode)
++            config.rt_format = value;
++        } else if (e == VAEntrypointVLD && attrs[i].type == VAConfigAttribDecSliceMode)
+             check(attrs[i].value == VA_DEC_SLICE_MODE_NORMAL, "unsupported slice mode",
+                   VA_STATUS_ERROR_ATTR_NOT_SUPPORTED);
+         else
+@@ -366,21 +369,22 @@
+ API(query_config,
+     (VADriverContextP ctx, VAConfigID id, VAProfile *p, VAEntrypoint *e, VAConfigAttrib *a, int *n),
+     auto config = lookup(d.configs, id, VA_STATUS_ERROR_INVALID_CONFIG);
+-    *p = config.profile; *e = config.entrypoint;
+-    a[0] = {VAConfigAttribRTFormat, profile_format(*p)}; *n = 1;
++    *p = config.profile; *e = config.entrypoint; a[0] = {VAConfigAttribRTFormat, config.rt_format};
++    *n = 1;
+     if (*e == VAEntrypointEncSlice) a[(*n)++] = {VAConfigAttribRateControl, config.rate_control};
+     return VA_STATUS_SUCCESS;)
+ API(
+     query_surfaces, (VADriverContextP ctx, VAConfigID id, VASurfaceAttrib *attrs, unsigned *count),
+     auto config = lookup(d.configs, id, VA_STATUS_ERROR_INVALID_CONFIG);
+-    auto profile = config.profile;
++
+     check(count, "null surface attribute count", VA_STATUS_ERROR_INVALID_PARAMETER);
+-    VASurfaceAttrib a[6]{};
++    VASurfaceAttrib a[7]{};
+     VASurfaceAttribType types[] = {VASurfaceAttribPixelFormat, VASurfaceAttribMinWidth,
+                                    VASurfaceAttribMinHeight, VASurfaceAttribMaxWidth,
+                                    VASurfaceAttribMaxHeight, VASurfaceAttribMemoryType};
+-    unsigned values[] = {profile_fourcc(profile), 128, 128, 8192, 8192,
+-                         VA_SURFACE_ATTRIB_MEM_TYPE_VA};
++    unsigned values[] = {unsigned(config.rt_format == VA_RT_FORMAT_YUV420_10 ? VA_FOURCC_P010
++                                                                             : VA_FOURCC_NV12),
++                         128, 128, 8192, 8192, VA_SURFACE_ATTRIB_MEM_TYPE_VA};
+     if (config.entrypoint == VAEntrypointVideoProc) {
+         values[1] = 16;
+         values[2] = 2;
+@@ -395,14 +399,18 @@
+             a[i].flags |= VA_SURFACE_ATTRIB_SETTABLE;
+         a[i].value.type = VAGenericValueTypeInteger;
+         a[i].value.value.i = values[i];
++    } unsigned n = 6;
++    if (config.rt_format == (VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10)) {
++        a[n] = a[0];
++        a[n++].value.value.i = VA_FOURCC_P010;
+     } if (!attrs) {
+-        *count = 6;
++        *count = n;
+         return VA_STATUS_SUCCESS;
+-    } if (*count < 6) {
+-        *count = 6;
++    } if (*count < n) {
++        *count = n;
+         return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+-    } std::memcpy(attrs, a, sizeof(a));
+-    *count = 6; return VA_STATUS_SUCCESS;)
++    } std::memcpy(attrs, a, sizeof(a[0]) * n);
++    *count = n; return VA_STATUS_SUCCESS;)
+ static std::shared_ptr<Memory> import_prime(const VADRMPRIMESurfaceDescriptor &desc, unsigned width,
+                                             unsigned height) {
+     check(desc.fourcc == VA_FOURCC_NV12 && desc.width == width && desc.height == height &&
+@@ -545,15 +553,17 @@
+               result,
+           "invalid context dimensions", VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
+     auto c = std::make_shared<Context>(); c->profile = config.profile;
++    c->rt_format = config.rt_format; c->surface_count = std::max(0, count);
++    c->fourcc = config.rt_format == VA_RT_FORMAT_YUV420_10 ? VA_FOURCC_P010 : VA_FOURCC_NV12;
+     c->entrypoint = config.entrypoint; c->encode_settings.rate_control = config.rate_control;
+     c->encode_settings.hevc = is_hevc(c->profile); if (c->entrypoint == VAEntrypointEncSlice)
+         check(w <= 3840 && h <= 2160 && !(w & 1) && !(h & 1), "unsupported encoder dimensions",
+               VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
+     for (int i = 0; i < count; ++i) surface(d, targets[i]); c->width = w; c->height = h;
+     int render_fd = ctx->drm_state ? static_cast<drm_state *>(ctx->drm_state)->fd : -1;
+-    if (c->entrypoint == VAEntrypointVLD)
++    if (c->entrypoint == VAEntrypointVLD && !is_av1(c->profile))
+         c->decoder = std::make_shared<Decoder>(d.device, w, h, std::max(0, count), c->profile,
+-                                               render_fd);
++                                               render_fd, c->fourcc);
+     if (processing) c->vpp = std::make_unique<Vpp>(render_fd); *result = d.next_id++;
+     d.contexts[*result] = c; return VA_STATUS_SUCCESS;)
+ API(
+@@ -620,8 +630,21 @@
+     auto c = context(d, id);
+     check(!c->target, "picture already open", VA_STATUS_ERROR_OPERATION_FAILED);
+     auto s = surface(d, target);
+-    check(s->fourcc == profile_fourcc(c->profile), "surface format does not match context",
+-          VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
++    check(!c->av1_failed, "AV1 context must be recreated after an error",
++          VA_STATUS_ERROR_DECODING_ERROR);
++    if (is_av1(c->profile) && !c->decoder) {
++        unsigned format =
++            s->fourcc == VA_FOURCC_P010 ? VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420;
++        check((s->fourcc == VA_FOURCC_NV12 || s->fourcc == VA_FOURCC_P010) &&
++                  (c->rt_format & format),
++              "AV1 surface format does not match configuration",
++              VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
++        c->fourcc = s->fourcc;
++        int render_fd = ctx->drm_state ? static_cast<drm_state *>(ctx->drm_state)->fd : -1;
++        c->decoder = std::make_shared<Decoder>(d.device, c->width, c->height, c->surface_count,
++                                               c->profile, render_fd, c->fourcc);
++    } check(c->entrypoint == VAEntrypointVideoProc || s->fourcc == c->fourcc,
++            "surface format does not match context", VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+     if (s->pending || (s->encode_task && s->encode_task->pending)) synchronize(d, s);
+     check(!s->derived_images, "surface has derived images", VA_STATUS_ERROR_SURFACE_BUSY);
+     if (c->entrypoint == VAEntrypointEncSlice) {
+@@ -639,7 +662,8 @@
+         return VA_STATUS_SUCCESS;
+     } if (!s->persistent_export) s->memory.reset();
+     s->status = VA_STATUS_SUCCESS; s->decoder = c->decoder; c->target = s; c->picture = Picture{};
+-    c->hevc_picture = HevcPicture{}; c->vp9_picture = Vp9Picture{}; return VA_STATUS_SUCCESS;)
++    c->hevc_picture = HevcPicture{}; c->vp9_picture = Vp9Picture{}; c->av1_picture = Av1Picture{};
++    return VA_STATUS_SUCCESS;)
+ template <class P> static void render_buffer(P &p, const std::shared_ptr<Buffer> &b) {
+     using Parameter = typename std::decay_t<decltype(p.pending_slices)>::value_type;
+     using SliceType = typename std::decay_t<decltype(p.slices)>::value_type;
+@@ -649,7 +673,7 @@
+         std::memcpy(&p.params, b->data.data(), sizeof(p.params));
+         p.has_params = true;
+     } else if (b->type == VAIQMatrixBufferType) {
+-        if constexpr (std::is_same_v<P, Vp9Picture>) {
++        if constexpr (std::is_same_v<P, Vp9Picture> || std::is_same_v<P, Av1Picture>) {
+             throw Error(VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE, "VP9 has no IQ matrix buffer");
+         } else {
+             check(b->element_size >= sizeof(p.iq) && b->elements == 1, "invalid IQ matrix",
+@@ -677,8 +701,8 @@
+             SliceType slice;
+             slice.params = s;
+             slice.bytes.assign(b->data.begin() + off, b->data.begin() + off + n);
+-            if (!std::is_same_v<P, Vp9Picture> && slice.bytes.size() >= 4 && !slice.bytes[0] &&
+-                !slice.bytes[1]) {
++            if (!std::is_same_v<P, Vp9Picture> && !std::is_same_v<P, Av1Picture> &&
++                slice.bytes.size() >= 4 && !slice.bytes[0] && !slice.bytes[1]) {
+                 unsigned prefix = slice.bytes[2] == 1                      ? 3
+                                   : !slice.bytes[2] && slice.bytes[3] == 1 ? 4
+                                                                            : 0;
+@@ -708,7 +732,9 @@
+             check(b->context_id == id, "encode buffer belongs to another context",
+                   VA_STATUS_ERROR_INVALID_BUFFER);
+             render_encode_buffer(c->encode_settings, c->encode_picture, *b);
+-        } else if (is_vp9(c->profile))
++        } else if (is_av1(c->profile))
++            render_buffer(c->av1_picture, b);
++        else if (is_vp9(c->profile))
+             render_buffer(c->vp9_picture, b);
+         else if (is_hevc(c->profile))
+             render_buffer(c->hevc_picture, b);
+@@ -762,7 +788,26 @@
+     } try {
+         // Do not cache parameter sets from a rejected picture: the firmware
+         // has not received them. Commit only after successful submission.
+-        if (is_vp9(c->profile)) {
++        if (is_av1(c->profile)) {
++            check(surface(d, c->av1_picture.params.current_frame) == target,
++                  "AV1 current surface differs from target", VA_STATUS_ERROR_INVALID_SURFACE);
++            check(c->av1_picture.params.frame_width_minus1 + 1u == c->width &&
++                      c->av1_picture.params.frame_height_minus1 + 1u == c->height,
++                  "AV1 dynamic frame dimensions are not implemented",
++                  VA_STATUS_ERROR_UNIMPLEMENTED);
++            auto next_state = c->av1;
++            auto packets = av1_bitstream(c->av1_picture, next_state, c->fourcc);
++            if (!packets.replay.empty()) {
++                auto replay = std::make_shared<Surface>();
++                replay->width = c->width;
++                replay->height = c->height;
++                replay->fourcc = c->fourcc;
++                c->decoder->submit(packets.replay, replay);
++                c->decoder->sync(replay); // Observe errors from the internal reference refresh.
++            }
++            c->decoder->submit(packets.picture, target);
++            c->av1 = std::move(next_state);
++        } else if (is_vp9(c->profile)) {
+             auto bytes = vp9_bitstream(c->profile, c->vp9_picture);
+             c->decoder->submit(bytes, target);
+         } else if (is_hevc(c->profile)) {
+@@ -782,9 +827,13 @@
+         if (target->persistent_export)
+             synchronize(d, target);
+     } catch (const Error &e) {
++        if (is_av1(c->profile))
++            c->av1_failed = true;
+         target->status = e.status;
+         throw;
+     } catch (...) {
++        if (is_av1(c->profile))
++            c->av1_failed = true;
+         target->status = VA_STATUS_ERROR_DECODING_ERROR;
+         throw;
+     } return VA_STATUS_SUCCESS;)
+@@ -1032,10 +1081,11 @@
+     try {
+         auto d = std::make_unique<Driver>();
+         d->device = find_device();
++        d->av1_supported = device_supports_av1(d->device);
+         d->encoder_device = find_encoder_device();
+         ctx->version_major = VA_MAJOR_VERSION;
+         ctx->version_minor = VA_MINOR_VERSION;
+-        ctx->max_profiles = 8;
++        ctx->max_profiles = 9;
+         ctx->max_entrypoints = 2;
+         ctx->max_attributes = 16;
+         // libva validates nonzero allocation bounds even when queries return no entries.
+diff --git a/src/decoder.cpp b/src/decoder.cpp
+--- a/src/decoder.cpp
++++ b/src/decoder.cpp
+@@ -91,10 +91,31 @@
+     }
+     throw Error(VA_STATUS_ERROR_OPERATION_FAILED, "no Iris stateful H264 decoder found");
+ }
++bool device_supports_av1(const std::string &device) {
++    int fd = open(device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
++    if (fd < 0)
++        return false;
++    bool found = false;
++    for (unsigned i = 0;; ++i) {
++        v4l2_fmtdesc f{};
++        f.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++        f.index = i;
++        if (ioctl(fd, VIDIOC_ENUM_FMT, &f) < 0)
++            break;
++        if (f.pixelformat == v4l2_fourcc('A', 'V', '0', '1')) {
++            found = true;
++            break;
++        }
++    }
++    close(fd);
++    return found;
++}
+ Decoder::Decoder(const std::string &device, unsigned width, unsigned height, unsigned surfaces,
+-                 VAProfile profile, int render_fd)
++                 VAProfile profile, int render_fd, unsigned output_fourcc)
+     : width_(width), height_(height), pool_size_(std::min(64u, std::max(32u, surfaces + 4))),
+-      fourcc_(is_10bit(profile) ? VA_FOURCC_P010 : VA_FOURCC_NV12), copier_(render_fd) {
++      fourcc_(output_fourcc ? output_fourcc
++                            : (is_10bit(profile) ? VA_FOURCC_P010 : VA_FOURCC_NV12)),
++      copier_(render_fd) {
+     fd_ = open(device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+     check(fd_ >= 0, "open Iris decoder");
+     try {
+@@ -105,7 +126,8 @@
+         fmt.type = OUTPUT;
+         fmt.fmt.pix_mp.width = width;
+         fmt.fmt.pix_mp.height = height;
+-        fmt.fmt.pix_mp.pixelformat = is_vp9(profile)    ? V4L2_PIX_FMT_VP9
++        fmt.fmt.pix_mp.pixelformat = is_av1(profile)    ? v4l2_fourcc('A', 'V', '0', '1')
++                                     : is_vp9(profile)  ? V4L2_PIX_FMT_VP9
+                                      : is_hevc(profile) ? V4L2_PIX_FMT_HEVC
+                                                         : V4L2_PIX_FMT_H264;
+         unsigned codec = fmt.fmt.pix_mp.pixelformat;
+diff --git a/src/internal.hpp b/src/internal.hpp
+--- a/src/internal.hpp
++++ b/src/internal.hpp
+@@ -6,6 +6,8 @@
+ #include <va/va_drmcommon.h>
+ #include <va/va_dec_hevc.h>
+ #include <va/va_dec_vp9.h>
++#include <va/va_dec_av1.h>
++#include <array>
+ #include <va/va_enc_h264.h>
+ #include <va/va_enc_hevc.h>
+ #include <algorithm>
+@@ -165,6 +167,41 @@
+ std::vector<uint8_t> hevc_bitstream(VAProfile profile, const HevcPicture &picture,
+                                     HevcState &state);
+ 
++inline bool is_av1(VAProfile p) {
++    return p == VAProfileAV1Profile0;
++}
++struct Av1Slice {
++    VASliceParameterBufferAV1 params{};
++    std::vector<uint8_t> bytes;
++};
++struct Av1Picture {
++    VADecPictureParameterBufferAV1 params{};
++    bool has_params = false;
++    std::vector<VASliceParameterBufferAV1> pending_slices;
++    std::vector<Av1Slice> slices;
++};
++using Av1Motion = std::array<std::array<int32_t, 6>, 7>;
++struct Av1State {
++    struct Slot {
++        VASurfaceID surface = VA_INVALID_SURFACE;
++        unsigned order_hint = 0;
++        Av1Motion motion{};
++    };
++    std::array<Slot, 8> slots{};
++    std::vector<uint8_t> sequence;
++    bool started = false;
++    std::vector<uint8_t> pending_packet;
++    size_t refresh_bit = 0;
++    VASurfaceID pending_surface = VA_INVALID_SURFACE;
++    unsigned pending_order_hint = 0;
++    Av1Motion pending_motion{};
++};
++struct Av1Packets {
++    std::vector<uint8_t> replay, picture;
++};
++Av1Packets av1_bitstream(const Av1Picture &, Av1State &, unsigned fourcc);
++bool device_supports_av1(const std::string &);
++
+ class Decoder {
+     int fd_ = -1;
+     FILE *dump_ = nullptr;
+@@ -183,7 +220,7 @@
+ 
+   public:
+     Decoder(const std::string &device, unsigned width, unsigned height, unsigned surfaces,
+-            VAProfile profile, int render_fd);
++            VAProfile profile, int render_fd, unsigned output_fourcc = 0);
+     ~Decoder();
+     void submit(const std::vector<uint8_t> &bytes, const std::shared_ptr<Surface> &surface);
+     void sync(const std::shared_ptr<Surface> &surface);
+@@ -277,13 +314,20 @@
+     HevcPicture hevc_picture;
+     HevcState hevc;
+     Vp9Picture vp9_picture;
++    Av1Picture av1_picture;
++    Av1State av1;
++    bool av1_failed = false;
++    unsigned fourcc = VA_FOURCC_NV12;
++    unsigned rt_format = VA_RT_FORMAT_YUV420, surface_count = 0;
+ };
+ struct Config {
+     VAProfile profile;
+     VAEntrypoint entrypoint;
+     unsigned rate_control = VA_RC_CQP;
++    unsigned rt_format = VA_RT_FORMAT_YUV420;
+ };
+ struct Driver {
++    bool av1_supported = false;
+     std::recursive_mutex mutex;
+     std::string device;
+     std::string encoder_device;
+diff --git a/tests/av1.cpp b/tests/av1.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/av1.cpp
+@@ -0,0 +1,168 @@
++// SPDX-License-Identifier: MIT
++// Header/state tests do not open a decoder or claim hardware validation.
++#include "../src/av1.cpp"
++#include <functional>
++#include <iostream>
++using namespace irisva;
++void require(bool value) {
++    if (!value)
++        throw std::runtime_error("AV1 test assertion failed");
++}
++void rejects(const std::function<void()> &f, VAStatus status) {
++    try {
++        f();
++    } catch (const Error &e) {
++        require(e.status == status);
++        return;
++    }
++    throw std::runtime_error("invalid AV1 request accepted");
++}
++Av1Picture key() {
++    Av1Picture pic{};
++    pic.has_params = true;
++    auto &p = pic.params;
++    p.current_frame = 1;
++    p.frame_width_minus1 = p.frame_height_minus1 = 127;
++    p.tile_cols = p.tile_rows = 1;
++    p.base_qindex = 80;
++    p.matrix_coefficients = 2;
++    p.seq_info_fields.fields.subsampling_x = p.seq_info_fields.fields.subsampling_y = 1;
++    p.seq_info_fields.fields.enable_order_hint = 1;
++    p.order_hint_bits_minus_1 = 6;
++    p.pic_info_fields.bits.show_frame = 1;
++    p.pic_info_fields.bits.error_resilient_mode = 1;
++    p.pic_info_fields.bits.uniform_tile_spacing_flag = 1;
++    std::fill(std::begin(p.ref_frame_map), std::end(p.ref_frame_map), VA_INVALID_SURFACE);
++    Av1Slice tile{};
++    tile.bytes = {0};
++    pic.slices.push_back(tile);
++    return pic;
++}
++int main() {
++    // AV1 segmentation uses signed two's complement, not magnitude/sign coding.
++    Bits signed_value;
++    signed_value.su(-55, 9);
++    require(signed_value.data == std::vector<uint8_t>({0xe4, 0x80}));
++    Bits singleton;
++    singleton.ns(0, 1);
++    require(singleton.data.empty());
++    rejects([&] { singleton.ns(1, 1); }, VA_STATUS_ERROR_INVALID_BUFFER);
++    rejects([&] { singleton.put(8, 3); }, VA_STATUS_ERROR_INVALID_BUFFER);
++    rejects([&] { singleton.su(-65, 7); }, VA_STATUS_ERROR_INVALID_BUFFER);
++
++    auto pic = key();
++    Av1State state;
++    auto first = av1_bitstream(pic, state, VA_FOURCC_NV12);
++    require(first.replay.empty() && !first.picture.empty());
++    for (const auto &slot : state.slots)
++        require(slot.surface == 1);
++    pic.params.current_frame = 2;
++    pic.params.order_hint = 1;
++    pic.params.pic_info_fields.bits.frame_type = 1;
++    pic.params.pic_info_fields.bits.error_resilient_mode = 0;
++    std::fill(std::begin(pic.params.ref_frame_map), std::end(pic.params.ref_frame_map), 1);
++    auto second = av1_bitstream(pic, state, VA_FOURCC_NV12);
++    require(second.replay.empty());
++    for (const auto &slot : state.slots)
++        require(slot.surface == 1);
++    auto pending = state.pending_packet;
++    size_t bit = state.refresh_bit;
++    pic.params.current_frame = 3;
++    pic.params.order_hint = 2;
++    pic.params.ref_frame_map[6] = 2;
++    pic.params.ref_frame_idx[0] = 6;
++    auto third = av1_bitstream(pic, state, VA_FOURCC_NV12);
++    require(!third.replay.empty() && third.replay.size() == pending.size());
++    for (unsigned i = 0; i < 8; ++i)
++        require(((third.replay[(bit + i) / 8] >> (7 - (bit + i) % 8)) & 1) ==
++                ((0x40 >> (7 - i)) & 1));
++    for (unsigned i = 0; i < 8; ++i)
++        require(state.slots[i].surface == (i == 6 ? 2u : 1u));
++    pic.params.current_frame = 4;
++    pic.params.ref_frame_map[6] = 99;
++    rejects([&] { av1_bitstream(pic, state, VA_FOURCC_NV12); }, VA_STATUS_ERROR_UNIMPLEMENTED);
++
++    // Fill all eight VA slots, then keep rotating references without guessing
++    // which of the seven current references may be needed by future frames.
++    Av1State full_state;
++    auto full = key();
++    av1_bitstream(full, full_state, VA_FOURCC_NV12);
++    std::array<VASurfaceID, 8> map;
++    map.fill(1);
++    full.params.pic_info_fields.bits.frame_type = 1;
++    full.params.pic_info_fields.bits.error_resilient_mode = 0;
++    for (unsigned frame = 2; frame <= 20; ++frame) {
++        if (frame > 2)
++            map[(frame - 3) % 8] = frame - 1;
++        std::copy(map.begin(), map.end(), full.params.ref_frame_map);
++        for (unsigned i = 0; i < 7; ++i)
++            full.params.ref_frame_idx[i] = i;
++        full.params.current_frame = frame;
++        full.params.order_hint = frame - 1;
++        auto packets = av1_bitstream(full, full_state, VA_FOURCC_NV12);
++        require((frame == 2) == packets.replay.empty());
++        for (unsigned i = 0; i < 8; ++i)
++            require(full_state.slots[i].surface == map[i]);
++    }
++
++    auto bad = key();
++    bad.params.bit_depth_idx = 1;
++    rejects(
++        [&] {
++            Av1State s;
++            av1_bitstream(bad, s, VA_FOURCC_NV12);
++        },
++        VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
++    {
++        Av1State s;
++        require(!av1_bitstream(bad, s, VA_FOURCC_P010).picture.empty());
++    }
++    bad = key();
++    bad.params.film_grain_info.film_grain_info_fields.bits.apply_grain = 1;
++    rejects(
++        [&] {
++            Av1State s;
++            av1_bitstream(bad, s, VA_FOURCC_NV12);
++        },
++        VA_STATUS_ERROR_UNIMPLEMENTED);
++    bad = key();
++    bad.params.pic_info_fields.bits.use_superres = 1;
++    rejects(
++        [&] {
++            Av1State s;
++            av1_bitstream(bad, s, VA_FOURCC_NV12);
++        },
++        VA_STATUS_ERROR_UNIMPLEMENTED);
++    bad = key();
++    bad.params.tile_cols = 2;
++    bad.slices.push_back(bad.slices[0]);
++    rejects(
++        [&] {
++            Av1State s;
++            av1_bitstream(bad, s, VA_FOURCC_NV12);
++        },
++        VA_STATUS_ERROR_INVALID_BUFFER);
++    bad = key();
++    bad.slices[0].params.tile_column = 1;
++    rejects(
++        [&] {
++            Av1State s;
++            av1_bitstream(bad, s, VA_FOURCC_NV12);
++        },
++        VA_STATUS_ERROR_INVALID_BUFFER);
++    bad = key();
++    bad.slices.clear();
++    rejects(
++        [&] {
++            Av1State s;
++            av1_bitstream(bad, s, VA_FOURCC_NV12);
++        },
++        VA_STATUS_ERROR_INVALID_BUFFER);
++    bad = key();
++    bad.params.seq_info_fields.fields.enable_order_hint = 0;
++    {
++        Av1State s;
++        require(!av1_bitstream(bad, s, VA_FOURCC_NV12).picture.empty());
++    }
++    std::cout << "AV1 header, reference replay, format and rejection tests passed\n";
++}

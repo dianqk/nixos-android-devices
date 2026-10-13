@@ -1,0 +1,51 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Mon, 12 Oct 2026 00:30:00 +0800
+Subject: [PATCH] scsi: ufs: qcom: Power down the controller/device during system suspend for SM8450
+
+Like SM8550 and SM8650, the SM8450 (and SM8475, which uses the SM8450
+UFS controller) UFS PHY does not retain its state across a CX power
+collapse. With the default spm_lvl of UFS_PM_LVL_3 the link is left in
+HIBERN8 and the device in SLEEP during system suspend. Once the SoC
+reaches CX collapse, the PHY state is lost and the first transfers after
+resume fail.
+
+On a Lenovo Legion Y700 (2023, SM8475) the first s2idle that reached
+AOSS/CX/DDR sleep was followed, about four seconds after resume, by UIC
+PA and data-link errors, repeated host and device resets and finally
+"HBA state error", failing reads and writes to the root filesystem.
+Earlier s2idle cycles on the same kernel that did not reach CX collapse
+resumed cleanly.
+
+Set no_phy_retention for "qcom,sm8450-ufshc" so that hba->spm_lvl
+defaults to UFS_PM_LVL_5 and the controller, device and PHY are powered
+down during system suspend and fully reinitialised on resume, as already
+done for SM8550/SM8650. The SM8550 LSDBS quirk does not apply to this
+controller, so use a separate drvdata.
+
+This follows upstream commit 3b2f56860b05 ("scsi: ufs: qcom: Power down
+the controller/device during system suspend for SM8550/SM8650 SoCs"):
+https://github.com/torvalds/linux/commit/3b2f56860b05bf0cea86af786fd9b7faa8fe3ef3
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+--- a/drivers/ufs/host/ufs-qcom.c
++++ b/drivers/ufs/host/ufs-qcom.c
+@@ -3004,6 +3004,10 @@
+ 		platform_device_msi_free_irqs_all(hba->dev);
+ }
+ 
++static const struct ufs_qcom_drvdata ufs_qcom_sm8450_drvdata = {
++	.no_phy_retention = true,
++};
++
+ static const struct ufs_qcom_drvdata ufs_qcom_sm8550_drvdata = {
+ 	.quirks = UFSHCD_QUIRK_BROKEN_LSDBS_CAP,
+ 	.no_phy_retention = true,
+@@ -3015,6 +3019,7 @@
+ 
+ static const struct of_device_id ufs_qcom_of_match[] __maybe_unused = {
+ 	{ .compatible = "qcom,ufshc" },
++	{ .compatible = "qcom,sm8450-ufshc", .data = &ufs_qcom_sm8450_drvdata },
+ 	{ .compatible = "qcom,sm8550-ufshc", .data = &ufs_qcom_sm8550_drvdata },
+ 	{ .compatible = "qcom,sm8650-ufshc", .data = &ufs_qcom_sm8550_drvdata },
+ 	{ .compatible = "qcom,sa8255p-ufshc", .data = &ufs_qcom_sa8255p_drvdata },

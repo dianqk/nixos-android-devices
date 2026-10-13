@@ -2,8 +2,11 @@
 
 [English](PATCHES.md) · [Polaris 设备索引](../../../../docs/polaris/README.zh.md)
 
+补丁集以 Linux 7.3-rc6 为目标；本设备的硬件结果基于此前的 7.x 内核取得。
+见[共享内核说明](../../README.zh.md)。
+
 内核包使用已锁定 Nixpkgs 输入中的 `linuxPackages_testing.kernel`，目标版本为
-Linux 7.3-rc5。[`series.nix`](series.nix)按应用顺序列出启用的补丁。
+Linux 7.3-rc6。[`series.nix`](series.nix)按应用顺序列出启用的补丁。
 构建结果包含 `qcom/sdm845-xiaomi-polaris.dtb` 和使用 LLVM 23 构建的
 Android 兼容 `Image.gz`。
 
@@ -12,7 +15,7 @@ q6asm 对齐补丁正确声明该格式及 24 位有效数据。
 
 相机使用 SDM845 社区提交
 [`dbc31cca7`](https://gitlab.com/sdm845-mainline/linux/-/commit/dbc31cca7cadbb97c2bee0ff7c8a3f86a7b25273)
-的 IMX363 驱动与上游 OV5675 驱动。IMX363 导入补丁仅为 Linux 7.3-rc5
+的 IMX363 驱动与上游 OV5675 驱动。IMX363 导入补丁仅为 Linux 7.3
 刷新 Kconfig 和 Makefile 上下文，新增代码保持不变。本地补丁在探测时保持 IMX363 复位，
 控制 Polaris 模组使能 GPIO，传递时钟启动错误，并将前置与后置主摄接入 CAMSS。
 供电和 GPIO 对应小米的
@@ -32,7 +35,7 @@ prepared/critical 引用迁移及运行时实际切换行为。依据
 
 QRTR nameserver 补丁保留了 [Takashi Iwai 的 HELLO 提案](https://lore.kernel.org/all/878q55sfxo.wl-tiwai@suse.de/)
 中的 `ns.c` 部分，保留原作者和提交说明，并明确记录部分导入的差异。
-另一份本地补丁在端点锁内合并重复 HELLO，保留主动握手，并确保先发 HELLO 再公告服务。
+另一份本地补丁在端点锁内合并重复 HELLO，保留主动握手，并确保先发 HELLO 再公告服务。两份补丁现位于共享目录 `pkgs/linux-kernel/patches/qrtr-hello/`，Aurora 也使用它们。
 这两项修改针对 Polaris 的 SMD 初次启动；MHI 挂起恢复及任意传输错误恢复不在已验证范围内。
 
 ## 导入的社区补丁
@@ -62,3 +65,7 @@ QRTR nameserver 补丁保留了 [Takashi Iwai 的 HELLO 提案](https://lore.ker
   未初始化 IPA 时，modem 接受关闭请求后等待确认超时，随后手机复位；初始化
   IPA 后，modem 返回关闭确认并完成资源回收，多次单独停止／启动测试通过。
   尚不能确定具体依赖 IPA 的哪项硬件或握手功能，也不代表完整手机断电已验证。
+
+## 同步状态
+
+[共享 GMU 补丁组](../../patches/gmu-sync-state/README.md) 为 GMU 绑定驱动；`unused-crypto` 补丁禁用未使用的 QCE 节点（Linux 7.3 将该驱动标记为 BROKEN），使供应方 `sync_state()` 不再一直等待。

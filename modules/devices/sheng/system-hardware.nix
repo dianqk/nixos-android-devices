@@ -16,6 +16,10 @@ let
 in
 {
   config = lib.mkIf (!config.androidDevices.recovery.enable) {
+    # The NT36532E driver exposes raw frames; the host processor creates the
+    # touchscreen input device used by desktop sessions.
+    hardware.sheng.thp.enable = lib.mkDefault true;
+
     # Managing the P2P interface can leave WCN7850 scans stuck after a toggle.
     networking.networkmanager.unmanaged = [ "interface-name:p2p-dev-wlp1s0" ];
     services.udev.extraRules = ''
@@ -27,6 +31,16 @@ in
     networking.networkmanager.wifi = lib.mkIf (config.hardware.sheng.wifiMacAddress != null) {
       macAddress = config.hardware.sheng.wifiMacAddress;
       scanRandMacAddress = false;
+    };
+    # Apply before IWD starts: NetworkManager's cloned address alone does not
+    # replace the random firmware fallback when using its IWD backend.
+    systemd.network.links."10-sheng-wifi" = lib.mkIf (config.hardware.sheng.wifiMacAddress != null) {
+      matchConfig.Path = "platform-1c00000.pcie-pci-0000:01:00.0";
+      linkConfig = {
+        MACAddressPolicy = "none";
+        MACAddress = config.hardware.sheng.wifiMacAddress;
+        NamePolicy = "keep kernel";
+      };
     };
     networking.hostName = lib.mkDefault config.hardware.sheng.systemHostName;
     environment.systemPackages = [ shengUcm ];

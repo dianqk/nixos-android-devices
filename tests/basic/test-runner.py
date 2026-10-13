@@ -2,6 +2,7 @@
 """Offline checks of failure reporting, media validation and selective execution."""
 import importlib.util
 import json
+import os
 import pathlib
 import sys
 import tempfile
@@ -32,7 +33,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_ssh_upload_streams_exact_binary_content(self):
         import shlex
-        base = ROOT / "tmp/basic-runner-tests"
+        base = pathlib.Path(os.environ.get("MOBILE_TEST_TMP", ROOT / "tmp")) / "basic-runner-tests"
         base.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=base) as directory:
             source = pathlib.Path(directory) / "a 'video'.mp4"
@@ -44,6 +45,54 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(shlex.split(args[-1]), ["cat", ">", suite.remote + "/" + source.name])
             with patch.object(suite, "command", side_effect=capture):
                 suite.upload(source)
+
+    def test_niri_session_environment_and_ambiguous_sockets(self):
+        suite = basic.Suite("tablet", pathlib.Path("unused"))
+        socket = "/run/user/1000/niri.wayland-1.123.sock"
+        with patch.object(suite, "shell", side_effect=[socket, "1000", "demo",
+                          "/run/user/1000/wayland-1", "ok"]) as shell:
+            self.assertEqual(suite.session("niri", "msg", "--json", "outputs"), "ok")
+            self.assertIn("NIRI_SOCKET=" + socket, shell.call_args.args)
+            self.assertIn("WAYLAND_DISPLAY=wayland-1", shell.call_args.args)
+            self.assertEqual(shell.call_args.args[:5], ("runuser", "-u", "demo", "--", "env"))
+        for sockets in ("", socket + "\n/run/user/1001/niri.wayland-2.456.sock"):
+            with patch.object(suite, "shell", return_value=sockets), self.assertRaises(RuntimeError):
+                suite.session("niri", "msg", "--json", "outputs")
+
+    def test_niri_display_active_mode_and_disabled_output(self):
+        base = pathlib.Path(os.environ.get("MOBILE_TEST_TMP", ROOT / "tmp")) / "basic-runner-tests"
+        base.mkdir(parents=True, exist_ok=True)
+        outputs = {"DSI-1": {"logical": {"width": 800, "height": 1280},
+                   "current_mode": 0, "modes": [{"width": 1600, "height": 2560}]},
+                   "DP-1": {"logical": None, "current_mode": None, "modes": []}}
+        with tempfile.TemporaryDirectory(dir=base) as directory:
+            suite = basic.Suite("tablet", pathlib.Path(directory))
+            with patch.object(suite, "session", return_value=json.dumps(outputs)), patch.object(suite, "shell"):
+                suite.display()
+            self.assertEqual(json.loads((suite.output / "outputs.json").read_text()), outputs)
+            outputs["DSI-1"]["current_mode"] = None
+            with patch.object(suite, "session", return_value=json.dumps(outputs)), self.assertRaises(RuntimeError):
+                suite.display()
+
+    def test_niri_gpu_restores_original_workspace_even_after_failure(self):
+        suite = basic.Suite("tablet", pathlib.Path("unused"))
+        workspaces = [{"id": 3, "idx": 2, "output": "DSI-1", "is_focused": True},
+                      {"id": 4, "idx": 3, "output": "DSI-1", "is_focused": False},
+                      {"id": 5, "idx": 4, "output": "DP-1", "is_focused": False}]
+        current = [{**workspaces[0], "idx": 1}, workspaces[1]]
+        for benchmark in ("GL_RENDERER: FD630\nglmark2 Score: 100", RuntimeError("benchmark failed")):
+            replies = [json.dumps(workspaces), json.dumps([{"workspace_id": 3}]), "",
+                       benchmark, json.dumps(current), "", ""]
+            with patch.object(suite, "session", side_effect=replies) as session:
+                if isinstance(benchmark, Exception):
+                    with self.assertRaisesRegex(RuntimeError, "benchmark failed"):
+                        suite.opengl()
+                else:
+                    suite.opengl()
+                calls = [call.args for call in session.call_args_list]
+                self.assertIn(("niri", "msg", "action", "focus-workspace", "3"), calls)
+                self.assertEqual(calls[-2], ("niri", "msg", "action", "focus-monitor", "DSI-1"))
+                self.assertEqual(calls[-1], ("niri", "msg", "action", "focus-workspace", "1"))
 
     def test_silent_eight_bit_media(self):
         info = {"streams": [{"codec_name": "h264", "pix_fmt": "yuv420p", "nb_frames": "10800"}], "format": {"duration": "180"}}
@@ -69,7 +118,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_truncated_decode_rejected(self):
         info = {"streams": [{"codec_name": "h264", "pix_fmt": "yuv420p", "nb_frames": "10800"}], "format": {"duration": "180"}}
-        base = ROOT / "tmp/basic-runner-tests"
+        base = pathlib.Path(os.environ.get("MOBILE_TEST_TMP", ROOT / "tmp")) / "basic-runner-tests"
         base.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=base) as directory:
             suite = basic.Suite("test-host", pathlib.Path(directory))
@@ -93,7 +142,7 @@ class RunnerTests(unittest.TestCase):
                 suite.camera()
 
     def test_skip_and_continue_after_failure(self):
-        base = ROOT / "tmp/basic-runner-tests"
+        base = pathlib.Path(os.environ.get("MOBILE_TEST_TMP", ROOT / "tmp")) / "basic-runner-tests"
         base.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=base) as directory:
             output = pathlib.Path(directory) / "results"

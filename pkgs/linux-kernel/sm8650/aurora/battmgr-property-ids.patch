@@ -1,0 +1,157 @@
+From: Yoni Yang <yoni980807@gmail.com>
+Date: Tue, 29 Sep 2026 17:47:15 +0000
+Subject: [PATCH] Add experimental Xiaomi 14 port with stock ABL boot
+
+Build Houji kernel, userspace and internal boot images from pinned public inputs and bundled stock firmware. Include the guarded installer, device integrations, regression tests and build/flash documentation. Hide the incompatible generic installer on Houji.
+
+Source: https://github.com/yoni13/armada-houji/commit/f5c689be6e603b259a5a85774d78c9cbd7cfefa4
+Extracted from ports/houji/patches/0003-qcom-battmgr-houji-property-ids.patch.
+The bundled patch has no separate author/date/message or sign-off trailers.
+
+The same initial source commit contains 0012-houji-battery-current-polarity.patch.
+
+Related power placeholder patch (0017-houji-drop-placeholder-battery-power.patch):
+From: Armada Houji maintainers
+Date: Fri, 2 Oct 2026 14:40:57 +0000 (containing commit)
+Subject: [PATCH] power: supply: qcom_battmgr: omit Houji placeholder power
+
+Houji's firmware reports a constant 10000000 for the translated POWER_NOW
+property, independent of the changing gauge voltage/current. Advertising it
+causes consumers such as btop to prefer a fictitious 10 W reading. It also
+selects their energy-based time estimator although this gauge exports charge.
+
+Do not advertise this unsupported measurement on Houji. Keep the measured
+VOLTAGE_NOW and CURRENT_NOW so consumers can derive watts and use the gauge's
+charge counter. Leave the property on Qualcomm variants that implement it.
+
+Source: https://github.com/yoni13/armada-houji/commit/cbbb4662865f02fa8375b85ad9ea3738db9d193e
+Containing commit author: Yoni Yang <yoni980807@gmail.com>
+Containing commit message:
+  Fix Houji resume: service sensor DSP requests across suspend
+  
+  The sensor DSP can send a reverse RPC to the frozen FastRPC listener
+  while the AP sleeps. Nothing woke the AP, the DSP watchdog fired, and
+  audio, battery telemetry and sensors were lost together.
+  
+  - fastrpc: wake for successful sensor NEXT2 replies during suspend and
+    refuse suspend while a reply is still owed
+  - asoc: drain deferred resume before soundcard teardown
+  - Game Mode session switch, battery power placeholder, charger suspend
+    guard, Gamescope fresh-frame wake, sensor teardown on close
+  - README and HISTORY updated; hardware validation notes included
+
+Local adaptation for Aurora:
+- Restrict the quirk to xiaomi,aurora while keeping the SM8550 supply descriptor.
+- Extend both directions through charge-control threshold reads (wire ID 27).
+- Keep charge-control writes (separate opcode 0x48), units and payload sizes intact.
+- Translate vendor notification 0x50 into a standard battery refresh, as OEM does.
+- Normalize positive discharge current at export, retaining the raw gauge value.
+- Use get_property ENODATA for the constant 10 W placeholder, rather than
+  adding a duplicate board supply descriptor. Current polarity/sentinel handling
+  follows the original Houji export boundary, with the existing Aurora quirk.
+- Do not enable ADSP or PMIC GLINK as part of this driver change.
+
+Aurora OEM enum and response layouts:
+https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/c7841217725ac8bed6c4bf790d149dde10444e3d/drivers/power/supply/qti_battery_charger.c
+
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -6,9 +6,11 @@
+  */
+ #include <linux/auxiliary_bus.h>
+ #include <linux/devm-helpers.h>
++#include <linux/limits.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/nvmem-consumer.h>
++#include <linux/of.h>
+ #include <linux/of_device.h>
+ #include <linux/power_supply.h>
+ #include <linux/property.h>
+@@ -313,6 +315,7 @@
+ 	struct pmic_glink_client *client;
+ 
+ 	enum qcom_battmgr_variant variant;
++	bool xiaomi_battery_property_ids;
+ 
+ 	struct power_supply *ac_psy;
+ 	struct power_supply *bat_psy;
+@@ -462,6 +465,10 @@
+ 		return -EINVAL;
+ 
+ 	prop = sm8350_bat_prop_map[psp];
++	/* Xiaomi inserts BATT_CONSTANT_CURRENT at wire ID 12. */
++	if (battmgr->xiaomi_battery_property_ids &&
++	    prop >= BATT_TEMP && prop <= BATT_CHG_CTRL_END_THR)
++		prop++;
+ 
+ 	mutex_lock(&battmgr->lock);
+ 	ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET, prop, 0);
+@@ -516,6 +523,10 @@
+ 	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
+ 	enum qcom_battmgr_unit unit = battmgr->unit;
+ 	int ret;
++
++	/* Aurora firmware returns a constant 10 W placeholder for this property. */
++	if (battmgr->xiaomi_battery_property_ids && psp == POWER_SUPPLY_PROP_POWER_NOW)
++		return -ENODATA;
+ 
+ 	if (!battmgr->service_up)
+ 		return -EAGAIN;
+@@ -561,6 +572,12 @@
+ 		break;
+ 	case POWER_SUPPLY_PROP_CURRENT_NOW:
+ 		val->intval = battmgr->status.current_now;
++		/* Preserve raw gauge current; Linux exposes positive for charging. */
++		if (battmgr->xiaomi_battery_property_ids) {
++			if (val->intval == S32_MIN)
++				return -ENODATA;
++			val->intval = -val->intval;
++		}
+ 		break;
+ 	case POWER_SUPPLY_PROP_POWER_NOW:
+ 		val->intval = battmgr->status.power_now;
+@@ -1202,6 +1219,9 @@
+ 
+ 	notification = le32_to_cpu(msg->notification);
+ 	notification &= 0xff;
++	/* Xiaomi vendor changes also invalidate the standard battery readings. */
++	if (battmgr->xiaomi_battery_property_ids && notification == 0x50)
++		notification = NOTIF_BAT_PROPERTY;
+ 	switch (notification) {
+ 	case NOTIF_BAT_INFO:
+ 		battmgr->info.valid = false;
+@@ -1382,6 +1402,13 @@
+ 	switch (opcode) {
+ 	case BATTMGR_BAT_PROPERTY_GET:
+ 		property = le32_to_cpu(resp->intval.property);
++		if (battmgr->xiaomi_battery_property_ids &&
++		    property > BATT_CHG_CTRL_LIM_MAX) {
++			/* Skip OEM-only IDs; normalize before payload decoding. */
++			if (property <= BATT_TEMP || property > BATT_CHG_CTRL_END_THR + 1)
++				return;
++			property--;
++		}
+ 		if (property == BATT_MODEL_NAME) {
+ 			if (payload_len != sizeof(resp->strval)) {
+ 				dev_warn(battmgr->dev,
+@@ -1575,6 +1602,10 @@
+ 	struct qcom_battmgr *battmgr = priv;
+ 	unsigned int opcode = le32_to_cpu(hdr->opcode);
+ 
++	/* Unrequested Xiaomi reports must not acknowledge a standard read. */
++	if (battmgr->xiaomi_battery_property_ids && opcode == 0x50)
++		return;
++
+ 	if (opcode == BATTMGR_NOTIFICATION)
+ 		qcom_battmgr_notification(battmgr, data, len);
+ 	else if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
+@@ -1663,6 +1694,8 @@
+ 	else
+ 		battmgr->variant = QCOM_BATTMGR_SM8350;
+ 
++	battmgr->xiaomi_battery_property_ids = of_machine_is_compatible("xiaomi,aurora");
++
+ 	ret = qcom_battmgr_charge_control_thresholds_init(battmgr);
+ 	if (ret < 0)
+ 		return dev_err_probe(dev, ret,

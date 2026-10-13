@@ -1,0 +1,70 @@
+Subject: [PATCH] Allocate CPU upload surfaces from the system DMA heap
+
+Local change against libva-v4l2 v1.0.0:
+https://github.com/radxa-pkg/libva-v4l2/tree/0e4ce1e05da1d0a92b342efc2090b9e4987035e1
+
+On SM8475, MSM cached-coherent GEM uploads produce intermittent corrupt Iris
+encoder input. GPU coherency does not establish coherency with the VPU; the
+MSM PRIME exporter lacks begin/end CPU-access callbacks. The system heap
+provides attachment-specific synchronization for the existing VA image map
+and unmap DMA_BUF_IOCTL_SYNC calls. Keep the linear layout, fd lifetime and
+direct DMA-BUF encoding path, and require access to /dev/dma_heap/system.
+
+--- a/src/backend.cpp
++++ b/src/backend.cpp
+@@ -2,6 +2,7 @@
+ #include "internal.hpp"
+ #include <drm_fourcc.h>
+ #include <linux/dma-buf.h>
++#include <linux/dma-heap.h>
+ #include <sys/ioctl.h>
+ #include <fcntl.h>
+ #include <unistd.h>
+@@ -232,13 +233,15 @@
+ }
+ 
+ static std::shared_ptr<Memory> allocate_undecoded_surface(VADriverContextP ctx, const Surface &s) {
+-    // mpv probes GPU import before creating a decoder context. Use an actual
+-    // linear MSM GEM allocation for these otherwise unbacked VA surfaces.
+-    // The PRIME fd owns the storage after the temporary GEM handle is closed.
+-    // If exported before decode, keep this allocation for the surface's
+-    // lifetime. A consumer may keep its fd without calling export again.
+-    check(ctx->drm_state, "surface allocation requires a DRM display");
+-    int fd = static_cast<drm_state *>(ctx->drm_state)->fd;
++    // These surfaces can be CPU-written by VA image upload and then imported
++    // by Iris. MSM_BO_CACHED_COHERENT only establishes GPU coherency: the MSM
++    // PRIME exporter has no CPU-access callbacks to flush dirty CPU cache lines
++    // for a noncoherent VPU. Use the system heap, whose DMA_BUF_IOCTL_SYNC
++    // callbacks synchronize each mapped device attachment.
++    // mpv also probes GPU import before creating a decoder context. This linear
++    // DMA-BUF remains importable, and an early export must keep its allocation
++    // for the surface's lifetime because a consumer may cache the fd.
++    (void)ctx;
+     auto m = std::make_shared<Memory>();
+     m->width = s.width;
+     m->height = s.height;
+@@ -250,12 +253,18 @@
+     check(page_size > 0, "cannot determine page size");
+     size_t size = size_t(m->stride) * m->storage_height * 3 / 2;
+     m->size = (size + size_t(page_size) - 1) / size_t(page_size) * size_t(page_size);
+-    int coherent = 0;
+-    m->fd = irisva_msm_allocate(fd, m->size, &coherent);
+-    m->origin = coherent ? MemoryOrigin::MsmCoherent : MemoryOrigin::MsmWriteCombined;
+-    check(m->fd >= 0, "allocate/export undecoded MSM surface", VA_STATUS_ERROR_ALLOCATION_FAILED);
+-    trace("allocated undecoded surface %ux%u fourcc=%#x pitch=%u size=%zu coherent=%d", s.width,
+-          s.height, s.fourcc, m->stride, m->size, coherent);
++    int heap = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
++    check(heap >= 0, "open system DMA heap for upload surface", VA_STATUS_ERROR_ALLOCATION_FAILED);
++    dma_heap_allocation_data allocation{};
++    allocation.len = m->size;
++    allocation.fd_flags = O_RDWR | O_CLOEXEC;
++    int result = ioctl(heap, DMA_HEAP_IOCTL_ALLOC, &allocation);
++    close(heap);
++    check(result == 0, "allocate upload DMA-BUF", VA_STATUS_ERROR_ALLOCATION_FAILED);
++    m->fd = allocation.fd;
++    m->origin = MemoryOrigin::DmaHeap;
++    trace("allocated undecoded surface %ux%u fourcc=%#x pitch=%u size=%zu dma-heap=system", s.width,
++          s.height, s.fourcc, m->stride, m->size);
+     return m;
+ }
+ 

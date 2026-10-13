@@ -28,16 +28,30 @@ let
         ./patches/0004-spmi-single-byte.patch
         ./patches/0005-pmic-gpio-input-state.patch
         ./patches/0006-simplefb-optional-properties.patch
+        ./patches/0007-mobile-boot-action-protocol.patch
+        ./patches/0008-mobile-ufs-boot-lun.patch
+        ./patches/0009-mobile-qcom-ab-efi-confirm.patch
+        ./patches/0010-acm-initialize-stdio.patch
       ]
       ++ board.patches;
-      extraConfig = import (directory + "/../config.nix") + board.config;
+      extraConfig =
+        import (directory + "/../config.nix")
+        + import ./boot-actions.nix {
+          profile = board.bootActionProfile or "none";
+          confirmationNonGptLunMask = board.bootActionConfirmationNonGptLunMask or 0;
+          androidNonGptLunMask = board.bootActionAndroidNonGptLunMask or 0;
+          chargerConfirmationPath = board.bootActionChargerConfirmationPath or "";
+        }
+        + board.config;
       configurePhase = ''
         runHook preConfigure
         make qcom_defconfig
         scripts/kconfig/merge_config.sh -m .config board/qualcomm/qcom-phone.config
         printf '%s' "$extraConfig" >> .config
         make olddefconfig
-        cp ${board.environment} board/qualcomm/${device}.env
+        cat ${board.environment} ${
+          lib.optionalString (board.chargerEnvironment or false) "${./charger.env}"
+        } > board/qualcomm/${device}.env
         runHook postConfigure
       '';
       filesToInstall = [
@@ -48,6 +62,15 @@ let
       extraMeta.platforms = [ "aarch64-linux" ];
     }).overrideAttrs
       (old: {
+        # Retain buildUBoot's build-time interpreter fixes for scripts and tools.
+        postPatch = (old.postPatch or "") + ''
+          cp ${../mobile-boot-action/firmware.c} lib/efi_loader/efi_mobile_boot_action.c
+          cp ${../mobile-boot-action/protocol.h} include/mobile_boot_action.h
+          cp ${../mobile-boot-action/pon-transaction.h} lib/efi_loader/mobile_pon_transaction.h
+          cp ${../mobile-boot-action/qcom-ab.h} lib/efi_loader/mobile_qcom_ab.h
+          cp ${../mobile-boot-action/qcom-ab-firmware.h} lib/efi_loader/mobile_qcom_ab_firmware.h
+          cp ${../mobile-boot-action/qcom-ab-confirm.h} lib/efi_loader/mobile_qcom_ab_confirm.h
+        '';
         nativeBuildInputs = old.nativeBuildInputs ++ [ buildPackages.xxd ];
       });
   payload = runCommand "${device}-u-boot-payload" { nativeBuildInputs = [ packagingTools.gzip ]; } ''

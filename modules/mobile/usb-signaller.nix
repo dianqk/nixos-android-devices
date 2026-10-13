@@ -3,6 +3,7 @@
   lib,
   pkgs,
   androidPackages,
+  utils,
   ...
 }:
 let
@@ -10,6 +11,9 @@ let
   cfg = androidDevices.usb.signaller;
   enabled = androidDevices.enable && androidDevices.usb.enable && !androidDevices.recovery.enable;
   package = cfg.package;
+  waitForHost = androidPackages.packaging.writeShellScript "acm-wait-host" (
+    builtins.readFile ./acm-wait-host.sh
+  );
   dbusPolicy = androidPackages.packaging.writeTextDir "share/dbus-1/system.d/com.meego.usb_moded.conf" ''
     <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
       "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
@@ -25,7 +29,13 @@ let
         <allow own="com.meego.usb_moded"/>
         <allow send_destination="com.meego.usb_moded"/>
       </policy>
-    </busconfig>
+    ${
+      lib.optionalString (cfg.controlGroup != null) ''
+        <policy group="${cfg.controlGroup}">
+          <allow send_destination="com.meego.usb_moded" send_interface="com.meego.usb_moded" send_member="set_mode"/>
+        </policy>
+      ''
+    }</busconfig>
   '';
   identity = builtins.hashString "sha256" androidDevices.usbSerial;
   mac =
@@ -47,6 +57,18 @@ in
       default = "172.16.42.1/24";
       description = "Device IPv4 address/prefix on the local USB management network.";
     };
+    controlGroup = lib.mkOption {
+      # A POSIX-style group name; it is interpolated into the D-Bus XML policy.
+      type = lib.types.nullOr (lib.types.strMatching "[a-z_][a-z0-9_-]*");
+      default = null;
+      example = "usb-mode";
+      description = ''
+        System group whose members may call usb-signaller's `set_mode` over the
+        system bus without elevation. The group is created when set. Members can
+        switch to charging-only or host mode, disconnecting the USB management
+        transport without any prompt. `null` keeps mode changes root-only.
+      '';
+    };
   };
   options.androidDevices.usb.acm.enable =
     lib.mkEnableOption "an ACM login console alongside NCM in usb-signaller developer mode";
@@ -67,11 +89,42 @@ in
           message = "The ACM console requires built-in USB_CONFIGFS_ACM support.";
         }
       ];
-      # Start only when ttyGS0 appears; do not make boot wait for a USB host.
-      # The standard serial-getty template retains the consumer's login policy.
+      # Device arrival starts the waiter; getty itself starts after enumeration.
       services.udev.extraRules = lib.mkIf androidDevices.usb.acm.enable ''
         SUBSYSTEM=="tty", KERNEL=="ttyGS0", TAG+="systemd", ENV{SYSTEMD_WANTS}+="serial-getty@ttyGS0.service"
       '';
+      systemd.services."serial-getty@ttyGS0" = lib.mkIf androidDevices.usb.acm.enable {
+        overrideStrategy = "asDropin";
+        path = [ pkgs.coreutils ];
+        serviceConfig = {
+          # The main process waits in the background. Keep the inherited getty
+          # ordering: Type=simple marks this service started before the wait.
+          Type = "simple";
+          StandardInput = "null";
+          StandardOutput = "journal";
+          StandardError = "journal";
+          TTYReset = false;
+          TTYVHangup = false;
+          TTYVTDisallocate = false;
+          ExecStart = [
+            ""
+            "${waitForHost} /sys/class/udc/${androidDevices.usbController}/state ${
+              lib.last (lib.toList config.systemd.services."serial-getty@".serviceConfig.ExecStart)
+            }"
+          ];
+        };
+      };
+      # NixOS names both drop-ins overrides.conf. The instance shadows the
+      # template's file, so include its evaluated settings before our overrides.
+      systemd.units."serial-getty@ttyGS0.service".text = lib.mkIf androidDevices.usb.acm.enable (
+        lib.mkForce (
+          config.systemd.units."serial-getty@.service".text
+          + "\n"
+          + (utils.systemdUtils.lib.serviceToUnit (
+            config.systemd.services."serial-getty@ttyGS0" // { name = "serial-getty@ttyGS0.service"; }
+          )).text
+        )
+      );
       environment.systemPackages = [ package ];
       services.dbus.enable = true;
       environment.etc."usb-signaller/usb-signaller.toml".text = ''
@@ -80,7 +133,9 @@ in
       '';
       # Queries are public. Mode changes are privileged because they can disconnect
       # the management transport. Do not install upstream's unrestricted set_mode rule.
+      # The optional control group receives only set_mode, not ownership or other methods.
       services.dbus.packages = [ dbusPolicy ];
+      users.groups = lib.mkIf (cfg.controlGroup != null) { ${cfg.controlGroup} = { }; };
       # networkd owns only USB; NetworkManager may continue to manage Wi-Fi.
       systemd.network.enable = true;
       networking.networkmanager.unmanaged = [ "interface-name:usb0" ];

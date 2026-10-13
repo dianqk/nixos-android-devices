@@ -4,6 +4,7 @@ pkgs: with pkgs; [
   ccache
   cpio
   dtc
+  elfutils
   flex
   gnumake
   gzip
@@ -17,5 +18,6 @@ pkgs: with pkgs; [
   python3
   rsync
   xz
+  zlib
   zstd
 ]

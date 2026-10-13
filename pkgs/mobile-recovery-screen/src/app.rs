@@ -3,12 +3,11 @@ use crate::device;
 use crate::device::Profile;
 #[cfg(feature = "backlight-control")]
 use crate::display::Backlight;
-use crate::display::Framebuffer;
+use crate::display::Console;
 use crate::input::{discover_inputs, poll_inputs};
 use crate::menu::Menu;
 use crate::render::render;
 use crate::status::{StatusSocket, UpdateStatus};
-use fontdue::{Font, FontSettings};
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -67,8 +66,7 @@ fn journal_log() -> String {
     }
 }
 fn preview_dimensions() -> io::Result<(usize, usize)> {
-    let value =
-        std::env::var("MOBILE_RECOVERY_PREVIEW_SIZE").unwrap_or_else(|_| "1080x2160".into());
+    let value = std::env::var("MOBILE_RECOVERY_PREVIEW_SIZE").unwrap_or_else(|_| "50x40".into());
     let (width, height) = value
         .split_once('x')
         .ok_or_else(|| io::Error::other("preview size must be WIDTHxHEIGHT"))?;
@@ -78,9 +76,9 @@ fn preview_dimensions() -> io::Result<(usize, usize)> {
     let height: usize = height
         .parse()
         .map_err(|_| io::Error::other("invalid preview height"))?;
-    if !(320..=4096).contains(&width) || !(320..=4096).contains(&height) {
+    if !(40..=240).contains(&width) || !(32..=160).contains(&height) {
         return Err(io::Error::other(
-            "preview size must be 320..4096 on each axis",
+            "preview size must be 40..240 columns and 32..160 rows",
         ));
     }
     Ok((width, height))
@@ -108,25 +106,16 @@ fn start_action(cfg: &Profile, action: &str, id: u64) -> io::Result<(Child, Path
 pub(crate) fn run() -> io::Result<()> {
     let args: Vec<_> = std::env::args_os().collect();
     let preview = args.get(1).is_some_and(|s| s == "--preview");
-    let (font_path, output) = if preview && args.len() == 4 {
-        (Path::new(&args[2]), Some(Path::new(&args[3])))
-    } else if !preview && args.len() == 2 {
-        (Path::new(&args[1]), None)
+    let output = if preview && args.len() == 3 {
+        Some(Path::new(&args[2]))
+    } else if !preview && args.len() == 1 {
+        None
     } else {
         return Err(io::Error::other(
-            "usage: mobile-recovery-screen [--preview] FONT [OUTPUT.ppm]",
+            "usage: mobile-recovery-screen [--preview OUTPUT.txt]",
         ));
     };
     let cfg = device::profile();
-    let font = Font::from_bytes(fs::read(font_path)?, FontSettings::default())
-        .map_err(io::Error::other)?;
-    let percent = std::env::var("MOBILE_RECOVERY_FONT_PERCENT")
-        .unwrap_or_else(|_| "100".into())
-        .parse::<u32>()
-        .map_err(|_| io::Error::other("font percent must be 75..150"))?;
-    if !(75..=150).contains(&percent) {
-        return Err(io::Error::other("font percent must be 75..150"));
-    }
     let mut menu = Menu::default();
     if preview {
         match std::env::var("MOBILE_RECOVERY_PREVIEW_STATE").as_deref() {
@@ -159,22 +148,21 @@ pub(crate) fn run() -> io::Result<()> {
         }
         render(
             &mut canvas,
-            &font,
             cfg,
             &menu,
             "ERROR: action failed",
             &preview_log,
             "USB link: configured",
             true,
-            percent as f32 / 100.0,
             &preview_update,
         );
-        return canvas.ppm(output.unwrap());
+        return canvas.save(output.unwrap());
     }
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .mode(0o600)
         .open("/tmp/mobile-recovery-screen.lock")?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
@@ -184,8 +172,8 @@ pub(crate) fn run() -> io::Result<()> {
         libc::signal(libc::SIGTERM, stop as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, stop as *const () as libc::sighandler_t);
     }
-    let mut fb = Framebuffer::open()?;
-    let mut canvas = Canvas::new(fb.var.xres as usize, fb.var.yres as usize);
+    let mut console = Console::open()?;
+    let mut canvas = Canvas::new(console.columns, console.rows);
     let mut inputs = Vec::new();
     let mut child: Option<(Child, PathBuf)> = None;
     let mut action_id = 0u64;
@@ -218,24 +206,22 @@ pub(crate) fn run() -> io::Result<()> {
         if redraw {
             render(
                 &mut canvas,
-                &font,
                 cfg,
                 &menu,
                 &failure,
                 log_cache.as_deref().unwrap_or(""),
                 &usb,
                 !inputs.is_empty(),
-                percent as f32 / 100.0,
                 &status_socket.status,
             );
-            fb.show(&canvas);
+            console.show(&canvas)?;
             #[cfg(feature = "refresh-panel")]
             if !refreshed {
-                fb.force_refresh()?;
+                console.force_refresh()?;
                 // Some DSI fbdev scanout paths discard the first frame while
                 // the blank cycle restores the panel. Submit it again after
                 // the forced modeset so the visible buffer contains this UI.
-                fb.show(&canvas);
+                console.show(&canvas)?;
                 refreshed = true;
             }
             #[cfg(feature = "backlight-control")]

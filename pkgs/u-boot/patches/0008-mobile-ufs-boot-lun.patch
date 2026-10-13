@@ -1,0 +1,117 @@
+From: NixOS Android devices contributors <nixos-android-devices@localhost>
+Date: Thu, 1 Oct 2026 18:00:00 +0800
+Subject: [PATCH] ufs: expose narrow boot-LUN selection for EFI slot actions
+
+Local integration against U-Boot a06e89ab05eaa2b8344d521319399333cd760ae5:
+https://source.denx.de/u-boot/u-boot/-/blob/a06e89ab05eaa2b8344d521319399333cd760ae5/drivers/ufs/ufs-uclass.c
+
+Allow read-only enabled-LUN enumeration and read/write bBootLunEn. Limit
+writes to boot LUN 1/2 on an active UFS device, using the existing query path.
+The caller checks both GPT copies and confirms the new boot-LUN value.
+
+Local extension: read-only boot IDs from the same configuration descriptor,
+so checked Android actions can bind selector IDs to physical XBL placement.
+---
+--- a/include/ufs.h
++++ b/include/ufs.h
+@@ -20,4 +20,11 @@
+  */
+ int ufs_probe_dev(int index);
+ 
++/* Narrow boot selection API; only the boot-LUN attribute can be written. */
++int ufs_mobile_boot_lun_get(struct udevice *dev, unsigned int *lun);
++int ufs_mobile_boot_lun_set(struct udevice *dev, unsigned int lun);
++int ufs_mobile_enabled_luns(struct udevice *dev, unsigned int *mask);
++int ufs_mobile_lun_info(struct udevice *dev, unsigned int *mask,
++			unsigned char boot_ids[8]);
++
+ #endif
+--- a/drivers/ufs/ufs-uclass.c
++++ b/drivers/ufs/ufs-uclass.c
+@@ -2331,6 +2331,86 @@
+ 	return device_bind_driver(dev, "ufs_scsi", "ufs_scsi", NULL);
+ }
+ 
++/* Qualcomm A/B boot services use an explicitly matched/probed UFS device.
++ * No arbitrary attribute/descriptor write interface is exposed. */
++int ufs_mobile_boot_lun_get(struct udevice *dev, unsigned int *lun)
++{
++	struct ufs_hba *hba = dev_get_uclass_priv(dev);
++	if (!lun || device_get_uclass_id(dev) != UCLASS_UFS || !device_active(dev))
++		return -EINVAL;
++	return ufshcd_query_attr_retry(hba, UPIU_QUERY_OPCODE_READ_ATTR,
++				     QUERY_ATTR_IDN_BOOT_LU_EN, 0, 0, lun);
++}
++
++int ufs_mobile_boot_lun_set(struct udevice *dev, unsigned int lun)
++{
++	struct ufs_hba *hba = dev_get_uclass_priv(dev);
++	if ((lun != 1 && lun != 2) || device_get_uclass_id(dev) != UCLASS_UFS ||
++	    !device_active(dev))
++		return -EINVAL;
++	return ufshcd_query_attr_retry(hba, UPIU_QUERY_OPCODE_WRITE_ATTR,
++				     QUERY_ATTR_IDN_BOOT_LU_EN, 0, 0, &lun);
++}
++
++int ufs_mobile_lun_info(struct udevice *dev, unsigned int *mask,
++			unsigned char boot_ids[8])
++{
++	struct ufs_hba *hba = dev_get_uclass_priv(dev);
++	unsigned int i, offset, stride;
++	u8 device_desc[QUERY_DESC_MAX_SIZE];
++	u8 config_desc[QUERY_DESC_MAX_SIZE];
++	int length = sizeof(config_desc), ret;
++	if (!mask || device_get_uclass_id(dev) != UCLASS_UFS || !device_active(dev))
++		return -EINVAL;
++	*mask = 0;
++	if (boot_ids)
++		memset(boot_ids, 0, 8);
++	memset(device_desc, 0, sizeof(device_desc));
++	ret = ufshcd_read_desc(hba, QUERY_DESC_IDN_DEVICE, 0,
++			       device_desc, hba->desc_size.dev_desc);
++	if (ret)
++		return ret;
++	if (hba->desc_size.dev_desc <= DEVICE_DESC_PARAM_UD_LEN ||
++	    device_desc[0] != hba->desc_size.dev_desc ||
++	    device_desc[1] != QUERY_DESC_IDN_DEVICE)
++		return -EINVAL;
++	offset = device_desc[DEVICE_DESC_PARAM_UD_OFFSET];
++	stride = device_desc[DEVICE_DESC_PARAM_UD_LEN];
++	ret = ufshcd_query_descriptor_retry(hba, UPIU_QUERY_OPCODE_READ_DESC,
++					    QUERY_DESC_IDN_CONFIGURATION, 0, 0,
++					    config_desc, &length);
++	if (ret)
++		return ret;
++	/* Unit Descriptor queries may reject unimplemented LUNs. Instead read
++	 * all eight bLUEnable fields from the Configuration Descriptor, whose
++	 * offset/stride are supplied by the device (and differ by UFS version). */
++	if (length < 0x10 || config_desc[0] != length ||
++	    config_desc[1] != QUERY_DESC_IDN_CONFIGURATION ||
++	    offset < 0x10 || stride < 0x10 || offset + 8 * stride > (unsigned int)length)
++		return -EINVAL;
++	if (boot_ids && config_desc[3] != 1)
++		return -EINVAL; /* Boot feature must be enabled for slot switching. */
++	for (i = 0; i < 8; i++) {
++		u8 enabled = config_desc[offset + i * stride];
++		if (enabled > 1)
++			return -EINVAL;
++		if (enabled)
++			*mask |= 1U << i;
++		if (boot_ids) {
++			u8 id = config_desc[offset + i * stride + 1];
++			if (id > 2 || (!enabled && id))
++				return -EINVAL;
++			boot_ids[i] = id;
++		}
++	}
++	return 0;
++}
++
++int ufs_mobile_enabled_luns(struct udevice *dev, unsigned int *mask)
++{
++	return ufs_mobile_lun_info(dev, mask, NULL);
++}
++
+ UCLASS_DRIVER(ufs) = {
+ 	.id			= UCLASS_UFS,
+ 	.name			= "ufs",

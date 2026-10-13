@@ -8,6 +8,7 @@
 let
   mobile = config.androidDevices;
   cfg = mobile.initrdUsb;
+  persistentKey = cfg.ssh.hostKeyStorage.enable && cfg.network.enable;
   identity = builtins.hashString "sha256" mobile.usbSerial;
   mac =
     prefix:
@@ -16,6 +17,7 @@ let
     );
   address = builtins.head (lib.splitString "/" cfg.address);
   gadget = "/sys/kernel/config/usb_gadget/recovery";
+  phase = if mobile.recovery.enable then "RAM recovery" else "early boot";
   setup = androidPackages.packaging.writeShellScript "mobile-initrd-usb" ''
     set -eu
     g=${gadget}
@@ -35,7 +37,7 @@ let
     printf 0x01 > "$g/bDeviceProtocol"
     mkdir -p "$g/strings/0x409" "$g/configs/c.1/strings/0x409"
     printf NixOS > "$g/strings/0x409/manufacturer"
-    printf '%s' ${lib.escapeShellArg "${mobile.deviceName} RAM recovery"} > "$g/strings/0x409/product"
+    printf '%s' ${lib.escapeShellArg "${mobile.deviceName} ${phase}"} > "$g/strings/0x409/product"
     printf '%s' ${lib.escapeShellArg mobile.usbSerial} > "$g/strings/0x409/serialnumber"
     printf recovery > "$g/configs/c.1/strings/0x409/configuration"
     ${lib.optionalString cfg.acm.enable ''
@@ -67,11 +69,27 @@ let
   console = androidPackages.packaging.writeShellScript "mobile-recovery-console" ''
     export PATH=/bin:/sbin
     export TERM=vt100
-    echo 'NixOS RAM recovery. No disk is mounted automatically.'
+    echo ${
+      lib.escapeShellArg (
+        if mobile.recovery.enable then
+          "NixOS RAM recovery. SSH identity may briefly access the Linux root; no target remains mounted."
+        else
+          "NixOS early boot. This console closes when the installed system starts."
+      )
+    }
+    if test -f /run/mobile-recovery/ssh-host-key-state; then
+      printf "SSH identity: "
+      cat /run/mobile-recovery/ssh-host-key-state
+    fi
     if test -f /run/mobile-recovery/ssh_host_ed25519_key.pub; then
       ${pkgs.openssh}/bin/ssh-keygen -lf /run/mobile-recovery/ssh_host_ed25519_key.pub
     fi
-    exec /bin/bash -i
+    ${
+      if mobile.recovery.enable && !mobile.recovery.minimal then
+        "exec /bin/recovery shell"
+      else
+        "exec /bin/bash -i"
+    }
   '';
 in
 {
@@ -106,6 +124,23 @@ in
       default = false;
       description = "Require an authorized SSH public key instead of the default passwordless recovery login.";
     };
+    ssh.hostKeyStorage = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = mobile.recovery.enable && !mobile.recovery.minimal;
+        description = "Reuse or create a recovery-only SSH host key on the verified Linux ext4 root; fall back to RAM on unavailable storage.";
+      };
+      compatible = lib.mkOption {
+        type = lib.types.str;
+        default = mobile.recovery.daemon.compatible;
+        description = "Required device-tree compatible before accessing host-key storage.";
+      };
+      controller = lib.mkOption {
+        type = lib.types.strMatching "[A-Za-z0-9._-]+";
+        default = mobile.recovery.daemon.controller;
+        description = "Required internal storage controller sysfs component; never select storage by device family.";
+      };
+    };
     authorizedKeys = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -114,6 +149,15 @@ in
   };
   config = lib.mkIf (mobile.enable && cfg.enable) {
     assertions = [
+      {
+        assertion =
+          !persistentKey
+          || (
+            mobile.recovery.enable && !mobile.recovery.minimal && mobile.persistentImage.rootfs.device != null
+          );
+        message = "Persistent recovery SSH identity requires full RAM recovery and an explicit root device.";
+      }
+
       {
         assertion = cfg.acm.enable || cfg.network.enable;
         message = "initrdUsb needs ACM or NCM enabled; both may be enabled together.";
@@ -169,7 +213,8 @@ in
       network = lib.mkIf cfg.network.enable {
         enable = true;
         networks."10-recovery-usb" = {
-          matchConfig.Name = "usb0";
+          # Match the identity set by this gadget, not a kernel-assigned name.
+          matchConfig.MACAddress = mac "02";
           address = [ cfg.address ];
           linkConfig.RequiredForOnline = "no";
           networkConfig = {
@@ -186,6 +231,35 @@ in
             EmitDNS = false;
             EmitNTP = false;
           };
+        };
+      };
+      contents."/etc/recovery-host-key.json" = lib.mkIf persistentKey {
+        text = builtins.toJSON {
+          identity = mobile.deviceName;
+          inherit (cfg.ssh.hostKeyStorage) compatible controller;
+          root_device = mobile.persistentImage.rootfs.device;
+          root_label = mobile.persistentImage.rootfs.label;
+        };
+      };
+      services.mobile-recovery-host-key = lib.mkIf persistentKey {
+        description = "Prepare recovery SSH identity with optional Linux-root persistence";
+        wantedBy = [ "mobile-recovery.target" ];
+        after = [ "systemd-udev-trigger.service" ];
+        before = [
+          "mobile-recovery-sshd.service"
+          "mobile-recovery-console.service"
+          "mobile-recovery-daemon.service"
+          "mobile-recovery-screen.service"
+        ];
+        unitConfig.DefaultDependencies = false;
+        environment.PATH = "/bin:/sbin";
+        serviceConfig = {
+          Type = "oneshot";
+          ExecStart = "/bin/mobile-recovery-host-key";
+          PrivateMounts = true;
+          TimeoutStartSec = 15;
+          UMask = "0077";
+          RemainAfterExit = true;
         };
       };
       contents."/etc/ssh/recovery_authorized_keys".text =
@@ -240,20 +314,42 @@ in
           Restart = "always";
           RestartSec = 2;
           StandardInput = "null";
+          # Interactive Bash ignores SIGTERM. Hang up the console before
+          # releasing its gadget and switching to the installed root.
+          KillSignal = "SIGHUP";
+          TimeoutStopSec = 5;
         };
       };
       services.mobile-recovery-sshd = lib.mkIf cfg.network.enable {
         wantedBy = [ (if mobile.recovery.enable then "mobile-recovery.target" else "initrd.target") ];
-        requires = [ "systemd-networkd.service" ];
-        after = [ "systemd-networkd.service" ];
+        requires = [
+          "systemd-networkd.service"
+          "mobile-initrd-usb.service"
+        ];
+        after = [
+          "systemd-networkd.service"
+          "mobile-initrd-usb.service"
+        ];
         before = [ "initrd-switch-root.target" ];
         conflicts = [ "initrd-switch-root.target" ];
         unitConfig.DefaultDependencies = false;
         preStart = ''
           set -eu
+          # Starting networkd does not mean its static address is installed yet.
+          # Keep sshd bound to the USB address, and wait for that exact address.
+          has_address() {
+            ${pkgs.busybox}/bin/ip -4 address show dev usb0 2>/dev/null |
+              ${pkgs.busybox}/bin/grep -Fq ${lib.escapeShellArg "inet ${cfg.address} "}
+          }
+          for attempt in $(seq 1 200); do
+            has_address && break
+            sleep 0.1
+          done
+          has_address
           mkdir -p /run/sshd /var/empty /run/mobile-recovery
           chmod 0700 /run/mobile-recovery
           if ! test -f /run/mobile-recovery/ssh_host_ed25519_key; then
+            printf 'temporary\n' > /run/mobile-recovery/ssh-host-key-state
             ${pkgs.openssh}/bin/ssh-keygen -q -t ed25519 -N "" -f /run/mobile-recovery/ssh_host_ed25519_key
           fi
           if ! test -e /run/mobile-recovery/authorized_keys; then

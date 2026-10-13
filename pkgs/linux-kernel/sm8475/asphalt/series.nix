@@ -2,7 +2,7 @@
   ./patches/local/0001-sm8475-core.patch
   ./patches/local/0002-asphalt-display.patch
   ./patches/local/0003-asphalt-touch.patch
-  ./patches/local/0004-sm8475-pcie-wifi.patch
+  ../../patches/pcie-qcom-iommu-cells.patch
   ./patches/local/0005-sm8475-ufs-clocks.patch
   ./patches/local/0006-asphalt-board-dts.patch
   ./patches/local/0007-sm8450-iris-video.patch
@@ -19,4 +19,22 @@
   ./patches/local/0018-asphalt-displayport.patch
   ./patches/local/0019-dp-debug-connector.patch
   ./patches/upstream/0020-lucid-ole-preserve-enabled-pll.patch
+  ../../patches/ssc-fastrpc-pdr.patch
+  ./patches/local/0021-asphalt-slpi.patch
+  ./patches/local/0022-sm8450-encoder-dpb.patch
+  ./patches/local/0023-sm8450-secure-arp-binding.patch
+  ./patches/local/0024-qcom-smmu-secure-arp.patch
+  ./patches/local/0025-iris-secure-arp.patch
+  ../../patches/iris-hfi-gen2-decode-order.patch
+  ../../patches/iris-hfi-gen2-capture-pool.patch
+  ../../patches/gmu-sync-state/0001.patch
+  ../../patches/gmu-sync-state/0002.patch
+  ../../patches/gmu-sync-state/0003.patch
+  ../../patches/gmu-sync-state/0004.patch
+  ../../patches/gmu-sync-state/0005.patch
+  ./patches/local/0026-asphalt-unused-crypto.patch
+  ./patches/local/0027-sm8450-ufs-no-phy-retention.patch
+  ./patches/upstream/0028-gcc-sm8450-cx-binding.patch
+  ./patches/upstream/0029-gcc-sm8450-cx-runtime-pm.patch
+  ./patches/upstream/0030-sm8450-gcc-cx-domain.patch
 ]

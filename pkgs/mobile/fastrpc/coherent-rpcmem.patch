@@ -1,0 +1,32 @@
+Use the mainline FastRPC coherent DMA allocator. Cached system DMA-heap
+buffers require CPU/device synchronization absent from this invocation path.
+Source baseline: https://github.com/qualcomm/fastrpc/blob/v1.0.7/src/rpcmem_linux.c
+
+--- a/src/rpcmem_linux.c
++++ b/src/rpcmem_linux.c
+@@ -88,18 +88,13 @@
+   pthread_mutex_init(&rpcmt, 0);
+   pthread_mutex_lock(&rpcmt);
+ 
+-  dmafd = open(DMA_HEAP_NAME, O_RDONLY | O_CLOEXEC);
+-  if (dmafd < 0) {
+-    FARF(ALWAYS, "Warning %d: Unable to open %s, falling back to fastrpc ioctl\n", errno, DMA_HEAP_NAME);
+-    /*
+-     * Application should link proper library as DEFAULT_DOMAIN_ID
+-     * is used to open rpc device node and not the uri passed by
+-     * user.
+-     */
+-    rpcfd = open_device_node(DEFAULT_DOMAIN_ID);
+-    if (rpcfd < 0)
+-      FARF(ALWAYS, "Warning %d: Unable to open fastrpc dev node for domain: %d\n", errno, DEFAULT_DOMAIN_ID);
+-  }
++  /* Mainline FastRPC does not synchronize cached system-heap mappings on
++   * every invocation. Use its coherent DMA allocator for shared RPC buffers.
++   * DEFAULT_DOMAIN_ID follows the linked domain-specific RPC library.
++   */
++  rpcfd = open_device_node(DEFAULT_DOMAIN_ID);
++  if (rpcfd < 0)
++    FARF(ALWAYS, "Unable to open fastrpc dev node for domain: %d\n", DEFAULT_DOMAIN_ID);
+   pthread_mutex_unlock(&rpcmt);
+ }
+ 

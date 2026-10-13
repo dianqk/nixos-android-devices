@@ -1,12 +1,12 @@
 # 配置自己的系统
 
-设备专属选项统一使用 `hardware.{asphalt,polaris,sheng,clover}.*`；
+设备专属选项统一使用 `hardware.{asphalt,polaris,sheng,aurora,clover}.*`；
 共享的启动、USB、recovery 等选项使用 `androidDevices.*`。
 
-[English](configuration.md) · [安装指南](README.zh.md) · [USB 连接](usb-signaller.md)
+[English](configuration.md) · [安装指南](README.zh.md) · [USB 连接](usb-signaller.zh.md)
 
 构建电脑需要 Linux 和启用 flakes 的 Nix。`buildSystem` 填电脑的架构：
-`x86_64-linux` 或 `aarch64-linux`；四款设备的目标架构都是 AArch64。
+`x86_64-linux` 或 `aarch64-linux`；五款设备的目标架构都是 AArch64。
 x86_64 电脑对本仓库定义或修改的编译包使用交叉工具链；普通上游系统包保持
 AArch64 原生，以复用其二进制缓存。
 
@@ -35,7 +35,7 @@ binfmt 解释器，并在 Nix daemon 配置中加入 `extra-platforms = aarch64-
 
 ```sh
 nix build .#system --option builders-use-substitutes false \
-  --out-link tmp/systemd-artifacts/system
+  --out-link result-system
 ```
 
 Nix 优先下载可用的 ARM 原生缓存，缺失的上游任务和 NixOS 生成配置可通过 QEMU
@@ -72,14 +72,15 @@ git init
 git add flake.nix
 nix flake lock
 nix eval .#nixosConfigurations.phone.config.system.build.toplevel.drvPath
-nix build .#system -o tmp/systemd-artifacts/system
-nix build .#boot -o tmp/systemd-artifacts/boot
-nix build .#boot-files -o tmp/systemd-artifacts/boot-files
-nix build .#bootstrap-info -o tmp/systemd-artifacts/bootstrap-info
-nix build .#recovery -o tmp/systemd-artifacts/recovery
+nix build .#system -o result-system
+nix build .#boot -o result-boot
+nix build .#boot-files -o result-boot-files
+nix build .#bootstrap-info -o result-bootstrap-info
+nix build .#recovery -o result-recovery
 ```
 
-以上只构建文件。随后按[设备首装指南](README.zh.md)准备分区并安装；固件和
+以上只构建文件。各指南将输出链接命名为 `result-<role>`，也可使用其他路径，
+保持一致即可。随后按[设备首装指南](README.zh.md)准备分区并安装；固件和
 EFI 文件仅在相应步骤需要时构建。system 与 bootstrap-info 必须来自同一锁定配置。
 
 ## 额外的内核直启镜像（Sheng / Clover）
@@ -88,7 +89,7 @@ U-Boot 保持默认：`boot` 和 `u-boot` 仍输出 U-Boot 固件。已有安装
 `boot-kernel`，把 Linux、配套直启 initrd 和设备 DTB 打包为 Android boot 镜像：
 
 ```sh
-nix build .#devices.sheng.boot-kernel --out-link tmp/systemd-artifacts/devices.sheng.boot-kernel
+nix build .#devices.sheng.boot-kernel --out-link result-boot-kernel
 # Clover 将 sheng 换成 clover；只构建实际需要的设备。
 ```
 
@@ -113,18 +114,18 @@ system profile 变化。启动前须将完整 closure 部署到现有 ext4 根�
 ## 选择设备和系统角色
 
 `lib.mkSystem { device; buildSystem; modules; }` 返回标准 NixOS 配置。
-`device` 支持 `asphalt`、`polaris`、`sheng`、`clover`；`modules` 中放自己的
+`device` 支持 `asphalt`、`polaris`、`sheng`、`aurora`、`clover`；`modules` 中放自己的
 NixOS 模块。可选参数 `specialArgs`、`overlays`、`nixpkgsConfig` 分别传递模块参数、
 包覆盖和 Nixpkgs 配置。
 
-| 模块提供的默认值 | Asphalt | Polaris | Sheng | Clover LTE |
-| --- | --- | --- | --- | --- |
-| 安装系统启动方式 | U-Boot/EFI | U-Boot/EFI | U-Boot/EFI | U-Boot/EFI |
-| 根 GPT 分区 | `linux` | `userdata` | `linux` | `userdata` |
-| ext4 默认标签 | `NIXOS` | `NIXOS` | `NIXOS` | `NIXOS` |
-| 选择 NCM 后的 USB 地址 | `172.16.43.1/24` | `172.16.42.1/24` | `172.16.45.1/24` | `172.16.44.1/24` |
+| 模块提供的默认值 | Asphalt | Polaris | Sheng | Aurora | Clover LTE |
+| --- | --- | --- | --- | --- | --- |
+| 安装系统启动方式 | U-Boot/EFI | U-Boot/EFI | U-Boot/EFI | U-Boot/EFI | U-Boot/EFI |
+| 根 GPT 分区 | `linux` | `userdata` | `linux` | `linux` | `userdata` |
+| ext4 默认标签 | `NIXOS` | `NIXOS` | `NIXOS` | `NIXOS` | `NIXOS` |
+| 选择 NCM 后的 USB 地址 | `172.16.43.1/24` | `172.16.42.1/24` | `172.16.45.1/24` | `172.16.42.1/24`（共享默认值） | `172.16.44.1/24` |
 
-四台设备的 ext4 默认标签统一为 `NIXOS`。已有安装应保留与实际文件系统一致的
+五台设备的 ext4 默认标签统一为 `NIXOS`。已有安装应保留与实际文件系统一致的
 配置标签和 recovery 存储契约；修改默认值不会自动重命名文件系统。
 
 设备模块提供硬件、持久系统默认值及 recovery 工具，不创建演示用户或选择桌面。
@@ -138,7 +139,7 @@ U-Boot 使用 ACM，RAM recovery 在 initrd 中直接配置 ACM+NCM，不运行 
 
 在**单独的配置**中设置 `androidDevices.recovery.enable = true` 即可得到 RAM recovery。
 两者共享硬件/存储身份，不把桌面、用户服务、安装系统的 USB SSH 配置导入 recovery。
-recovery 使用 [ACM/NCM 和 OpenSSH](recovery.md)，不启动磁盘中的系统。更改主机名时，在两份配置中设置相同的
+recovery 使用 [ACM/NCM 和 OpenSSH](recovery.zh.md)，不启动磁盘中的系统。更改主机名时，在两份配置中设置相同的
 `hardware.<device>.systemHostName`，以便 recovery 识别目标系统。
 
 已有构建框架也可直接导入 `nixosModules.<device>`，配合
@@ -150,17 +151,17 @@ imports = [ inputs.androidDevices.nixosModules.polaris ];
 androidDevices.usbSerial = "my-polaris-01";
 ```
 
-其他设备将 `polaris` 替换为 `asphalt`、`sheng` 或 `clover`。无需额外导入
+其他设备将 `polaris` 替换为 `asphalt`、`sheng`、`aurora` 或 `clover`。无需额外导入
 通用模块，也无需设置 `androidDevices.enable = true`。
 桌面策略及逐机身份由使用者提供。
 
 ## 添加桌面和服务
 
-桌面、用户、认证和通用系统精简使用标准 NixOS 配置。公共设备模块不导出 Sway
+桌面、用户、认证和通用系统精简使用标准 NixOS 配置。公共设备模块不导出桌面策略
 或通用 minimal 系统模块。消费示例直接导入 Nixpkgs 的 `profiles/minimal.nix`；
 可以删除该导入，也可以继续添加服务。
 
-例如，在自己的安装系统中添加 Sway/Foot：
+例如，在自己的安装系统中添加 Niri/Foot：
 
 ```nix
 {
@@ -169,14 +170,24 @@ androidDevices.usbSerial = "my-polaris-01";
     initialPassword = "change-before-use"; # 也可使用 hashedPasswordFile。
     extraGroups = [ "video" "input" "render" ];
   };
-  programs.sway.enable = true;
+  programs.niri.enable = true;
   programs.foot.enable = true;
 }
 ```
 
-在本地 tty 登录后运行 `dbus-run-session sway`。输出、按键、终端和自启动由自己的
-配置管理。[桌面示例](../examples/desktop.nix)演示完整会话和显式的演示用户自动登录；
-复制需要的部分并自行修改，不把它作为上游模块接口导入。其他桌面同样使用标准
+在本地 tty 登录后运行 `niri-session`。输出、按键、终端和自启动由自己的
+配置管理。[桌面示例](../examples/desktop.nix)演示完整会话、显式的演示用户自动登录，
+以及始终显示在底部并预留屏幕空间的 wvkbd 虚拟键盘。
+复制需要的部分并自行修改，不把它作为上游模块接口导入。示例通过 `NIRI_CONFIG`
+选择 `/etc/niri/config.kdl`，由 demo 的 tty1 登录启动 `niri-session`。
+示例文件中的 `example.desktop.scale` 设置内屏缩放，它不是导出的硬件模块选项。
+Niri 使用默认屏幕方向；示例不添加输出 transform、旋转 metadata 覆盖或自动旋转
+客户端。传感器支持仍可用于诊断或显式配置的旋转策略。触摸屏映射到 `DSI-1`，
+窗口使用无间距的全宽列，
+保留 wvkbd 的屏幕空间。Super+Return 打开终端，Super+左右切换列，Super+上下切换
+工作区，Super+O 打开概览，Super+Q 关闭窗口，Super+Shift+E 退出会话。Print 截图；
+需要指定保存路径时运行 `niri msg action screenshot-screen --path /tmp/screen.png`。
+其他桌面同样使用标准
 NixOS 模块。面板旋转、缩放和 UI 偏好属于具体会话配置。
 
 Polaris 的 `hardware.polaris.radio.enable` 和 `hardware.polaris.audio.enable`
@@ -185,7 +196,9 @@ Polaris 的 `hardware.polaris.radio.enable` 和 `hardware.polaris.audio.enable`
 PipeWire 等服务即可，无需禁用或重新导入内部文件。音频与无线按需共享 DSP 服务。
 其他设备保留各自的硬件默认值；传感器、指纹等可选功能见对应设备说明。
 
-播放器可使用 `config.androidDevices.video.ffmpegPackage` 保留设备解码修复。
+所有设备（包括 Polaris/Asphalt）默认使用上游 FFmpeg。
+`androidDevices.video.ffmpegPackage` 仍可覆盖；[裁剪后的本地 H.264/HEVC 配置](video.zh.md)
+及设备 V4L2 修复仅在诊断或专用本地媒体构建中按需选择。
 蓝牙、PipeWire、Wi-Fi 凭据、用户、软件包及应用服务继续使用标准 NixOS 选项。
 
 需要相机 CLI 时，在接收 `config` 的模块中设置

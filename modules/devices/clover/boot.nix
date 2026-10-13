@@ -22,6 +22,12 @@ in
     usb.signaller.address = lib.mkDefault "172.16.44.1/24";
     persistentImage.rootfs.device = lib.mkDefault "/dev/disk/by-partlabel/userdata";
     boot = {
+      actions = {
+        reboot = lib.mkDefault true;
+        poweroff = lib.mkDefault true;
+        bootloader = lib.mkDefault true;
+        recovery = lib.mkDefault true;
+      };
       firmwarePackage = lib.mkDefault (androidPackages.mkUBoot { device = "clover"; });
       directKernel.enable = lib.mkDefault true;
       uefi = {
@@ -29,14 +35,10 @@ in
         requireStandardEsp = false;
       };
     };
-    recovery = {
-      initialInstallAdapter = ../../../devices/clover/initial-install.sh;
-      targetHostName = board.systemHostName;
-      bootPartitionLabel = "system";
-      extraTargetConfig = ''
-        CLOVER_STORAGE_ROLES=/bin/clover-storage-roles
-        CLOVER_ROOT_UUID=${lib.escapeShellArg (if board.rootUUID == null then "" else board.rootUUID)}
-      '';
+    initrdUsb.ssh.hostKeyStorage = {
+      compatible = "xiaomi,clover";
+      controller = "c0c4000.sdhci";
     };
+    recovery.targetHostName = board.systemHostName;
   };
 }

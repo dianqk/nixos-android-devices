@@ -3,7 +3,7 @@
 [English](README.md) · [项目首页](../README.zh.md)
 
 从[配置指南](configuration.zh.md)创建自己的系统，再按设备准备存储和引导。
-四个型号均使用 U-Boot → systemd-boot → Linux。
+五个型号均使用 U-Boot → systemd-boot → Linux。
 
 ## 安装
 
@@ -12,10 +12,11 @@
 | Asphalt / Y700 2023 | 独立 1 GiB `linux-boot` | `linux` | 仅 `boot_b` | [配置](asphalt/README.zh.md) · [首装准备](asphalt/first-install.zh.md) |
 | Polaris / MIX 2S | 物理 `system` | `userdata` | `boot`，无 A/B | [配置](polaris/README.zh.md) · [首装](polaris/first-install.zh.md) |
 | Sheng / 平板 6S Pro | 独立 1 GiB `linux-boot` | `linux` | 仅 `boot_b` | [配置](sheng/README.zh.md) · [首装准备](sheng/first-install.zh.md) |
+| Aurora / 小米 14 Ultra | 独立 1 GiB `linux-boot` | `linux` | 仅 `boot_b` | [配置与安装](aurora/README.zh.md) |
 | Clover / 平板 4 LTE | 物理 `system` | `userdata` | `boot`，无 A/B | [配置](clover/README.zh.md) · [首装准备](clover/first-install.zh.md) |
 
-四款设备均可在分区准备完成后使用[首次安装器](initial-install.zh.md)。
-Clover 需要实测存储契约，其 U-Boot 尚未真机验证。Asphalt/Sheng 的 Linux
+五款设备均可在分区准备完成后使用[首次安装器](initial-install.zh.md)。
+Clover 需要实测存储契约，其 U-Boot 尚未真机验证。Asphalt/Sheng/Aurora 的 Linux
 分区取自原 userdata 分配范围，保留 Android A 和 super。
 
 完整步骤见 [U-Boot 安装指南](u-boot-install.zh.md)。
@@ -23,14 +24,23 @@ Clover 需要实测存储契约，其 U-Boot 尚未真机验证。Asphalt/Sheng 
 ## 日常更新与排障
 
 - 配置用户、桌面、应用和服务：[配置指南](configuration.zh.md)。
-- USB 网络、SSH 和 `nixos-rebuild boot`：[连接与更新](usb-signaller.md)。
-- 选择 Polaris 代际与菜单设置：[启动菜单](polaris/boot-menu.md)。
-- 启动失败、挂载目标文件系统和离线更新：[RAM recovery](recovery.md)。
+- USB 网络、SSH 和 `nixos-rebuild boot`：[连接与更新](usb-signaller.zh.md)。
+- 选择 Polaris 代际与菜单设置：[启动菜单](polaris/boot-menu.zh.md)。
+- 启动失败、挂载目标文件系统和离线更新：[RAM recovery](recovery.zh.md)。
 - 闭包传输与受检查的设备操作：[mobile-device](../pkgs/mobile-device/README.zh.md)。
 - Sheng recovery 镜像维护：[recovery 操作](sheng/recovery.zh.md)。
 
 普通系统更新维护 FAT `/boot` 上的内核、initrd、DTB 和代际条目。
 U-Boot 固件与 recovery 镜像单独更新。
+
+## 定制与移植
+
+- 软件包复用与覆盖：[软件包](packages.zh.md)。
+- 模块边界、共享 `androidDevices.*` 输入和设备选项：[模块](modules.zh.md)。
+- 求值检查、内核补丁集和新设备适配：[开发](development.zh.md)。
+- 适配主机工具与 USB 配置：[主机](host.zh.md)。
+- SSC 传感器与屏幕旋转：[传感器](sensors.zh.md)。
+- 高通基带与 QTEE 服务：[基带](modem.zh.md)。
 
 ## 支持等级
 

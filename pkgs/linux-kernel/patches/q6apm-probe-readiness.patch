@@ -1,0 +1,58 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 7 Oct 2026 17:00:00 +0800
+Subject: [PATCH] ASoC: qcom: q6apm: query readiness after GPR callback registration
+
+apr_device_probe() installs the GPR response callback only after apm_probe()
+returns. The synchronous GET_SPF_STATE sent during apm_probe consequently
+loses its response and times out. A receive trace on SM8650 with the OEM
+ADSP confirms opcode 0x02001007 and ready=1 arrive without apm_callback().
+
+Drop the premature query; q6prm still queries readiness after APM binds.
+Propagate query errors and do not convert a negative error to boolean true.
+
+Base: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/soc/qcom/apr.c?h=v7.3-rc5
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+diff --git a/sound/soc/qcom/qdsp6/q6apm.c b/sound/soc/qcom/qdsp6/q6apm.c
+index f167b9dae..99f5eba40 100644
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -142,12 +142,15 @@ static void q6apm_put_audioreach_graph(struct kref *ref)
+ 
+ static int q6apm_get_apm_state(struct q6apm *apm)
+ {
++	int ret;
+ 	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(0,
+ 								APM_CMD_GET_SPF_STATE, 0);
+ 	if (IS_ERR(pkt))
+ 		return PTR_ERR(pkt);
+ 
+-	q6apm_send_cmd_sync(apm, pkt, APM_CMD_RSP_GET_SPF_STATE);
++	ret = q6apm_send_cmd_sync(apm, pkt, APM_CMD_RSP_GET_SPF_STATE);
++	if (ret)
++		return ret;
+ 
+ 	return apm->state;
+ }
+@@ -155,7 +158,7 @@ static int q6apm_get_apm_state(struct q6apm *apm)
+ bool q6apm_is_adsp_ready(void)
+ {
+ 	if (g_apm)
+-		return q6apm_get_apm_state(g_apm);
++		return q6apm_get_apm_state(g_apm) > 0;
+ 
+ 	return false;
+ }
+@@ -883,8 +886,10 @@ static int apm_probe(gpr_device_t *gdev)
+ 
+ 	g_apm = apm;
+ 
+-	q6apm_get_apm_state(apm);
+-
++	/*
++	 * The GPR bus installs our response callback after this probe returns.
++	 * q6prm checks readiness once the service is bound.
++	 */
+ 	ret = snd_soc_register_component(dev, &q6apm_audio_component, NULL, 0);
+ 	if (ret < 0) {
+ 		dev_err(dev, "failed to register q6apm: %d\n", ret);

@@ -1,0 +1,35 @@
+Subject: [PATCH] Normalize SSC device axes for the orientation classifier
+
+SSC samples follow Android's X-right/Y-top/Z-out device frame. The common
+orientation classifier and its existing IIO tests expect negative Y for normal
+and positive X for left-up, while tilt expects positive Z for face-up.
+Adapt the SSC backend once at that interface boundary; keep the existing IIO
+backends and orientation API unchanged. This is independent of device model,
+panel installation angle and compositor transform mapping.
+
+Protocol reference:
+https://git.martb.dev/MartB/vendor_oneplus_kebab/src/commit/6694ebe6754e2d70cbf98aba495ad43396a21385/proprietary/vendor/etc/sensors/proto/sns_accel.proto
+Consumer contract: src/orientation.c and tests/integration-test.py in 3.9.
+Requires libssc to preserve the protocol's device coordinate frame.
+
+Local change against iio-sensor-proxy 3.9; no imported upstream patch.
+
+--- a/src/drv-ssc-accel.c
++++ b/src/drv-ssc-accel.c
+@@ -56,8 +56,14 @@
+ 	AccelReadings readings;
+ 	AccelVec3 tmp;
+ 
+-	tmp.x = accel_x;
+-	tmp.y = accel_y;
++	/* SSC events use Android device axes: X right, Y top, Z out of the
++	 * screen (sns_accel.proto). orientation_calc() expects screen-plane
++	 * components with the opposite signs: normal has negative Y and
++	 * left-up has positive X. Its tilt calculation still uses Z outwards.
++	 * Normalize this backend at the protocol boundary, before any residual
++	 * device mounting correction. Do not change the libssc event frame. */
++	tmp.x = -accel_x;
++	tmp.y = -accel_y;
+ 	tmp.z = accel_z;
+ 
+ 	if (!apply_mount_matrix (drv_data->mount_matrix, &tmp))

@@ -19,10 +19,15 @@
 ```nix
 {
   androidDevices.usbSerial = "my-clover-01";
-  hardware.clover.storageRolesFile = ./storage-roles.sh;
   androidDevices.persistentImage.rootfs.label = "NIXOS";
-  # Preserve the existing UUID when keeping a filesystem:
-  # hardware.clover.rootUUID = "YOUR_MEASURED_UUID";
+  # This tablet's measured partitions (see installation preparation):
+  hardware.clover.storageRoles = {
+    root = { partuuid = "YOUR_USERDATA_PARTUUID"; bytes = YOUR_USERDATA_BYTES; };
+    firmware = { partuuid = "YOUR_BOOT_PARTUUID"; bytes = 67108864; };
+    recovery = { partuuid = "YOUR_RECOVERY_PARTUUID"; bytes = 67108864; };
+    misc = { partuuid = "YOUR_MISC_PARTUUID"; bytes = 1048576; };
+    # Optional: number, offset and root.fsUuid to keep an existing filesystem.
+  };
 }
 ```
 
@@ -33,7 +38,7 @@
 Clover 使用 U-Boot/systemd-boot，物理 `system` 为 FAT `/boot`，`userdata` 为 ext4 根。
 U-Boot 尚未真机验证，已接入[共享 EFI 首装器](../initial-install.zh.md)，分区准备需单独完成，见[安装准备](first-install.zh.md)。
 
-默认内核为 Nixpkgs Linux 7.3-rc5，附有[注明来源的 Clover 补丁](../../pkgs/linux-kernel/sdm660/clover/PATCHES.zh.md)，
+默认内核为 Nixpkgs Linux 7.3-rc6，附有[注明来源的 Clover 补丁](../../pkgs/linux-kernel/sdm660/clover/PATCHES.zh.md)，
 尚未在设备上启动验证。
 
 ## 使用与排障
@@ -42,10 +47,17 @@ U-Boot 尚未真机验证，已接入[共享 EFI 首装器](../initial-install.z
 仓库演示产物使用 `.#devices.clover.<role>`，如 `.#devices.clover.system`。使用 `lib.mkArtifacts` 得到与配置匹配的产物，
 详见[产物说明](../configuration.zh.md#选择构建产物)。
 
-- 日常系统更新：[USB SSH](../usb-signaller.md)。
-- 启动失败与离线更新：[RAM recovery](../recovery.md)。
+- 日常系统更新：[USB SSH](../usb-signaller.zh.md)。
+- 启动失败与离线更新：[RAM recovery](../recovery.zh.md)。
 - Wi-Fi、音频、显示等支持程度：[硬件参考](hardware.zh.md)。
 - 构建/求值问题：[配置排障](../configuration.zh.md#更新恢复与排障)。
+
+桌面示例使用 Niri 的 OpenGL ES/EGL 渲染器，不需要 Vulkan。
+Mesa 的 Freedreno 支持 Adreno 5xx 的 GL/GLES，Turnip Vulkan 驱动不支持这一代 GPU。
+这说明渲染 API 可兼容，尚不代表 Clover 实机启动和实体显示已验证。
+运行[基础硬件测试](../../tests/basic/README.zh.md)时使用 `--skip vulkan`。
+依据：[Niri 渲染源码](https://github.com/niri-wm/niri/blob/v26.04/src/backend/tty.rs)、
+[Mesa 驱动支持说明](https://docs.mesa3d.org/drivers/freedreno.html)。
 
 ## 固件来源
 

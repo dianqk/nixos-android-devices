@@ -1,0 +1,164 @@
+From 01d0429432429ea5b501ee79d73286a7ed1272c8 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 13 Oct 2026 10:24:19 +0800
+Subject: [PATCH] net: qrtr: ns: keep announcing services after a failed
+ send
+
+When a remote node says HELLO, the name server replies with its own HELLO
+and then announces every local service to the node. announce_servers()
+gives up at the first failed send, so one transient failure hides all
+remaining services from the remote. On SM8650 (Aurora) the modem then
+waits for services such as rmtfs and TFTP until its watchdog fires
+("DOG detects stalled initialization"). The kernel log showed only
+"failed to announce new service", without the error or the service, and
+"failed while handling packet" lacked its newline, so it appeared only with
+the next message, 40 s later.
+
+A send to a node that has just said HELLO can fail transiently: since
+commit 544d85de4dc2 ("net: qrtr: Send HELLO message on endpoint register")
+the core drops every packet but HELLO with -EAGAIN until its own HELLO to
+the node has been sent, and the endpoint's hello work retries that every
+100 ms; a transport can also be briefly out of buffers.
+
+- Retry -EAGAIN, -EBUSY, -ENOMEM, -ENOBUFS and -ETIMEDOUT with a 50 ms
+  sleep, at most 10 times per announcement (0.5 s in total), so the work is
+  bounded even if the node never accepts. The name server runs in a
+  workqueue, so sleeping is fine.
+- After a failure, log the service, the destination and the error, and
+  continue with the remaining services; return the last error.
+- Announce even when the HELLO reply fails: the endpoint's own HELLO work
+  may still get it out, and the retries above cover that window.
+- Log the error of a failed HELLO reply, add the error and the missing
+  newline to "failed while handling packet", and log failed sends in the
+  SMD/rpmsg transport.
+
+This is a local patch on top of Takashi Iwai's "net: qrtr: Fix
+suspend/resume regression in HELLO handshake" and the local HELLO
+coalescing patch, which make the reply HELLO precede the announcements.
+---
+ net/qrtr/ns.c  | 48 +++++++++++++++++++++++++++++++++++++++---------
+ net/qrtr/smd.c |  3 +++
+ 2 files changed, 42 insertions(+), 9 deletions(-)
+
+diff --git a/net/qrtr/ns.c b/net/qrtr/ns.c
+index fe2dfc05e380..4067cce746d0 100644
+--- a/net/qrtr/ns.c
++++ b/net/qrtr/ns.c
+@@ -5,6 +5,7 @@
+  * Copyright (c) 2020, Linaro Ltd.
+  */
+ 
++#include <linux/delay.h>
+ #include <linux/module.h>
+ #include <linux/qrtr.h>
+ #include <linux/workqueue.h>
+@@ -212,12 +213,30 @@ static void lookup_notify(struct sockaddr_qrtr *to, struct qrtr_server *srv,
+ 		pr_err("failed to send lookup notification\n");
+ }
+ 
++/*
++ * Sends to a node that has just said HELLO can fail transiently: the core
++ * drops everything but HELLO with -EAGAIN until its own HELLO to the node is
++ * out (the endpoint's hello work retries every 100 ms), and a transport can
++ * briefly run out of buffers. Retry such failures a bounded number of times
++ * per announcement; the name server runs in process context.
++ */
++#define QRTR_NS_ANNOUNCE_RETRIES	10
++#define QRTR_NS_ANNOUNCE_DELAY_MS	50
++
++static bool qrtr_ns_send_transient(int ret)
++{
++	return ret == -EAGAIN || ret == -EBUSY || ret == -ENOMEM ||
++	       ret == -ENOBUFS || ret == -ETIMEDOUT;
++}
++
+ /* Announce the list of servers registered on the local node */
+ static int announce_servers(struct sockaddr_qrtr *sq)
+ {
++	int retries = QRTR_NS_ANNOUNCE_RETRIES;
+ 	struct qrtr_server *srv;
+ 	struct qrtr_node *node;
+ 	unsigned long index;
++	int err = 0;
+ 	int ret;
+ 
+ 	node = node_get(qrtr_ns.local_node);
+@@ -227,15 +246,23 @@ static int announce_servers(struct sockaddr_qrtr *sq)
+ 	/* Announce the list of servers registered in this node */
+ 	xa_for_each(&node->servers, index, srv) {
+ 		ret = service_announce_new(sq, srv);
++		while (qrtr_ns_send_transient(ret) && retries > 0) {
++			retries--;
++			msleep(QRTR_NS_ANNOUNCE_DELAY_MS);
++			ret = service_announce_new(sq, srv);
++		}
+ 		if (ret < 0) {
+ 			if (ret == -ENODEV)
+ 				continue;
+ 
+-			pr_err("failed to announce new service\n");
+-			return ret;
++			/* Keep announcing the remaining services. */
++			pr_err("failed to announce service %u:%u to %u:%u: %d\n",
++			       srv->service, srv->instance, sq->sq_node,
++			       sq->sq_port, ret);
++			err = ret;
+ 		}
+ 	}
+-	return 0;
++	return err;
+ }
+ 
+ static struct qrtr_server *server_add(unsigned int service,
+@@ -345,7 +372,8 @@ static int say_hello(struct sockaddr_qrtr *dest)
+ 
+ 	ret = kernel_sendmsg(qrtr_ns.sock, &msg, &iv, 1, sizeof(pkt));
+ 	if (ret < 0)
+-		pr_err("failed to send hello msg\n");
++		pr_err("failed to send hello msg to %u:%u: %d\n",
++		       dest->sq_node, dest->sq_port, ret);
+ 
+ 	return ret;
+ }
+@@ -354,11 +382,13 @@ static int ctrl_cmd_hello(struct sockaddr_qrtr *sq)
+ {
+ 	int ret;
+ 
++	/*
++	 * The endpoint's own HELLO work may still get through when the reply
++	 * fails; announce_servers() retries until the HELLO is out.
++	 */
+ 	ret = say_hello(sq);
+-	if (ret < 0)
+-		return ret;
+ 
+-	return announce_servers(sq);
++	return announce_servers(sq) ?: ret;
+ }
+ 
+ static int ctrl_cmd_bye(struct sockaddr_qrtr *from)
+@@ -719,8 +749,8 @@ static void qrtr_ns_worker(struct work_struct *work)
+ 		}
+ 
+ 		if (ret < 0)
+-			pr_err_ratelimited("failed while handling packet from %d:%d",
+-			       sq.sq_node, sq.sq_port);
++			pr_err_ratelimited("failed while handling packet from %d:%d: %d\n",
++			       sq.sq_node, sq.sq_port, ret);
+ 	}
+ 
+ 	kfree(recv_buf);
+diff --git a/net/qrtr/smd.c b/net/qrtr/smd.c
+index c91bf030fbc7..76a21cd3229f 100644
+--- a/net/qrtr/smd.c
++++ b/net/qrtr/smd.c
+@@ -47,6 +47,9 @@ static int qcom_smd_qrtr_send(struct qrtr_endpoint *ep, struct sk_buff *skb)
+ 		goto out;
+ 
+ 	rc = rpmsg_send(qdev->channel, skb->data, skb->len);
++	if (rc)
++		dev_err_ratelimited(qdev->dev, "failed to send %u bytes: %d\n",
++				    skb->len, rc);
+ 
+ out:
+ 	if (rc)

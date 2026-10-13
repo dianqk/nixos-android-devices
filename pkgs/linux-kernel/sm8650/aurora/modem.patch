@@ -1,0 +1,57 @@
+From 6f0215aad078538ac8b22884ced059ec6c1c9dd2 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Mon, 12 Oct 2026 20:24:28 +0800
+Subject: [PATCH] arm64: dts: qcom: aurora: enable the modem and IPA
+
+Enable the SM8650 MPSS remoteproc, IPA v5.5 and the static rmtfs shared
+memory. Load the unchanged split OEM images (modem.mdt + modem_dtb.mdt and
+ipa_fws.mdt with their .bNN segments) through the MDT loader.
+
+The stock Android 14 reserved-memory nodes for mpss, q6_mpss_dtb, mpss_dsm,
+mpss_dsm_2, qlink_logging, ipa_fw and ipa_gsi use the same addresses and sizes
+as sm8650.dtsi. Stock allocates its 4 MiB rmtfs buffer dynamically (client 1);
+the dtsi region at 0xd7c00000 lies in HLOS RAM in the stock map and overlaps
+no Aurora reservation.
+
+The PAS driver keeps MPSS auto_boot disabled: rmtfs -s starts the modem after
+its QMI service is available.
+---
+ .../boot/dts/qcom/sm8650-xiaomi-aurora.dts     | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts b/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
+index eac9f15a66d8..67c4c849d04e 100644
+--- a/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
++++ b/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
+@@ -99,8 +99,6 @@ ramoops@a7000000 {
+ &adspslpi_mem { reg = <0 0x9df00000 0 0x4680000>; };
+ &hwfence_shbuf { reg = <0 0xff100000 0 0x2dd000>; };
+ &oem_vm_mem { reg = <0 0xf7c00000 0 0x3800000>; };
+-/* Keep the reservation, but do not assign modem memory during USB bring-up. */
+-&rmtfs_mem { status = "disabled"; };
+ &xo_board { clock-frequency = <76800000>; };
+ &sleep_clk { clock-frequency = <32000>; };
+ 
+@@ -384,6 +382,22 @@ touch_irq_default: touch-irq-default-state {
+ 	};
+ };
+ 
++&ipa {
++	firmware-name = "qcom/sm8650/xiaomi/aurora/ipa_fws.mdt";
++	status = "okay";
++};
++
++/*
++ * The stock modem carve-outs (mpss, q6_mpss_dtb, mpss_dsm, mpss_dsm_2,
++ * qlink_logging, ipa_fw and ipa_gsi) match sm8650.dtsi. The driver keeps
++ * auto_boot disabled; rmtfs starts MPSS once its QMI service is ready.
++ */
++&remoteproc_mpss {
++	firmware-name = "qcom/sm8650/xiaomi/aurora/modem.mdt",
++			"qcom/sm8650/xiaomi/aurora/modem_dtb.mdt";
++	status = "okay";
++};
++
+ &remoteproc_adsp {
+ 	firmware-name = "qcom/sm8650/xiaomi/aurora/adsp.mdt",
+ 			"qcom/sm8650/xiaomi/aurora/adsp_dtb.mdt";

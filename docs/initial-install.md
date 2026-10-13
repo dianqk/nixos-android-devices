@@ -3,13 +3,14 @@
 [中文](initial-install.zh.md) · [Storage preparation](u-boot-install.md)
 
 `mobile-device recovery install-initial` installs an initial EFI system on
-Asphalt, Polaris, Sheng and Clover, with device, slot and partition checks.
+Asphalt, Polaris, Sheng, Clover and experimental Aurora, with device, slot and partition checks.
 
 Prepare an empty ext4 root and FAT `/boot` using the device guide first:
 [Asphalt](asphalt/first-install.md), [Polaris](polaris/first-install.md),
-[Sheng](sheng/first-install.md), [Clover](clover/first-install.md).
-This command does not create partitions or format filesystems. Clover requires a
-measured storage contract including `userdata`, `system` and `boot`; its U-Boot
+[Sheng](sheng/first-install.md), [Clover](clover/first-install.md),
+[Aurora](aurora/README.md#first-partition-installation-and-updates-experimental).
+This command does not create partitions or format filesystems. Clover requires
+measured storage roles for `userdata`, `boot`, `recovery` and `misc`; its U-Boot
 still lacks hardware validation. Asphalt/Sheng require recovery on slot B and
 write only `boot_b`; Android A, super and both recovery partitions are preserved.
 
@@ -21,11 +22,11 @@ image is needed. Both x86_64 and AArch64 Linux hosts can initiate installation.
 Run these commands on the build host, replacing paths and the recovery SSH alias:
 
 ```sh
-SYSTEM=$(readlink -f tmp/systemd-artifacts/system)
+SYSTEM=$(readlink -f result-system)
 mobile-device recovery --target RECOVERY_HOST install-initial "$SYSTEM" \
-  --bootstrap-info tmp/systemd-artifacts/bootstrap-info
+  --bootstrap-info result-bootstrap-info
 mobile-device recovery --target RECOVERY_HOST install-initial "$SYSTEM" \
-  --bootstrap-info tmp/systemd-artifacts/bootstrap-info --execute
+  --bootstrap-info result-bootstrap-info --execute
 ```
 
 The first command validates local metadata and recovery prerequisites without
@@ -41,7 +42,8 @@ because the empty root has no usable Nix database yet. Ordinary `deploy` operate
 on an existing installed system and does not perform this bootstrap or write
 U-Boot.
 
-The default result file is `/run/mobile-initial-install.result`. On success,
+The recovery daemon reports results through `recovery status` and
+`recovery task TASK_ID`. On success,
 inspect recovery status and explicitly reboot when ready. No second firmware
 flash is needed. On failure, the root retains
 `/var/lib/mobile-efi-preparation/pending`, which blocks normal recovery boot
@@ -50,5 +52,10 @@ marker. Once files have been imported, a blind rerun is refused because the root
 is no longer empty. Repair deliberately or explicitly prepare an empty root
 again. Root, FAT and firmware writes are not atomic. A boot write/readback failure
 requires repairing the matching firmware before rebooting.
+
+For Asphalt, before the first normal U-Boot boot, return to OEM fastboot and
+complete the separate [checked B DTBO erase](asphalt/first-install.md#erase-b-dtbo-and-boot).
+The installer has already written `boot_b`; do not flash U-Boot a second time.
+This DTBO preparation is not performed by `install-initial`.
 
 Fresh-install hardware validation remains incomplete; see the device guides.

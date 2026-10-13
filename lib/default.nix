@@ -101,5 +101,8 @@ in
     }
     // nixpkgsLib.optionalAttrs (c.system.build ? mobileDirectBootImage) {
       boot-kernel = c.system.build.mobileDirectBootImage;
+    }
+    // nixpkgsLib.optionalAttrs (c.system.build ? mobileChargerImage) {
+      charger = c.system.build.mobileChargerImage;
     };
 }

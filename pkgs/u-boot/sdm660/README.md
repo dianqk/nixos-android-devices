@@ -47,8 +47,8 @@ updates are disabled. Normal generations belong on FAT, not in Android `boot`.
 ## Build and validation
 
 ```sh
-nix build .#devices.clover.u-boot --builders '' --out-link tmp/systemd-artifacts/devices.clover.u-boot
-python tests/clover-uboot.py "$(nix eval --raw .#devices.clover.u-boot.firmware.outPath)" tmp/systemd-artifacts/devices.clover.u-boot
+nix build .#devices.clover.u-boot --out-link result-u-boot
+python tests/clover-uboot.py "$(nix eval --raw .#devices.clover.u-boot.firmware.outPath)" result-u-boot
 nix eval --impure --json --expr 'import ./tests/clover-uefi.nix { flake = builtins.getFlake (toString ./.); }'
 ```
 

@@ -1,4 +1,5 @@
 {
+  bootActionProfile = "pon";
   deviceTree = "qcom/sdm660-xiaomi-clover";
   patches = [
     ../patches/0000-gdsc-flags.patch

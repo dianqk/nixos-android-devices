@@ -1,0 +1,20 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 6 Oct 2026 23:00:00 +0800
+Subject: [PATCH] snapdragon: copy the fallback DT to fdt_addr_r with overlays
+
+With OF_LIBFDT_OVERLAY, the last allocation overwrites addr with
+fdtoverlay_addr_r. Copy the control DT to the reserved fdt_addr_r instead,
+so EFI/booti receive a valid fallback DT. Local fix for v2026.10-rc5;
+Aurora enables overlays to retain labels required by the ABL hypervisor.
+---
+--- a/arch/arm/mach-snapdragon/board.c
++++ b/arch/arm/mach-snapdragon/board.c
+@@ -568,7 +568,7 @@
+ 		log_warning("%s: Failed to reserve memory for copying FDT\n",
+ 			    __func__);
+ 	else
+-		memcpy((void *)addr, (void *)gd->fdt_blob,
++		memcpy((void *)env_get_hex("fdt_addr_r", 0), (void *)gd->fdt_blob,
+ 		       fdt32_to_cpu(fdt_blob->totalsize));
+ 
+ 	configure_env();

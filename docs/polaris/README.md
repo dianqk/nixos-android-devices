@@ -6,6 +6,9 @@ Support: Tier 2. See [support criteria](../README.md#support-tiers).
 
 ## Configure and install
 
+Prepare the **latest LineageOS 22.2 build for polaris** first. See the
+[Android baseline and identity checks](first-install.md#android-base-before-installation).
+
 1. Create a consumer flake using the [configuration guide](../configuration.md).
    Set `device = "polaris"` in `lib.mkSystem`, or import `nixosModules.polaris`.
 2. Add the settings below to your installed configuration. Share the root
@@ -29,6 +32,8 @@ set `hardware.polaris.radio.identityFile` to the device-side Wi-Fi address file,
 `bluetoothIdentityFile` to the Bluetooth address file. These paths refer to files
 on the phone, not build-input files. The module does not collect calibration or
 invent factory identities. With no snapshot directory, RMTFS does not start.
+The snapshot is served through the shared [modem services](../modem.md) as
+`modem-rmtfs.service` and `modem-tqftpserv.service`.
 If you do not have verified radio data, start with the USB console configuration.
 Use normal NixOS options to enable NetworkManager, Bluetooth and PipeWire.
 
@@ -43,6 +48,7 @@ The repository examples use `.#devices.polaris.<role>`, for example `.#devices.p
 `lib.mkArtifacts` selects matching artifacts from your configuration; see the
 [artifact guide](../configuration.md#select-artifacts).
 
+- Off-mode charging: [setup, controls and limits](charging.md).
 - Routine updates: [USB SSH](../usb-signaller.md).
 - Failed boot or offline updates: [RAM recovery](../recovery.md).
 - Wi-Fi, audio, display and other limitations: [hardware reference](hardware.md).

@@ -1,5 +1,7 @@
 # 移动设备 initrd 依赖收集器
 
+[English](README.md)
+
 在锁定的 Nixpkgs `makeInitrdNGTool` 上应用小范围源码补丁。
 共享 systemd-initrd 模块为 `makeInitrdNG` 选择构建主机原生工具，
 不修改设备端 systemd 或动态库。

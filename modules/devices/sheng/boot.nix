@@ -22,6 +22,14 @@ in
     usb.signaller.address = lib.mkDefault "172.16.45.1/24";
     persistentImage.rootfs.device = lib.mkDefault "/dev/disk/by-partlabel/linux";
     boot = {
+      actions = {
+        reboot = lib.mkDefault true;
+        poweroff = lib.mkDefault true;
+        bootloader = lib.mkDefault true;
+        recovery = lib.mkDefault true;
+        recoveryTarget = lib.mkDefault "slot-b";
+        android = lib.mkDefault true;
+      };
       firmwarePackage = lib.mkDefault (androidPackages.mkUBoot { device = "sheng"; });
       directKernel.enable = lib.mkDefault true;
       uefi = {
@@ -30,9 +38,7 @@ in
       };
     };
     recovery = {
-      initialInstallAdapter = ../../../devices/sheng/initial-install.sh;
       targetHostName = board.systemHostName;
-      bootPartitionLabel = "linux-boot";
     };
   };
 }

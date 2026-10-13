@@ -1,0 +1,105 @@
+From 5dfa4c0d5bb1a8b8c73c6a47da581b45753c697e Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 9 Oct 2026 13:42:35 +0800
+Subject: [PATCH] drm/msm/dpu: split SM8650 command scanout at the mixer
+ boundary
+
+Use parallel SMART_DMA rectangles for unscaled RGB planes spanning the
+two layer mixers. Split at the physical LM boundary rather than the
+center of the plane, including offset windows. Preserve single-mixer,
+video/DP, scaling, rotation and YUV paths. This aligns the scanout
+rectangles with the SM8650 vendor display path; hardware acceptance
+remains required.
+
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c | 53 ++++++++++++++++++++++-
+ 1 file changed, 51 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
+index 7b92082d3..6a23b8b31 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
+@@ -25,6 +25,7 @@
+ #include "dpu_hw_util.h"
+ #include "dpu_trace.h"
+ #include "dpu_crtc.h"
++#include "dpu_encoder.h"
+ #include "dpu_vbif.h"
+ #include "dpu_plane.h"
+ 
+@@ -868,6 +869,50 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
+ 	return 0;
+ }
+ 
++/* Keep 1:1 RGB command scanout rectangles on their respective layer mixer. */
++static bool dpu_plane_split_lm_rect(struct dpu_sw_pipe_cfg *left,
++				  struct dpu_sw_pipe_cfg *right, int boundary)
++{
++	int source_boundary;
++
++	if (left->dst_rect.x1 >= boundary || left->dst_rect.x2 <= boundary)
++		return false;
++
++	source_boundary = left->src_rect.x1 + boundary - left->dst_rect.x1;
++	*right = *left;
++	left->src_rect.x2 = source_boundary;
++	left->dst_rect.x2 = boundary;
++	right->src_rect.x1 = source_boundary;
++	right->dst_rect.x1 = boundary;
++	return true;
++}
++
++static bool dpu_plane_needs_lm_split(struct drm_plane *plane,
++		const struct drm_plane_state *state,
++		const struct drm_crtc_state *crtc_state)
++{
++	struct dpu_kms *kms = _dpu_plane_get_kms(plane);
++	struct drm_encoder *encoder;
++	bool command = false;
++
++	/* Only the SM8650 command path has been compared with the vendor path. */
++	if (kms->catalog->mdss_ver->core_major_ver != 10 ||
++	    dpu_crtc_get_num_lm(crtc_state) != 2 ||
++	    state->rotation != DRM_MODE_ROTATE_0 ||
++	    state->src_w != state->crtc_w << 16 ||
++	    state->src_h != state->crtc_h << 16 ||
++	    MSM_FORMAT_IS_YUV(msm_framebuffer_format(state->fb)))
++		return false;
++
++	/* Use the incoming encoder mask, including the first modeset. */
++	drm_for_each_encoder_mask(encoder, plane->dev, crtc_state->encoder_mask) {
++		if (dpu_encoder_get_intf_mode(encoder) != INTF_MODE_CMD)
++			return false;
++		command = true;
++	}
++	return command;
++}
++
+ static int dpu_plane_split(struct drm_plane *plane,
+ 			   struct drm_plane_state *new_plane_state,
+ 			   const struct drm_crtc_state *crtc_state)
+@@ -882,6 +927,7 @@ static int dpu_plane_split(struct drm_plane *plane,
+ 	uint32_t max_linewidth;
+ 	u32 num_lm;
+ 	int stage_id, num_stages;
++	bool split_at_lm = dpu_plane_needs_lm_split(plane, new_plane_state, crtc_state);
+ 
+ 	max_linewidth = pdpu->catalog->caps->max_linewidth;
+ 
+@@ -948,8 +994,11 @@ static int dpu_plane_split(struct drm_plane *plane,
+ 		DPU_DEBUG_PLANE(pdpu, "Got clip src:" DRM_RECT_FMT " dst: " DRM_RECT_FMT "\n",
+ 				DRM_RECT_ARG(&pipe_cfg->src_rect), DRM_RECT_ARG(&pipe_cfg->dst_rect));
+ 
+-		/* Split wide rect into 2 rect */
+-		if ((drm_rect_width(&pipe_cfg->src_rect) > max_linewidth) ||
++		/* Prefer two parallel rectangles at the physical mixer boundary. */
++		if (split_at_lm &&
++		    dpu_plane_split_lm_rect(pipe_cfg, r_pipe_cfg, mode->hdisplay / 2)) {
++			/* Existing resource assignment selects parallel SMART_DMA. */
++		} else if ((drm_rect_width(&pipe_cfg->src_rect) > max_linewidth) ||
+ 		     _dpu_plane_calc_clk(mode, pipe_cfg) > max_mdp_clk_rate) {
+ 
+ 			if (drm_rect_width(&pipe_cfg->src_rect) > 2 * max_linewidth) {
+-- 
+2.55.0
+

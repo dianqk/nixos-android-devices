@@ -1,0 +1,25 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 6 Oct 2026 23:00:00 +0800
+Subject: [PATCH] usb: gadget: acm: initialize the entire stdio descriptor
+
+With CONSOLE_FLUSH_SUPPORT, stdio_dev includes an optional flush callback.
+The ACM initializer leaves it uninitialized on the stack. panic() flushes
+stdout before resetting, so a console using ACM can branch into garbage
+instead of resetting, recursively faulting in the exception handler.
+
+Zero the descriptor before assigning supported callbacks. ACM has no flush
+implementation, so the console should skip its NULL callback. This local
+fix also initializes unused fields for configurations without flush support.
+Baseline: U-Boot v2026.10-rc5, a06e89ab05eaa2b8344d521319399333cd760ae5.
+---
+--- a/drivers/usb/gadget/f_acm.c
++++ b/drivers/usb/gadget/f_acm.c
+@@ -673,7 +673,7 @@ static int acm_stdio_stop(struct stdio_dev *dev)
+ 
+ int drv_usbacm_init(void)
+ {
+-	struct stdio_dev stdio;
++	struct stdio_dev stdio = { 0 };
+ 
+ 	strcpy(stdio.name, "usbacm");
+ 	stdio.flags = DEV_FLAGS_INPUT | DEV_FLAGS_OUTPUT;

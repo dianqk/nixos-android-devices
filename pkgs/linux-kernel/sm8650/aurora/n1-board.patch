@@ -1,0 +1,97 @@
+From f6617bdb99bb90d459a6cbd78c1e8f7958a237a8 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 6 Oct 2026 11:34:23 +0800
+Subject: [PATCH] arm64: dts: qcom: wire the aurora N1 DSI panel
+
+Describe the stock panel supplies, reset and TE pins and connect the primary
+DSI host/PHY to the N1 panel. Keep GPU and remote processors disabled.
+
+---
+ .../boot/dts/qcom/sm8650-xiaomi-aurora.dts    | 74 +++++++++++++++++++
+ 1 file changed, 74 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts b/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
+index 01b5b5171..5096b8925 100644
+--- a/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
++++ b/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
+@@ -162,3 +162,77 @@ &ufs_mem_phy {
+ 	vdda-pll-supply = <&vreg_l3i>;
+ 	status = "okay";
+ };
++
++/* N1 display wiring; panel driver is loaded after the recovery USB shell. */
++/ {
++	vreg_panel_vddd: regulator-panel-vddd {
++		compatible = "regulator-fixed";
++		regulator-name = "panel_vddd";
++		regulator-min-microvolt = <1060000>;
++		regulator-max-microvolt = <1060000>;
++		gpio = <&tlmm 28 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		regulator-boot-on;
++	};
++};
++
++&apps_rsc {
++	regulators-0 {
++		vreg_l13b: ldo13 {
++			regulator-name = "vreg_l13b";
++			regulator-min-microvolt = <3000000>;
++			regulator-max-microvolt = <3000000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++	regulators-2 {
++		vreg_l2g: ldo2 {
++			regulator-name = "vreg_l2g";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++};
++
++&tlmm {
++	n1_reset: panel-reset-state {
++		pins = "gpio133";
++		function = "gpio";
++		drive-strength = <8>;
++		bias-disable;
++	};
++	n1_te: panel-te-state {
++		pins = "gpio86";
++		function = "mdp_vsync";
++		drive-strength = <2>;
++		bias-pull-down;
++	};
++};
++
++&mdss { status = "okay"; };
++&mdss_dsi0 {
++	vdda-supply = <&vreg_l3i>;
++	status = "okay";
++	panel@0 {
++		compatible = "xiaomi,n1-42-02-0a";
++		reg = <0>;
++		vddio-supply = <&vreg_l2g>;
++		vddd-supply = <&vreg_panel_vddd>;
++		vci-supply = <&vreg_l13b>;
++		reset-gpios = <&tlmm 133 GPIO_ACTIVE_LOW>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&n1_reset>, <&n1_te>;
++		port {
++			n1_in: endpoint { remote-endpoint = <&mdss_dsi0_out>; };
++		};
++	};
++};
++&mdss_dsi0_out {
++	data-lanes = <0 1 2 3>;
++	remote-endpoint = <&n1_in>;
++};
++&mdss_dsi0_phy {
++	vdds-supply = <&vreg_l1i>;
++	status = "okay";
++};
+-- 
+2.55.0
+

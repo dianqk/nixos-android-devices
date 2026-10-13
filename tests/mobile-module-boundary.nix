@@ -23,7 +23,22 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
             deviceName = "unregistered-board";
             usbSerial = "test-serial";
             usb.enable = false;
-            kernelPackage = pkgs.linux;
+            # This synthetic board has no bootable DTB or firmware. Supply
+            # full-recovery display capabilities independently of the generic
+            # Nixpkgs kernel's framebuffer module choices; real board kernels
+            # are checked by public-api/platforms.
+            kernelPackage = pkgs.linux // {
+              config = pkgs.linux.config // {
+                isYes =
+                  name:
+                  builtins.elem name [
+                    "VT"
+                    "FRAMEBUFFER_CONSOLE"
+                    "DRM_FBDEV_EMULATION"
+                  ]
+                  || pkgs.linux.config.isYes name;
+              };
+            };
             boot = {
               firmwarePackage = firmware;
               uefi.device = "/dev/disk/by-partlabel/custom-boot";
@@ -42,13 +57,25 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
               device = "/dev/disk/by-partlabel/custom-root";
             };
             recovery = {
-              initialInstallAdapter = builtins.toFile "test-initial-adapter" "# Evaluation fixture";
               targetHostName = "installed-host";
-              bootPartitionLabel = "custom-boot";
-              extraTargetConfig = "TEST_STORAGE_ADAPTER=/bin/test-storage";
-              helpFile = builtins.toFile "test-recovery-help" "Evaluation fixture";
-              tools = pkgs.emptyDirectory;
               screenPackage = pkgs.emptyDirectory;
+              extendedStorageTools = true;
+              # A new board supplies explicit daemon inputs; no shared branch.
+              daemon = {
+                slotModel = "single";
+                compatible = "test,independent";
+                controller = "test-controller";
+                miscBytes = 1048576;
+                bootRequest = "bcb";
+                recoveryRebootArgument = null;
+                roles = {
+                  root.label = "custom-root";
+                  esp.label = "custom-boot";
+                  firmware.label = "custom-firmware";
+                  recovery.label = "custom-recovery";
+                  misc.label = "custom-misc";
+                };
+              };
             };
           };
         }
@@ -79,7 +106,7 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
       }).config;
     standardScript = standard.system.build.installBootLoader.text;
     vendorScript = vendor.system.build.installBootLoader.text;
-    target = recovery.boot.initrd.systemd.contents."/etc/mobile-recovery-target".text;
+    contract = builtins.fromJSON recovery.boot.initrd.systemd.contents."/etc/mobile-recovery.json".text;
   in
   assert lib.all (c: lib.all (a: a.assertion) c.assertions) [
     standard
@@ -101,9 +128,11 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
   assert !(recovery.system.build ? mobileDirectBootImage);
   assert !recovery.androidDevices.persistentImage.enable;
   assert !recovery.boot.loader.systemd-boot.enable;
-  assert lib.hasInfix "TARGET_HOSTNAME=installed-host" target;
-  assert lib.hasInfix "TARGET_ESP_LABEL=custom-boot" target;
-  assert lib.hasInfix "TEST_STORAGE_ADAPTER=/bin/test-storage" target;
+  assert contract.hostname == "installed-host";
+  assert contract.identity == "unregistered-board";
+  assert contract.roles.esp.label == "custom-boot";
+  assert contract.boot_request == "bcb" && contract.recovery_reboot_argument == null;
+  assert lib.hasInfix "mobile-storage-roles.json" standard.system.systemBuilderCommands;
   assert lib.all (script: lib.hasInfix "The mounted /boot does not match" script) [
     standardScript
     vendorScript

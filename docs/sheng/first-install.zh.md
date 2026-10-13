@@ -1,9 +1,22 @@
 # Sheng 首次安装
 
-请先阅读[统一 U-Boot 安装流程](../u-boot-install.zh.md)和[本机配置](README.zh.md)。
+[English](first-install.md)
 
-准备好以下分区后，使用[共享首次安装器](../initial-install.zh.md)导入闭包、安装 EFI 并写入匹配的 U-Boot 固件。
+使用 Rust daemon recovery，在 B 槽执行操作，保留 A、super、校准和独立 recovery。
+Recovery initrd 不包含 Python；标准 NixOS 安装与更新可在 chroot 中使用目标系统的 Python。
 
-使用独立 1 GiB FAT linux-boot 与 ext4 linux，仅操作 B；保留 A 和 super。若从占满原分配范围的 Android userdata 划出空间，必须先安全缩小或准备重建其文件系统，不能仅缩小 GPT 来保留数据。
+从原厂 userdata 布局开始，以下命令先检查，再明确执行**破坏性**准备：Android 与 Linux
+各约占原 userdata 的 50%，Linux 一侧包含独立 FAT ESP（默认 1 GiB）和 ext4 根。
+Android userdata 数据不保留，之后需要单独恢复出厂初始化。已分区设备不会重新分区。
 
-从临时启动 recovery、通过 ACM/NCM 进入，到按本机 GPT 手动准备分区的命令见[Sheng 手动分区示例](manual-storage.zh.md)。示例也说明与 `format-root` 自动命令的差异。
+```sh
+ssh RECOVERY_HOST 'recovery prepare-install --check'
+ssh RECOVERY_HOST 'recovery prepare-install --confirm-erase-userdata'
+```
+
+完成后按[首次安装](../initial-install.zh.md)导入系统、安装 EFI，最后写入匹配的 U-Boot。
+已有系统使用 `recovery rebuild boot` 更新，或从 host 使用 `mobile-device recovery deploy`。
+旧有的 root/ESP 顺序和对齐间隙仍受支持；普通更新不重新分区。
+
+仅需清空已有 Linux 根时，可用 `recovery format-root --check` 检查，
+再通过 `--confirm` 格式化；此操作不清空 Android 或 ESP。新的 daemon 操作尚待各设备实机验证。

@@ -1,0 +1,48 @@
+From: Dianqk <dianqk@dianqk.net>
+Date: Sun, 4 Oct 2026 21:15:00 +0800
+Subject: [PATCH] wifi: ath10k: use the TLV secondary-channel DFS flag
+
+The non-TLV channel encoding uses bit 15 for DFS on the secondary
+80 MHz segment. TLV firmware instead reserves bit 15 for quarter-rate
+channels and uses bit 16 for the secondary-segment DFS flag.
+
+ath10k_wmi_put_wmi_channel() is shared by both interfaces. Select the
+flag according to the active WMI interface so that a VHT160 or VHT80+80
+channel with a DFS secondary segment is not encoded as quarter-rate
+for TLV firmware. Retain the existing encoding for non-TLV firmware.
+
+Link: https://android.googlesource.com/kernel/msm-modules/wlan-fw-api/+/c16fb8a901d149ab96b0ce6886845e3a82389d74/fw/wmi_unified.h#1768
+Signed-off-by: Dianqk <dianqk@dianqk.net>
+---
+diff --git a/drivers/net/wireless/ath/ath10k/wmi.c b/drivers/net/wireless/ath/ath10k/wmi.c
+--- a/drivers/net/wireless/ath/ath10k/wmi.c
++++ b/drivers/net/wireless/ath/ath10k/wmi.c
+@@ -1747,8 +1747,13 @@
+ 		ch->band_center_freq2 = __cpu_to_le32(arg->band_center_freq1);
+ 	}
+ 
+-	if (chan && chan->flags & IEEE80211_CHAN_RADAR)
+-		flags |= WMI_CHAN_FLAG_DFS_CFREQ2;
++	if (chan && chan->flags & IEEE80211_CHAN_RADAR) {
++		if (ar->running_fw->fw_file.wmi_op_version ==
++		    ATH10K_FW_WMI_OP_VERSION_TLV)
++			flags |= WMI_TLV_CHAN_FLAG_DFS_CFREQ2;
++		else
++			flags |= WMI_CHAN_FLAG_DFS_CFREQ2;
++	}
+ 
+ 	ch->min_power = arg->min_power;
+ 	ch->max_power = arg->max_power;
+diff --git a/drivers/net/wireless/ath/ath10k/wmi-tlv.h b/drivers/net/wireless/ath/ath10k/wmi-tlv.h
+--- a/drivers/net/wireless/ath/ath10k/wmi-tlv.h
++++ b/drivers/net/wireless/ath/ath10k/wmi-tlv.h
+@@ -18,6 +18,9 @@
+ #define WMI_TLV_MGMT_TX_FRAME_MAX_LEN	64
+ 
+ #define WMI_RSRC_CFG_FLAG_TX_ACK_RSSI		BIT(18)
++
++/* TLV reserves bit 15 for quarter-rate channels. */
++#define WMI_TLV_CHAN_FLAG_DFS_CFREQ2		BIT(16)
+ 
+ enum wmi_tlv_grp_id {
+ 	WMI_TLV_GRP_START = 0x3,

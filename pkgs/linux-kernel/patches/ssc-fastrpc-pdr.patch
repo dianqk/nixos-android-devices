@@ -1,0 +1,141 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 2 Oct 2026 12:00:00 +0800
+Subject: [PATCH] misc: fastrpc: optionally acknowledge static PD service notifications
+
+Some SLPI firmware requires sensor_pd service registry acknowledgements.
+Subscribe only when the board supplies an explicit service/domain pair.
+The PDR helper owns notification ACKs; leave transport-wide teardown to
+RPMSG and sensor listener recovery to userspace. Release PDR work before
+freeing the channel context on removal and after failed lookups.
+
+This is an acknowledgement subscription, not static-PD restart handling.
+
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -266,9 +266,11 @@
+ config QCOM_FASTRPC
+ 	tristate "Qualcomm FastRPC"
+ 	depends on ARCH_QCOM || COMPILE_TEST
++	depends on NET
+ 	depends on RPMSG
+ 	select DMA_SHARED_BUFFER
+ 	select QCOM_SCM
++	select QCOM_PDR_HELPERS
+ 	help
+ 	  Provides a communication mechanism that allows for clients to
+ 	  make remote method invocations across processor boundary to
+--- a/Documentation/devicetree/bindings/misc/qcom,fastrpc.yaml
++++ b/Documentation/devicetree/bindings/misc/qcom,fastrpc.yaml
+@@ -59,6 +59,15 @@
+     description:
+       Used to mark the current domain as non-secure.
+     type: boolean
++
++  qcom,protection-domain:
++    $ref: /schemas/types.yaml#/definitions/string-array
++    description:
++      Service name and protection domain path to subscribe to through the
++      service registry. Notifications are acknowledged by the PDR helper.
++    items:
++      - description: Service name, for example tms/servreg.
++      - description: Protection domain path, for example msm/slpi/sensor_pd.
+ 
+   qcom,smd-channels:
+     description:
+--- a/drivers/misc/fastrpc.c
++++ b/drivers/misc/fastrpc.c
+@@ -17,6 +17,7 @@
+ #include <linux/sort.h>
+ #include <linux/of_platform.h>
+ #include <linux/rpmsg.h>
++#include <linux/soc/qcom/pdr.h>
+ #include <linux/scatterlist.h>
+ #include <linux/slab.h>
+ #include <linux/firmware/qcom/qcom_scm.h>
+@@ -302,6 +303,7 @@
+ };
+ 
+ struct fastrpc_channel_ctx {
++	struct pdr_handle *pdr;
+ 	int domain_id;
+ 	int sesscount;
+ 	int vmcount;
+@@ -2533,6 +2535,54 @@
+ 	{},
+ };
+ 
++/* The listener owns static-PD recovery; this subscription provides the
++ * service registry acknowledgement required by the sensor firmware.
++ */
++static void fastrpc_pd_status(int state, char *service_path, void *priv)
++{
++	struct device *dev = priv;
++
++	dev_dbg(dev, "protection domain %s state %#x\n", service_path, state);
++}
++
++static int fastrpc_init_pdr(struct device *dev, struct fastrpc_channel_ctx *cctx)
++{
++	struct pdr_service *service;
++	const char *name, *path;
++	int ret;
++
++	if (!of_find_property(dev->of_node, "qcom,protection-domain", NULL))
++		return 0;
++
++	ret = of_property_count_strings(dev->of_node, "qcom,protection-domain");
++	if (ret != 2)
++		return -EINVAL;
++
++	ret = of_property_read_string_index(dev->of_node, "qcom,protection-domain", 0, &name);
++	if (ret)
++		return ret;
++	ret = of_property_read_string_index(dev->of_node, "qcom,protection-domain", 1, &path);
++	if (ret)
++		return ret;
++
++	cctx->pdr = pdr_handle_alloc(fastrpc_pd_status, dev);
++	if (IS_ERR(cctx->pdr)) {
++		ret = PTR_ERR(cctx->pdr);
++		cctx->pdr = NULL;
++		return ret;
++	}
++
++	service = pdr_add_lookup(cctx->pdr, name, path);
++	if (IS_ERR(service)) {
++		ret = PTR_ERR(service);
++		pdr_handle_release(cctx->pdr);
++		cctx->pdr = NULL;
++		return ret;
++	}
++
++	return 0;
++}
++
+ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
+ {
+ 	struct device *rdev = &rpdev->dev;
+@@ -2646,6 +2696,12 @@
+ 	if (err)
+ 		goto err_deregister_fdev;
+ 
++	err = fastrpc_init_pdr(rdev, data);
++	if (err) {
++		of_platform_depopulate(rdev);
++		goto err_deregister_fdev;
++	}
++
+ 	return 0;
+ 
+ err_deregister_fdev:
+@@ -2677,6 +2733,10 @@
+ 	struct fastrpc_buf *buf, *b;
+ 	struct fastrpc_user *user;
+ 	unsigned long flags;
++
++	/* Stop PDR work while the device and channel context are still alive. */
++	if (cctx->pdr)
++		pdr_handle_release(cctx->pdr);
+ 
+ 	/* No invocations past this point */
+ 	spin_lock_irqsave(&cctx->lock, flags);

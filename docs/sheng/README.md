@@ -5,7 +5,8 @@
 Support: Tier 2. See [support criteria](../README.md#support-tiers).
 
 An optional `boot-kernel` image boots a fixed Linux system directly.
-U-Boot is the default. See [configuration and usage](../configuration.md#supplemental-direct-kernel-image-sheng-and-clover).
+U-Boot is the default. See [configuration and usage](../configuration.md#supplemental-direct-kernel-image-sheng-and-clover)
+and [Android/U-Boot compatibility and A/B limits](../android-uboot-compatibility.md).
 
 ## Configure and install
 
@@ -37,15 +38,15 @@ features you intend to use. `hardware.sheng.suspendWorkarounds.enable` defaults 
 claim of validated suspend. Preserve the device's recovery firmware list because
 ADSP firmware is also needed for the Type-C/USB path.
 
-The default Sheng kernel and installed system example use pinned Linux 7.2.6.
-The Nixpkgs 7.3-rc5 patch series remains available as `kernel-testing`; the RAM
-recovery example selects it explicitly while its Wi-Fi path is investigated.
-See the [kernel package notes](../../pkgs/linux-kernel/sm8550/sheng/PATCHES.md)
-for source attribution and both build commands.
+Sheng packages the Nixpkgs Linux 7.3-rc6 kernel for the installed system and
+RAM recovery, available as `devices.sheng.kernel`. The hardware results below
+were obtained with 7.3-rc5. See the
+[kernel package notes](../../pkgs/linux-kernel/sm8550/sheng/PATCHES.md)
+for source attribution and the build command.
 
-Sheng has booted through installed slot-B U-Boot/EFI with the 7.2.6 example.
-USB/SSH and Wi-Fi work with 7.2.6. RAM boot has verified the visible U-Boot menu
-and volume/power selection, but Linux display startup can leave the panel black.
+Installed slot-B U-Boot/EFI boots, direct desktop display, Wi-Fi and USB/Wi-Fi
+SSH have passed with 7.3. RAM boot has verified the visible U-Boot menu and
+volume/power selection. Retain a working rollback generation.
 Boot without a USB host remains unverified. See [known limitations](hardware.md#known-limitations).
 Use a separate 1 GiB FAT `linux-boot` ESP and ext4 `linux`, with firmware in
 `boot_b`. Preserve A and super. See [installation preparation](first-install.md)

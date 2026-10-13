@@ -1,0 +1,66 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 7 Oct 2026 10:00:00 +0800
+Subject: [PATCH] drm/panel: xiaomi-n1: match stock command transfer parameters
+
+The N1 60 Hz stock timing selects 1.36 GHz DSI lanes, a 7300 us MDP
+transfer budget and two DSC slices per packet. The initial driver copied
+its porches but did not account for the separate downstream lane clock,
+so MSM selected about 677 MHz and sent each slice in a separate packet.
+
+Express the command transfer overhead in the horizontal blanking used
+by MSM's clock calculation and select the existing all-slices packet
+flag. Keep the panel refresh at 60 Hz, its vertical TE timing, DSC PPS,
+initialization sequence and brightness controls unchanged.
+
+This follows the command-mode porch approach described by Abhinav Kumar
+and used by Marijn Suijten's SOFEF01 proposal, with a local derivation for
+N1's DSC 10bpc/8bpp mode rather than copying the non-DSC panel timings:
+https://lkml.iu.edu/2306.1/05026.html
+https://www.mail-archive.com/dri-devel@lists.freedesktop.org/msg581526.html
+
+The packet flag is already supported by the selected kernel and is also
+used by the Sheng panel. No DSI host API or shared clock policy changes.
+This corrects transport configuration mismatches; intermittent physical
+snow still requires visual acceptance, not merely a clean screenshot.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+--- a/drivers/gpu/drm/panel/panel-xiaomi-n1.c
++++ b/drivers/gpu/drm/panel/panel-xiaomi-n1.c
+@@ -252,9 +252,23 @@
+ 	return 0;
+ }
+ 
++/*
++ * The stock 60 Hz mode uses a 1.36 GHz lane rate and a 7300 us MDP
++ * transfer budget. Copying its video-style porches gives only 677 MHz
++ * with MSM's DSC clock calculation, extending the payload to 13.6 ms.
++ *
++ * Command mode has no wire-level horizontal porches. Represent the
++ * transfer budget in horizontal blanking, as required by the current MSM
++ * host, while retaining 60 Hz and the original vertical/TE timing:
++ *   compressed active = ceil(1440 * 8 / 30) = 384
++ *   compressed total = ceil(1360000000 * 4 / (30 * 3244 * 60)) = 932
++ *   htotal = 1440 + (932 - 384) = 1988
++ * The resulting lane rate is 1.36053 GHz (within 0.04% of stock).
++ * See dsi_adjust_pclk_for_compression(); this does not change DDIC commands.
++ */
+ static const struct drm_display_mode n1_mode = {
+-	.clock = 295853,
+-	.hdisplay = 1440, .hsync_start = 1472, .hsync_end = 1488, .htotal = 1520,
++	.clock = 386944,
++	.hdisplay = 1440, .hsync_start = 1472, .hsync_end = 1488, .htotal = 1988,
+ 	.vdisplay = 3200, .vsync_start = 3216, .vsync_end = 3220, .vtotal = 3244,
+ 	.width_mm = 70, .height_mm = 156,
+ 	.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
+@@ -317,7 +331,9 @@
+ 		return PTR_ERR(ctx->panel.backlight);
+ 	dsi->lanes = 4;
+ 	dsi->format = MIPI_DSI_FMT_RGB101010;
+-	dsi->mode_flags = MIPI_DSI_CLOCK_NON_CONTINUOUS;
++	/* Stock qcom,mdss-dsc-slice-per-pkt = <2>: one full line per packet. */
++	dsi->mode_flags = MIPI_DSI_CLOCK_NON_CONTINUOUS |
++			  MIPI_DSI_MODE_DSC_ALL_SLICES_IN_PKT;
+ 	ctx->dsc = (struct drm_dsc_config) {
+ 		.dsc_version_major = 1, .dsc_version_minor = 2,
+ 		.slice_height = 20, .slice_width = 720, .slice_count = 2,

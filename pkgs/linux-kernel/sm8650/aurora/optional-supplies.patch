@@ -1,0 +1,115 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Thu, 8 Oct 2026 05:00:00 +0800
+Subject: [PATCH] drm/msm, PCI: qcom: acquire optional legacy supplies explicitly
+
+SM8650 GPU power is voted through GMU/RPMh and power domains. PCIe PHY
+and WCN7850 endpoint supplies belong to the PHY and power-sequencing
+providers. Legacy vdd/vddcx and controller vdda/vddpe-3v3 are absent from
+these nodes, so normal regulator_get creates dummy consumers and logs
+warnings at every deferred PCIe probe.
+
+Use optional acquisition for MSM's already-optional supplies and the
+PCIe 2.7.0 resource path. Keep actual supplies in the bulk enable/disable
+list; an absent supply is omitted, while deferral and other errors are
+propagated. Do not add fictional regulators or change voltage votes.
+Older PCIe resource implementations remain unchanged.
+
+References:
+https://github.com/torvalds/linux/blob/v7.3-rc5/Documentation/devicetree/bindings/pci/qcom,pcie-sm8550.yaml
+https://github.com/torvalds/linux/blob/v7.3-rc5/arch/arm64/boot/dts/qcom/sm8650.dtsi
+Signed-off-by: dianqk <dianqk@dianqk.net>
+--- a/drivers/gpu/drm/msm/msm_gpu.c
++++ b/drivers/gpu/drm/msm/msm_gpu.c
+@@ -956,15 +956,23 @@
+ 		gpu->ebi1_clk = NULL;
+ 
+ 	/* Acquire regulators: */
+-	gpu->gpu_reg = devm_regulator_get(&pdev->dev, "vdd");
++	gpu->gpu_reg = devm_regulator_get_optional(&pdev->dev, "vdd");
+ 	DBG("gpu_reg: %p", gpu->gpu_reg);
+-	if (IS_ERR(gpu->gpu_reg))
++	if (IS_ERR(gpu->gpu_reg)) {
++		ret = PTR_ERR(gpu->gpu_reg);
+ 		gpu->gpu_reg = NULL;
+-
+-	gpu->gpu_cx = devm_regulator_get(&pdev->dev, "vddcx");
++		if (ret != -ENODEV)
++			goto fail;
++	}
++
++	gpu->gpu_cx = devm_regulator_get_optional(&pdev->dev, "vddcx");
+ 	DBG("gpu_cx: %p", gpu->gpu_cx);
+-	if (IS_ERR(gpu->gpu_cx))
++	if (IS_ERR(gpu->gpu_cx)) {
++		ret = PTR_ERR(gpu->gpu_cx);
+ 		gpu->gpu_cx = NULL;
++		if (ret != -ENODEV)
++			goto fail;
++	}
+ 
+ 	platform_set_drvdata(pdev, &gpu->adreno_smmu);
+ 
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -237,6 +237,7 @@
+ 	struct clk_bulk_data *clks;
+ 	int num_clks;
+ 	struct regulator_bulk_data supplies[QCOM_PCIE_2_7_0_MAX_SUPPLIES];
++	unsigned int num_supplies;
+ 	struct reset_control *rst;
+ };
+ 
+@@ -1004,12 +1005,20 @@
+ 	if (IS_ERR(res->rst))
+ 		return PTR_ERR(res->rst);
+ 
+-	res->supplies[0].supply = "vdda";
+-	res->supplies[1].supply = "vddpe-3v3";
+-	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(res->supplies),
+-				      res->supplies);
+-	if (ret)
+-		return ret;
++	/* PHY and endpoint power may be owned by their separate drivers. */
++	for (unsigned int i = 0; i < ARRAY_SIZE(res->supplies); i++) {
++		const char *name = i ? "vddpe-3v3" : "vdda";
++		struct regulator *supply = devm_regulator_get_optional(dev, name);
++
++		if (IS_ERR(supply)) {
++			ret = PTR_ERR(supply);
++			if (ret == -ENODEV)
++				continue;
++			return ret;
++		}
++		res->supplies[res->num_supplies].supply = name;
++		res->supplies[res->num_supplies++].consumer = supply;
++	}
+ 
+ 	res->num_clks = devm_clk_bulk_get_all(dev, &res->clks);
+ 	if (res->num_clks < 0) {
+@@ -1028,7 +1037,7 @@
+ 	u32 val;
+ 	int ret;
+ 
+-	ret = regulator_bulk_enable(ARRAY_SIZE(res->supplies), res->supplies);
++	ret = regulator_bulk_enable(res->num_supplies, res->supplies);
+ 	if (ret < 0) {
+ 		dev_err(dev, "cannot enable regulators\n");
+ 		return ret;
+@@ -1089,7 +1098,7 @@
+ err_disable_clocks:
+ 	clk_bulk_disable_unprepare(res->num_clks, res->clks);
+ err_disable_regulators:
+-	regulator_bulk_disable(ARRAY_SIZE(res->supplies), res->supplies);
++	regulator_bulk_disable(res->num_supplies, res->supplies);
+ 
+ 	return ret;
+ }
+@@ -1138,7 +1147,7 @@
+ 
+ 	clk_bulk_disable_unprepare(res->num_clks, res->clks);
+ 
+-	regulator_bulk_disable(ARRAY_SIZE(res->supplies), res->supplies);
++	regulator_bulk_disable(res->num_supplies, res->supplies);
+ }
+ 
+ static int qcom_pcie_config_sid_1_9_0(struct qcom_pcie *pcie)

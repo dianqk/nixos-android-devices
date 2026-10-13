@@ -4,7 +4,8 @@
     feature = "device-polaris",
     feature = "device-asphalt",
     feature = "device-clover",
-    feature = "device-sheng"
+    feature = "device-sheng",
+    feature = "device-aurora"
 )))]
 compile_error!("select one supported device feature");
 #[cfg(any(
@@ -23,6 +24,23 @@ compile_error!("select one supported device feature");
     all(feature = "device-clover", feature = "device-sheng"),
 ))]
 compile_error!("select only one device feature");
+#[cfg(all(
+    feature = "device-aurora",
+    any(
+        feature = "device-polaris",
+        feature = "device-clover",
+        feature = "device-asphalt",
+        feature = "device-sheng"
+    )
+))]
+compile_error!("select only one device feature");
+#[cfg(all(feature = "device-aurora", not(feature = "ab-partitions")))]
+compile_error!("Aurora requires the ab-partitions capability");
+#[cfg(feature = "device-aurora")]
+mod aurora;
+#[cfg(feature = "device-aurora")]
+use aurora as selected;
+
 #[cfg(all(feature = "device-polaris", not(feature = "refresh-panel")))]
 compile_error!("Polaris requires the refresh-panel capability");
 #[cfg(all(feature = "device-clover", not(feature = "refresh-panel")))]
@@ -94,7 +112,6 @@ pub(crate) struct Profile {
     pub id: &'static str,
     pub title: &'static str,
     pub warning: &'static str,
-    pub log_font_px: u32,
     pub boot_system_label: &'static str,
     pub items: &'static [Item],
     #[cfg(feature = "backlight-control")]

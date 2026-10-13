@@ -8,25 +8,17 @@
 let
   cfg = config.hardware.polaris.radio;
   firmware = androidPackages.devices.polaris.wifi-firmware;
-  rmtfs = cfg.rmtfsPackage;
-  tqftpserv = cfg.tqftpservPackage;
-  service = command: {
-    requires = [ "qrtr-ns.service" ];
-    after = [ "qrtr-ns.service" ];
-    serviceConfig = {
-      ExecStart = command;
-      Restart = "no"; # No unattended firmware crash loops during initial tests.
-    };
-  };
+  moved =
+    name:
+    lib.mkRenamedOptionModule [ "hardware" "polaris" "radio" name ] [ "androidDevices" "modem" name ];
 in
 {
+  imports = map moved [
+    "rmtfsPackage"
+    "tqftpservPackage"
+  ];
+
   options.hardware.polaris.radio = {
-    rmtfsPackage = lib.mkPackageOption androidPackages.devices.polaris "rmtfs" {
-      pkgsText = "androidPackages.devices.polaris";
-    };
-    tqftpservPackage = lib.mkPackageOption androidPackages "mobile-tqftpserv" {
-      pkgsText = "androidPackages";
-    };
     enable = lib.mkOption {
       type = lib.types.bool;
       default = true;
@@ -35,7 +27,10 @@ in
     snapshotDirectory = lib.mkOption {
       type = lib.types.nullOr (lib.types.strMatching "/[A-Za-z0-9/._-]+");
       default = null;
-      description = "Verified modem calibration snapshot directory; null skips RMTFS startup.";
+      description = ''
+        Verified modem calibration snapshot directory, served read-only by rmtfs
+        through `androidDevices.modem`; null leaves the modem services out.
+      '';
     };
     bluetoothIdentityFile = lib.mkOption {
       type = lib.types.nullOr (lib.types.strMatching "/[A-Za-z0-9/._-]+");
@@ -78,7 +73,7 @@ in
       wantedBy = [ "multi-user.target" ];
       requiredBy = lib.optional config.networking.networkmanager.enable "NetworkManager.service";
       before = [
-        "polaris-rmtfs.service"
+        "modem-rmtfs.service"
       ]
       ++ lib.optional config.networking.networkmanager.enable "NetworkManager.service";
       after = [ "systemd-udevd.service" ];
@@ -101,8 +96,8 @@ in
       description = "Route Polaris Qualcomm diagnostic messages";
       wantedBy = [ "sysinit.target" ];
       before = [
-        "polaris-rmtfs.service"
-        "polaris-tqftpserv.service"
+        "modem-rmtfs.service"
+        "modem-tqftpserv.service"
       ];
       path = [ pkgs.kmod ];
       serviceConfig = {
@@ -111,31 +106,37 @@ in
         Restart = "no";
       };
     };
-    systemd.services.polaris-rmtfs = lib.mkIf (cfg.snapshotDirectory != null) (
-      (service "${rmtfs}/bin/rmtfs -s -r -o ${cfg.snapshotDirectory}")
-      // {
-        wantedBy = [ "multi-user.target" ];
-        requires = [
-          "qrtr-ns.service"
-          "polaris-diag-router.service"
-          "polaris-pd-mapper.service"
-          "polaris-tqftpserv.service"
-        ];
-        after = [
-          "qrtr-ns.service"
-          "polaris-diag-router.service"
-          "polaris-pd-mapper.service"
-          "polaris-tqftpserv.service"
-        ];
-        unitConfig.ConditionPathExists = "${cfg.snapshotDirectory}/SHA256SUMS";
-        serviceConfig = {
-          ExecStart = "${rmtfs}/bin/rmtfs -s -r -o ${cfg.snapshotDirectory}";
-          Restart = "no";
-          ProtectSystem = "strict";
-          ReadOnlyPaths = [ "${cfg.snapshotDirectory}" ];
-        };
-      }
-    );
-    systemd.services.polaris-tqftpserv = service "${tqftpserv}/bin/tqftpserv";
+    # MSS through the shared modem module: rmtfs -s starts it from the
+    # read-only calibration snapshot once the snapshot's checksums exist,
+    # stops it when rmtfs exits, and nothing restarts on its own. No clock
+    # wait, SIM provisioning or ModemManager integration.
+    androidDevices.modem = lib.mkIf (cfg.snapshotDirectory != null) {
+      enable = true;
+      startMethod = "rmtfs";
+      startAtBoot = true;
+      nvDirectory = cfg.snapshotDirectory;
+      rmtfsVerbose = false;
+      rmtfsPackage = lib.mkDefault androidPackages.devices.polaris.rmtfs;
+      timeSyncTimeout = 0;
+      simProvisioning = false;
+      modemManager = false;
+    };
+    systemd.services.modem-rmtfs = lib.mkIf (cfg.snapshotDirectory != null) {
+      requires = [
+        "qrtr-ns.service"
+        "polaris-diag-router.service"
+        "polaris-pd-mapper.service"
+      ];
+      after = [
+        "qrtr-ns.service"
+        "polaris-diag-router.service"
+        "polaris-pd-mapper.service"
+      ];
+      unitConfig.ConditionPathExists = "${cfg.snapshotDirectory}/SHA256SUMS";
+    };
+    systemd.services.modem-tqftpserv = lib.mkIf (cfg.snapshotDirectory != null) {
+      requires = [ "qrtr-ns.service" ];
+      after = [ "qrtr-ns.service" ];
+    };
   };
 }

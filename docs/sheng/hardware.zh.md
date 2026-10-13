@@ -9,31 +9,40 @@
 | 领域 | 适配内容 | 状态 |
 | --- | --- | --- |
 | 启动与存储 | SM8550 内核/设备树、A/B boot 与 recovery、手工 GPT 准备、`linux` ext4 根分区 | 持久 B 槽 U-Boot/EFI 和独立 RAM recovery 已验证；全新分区未测试 |
-| 显示与输入 | 面板、NT36532E 触摸、recovery 按键 | RAM 启动已验证 U-Boot 菜单和音量/电源选择；进入 Linux 后可能黑屏；触摸未验证 |
-| GPU 与视频 | Adreno 和视频固件、内核驱动 | 硬件 OpenGL/Vulkan 与 H.264/HEVC 解码已验证 |
+| 显示与输入 | 面板、NT36532E 触摸、recovery 按键 | RAM 启动已验证 U-Boot 菜单和音量/电源选择；带补丁的 7.3 显示接管通过；触摸未验证 |
+| GPU 与视频 | Adreno 和视频固件、内核驱动 | 已验证硬件 OpenGL/Vulkan；7.3 H.264/HEVC 8-bit 解码通过，FFmpeg Main10 失败 |
 | USB | 正常系统 NCM/SSH；recovery ACM+NCM/SSH；系统 ACM 可选 | 已配置，所选传输方式需在实机验证 |
-| Wi-Fi 与蓝牙 | WCN7850 固件和蓝牙驱动 | Wi-Fi/蓝牙实时扫描通过；需配置本机蓝牙地址 |
-| 音频 | ADSP 固件、拓扑、SoundWire 和 CS35L43 驱动 | 已验证 ALSA 声卡/PCM；未验证播放、录音与路由 |
+| Wi-Fi 与蓝牙 | WCN7850 固件和蓝牙驱动 | 7.3 协商到 80 MHz EHT/NSS 2、约 1.3 Gbit/s；蓝牙扫描通过，配对未测 |
+| 音频 | ADSP 固件、拓扑、SoundWire 和 CS35L43 驱动 | 7.3 可探测全部六颗功放和 ALSA PCM；受测示例没有活动的 PipeWire 输出路由 |
 | 传感器、指纹、手写笔 | ADSP 传感器服务、FPC1553 与手写笔工具 | 可选；端到端使用未验证 |
 | 相机 | CAMSS/flash-class 驱动、libcamera 传感器增益映射 | 前摄场景与后摄彩条通过；ISP 尚未校准 |
 
 ## 已知限制
 
-默认 7.2.6 内核可启动并使用 USB/SSH 和 Wi-Fi；可选的 7.3-rc5 内核目前无法加载
-WCN7850 固件。不连接 USB 主机的启动仍未验证。
+打包的内核为 Nixpkgs Linux 7.3-rc6。本页硬件结果基于 7.3-rc5 补丁集取得。
+见[内核补丁说明](../../pkgs/linux-kernel/sm8550/sheng/PATCHES.zh.md)。
 
-从 U-Boot 菜单进入 Linux 后可能黑屏。测试中，关闭再开启合成器的 DSI 输出可恢复
-画面，仅调整亮度无效；即使 SSH 可达，也可能遇到此显示启动问题。完整色彩准确性仍未验证。
+7.3 安装系统可用：无需关闭再开启 DSI 输出即可直接以 120 Hz 显示 3048×2032 桌面，
+Wi-Fi 自动连接和扫描，以及通过 USB 和 Wi-Fi 的 SSH。应保留可用的回退代。
 
-FFmpeg 的 `h264_v4l2m2m` 和 `hevc_v4l2m2m` 已通过 Iris 完整硬解 180 秒
-1080p、8-bit 视频。mpv、零拷贝显示和音画同步仍未验证。
+已知问题与未验证范围：
 
-Libcamera 已验证前置 OV32D40 的 3264×2448 场景照片和后置 S5KJN1 的
-4080×3060 彩条。后摄实景画质、自动对焦、闪光灯和色彩校准仍未验证；
-深度传感器可枚举，但采集画质未测试。
-
-Recovery 和普通系统可协商 10 Gb/s USB 链路，持续吞吐量未测量。
-Recovery 需保留模块提供的 ADSP 固件；缺失时 Type-C/UCSI 无法启动，USB 限于 480 Mb/s。
+- 不连接 USB 主机的启动、休眠和完整色彩准确性未验证。
+- 视频：FFmpeg 的 `h264_v4l2m2m` 和 `hevc_v4l2m2m` 解码 1080p H.264 与 HEVC Main，
+  结果与软件解码逐像素一致。HEVC Main10 在捕获缓冲区初始化时返回 `EINVAL`。
+  VA-API、mpv、零拷贝显示和音画同步见[视频说明](../video.zh.md)，不在本项检查内。
+- Wi-Fi：5 GHz 连接协商到 80 MHz EHT、双空间流（PHY 速率约 1.1–1.3 Gbit/s）。
+  吞吐量和 160/320 MHz 未测量。
+- 蓝牙：LE 与 BR/EDR 扫描可用；配对和音频未验证。需配置本机蓝牙地址。
+- 音频：六颗 CS35L43 功放全部绑定，ALSA 声卡提供两个播放 PCM 和一个录音 PCM，
+  但没有 PipeWire 输出：声卡长名称与已安装 UCM 文件名不同，UCM 查找失败，
+  只出现 Off/Pro Audio 配置。外放、录音和路由暂不可用。
+- 相机：libcamera 可拍摄前置 OV32D40 3264×2448 场景和后置 S5KJN1 4080×3060 彩条。
+  后摄实景画质、自动对焦、闪光灯、色彩校准和深度传感器未验证。
+- Recovery 和普通系统可协商 10 Gb/s USB，持续吞吐量未测量。Recovery 需保留模块
+  提供的 ADSP 固件；缺失时 Type-C/UCSI 无法启动，USB 限于 480 Mb/s。
+- 内核日志包含启动早期的显示 SID SMMU fault、CPU 特性差异、CDSP 子系统事件/APM
+  命令超时、音频警告及未启用后端 DAI 警告；均为已知现象，不代表新故障。
 
 ## 可选设置
 

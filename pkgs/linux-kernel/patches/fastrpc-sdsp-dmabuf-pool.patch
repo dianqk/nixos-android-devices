@@ -1,0 +1,245 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 04 Oct 2026 17:00:00 +0800
+Subject: [PATCH] misc: fastrpc: allocate SDSP dma-bufs from its shared pool
+
+The SDSP SID-zero context bank does not have an IOMMU or a reserved DMA
+pool attached. Exporting coherent buffers through that device allocates
+ordinary CMA memory, whereas RPC metadata uses the RPMSG device's pool
+already shared with SDSP. On SDM845, the first listener request mapping
+such an exported buffer stops making progress.
+
+Use the shared pool for SDSP SID-zero exports too. Check the complete
+physical allocation before exporting: the DMA API can fall back to
+ordinary pages when its CMA pool cannot satisfy a request. Reject this
+fallback instead of exposing memory outside the shared region.
+
+Take a stable RPMSG device reference under the channel lock. Buffers keep
+their allocation device and unmodified DMA handle until release, so DMA
+operations do not dereference a listener that may have closed its fd.
+Store the RPMSG DMA mask in the device itself rather than channel storage
+that can disappear before an exported buffer is released.
+
+Other domains and nonzero SIDs retain their allocation path. Do not
+change VMIDs or reserved-memory assignment/recovery policy.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+
+--- a/drivers/misc/fastrpc.c
++++ b/drivers/misc/fastrpc.c
+@@ -221,7 +221,7 @@
+ };
+ 
+ struct fastrpc_buf {
+-	struct fastrpc_user *fl;
++	dma_addr_t dma_handle;
+ 	struct dma_buf *dmabuf;
+ 	struct device *dev;
+ 	void *virt;
+@@ -326,7 +326,6 @@
+ 	bool poll_mode_supported;
+ 	/* Per-channel sequence counter; incremented on every context allocation */
+ 	atomic_t ctx_seq;
+-	u64 dma_mask;
+ 	const struct fastrpc_soc_data *soc_data;
+ };
+ 
+@@ -358,14 +357,6 @@
+ 	/* Reference count */
+ 	struct kref refcount;
+ };
+-
+-/* Extract SMMU PA from consolidated IOVA */
+-static inline dma_addr_t fastrpc_ipa_to_dma_addr(struct fastrpc_channel_ctx *cctx, dma_addr_t iova)
+-{
+-	if (!cctx->soc_data->sid_pos)
+-		return 0;
+-	return iova & GENMASK_ULL(cctx->soc_data->sid_pos - 1, 0);
+-}
+ 
+ /*
+  * Prepare the consolidated iova to send to DSP by prepending the SID
+@@ -471,11 +462,12 @@
+ 		return;
+ 
+ 	dma_free_coherent(buf->dev, buf->size, buf->virt,
+-			  fastrpc_ipa_to_dma_addr(buf->fl->cctx, buf->dma_addr));
++			  buf->dma_handle);
++	put_device(buf->dev);
+ 	kfree(buf);
+ }
+ 
+-static int __fastrpc_buf_alloc(struct fastrpc_user *fl, struct device *dev,
++static int __fastrpc_buf_alloc(struct device *dev,
+ 			     u64 size, struct fastrpc_buf **obuf)
+ {
+ 	struct fastrpc_buf *buf;
+@@ -488,21 +480,22 @@
+ 	INIT_LIST_HEAD(&buf->node);
+ 	mutex_init(&buf->lock);
+ 
+-	buf->fl = fl;
+ 	buf->virt = NULL;
+ 	buf->dma_addr = 0;
+ 	buf->size = size;
+-	buf->dev = dev;
++	buf->dev = get_device(dev);
+ 	buf->raddr = 0;
+ 
+-	buf->virt = dma_alloc_coherent(dev, buf->size, &buf->dma_addr,
++	buf->virt = dma_alloc_coherent(dev, buf->size, &buf->dma_handle,
+ 				       GFP_KERNEL);
+ 	if (!buf->virt) {
++		put_device(buf->dev);
+ 		mutex_destroy(&buf->lock);
+ 		kfree(buf);
+ 		return -ENOMEM;
+ 	}
+ 
++	buf->dma_addr = buf->dma_handle;
+ 	*obuf = buf;
+ 
+ 	return 0;
+@@ -514,7 +507,7 @@
+ 	int ret;
+ 	struct fastrpc_buf *buf;
+ 
+-	ret = __fastrpc_buf_alloc(fl, dev, size, obuf);
++	ret = __fastrpc_buf_alloc(dev, size, obuf);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -531,7 +524,7 @@
+ {
+ 	struct device *rdev = &fl->cctx->rpdev->dev;
+ 
+-	return  __fastrpc_buf_alloc(fl, rdev, size, obuf);
++	return  __fastrpc_buf_alloc(rdev, size, obuf);
+ }
+ 
+ static void fastrpc_channel_ctx_free(struct kref *ref)
+@@ -812,7 +805,7 @@
+ 		return -ENOMEM;
+ 
+ 	ret = dma_get_sgtable(buffer->dev, &a->sgt, buffer->virt,
+-			      fastrpc_ipa_to_dma_addr(buffer->fl->cctx, buffer->dma_addr),
++			      buffer->dma_handle,
+ 			      buffer->size);
+ 	if (ret < 0) {
+ 		dev_err(buffer->dev, "failed to get scatterlist from DMA API\n");
+@@ -862,7 +855,7 @@
+ 	dma_resv_assert_held(dmabuf->resv);
+ 
+ 	return dma_mmap_coherent(buf->dev, vma, buf->virt,
+-				 fastrpc_ipa_to_dma_addr(buf->fl->cctx, buf->dma_addr), size);
++				 buf->dma_handle, size);
+ }
+ 
+ static const struct dma_buf_ops fastrpc_dma_buf_ops = {
+@@ -1800,6 +1793,86 @@
+ 	return 0;
+ }
+ 
++/* SDSP without an IOMMU can only access its pre-shared reserved pool. */
++static int fastrpc_sdsp_dmabuf_alloc(struct fastrpc_user *fl, u64 size,
++				   struct fastrpc_buf **obuf)
++{
++	struct fastrpc_channel_ctx *cctx = fl->cctx;
++	struct fastrpc_buf *buf;
++	struct sg_table table;
++	struct scatterlist *sg;
++	struct resource res;
++	struct device *dev;
++	phys_addr_t next;
++	unsigned long flags;
++	u64 remaining;
++	int err, i;
++
++	if (!size || size > SIZE_MAX - (PAGE_SIZE - 1))
++		return -EINVAL;
++
++	/* Removal clears rpdev under this lock; allocation must sleep outside it. */
++	spin_lock_irqsave(&cctx->lock, flags);
++	dev = cctx->rpdev ? get_device(&cctx->rpdev->dev) : NULL;
++	spin_unlock_irqrestore(&cctx->lock, flags);
++	if (!dev)
++		return -EPIPE;
++
++	err = -EINVAL;
++	if (device_iommu_mapped(dev))
++		goto put_dev;
++
++	err = of_reserved_mem_region_to_resource(dev->of_node, 0, &res);
++	if (err)
++		goto put_dev;
++
++	remaining = PAGE_ALIGN(size);
++	err = -ENOMEM;
++	if (remaining > resource_size(&res))
++		goto put_dev;
++
++	err = __fastrpc_buf_alloc(dev, size, &buf);
++	if (err)
++		goto put_dev;
++
++	/* DMA allocation may fall back to ordinary pages when CMA is exhausted. */
++	err = dma_get_sgtable(dev, &table, buf->virt, buf->dma_handle, size);
++	if (err)
++		goto free_buf;
++
++	err = -ENOMEM;
++	if (!table.sgl || !table.orig_nents)
++		goto free_table;
++	next = sg_phys(table.sgl);
++	for_each_sg(table.sgl, sg, table.orig_nents, i) {
++		if (!sg->length || sg->length > remaining || sg_phys(sg) != next ||
++		    next < res.start || next > res.end ||
++		    sg->length - 1 > res.end - next)
++			goto free_table;
++		remaining -= sg->length;
++		if (remaining) {
++			if (sg->length > res.end - next)
++				goto free_table;
++			next += sg->length;
++		}
++	}
++	if (remaining)
++		goto free_table;
++
++	sg_free_table(&table);
++	put_device(dev);
++	*obuf = buf;
++	return 0;
++
++free_table:
++	sg_free_table(&table);
++free_buf:
++	fastrpc_buf_free(buf);
++put_dev:
++	put_device(dev);
++	return err;
++}
++
+ static int fastrpc_dmabuf_alloc(struct fastrpc_user *fl, char __user *argp)
+ {
+ 	struct fastrpc_alloc_dma_buf bp;
+@@ -1810,7 +1883,10 @@
+ 	if (copy_from_user(&bp, argp, sizeof(bp)))
+ 		return -EFAULT;
+ 
+-	err = fastrpc_buf_alloc(fl, fl->sctx->dev, bp.size, &buf);
++	if (fl->cctx->domain_id == SDSP_DOMAIN_ID && !fl->sctx->sid)
++		err = fastrpc_sdsp_dmabuf_alloc(fl, bp.size, &buf);
++	else
++		err = fastrpc_buf_alloc(fl, fl->sctx->dev, bp.size, &buf);
+ 	if (err)
+ 		return err;
+ 	exp_info.ops = &fastrpc_dma_buf_ops;
+@@ -2682,7 +2758,7 @@
+ 	kref_init(&data->refcount);
+ 	atomic_set(&data->ctx_seq, 0);
+ 
+-	rdev->dma_mask = &data->dma_mask;
++	rdev->dma_mask = &rdev->coherent_dma_mask;
+ 	dma_set_mask_and_coherent(rdev, DMA_BIT_MASK(32));
+ 	INIT_LIST_HEAD(&data->users);
+ 	INIT_LIST_HEAD(&data->invoke_interrupted_mmaps);

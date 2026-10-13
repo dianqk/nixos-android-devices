@@ -79,7 +79,11 @@ in
       device = lib.mkForce rootDevice;
       fsType = "ext4";
       autoResize = true;
-      options = [ "noatime" ];
+      # Stop writing on filesystem errors instead of continuing on a failing disk.
+      options = [
+        "noatime"
+        "errors=remount-ro"
+      ];
     };
     boot.growPartition = lib.mkForce false;
     nix.settings.fsync-store-paths = true;

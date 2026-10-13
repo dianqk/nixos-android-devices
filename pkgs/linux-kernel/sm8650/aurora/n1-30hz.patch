@@ -1,0 +1,114 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 9 Oct 2026 20:00:00 +0800
+Subject: [PATCH] drm/panel: xiaomi-n1: add stock fixed 30 Hz mode
+
+Preserve the preferred 60 Hz mode and existing 120 Hz initialization.
+Add the stock normal30 sequence: extra OSC writes shared with 120 Hz,
+the 60 Hz rate sequence with BA repeat counts 03/03 and BC 60.
+All 124 packet types, payloads and delays match the Aurora live FDT.
+This is fixed normal30, not the distinct auto60-to-30 timing.
+
+Keep the stock 1.36 GHz lane budget and vertical timing using a compressed
+horizontal total of 1864 (DRM htotal 2920, clock 284174 kHz). Halving the
+60 Hz clock alone would halve the link bandwidth. Use the existing full
+modeset path for initialization and wake; no seamless or LTPO support.
+
+Original device-tree reference (live firmware may have newer commands):
+https://github.com/MiCode/vendor_qcom_proprietary_display-devicetree/blob/3354864add728de1916f65511c25a512e8b06a72/display/dsi-panel-n1-42-02-0a-dsc-cmd.dtsi
+
+---
+diff --git a/drivers/gpu/drm/panel/panel-xiaomi-n1.c b/drivers/gpu/drm/panel/panel-xiaomi-n1.c
+index 97df34392..53aeee892 100644
+--- a/drivers/gpu/drm/panel/panel-xiaomi-n1.c
++++ b/drivers/gpu/drm/panel/panel-xiaomi-n1.c
+@@ -29,7 +29,7 @@ struct n1_panel {
+ 	bool prepared;
+ };
+ 
+-/* Both modes retain stock flat-mode-on initialization (5f 00).
++/* All modes retain stock flat-mode-on initialization (5f 00).
+  * Stock Aurora 120 Hz init property SHA256: 88e7a37f3c889be652e1f536d440102ab820ddeba42fb977a8b79d079b98f1b1
+  * Stock Aurora 60 Hz init property SHA256: d0e617462560c25faa92a05e7b65d3ed9077d0803dc3273bd4c2905466253a2c */
+ struct n1_cmd {
+@@ -90,7 +90,7 @@ static const struct n1_cmd n1_init_common[] = {
+ 	{ 0x15, 0, 2, { 0x5a, 0x00 } },
+ };
+ 
+-static const struct n1_cmd n1_init_120hz_osc[] = {
++static const struct n1_cmd n1_init_extra_osc[] = {
+ 	{ 0x39, 0, 6, { 0xf0, 0x55, 0xaa, 0x52, 0x08, 0x01 } },
+ 	{ 0x39, 0, 42, { 0xc3, 0x99, 0x04, 0x20, 0x15, 0xff, 0x00, 0x04, 0x20, 0x0e, 0xff, 0x00, 0x06, 0x2f, 0x21, 0x06, 0x37, 0x16, 0x06, 0x2f, 0x21, 0x06, 0x37, 0x16, 0x06, 0x2f, 0x21, 0x06, 0x37, 0x16, 0x06, 0x2f, 0x21, 0x06, 0x37, 0x16, 0x06, 0x2f, 0x21, 0x06, 0x37, 0x16 } },
+ };
+@@ -157,6 +157,17 @@ static const struct n1_cmd n1_init_60hz[] = {
+ 	{ 0x15, 0, 2, { 0xbc, 0x20 } },
+ };
+ 
++static const struct n1_cmd n1_init_30hz[] = {
++	{ 0x15, 0, 2, { 0xbe, 0x2d } },
++	{ 0x15, 0, 2, { 0x26, 0x01 } },
++	{ 0x15, 0, 2, { 0x2f, 0x00 } },
++	{ 0x15, 0, 2, { 0x2f, 0x30 } },
++	{ 0x39, 0, 6, { 0xf0, 0x55, 0xaa, 0x52, 0x08, 0x00 } },
++	{ 0x15, 0, 2, { 0x6f, 0x1c } },
++	{ 0x39, 0, 10, { 0xba, 0x91, 0x01, 0x01, 0x00, 0x01, 0x03, 0x03, 0x00, 0x00 } },
++	{ 0x15, 0, 2, { 0xbc, 0x60 } },
++};
++
+ static const struct n1_cmd n1_init_120hz[] = {
+ 	{ 0x15, 0, 2, { 0xbe, 0x2d } },
+ 	{ 0x15, 0, 2, { 0x26, 0x00 } },
+@@ -217,6 +228,13 @@ static const struct drm_display_mode n1_modes[] = { {
+ 	.vdisplay = 3200, .vsync_start = 3216, .vsync_end = 3220, .vtotal = 3244,
+ 	.width_mm = 70, .height_mm = 156,
+ 	.type = DRM_MODE_TYPE_DRIVER,
++}, {
++	/* 30 Hz: compressed total 1864, preserving the 1.36 GHz lane budget. */
++	.clock = 284174,
++	.hdisplay = 1440, .hsync_start = 1472, .hsync_end = 1488, .htotal = 2920,
++	.vdisplay = 3200, .vsync_start = 3216, .vsync_end = 3220, .vtotal = 3244,
++	.width_mm = 70, .height_mm = 156,
++	.type = DRM_MODE_TYPE_DRIVER,
+ } };
+ 
+ /* The panel bridge prepares after atomic state is swapped. Like NT36532E,
+@@ -270,24 +288,26 @@ static int n1_send_cmds(struct n1_panel *ctx, const struct n1_cmd *cmds,
+ 	return 0;
+ }
+ 
+-static int n1_init(struct n1_panel *ctx, bool high_refresh)
++static int n1_init(struct n1_panel *ctx, int mode)
+ {
+ 	int ret;
+ 
+ 	ret = n1_send_cmds(ctx, n1_init_common, ARRAY_SIZE(n1_init_common));
+ 	if (ret)
+ 		return ret;
+-	if (high_refresh) {
+-		ret = n1_send_cmds(ctx, n1_init_120hz_osc,
+-				   ARRAY_SIZE(n1_init_120hz_osc));
++	if (mode != 0) {
++		ret = n1_send_cmds(ctx, n1_init_extra_osc,
++				   ARRAY_SIZE(n1_init_extra_osc));
+ 		if (ret)
+ 			return ret;
+ 	}
+ 	ret = n1_send_cmds(ctx, n1_init_brightness, ARRAY_SIZE(n1_init_brightness));
+ 	if (ret)
+ 		return ret;
+-	if (high_refresh)
++	if (mode == 1)
+ 		ret = n1_send_cmds(ctx, n1_init_120hz, ARRAY_SIZE(n1_init_120hz));
++	else if (mode == 2)
++		ret = n1_send_cmds(ctx, n1_init_30hz, ARRAY_SIZE(n1_init_30hz));
+ 	else
+ 		ret = n1_send_cmds(ctx, n1_init_60hz, ARRAY_SIZE(n1_init_60hz));
+ 	if (ret)
+@@ -334,7 +354,7 @@ static int n1_prepare(struct drm_panel *panel)
+ 	msleep(10);
+ 	dev_info(&dsi->dev, "N1 powered and reset; sending stock %d Hz commands\n",
+ 		 drm_mode_vrefresh(&n1_modes[mode]));
+-	ret = n1_init(ctx, mode == 1);
++	ret = n1_init(ctx, mode);
+ 	if (ret)
+ 		goto fail;
+ 	dsi->mode_flags |= MIPI_DSI_MODE_LPM;

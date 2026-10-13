@@ -1,0 +1,52 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 6 Oct 2026 23:00:00 +0800
+Subject: [PATCH] clk: qcom: complete SM8650 USB and UniPro boot clocks
+
+Local adaptation, not an imported upstream commit. The USB gate already
+exists in v2026.10-rc5; add its master dependency only. Use the SM8650
+100/201.5/403 MHz UniPro table and encoded HID handling learned on SM8550.
+Leave PLL configuration to ABL. Registers, mux and rates follow:
+https://github.com/torvalds/linux/blob/v7.3-rc5/drivers/clk/qcom/gcc-sm8650.c
+---
+--- a/drivers/clk/qcom/clock-sm8650.c
++++ b/drivers/clk/qcom/clock-sm8650.c
+@@ -64,12 +64,31 @@
+ 	{ }
+ };
+ 
++/* Linux gcc-sm8650.c: GPLL4 main is 806 MHz; mux selection is 5. */
++static const struct freq_tbl ftbl_ufs_unipro[] = {
++	F(100000000, CFG_CLK_SRC_GPLL0_EVEN, 3, 0, 0),
++	F(201500000, (5 << 8), 4, 0, 0),
++	F(403000000, (5 << 8), 2, 0, 0),
++	{ }
++};
++
+ static ulong sm8650_set_rate(struct clk *clk, ulong rate)
+ {
+ 	struct msm_clk_priv *priv = dev_get_priv(clk->dev);
+ 	const struct freq_tbl *freq;
+ 
+ 	switch (clk->id) {
++	case GCC_UFS_PHY_UNIPRO_CORE_CLK:
++		if (!rate || rate > 403000000)
++			return -EINVAL;
++		freq = qcom_find_freq(ftbl_ufs_unipro, rate);
++		/* F() already encodes HID: replace, do not encode/OR it again. */
++		clrsetbits_le32(priv->base + 0x7709c,
++			       GENMASK(4, 0) | GENMASK(10, 8) |
++			       GENMASK(13, 12) | BIT(20),
++			       freq->pre_div | freq->src);
++		clk_bcr_update(priv->base + 0x77098);
++		return freq->freq;
+ 	case GCC_QUPV3_WRAP2_S7_CLK: /* UART15 */
+ 		freq = qcom_find_freq(ftbl_gcc_qupv3_wrap1_s3_clk_src, rate);
+ 		clk_rcg_set_rate_mnd(priv->base, 0x1e898,
+@@ -201,6 +220,7 @@
+ 	struct msm_clk_priv *priv = dev_get_priv(clk->dev);
+ 
+ 	switch (clk->id) {
++	case GCC_CFG_NOC_USB3_PRIM_AXI_CLK:
+ 	case GCC_AGGRE_USB3_PRIM_AXI_CLK:
+ 		qcom_gate_clk_en(priv, GCC_USB30_PRIM_MASTER_CLK);
+ 		fallthrough;

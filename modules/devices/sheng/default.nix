@@ -19,7 +19,7 @@
     wifiMacAddress = lib.mkOption {
       type = lib.types.nullOr (lib.types.strMatching "[0-9A-Fa-f:]{17}");
       default = null;
-      description = "This tablet's factory Wi-Fi MAC, when known.";
+      description = "Stable Wi-Fi MAC for this tablet; use its factory address when known.";
     };
     bluetoothAddress = lib.mkOption {
       type = lib.types.nullOr (lib.types.strMatching "[0-9A-Fa-f:]{17}");

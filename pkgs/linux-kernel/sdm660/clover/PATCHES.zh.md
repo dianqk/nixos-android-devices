@@ -2,18 +2,16 @@
 
 [English](PATCHES.md) · [Clover 指南](../../../../docs/clover/README.zh.md)
 
-`devices.clover.kernel` 使用 Nixpkgs Linux 7.3-rc5 和按顺序应用的
+补丁集以 Linux 7.3-rc6 为目标。见[共享内核说明](../../README.zh.md)。
+
+`devices.clover.kernel` 补丁集以 Linux 7.3-rc6 为目标，按顺序应用的
 [补丁列表](series.nix)，从 x86_64 跨平台构建到 AArch64。正式系统和 RAM recovery
 使用此内核；尚未在设备上启动验证。
-`devices.clover.kernel-mainline` 保留固定版本的
-[`sdm660-mainline/linux` 7.2.3 源码](https://github.com/sdm660-mainline/linux/tree/e47d622cb6d2440a9eacdc8bb2df32c037bec7b8)
-和原有的 WCN3990 本地补丁，供 7.3 实机验证完成前回退。
 
 在 x86_64 主机上通过仓库的跨平台包作用域构建：
 
 ```console
-nix build .#devices.clover.kernel --out-link tmp/systemd-artifacts/devices.clover.kernel
-nix build .#devices.clover.kernel-mainline --out-link tmp/systemd-artifacts/devices.clover.kernel-mainline
+nix build .#devices.clover.kernel --out-link result-kernel
 ```
 
 每条补丁保留原作者、日期、提交说明和 trailers；`Source-Commit` 与 `Scope`

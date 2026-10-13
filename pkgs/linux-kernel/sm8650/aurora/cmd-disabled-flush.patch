@@ -1,0 +1,39 @@
+From ac52ff6ac5465a3469b9e4a1cd9a3bec0d54a92b Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 6 Oct 2026 11:50:57 +0800
+Subject: [PATCH] drm/msm/dpu: skip command flush wait while encoder is
+ disabled
+
+msm_atomic_commit_tail waits for the previous flush before enabling a CRTC.
+On command-mode DPMS resume the CRTC state is already active while the
+physical encoder is still disabled. Reading CTL state and waiting for its
+interrupt in that interval emits a false disabled-encoder error.
+
+Return the existing no-wait result before accessing CTL. Keep the enabled
+encoder path and its timeout checks intact.
+
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
+index 45079ee59..a2ca10044 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
+@@ -683,6 +683,13 @@ static int dpu_encoder_phys_cmd_wait_for_tx_complete(
+ static int dpu_encoder_phys_cmd_wait_for_commit_done(
+ 		struct dpu_encoder_phys *phys_enc)
+ {
++	/* The pre-commit flush also runs before re-enabling an inactive CRTC.
++	 * There is no previous transfer to wait for while the encoder is off.
++	 * Avoid reading CTL state or waiting for its disabled interrupt.
++	 */
++	if (phys_enc->enable_state == DPU_ENC_DISABLED)
++		return -EWOULDBLOCK;
++
+ 	/* only required for master controller */
+ 	if (!dpu_encoder_phys_cmd_is_master(phys_enc))
+ 		return 0;
+-- 
+2.55.0
+

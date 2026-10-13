@@ -1,0 +1,69 @@
+Subject: [PATCH] arm64: dts: qcom: aurora: enable ADSP battery and USB2 role switching
+
+Use the board's OEM ADSP and DTB firmware for charger_pd. Wire the USB-C
+connector to DWC3 so UCSI can locate the role switch. Fixed peripheral
+mode never registers that switch and leaves UCSI probing with EPROBE_DEFER.
+Keep high-speed and a peripheral default while USB3/DP wiring is validated.
+
+Reference: https://github.com/torvalds/linux/blob/v7.3-rc5/arch/arm64/boot/dts/qcom/sm8650-hdk.dts
+Firmware provenance: pkgs/aurora/firmware/README.md
+
+--- a/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
++++ b/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
+@@ -26,10 +26,31 @@ &gpu_zap_shader {
+ / {
+ 	model = "Xiaomi 14 Ultra";
+ 	compatible = "xiaomi,aurora", "qcom,sm8650";
++
+ 	qcom,msm-id = <557 0x20000>, <557 0x10000>;
+ 	qcom,board-id = <8 0>;
+ 	xiaomi,miboard-id = <4 0>;
+ 
++	pmic-glink {
++		compatible = "qcom,sm8650-pmic-glink", "qcom,sm8550-pmic-glink",
++			     "qcom,pmic-glink";
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		connector@0 {
++			compatible = "usb-c-connector";
++			reg = <0>;
++			power-role = "dual";
++			data-role = "dual";
++
++			port {
++				pmic_glink_hs_in: endpoint {
++					remote-endpoint = <&usb_1_dwc3_hs>;
++				};
++			};
++		};
++	};
++
+ 	/* Firmware hypervisor overlay targets this symbol to set always-on. */
+ 	arch_timer: timer { };
+ 
+@@ -130,7 +151,9 @@ &usb_dp_qmpphy {
+ 	status = "okay";
+ };
+ &usb_1 {
+-	dr_mode = "peripheral";
++	dr_mode = "otg";
++	usb-role-switch;
++	role-switch-default-mode = "peripheral";
+ 	maximum-speed = "high-speed";
+ 	status = "okay";
+ };
+@@ -283,3 +306,13 @@ &pon_resin {
+ 	linux,code = <KEY_VOLUMEDOWN>;
+ 	status = "okay";
+ };
++
++&remoteproc_adsp {
++	firmware-name = "qcom/sm8650/xiaomi/aurora/adsp.mdt",
++			"qcom/sm8650/xiaomi/aurora/adsp_dtb.mdt";
++	status = "okay";
++};
++
++&usb_1_dwc3_hs {
++	remote-endpoint = <&pmic_glink_hs_in>;
++};

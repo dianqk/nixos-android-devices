@@ -1,6 +1,6 @@
 # 基础硬件测试
 
-在有 Python 3 和 OpenSSH 的主机执行；示例系统需启用 root SSH 并已启动 Sway：
+在有 Python 3 和 OpenSSH 的主机执行；示例系统需启用 root SSH 并已启动 Niri：
 
 ```sh
 python3 tests/basic/run.py --ssh DEVICE_HOST --media tmp/basic-media --output tmp/basic-results
@@ -24,7 +24,7 @@ SSH 配置可指定 Wi-Fi 地址、密钥和已验证的 known_hosts；所有测
 
 | 项目 | 检测内容 |
 | --- | --- |
-| `display` | Sway 输出、分辨率、刷新率、缩放、旋转、DRM 接口／模式及背光信息。实体是否可见需另行截图和拍照确认。 |
+| `display` | Niri 输出、分辨率、刷新率、缩放、旋转、DRM 接口／模式及背光信息。实体是否可见需另行截图和拍照确认。 |
 | `wifi` | 一次实时 Wi-Fi 扫描，不连接。 |
 | `bluetooth` | 扫描附近设备 15 秒，不配对、不连接。 |
 | `audio` | 内核 ALSA 声卡和物理 PCM 设备节点，不播放、不录音；不验证实际声音或耳机插入。 |

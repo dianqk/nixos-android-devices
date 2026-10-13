@@ -1,14 +1,34 @@
 # First install on Polaris
 
-[中文](first-install.zh.md) · [Device guide](README.md) · [Manual storage commands](manual-storage.md)
+[中文](first-install.zh.md) · [Device guide](README.md) · [Storage preparation](manual-storage.md)
 
 Polaris uses physical `system` as FAT32 `/boot`, `userdata` as ext4 `/`, and
 `boot` for U-Boot. GPT geometry and partition types stay unchanged. This device
 has **no A/B slots**; use `boot` and `recovery` without slot suffixes.
 
 You need an unlocked phone, a Linux build host with Nix flakes enabled, USB
-fastboot/SSH access, and room for the system closure plus at least 1 GiB on
-userdata. Formatting erases the selected partition.
+fastboot/SSH access, and a userdata partition of at least 16 GiB (the
+`androidDevices.recovery.minimumRootBytes` default) with room for the system
+closure plus 1 GiB. Formatting erases the selected partition.
+
+## Android base before installation
+
+**The Polaris adaptation baseline is the latest LineageOS 22.2 build for
+`polaris`. Prepare that release before installing NixOS.** Here, “latest” means
+the latest build within the 22.2 series, not a newer LineageOS major release.
+No exact build date is pinned by this guide.
+
+Before replacing Android, verify and record the installed build:
+
+```sh
+adb -s SERIAL shell getprop ro.product.device
+adb -s SERIAL shell getprop ro.lineage.version
+adb -s SERIAL shell getprop ro.build.fingerprint
+```
+
+Confirm `polaris` and a `22.2-…` LineageOS version. Complete Android preparation
+before formatting `system` and `userdata` for NixOS; Polaris has no second slot
+in which to retain Android. NixOS updates do not install or update LineageOS.
 
 ## Identify this phone
 
@@ -17,39 +37,39 @@ From this repository, build and temporarily boot RAM recovery. Replace
 fastboot command checks the target and image; `--execute` boots it.
 
 ```sh
-nix build .#devices.polaris.recovery -o tmp/systemd-artifacts/devices.polaris.recovery
-nix run .#mobile-device -- --serial FASTBOOT_SERIAL fastboot boot tmp/systemd-artifacts/devices.polaris.recovery
-nix run .#mobile-device -- --serial FASTBOOT_SERIAL fastboot boot tmp/systemd-artifacts/devices.polaris.recovery --execute
+nix build .#devices.polaris.recovery -o result-recovery
+nix run .#mobile-device -- --serial FASTBOOT_SERIAL fastboot boot result-recovery
+nix run .#mobile-device -- --serial FASTBOOT_SERIAL fastboot boot result-recovery --execute
 ```
 
 Set up `RECOVERY_HOST` and its host key using the [connection guide](../recovery.md).
-Recovery does not mount or write partitions at startup. Inspect the layout:
+Full recovery may briefly access an existing Linux root for its SSH identity;
+it does not format storage and leaves no target mounted. Inspect the layout:
 
 ```sh
 ssh -T RECOVERY_HOST 'lsblk -b -o NAME,SIZE,PARTUUID,PARTLABEL,START,FSTYPE,LABEL,UUID'
 ```
 
 Confirm unique `system`, `userdata`, `boot` and `misc` GPT names on the built-in
-UFS. The reboot helper requires a 4 MiB `misc` partition. Recovery checks the
-board, controller, partition names and filesystem labels. For exact per-phone
-UUID and geometry checks, supply a measured
-[`storage-roles.example.sh`](../../devices/polaris/storage-roles.example.sh)
-through `hardware.polaris.storageRolesFile`.
+UFS. Recovery requests require a 4 MiB `misc` partition. Recovery checks the
+board, controller, partition names, kernel geometry and filesystem labels. For
+exact per-phone checks, add measured values to `hardware.polaris.storageRoles`
+(see [single-slot devices](../recovery.md#single-slot-devices-clover-and-polaris)).
 
 ## Build matching system and recovery
 
 Copy the [consumer flake](../../examples/consumer/flake.nix) and follow the
 [configuration guide](../configuration.md). Select `device = "polaris"`, set the
 build host architecture and a unique USB serial, and add your SSH public key.
-Keep the root label (default `NIXOS`) and any storage contract shared between
+Keep the root label (default `NIXOS`) and any `storageRoles` shared between
 system and recovery. The sample starts a console system with radios/audio off.
 
 From your configuration directory, with the files tracked by Git:
 
 ```sh
-nix build .#system -o tmp/systemd-artifacts/system
-nix build .#bootstrap-info -o tmp/systemd-artifacts/bootstrap-info
-nix build .#recovery -o tmp/systemd-artifacts/recovery
+nix build .#system -o result-system
+nix build .#bootstrap-info -o result-bootstrap-info
+nix build .#recovery -o result-recovery
 nix profile install .#mobile-device
 ```
 
@@ -61,16 +81,16 @@ includes its matching U-Boot image.
 Temporarily boot the recovery built from your configuration and reconnect SSH:
 
 ```sh
-mobile-device --serial FASTBOOT_SERIAL fastboot boot tmp/systemd-artifacts/recovery
-mobile-device --serial FASTBOOT_SERIAL fastboot boot tmp/systemd-artifacts/recovery --execute
+mobile-device --serial FASTBOOT_SERIAL fastboot boot result-recovery
+mobile-device --serial FASTBOOT_SERIAL fastboot boot result-recovery --execute
 ```
 
 If userdata is not an empty ext4 filesystem with the configured label, check
 and explicitly format it. **This erases userdata.**
 
 ```sh
-mobile-device recovery --target RECOVERY_HOST format-userdata
-mobile-device recovery --target RECOVERY_HOST format-userdata --execute
+mobile-device recovery --target RECOVERY_HOST format-root
+mobile-device recovery --target RECOVERY_HOST format-root --execute
 ```
 
 Prepare physical `system` as FAT32. A matching FAT filesystem is checked and
@@ -84,11 +104,11 @@ mobile-device recovery --target RECOVERY_HOST prepare-boot --execute
 Check and install the system:
 
 ```sh
-SYSTEM=$(readlink -f tmp/systemd-artifacts/system)
+SYSTEM=$(readlink -f result-system)
 mobile-device recovery --target RECOVERY_HOST install-initial "$SYSTEM" \
-  --bootstrap-info tmp/systemd-artifacts/bootstrap-info
+  --bootstrap-info result-bootstrap-info
 mobile-device recovery --target RECOVERY_HOST install-initial "$SYSTEM" \
-  --bootstrap-info tmp/systemd-artifacts/bootstrap-info --execute
+  --bootstrap-info result-bootstrap-info --execute
 ```
 
 The [first installer](../initial-install.md) verifies the closure, installs EFI

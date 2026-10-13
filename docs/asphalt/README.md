@@ -6,6 +6,13 @@ Support: Tier 2. See [support criteria](../README.md#support-tiers).
 
 ## Configure and install
 
+For first installation, prepare the **ROW ZUI 17.0.339 (Android 15) base**. See the
+[Android baseline and identity checks](first-install.md#android-base-before-installation),
+including the distinction from the Android 16 GSI used during adaptation.
+If Android replaced the boot path of an existing NixOS installation, follow
+[boot restoration](first-install.md#restore-an-existing-efi-installation) to retain
+its root/ESP and data; do not rerun destructive first-install preparation.
+
 1. Create a consumer flake using the [configuration guide](../configuration.md).
    Set `device = "asphalt"` in `lib.mkSystem`, or import `nixosModules.asphalt`.
 2. Add the settings below to your installed configuration. Share device and
@@ -29,15 +36,21 @@ Optional identity files are build inputs. The Wi-Fi file holds the factory
 MAC; the Bluetooth file holds the saved Qualcomm NVM address in controller byte
 order, which the service reverses for BlueZ. Recovery does not run these identity
 services. The root filesystem lives in a dedicated physical `linux` partition,
-not in Android super. B-slot boot-success acknowledgement is not automatic;
-see the [hardware limitations](hardware.md) before relying on repeated reboots.
+not in Android super. Current U-Boot acknowledges B after validated EFI loading;
+this is not a Linux health check. See [hardware limitations](hardware.md).
 
 Asphalt has booted through U-Boot/EFI and passed generation updates and rollback.
 Use a separate 1 GiB FAT `linux-boot` ESP and ext4 `linux`, with firmware in
 `boot_b`. Preserve A and super. See [installation preparation](first-install.md)
-for the remaining manual preparation steps.
+for the remaining manual preparation steps. The U-Boot/mainline B path requires
+an erased `dtbo_b`; an Android/LineageOS installation can restore incompatible
+overlays. Use the [checked DTBO erase](../../pkgs/mobile-device/README.md#asphalt-dtbo-erase)
+only when restoring this B boot path, preserving A and recovery.
 
 ## Use and troubleshoot
+
+See [Android/U-Boot compatibility and A/B limits](../android-uboot-compatibility.md)
+for the supported boot paths.
 
 In your consumer flake, build `.#system`, `.#bootstrap-info` and `.#recovery`.
 The repository examples use `.#devices.asphalt.<role>`, for example `.#devices.asphalt.system`.

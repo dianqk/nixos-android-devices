@@ -1,0 +1,58 @@
+From: dianqk <dianqk@dianqk.net>
+Subject: [PATCH] media: iris: allocate separate encoder DPBs for SM8450 firmware
+
+The SM8450 Gen2 firmware takes an indexed HFI_BUFFER_DPB for each reference
+frame. The generic scratch2 allocation aggregates the reference storage into
+one buffer, as used by the older scratch-buffer protocol. Select the per-frame
+size and count through the firmware descriptor, leaving other firmware intact.
+
+Protocol reference (size and count):
+https://github.com/lolipuru/kernel_lenovo_sm8475-modules/blob/0ba8898cd4d9201c0942d4145813a98d1a93389a/qcom/opensource/video-driver/driver/variant/iris2/src/msm_vidc_buffer_iris2.c
+
+--- a/drivers/media/platform/qcom/iris/iris_platform_common.h
++++ b/drivers/media/platform/qcom/iris/iris_platform_common.h
+@@ -286,6 +286,8 @@
+ };
+ 
+ struct iris_firmware_desc {
++	/* Firmware consumes individually indexed encoder reference frames. */
++	bool enc_dpb_per_buffer;
+ 	const struct iris_firmware_data *firmware_data;
+ 	u32 (*get_vpu_buffer_size)(struct iris_inst *inst, enum iris_buffer_type buffer_type);
+ 	const char *fwname;
+--- a/drivers/media/platform/qcom/iris/iris_platform_vpu2.c
++++ b/drivers/media/platform/qcom/iris/iris_platform_vpu2.c
+@@ -42,6 +42,7 @@
+ };
+ 
+ static const struct iris_firmware_desc iris_vpu20_p4_gen2_desc = {
++	.enc_dpb_per_buffer = true,
+ 	.firmware_data = &iris_hfi_gen2_data,
+ 	.get_vpu_buffer_size = iris_vpu_buf_size,
+ 	.fwname = "qcom/vpu/vpu20_p4.mbn",
+--- a/drivers/media/platform/qcom/iris/iris_vpu_buffer.c
++++ b/drivers/media/platform/qcom/iris/iris_vpu_buffer.c
+@@ -1739,6 +1739,9 @@
+ 	u32 frame_width = iris_vpu_enc_get_bitstream_width(inst);
+ 	u32 num_ref = hfi_buffer_get_recon_count(inst);
+ 
++	if (inst->core->iris_firmware_desc->enc_dpb_per_buffer)
++		return hfi_buffer_dpb_enc(frame_width, frame_height, false);
++
+ 	return hfi_buffer_scratch2_enc(frame_width, frame_height, num_ref, false);
+ }
+ 
+@@ -2243,8 +2246,12 @@
+ 	case BUF_LINE:
+ 	case BUF_PERSIST:
+ 		return internal_buffer_count(inst, buffer_type);
++	case BUF_SCRATCH_2:
++		if (inst->domain == ENCODER &&
++		    inst->core->iris_firmware_desc->enc_dpb_per_buffer)
++			return hfi_buffer_get_recon_count(inst) + 1;
++		return 1;
+ 	case BUF_SCRATCH_1:
+-	case BUF_SCRATCH_2:
+ 	case BUF_VPSS:
+ 	case BUF_ARP:
+ 	case BUF_PARTIAL:

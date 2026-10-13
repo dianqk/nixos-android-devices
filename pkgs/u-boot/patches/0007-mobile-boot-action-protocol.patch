@@ -1,0 +1,84 @@
+From: NixOS Android devices contributors <nixos-android-devices@localhost>
+Date: Thu, 1 Oct 2026 12:00:00 +0800
+Subject: [PATCH] efi: register optional mobile PON reboot action protocol
+
+Local integration against U-Boot a06e89ab05eaa2b8344d521319399333cd760ae5:
+https://source.denx.de/u-boot/u-boot/-/blob/a06e89ab05eaa2b8344d521319399333cd760ae5/lib/efi_loader/efi_setup.c
+
+Compile the separate boot-services adapter only when explicitly enabled by
+board configuration. The adapter validates PON and PSCI before masked byte
+writes and exposes no runtime service or arbitrary register access.
+
+Local extension: an explicit Android-only non-GPT candidate mask.
+Boot-LU mapping and snapshot state are checked by the shared adapter.
+---
+--- a/lib/efi_loader/Makefile
++++ b/lib/efi_loader/Makefile
+@@ -45,6 +45,7 @@
+ obj-y += efi_root_node.o
+ obj-y += efi_runtime.o
+ obj-y += efi_setup.o
++obj-$(CONFIG_EFI_MOBILE_BOOT_ACTION) += efi_mobile_boot_action.o
+ obj-y += efi_string.o
+ obj-$(CONFIG_EFI_UNICODE_COLLATION_PROTOCOL2) += efi_unicode_collation.o
+ obj-y += efi_var_common.o
+--- a/lib/efi_loader/Kconfig
++++ b/lib/efi_loader/Kconfig
+@@ -621,6 +621,31 @@
+ 	  directly boot from network.
+ endmenu
+ 
++config EFI_MOBILE_BOOT_ACTION
++	bool "Confirmed OEM reboot targets through EFI boot services"
++	depends on ARM64 && PMIC_QCOM && SPMI_MSM && ARM_PSCI_FW && PSCI_RESET
++	help
++	  Publish the mobile boot-action protocol for explicitly configured
++	  PON or explicitly selected SDAM/A/B backend. The service is
++	  disabled at ExitBootServices.
++
++config EFI_MOBILE_BOOT_ACTION_QCOM_AB
++	bool "Qualcomm SDAM and GPT A/B reboot backend"
++	depends on EFI_MOBILE_BOOT_ACTION && SCSI && UFS && BLK
++	help
++	  Check B recovery and switch Android to A through checked GPT
++	  metadata and UFS boot-LUN updates. No partition payload writes.
++
++config EFI_MOBILE_QCOM_AB_ANDROID_NON_GPT_LUN_MASK
++	int "Non-GPT LUN mask accepted for checked Android A reboot"
++	depends on EFI_MOBILE_BOOT_ACTION_QCOM_AB
++	range 0 255
++	default 0
++	help
++	  Permit explicit zero-metadata candidates only after all three
++	  metadata blocks read as zero. Never omit a boot-ID-bearing LUN.
++	  Independent of B confirmation; recovery retains full GPT checks.
++
+ config BOOTEFI_HELLO_COMPILE
+ 	bool "Compile a standard EFI hello world binary for testing"
+ 	default y
+--- a/include/efi_loader.h
++++ b/include/efi_loader.h
+@@ -647,6 +647,8 @@
+ efi_status_t efi_tcg2_measure_dtb(void *dtb);
+ /* Called by bootefi to initialize root node */
+ efi_status_t efi_root_node_register(void);
++/* Non-runtime mobile OEM reboot targets. */
++efi_status_t efi_mobile_boot_action_register(void);
+ /* Called by bootefi to initialize runtime */
+ efi_status_t efi_initialize_system_table(void);
+ /* Called by bootefi to initialize debug */
+--- a/lib/efi_loader/efi_setup.c
++++ b/lib/efi_loader/efi_setup.c
+@@ -382,6 +382,12 @@
+ 	if (ret != EFI_SUCCESS)
+ 		goto out;
+ 
++	if (IS_ENABLED(CONFIG_EFI_MOBILE_BOOT_ACTION)) {
++		ret = efi_mobile_boot_action_register();
++		if (ret != EFI_SUCCESS)
++			goto out;
++	}
++
+ 	/* Execute capsules after reboot */
+ 	if (IS_ENABLED(CONFIG_EFI_CAPSULE_ON_DISK) &&
+ 	    !IS_ENABLED(CONFIG_EFI_CAPSULE_ON_DISK_EARLY))

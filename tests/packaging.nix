@@ -9,6 +9,7 @@ let
   env = flake.lib.mkBuildEnvironment { inherit buildSystem; };
   target = env.pkgs;
   host = env.buildPackages;
+  mobileDevice = flake.packages.${buildSystem}.mobile-device;
   packaging = target.androidDevicePackages.packaging;
   script = packaging.writeShellApplication {
     name = "target-packaging-probe";
@@ -34,7 +35,10 @@ in
 assert script.system == buildSystem;
 assert binary.system == buildSystem;
 assert nativeProbe.system == "aarch64-linux";
+assert mobileDevice.system == buildSystem;
 host.runCommand "android-packaging-platforms" { nativeBuildInputs = [ host.patchelf ]; } ''
+  test "$(head -n1 ${mobileDevice}/bin/mobile-device)" = '#! ${host.runtimeShell} -e'
+  ${mobileDevice}/bin/mobile-device --help >/dev/null
   test "$(head -n1 ${script}/bin/target-packaging-probe)" = '#!${target.runtimeShell}'
   grep -F '${target.coreutils}/bin' ${script}/bin/target-packaging-probe
   test "$(patchelf --print-interpreter ${binary}/bin/hello)" = '${target.stdenv.cc.bintools.dynamicLinker}'

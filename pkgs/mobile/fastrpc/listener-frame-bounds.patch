@@ -1,0 +1,110 @@
+Validate listener input against the received frame length, including output
+length words, before using the signed sbuf cursor or allocating responses.
+Source baseline: https://github.com/qualcomm/fastrpc/tree/v1.0.7
+
+--- a/inc/listener_buf.h
++++ b/inc/listener_buf.h
+@@ -7,6 +7,8 @@
+ #include "sbuf.h"
+ #include "remote.h"
+ #include "verify.h"
++#include "AEEStdErr.h"
++#include <limits.h>
+ 
+ static __inline void pack_in_bufs(struct sbuf* buf, remote_arg* pra, int nBufs) {
+    int ii;
+@@ -32,31 +34,45 @@
+    }
+ }
+ 
+-static __inline void unpack_in_bufs(struct sbuf* buf, remote_arg* pra, int nBufs) {
++/* Validate the complete wire frame before handing any pointers to a skeleton. */
++static __inline int unpack_in_bufs(struct sbuf* buf, remote_arg* pra, int nBufs) {
+    int ii;
+-   uint32_t len=0;
+-   C_ASSERT(sizeof(len) == 4);
+-   for(ii = 0; ii < nBufs; ++ii) {
+-      sbuf_read(buf, (uint8_t*)&len, 4);
++   for (ii = 0; ii < nBufs; ++ii) {
++      uint32_t len;
++      if (buf->bufCur > buf->bufEnd || buf->bufEnd - buf->bufCur < sizeof(len))
++         return AEE_EBADPARM;
++      sbuf_read(buf, &len, sizeof(len));
++      if (len) {
++         sbuf_align(buf, 8);
++         if (len > INT_MAX || buf->bufCur > buf->bufEnd ||
++             len > buf->bufEnd - buf->bufCur)
++            return AEE_EBADPARM;
++      }
+       pra[ii].buf.nLen = len;
+-      if(pra[ii].buf.nLen) {
+-         sbuf_align(buf, 8);
+-         if((int)pra[ii].buf.nLen <= sbuf_left(buf)) {
+-            pra[ii].buf.pv = sbuf_head(buf);
+-         }
+-         sbuf_advance(buf, pra[ii].buf.nLen);
+-      }
++      pra[ii].buf.pv = len ? sbuf_head(buf) : NULL;
++      sbuf_advance(buf, len);
+    }
++   return AEE_SUCCESS;
+ }
+ 
+-static __inline void unpack_out_lens(struct sbuf* buf, remote_arg* pra, int nBufs) {
++static __inline int unpack_out_lens(struct sbuf* buf, remote_arg* pra, int nBufs) {
+    int ii;
+-   uint32_t len=0;
+-   C_ASSERT(sizeof(len) == 4);
+-   for(ii = 0; ii < nBufs; ++ii) {
+-      sbuf_read(buf, (uint8_t*)&len, 4);
++   uint64_t needed = 0;
++   for (ii = 0; ii < nBufs; ++ii) {
++      uint32_t len;
++      if (buf->bufCur > buf->bufEnd || buf->bufEnd - buf->bufCur < sizeof(len))
++         return AEE_EBADPARM;
++      sbuf_read(buf, &len, sizeof(len));
++      needed += sizeof(len);
++      if (len)
++         needed = ((needed + 7) & ~UINT64_C(7)) + len;
++      /* Leave room for the listener's doubled, page-aligned cache sizing. */
++      if (needed > (INT_MAX - 4096) / 2)
++         return AEE_EBADSIZE;
+       pra[ii].buf.nLen = len;
++      pra[ii].buf.pv = NULL;
+    }
++   return AEE_SUCCESS;
+ }
+ 
+ //map out buffers on the hlos side to the remote_arg array
+--- a/src/listener_android.c
++++ b/src/listener_android.c
+@@ -188,7 +188,9 @@
+       }
+     }
+     FASTRPC_GET_REF(domain);
+-    if (__builtin_smul_overflow(inBufsLenReq, 2, &bufs_len)) {
++    bufs_len = 0;
++    if (inBufsLenReq < 0 || inBufsLenReq > (INT_MAX - 4096) / 2 ||
++        __builtin_smul_overflow(inBufsLenReq, 2, &bufs_len)) {
+       FARF(ERROR,
+            "Error: %s: overflow occurred while multiplying input buffer size: "
+            "%d * 2 = %d for handle 0x%x, sc 0x%x",
+@@ -248,10 +250,14 @@
+       goto invoke;
+     }
+ 
+-    sbuf_init(&buf, 0, inBufs, inBufsLen);
+-    unpack_in_bufs(&buf, args, REMOTE_SCALARS_INBUFS(sc));
+-    unpack_out_lens(&buf, args + REMOTE_SCALARS_INBUFS(sc),
+-                    REMOTE_SCALARS_OUTBUFS(sc));
++    sbuf_init(&buf, 0, inBufs, inBufsLenReq);
++    result = unpack_in_bufs(&buf, args, REMOTE_SCALARS_INBUFS(sc));
++    if (result != AEE_SUCCESS)
++      goto invoke;
++    result = unpack_out_lens(&buf, args + REMOTE_SCALARS_INBUFS(sc),
++                             REMOTE_SCALARS_OUTBUFS(sc));
++    if (result != AEE_SUCCESS)
++      goto invoke;
+ 
+     sbuf_init(&buf, 0, 0, 0);
+     pack_out_bufs(&buf, args + REMOTE_SCALARS_INBUFS(sc),

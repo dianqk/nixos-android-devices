@@ -1,9 +1,11 @@
 {
+  bootActionProfile = "pon";
   deviceTree = "qcom/sdm845-xiaomi-polaris";
   patches = [
     ./patches/0001-polaris-abl-framebuffer.patch
     ./patches/0002-video-scale-bitmap-console-fonts.patch
   ];
+  chargerEnvironment = true;
   environment = ./polaris.env;
   config = ''
     CONFIG_DEFAULT_DEVICE_TREE="qcom/sdm845-xiaomi-polaris"

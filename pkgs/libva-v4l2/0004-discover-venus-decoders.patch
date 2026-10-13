@@ -1,0 +1,35 @@
+Subject: [PATCH] Discover Qualcomm Venus stateful decoders
+
+Local change against libva-v4l2 v1.0.0:
+https://github.com/radxa-pkg/libva-v4l2/tree/0e4ce1e05da1d0a92b342efc2090b9e4987035e1
+
+Venus provides the decode-order controls and DMA-BUF capture used by this
+backend. Accept its driver name while retaining the M2M and compressed OUTPUT
+format checks, so camera and encoder nodes are not selected. Video indices
+can change between boots.
+
+On SDM845 Polaris with Linux 7.3-rc5, stock FFmpeg VA-API H264 High and HEVC
+Main each pass 90 frames with B frames and pixel-exact software comparisons.
+Do not extend encoder discovery: Venus encoding still faults in firmware.
+
+--- a/src/decoder.cpp
++++ b/src/decoder.cpp
+@@ -72,7 +72,8 @@
+         v4l2_capability cap{};
+         bool match = false;
+         if (!call(fd, VIDIOC_QUERYCAP, &cap) &&
+-            !strcmp(reinterpret_cast<char *>(cap.driver), "iris_driver")) {
++            (!strcmp(reinterpret_cast<char *>(cap.driver), "iris_driver") ||
++             !strcmp(reinterpret_cast<char *>(cap.driver), "qcom-venus"))) {
+             unsigned caps =
+                 cap.capabilities & V4L2_CAP_DEVICE_CAPS ? cap.device_caps : cap.capabilities;
+             if (caps & V4L2_CAP_VIDEO_M2M_MPLANE) {
+@@ -89,7 +90,7 @@
+         if (match)
+             return path;
+     }
+-    throw Error(VA_STATUS_ERROR_OPERATION_FAILED, "no Iris stateful H264 decoder found");
++    throw Error(VA_STATUS_ERROR_OPERATION_FAILED, "no Qualcomm stateful H264 decoder found");
+ }
+ bool device_supports_av1(const std::string &device) {
+     int fd = open(device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);

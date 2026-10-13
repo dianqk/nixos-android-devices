@@ -1,0 +1,144 @@
+Subject: [PATCH] Preserve SSC accelerometer device coordinates
+
+SSC accelerometer events are already factory calibrated and oriented to the
+Android device frame. Attribute 20 is placement metadata, not a residual
+sample transform. Remove the extra multiplication and erroneous parsing of
+placement as nine consecutive rotation entries. Keep the public property as
+identity for ABI compatibility.
+
+Protocol reference (Handling stream events, item 3):
+https://git.martb.dev/MartB/vendor_oneplus_kebab/src/commit/6694ebe6754e2d70cbf98aba495ad43396a21385/proprietary/vendor/etc/sensors/proto/sns_accel.proto
+Placement attribute:
+https://git.martb.dev/MartB/vendor_oneplus_kebab/src/commit/6694ebe6754e2d70cbf98aba495ad43396a21385/proprietary/vendor/etc/sensors/proto/sns_std_sensor.proto
+
+Local change against libssc v0.4.4; no imported upstream patch.
+
+--- a/src/libssc-sensor.c
++++ b/src/libssc-sensor.c
+@@ -277,7 +277,6 @@
+ 	SSCSensorPrivate *priv = NULL;
+ 	ReportReceivedContext *ctx = user_data;
+ 	gboolean attributes_populated = FALSE;
+-	gboolean mount_matrix_attribute_populated = FALSE;
+ 	GError *error = NULL;
+ 
+ 	priv = ssc_sensor_get_instance_private (ctx->sensor);
+@@ -397,26 +396,9 @@
+ 					if (attr_msg->attr[i]->value_array->n_v == 1 && attr_msg->attr[i]->value_array->v[0]->has_i)
+ 						priv->stream_type = attr_msg->attr[i]->value_array->v[0]->i;
+ 					break;
+-				case SSC_ATTRIBUTE_MOUNT_MATRIX:
+-					mount_matrix_attribute_populated = TRUE;
+-					/* 3x3 mount matrix has max 9 values but a 3x4 matrix is provided, use the first 9 values */
+-					for (gsize j = 0; j < MIN(attr_msg->attr[i]->value_array->n_v, 9); j++) {
+-						if (attr_msg->attr[i]->value_array->v[j]->has_f) {
+-							priv->mount_matrix[j/3][j%3] = attr_msg->attr[i]->value_array->v[j]->f;
+-						}
+-					}
+-
+-					/* Fallback to identity matrix in case matrix is all 0 */
+-					gint sum = 0;
+-					for (gsize k = 0; k < 9; k++)
+-						sum += priv->mount_matrix[k/3][k%3];
+-
+-					if (sum == 0) {
+-						priv->mount_matrix[0][0] = 1.0;
+-						priv->mount_matrix[1][1] = 1.0;
+-						priv->mount_matrix[2][2] = 1.0;
+-						g_warning ("Mount matrix provided by firmware is all 0, falling back to identity matrix!");
+-					}
++				case SSC_ATTRIBUTE_PLACEMENT:
++					/* Placement describes the sensor element, not a transform
++					 * for samples already expressed in device coordinates. */
+ 					break;
+ 		       }
+ 		}
+@@ -430,13 +412,7 @@
+ 		g_debug ("  stream-type: %s", priv->stream_type == SSC_STREAM_TYPE_CONTINUOUS ? "continuous" : "on-change");
+ 		g_debug ("  sample-rate: %f Hz", priv->sample_rate);
+ 		g_debug ("  available: %s", priv->available ? "yes" : "no");
+-		if (mount_matrix_attribute_populated) {
+-			g_debug ("  mount-matrix: [[%f,%f,%f],[%f,%f,%f],[%f,%f,%f]]",
+-                        	 priv->mount_matrix[0][0], priv->mount_matrix[0][1], priv->mount_matrix[0][2],
+-				 priv->mount_matrix[1][0], priv->mount_matrix[1][1], priv->mount_matrix[1][2],
+-				 priv->mount_matrix[2][0], priv->mount_matrix[2][1], priv->mount_matrix[2][2]);
+-		} else
+-			g_debug ("  mount-matrix: undefined");
++
+ 
+ 		/* Sensor initialized, complete task and stop listening */
+ 		if (ctx->task) {
+@@ -904,7 +880,8 @@
+ 
+ 	priv = ssc_sensor_get_instance_private (self);
+ 
+-	/* Use identity matrix in case no mount matrix is exposed */
++	/* Retain the legacy property as identity: SSC samples are already
++	 * in device coordinates. Placement must not change their axes. */
+ 	memset(priv->mount_matrix, 0, sizeof(priv->mount_matrix));
+ 	priv->mount_matrix[0][0] = 1.0;
+ 	priv->mount_matrix[1][1] = 1.0;
+--- a/src/libssc-sensor-accelerometer.c
++++ b/src/libssc-sensor-accelerometer.c
+@@ -67,7 +67,6 @@
+ 	SignalContext *ctx = NULL;
+ 	guint64 sensor_uid_low;
+ 	guint64 sensor_uid_high;
+-	gfloat (*mount_matrix)[3];
+ 	gfloat x;
+ 	gfloat y;
+ 	gfloat z;
+@@ -75,7 +74,6 @@
+ 	g_object_get (sensor,
+ 		      SSC_SENSOR_UID_HIGH, &sensor_uid_high,
+ 		      SSC_SENSOR_UID_LOW, &sensor_uid_low,
+-		      SSC_SENSOR_MOUNT_MATRIX, &mount_matrix,
+ 		      NULL);
+ 
+ 	if (sensor_uid_high == uid_high && sensor_uid_low == uid_low && msg_id == SSC_MSG_REPORT_MEASUREMENT) {
+@@ -95,10 +93,12 @@
+ 			ctx = g_slice_new0 (SignalContext);
+ 			ctx->sensor = sensor;
+ 
+-			/* Apply mount matrix specified in https://www.kernel.org/doc/Documentation/devicetree/bindings/iio/mount-matrix.txt */
+-			ctx->x = mount_matrix[0][0] * x + mount_matrix[0][1] * y + mount_matrix[0][2] * z;
+-			ctx->y = mount_matrix[1][0] * x + mount_matrix[1][1] * y + mount_matrix[1][2] * z;
+-			ctx->z = mount_matrix[2][0] * x + mount_matrix[2][1] * y + mount_matrix[2][2] * z;
++			/* sns_accel.proto specifies calibrated Android device coordinates.
++			 * SNS_STD_SENSOR_ATTRID_PLACEMENT is descriptive metadata; applying
++			 * it here rotates the samples a second time. */
++			ctx->x = x;
++			ctx->y = y;
++			ctx->z = z;
+ 
+ 			g_idle_add_full (G_PRIORITY_DEFAULT_IDLE, emit_signal, ctx, (GDestroyNotify)signal_context_free);
+ 		}
+--- a/src/libssc-common-private.h
++++ b/src/libssc-common-private.h
+@@ -61,7 +61,7 @@
+ #define SSC_ATTRIBUTE_DYNAMIC				17
+ #define SSC_ATTRIBUTE_HARDWARE_ID			18
+ #define SSC_ATTRIBUTE_RIGID_BODY			19
+-#define SSC_ATTRIBUTE_MOUNT_MATRIX			20
++#define SSC_ATTRIBUTE_PLACEMENT			20
+ #define SSC_ATTRIBUTE_PHYSICAL_SENSOR			21
+ #define SSC_ATTRIBUTE_PHYSICAL_SENSOR_TESTS		22
+ #define SSC_ATTRIBUTE_SELECTED_RESULTION		23
+--- a/docs/Qualcomm-Sensorcore-Docs.md
++++ b/docs/Qualcomm-Sensorcore-Docs.md
+@@ -1289,7 +1289,11 @@
+ ```
+ 
+ 
+-### Mount matrix
+-
+-Sensor attribute (ID=20) specifies the mount matrix of the sensor. This matches the `platform` key in the JSON configuration files which are stored in the device firmware packages.
+-This matrix is a 3x4 matrix of which we use only the first 3 columns (3x3). Once specified, libssc can apply the mount matrix immediately.
++### Sensor placement
++
++Attribute 20 (SNS_STD_SENSOR_ATTRID_PLACEMENT) describes the sensor element's
++location and orientation in the device frame. It is not an additional transform
++for accelerometer events: sns_accel.proto specifies that those events already
++use calibrated Android device coordinates. Applying placement to the events
++would change their coordinate frame again. The legacy mount-matrix property
++remains identity for API compatibility.

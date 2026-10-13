@@ -11,7 +11,7 @@
         androidDevices.usbSerial = "my-polaris-01";
         androidDevices.persistentImage.rootfs.label = "NIXOS";
         # Optional exact per-phone checks; see the device's first-install guide.
-        # Optional: hardware.polaris.storageRolesFile = ./storage-roles.sh;
+        # Optional measured roles: hardware.polaris.storageRoles.root.partuuid = "...";
         system.stateVersion = "26.05";
       };
       phone = androidDevices.lib.mkSystem {

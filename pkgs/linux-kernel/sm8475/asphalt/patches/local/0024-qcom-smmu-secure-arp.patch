@@ -1,0 +1,534 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 3 Oct 2026 17:20:00 +0800
+Subject: [PATCH] iommu: arm-smmu-qcom: share SM8450 ARP page tables with firmware
+
+Use shared HLOS/CP_NON_PIXEL page ownership for the SM8450 ARP context's
+stage-one page tables. Other clients retain the existing allocation path.
+Secure VMID denotes SCM ownership, not the SMMU stage-two VMID field.
+
+Keep up to 64 table allocations until the context is confirmed quiescent;
+normal 4K unmaps retain linked tables for reuse. SCM calls may sleep, so table
+free callbacks cannot revoke ownership. Fail closed and retain protected RAM
+and live context-bank state when permission, PM or TLB completion is uncertain.
+
+Architectural reference (independently implemented, not a patch import):
+https://lists.infradead.org/pipermail/linux-arm-kernel/2023-November/878727.html
+
+diff --git a/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c b/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c
+--- a/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c
++++ b/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c
+@@ -6,6 +6,9 @@
+ #include <linux/acpi.h>
+ #include <linux/adreno-smmu-priv.h>
+ #include <linux/delay.h>
++#include <linux/mm.h>
++#include <linux/slab.h>
++#include <dt-bindings/firmware/qcom,scm.h>
+ #include <linux/of_device.h>
+ #include <linux/firmware/qcom/qcom_scm.h>
+ #include <linux/platform_device.h>
+@@ -33,6 +36,8 @@
+ #define GFX_ACTLR_PRR          (1 << 5)
+ 
+ static const struct of_device_id qcom_smmu_actlr_client_of_match[] = {
++	{ .compatible = "qcom,sm8450-iris-secure-arp",
++		.data = (const void *)(PREFETCH_SHALLOW | CPRE | CMTLB) },
+ 	{ .compatible = "qcom,adreno",
+ 			.data = (const void *) (PREFETCH_DEEP | CPRE | CMTLB) },
+ 	{ .compatible = "qcom,adreno-gmu",
+@@ -430,6 +435,115 @@
+ 	{ }
+ };
+ 
++
++/*
++ * Secure video streams use ordinary S1 translations, but the hypervisor must
++ * also grant CP_NON_PIXEL read access to their page tables. Retain all table
++ * allocations until the context is disabled: io-pgtable free can be atomic,
++ * while SCM ownership changes may sleep. Bound retention per domain.
++ */
++#define QCOM_SECURE_PT_MAX 64
++struct qcom_secure_pt {
++	struct list_head list;
++	void *pages;
++	size_t size;
++	u64 owners;
++};
++static bool qcom_secure_pt_disabled;
++static LIST_HEAD(qcom_secure_pt_quarantine);
++static DEFINE_SPINLOCK(qcom_secure_pt_quarantine_lock);
++
++static void qcom_secure_pt_quarantine_add(struct qcom_secure_pt *pt)
++{
++	unsigned long flags;
++	phys_addr_t phys = virt_to_phys(pt->pages);
++
++	WRITE_ONCE(qcom_secure_pt_disabled, true);
++	pr_err("arm-smmu: retaining protected table %pa size %zu owners %#llx\n",
++	       &phys, pt->size, pt->owners);
++	spin_lock_irqsave(&qcom_secure_pt_quarantine_lock, flags);
++	list_add_tail(&pt->list, &qcom_secure_pt_quarantine);
++	spin_unlock_irqrestore(&qcom_secure_pt_quarantine_lock, flags);
++}
++
++static void *qcom_secure_pt_alloc(void *cookie, size_t size, gfp_t gfp)
++{
++	struct arm_smmu_domain *domain = cookie;
++	struct qcom_scm_vmperm perms[] = {
++		{ QCOM_SCM_VMID_HLOS, QCOM_SCM_PERM_RW },
++		{ domain->secure_vmid, QCOM_SCM_PERM_READ },
++	};
++	struct qcom_secure_pt *pt;
++	unsigned long flags;
++	int ret;
++
++	/* The private ARP domain maps from process context with GFP_KERNEL. */
++	if (READ_ONCE(qcom_secure_pt_disabled) || READ_ONCE(domain->secure_faulted) ||
++	    !gfpflags_allow_blocking(gfp))
++		return NULL;
++	spin_lock_irqsave(&domain->secure_pt_lock, flags);
++	if (domain->secure_pt_count == QCOM_SECURE_PT_MAX) {
++		spin_unlock_irqrestore(&domain->secure_pt_lock, flags);
++		return NULL;
++	}
++	domain->secure_pt_count++;
++	spin_unlock_irqrestore(&domain->secure_pt_lock, flags);
++	pt = kzalloc(sizeof(*pt), gfp);
++	if (!pt)
++		goto uncount;
++	pt->size = PAGE_ALIGN(size);
++	pt->pages = alloc_pages_exact(pt->size, gfp | __GFP_ZERO);
++	if (!pt->pages) {
++		kfree(pt);
++		goto uncount;
++	}
++	pt->owners = BIT_ULL(QCOM_SCM_VMID_HLOS);
++	ret = qcom_scm_assign_mem(virt_to_phys(pt->pages), pt->size,
++				  &pt->owners, perms, ARRAY_SIZE(perms));
++	if (ret) {
++		/* A failed permission transition must not return pages to buddy. */
++		WRITE_ONCE(domain->secure_faulted, true);
++		qcom_secure_pt_quarantine_add(pt);
++		return NULL;
++	}
++	spin_lock_irqsave(&domain->secure_pt_lock, flags);
++	list_add_tail(&pt->list, &domain->secure_pt_pages);
++	spin_unlock_irqrestore(&domain->secure_pt_lock, flags);
++	return pt->pages;
++uncount:
++	spin_lock_irqsave(&domain->secure_pt_lock, flags);
++	domain->secure_pt_count--;
++	spin_unlock_irqrestore(&domain->secure_pt_lock, flags);
++	return NULL;
++}
++
++static void qcom_secure_pt_free(void *cookie, void *pages, size_t size)
++{
++	/* Retired tables remain owned by the domain until destroy_context. */
++}
++
++static void qcom_smmu_destroy_context(struct arm_smmu_domain *domain)
++{
++	struct qcom_scm_vmperm hlos = { QCOM_SCM_VMID_HLOS, QCOM_SCM_PERM_RWX };
++	struct qcom_secure_pt *pt, *next;
++
++	if (!domain->secure_vmid)
++		return;
++	/* Called only after CB disable/page-table teardown or failed setup. */
++	list_for_each_entry_safe(pt, next, &domain->secure_pt_pages, list) {
++		list_del(&pt->list);
++		if (qcom_scm_assign_mem(virt_to_phys(pt->pages), pt->size,
++					&pt->owners, &hlos, 1)) {
++			qcom_secure_pt_quarantine_add(pt);
++			continue;
++		}
++		free_pages_exact(pt->pages, pt->size);
++		kfree(pt);
++	}
++	domain->secure_vmid = 0;
++	domain->secure_pt_count = 0;
++}
++
+ static int qcom_smmu_init_context(struct arm_smmu_domain *smmu_domain,
+ 		struct io_pgtable_cfg *pgtbl_cfg, struct device *dev)
+ {
+@@ -445,6 +559,23 @@
+ 	if (client_match)
+ 		qcom_smmu_set_actlr_dev(dev, smmu, cbndx, client_match);
+ 
++	if (of_device_is_compatible(dev->of_node, "qcom,sm8450-iris-secure-arp")) {
++		u32 vmid;
++
++		if (of_property_read_u32(dev->of_node, "qcom,iommu-vmid", &vmid) ||
++		    vmid != QCOM_SCM_VMID_CP_NON_PIXEL ||
++		    smmu_domain->stage != ARM_SMMU_DOMAIN_S1)
++			return -EINVAL;
++		if (READ_ONCE(qcom_secure_pt_disabled))
++			return -EIO;
++		if (!qcom_scm_is_available())
++			return -EPROBE_DEFER;
++		INIT_LIST_HEAD(&smmu_domain->secure_pt_pages);
++		spin_lock_init(&smmu_domain->secure_pt_lock);
++		smmu_domain->secure_vmid = vmid;
++		pgtbl_cfg->alloc = qcom_secure_pt_alloc;
++		pgtbl_cfg->free = qcom_secure_pt_free;
++	}
+ 	return 0;
+ }
+ 
+@@ -610,6 +741,7 @@
+ 
+ static const struct arm_smmu_impl qcom_smmu_v2_impl = {
+ 	.init_context = qcom_smmu_init_context,
++	.destroy_context = qcom_smmu_destroy_context,
+ 	.cfg_probe = qcom_smmu_cfg_probe,
+ 	.def_domain_type = qcom_smmu_def_domain_type,
+ 	.write_s2cr = qcom_smmu_write_s2cr,
+@@ -618,6 +750,7 @@
+ 
+ static const struct arm_smmu_impl qcom_smmu_500_impl = {
+ 	.init_context = qcom_smmu_init_context,
++	.destroy_context = qcom_smmu_destroy_context,
+ 	.cfg_probe = qcom_smmu_cfg_probe,
+ 	.def_domain_type = qcom_smmu_def_domain_type,
+ 	.reset = arm_mmu500_reset,
+@@ -631,6 +764,7 @@
+ 
+ static const struct arm_smmu_impl sdm845_smmu_500_impl = {
+ 	.init_context = qcom_smmu_init_context,
++	.destroy_context = qcom_smmu_destroy_context,
+ 	.cfg_probe = qcom_smmu_cfg_probe,
+ 	.def_domain_type = qcom_smmu_def_domain_type,
+ 	.reset = qcom_sdm845_smmu500_reset,
+diff --git a/drivers/iommu/arm/arm-smmu/arm-smmu.c b/drivers/iommu/arm/arm-smmu/arm-smmu.c
+--- a/drivers/iommu/arm/arm-smmu/arm-smmu.c
++++ b/drivers/iommu/arm/arm-smmu/arm-smmu.c
+@@ -17,6 +17,7 @@
+ 
+ #define pr_fmt(fmt) "arm-smmu: " fmt
+ 
++#include <linux/soc/qcom/secure-iommu.h>
+ #include <linux/acpi.h>
+ #include <linux/acpi_iort.h>
+ #include <linux/bitfield.h>
+@@ -251,6 +252,10 @@
+ 	spin_lock_irqsave(&smmu_domain->cb_lock, flags);
+ 	__arm_smmu_tlb_sync(smmu, ARM_SMMU_CB(smmu, smmu_domain->cfg.cbndx),
+ 			    ARM_SMMU_CB_TLBSYNC, ARM_SMMU_CB_TLBSTATUS);
++	if (smmu_domain->secure_vmid &&
++	    (arm_smmu_cb_read(smmu, smmu_domain->cfg.cbndx, ARM_SMMU_CB_TLBSTATUS) &
++	     ARM_SMMU_sTLBGSTATUS_GSACTIVE))
++		WRITE_ONCE(smmu_domain->secure_faulted, true);
+ 	spin_unlock_irqrestore(&smmu_domain->cb_lock, flags);
+ }
+ 
+@@ -412,10 +417,20 @@
+ void arm_smmu_read_context_fault_info(struct arm_smmu_device *smmu, int idx,
+ 				      struct arm_smmu_context_fault_info *cfi)
+ {
++	struct arm_smmu_cfg *cfg;
++
+ 	cfi->iova = arm_smmu_cb_readq(smmu, idx, ARM_SMMU_CB_FAR);
+ 	cfi->fsr = arm_smmu_cb_read(smmu, idx, ARM_SMMU_CB_FSR);
+ 	cfi->fsynr = arm_smmu_cb_read(smmu, idx, ARM_SMMU_CB_FSYNR0);
+ 	cfi->cbfrsynra = arm_smmu_gr1_read(smmu, ARM_SMMU_GR1_CBFRSYNRA(idx));
++	cfg = READ_ONCE(smmu->cbs[idx].cfg);
++	if ((cfi->fsr & ARM_SMMU_CB_FSR_FAULT) && cfg) {
++		struct arm_smmu_domain *domain = container_of(cfg,
++							struct arm_smmu_domain, cfg);
++
++		if (domain->secure_vmid)
++			WRITE_ONCE(domain->secure_faulted, true);
++	}
+ }
+ 
+ void arm_smmu_print_context_fault_info(struct arm_smmu_device *smmu, int idx,
+@@ -875,6 +890,8 @@
+ 	return 0;
+ 
+ out_clear_smmu:
++	if (smmu->impl && smmu->impl->destroy_context)
++		smmu->impl->destroy_context(smmu_domain);
+ 	__arm_smmu_free_bitmap(smmu->context_map, cfg->cbndx);
+ 	smmu_domain->smmu = NULL;
+ out_unlock:
+@@ -882,18 +899,21 @@
+ 	return ret;
+ }
+ 
+-static void arm_smmu_destroy_domain_context(struct arm_smmu_domain *smmu_domain)
++static bool arm_smmu_destroy_domain_context(struct arm_smmu_domain *smmu_domain)
+ {
+ 	struct arm_smmu_device *smmu = smmu_domain->smmu;
+ 	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
+ 	int ret, irq;
+ 
+ 	if (!smmu)
+-		return;
++		return true;
+ 
+ 	ret = arm_smmu_rpm_get(smmu);
+-	if (ret < 0)
+-		return;
++	if (ret < 0) {
++		if (smmu_domain->secure_vmid)
++			dev_err(smmu->dev, "retaining secure domain after PM failure\n");
++		return !smmu_domain->secure_vmid;
++	}
+ 
+ 	/*
+ 	 * Disable the context bank and free the page tables before freeing
+@@ -901,6 +921,16 @@
+ 	 */
+ 	smmu->cbs[cfg->cbndx].cfg = NULL;
+ 	arm_smmu_write_context_bank(smmu, cfg->cbndx);
++	if (smmu_domain->secure_vmid) {
++		arm_smmu_tlb_inv_context_s1(smmu_domain);
++		if (READ_ONCE(smmu_domain->secure_faulted) ||
++		    (arm_smmu_cb_read(smmu, cfg->cbndx, ARM_SMMU_CB_SCTLR) &
++		     ARM_SMMU_SCTLR_M)) {
++			dev_err(smmu->dev, "retaining uncertain secure context and IRQ cookie\n");
++			arm_smmu_rpm_put(smmu);
++			return false;
++		}
++	}
+ 
+ 	if (cfg->irptndx != ARM_SMMU_INVALID_IRPTNDX) {
+ 		irq = smmu->irqs[cfg->irptndx];
+@@ -908,9 +938,18 @@
+ 	}
+ 
+ 	free_io_pgtable_ops(smmu_domain->pgtbl_ops);
++	smmu_domain->pgtbl_ops = NULL;
++	if (smmu_domain->secure_vmid && READ_ONCE(smmu_domain->secure_faulted)) {
++		dev_err(smmu->dev, "retaining protected tables after final TLB failure\n");
++		arm_smmu_rpm_put(smmu);
++		return false;
++	}
++	if (smmu->impl && smmu->impl->destroy_context)
++		smmu->impl->destroy_context(smmu_domain);
+ 	__arm_smmu_free_bitmap(smmu->context_map, cfg->cbndx);
+ 
+ 	arm_smmu_rpm_put(smmu);
++	return true;
+ }
+ 
+ static struct iommu_domain *arm_smmu_domain_alloc_paging(struct device *dev)
+@@ -935,6 +974,9 @@
+ 	return &smmu_domain->domain;
+ }
+ 
++static LIST_HEAD(arm_smmu_secure_quarantine);
++static DEFINE_MUTEX(arm_smmu_secure_quarantine_lock);
++
+ static void arm_smmu_domain_free(struct iommu_domain *domain)
+ {
+ 	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
+@@ -943,8 +985,14 @@
+ 	 * Free the domain resources. We assume that all devices have
+ 	 * already been detached.
+ 	 */
+-	arm_smmu_destroy_domain_context(smmu_domain);
+-	kfree(smmu_domain);
++	if (arm_smmu_destroy_domain_context(smmu_domain)) {
++		kfree(smmu_domain);
++	} else {
++		mutex_lock(&arm_smmu_secure_quarantine_lock);
++		list_add_tail(&smmu_domain->secure_quarantine,
++			      &arm_smmu_secure_quarantine);
++		mutex_unlock(&arm_smmu_secure_quarantine_lock);
++	}
+ }
+ 
+ static void arm_smmu_write_smr(struct arm_smmu_device *smmu, int idx)
+@@ -1162,6 +1210,18 @@
+ 	}
+ }
+ 
++static void arm_smmu_poison_secure_domain(struct iommu_domain *domain)
++{
++	struct arm_smmu_domain *smmu_domain;
++
++	if (!domain || domain->owner != &arm_smmu_ops ||
++	    !(domain->type & __IOMMU_DOMAIN_PAGING))
++		return;
++	smmu_domain = to_smmu_domain(domain);
++	if (smmu_domain->secure_vmid)
++		WRITE_ONCE(smmu_domain->secure_faulted, true);
++}
++
+ static int arm_smmu_attach_dev(struct iommu_domain *domain, struct device *dev,
+ 			       struct iommu_domain *old)
+ {
+@@ -1185,8 +1245,10 @@
+ 	smmu = cfg->smmu;
+ 
+ 	ret = arm_smmu_rpm_get(smmu);
+-	if (ret < 0)
++	if (ret < 0) {
++		arm_smmu_poison_secure_domain(old);
+ 		return ret;
++	}
+ 
+ 	/* Ensure that the domain is finalised */
+ 	ret = arm_smmu_init_domain_context(smmu_domain, smmu, dev);
+@@ -1235,7 +1297,11 @@
+ 					struct device *dev,
+ 					struct iommu_domain *old)
+ {
+-	return arm_smmu_attach_dev_type(dev, S2CR_TYPE_BYPASS);
++	int ret = arm_smmu_attach_dev_type(dev, S2CR_TYPE_BYPASS);
++
++	if (ret)
++		arm_smmu_poison_secure_domain(old);
++	return ret;
+ }
+ 
+ static const struct iommu_domain_ops arm_smmu_identity_ops = {
+@@ -1251,7 +1317,11 @@
+ 				       struct device *dev,
+ 				       struct iommu_domain *old)
+ {
+-	return arm_smmu_attach_dev_type(dev, S2CR_TYPE_FAULT);
++	int ret = arm_smmu_attach_dev_type(dev, S2CR_TYPE_FAULT);
++
++	if (ret)
++		arm_smmu_poison_secure_domain(old);
++	return ret;
+ }
+ 
+ static const struct iommu_domain_ops arm_smmu_blocked_ops = {
+@@ -1267,6 +1337,7 @@
+ 			      phys_addr_t paddr, size_t pgsize, size_t pgcount,
+ 			      int prot, gfp_t gfp, size_t *mapped)
+ {
++	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
+ 	struct io_pgtable_ops *ops = to_smmu_domain(domain)->pgtbl_ops;
+ 	struct arm_smmu_device *smmu = to_smmu_domain(domain)->smmu;
+ 	int ret;
+@@ -1274,7 +1345,12 @@
+ 	if (!ops)
+ 		return -ENODEV;
+ 
+-	arm_smmu_rpm_get(smmu);
++	if (smmu_domain->secure_vmid && READ_ONCE(smmu_domain->secure_faulted))
++		return -EIO;
++	if (arm_smmu_rpm_get(smmu) < 0 && smmu_domain->secure_vmid) {
++		WRITE_ONCE(smmu_domain->secure_faulted, true);
++		return -EIO;
++	}
+ 	ret = ops->map_pages(ops, iova, paddr, pgsize, pgcount, prot, gfp, mapped);
+ 	arm_smmu_rpm_put(smmu);
+ 
+@@ -1285,6 +1361,7 @@
+ 				   size_t pgsize, size_t pgcount,
+ 				   struct iommu_iotlb_gather *iotlb_gather)
+ {
++	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
+ 	struct io_pgtable_ops *ops = to_smmu_domain(domain)->pgtbl_ops;
+ 	struct arm_smmu_device *smmu = to_smmu_domain(domain)->smmu;
+ 	size_t ret;
+@@ -1292,7 +1369,12 @@
+ 	if (!ops)
+ 		return 0;
+ 
+-	arm_smmu_rpm_get(smmu);
++	if (smmu_domain->secure_vmid && READ_ONCE(smmu_domain->secure_faulted))
++		return 0;
++	if (arm_smmu_rpm_get(smmu) < 0 && smmu_domain->secure_vmid) {
++		WRITE_ONCE(smmu_domain->secure_faulted, true);
++		return 0;
++	}
+ 	ret = ops->unmap_pages(ops, iova, pgsize, pgcount, iotlb_gather);
+ 	arm_smmu_rpm_put(smmu);
+ 
+@@ -1305,7 +1387,12 @@
+ 	struct arm_smmu_device *smmu = smmu_domain->smmu;
+ 
+ 	if (smmu_domain->flush_ops) {
+-		arm_smmu_rpm_get(smmu);
++		if (smmu_domain->secure_vmid && READ_ONCE(smmu_domain->secure_faulted))
++			return;
++		if (arm_smmu_rpm_get(smmu) < 0 && smmu_domain->secure_vmid) {
++			WRITE_ONCE(smmu_domain->secure_faulted, true);
++			return;
++		}
+ 		smmu_domain->flush_ops->tlb_flush_all(smmu_domain);
+ 		arm_smmu_rpm_put(smmu);
+ 	}
+@@ -1320,7 +1407,12 @@
+ 	if (!smmu)
+ 		return;
+ 
+-	arm_smmu_rpm_get(smmu);
++	if (smmu_domain->secure_vmid && READ_ONCE(smmu_domain->secure_faulted))
++		return;
++	if (arm_smmu_rpm_get(smmu) < 0 && smmu_domain->secure_vmid) {
++		WRITE_ONCE(smmu_domain->secure_faulted, true);
++		return;
++	}
+ 	if (smmu->version == ARM_SMMU_V2 ||
+ 	    smmu_domain->stage == ARM_SMMU_DOMAIN_S1)
+ 		arm_smmu_tlb_sync_context(smmu_domain);
+@@ -1328,6 +1420,17 @@
+ 		arm_smmu_tlb_sync_global(smmu);
+ 	arm_smmu_rpm_put(smmu);
+ }
++
++bool qcom_smmu_secure_domain_healthy(struct iommu_domain *domain)
++{
++	struct arm_smmu_domain *smmu_domain;
++
++	if (!domain || domain->owner != &arm_smmu_ops)
++		return false;
++	smmu_domain = to_smmu_domain(domain);
++	return smmu_domain->secure_vmid && !READ_ONCE(smmu_domain->secure_faulted);
++}
++EXPORT_SYMBOL_GPL(qcom_smmu_secure_domain_healthy);
+ 
+ static phys_addr_t arm_smmu_iova_to_phys_hard(struct iommu_domain *domain,
+ 					      dma_addr_t iova)
+diff --git a/drivers/iommu/arm/arm-smmu/arm-smmu.h b/drivers/iommu/arm/arm-smmu/arm-smmu.h
+--- a/drivers/iommu/arm/arm-smmu/arm-smmu.h
++++ b/drivers/iommu/arm/arm-smmu/arm-smmu.h
+@@ -376,6 +376,12 @@
+ };
+ 
+ struct arm_smmu_domain {
++	u32 secure_vmid;
++	bool secure_faulted;
++	unsigned int secure_pt_count;
++	spinlock_t secure_pt_lock;
++	struct list_head secure_pt_pages;
++	struct list_head secure_quarantine;
+ 	struct arm_smmu_device		*smmu;
+ 	struct io_pgtable_ops		*pgtbl_ops;
+ 	unsigned long			pgtbl_quirks;
+@@ -433,6 +439,7 @@
+ 
+ /* Implementation details, yay! */
+ struct arm_smmu_impl {
++	void (*destroy_context)(struct arm_smmu_domain *smmu_domain);
+ 	u32 (*read_reg)(struct arm_smmu_device *smmu, int page, int offset);
+ 	void (*write_reg)(struct arm_smmu_device *smmu, int page, int offset,
+ 			  u32 val);
+diff --git a/include/linux/soc/qcom/secure-iommu.h b/include/linux/soc/qcom/secure-iommu.h
+new file mode 100644
+--- /dev/null
++++ b/include/linux/soc/qcom/secure-iommu.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef QCOM_SECURE_IOMMU_H
++#define QCOM_SECURE_IOMMU_H
++#include <linux/kconfig.h>
++#include <linux/types.h>
++struct iommu_domain;
++#if IS_REACHABLE(CONFIG_ARM_SMMU)
++bool qcom_smmu_secure_domain_healthy(struct iommu_domain *domain);
++#else
++static inline bool qcom_smmu_secure_domain_healthy(struct iommu_domain *domain)
++{
++	return false;
++}
++#endif
++#endif

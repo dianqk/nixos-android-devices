@@ -1,0 +1,32 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 11 Oct 2026 23:00:00 +0800
+Subject: [PATCH] arm64: dts: qcom: sm8550-xiaomi-sheng: disable unsupported QCE
+
+Linux 7.3 marks CRYPTO_DEV_QCE as BROKEN: the driver cannot arbitrate
+access with the secure world and is slower than the CPU. No driver binds
+the SoC crypto node, yet it defaults to enabled and is an interconnect
+consumer, so fw_devlink keeps the aggre2_noc/mc_virt interconnect
+providers sync_state() pending for the whole boot and their boot-time
+bandwidth floors are never dropped. Disable this Linux consumer on the
+board; leave the remote-controlled BAM and secure-world ownership
+untouched. CPU crypto remains available. Do not override BROKEN.
+
+This mirrors the Xiaomi Aurora (SM8650) board change.
+
+Reference: https://github.com/torvalds/linux/blob/v7.3-rc6/drivers/crypto/Kconfig
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+--- a/arch/arm64/boot/dts/qcom/sm8550-xiaomi-sheng.dts
++++ b/arch/arm64/boot/dts/qcom/sm8550-xiaomi-sheng.dts
+@@ -995,6 +995,10 @@
+ 
+ &gpi_dma2 {
+ 	status = "okay";
++};
++
++&crypto {
++	status = "disabled";
+ };
+ 
+ &gpu {

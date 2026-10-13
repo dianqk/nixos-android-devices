@@ -54,21 +54,13 @@ Nixpkgs。普通上游包不变；交叉工具链及库依赖仍可能需要单�
 
 设备内核包可直接使用
 `devicePackages.devices.<device>.kernel`，设备模块也将其作为默认值。
-Sheng 默认使用固定版本 7.2.6，`kernel-mainline` 是它的别名；7.3-rc5 移植版仍以
-`kernel-testing` 提供。Clover 默认使用 7.3，另有固定版本 7.2.3 的
-`kernel-mainline` 回退包。要在单独的 Sheng 系统配置中测试 7.3，可显式选用：
+Sheng 仅提供基于 Nixpkgs 的 `devices.sheng.kernel`，`nixosModules.sheng` 默认选用它。
+迁移：已移除的 `devices.sheng.kernel-mainline` 和 `devices.sheng.kernel-testing`
+由 `devices.sheng.kernel` 取代。
 
-```nix
-# 放在 flake 的 modules 列表内，外层已定义 inputs：
-({ lib, pkgs, ... }: {
-  androidDevices.kernelPackage = lib.mkForce (
-    inputs.androidDevices.lib.mkPackageSet { inherit pkgs; }
-  ).devices.sheng.kernel-testing;
-})
-```
-
-Clover 的 7.2.3 回退包为 `devices.clover.kernel-mainline`。Recovery 可在自己的
-系统配置中独立选择内核。
+每款设备只有一个基于 Nixpkgs 所提供版本的内核；recovery 与已安装系统使用同一内核。
+同一构建平台（`x86_64-linux` 交叉、`aarch64-linux` 原生）内，system、recovery 和 kernel
+输出共用同一内核 derivation。
 包集合还提供 `mkKernel`、`mkUBoot`、
 `mkAndroidBootImage`、`mkRootfsImage` 和 `mkRecoveryScreen` 等工厂函数。
 flake 的 `packages` 只选择可构建的 derivation，不直接导出包含函数的整个 scope。
@@ -98,9 +90,8 @@ flake 的 `packages` 只选择可构建的 derivation，不直接导出包含函
 包定义及其依赖关系放在 `pkgs/`；NixOS 模块负责配置、服务顺序和运行策略。
 包通过 `callPackage` 接收依赖，不另行导入 Nixpkgs。
 
-各板包定义位于 `pkgs/asphalt`、`pkgs/polaris`、`pkgs/sheng` 和 `pkgs/clover`。
-固件、ALSA UCM、无线服务适配、recovery 工具和 Sheng 可选服务均由同一 scope 提供。
-recovery 工厂从模块接收存储标识和主机名参数，求值或服务启动时不会自动操作存储。
+各板包定义位于 `pkgs/asphalt`、`pkgs/polaris`、`pkgs/sheng`、`pkgs/aurora` 和 `pkgs/clover`。
+固件、ALSA UCM、无线服务适配和 Sheng 可选服务均由同一 scope 提供。
 
 Sheng 的 `hardware.sheng.{thp,pen-status}` 选项提供 `package`。
 指纹使用普通的 `services.fprintd.enable = true`；Sheng 模块默认将
@@ -110,12 +101,12 @@ Sheng 的 `hardware.sheng.{thp,pen-status}` 选项提供 `package`。
 运行路径；PAM 由 NixOS 管理，login、greetd 和 keyring 策略由消费者自行配置。
 底层 QTEE/TA 包可通过 scope override 替换。
 `hardware.sheng.sensors` 提供 `fastrpcPackage`、`registryPackage`、
-`qrtrPackage` 和 `devauthPackage`；Polaris radio 提供 `rmtfsPackage` 和
-`tqftpservPackage`。固件等共享包可通过 scope override 替换，无需复制模块。
+`qrtrPackage` 和 `devauthPackage`；共享基带模块提供
+`androidDevices.modem.{rmtfsPackage,tqftpservPackage}`（Polaris 与 Aurora）。固件等共享包可通过 scope override 替换，无需复制模块。
 
 ## 设备命名空间
 
-`asphalt`、`polaris`、`sheng`、`clover` 是作为稳定标识的设备代号，
+`asphalt`、`polaris`、`sheng`、`aurora`、`clover` 是作为稳定标识的设备代号，
 不是处理器名称或产物类型：
 
 | 代号 | 设备 |
@@ -123,6 +114,7 @@ Sheng 的 `hardware.sheng.{thp,pen-status}` 选项提供 `package`。
 | `asphalt` | 联想 Y700 2023 |
 | `polaris` | 小米 MIX 2S |
 | `sheng` | 小米平板 6S Pro |
+| `aurora` | 小米 14 Ultra |
 | `clover` | 小米平板 4 LTE（当前支持的变体） |
 
 设备专用包使用 `devicePackages.devices.<代号>`，例如
@@ -156,3 +148,17 @@ flake 引用写作
 根据 [Nix flake 输出规则](https://nix.dev/manual/nix/stable/command-ref/new-cli/nix3-flake-check.html)，
 `packages.<system>.<name>` 必须直接是 derivation，嵌套设备产物放在 `legacyPackages`；
 通用工具仍从 `packages` 导出，两者均可通过 `nix build .#<属性路径>` 构建。
+
+## VA-API
+
+`androidDevices.video.vaapi.enable` / `androidDevices.video.vaapi.package`:
+[configuration](video.md#optional-va-api-driver) · [中文](video.zh.md).
+The `libva-v4l2` package deliberately follows native target `pkgs` in the mobile
+build environment, retaining graphics-library cache reuse on both build hosts.
+
+## QTEE
+
+`androidDevices.qtee.supplicant.package` / `androidDevices.qtee.modemOpener.package`：
+[基带与 QTEE 服务](modem.zh.md)。
+`qcbor`、`qcomtee`、`mink-idl-compiler`、`minkipc` 和 `mink-modem-opener` 与其他上游系统软件一样使用原生目标 `pkgs`；`mink-idl-compiler` 是构建时的头文件生成器。
+`qmi-framework` 提供 QMI 客户端/服务库。`qwesd`（Qualcomm 预编译守护进程，非自由软件，`androidDevices.qtee.qwesd.package`）在包作用域中，但不作为 flake 包导出。

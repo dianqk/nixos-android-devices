@@ -1,0 +1,869 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 7 Oct 2026 14:30:00 +0800
+Subject: [PATCH] input: add Aurora S3910P raw transport and board wiring
+
+Adapt Yoni Yang's Houji SPI transport to Aurora's PM8010 supply and
+Android 14 controller identity. Expose raw sensor frames for the pinned
+userspace host processor; do not create a second native input device.
+Quiesce IRQ/recovery before removal and invalidate sessions on suspend.
+
+Original author: Yoni Yang <yoni980807@gmail.com>
+Source: https://github.com/yoni13/armada-houji/blob/5d6156dbb0ce23d0156040219be38bbc28aa15c8/ports/houji/touch/houji-tcm-probe.c
+Original dates/messages and local changes: pkgs/aurora/touch/ORIGINS.md
+---
+diff --git a/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts b/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
+index 5360a74ce..1d388e931 100644
+--- a/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
++++ b/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
+@@ -529,3 +529,57 @@ wlan_en: wlan-en-state {
+ 		bias-pull-down;
+ 	};
+ };
++
++/* Synaptics S3910P: stock Aurora OS1.0.3.0 Android 14 wiring. */
++&apps_rsc {
++	regulators-0 {
++		vreg_l12b_touch: ldo12 {
++			regulator-name = "vreg_l12b_touch";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++	regulators-6 {
++		compatible = "qcom,pm8010-rpmh-regulators";
++		qcom,pmic-id = "m";
++		vreg_l7m_touch: ldo7 {
++			regulator-name = "vreg_l7m_touch";
++			regulator-min-microvolt = <2960000>;
++			regulator-max-microvolt = <2960000>;
++		};
++	};
++};
++
++&qupv3_id_0 { status = "okay"; };
++&gpi_dma1 { status = "okay"; };
++&spi4 {
++	status = "okay";
++	touchscreen@0 {
++		compatible = "synaptics,s3910p-aurora";
++		reg = <0>;
++		spi-max-frequency = <15000000>;
++		avdd-supply = <&vreg_l7m_touch>;
++		iovdd-supply = <&vreg_l12b_touch>;
++		reset-gpios = <&tlmm 161 GPIO_ACTIVE_LOW>;
++		irq-gpios = <&tlmm 162 GPIO_ACTIVE_LOW>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&touch_reset_default &touch_irq_default>;
++	};
++};
++&qup_spi4_cs { bias-pull-down; /delete-property/ bias-disable; };
++&qup_spi4_data_clk { bias-pull-down; /delete-property/ bias-disable; };
++&tlmm {
++	touch_reset_default: touch-reset-default-state {
++		pins = "gpio161";
++		function = "gpio";
++		bias-disable;
++		output-low;
++	};
++	touch_irq_default: touch-irq-default-state {
++		pins = "gpio162";
++		function = "gpio";
++		bias-disable;
++		input-enable;
++	};
++};
+diff --git a/drivers/input/touchscreen/Kconfig b/drivers/input/touchscreen/Kconfig
+index 9b9ae8ac3..ba16913b3 100644
+--- a/drivers/input/touchscreen/Kconfig
++++ b/drivers/input/touchscreen/Kconfig
+@@ -1414,4 +1414,12 @@ config TOUCHSCREEN_HIMAX_HX83112B
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called himax_hx83112b.
+ 
++config TOUCHSCREEN_AURORA_TCM
++	tristate "Xiaomi 14 Ultra Synaptics raw touch transport"
++	depends on SPI && GPIOLIB
++	help
++	  Raw-frame transport for Aurora's S3910P controller. Coordinates are
++	  calculated by the Aurora userspace touch host processor via uinput.
++
++
+ endif
+diff --git a/drivers/input/touchscreen/Makefile b/drivers/input/touchscreen/Makefile
+index bfd9de833..a40a7e608 100644
+--- a/drivers/input/touchscreen/Makefile
++++ b/drivers/input/touchscreen/Makefile
+@@ -119,3 +119,4 @@ obj-$(CONFIG_TOUCHSCREEN_IQS5XX)	+= iqs5xx.o
+ obj-$(CONFIG_TOUCHSCREEN_IQS7211)	+= iqs7211.o
+ obj-$(CONFIG_TOUCHSCREEN_ZINITIX)	+= zinitix.o
+ obj-$(CONFIG_TOUCHSCREEN_HIMAX_HX83112B)	+= himax_hx83112b.o
++obj-$(CONFIG_TOUCHSCREEN_AURORA_TCM) += aurora-tcm.o
+diff --git a/drivers/input/touchscreen/aurora-tcm.c b/drivers/input/touchscreen/aurora-tcm.c
+new file mode 100644
+index 000000000..bd46ef7bd
+--- /dev/null
++++ b/drivers/input/touchscreen/aurora-tcm.c
+@@ -0,0 +1,762 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Aurora S3910P SPI raw-frame transport. No firmware download or flash commands.
++ * Protocol/wiring reference: lolipuru/kernel_xiaomi_sm8650-modules,
++ * 4a31d6ee77b27c1b93d329de7bf4cbe16e699599, synaptics_tcm2.
++ */
++#include <linux/delay.h>
++#include <linux/debugfs.h>
++#include <linux/ktime.h>
++#include <linux/mutex.h>
++#include <linux/seq_file.h>
++#include <linux/gpio/consumer.h>
++#include <linux/module.h>
++#include <linux/interrupt.h>
++#include <linux/regulator/consumer.h>
++#include <linux/spi/spi.h>
++#include <linux/unaligned.h>
++#include <linux/kfifo.h>
++#include <linux/kref.h>
++#include <linux/miscdevice.h>
++#include <linux/poll.h>
++#include <linux/pm.h>
++#include <linux/sched.h>
++#include <uapi/linux/sched/types.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <linux/workqueue.h>
++
++struct aurora_stream_record {
++	u16 length;
++	u8 bytes[24 + 4096];
++};
++
++struct aurora_tcm_probe {
++	struct spi_device *spi;
++	struct regulator *avdd, *iovdd;
++	struct gpio_desc *reset, *irq;
++	u8 tx[4096], rx[4096];
++	u16 max_x, max_y, max_objects, max_write;
++	unsigned int reports;
++	bool stopping;
++	struct mutex raw_lock;
++	u8 raw[4096];
++	u16 raw_len;
++	u32 raw_sequence;
++	u64 raw_timestamp;
++	struct kref refs;
++	struct miscdevice stream_device;
++	struct dentry *debug;
++	DECLARE_KFIFO_PTR(stream_fifo, struct aurora_stream_record);
++	struct aurora_stream_record producer;
++	wait_queue_head_t stream_wait;
++	bool stream_open, stream_dead;
++	int stream_error;
++	int irq_number;
++	bool irq_priority_set;
++	/* Packet errors reset and reconfigure the controller instead of
++	 * leaving the stream stopped until the next boot. */
++	struct delayed_work recover_work;
++	unsigned long recovering;
++	unsigned int recover_attempts, recoveries;
++};
++
++struct aurora_stream_reader {
++	struct aurora_tcm_probe *touch;
++	struct mutex read_lock;
++	struct aurora_stream_record record;
++};
++
++static void aurora_stream_free(struct kref *refs)
++{
++	struct aurora_tcm_probe *t = container_of(refs, struct aurora_tcm_probe, refs);
++
++	kfifo_free(&t->stream_fifo);
++	kfree(t);
++}
++
++static void aurora_touch_put(void *data)
++{
++	struct aurora_tcm_probe *t = data;
++
++	kref_put(&t->refs, aurora_stream_free);
++}
++
++static int aurora_stream_open(struct inode *inode, struct file *file)
++{
++	struct miscdevice *misc = file->private_data;
++	struct aurora_tcm_probe *t = container_of(misc, struct aurora_tcm_probe, stream_device);
++	struct aurora_stream_reader *reader;
++	int ret = 0;
++
++	reader = kzalloc(sizeof(*reader), GFP_KERNEL);
++	if (!reader)
++		return -ENOMEM;
++	mutex_lock(&t->raw_lock);
++	if (t->stream_dead)
++		ret = -ENODEV;
++	else if (t->stream_open)
++		ret = -EBUSY;
++	else {
++		t->stream_open = true;
++		t->stream_error = 0;
++		kfifo_reset(&t->stream_fifo);
++		kref_get(&t->refs);
++	}
++	mutex_unlock(&t->raw_lock);
++	if (ret) {
++		kfree(reader);
++		return ret;
++	}
++	reader->touch = t;
++	mutex_init(&reader->read_lock);
++	file->private_data = reader;
++	return nonseekable_open(inode, file);
++}
++
++static int aurora_stream_release(struct inode *inode, struct file *file)
++{
++	struct aurora_stream_reader *reader = file->private_data;
++	struct aurora_tcm_probe *t = reader->touch;
++
++	mutex_lock(&t->raw_lock);
++	t->stream_open = false;
++	mutex_unlock(&t->raw_lock);
++	kfree(reader);
++	kref_put(&t->refs, aurora_stream_free);
++	return 0;
++}
++
++static ssize_t aurora_stream_read_locked(struct file *file, char __user *buffer,
++				size_t count, loff_t *position)
++{
++	struct aurora_stream_reader *reader = file->private_data;
++	struct aurora_tcm_probe *t = reader->touch;
++	int ret;
++
++	if (!count)
++		return 0;
++	for (;;) {
++		ret = mutex_lock_interruptible(&t->raw_lock);
++		if (ret)
++			return ret;
++		if (t->stream_dead || t->stream_error) {
++			ret = t->stream_dead ? -ENODEV : t->stream_error;
++			mutex_unlock(&t->raw_lock);
++			return ret;
++		}
++		if (kfifo_out_peek(&t->stream_fifo, &reader->record, 1)) {
++			if (count < reader->record.length) {
++				mutex_unlock(&t->raw_lock);
++				return -EMSGSIZE;
++			}
++			kfifo_skip(&t->stream_fifo);
++			mutex_unlock(&t->raw_lock);
++			if (copy_to_user(buffer, reader->record.bytes, reader->record.length))
++				return -EFAULT;
++			return reader->record.length;
++		}
++		mutex_unlock(&t->raw_lock);
++		if (file->f_flags & O_NONBLOCK)
++			return -EAGAIN;
++		ret = wait_event_interruptible(t->stream_wait,
++			READ_ONCE(t->stream_dead) || READ_ONCE(t->stream_error) ||
++			!kfifo_is_empty(&t->stream_fifo));
++		if (ret)
++			return ret;
++	}
++}
++
++static ssize_t aurora_stream_read(struct file *file, char __user *buffer,
++				size_t count, loff_t *position)
++{
++	struct aurora_stream_reader *reader = file->private_data;
++	ssize_t ret = mutex_lock_interruptible(&reader->read_lock);
++
++	if (ret)
++		return ret;
++	ret = aurora_stream_read_locked(file, buffer, count, position);
++	mutex_unlock(&reader->read_lock);
++	return ret;
++}
++
++static __poll_t aurora_stream_poll(struct file *file, poll_table *wait)
++{
++	struct aurora_stream_reader *reader = file->private_data;
++	struct aurora_tcm_probe *t = reader->touch;
++	__poll_t events = 0;
++
++	poll_wait(file, &t->stream_wait, wait);
++	mutex_lock(&t->raw_lock);
++	if (t->stream_dead)
++		events = EPOLLHUP | EPOLLERR;
++	else if (t->stream_error)
++		events = EPOLLERR;
++	else if (!kfifo_is_empty(&t->stream_fifo))
++		events = EPOLLIN | EPOLLRDNORM;
++	mutex_unlock(&t->raw_lock);
++	return events;
++}
++
++static const struct file_operations aurora_stream_fops = {
++	.owner = THIS_MODULE,
++	.open = aurora_stream_open,
++	.release = aurora_stream_release,
++	.read = aurora_stream_read,
++	.poll = aurora_stream_poll,
++};
++
++static void aurora_stream_unregister(void *data)
++{
++	struct aurora_tcm_probe *t = data;
++
++	mutex_lock(&t->raw_lock);
++	t->stream_dead = true;
++	mutex_unlock(&t->raw_lock);
++	wake_up_interruptible(&t->stream_wait);
++	misc_deregister(&t->stream_device);
++}
++
++/* Caller holds raw_lock. Overflow is explicit and terminal for this reader;
++ * the stock temporal algorithm must not silently receive a broken sequence. */
++static void aurora_stream_enqueue(struct aurora_tcm_probe *t)
++{
++	u8 *p = t->producer.bytes;
++
++	if (!t->stream_open || t->stream_error || t->stream_dead)
++		return;
++	memset(p, 0, 24);
++	memcpy(p, "HTRF", 4);
++	put_unaligned_le32(t->raw_sequence, p + 4);
++	put_unaligned_le64(t->raw_timestamp, p + 8);
++	put_unaligned_le16(t->raw_len, p + 16);
++	memcpy(p + 24, t->raw, t->raw_len);
++	t->producer.length = 24 + t->raw_len;
++	if (kfifo_in(&t->stream_fifo, &t->producer, 1) != 1)
++		t->stream_error = -EOVERFLOW;
++}
++
++/* Read-only diagnostic snapshot. The mutex makes each record atomic;
++ * the seq_file buffer keeps partial userspace reads from mixing frames.
++ * HTRF record: magic, LE32 sequence, LE64 monotonic ns, LE16 size,
++ * six reserved zero bytes, then the exact controller payload.
++ */
++static int aurora_tcm_raw_show(struct seq_file *s, void *unused)
++{
++	struct aurora_tcm_probe *t = s->private;
++	u8 header[24] = { 'H', 'T', 'R', 'F' };
++
++	mutex_lock(&t->raw_lock);
++	if (t->raw_len) {
++		put_unaligned_le32(t->raw_sequence, header + 4);
++		put_unaligned_le64(t->raw_timestamp, header + 8);
++		put_unaligned_le16(t->raw_len, header + 16);
++		seq_write(s, header, sizeof(header));
++		seq_write(s, t->raw, t->raw_len);
++	}
++	mutex_unlock(&t->raw_lock);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(aurora_tcm_raw);
++
++static void aurora_tcm_debug_remove(void *data)
++{
++	struct aurora_tcm_probe *t = data;
++
++	debugfs_remove_recursive(t->debug);
++	t->debug = NULL;
++}
++
++static void aurora_tcm_power_off(void *data)
++{
++	struct aurora_tcm_probe *t = data;
++
++	gpiod_set_value_cansleep(t->reset, 1);
++	regulator_disable(t->iovdd);
++	usleep_range(3000, 3100);
++	regulator_disable(t->avdd);
++}
++
++static int aurora_tcm_read(struct aurora_tcm_probe *t, size_t len)
++{
++	struct spi_transfer xfer = {
++		.tx_buf = t->tx, .rx_buf = t->rx, .len = len,
++	};
++
++	if (len > sizeof(t->rx))
++		return -EINVAL;
++	memset(t->tx, 0xff, len);
++	return spi_sync_transfer(t->spi, &xfer, 1);
++}
++
++/* Message reads and setup commands run before the IRQ is registered. */
++static int aurora_tcm_message(struct aurora_tcm_probe *t, u8 *code, u16 *len)
++{
++	int ret;
++
++	ret = aurora_tcm_read(t, 4);
++	if (ret)
++		return ret;
++	if (t->rx[0] != 0xa5)
++		return -EPROTO;
++	*code = t->rx[1];
++	*len = get_unaligned_le16(t->rx + 2);
++	if (!*len)
++		return 0;
++	if (*len > sizeof(t->rx) - 3)
++		return -EMSGSIZE;
++	usleep_range(100, 200);
++	ret = aurora_tcm_read(t, *len + 3);
++	if (ret)
++		return ret;
++	if (t->rx[0] != 0xa5 || t->rx[1] != 0x03 || t->rx[*len + 2] != 0x5a)
++		return -EPROTO;
++	return 0;
++}
++
++/* Compare the controller's full-duplex transfer path with TX-only writes.
++ * RX bytes during writes are discarded; command bytes and CS framing match.
++ */
++static int aurora_tcm_write(struct aurora_tcm_probe *t, size_t len)
++{
++	struct spi_transfer xfer = {
++		.tx_buf = t->tx, .rx_buf = t->rx, .len = len,
++	};
++
++	return spi_sync_transfer(t->spi, &xfer, 1);
++}
++
++static int aurora_tcm_command(struct aurora_tcm_probe *t, u8 cmd,
++			     const u8 *data, u16 len, u16 *reply_len)
++{
++	u8 code;
++	u16 received;
++	int ret, i;
++
++	if (len > sizeof(t->tx) - 3 || len + 3 > t->max_write)
++		return -EMSGSIZE;
++	t->tx[0] = cmd;
++	put_unaligned_le16(len, t->tx + 1);
++	if (len)
++		memcpy(t->tx + 3, data, len);
++	ret = aurora_tcm_write(t, len + 3);
++	if (ret)
++		return ret;
++	for (i = 0; i < 100; i++) {
++		msleep(20);
++		ret = aurora_tcm_message(t, &code, &received);
++		if (ret)
++			return ret;
++		if (!i || code == 0x01)
++			dev_info(&t->spi->dev, "TCM command %02x reply %02x length %u\n", cmd, code, received);
++		if (code == 0x01) {
++			*reply_len = received;
++			return 0;
++		}
++		/* Idle/ACK and asynchronous reports are not command replies. */
++		if (!code || code == 0x04 || code == 0x07 || code >= 0x10)
++			continue;
++		dev_err(&t->spi->dev, "TCM command %02x status %02x\n", cmd, code);
++		return -EIO;
++	}
++	return -ETIMEDOUT;
++}
++
++static void aurora_tcm_recover(struct work_struct *work);
++static int aurora_tcm_identify(struct aurora_tcm_probe *t);
++static int aurora_tcm_configure(struct aurora_tcm_probe *t);
++static const u8 aurora_touch_report = 0xc0;
++
++/* Disable the IRQ once per recovery; recovery re-enables it. */
++static void aurora_tcm_schedule_recovery(struct aurora_tcm_probe *t, int error, bool sync)
++{
++	if (READ_ONCE(t->stopping) || test_and_set_bit(0, &t->recovering))
++		return;
++	if (sync)
++		disable_irq(t->irq_number);
++	else
++		disable_irq_nosync(t->irq_number);
++	mutex_lock(&t->raw_lock);
++	t->stream_error = error;
++	mutex_unlock(&t->raw_lock);
++	wake_up_interruptible(&t->stream_wait);
++	t->recover_attempts = 0;
++	queue_delayed_work(system_freezable_wq, &t->recover_work, 0);
++}
++
++static irqreturn_t aurora_tcm_irq(int irq, void *data)
++{
++	struct aurora_tcm_probe *t = data;
++	u8 code;
++	u16 len;
++	int ret;
++
++	/* USB and touch IRQ threads otherwise both run FIFO/50 on CPU0.
++	 * A saturated NCM link can defer reading the controller for tens of
++	 * milliseconds, losing sensor frames before they reach our FIFO.
++	 * Stay just above the default IRQ priority; unlike the OEM FIFO/99,
++	 * leave room for higher-priority system work. Only this dedicated
++	 * threaded IRQ is changed, never a shared workqueue or SPI worker.
++	 */
++	if (!t->irq_priority_set) {
++		const struct sched_attr attr = {
++			.size = sizeof(attr),
++			.sched_policy = SCHED_FIFO,
++			.sched_priority = MAX_RT_PRIO / 2 + 1,
++		};
++
++		ret = sched_setattr_nocheck(current, &attr);
++		if (ret)
++			dev_warn(&t->spi->dev, "Touch IRQ priority setup failed: %d\n", ret);
++		t->irq_priority_set = true;
++	}
++
++	ret = aurora_tcm_message(t, &code, &len);
++	if (!ret && t->reports++ < 6)
++		dev_info(&t->spi->dev, "TCM interrupt report %02x length %u\n", code, len);
++	if (!ret && code == 0xc0 && len != 1722)
++		ret = -EPROTO;
++	if (!ret && code == 0xc0) {
++		mutex_lock(&t->raw_lock);
++		memcpy(t->raw, t->rx + 2, len);
++		t->raw_len = len;
++		t->raw_sequence++;
++		t->raw_timestamp = ktime_get_ns();
++		aurora_stream_enqueue(t);
++		mutex_unlock(&t->raw_lock);
++		wake_up_interruptible(&t->stream_wait);
++	}
++	if (ret) {
++		/* Quiesce the level-triggered line, end the reader's session and
++		 * reset the controller. A failed SPI transfer (for example a DMA
++		 * completion later than the SPI core's 200 ms limit) used to stop
++		 * touch until reboot.
++		 */
++		dev_err(&t->spi->dev, "Touch packet error %d; resetting controller\n", ret);
++		aurora_tcm_schedule_recovery(t, ret, false);
++	}
++	return IRQ_HANDLED;
++}
++
++static void aurora_tcm_recover(struct work_struct *work)
++{
++	struct aurora_tcm_probe *t = container_of(to_delayed_work(work),
++						 struct aurora_tcm_probe, recover_work);
++	unsigned int delay;
++	u16 len;
++	int ret;
++
++	if (READ_ONCE(t->stopping))
++		return;
++	/* The IRQ thread may still be returning from the failed packet. */
++	synchronize_irq(t->irq_number);
++	ret = aurora_tcm_identify(t);
++	if (!ret)
++		ret = aurora_tcm_configure(t);
++	if (!ret)
++		ret = aurora_tcm_command(t, 0x05, &aurora_touch_report, 1, &len);
++	if (ret) {
++		delay = min(100U << min(t->recover_attempts, 6U), 5000U);
++		t->recover_attempts++;
++		dev_err_ratelimited(&t->spi->dev,
++				    "Touch controller reset failed (%d); retry %u in %u ms\n",
++				    ret, t->recover_attempts, delay);
++		queue_delayed_work(system_freezable_wq, &t->recover_work,
++				   msecs_to_jiffies(delay));
++		return;
++	}
++	t->recover_attempts = 0;
++	t->recoveries++;
++	dev_info(&t->spi->dev, "Touch controller recovered (%u)\n", t->recoveries);
++	clear_bit(0, &t->recovering);
++	enable_irq(t->irq_number);
++}
++
++static ssize_t aurora_tcm_recover_write(struct file *file, const char __user *buf,
++				       size_t count, loff_t *ppos)
++{
++	struct aurora_tcm_probe *t = file->private_data;
++
++	if (t->irq_number <= 0)
++		return -ENODEV;
++	dev_info(&t->spi->dev, "Touch controller reset requested\n");
++	aurora_tcm_schedule_recovery(t, -EIO, true);
++	return count;
++}
++
++/* Exact stock format read back from Aurora firmware build 4337601. It has an
++ * 18-byte header (count last), then packed slot/class, X/Y/Z and widths.
++ * Sensor/gesture header fields and Z/widths are not reported.
++ */
++static const u8 aurora_tcm_format[] = {
++	0x10, 8, 0x1b, 48, 0x16, 4, 0x1e, 4, 0x12, 16,
++	0x20, 16, 0x21, 16, 0x22, 4, 0x23, 4, 0x25, 16,
++	0x18, 8, 0x01, 0x06, 4, 0x07, 4, 0x08, 16, 0x09, 16,
++	0x0a, 16, 0x0b, 8, 0x0c, 8, 0x03, 0x00,
++};
++
++/* Verify the known application before enabling raw reports (0x05).
++ * Probe and recovery share this; no firmware download or flash operations.
++ */
++static int aurora_tcm_configure(struct aurora_tcm_probe *t)
++{
++	struct device *dev = &t->spi->dev;
++	u16 len, config_size;
++	int ret;
++
++	ret = aurora_tcm_command(t, 0x20, NULL, 0, &len);
++	if (ret)
++		return dev_err_probe(dev, ret, "get application info\n");
++	/* Only fields through max_objects are consumed; trailing fields are optional. */
++	if (len < 38 || get_unaligned_le16(t->rx + 4))
++		return dev_err_probe(dev, -EPROTO, "application status or length\n");
++	config_size = get_unaligned_le16(t->rx + 14);
++	t->max_x = get_unaligned_le16(t->rx + 34);
++	t->max_y = get_unaligned_le16(t->rx + 36);
++	t->max_objects = get_unaligned_le16(t->rx + 38);
++	dev_info(dev, "Aurora TCM application: max=%ux%u objects=%u config-size=%u\n",
++		 t->max_x, t->max_y, t->max_objects, config_size);
++	if (t->max_x != 1439 || t->max_y != 3199 || t->max_objects != 10 ||
++	    memcmp(t->rx + 18, "N1CTE022", 8) ||
++	    config_size < sizeof(aurora_tcm_format) || config_size > sizeof(t->rx) - 3)
++		return -EINVAL;
++	ret = aurora_tcm_command(t, 0x06, &aurora_touch_report, 1, &len);
++	if (ret)
++		return dev_err_probe(dev, ret, "disable report before setup\n");
++	ret = aurora_tcm_command(t, 0x25, NULL, 0, &len);
++	if (ret || len != config_size || len < sizeof(aurora_tcm_format) ||
++	    memcmp(t->rx + 2, aurora_tcm_format, sizeof(aurora_tcm_format)))
++		return dev_err_probe(dev, ret ?: -EPROTO, "verify stock touch format\n");
++	return 0;
++}
++
++static ssize_t aurora_tcm_recover_write(struct file *file, const char __user *buf,
++				       size_t count, loff_t *ppos);
++static const struct file_operations aurora_tcm_recover_fops = {
++	.open = simple_open,
++	.write = aurora_tcm_recover_write,
++	.llseek = noop_llseek,
++};
++
++static void aurora_tcm_quiesce(void *data)
++{
++	struct aurora_tcm_probe *t = data;
++
++	WRITE_ONCE(t->stopping, true);
++	/* Drain manual reset callbacks before cancelling work: an already active
++	 * debugfs writer could otherwise enqueue after cancel_delayed_work_sync.
++	 */
++	aurora_tcm_debug_remove(t);
++	disable_irq(t->irq_number);
++	cancel_delayed_work_sync(&t->recover_work);
++}
++
++static int aurora_tcm_setup_stream(struct aurora_tcm_probe *t)
++{
++	struct device *dev = &t->spi->dev;
++	u16 len;
++	int ret, irq;
++	struct dentry *debug;
++
++	ret = aurora_tcm_configure(t);
++	if (ret)
++		return ret;
++	ret = aurora_tcm_command(t, 0x05, &aurora_touch_report, 1, &len);
++	if (ret)
++		return dev_err_probe(dev, ret, "enable touch reports\n");
++	irq = gpiod_to_irq(t->irq);
++	if (irq < 0)
++		return irq;
++	debug = debugfs_create_dir("aurora-touch", NULL);
++	if (IS_ERR(debug))
++		return PTR_ERR(debug);
++	t->debug = debug;
++	debugfs_create_file("raw_frame", 0400, debug, t, &aurora_tcm_raw_fops);
++	debugfs_create_file("recover", 0200, debug, t, &aurora_tcm_recover_fops);
++	debugfs_create_u32("recoveries", 0400, debug, &t->recoveries);
++	ret = devm_add_action_or_reset(dev, aurora_tcm_debug_remove, t);
++	if (ret)
++		return ret;
++	t->stream_device.minor = MISC_DYNAMIC_MINOR;
++	t->stream_device.name = "aurora-touch-raw";
++	t->stream_device.fops = &aurora_stream_fops;
++	t->stream_device.parent = dev;
++	t->stream_device.mode = 0400;
++	ret = misc_register(&t->stream_device);
++	if (ret)
++		return ret;
++	ret = devm_add_action_or_reset(dev, aurora_stream_unregister, t);
++	if (ret)
++		return ret;
++	t->irq_number = irq;
++	ret = devm_request_threaded_irq(dev, irq, NULL, aurora_tcm_irq,
++					IRQF_ONESHOT | IRQF_TRIGGER_LOW,
++					dev_name(dev), t);
++	if (ret)
++		return dev_err_probe(dev, ret, "touch interrupt\n");
++	/* Registered after the IRQ, so it is cancelled before the IRQ is freed. */
++	ret = devm_add_action_or_reset(dev, aurora_tcm_quiesce, t);
++	if (ret)
++		return ret;
++	dev_info(dev, "Aurora TCM raw stream ready on IRQ %d\n", irq);
++	return 0;
++}
++
++/* Reset the powered controller and read its identity report. Returns
++ * -ENODEV for a controller that is not in TCM v1 application mode.
++ */
++static int aurora_tcm_identify(struct aurora_tcm_probe *t)
++{
++	struct device *dev = &t->spi->dev;
++	unsigned int len;
++	int ret;
++
++	gpiod_set_value_cansleep(t->reset, 1);
++	msleep(10);
++	gpiod_set_value_cansleep(t->reset, 0);
++	msleep(200);
++	dev_info(dev, "Aurora TCM identity probe: avdd=%d iovdd=%d IRQ asserted=%d\n",
++		 regulator_get_voltage(t->avdd), regulator_get_voltage(t->iovdd),
++		 gpiod_get_value_cansleep(t->irq));
++	/* The vendor detection path sends this one-byte identification magic. */
++	t->tx[0] = 0x02;
++	ret = spi_write(t->spi, t->tx, 1);
++	if (ret)
++		return dev_err_probe(dev, ret, "identity magic\n");
++	usleep_range(1000, 2000);
++	ret = aurora_tcm_read(t, 4);
++	if (ret)
++		return dev_err_probe(dev, ret, "startup header\n");
++	dev_info(dev, "Aurora TCM startup header: %4ph\n", t->rx);
++	if (t->rx[0] != 0xa5 || t->rx[1] != 0x10) {
++		return -ENODEV;
++	}
++	len = get_unaligned_le16(t->rx + 2);
++	if (len < 24 || len > sizeof(t->rx) - 7)
++		return dev_err_probe(dev, -EINVAL, "unexpected identity length %u\n", len);
++	usleep_range(1000, 2000);
++	/* Marker/status + payload + EOM + optional CRC/RC/EOM trailer. */
++	ret = aurora_tcm_read(t, len + 7);
++	if (ret)
++		return dev_err_probe(dev, ret, "identity payload\n");
++	dev_info(dev, "Aurora TCM identity packet: %*ph\n", (int)min(len + 7, 64U), t->rx);
++	if (t->rx[0] != 0xa5 || t->rx[1] != 0x03)
++		return dev_err_probe(dev, -EPROTO, "unexpected continuation\n");
++	dev_info(dev, "Aurora TCM v%u mode=0x%02x part=%16ph build=%u max-write=%u\n",
++		 t->rx[2], t->rx[3], t->rx + 4,
++		 get_unaligned_le32(t->rx + 20), get_unaligned_le16(t->rx + 24));
++	if (t->rx[2] != 1 || t->rx[3] != 1 ||
++	    memcmp(t->rx + 4, "S3910 A0B0-15.2", 15) ||
++	    get_unaligned_le32(t->rx + 20) != 4337601 ||
++	    t->rx[len + 3] != 0x5a || t->rx[len + 4] != 0x5a)
++		return dev_err_probe(dev, -EPROTO, "untested firmware mode or CRC framing\n");
++	t->max_write = get_unaligned_le16(t->rx + 24);
++	return 0;
++}
++
++static int aurora_tcm_probe(struct spi_device *spi)
++{
++	struct device *dev = &spi->dev;
++	struct aurora_tcm_probe *t;
++	int ret;
++
++	t = kzalloc(sizeof(*t), GFP_KERNEL);
++	if (!t)
++		return -ENOMEM;
++	t->spi = spi;
++	spi_set_drvdata(spi, t);
++	mutex_init(&t->raw_lock);
++	kref_init(&t->refs);
++	init_waitqueue_head(&t->stream_wait);
++	INIT_DELAYED_WORK(&t->recover_work, aurora_tcm_recover);
++	ret = devm_add_action_or_reset(dev, aurora_touch_put, t);
++	if (ret)
++		return ret;
++	ret = kfifo_alloc(&t->stream_fifo, 64, GFP_KERNEL);
++	if (ret)
++		return ret;
++	t->avdd = devm_regulator_get(dev, "avdd");
++	if (IS_ERR(t->avdd))
++		return dev_err_probe(dev, PTR_ERR(t->avdd), "avdd supply\n");
++	t->iovdd = devm_regulator_get(dev, "iovdd");
++	if (IS_ERR(t->iovdd))
++		return dev_err_probe(dev, PTR_ERR(t->iovdd), "iovdd supply\n");
++	t->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(t->reset))
++		return dev_err_probe(dev, PTR_ERR(t->reset), "reset GPIO\n");
++	t->irq = devm_gpiod_get(dev, "irq", GPIOD_IN);
++	if (IS_ERR(t->irq))
++		return dev_err_probe(dev, PTR_ERR(t->irq), "irq GPIO\n");
++	spi->mode = SPI_MODE_0;
++	spi->bits_per_word = 8;
++	ret = spi_setup(spi);
++	if (ret)
++		return dev_err_probe(dev, ret, "SPI setup\n");
++	ret = regulator_enable(t->avdd);
++	if (ret)
++		return ret;
++	usleep_range(3000, 3100);
++	ret = regulator_enable(t->iovdd);
++	if (ret) {
++		regulator_disable(t->avdd);
++		return ret;
++	}
++	ret = devm_add_action_or_reset(dev, aurora_tcm_power_off, t);
++	if (ret)
++		return ret;
++	msleep(50);
++	ret = aurora_tcm_identify(t);
++	if (ret == -ENODEV) {
++		dev_info(dev, "Not a TCM v1 identify report; no further commands\n");
++		return ret;
++	}
++	if (ret)
++		return ret;
++	return aurora_tcm_setup_stream(t);
++}
++
++static int aurora_tcm_suspend(struct device *dev)
++{
++	struct aurora_tcm_probe *t = dev_get_drvdata(dev);
++
++	/* Quiesce the threaded reader before the parent SPI controller suspends.
++	 * Otherwise a report can return -ESHUTDOWN and permanently stop the stream.
++	 */
++	if (t->irq_number > 0)
++		disable_irq(t->irq_number);
++	mutex_lock(&t->raw_lock);
++	t->stream_error = -EPIPE;
++	mutex_unlock(&t->raw_lock);
++	wake_up_interruptible(&t->stream_wait);
++	return 0;
++}
++
++static int aurora_tcm_resume(struct device *dev)
++{
++	struct aurora_tcm_probe *t = dev_get_drvdata(dev);
++
++	if (t->irq_number > 0)
++		enable_irq(t->irq_number);
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(aurora_tcm_pm_ops, aurora_tcm_suspend,
++			       aurora_tcm_resume);
++
++static const struct of_device_id aurora_tcm_of_match[] = {
++	{ .compatible = "synaptics,s3910p-aurora" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, aurora_tcm_of_match);
++static const struct spi_device_id aurora_tcm_id[] = {
++	{ "s3910p-aurora" }, { }
++};
++MODULE_DEVICE_TABLE(spi, aurora_tcm_id);
++static struct spi_driver aurora_tcm_driver = {
++	.driver = { .name = "aurora-tcm", .of_match_table = aurora_tcm_of_match,
++		    .pm = pm_sleep_ptr(&aurora_tcm_pm_ops) },
++	.probe = aurora_tcm_probe,
++	.id_table = aurora_tcm_id,
++};
++module_spi_driver(aurora_tcm_driver);
++MODULE_DESCRIPTION("Aurora TouchComm raw-frame transport");
++MODULE_LICENSE("GPL");

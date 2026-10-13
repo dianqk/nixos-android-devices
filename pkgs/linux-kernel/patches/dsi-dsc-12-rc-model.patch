@@ -1,0 +1,46 @@
+From: Pengyu Luo <mitltlatltl@gmail.com>
+Date: Fri,  6 Mar 2026 17:25:53 +0800
+Subject: [PATCH] drm/msm/dsi: setup RC model properly
+
+Using incorrect parameters does not seem to affect the display, but we
+should use the correct in accordance with the DSC 1.1 or 1.2.
+
+Signed-off-by: Pengyu Luo <mitltlatltl@gmail.com>
+Link: https://lore.kernel.org/r/20260306092553.37973-1-mitltlatltl@gmail.com
+
+Local adaptation:
+- Rebase onto the shared mobile kernel queue.
+- Keep DSC 1.1 pre-SCR behavior; select DSC 1.2 RGB parameters by version.
+- Omit the unimplemented native 4:2:2/4:2:0 branches, as discussed in review.
+  SCR1 parameters exist in the 1.2 RGB table; do not claim they are absent.
+
+---
+--- a/drivers/gpu/drm/msm/dsi/dsi_host.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_host.c
+@@ -1908,8 +1908,24 @@
+ 	drm_dsc_set_const_params(dsc);
+ 	drm_dsc_set_rc_buf_thresh(dsc);
+ 
+-	/* DPU supports only pre-SCR panels */
+-	ret = drm_dsc_setup_rc_params(dsc, DRM_DSC_1_1_PRE_SCR);
++	if (dsc->dsc_version_major != 1) {
++		DRM_DEV_ERROR(&msm_host->pdev->dev, "Unsupported DSC version: %x.%x\n",
++			      dsc->dsc_version_major, dsc->dsc_version_minor);
++		return -EOPNOTSUPP;
++	}
++
++	switch (dsc->dsc_version_minor) {
++	case 1:
++		/* Keep the existing pre-SCR parameters for DSC 1.1 panels. */
++		ret = drm_dsc_setup_rc_params(dsc, DRM_DSC_1_1_PRE_SCR);
++		break;
++	case 2:
++		/* DSI currently supplies RGB input, without native 4:2:x. */
++		ret = drm_dsc_setup_rc_params(dsc, DRM_DSC_1_2_444);
++		break;
++	default:
++		ret = -EOPNOTSUPP;
++	}
+ 	if (ret) {
+ 		DRM_DEV_ERROR(&msm_host->pdev->dev, "could not find DSC RC parameters\n");
+ 		return ret;

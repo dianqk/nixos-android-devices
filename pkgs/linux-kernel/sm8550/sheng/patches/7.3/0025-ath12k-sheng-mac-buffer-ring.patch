@@ -1,0 +1,55 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Mon, 5 Oct 2026 20:15:00 +0800
+Subject: [PATCH] wifi: ath12k: retain 2048 MAC buffers for Sheng firmware
+
+The WCN7850 on Xiaomi Sheng uses WLAN.HMT.1.1.c2-00259 firmware. With
+4096 MAC buffers, firmware initialization completes but the first MAC
+start exhausts the two HTC credits and WMI_PDEV_SET_PARAM times out.
+Restoring 2048 buffers permits interface startup and credit replenishment.
+The larger RX release ring can be retained.
+
+Upstream commit 58aeb412495a increased the MAC buffer count to 4096 for
+throughput stability, tested with newer HMT.1.1.c5-00302 firmware. Keep
+that default for other boards and limit this compatibility workaround to
+Sheng's WCN7850. This is a local workaround, not an upstream patch.
+
+Related-upstream: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=58aeb412495ada7fe5495c7805504d7cf1d45453
+---
+diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.c b/drivers/net/wireless/ath/ath12k/dp_rx.c
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -7,6 +7,7 @@
+ #include <linux/fips.h>
+ #include <linux/ieee80211.h>
+ #include <linux/kernel.h>
++#include <linux/of.h>
+ #include <linux/skbuff.h>
+ #include "core.h"
+ #include "debug.h"
+@@ -1693,6 +1694,7 @@
+ int ath12k_dp_rx_alloc(struct ath12k_base *ab)
+ {
+ 	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
++	u32 mac_buf_ring_size = DP_RX_MAC_BUF_RING_SIZE;
+ 	struct dp_srng *srng;
+ 	int i, ret;
+ 
+@@ -1708,12 +1710,17 @@
+ 		return ret;
+ 	}
+ 
++	/* Sheng's HMT.1.1.c2 firmware stalls WMI with 4096 MAC buffers. */
++	if (ab->hw_rev == ATH12K_HW_WCN7850_HW20 &&
++	    of_machine_is_compatible("xiaomi,sheng"))
++		mac_buf_ring_size = 2048;
++
+ 	if (ab->hw_params->rx_mac_buf_ring) {
+ 		for (i = 0; i < ab->hw_params->num_rxdma_per_pdev; i++) {
+ 			ret = ath12k_dp_srng_setup(ab,
+ 						   &dp->rx_mac_buf_ring[i],
+ 						   HAL_RXDMA_BUF, 1,
+-						   i, DP_RX_MAC_BUF_RING_SIZE);
++						   i, mac_buf_ring_size);
+ 			if (ret) {
+ 				ath12k_warn(ab, "failed to setup rx_mac_buf_ring %d\n",
+ 					    i);

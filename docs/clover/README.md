@@ -7,6 +7,9 @@ Support: Tier 3. See [support criteria](../README.md#support-tiers).
 An optional `boot-kernel` image boots a fixed Linux system directly.
 U-Boot is the default. See [configuration and usage](../configuration.md#supplemental-direct-kernel-image-sheng-and-clover).
 
+The EFI menu includes [power and special reboot actions](../boot-actions.md).
+These require matching U-Boot; their hardware behavior remains unverified.
+
 ## Configure and install
 
 1. Create a consumer flake using the [configuration guide](../configuration.md).
@@ -21,10 +24,15 @@ U-Boot is the default. See [configuration and usage](../configuration.md#supplem
 ```nix
 {
   androidDevices.usbSerial = "my-clover-01";
-  hardware.clover.storageRolesFile = ./storage-roles.sh;
   androidDevices.persistentImage.rootfs.label = "NIXOS";
-  # Preserve the existing UUID when keeping a filesystem:
-  # hardware.clover.rootUUID = "YOUR_MEASURED_UUID";
+  # This tablet's measured partitions (see installation preparation):
+  hardware.clover.storageRoles = {
+    root = { partuuid = "YOUR_USERDATA_PARTUUID"; bytes = YOUR_USERDATA_BYTES; };
+    firmware = { partuuid = "YOUR_BOOT_PARTUUID"; bytes = 67108864; };
+    recovery = { partuuid = "YOUR_RECOVERY_PARTUUID"; bytes = 67108864; };
+    misc = { partuuid = "YOUR_MISC_PARTUUID"; bytes = 1048576; };
+    # Optional: number, offset and root.fsUuid to keep an existing filesystem.
+  };
 }
 ```
 
@@ -38,7 +46,7 @@ Clover uses U-Boot/systemd-boot with physical `system` as FAT `/boot` and
 `userdata` as ext4 root. U-Boot is untested on hardware. The [shared first installer](../initial-install.md)
 supports prepared partitions; see [installation preparation](first-install.md).
 
-The default kernel is Nixpkgs Linux 7.3-rc5 with [sourced Clover patches](../../pkgs/linux-kernel/sdm660/clover/PATCHES.md).
+The default kernel is Nixpkgs Linux 7.3-rc6 with [sourced Clover patches](../../pkgs/linux-kernel/sdm660/clover/PATCHES.md).
 It has not been boot-tested.
 
 ## Use and troubleshoot
@@ -52,6 +60,14 @@ The repository examples use `.#devices.clover.<role>`, for example `.#devices.cl
 - Failed boot or offline updates: [RAM recovery](../recovery.md).
 - Wi-Fi, audio, display and other limitations: [hardware reference](hardware.md).
 - Configuration/build problems: [troubleshooting](../configuration.md#update-recover-and-troubleshoot).
+
+The desktop example uses Niri's OpenGL ES/EGL renderer and does not require
+Vulkan. Mesa's Freedreno supports Adreno 5xx GL/GLES; its Turnip Vulkan driver
+does not support this GPU generation. This establishes API compatibility,
+not a successful Clover boot or physical display test. Run the [basic hardware
+suite](../../tests/basic/README.md) with `--skip vulkan`.
+See [Niri's renderer](https://github.com/niri-wm/niri/blob/v26.04/src/backend/tty.rs)
+and [Mesa's driver support](https://docs.mesa3d.org/drivers/freedreno.html).
 
 ## Firmware sources
 

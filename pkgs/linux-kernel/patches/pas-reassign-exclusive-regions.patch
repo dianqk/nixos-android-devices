@@ -1,0 +1,242 @@
+From f0df06267c771c7473ebf8cb44dec388aaf08304 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 13 Oct 2026 14:44:39 +0800
+Subject: [PATCH] remoteproc: qcom_q6v5_pas: Reassign exclusive memory
+ regions on every start
+
+PAS resources with region_assign_idx (the SM8550, SM8650 and SM8750 MPSS)
+hand their DSM regions to MSS_MSA exclusively once at probe, and give them
+back to HLOS only when the driver is removed. A stop does not reclaim them
+and the next start does not assign them again.
+
+On SM8650 (Xiaomi Aurora), a healthy MPSS stop followed by a start succeeds
+on the Linux and TrustZone side (both PAS shutdowns, init image, memory
+setup and auth-and-reset return 0, the modem reports ready), but the phone
+hard-resets a few seconds after the restarted modem runs (PSHOLD reset,
+cold DDR initialization). The downstream driver (ssr_hyp_assign_mem) assigns
+these regions HLOS->MSS at the start of every boot and reclaims them
+MSS->HLOS after the PAS shutdowns. Doing the same, three stop/start cycles
+and a further restart ran without a reset and the modem came back to
+service.
+
+Track the assignment per region. Probe still assigns every region. Start
+assigns each region that is not assigned. Stop reclaims the exclusive
+regions only when the PAS (and DTB) shutdown succeeded, so a remote that
+may still be running keeps them; a region whose reclaim fails stays marked
+assigned and is neither reassigned nor reclaimed twice. Remove and the
+probe error path reclaim only assigned regions. Shared regions keep their
+probe-time assignment.
+
+Also return a failed PAS shutdown from qcom_pas_stop() instead of
+overwriting it with the result of busting the hwspinlock.
+---
+ drivers/remoteproc/qcom_q6v5_pas.c | 129 ++++++++++++++++++++++-------
+ 1 file changed, 98 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/remoteproc/qcom_q6v5_pas.c b/drivers/remoteproc/qcom_q6v5_pas.c
+index a005546c265d..8b773ff135f8 100644
+--- a/drivers/remoteproc/qcom_q6v5_pas.c
++++ b/drivers/remoteproc/qcom_q6v5_pas.c
+@@ -113,6 +113,7 @@ struct qcom_pas {
+ 	bool region_assign_shared;
+ 	int region_assign_vmid;
+ 	u64 region_assign_owners[MAX_ASSIGN_COUNT];
++	bool region_assigned[MAX_ASSIGN_COUNT];
+ 
+ 	struct qcom_rproc_glink glink_subdev;
+ 	struct qcom_rproc_subdev smd_subdev;
+@@ -125,6 +126,9 @@ struct qcom_pas {
+ 	struct qcom_pas_context *dtb_pas_ctx;
+ };
+ 
++static int qcom_pas_assign_regions(struct qcom_pas *pas);
++static int qcom_pas_reclaim_regions(struct qcom_pas *pas);
++
+ static void qcom_pas_segment_dump(struct rproc *rproc,
+ 				  struct rproc_dump_segment *segment,
+ 				  void *dest, size_t offset, size_t size)
+@@ -282,6 +286,11 @@ static int qcom_pas_start(struct rproc *rproc)
+ 	struct qcom_pas *pas = rproc->priv;
+ 	int ret;
+ 
++	/* Regions reclaimed by the previous stop go back to the remote first. */
++	ret = qcom_pas_assign_regions(pas);
++	if (ret)
++		return ret;
++
+ 	ret = qcom_q6v5_prepare(&pas->q6v5);
+ 	if (ret)
+ 		return ret;
+@@ -405,7 +414,8 @@ static int qcom_pas_stop(struct rproc *rproc)
+ {
+ 	struct qcom_pas *pas = rproc->priv;
+ 	int handover;
+-	int dtb_ret;
++	int dtb_ret = 0;
++	int bust_ret;
+ 	int ret;
+ 
+ 	ret = qcom_q6v5_request_stop(&pas->q6v5, pas->sysmon);
+@@ -436,8 +446,19 @@ static int qcom_pas_stop(struct rproc *rproc)
+ 	if (handover)
+ 		qcom_pas_handover(&pas->q6v5);
+ 
+-	if (pas->smem_host_id)
+-		ret = qcom_smem_bust_hwspin_lock_by_host(pas->smem_host_id);
++	/*
++	 * Only a remote that has shut down may lose its exclusive regions;
++	 * after a failed shutdown they stay assigned.
++	 */
++	if (!ret && !dtb_ret)
++		qcom_pas_reclaim_regions(pas);
++
++	if (pas->smem_host_id) {
++		bust_ret = qcom_smem_bust_hwspin_lock_by_host(pas->smem_host_id);
++		/* Report a failed shutdown rather than the lock bust result. */
++		if (!ret)
++			ret = bust_ret;
++	}
+ 
+ 	return ret;
+ }
+@@ -745,10 +766,59 @@ static int qcom_pas_alloc_memory_region(struct qcom_pas *pas)
+ 	return 0;
+ }
+ 
+-static int qcom_pas_assign_memory_region(struct qcom_pas *pas)
++static int qcom_pas_assign_one_region(struct qcom_pas *pas, int offset)
+ {
+-	struct qcom_scm_vmperm perm[MAX_ASSIGN_COUNT];
++	struct qcom_scm_vmperm perm[2];
+ 	unsigned int perm_size;
++	int ret;
++
++	if (pas->region_assign_shared)  {
++		perm[0].vmid = QCOM_SCM_VMID_HLOS;
++		perm[0].perm = QCOM_SCM_PERM_RW;
++		perm[1].vmid = pas->region_assign_vmid;
++		perm[1].perm = QCOM_SCM_PERM_RW;
++		perm_size = 2;
++	} else {
++		perm[0].vmid = pas->region_assign_vmid;
++		perm[0].perm = QCOM_SCM_PERM_RW;
++		perm_size = 1;
++	}
++
++	ret = qcom_scm_assign_mem(pas->region_assign_phys[offset],
++				  pas->region_assign_size[offset],
++				  &pas->region_assign_owners[offset],
++				  perm, perm_size);
++	if (ret < 0) {
++		dev_err(pas->dev, "assign memory %d failed: %d\n", offset, ret);
++		return ret;
++	}
++
++	pas->region_assigned[offset] = true;
++	dev_dbg(pas->dev, "assigned memory region %d to vmid %d\n", offset,
++		pas->region_assign_vmid);
++	return 0;
++}
++
++/* Assign every region that is not currently assigned to the remote. */
++static int qcom_pas_assign_regions(struct qcom_pas *pas)
++{
++	int offset;
++	int ret;
++
++	for (offset = 0; offset < pas->region_assign_count; ++offset) {
++		if (pas->region_assigned[offset])
++			continue;
++
++		ret = qcom_pas_assign_one_region(pas, offset);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static int qcom_pas_assign_memory_region(struct qcom_pas *pas)
++{
+ 	int offset;
+ 	int ret;
+ 
+@@ -767,45 +837,30 @@ static int qcom_pas_assign_memory_region(struct qcom_pas *pas)
+ 			return ret;
+ 		}
+ 
+-		if (pas->region_assign_shared)  {
+-			perm[0].vmid = QCOM_SCM_VMID_HLOS;
+-			perm[0].perm = QCOM_SCM_PERM_RW;
+-			perm[1].vmid = pas->region_assign_vmid;
+-			perm[1].perm = QCOM_SCM_PERM_RW;
+-			perm_size = 2;
+-		} else {
+-			perm[0].vmid = pas->region_assign_vmid;
+-			perm[0].perm = QCOM_SCM_PERM_RW;
+-			perm_size = 1;
+-		}
+-
+ 		pas->region_assign_phys[offset] = res.start;
+ 		pas->region_assign_size[offset] = resource_size(&res);
+ 		pas->region_assign_owners[offset] = BIT(QCOM_SCM_VMID_HLOS);
+-
+-		ret = qcom_scm_assign_mem(pas->region_assign_phys[offset],
+-					  pas->region_assign_size[offset],
+-					  &pas->region_assign_owners[offset],
+-					  perm, perm_size);
+-		if (ret < 0) {
+-			dev_err(pas->dev, "assign memory %d failed\n", offset);
+-			return ret;
+-		}
++		pas->region_assigned[offset] = false;
+ 	}
+ 
+-	return 0;
++	return qcom_pas_assign_regions(pas);
+ }
+ 
+-static void qcom_pas_unassign_memory_region(struct qcom_pas *pas)
++/* Give every assigned exclusive region back to HLOS. */
++static int qcom_pas_reclaim_regions(struct qcom_pas *pas)
+ {
+ 	struct qcom_scm_vmperm perm;
+ 	int offset;
+ 	int ret;
++	int err = 0;
+ 
+ 	if (!pas->region_assign_idx || pas->region_assign_shared)
+-		return;
++		return 0;
+ 
+ 	for (offset = 0; offset < pas->region_assign_count; ++offset) {
++		if (!pas->region_assigned[offset])
++			continue;
++
+ 		perm.vmid = QCOM_SCM_VMID_HLOS;
+ 		perm.perm = QCOM_SCM_PERM_RW;
+ 
+@@ -813,9 +868,21 @@ static void qcom_pas_unassign_memory_region(struct qcom_pas *pas)
+ 					  pas->region_assign_size[offset],
+ 					  &pas->region_assign_owners[offset],
+ 					  &perm, 1);
+-		if (ret < 0)
+-			dev_err(pas->dev, "unassign memory %d failed\n", offset);
++		if (ret < 0) {
++			dev_err(pas->dev, "unassign memory %d failed: %d\n", offset, ret);
++			err = ret;
++			continue;
++		}
++		pas->region_assigned[offset] = false;
++		dev_dbg(pas->dev, "reclaimed memory region %d\n", offset);
+ 	}
++
++	return err;
++}
++
++static void qcom_pas_unassign_memory_region(struct qcom_pas *pas)
++{
++	qcom_pas_reclaim_regions(pas);
+ }
+ 
+ static int qcom_pas_probe(struct platform_device *pdev)

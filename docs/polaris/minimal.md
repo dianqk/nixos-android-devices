@@ -1,5 +1,7 @@
 # Root TTY example
 
+[中文](minimal.zh.md)
+
 `examples/polaris/minimal.nix` is a separate installed U-Boot/EFI example.
 It automatically logs root into the console, has no normal users or graphical
 session, and omits Wi-Fi/Bluetooth/audio userspace. System service accounts
@@ -33,8 +35,8 @@ Available packages on both build platforms:
 Build the system and first-install metadata:
 
 ```sh
-nix build .#devices.polaris.minimal.system -o tmp/systemd-artifacts/devices.polaris.minimal.system
-nix build .#devices.polaris.minimal.bootstrap-info -o tmp/systemd-artifacts/devices.polaris.minimal.bootstrap-info
+nix build .#devices.polaris.minimal.system -o result-system
+nix build .#devices.polaris.minimal.bootstrap-info -o result-bootstrap-info
 ```
 
 For a customized `nixosConfigurations.polaris-minimal`, update over USB with:

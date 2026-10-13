@@ -3,7 +3,18 @@ flake.inputs.nixpkgs.lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
   buildSystem:
   let
     lib = flake.inputs.nixpkgs.lib;
-    env = flake.lib.mkBuildEnvironment { inherit buildSystem; };
+    env = flake.lib.mkBuildEnvironment {
+      inherit buildSystem;
+      # The desktop examples explicitly enable proprietary OEM sensor data.
+      config.allowUnfreePredicate =
+        package:
+        builtins.elem (lib.getName package) [
+          "asphalt-sensors"
+          "asphalt-sensors-zstd"
+          "polaris-sensors"
+          "polaris-sensors-zstd"
+        ];
+    };
     devices = {
       polaris = {
         example = "system";
@@ -38,6 +49,20 @@ flake.inputs.nixpkgs.lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
         (example expected.example)
         { androidDevices.usb.acm.enable = lib.mkForce false; }
       ];
+      consumer = make [
+        {
+          androidDevices.usb.acm.enable = true;
+          services.getty = {
+            autologinUser = "diagnostic";
+            loginOptions = "--preserve-environment";
+            extraArgs = [ "--noissue" ];
+          };
+          systemd.services."serial-getty@" = {
+            environment.ACM_TEMPLATE_PROBE = "retained";
+            serviceConfig.Nice = 5;
+          };
+        }
+      ];
       recovery = make [ (example "recovery") ];
       invalid = make [
         (example expected.example)
@@ -60,7 +85,45 @@ flake.inputs.nixpkgs.lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
     assert withoutAcm.systemd.services.usb-signaller.environment.USB_SIGNALLER_ACM == "0";
     assert lib.hasInfix "serial-getty@ttyGS0.service" normal.services.udev.extraRules;
     assert !(lib.hasInfix "serial-getty@ttyGS0.service" withoutAcm.services.udev.extraRules);
-    assert !(normal.systemd.services ? "serial-getty@ttyGS0"); # udev starts the standard template on device arrival
+    assert !(withoutAcm.systemd.services ? "serial-getty@ttyGS0");
+    assert normal.systemd.services."serial-getty@ttyGS0".overrideStrategy == "asDropin";
+    assert normal.systemd.services."serial-getty@ttyGS0".serviceConfig.Type == "simple";
+    assert normal.systemd.services."serial-getty@ttyGS0".serviceConfig.StandardInput == "null";
+    assert normal.systemd.services."serial-getty@ttyGS0".serviceConfig.StandardOutput == "journal";
+    assert !normal.systemd.services."serial-getty@ttyGS0".serviceConfig.TTYReset;
+    assert !normal.systemd.services."serial-getty@ttyGS0".serviceConfig.TTYVHangup;
+    assert !normal.systemd.services."serial-getty@ttyGS0".serviceConfig.TTYVTDisallocate;
+    assert normal.systemd.services."serial-getty@ttyGS0".preStart == "";
+    assert normal.systemd.services."serial-getty@ttyGS0".wantedBy == [ ];
+    assert lib.hasInfix "/sys/class/udc/${expected.controller}/state" (
+      lib.last normal.systemd.services."serial-getty@ttyGS0".serviceConfig.ExecStart
+    );
+    assert normal.services.getty.autologinUser == null;
+    assert
+      !(lib.hasInfix "--autologin" (
+        lib.last normal.systemd.services."serial-getty@ttyGS0".serviceConfig.ExecStart
+      ));
+    assert lib.hasInfix "--autologin demo" (
+      lib.last normal.systemd.services."getty@tty1".serviceConfig.ExecStart
+    );
+    assert lib.hasPrefix normal.systemd.units."serial-getty@.service".text
+      normal.systemd.units."serial-getty@ttyGS0.service".text;
+    assert lib.hasPrefix normal.systemd.units."getty@.service".text
+      normal.systemd.units."getty@tty1.service".text;
+    assert lib.hasInfix ''Environment="TTY=%I"'' normal.systemd.units."getty@tty1.service".text;
+    assert lib.hasInfix "ExecStartPre=" normal.systemd.units."getty@tty1.service".text;
+    assert lib.hasInfix ''Environment="ACM_TEMPLATE_PROBE=retained"''
+      consumer.systemd.units."serial-getty@ttyGS0.service".text;
+    assert lib.hasInfix "Nice=5" consumer.systemd.units."serial-getty@ttyGS0.service".text;
+    assert lib.hasInfix "--autologin diagnostic" (
+      lib.last consumer.systemd.services."serial-getty@ttyGS0".serviceConfig.ExecStart
+    );
+    assert lib.hasInfix "--login-options --preserve-environment" (
+      lib.last consumer.systemd.services."serial-getty@ttyGS0".serviceConfig.ExecStart
+    );
+    assert lib.hasInfix "--noissue" (
+      lib.last consumer.systemd.services."serial-getty@ttyGS0".serviceConfig.ExecStart
+    );
     assert normal.androidDevices.kernelPackage.config.isYes "USB_CONFIGFS_ACM";
     assert lib.all (a: a.assertion) normal.assertions;
     assert lib.all (a: a.assertion) recovery.assertions;

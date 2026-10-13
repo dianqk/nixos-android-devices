@@ -1,6 +1,6 @@
 # Connect over USB and update a system
 
-[Configure a system](configuration.md) · [Installation paths](README.md)
+[Configure a system](configuration.md) · [Installation paths](README.md) · [中文](usb-signaller.zh.md)
 
 ## Enable the device connection
 
@@ -70,7 +70,7 @@ No USB Ethernet interface usually indicates a cable, port or gadget/controller
 problem. An address without SSH access points to credentials, DHCP/routing or
 SSH configuration. RAM recovery remains the fallback when the installed system
 cannot start. Asphalt and Polaris have hardware-validated NCM/SSH updates. Sheng has passed
-installed B-slot U-Boot/EFI Linux, NCM/SSH and Wi-Fi with its 7.2.6 example. Asphalt's
+installed B-slot U-Boot/EFI Linux, NCM/SSH and Wi-Fi with its 7.3 kernel. Asphalt's
 connectors have different support, so consult its [hardware notes](asphalt/hardware.md).
 
 ## Optional ACM console
@@ -79,10 +79,17 @@ Set `androidDevices.usb.acm.enable = true;` to expose an ACM serial login
 console alongside NCM in developer mode. It defaults to `false`; the public
 USB examples enable it explicitly. The kernel must include `USB_CONFIGFS_ACM`.
 Connect using the device's serial-number link under `/dev/serial/by-id/` on the
-host. Linux runs the standard `serial-getty@ttyGS0` login service when the gadget
-port appears. Your configured getty/login policy applies; the module does not
-create a user, password, or root autologin. Public desktop examples retain their
-explicit demo-user autologin policy.
+host. When the gadget port appears, `serial-getty@ttyGS0` starts a background
+waiter. It reads the selected controller's state without opening or resetting
+the TTY, and runs getty once USB enumeration reaches `configured`. This means
+USB is configured, not necessarily that a host application has opened the
+serial port. Waiting does not delay boot or local login. Disconnect hangs up
+the serial session; the restarted service waits for enumeration again.
+
+Your configured getty/login policy applies; the module does not create a user,
+password, or root autologin. Public desktop examples automatically log in demo
+only on local tty1; the ACM console shows the ordinary login prompt. The
+minimal lab example retains its explicit root-autologin policy.
 
 ACM does not replace NCM or SSH, and boot does not wait for a host to open it.
 It disappears in charging-only/host mode and returns with developer mode.
@@ -122,12 +129,33 @@ this backend deliberately does not add networking to the normal initrd.
 The supported modes are `developer_mode`, `charging_only`, and
 `host_mode`. MTP, tethering and mass storage are not advertised because their
 supporting services and policy are not configured here. USB role changes are
-root-only; ordinary users may query the daemon over the system bus.
+root-only by default; ordinary users may query the daemon over the system bus.
+
+To let selected users change modes without `sudo` or a polkit prompt, name a
+control group and add those users to it:
+
+```nix
+{
+  androidDevices.usb.signaller.controlGroup = "usb-mode";
+  users.users.alice.extraGroups = [ "usb-mode" ];
+}
+```
+
+The module creates the group and adds a D-Bus rule allowing its members to call
+only `set_mode`; ownership of the daemon's bus name and other methods stay
+root-only. usb-signaller performs no caller check of its own, so the D-Bus
+policy is the whole authorization. **Risk:** any member can switch to
+`charging_only` or `host_mode` and immediately disconnect USB networking, the
+ACM console and any SSH session over USB, with no prompt. Add only users who may
+already administer the device, and keep another management channel (Wi-Fi SSH
+or a local console) to return to `developer_mode`. The default `null` adds no
+group or rule. Group membership takes effect at the user's next login.
 
 ```sh
 busctl call com.meego.usb_moded /com/meego/usb_moded com.meego.usb_moded get_modes
 busctl call com.meego.usb_moded /com/meego/usb_moded com.meego.usb_moded mode_request
 # These disconnect USB networking; issue them locally or through Wi-Fi SSH.
+# Members of controlGroup may omit sudo.
 sudo busctl call com.meego.usb_moded /com/meego/usb_moded com.meego.usb_moded set_mode s host_mode
 sudo busctl call com.meego.usb_moded /com/meego/usb_moded com.meego.usb_moded set_mode s developer_mode
 ```
@@ -136,7 +164,7 @@ sudo busctl call com.meego.usb_moded /com/meego/usb_moded com.meego.usb_moded se
 | --- | --- |
 | Computer | Device role + NCM provides DHCP and configured SSH. |
 | Mouse/keyboard | A working host/VBUS path lets standard USB HID and the desktop input stack handle it. usb-signaller does not supply power or input drivers. |
-| USB disk/card reader | Host/VBUS and USB Storage/UAS/SCSI expose block devices. Mounting and filesystem permissions are normal OS/desktop policy; this minimal Sway example has no automount UI. |
+| USB disk/card reader | Host/VBUS and USB Storage/UAS/SCSI expose block devices. Mounting and filesystem permissions are normal OS/desktop policy; this minimal Niri example has no automount UI. |
 | Display/dock | USB-C DP needs real DP wiring, CC/PD, orientation/mux/PHY and DRM support, followed by compositor output policy. A data-role write alone cannot enable DP. DisplayLink is a separate USB graphics path. |
 
 usb-signaller monitors Type-C events but this integration does not implement an

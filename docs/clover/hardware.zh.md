@@ -4,11 +4,11 @@
 
 ## 硬件适配状态
 
-“已配置”表示仓库包含适配代码，不代表另一台平板已通过全新安装。
+“已配置”表示仓库包含适配代码，不代表已在设备上测试。
 
 | 领域 | 适配内容 | 状态 |
 | --- | --- | --- |
-| 启动与存储 | SDM660 内核/设备树、Android boot/recovery、受检 eMMC 契约、`userdata` ext4 | 已配置；另一台设备的首次安装未验证 |
+| 启动与存储 | SDM660 内核/设备树、Android boot/recovery、实测 eMMC 存储角色、`userdata` ext4 | 已配置；未经启动测试 |
 | 显示与输入 | 8 英寸 LTE 面板、FT5406 触摸、recovery 按键 | 已配置 |
 | GPU 与视频 | Adreno 固件和内核驱动 | 已配置；端到端使用未验证 |
 | USB | 正常系统 NCM/SSH；recovery ACM+NCM/SSH；系统 ACM 可选 | 已配置，所选传输方式需在实机验证 |

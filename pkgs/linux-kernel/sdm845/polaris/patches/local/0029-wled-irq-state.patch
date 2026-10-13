@@ -1,0 +1,46 @@
+From: Dianqk <dianqk@dianqk.net>
+Date: Sun, 4 Oct 2026 22:00:00 +0800
+Subject: [PATCH] backlight: qcom-wled: complete OVP IRQ state tracking
+
+The downstream IRQ balance fix tracks whether delayed work needs to
+re-enable the OVP IRQ. Record the initial disable when the module is
+off during IRQ configuration, or the first enable leaves it masked.
+
+Also use the tracked IRQ state after cancelling delayed work instead
+of treating a successful cancellation as proof that the IRQ is already
+disabled. The bootloader may leave the module and IRQ enabled before
+the first brightness update schedules work. Blanking before that work
+runs must still disable the IRQ.
+
+Keep the existing delayed enable and protection thresholds. This is a
+separate follow-up to the downstream IRQ balance patch.
+
+Link: https://gitlab.com/sdm845-mainline/linux/-/commit/2712eead924a6c830ce93d0f9d794b0a23a57acc
+Signed-off-by: Dianqk <dianqk@dianqk.net>
+---
+diff --git a/drivers/video/backlight/qcom-wled.c b/drivers/video/backlight/qcom-wled.c
+--- a/drivers/video/backlight/qcom-wled.c
++++ b/drivers/video/backlight/qcom-wled.c
+@@ -325,8 +325,8 @@
+ 			 */
+ 			schedule_delayed_work(&wled->ovp_work, HZ / 100);
+ 		} else {
+-			if (!cancel_delayed_work_sync(&wled->ovp_work) &&
+-			    !wled->ovp_irq_disabled) {
++			cancel_delayed_work_sync(&wled->ovp_work);
++			if (!wled->ovp_irq_disabled) {
+ 				disable_irq(wled->ovp_irq);
+ 				wled->ovp_irq_disabled = true;
+ 			}
+@@ -1656,8 +1656,10 @@
+ 		return rc;
+ 
+ 	/* Keep OVP irq disabled until module is enabled */
+-	if (!(val & WLED3_CTRL_REG_MOD_EN_MASK))
++	if (!(val & WLED3_CTRL_REG_MOD_EN_MASK)) {
+ 		disable_irq(wled->ovp_irq);
++		wled->ovp_irq_disabled = true;
++	}
+ 
+ 	return 0;
+ }

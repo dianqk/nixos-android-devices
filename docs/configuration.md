@@ -1,12 +1,12 @@
 # Configure your own system
 
-Device-specific settings use `hardware.{asphalt,polaris,sheng,clover}.*`.
+Device-specific settings use `hardware.{asphalt,polaris,sheng,aurora,clover}.*`.
 Shared boot, USB and recovery settings use `androidDevices.*`.
 
 [中文](configuration.zh.md) · [Installation guides](README.md) · [USB access](usb-signaller.md)
 
 Use a Linux computer with Nix flakes enabled. Choose `x86_64-linux` or
-`aarch64-linux` for the **build computer**; all four devices run AArch64. An
+`aarch64-linux` for the **build computer**; all five devices run AArch64. An
 x86_64 build uses the cross toolchain for this repository's compiled device
 packages. Upstream system packages remain native AArch64 so their binary caches
 can be reused.
@@ -38,7 +38,7 @@ setting `extra-platforms` alone does not install an emulator.
 
 ```sh
 nix build .#system --option builders-use-substitutes false \
-  --out-link tmp/systemd-artifacts/system
+  --out-link result-system
 ```
 
 Nix substitutes available native ARM packages first; uncached upstream jobs and
@@ -81,14 +81,15 @@ git init
 git add flake.nix
 nix flake lock
 nix eval .#nixosConfigurations.phone.config.system.build.toplevel.drvPath
-nix build .#system -o tmp/systemd-artifacts/system
-nix build .#boot -o tmp/systemd-artifacts/boot
-nix build .#boot-files -o tmp/systemd-artifacts/boot-files
-nix build .#bootstrap-info -o tmp/systemd-artifacts/bootstrap-info
-nix build .#recovery -o tmp/systemd-artifacts/recovery
+nix build .#system -o result-system
+nix build .#boot -o result-boot
+nix build .#boot-files -o result-boot-files
+nix build .#bootstrap-info -o result-bootstrap-info
+nix build .#recovery -o result-recovery
 ```
 
-These commands only build files. Follow the device's [first-install guide](README.md)
+These commands only build files. The guides name output links `result-<role>`;
+any path works if you use it consistently. Follow the device's [first-install guide](README.md)
 to prepare storage and install them. Build firmware/boot files only when the guide
 requires them. Keep system, bootstrap-info and boot-files from the same locked flake.
 
@@ -99,7 +100,7 @@ For an existing installation, `boot-kernel` additionally packages Linux, a
 matching direct-boot initrd and the board DTB as an Android boot image:
 
 ```sh
-nix build .#devices.sheng.boot-kernel --out-link tmp/systemd-artifacts/devices.sheng.boot-kernel
+nix build .#devices.sheng.boot-kernel --out-link result-boot-kernel
 # For Clover, replace sheng with clover; build only the device you need.
 ```
 
@@ -130,16 +131,16 @@ EFI menu booting. Direct-kernel boot remains unverified on both devices.
 ## Choose a device and role
 
 `lib.mkSystem { device; buildSystem; modules; }` returns a normal NixOS system
-configuration. Device names are `asphalt`, `polaris`, `sheng`, and `clover`.
+configuration. Device names are `asphalt`, `polaris`, `sheng`, `aurora` and `clover`.
 `modules` holds your ordinary NixOS modules; optional `specialArgs`, `overlays`,
 and `nixpkgsConfig` configure arguments and packages.
 
-| Setting supplied by the device module | Asphalt | Polaris | Sheng | Clover LTE |
-| --- | --- | --- | --- | --- |
-| Installed boot | U-Boot/EFI | U-Boot/EFI | U-Boot/EFI | U-Boot/EFI |
-| Root GPT partition | `linux` | `userdata` | `linux` | `userdata` |
-| Default ext4 label | `NIXOS` | `NIXOS` | `NIXOS` | `NIXOS` |
-| USB NCM address, if selected | `172.16.43.1/24` | `172.16.42.1/24` | `172.16.45.1/24` | `172.16.44.1/24` |
+| Setting supplied by the device module | Asphalt | Polaris | Sheng | Aurora | Clover LTE |
+| --- | --- | --- | --- | --- | --- |
+| Installed boot | U-Boot/EFI | U-Boot/EFI | U-Boot/EFI | U-Boot/EFI | U-Boot/EFI |
+| Root GPT partition | `linux` | `userdata` | `linux` | `linux` | `userdata` |
+| Default ext4 label | `NIXOS` | `NIXOS` | `NIXOS` | `NIXOS` | `NIXOS` |
+| USB NCM address, if selected | `172.16.43.1/24` | `172.16.42.1/24` | `172.16.45.1/24` | `172.16.42.1/24` (shared default) | `172.16.44.1/24` |
 
 All devices default to the ext4 label `NIXOS`. For an existing installation,
 keep its configured label and recovery storage contract consistent; changing
@@ -187,18 +188,18 @@ imports = [ inputs.androidDevices.nixosModules.polaris ];
 androidDevices.usbSerial = "my-polaris-01";
 ```
 
-Use `asphalt`, `sheng`, or `clover` in place of `polaris` for the other boards.
+Use `asphalt`, `sheng`, `aurora` or `clover` in place of `polaris` for the other boards.
 No separate common-module import or `androidDevices.enable = true` is needed.
 Device modules do not select a desktop or supply device identities.
 
 ## Add a desktop or services
 
 Desktop environments, users, authentication and generic system profiles use
-ordinary NixOS configuration. The public device modules do not export Sway or
+ordinary NixOS configuration. The public device modules do not export desktop policy or
 a general-purpose minimal-system profile. The consumer sample imports Nixpkgs'
 `profiles/minimal.nix` directly; you can omit it or add services normally.
 
-For Sway/Foot, add your own module to the installed system, for example:
+For Niri/Foot, add your own module to the installed system, for example:
 
 ```nix
 {
@@ -207,16 +208,29 @@ For Sway/Foot, add your own module to the installed system, for example:
     initialPassword = "change-before-use"; # Or use hashedPasswordFile.
     extraGroups = [ "video" "input" "render" ];
   };
-  programs.sway.enable = true;
+  programs.niri.enable = true;
   programs.foot.enable = true;
 }
 ```
 
-Log in on a local tty and run `dbus-run-session sway`. Configure Sway's outputs,
+Log in on a local tty and run `niri-session`. Configure Niri's outputs,
 keybindings, terminal and startup in your own configuration. The
 [desktop example](../examples/desktop.nix) demonstrates a full session, including
-explicit demo-user autologin; copy and adapt the parts you want rather than
-importing it as an upstream interface. Other compositors use their normal NixOS
+explicit demo-user autologin and an always-visible wvkbd keyboard at the bottom
+with reserved screen space. Copy and adapt the parts you want rather than
+importing it as an upstream interface. The example uses `/etc/niri/config.kdl`,
+selected through `NIRI_CONFIG`, and starts `niri-session` from the demo tty1 login.
+`example.desktop.scale` sets the internal display scale in these example files;
+it is not an exported hardware-module option.
+Niri uses its default screen orientation: the examples add no output transform,
+rotation metadata override or automatic rotation client. Sensor support remains
+available for diagnostics and an explicitly configured rotation policy.
+The touchscreen is mapped to `DSI-1`. Windows use full-width columns without gaps,
+leaving wvkbd's reserved area visible. Super+Return opens a terminal, Super+Left/Right
+changes columns, Super+Up/Down changes workspaces, Super+O opens the overview,
+Super+Q closes a window, and Super+Shift+E exits the session. Print takes a screenshot;
+for a specific path use `niri msg action screenshot-screen --path /tmp/screen.png`.
+Other compositors use their normal NixOS
 modules as well. Panel rotation/scale and UI preferences belong to that session.
 
 On Polaris, `hardware.polaris.radio.enable` and `hardware.polaris.audio.enable`
@@ -227,8 +241,10 @@ or re-imported. Audio and radio share the DSP service mapper where needed.
 Other boards retain their device-specific hardware defaults; see their option
 and hardware notes before enabling optional sensors or fingerprint services.
 
-Media applications can use `config.androidDevices.video.ffmpegPackage` to retain the
-board's decoder fixes, for example when overriding the FFmpeg input to a player.
+Media applications use upstream FFmpeg by default, including Polaris/Asphalt.
+`androidDevices.video.ffmpegPackage` remains overridable; the
+[restricted local H.264/HEVC profile](video.md) and device V4L2 fixes are opt-in
+for diagnostics or specialized local-media builds.
 Normal NixOS configuration still controls Bluetooth, PipeWire, Wi-Fi credentials,
 users, packages and application services.
 

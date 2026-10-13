@@ -1,9 +1,27 @@
 # Sheng first installation
 
-Read the [U-Boot installation workflow](../u-boot-install.md) and [device configuration](README.md) first.
+[中文](first-install.zh.md)
 
-After preparing the partitions below, use the [shared first installer](../initial-install.md) to import the closure, install EFI and write matching U-Boot firmware.
+Use the Rust daemon recovery on slot B; preserve A, super, calibration and independent recovery.
+The recovery initrd contains no Python. Standard NixOS installation/update tools may use
+Python from the target system inside chroot.
 
-Use a separate 1 GiB FAT linux-boot and ext4 linux. Operate on B only; preserve A and super. If Android userdata fills the original allocation, safely shrink its filesystem or prepare to recreate it before reducing its GPT entry.
+Starting from the original userdata layout, check and explicitly execute **destructive**
+preparation below. Android and Linux each receive approximately half of the original
+userdata allocation; the Linux half contains a separate FAT ESP (1 GiB by default) and
+ext4 root. Android userdata is destroyed and requires a separate factory reset.
+Already partitioned devices are refused by this operation.
 
-See the [Sheng manual storage example](manual-storage.md) for temporary recovery boot, ACM/NCM access and per-device GPT preparation commands. It also explains the scope of the checked `format-root` command.
+```sh
+ssh RECOVERY_HOST 'recovery prepare-install --check'
+ssh RECOVERY_HOST 'recovery prepare-install --confirm-erase-userdata'
+```
+
+Then follow [first installation](../initial-install.md) to import the system, install EFI
+and write matching U-Boot last. Update installed systems with `recovery rebuild boot`
+or host-side `mobile-device recovery deploy`. Existing root/ESP ordering and alignment
+gaps remain supported; ordinary updates do not repartition.
+
+To erase only an existing Linux root, check `recovery format-root --check`, then use
+`--confirm`. This leaves Android and the ESP intact. The daemon operations have not
+been hardware-validated on every device.

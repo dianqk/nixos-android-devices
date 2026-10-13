@@ -13,7 +13,6 @@
   systemd,
   gnutar,
   jq,
-  recoveryTools,
   screenPackage,
   extended ? false,
 }:
@@ -72,12 +71,6 @@ let
 in
 runCommand "mobile-recovery-utils" { } ''
   mkdir -p $out/bin
-  cp ${./mobile-recovery-deploy/initial.sh} $out/bin/mobile-install-initial
-  chmod +x $out/bin/mobile-install-initial
-  cp ${./mobile-recovery-deploy/deploy.sh} $out/bin/mobile-recovery-deploy
-  cp ${./mobile-recovery-deploy/target.sh} $out/bin/mobile-recovery-target
-  cp ${./mobile-recovery-deploy/rebuild.sh} $out/bin/mobile-offline-rebuild
-  chmod +x $out/bin/mobile-recovery-deploy $out/bin/mobile-recovery-target $out/bin/mobile-offline-rebuild
   ${lib.concatStringsSep "\n" (
     map (
       { package, names }:
@@ -91,5 +84,7 @@ runCommand "mobile-recovery-utils" { } ''
       '') names
     ) tools
   )}
-  ln -s ${recoveryTools}/bin/* ${screenPackage}/bin/* $out/bin/
+  for name in recovery mobile-recovery-daemon mobile-recovery-screen mobile-recovery-host-key; do
+    ln -s ${screenPackage}/bin/$name $out/bin/$name
+  done
 ''

@@ -12,6 +12,7 @@ BOARDS = {
     'xiaomi,clover-lte': 'clover',
     'xiaomi,polaris': 'polaris',
     'xiaomi,sheng': 'sheng',
+    'xiaomi,aurora': 'aurora',
     'lenovo,asphalt': 'asphalt',
 }
 

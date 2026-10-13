@@ -28,9 +28,34 @@ pkgs.lib.makeScope packaging.newScope (
     inherit (packaging) buildPackages;
 
     usb-signaller = compile ./usb-signaller { };
+    mobile-boot-action = compile ./mobile-boot-action { };
+    mobile-charger = compile ./mobile-charger { };
     mobile-device = self.callPackage ./mobile-device { };
     libcamera = compile ./libcamera { inherit (compilationPkgs) libcamera; };
+    # Keep the VA driver and its graphics dependencies native to the target,
+    # including in mixed native-userspace / cross-kernel build environments.
+    libva-v4l2 = pkgs.callPackage ./libva-v4l2 { };
+    # QTEE userspace (minkipc) and the modem's IMinkModemOpener bridge; native
+    # to the target like other upstream system software.
+    qcbor = pkgs.callPackage ./qcom-tee/qcbor.nix { };
+    qcomtee = pkgs.callPackage ./qcom-tee/qcomtee.nix { inherit (self) qcbor; };
+    mink-idl-compiler = pkgs.callPackage ./qcom-tee/mink-idl-compiler.nix { };
+    minkipc = pkgs.callPackage ./qcom-tee/minkipc.nix {
+      inherit (self) qcbor qcomtee mink-idl-compiler;
+    };
+    mink-modem-opener = pkgs.callPackage ./qcom-tee/mink-modem-opener {
+      inherit (self) minkipc mink-idl-compiler;
+    };
+    qmi-framework = pkgs.callPackage ./qcom-tee/qmi-framework.nix { };
+    # Unfree Qualcomm prebuilt; not exported as a flake package.
+    qwesd = pkgs.callPackage ./qcom-tee/qwesd.nix {
+      inherit (self) minkipc qcbor qmi-framework;
+    };
+    ffmpeg = compile ./mobile/ffmpeg.nix { inherit (compilationPkgs) ffmpeg; };
     pd-mapper = compile ./mobile/pd-mapper.nix { };
+    fastrpc = compile ./mobile/fastrpc { };
+    mkSSCRegistry = args: self.callPackage ./mobile/ssc-registry args;
+    sensor-rotate = self.callPackage ./mobile/sensor-rotate { };
     umtp-responder = compile ./mobile/umtp-responder.nix { };
     makeInitrdNGTool = self.callPackage ./make-initrd-ng {
       inherit (packaging.buildPackages) makeInitrdNGTool;
@@ -49,6 +74,17 @@ pkgs.lib.makeScope packaging.newScope (
     mobile-tqftpserv = compile ./mobile/tqftpserv.nix { };
 
     devices = {
+      aurora = pkgs.lib.makeScope self.newScope (device: {
+        kernel = self.mkKernel { device = "aurora"; };
+        firmware-source = device.callPackage ./aurora/firmware-source.nix { };
+        firmware = device.callPackage ./aurora/firmware.nix {
+          inherit (packaging.buildPackages) python3 alsa-utils alsa-ucm-conf m4;
+          runtimeAlsaUtils = pkgs.alsa-utils;
+          runtimeCoreutils = pkgs.coreutils;
+          inherit (pkgs) runtimeShell;
+        };
+        touch = compile ./aurora/touch { inherit (device) firmware-source; };
+      });
       polaris = pkgs.lib.makeScope self.newScope (
         device:
         let
@@ -56,16 +92,14 @@ pkgs.lib.makeScope packaging.newScope (
         in
         {
           kernel = self.mkKernel { device = "polaris"; };
-          mkRecoveryTools = device.callPackage ./polaris/recovery-tools.nix { };
-          mkSystemUpdater = device.callPackage ./polaris/system-updater.nix { };
-          mkBootInstaller = device.callPackage ./polaris/boot-installer.nix { };
           wifi-firmware = device.callPackage ./polaris/wifi-firmware.nix { };
           gpu-firmware = device.callPackage ./polaris/gpu-firmware.nix { };
           ipa-firmware = device.callPackage ./polaris/ipa-firmware.nix { };
           bluetooth-firmware = device.callPackage ./polaris/bluetooth-firmware.nix { };
           multimedia-firmware = device.callPackage ./polaris/multimedia-firmware.nix { };
+          sensors = device.callPackage ./polaris/sensors { };
           alsa-ucm = device.callPackage ./polaris/alsa-ucm.nix { };
-          ffmpeg = compile ./polaris/ffmpeg.nix { inherit (compilationPkgs) ffmpeg; };
+          ffmpeg = compile ./polaris/ffmpeg.nix { inherit (self) ffmpeg; };
           rmtfs = compile ./polaris/rmtfs.nix { inherit (compilationPkgs) rmtfs; };
         }
       );
@@ -76,14 +110,13 @@ pkgs.lib.makeScope packaging.newScope (
         in
         {
           kernel = self.mkKernel { device = "asphalt"; };
-          mkRecoveryTools = device.callPackage ./asphalt/recovery-tools.nix { };
           firmware-source = device.callPackage ./asphalt/firmware-source.nix { };
           firmware = device.callPackage ./asphalt/firmware.nix { };
-          disabled-dtbo = device.callPackage ./asphalt/disabled-dtbo.nix { };
+          sensors = device.callPackage ./asphalt/sensors { };
           wifi-firmware = device.callPackage ./asphalt/wifi-firmware.nix { };
           audio-topology = device.callPackage ./asphalt/audio-topology.nix { };
           alsa-ucm = device.callPackage ./asphalt/alsa-ucm.nix { };
-          ffmpeg = compile ./asphalt/ffmpeg.nix { inherit (compilationPkgs) ffmpeg; };
+          ffmpeg = compile ./asphalt/ffmpeg.nix { inherit (self) ffmpeg; };
         }
       );
       clover = pkgs.lib.makeScope self.newScope (
@@ -93,11 +126,6 @@ pkgs.lib.makeScope packaging.newScope (
         in
         {
           kernel = self.mkKernel { device = "clover"; };
-          kernel-mainline = self.mkKernel {
-            device = "clover";
-            variant = "mainline";
-          };
-          mkRecoveryTools = device.callPackage ./clover/recovery-tools.nix { };
           firmware = device.callPackage ./clover/firmware.nix { inherit (packaging.buildPackages) python3; };
           msm-firmware-loader = device.callPackage ./clover/msm-firmware-loader.nix {
             python3 = packaging.buildPackages.python3;
@@ -115,17 +143,8 @@ pkgs.lib.makeScope packaging.newScope (
         in
         {
           kernel = self.mkKernel { device = "sheng"; };
-          kernel-mainline = self.mkKernel {
-            device = "sheng";
-            variant = "mainline";
-          };
-          kernel-testing = self.mkKernel {
-            device = "sheng";
-            variant = "testing";
-          };
           firmware-source = device.callPackage ./sheng/firmware-source.nix { };
           mipps-auth = device.callPackage ./sheng/xiaomi-mipps-auth.nix { };
-          mkRecoveryTools = device.callPackage ./sheng/recovery-tools.nix { };
           firmware = device.callPackage ./sheng/firmware.nix { };
           initrd-firmware = device.callPackage ./sheng/initrd-firmware.nix {
             sheng-firmware = device.firmware;
@@ -133,7 +152,7 @@ pkgs.lib.makeScope packaging.newScope (
           alsa-ucm = device.callPackage ./sheng/alsa-ucm.nix {
             inherit (packaging.buildPackages) alsa-ucm-conf;
           };
-          fastrpc = compile ./sheng/fastrpc.nix { };
+          fastrpc = self.fastrpc;
           qrtr = compile ./sheng/qrtr.nix { };
           sensors-file = device.callPackage ./sheng/sheng-sensors-file.nix { };
           devauth = device.callPackage ./sheng/devauth.nix { };
