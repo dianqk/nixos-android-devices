@@ -25,6 +25,7 @@ Clover 需要实测存储契约，其 U-Boot 尚未真机验证。Asphalt/Sheng/
 
 - 配置用户、桌面、应用和服务：[配置指南](configuration.zh.md)。
 - USB 网络、SSH 和 `nixos-rebuild boot`：[连接与更新](usb-signaller.zh.md)。
+- 为 Wi-Fi 与基带准备校准快照：[基带校准快照](polaris/radio-snapshot.zh.md)。
 - 选择 Polaris 代际与菜单设置：[启动菜单](polaris/boot-menu.zh.md)。
 - 启动失败、挂载目标文件系统和离线更新：[RAM recovery](recovery.zh.md)。
 - 闭包传输与受检查的设备操作：[mobile-device](../pkgs/mobile-device/README.zh.md)。

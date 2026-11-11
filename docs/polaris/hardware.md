@@ -18,7 +18,7 @@ that a new installation has passed a full device test.
 | GPU | Polaris firmware package and kernel support | Short OpenGL (FD630) and Vulkan (Turnip Adreno 630) render tests pass at scale 1; vkmark times out at scale 3 |
 | Video decoding | Device-patched FFmpeg V4L2 M2M | Complete silent 180-second 1080p H.264 and HEVC 8-bit clips decode with all frames and no errors |
 | USB | NCM/SSH in the system; ACM+NCM/SSH in recovery; optional system ACM | Configured; validate the selected transport on hardware |
-| Wi-Fi and modem | Firmware and QRTR/RMTFS services through [`androidDevices.modem`](../modem.md); optional per-phone calibration and identity | Fresh access-point scan passes with per-phone data; connections untested |
+| Wi-Fi and modem | Firmware and QRTR/RMTFS services through [`androidDevices.modem`](../modem.md); per-phone [calibration snapshot](radio-snapshot.md) and identity required | With a complete snapshot: access-point scan, WPA2 association, DHCP lease and HTTPS requests pass; 270 Mbit/s VHT-MCS 6 40 MHz NSS 2 receive rate at -54 dBm |
 | Bluetooth | Early firmware and optional per-phone identity | Fresh nearby-device scan passes; no pairing or connection tested |
 | Audio | ADSP service descriptors, TAS2559 driver, ALSA UCM and PCM sample alignment | Physical X2S card and MultiMedia1/2 PCM detection passes; basic tests do not play or record audio |
 | Camera | Main rear IMX363 and front OV5675 through CAMSS and libcamera | Both enumerate and capture real images; front 1296×972 and rear 1920×1080 output tested, including capture as `demo` |
@@ -29,9 +29,14 @@ The default FFmpeg is upstream nixpkgs. The direct V4L2 results in this document
 refer to the retained device-patched diagnostic build; select it explicitly as
 shown in [optional FFmpeg](../video.md#optional-restricted-ffmpeg).
 
-An intermittent modem startup XPU fault can prevent Wi-Fi initialization after
-reboot. RMTFS keeps calibration writes in RAM; its backing snapshot stays
-read-only. Complete poweroff remains unverified.
+An incomplete calibration snapshot makes MPSS fatal-error about every 40 seconds
+and restart, so `wlan0` never appears even though the Wi-Fi probe itself
+succeeds; `rmtfs` logs the file it could not open. See
+[radio calibration snapshot](radio-snapshot.md). With a complete snapshot the
+modem stayed up for hours without a crash. One boot hung before USB enumeration
+and recovered from a forced power cycle; it did not recur. RMTFS keeps
+calibration writes in RAM; its backing snapshot stays read-only. Complete
+poweroff remains unverified.
 
 ## Cameras
 

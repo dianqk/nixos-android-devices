@@ -27,6 +27,7 @@ Follow [U-Boot installation](u-boot-install.md) for the complete sequence.
 
 - Users, desktops, applications and services: [configuration](configuration.md).
 - USB networking, SSH and `nixos-rebuild boot`: [connect and update](usb-signaller.md).
+- Polaris radio calibration snapshot for Wi-Fi and the modem: [radio snapshot](polaris/radio-snapshot.md).
 - Polaris generation selection and menu settings: [boot menu](polaris/boot-menu.md).
 - Polaris/Clover pre-Linux power and reboot targets: [boot actions](boot-actions.md).
 - Failed boots, target mounts and offline updates: [RAM recovery](recovery.md).

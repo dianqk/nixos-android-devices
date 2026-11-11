@@ -29,7 +29,8 @@
 `hardware.polaris.radio.identityFile` 指定设备上的 Wi-Fi 地址文件，
 `snapshotDirectory` 指向已核对的只读校准快照，`bluetoothIdentityFile` 指定蓝牙地址。
 这些都是手机上的路径，不是构建输入文件。模块不会采集校准数据或生成出厂身份；
-未配置快照目录时不启动 RMTFS。快照经由共享[基带服务](../modem.zh.md)以
+未配置快照目录时不启动 RMTFS，基带服务也不会安装，Wi-Fi 同样会缺少固件服务。
+快照必须包含哪些文件见[基带校准快照](radio-snapshot.zh.md)。快照经由共享[基带服务](../modem.zh.md)以
 `modem-rmtfs.service` 和 `modem-tqftpserv.service` 提供。缺少已核实无线数据时先使用 USB 控制台配置。
 NetworkManager、Bluetooth 和 PipeWire 使用标准 NixOS 选项启用。
 

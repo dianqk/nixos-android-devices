@@ -16,7 +16,7 @@
 | GPU | Polaris 固件包与内核支持 | 1 倍缩放下 OpenGL（FD630）和 Vulkan（Turnip Adreno 630）短场景渲染通过；3 倍下 vkmark 超时 |
 | 视频解码 | 带设备补丁的 FFmpeg V4L2 M2M | 180 秒 1080p H.264／HEVC 8-bit 无声视频完整硬解，帧数齐全且无解码错误 |
 | USB | 正常系统 NCM/SSH；recovery ACM+NCM/SSH；系统 ACM 可选 | 已配置，所选传输方式需在实机验证 |
-| Wi-Fi 与调制解调器 | 固件和经由 [`androidDevices.modem`](../modem.zh.md) 的 QRTR/RMTFS 服务；逐机校准与身份数据可选配置 | 提供逐机数据后，实时热点扫描通过；未测试连接 |
+| Wi-Fi 与调制解调器 | 固件和经由 [`androidDevices.modem`](../modem.zh.md) 的 QRTR/RMTFS 服务；必须提供逐机[校准快照](radio-snapshot.zh.md)与身份数据 | 快照完整时：热点扫描、WPA2 关联、DHCP 取址与 HTTPS 请求均通过；-54 dBm 下接收速率 270 Mbit/s（VHT-MCS 6 40 MHz NSS 2）|
 | 蓝牙 | 早期固件与可选的逐机身份配置 | 实时扫描附近设备通过；未测试配对或连接 |
 | 音频 | ADSP 服务描述文件、TAS2559 驱动、ALSA UCM、PCM 采样对齐 | 物理 X2S 声卡及 MultiMedia1/2 PCM 检测通过；基础测试不播放或录音 |
 | 相机 | 后置主摄 IMX363 与前置 OV5675，通过 CAMSS 和 libcamera 接入 | 两颗均可枚举并拍摄实际图像；已测试前摄 1296×972、后摄 1920×1080 输出，以及 `demo` 用户拍照 |
@@ -26,7 +26,10 @@
 FFmpeg 默认使用上游 nixpkgs。本文直接 V4L2 的验证记录针对保留的设备补丁版，
 诊断时需按[可选 FFmpeg](../video.zh.md) 显式选择。
 
-重启后 modem 启动偶发 XPU 故障，可能导致 Wi-Fi 初始化失败。
+校准快照不完整时 MPSS 每 40 秒左右 fatal error 一次并自动重启，`wlan0` 因此
+始终不出现——即使 Wi-Fi 本身的 probe 全部成功；`rmtfs` 会记录它打不开的文件。
+详见[基带校准快照](radio-snapshot.zh.md)。快照完整时基带连续运行数小时无崩溃。
+测试机上曾有一次开机在 USB 枚举之前卡住，强制断电重启后恢复，未再复现。
 RMTFS 的校准写入仅保存在内存中，底层快照保持只读。完整断电仍未验证。
 
 ## 相机
