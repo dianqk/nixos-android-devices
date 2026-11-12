@@ -31,7 +31,10 @@ set `hardware.polaris.radio.identityFile` to the device-side Wi-Fi address file,
 `snapshotDirectory` to the verified read-only calibration snapshot, and
 `bluetoothIdentityFile` to the Bluetooth address file. These paths refer to files
 on the phone, not build-input files. The module does not collect calibration or
-invent factory identities. With no snapshot directory, RMTFS does not start.
+invent factory identities. With no snapshot directory, RMTFS does not start and
+the modem services are left out, which also leaves Wi-Fi without a firmware
+service. See [radio calibration snapshot](radio-snapshot.md) for the files the
+snapshot must contain.
 The snapshot is served through the shared [modem services](../modem.md) as
 `modem-rmtfs.service` and `modem-tqftpserv.service`.
 If you do not have verified radio data, start with the USB console configuration.
