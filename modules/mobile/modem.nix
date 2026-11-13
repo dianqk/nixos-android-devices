@@ -239,11 +239,19 @@ in
     # 9317cbc4 (MR !1509) is on main only; drop this once nixpkgs ships a
     # release containing it. Only the daemon uses this package; clients such
     # as NetworkManager keep the stock libmm-glib.
+    #
+    # Firmware on SDM845 and later (IPA data path) additionally refuses to
+    # start a PS call for a WDS client that was never bound to a subscription:
+    # registration and PS attach look healthy, but every Start Network returns
+    # QMI CallFailed with verbose call end reason (3, 2001) [cm] no-service.
+    # Android's RIL sends WDS Bind Subscription first; ModemManager does not.
+    # The call is skipped gracefully by firmware that does not implement it.
     networking.modemmanager.package = lib.mkIf cfg.modemManager (
       lib.mkDefault (
         pkgs.modemmanager.overrideAttrs (old: {
           patches = (old.patches or [ ]) ++ [
             ../../pkgs/modemmanager/netlink-transaction-use-after-free.patch
+            ../../pkgs/modemmanager/bind-wds-subscription.patch
           ];
         })
       )

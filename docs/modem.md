@@ -32,7 +32,7 @@ enable a device option rather than these modules directly:
 | `crashRecovery` | `false` | Let the kernel restart MPSS after a crash. |
 | `timeSyncTimeout` | `120` | Seconds to wait for NTP synchronization before starting MPSS; `0` disables the wait. |
 | `simProvisioning` | `true` | Activate the primary GW provisioning session for the first USIM if the modem has not. |
-| `modemManager` | `true` | Enable ModemManager (with a bundled netlink fix) and start it with MPSS. |
+| `modemManager` | `true` | Enable ModemManager and start it with MPSS. The packaged daemon carries two local fixes: the netlink transaction use-after-free that crashed it on the first QMAP data connection, and the `WDS Bind Subscription` needed before `Start Network` on SDM845-and-later firmware (otherwise every data call ends with `cm error: no-service`). |
 | `firmware` | `[ ]` | Modem firmware packages, installed in the root file system only. |
 | `rmtfsPackage`, `tqftpservPackage` | packaged defaults | Replace rmtfs or tqftpserv. |
 | `rmtfsVerbose`, `rmtfsMemoryDevice` | `true`, `/dev/qcom_rmtfs_mem1` | rmtfs logging and shared-memory device. |
@@ -45,6 +45,19 @@ stopped.
 
 Back up the NV partitions before setting `allowNvWrites = true`, and never
 restore another handset's NV data.
+
+### SIM provisioning needs written NV
+
+Activating the primary GW provisioning session writes to the modem's NV
+(session index and card state). With read-only NV the firmware answers
+`QMI error (3): Internal`, which reads like a power or SIM problem but is not:
+the card stays readable (ICCID, applications) and its supply can be toggled
+through `--uim-sim-power-on/off`. Pair `simProvisioning = true` with
+`allowNvWrites = true` when the modem has no session of its own.
+
+Cellular data also needs NetworkManager to own the connection: a bearer that
+ModemManager starts directly comes up but passes no traffic, while an NM `gsm`
+profile with the carrier APN configures the QMAP interface and routes.
 
 ## `androidDevices.qtee`
 

@@ -32,7 +32,7 @@ remoteproc、NV 存储和固件由设备模块提供；通常只需启用设备�
 | `crashRecovery` | `false` | 基带崩溃后由内核自动重启 MPSS。 |
 | `timeSyncTimeout` | `120` | 启动 MPSS 前等待 NTP 同步的秒数；`0` 关闭等待。 |
 | `simProvisioning` | `true` | 若基带未自行激活，为第一张 USIM 激活主 GW provisioning 会话。 |
-| `modemManager` | `true` | 启用 ModemManager（附带 netlink 修复）并随 MPSS 启动。 |
+| `modemManager` | `true` | 启用 ModemManager 并随 MPSS 启动。打包的守护进程带两个本地修复：netlink 事务 use-after-free（第一次 QMAP 数据连接会崩），以及 SDM845 及之后固件在 `Start Network` 之前必须的 `WDS Bind Subscription`（否则每次数据呼叫都以 `cm error: no-service` 结束）。 |
 | `firmware` | `[ ]` | 基带固件包，只安装在根文件系统中。 |
 | `rmtfsPackage`、`tqftpservPackage` | 打包的默认值 | 替换 rmtfs 或 tqftpserv。 |
 | `rmtfsVerbose`、`rmtfsMemoryDevice` | `true`、`/dev/qcom_rmtfs_mem1` | rmtfs 日志与共享内存设备。 |
@@ -43,6 +43,16 @@ remoteproc、NV 存储和固件由设备模块提供；通常只需启用设备�
 崩溃的 MPSS 保持原状，不会被停止。
 
 设置 `allowNvWrites = true` 前先备份 NV 分区，切勿恢复其他手机的 NV 数据。
+
+### SIM 会话需要能写 NV
+
+激活 primary GW provisioning 会话会写基带 NV（会话索引与卡状态）。NV 只读时固件回
+`QMI error (3): Internal`，看起来像供电或 SIM 故障，其实不是：卡照样读得到
+（ICCID、应用列表），供电也能用 `--uim-sim-power-on/off` 切换。
+当基带自己不会建会话时，`simProvisioning = true` 要配 `allowNvWrites = true`。
+
+蜂窝数据还需要让 NetworkManager 接管连接：ModemManager 直接起的承载能连上但没有流量；
+用 NM 的 `gsm` profile（填运营商 APN）才会配置 QMAP 接口与路由。
 
 ## `androidDevices.qtee`
 
