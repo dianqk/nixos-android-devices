@@ -1,0 +1,593 @@
+Subject: [PATCH] soundwire: qcom: restore enumeration after clock context loss
+
+Unicorn RX loses its auto-enumeration table over an idle clock cycle. A
+registered WCD938x at device 2 reappears at the enumeration address, while
+the old resume path returns success and later reads return stale ID data.
+Detect loss of previously attached, bound peripherals before depreparing
+clock stop. Reset and re-enumerate using the existing reset-capable path,
+waiting for bound peripherals rather than the first enumeration IRQ.
+Process reattached peripheral status in a PM-referenced worker after the
+manager resume callback completes. Alert handling can synchronously resume
+a peripheral, so doing it inside manager resume deadlocks against itself.
+Defer IRQ status handling while the manager is resuming as well. Account
+for peripherals already reporting ALERT at enumeration, delivering their
+initial ATTACHED transition before processing the alert. Only signal
+enumeration completion after device zero has gone away and IDs are valid.
+Make WCD938x resume wait for initialization after a manager reset before
+restoring registers or accepting a new stream. The asynchronous manager
+status worker uses no-PM bus operations and can complete this initialization
+while the peripheral PM callback is waiting.
+Keep runtime PM and the ordinary retained-context clock-stop path enabled.
+
+Compute reset requirements at suspend time, after peripheral properties
+are available, instead of overwriting the flag for each enumeration entry.
+Propagate clock/resume/deprepare failures and balance clocks on failure.
+Reject debugfs accesses when peripheral resume fails or it is unassigned;
+ignoring -EACCES on an unbound peripheral can access a clock-gated manager.
+A peripheral without a bound/initialized driver has no verified clock-stop
+capabilities. Use reset recovery for such a bus instead of interpreting its
+zero-initialized properties as support for the extended clock-stop protocol.
+On Unicorn, unbound 0217:f001 remains SCP_STAT.CLK_STP_NF=1 after deprepare,
+while WCD938x reports ready. This is separate from lost manager context.
+Before gating a bus containing unbound peripherals, issue ClockStopNow and
+mask bus-clash interrupts. Reset on resume replaces the unsupported extended
+prepare/deprepare negotiation; it must not leave an active bus running until
+its clock is removed. Keep the pre-existing mode-1-only path unchanged.
+For pre-v2 managers, match Qualcomm's reset recovery sequence: reset the
+component twice and request a bus reset before restarting frame generation.
+Resetting only the manager table leaves peripheral protocol state from the
+previous session, with parity faults during re-enumeration. The explicit
+bus-reset request is present in the pinned OEM controller implementation.
+Do not write legacy bus-reset control on v2 controllers.
+No guessed peripheral capabilities or private data are introduced.
+
+diff --git a/drivers/soundwire/qcom.c b/drivers/soundwire/qcom.c
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -5,6 +5,9 @@
+ #include <linux/completion.h>
+ #include <linux/interrupt.h>
+ #include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/workqueue.h>
++#include <linux/string.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/debugfs.h>
+@@ -94,6 +97,7 @@
+ #define SWRM_MCP_FRAME_CTRL_BANK_COL_CTRL_BMSK			GENMASK(2, 0)
+ #define SWRM_MCP_FRAME_CTRL_BANK_ROW_CTRL_BMSK			GENMASK(7, 3)
+ #define SWRM_MCP_BUS_CTRL					0x1044
++#define SWRM_MCP_BUS_RESET					BIT(0)
+ #define SWRM_MCP_BUS_CLK_START					BIT(1)
+ #define SWRM_MCP_CFG_ADDR					0x1048
+ #define SWRM_MCP_CFG_MAX_NUM_OF_CMD_NO_PINGS_BMSK		GENMASK(21, 17)
+@@ -221,6 +225,9 @@
+ 	u32 slave_status;
+ 	u32 wr_fifo_depth;
+ 	bool clock_stop_not_supported;
++	u32 suspended_slave_status;
++	struct work_struct status_work;
++	struct mutex status_lock;
+ };
+ 
+ struct qcom_swrm_data {
+@@ -624,7 +631,7 @@
+ 	status = (status >> (devnum * SWRM_MCP_SLV_STATUS_SZ));
+ 	status &= SWRM_MCP_SLV_STATUS_MASK;
+ 
+-	if (status == SDW_SLAVE_ATTACHED) {
++	if (status == SDW_SLAVE_ATTACHED || status == SDW_SLAVE_ALERT) {
+ 		if (slave)
+ 			slave->dev_num = devnum;
+ 		mutex_lock(&bus->bus_lock);
+@@ -656,7 +663,7 @@
+ 		ctrl->reg_read(ctrl, SWRM_ENUMERATOR_SLAVE_DEV_ID_2(i), &val2);
+ 
+ 		if (!val1 && !val2)
+-			break;
++			return 0;
+ 
+ 		addr = buf2[1] | (buf2[0] << 8) | (buf1[3] << 16) |
+ 			((u64)buf1[2] << 24) | ((u64)buf1[1] << 32) |
+@@ -664,14 +671,10 @@
+ 
+ 		sdw_extract_slave_id(bus, addr, &id);
+ 		found = false;
+-		ctrl->clock_stop_not_supported = false;
+ 		/* Now compare with entries */
+ 		list_for_each_entry_safe(slave, _s, &bus->slaves, node) {
+ 			if (sdw_compare_devid(slave, id) == 0) {
+ 				qcom_swrm_set_slave_dev_num(bus, slave, i);
+-				if (slave->prop.clk_stop_mode1)
+-					ctrl->clock_stop_not_supported = true;
+-
+ 				found = true;
+ 				break;
+ 			}
+@@ -683,8 +686,71 @@
+ 		}
+ 	}
+ 
+-	complete(&ctrl->enumeration);
++	/* Device zero still attached means auto-enumeration is not finished. */
++	if (ctrl->status[0] == SDW_SLAVE_UNATTACHED)
++		complete(&ctrl->enumeration);
+ 	return 0;
++}
++
++/* An enumerated peripheral may already have a pending SCP alert. */
++static void qcom_swrm_process_status(struct qcom_swrm_ctrl *ctrl,
++				   enum sdw_slave_status *status)
++{
++	enum sdw_slave_status initial[SDW_MAX_DEVICES + 1];
++	struct sdw_slave *slave;
++	bool attach = false;
++
++	memcpy(initial, status, sizeof(initial));
++	mutex_lock(&ctrl->bus.bus_lock);
++	list_for_each_entry(slave, &ctrl->bus.slaves, node) {
++		if (slave->dev_num && slave->status == SDW_SLAVE_UNATTACHED &&
++		    status[slave->dev_num] == SDW_SLAVE_ALERT) {
++			initial[slave->dev_num] = SDW_SLAVE_ATTACHED;
++			attach = true;
++		}
++	}
++	mutex_unlock(&ctrl->bus.bus_lock);
++	if (attach)
++		sdw_handle_slave_status(&ctrl->bus, initial);
++	sdw_handle_slave_status(&ctrl->bus, status);
++}
++
++/* Slave alert handling may resume a peripheral and thus its manager. */
++static void qcom_swrm_handle_status(struct qcom_swrm_ctrl *ctrl)
++{
++	if (pm_runtime_enabled(ctrl->dev) && !pm_runtime_active(ctrl->dev)) {
++		schedule_work(&ctrl->status_work);
++		return;
++	}
++
++	mutex_lock(&ctrl->status_lock);
++	qcom_swrm_process_status(ctrl, ctrl->status);
++	mutex_unlock(&ctrl->status_lock);
++}
++
++static void qcom_swrm_status_work(struct work_struct *work)
++{
++	struct qcom_swrm_ctrl *ctrl = container_of(work, struct qcom_swrm_ctrl,
++						status_work);
++	enum sdw_slave_status status[SDW_MAX_DEVICES + 1];
++	u32 value;
++	int i, ret;
++
++	/* Wait outside the resume callback until the manager is fully active. */
++	ret = pm_runtime_resume_and_get(ctrl->dev);
++	if (ret < 0)
++		return;
++
++	mutex_lock(&ctrl->status_lock);
++	ctrl->reg_read(ctrl, SWRM_MCP_SLV_STATUS, &value);
++	for (i = 0; i <= SDW_MAX_DEVICES; i++)
++		status[i] = (value >> (i * SWRM_MCP_SLV_STATUS_SZ)) &
++			    SWRM_MCP_SLV_STATUS_MASK;
++	/* Do not consume the IRQ handler's cached enumeration state. */
++	qcom_swrm_process_status(ctrl, status);
++	mutex_unlock(&ctrl->status_lock);
++	pm_runtime_mark_last_busy(ctrl->dev);
++	pm_runtime_put_autosuspend(ctrl->dev);
+ }
+ 
+ static irqreturn_t qcom_swrm_wake_irq_handler(int irq, void *dev_id)
+@@ -738,7 +804,7 @@
+ 					dev_err_ratelimited(ctrl->dev,
+ 					    "no slave alert found.spurious interrupt\n");
+ 				} else {
+-					sdw_handle_slave_status(&ctrl->bus, ctrl->status);
++					qcom_swrm_handle_status(ctrl);
+ 				}
+ 
+ 				break;
+@@ -752,7 +818,7 @@
+ 				} else {
+ 					qcom_swrm_get_device_status(ctrl);
+ 					qcom_swrm_enumerate(&ctrl->bus);
+-					sdw_handle_slave_status(&ctrl->bus, ctrl->status);
++					qcom_swrm_handle_status(ctrl);
+ 				}
+ 				break;
+ 			case SWRM_INTERRUPT_STATUS_MASTER_CLASH_DET:
+@@ -1610,6 +1676,8 @@
+ 	ctrl->dev = dev;
+ 	dev_set_drvdata(&pdev->dev, ctrl);
+ 	mutex_init(&ctrl->port_lock);
++	mutex_init(&ctrl->status_lock);
++	INIT_WORK(&ctrl->status_work, qcom_swrm_status_work);
+ 	init_completion(&ctrl->broadcast);
+ 	init_completion(&ctrl->enumeration);
+ 
+@@ -1715,13 +1783,119 @@
+ {
+ 	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(&pdev->dev);
+ 
++	disable_irq(ctrl->irq);
++	cancel_work_sync(&ctrl->status_work);
+ 	sdw_bus_master_delete(&ctrl->bus);
+ 	clk_disable_unprepare(ctrl->hclk);
+ }
+ 
++/* Unbound peripherals have no initialized clock-stop capabilities. */
++static bool qcom_swrm_needs_reset(struct qcom_swrm_ctrl *ctrl)
++{
++	struct sdw_slave *slave;
++	bool reset = false;
++
++	mutex_lock(&ctrl->bus.bus_lock);
++	list_for_each_entry(slave, &ctrl->bus.slaves, node) {
++		if (!slave->probed || slave->prop.clk_stop_mode1) {
++			reset = true;
++			break;
++		}
++	}
++	mutex_unlock(&ctrl->bus.bus_lock);
++
++	return reset;
++}
++
++static bool qcom_swrm_slave_present(u32 status, unsigned int dev_num)
++{
++	u32 state = (status >> (dev_num * SWRM_MCP_SLV_STATUS_SZ)) &
++		    SWRM_MCP_SLV_STATUS_MASK;
++
++	return state == SDW_SLAVE_ATTACHED || state == SDW_SLAVE_ALERT;
++}
++
++static bool qcom_swrm_context_lost(struct qcom_swrm_ctrl *ctrl, u32 status)
++{
++	struct sdw_slave *slave;
++	bool lost = false;
++
++	mutex_lock(&ctrl->bus.bus_lock);
++	list_for_each_entry(slave, &ctrl->bus.slaves, node) {
++		if (!slave->probed || !slave->dev_num)
++			continue;
++		if (qcom_swrm_slave_present(ctrl->suspended_slave_status,
++					  slave->dev_num) &&
++		    !qcom_swrm_slave_present(status, slave->dev_num)) {
++			lost = true;
++			break;
++		}
++	}
++	mutex_unlock(&ctrl->bus.bus_lock);
++
++	return lost;
++}
++
++static bool qcom_swrm_peripherals_ready(struct qcom_swrm_ctrl *ctrl)
++{
++	struct sdw_slave *slave;
++	u32 status;
++	bool ready = true;
++
++	/* Do not update slave_status here: the IRQ must observe the change. */
++	ctrl->reg_read(ctrl, SWRM_MCP_SLV_STATUS, &status);
++	mutex_lock(&ctrl->bus.bus_lock);
++	list_for_each_entry(slave, &ctrl->bus.slaves, node) {
++		if (!slave->probed)
++			continue;
++		if (!slave->dev_num ||
++		    !qcom_swrm_slave_present(status, slave->dev_num)) {
++			ready = false;
++			break;
++		}
++	}
++	mutex_unlock(&ctrl->bus.bus_lock);
++
++	return ready;
++}
++
++static int qcom_swrm_reenumerate(struct qcom_swrm_ctrl *ctrl)
++{
++	bool ready;
++	int ret;
++
++	sdw_clear_slave_status(&ctrl->bus, SDW_UNATTACH_REQUEST_MASTER_RESET);
++	reinit_completion(&ctrl->enumeration);
++	ctrl->reg_write(ctrl, SWRM_COMP_SW_RESET, 0x01);
++	if (ctrl->version < SWRM_VERSION_2_0_0)
++		ctrl->reg_write(ctrl, SWRM_COMP_SW_RESET, 0x01);
++	usleep_range(100, 105);
++	/* The component reset alone does not reset peripheral protocol state. */
++	if (ctrl->version < SWRM_VERSION_2_0_0)
++		ctrl->reg_write(ctrl, SWRM_MCP_BUS_CTRL, SWRM_MCP_BUS_RESET);
++	qcom_swrm_init(ctrl);
++	usleep_range(100, 105);
++	if (!swrm_wait_for_frame_gen_enabled(ctrl))
++		return -ETIMEDOUT;
++
++	if (!wait_for_completion_timeout(&ctrl->enumeration,
++					 msecs_to_jiffies(TIMEOUT_MS)))
++		return -ETIMEDOUT;
++
++	ret = read_poll_timeout(qcom_swrm_peripherals_ready, ready, ready,
++				1000, TIMEOUT_MS * 1000, false, ctrl);
++	if (ret)
++		return ret;
++
++	/* Processing alerts here could wait for this very resume callback. */
++	schedule_work(&ctrl->status_work);
++	return 0;
++}
++
+ static int __maybe_unused swrm_runtime_resume(struct device *dev)
+ {
+ 	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(dev);
++	u32 status;
+ 	int ret;
+ 
+ 	if (ctrl->wake_irq > 0) {
+@@ -1729,24 +1903,14 @@
+ 			disable_irq_nosync(ctrl->wake_irq);
+ 	}
+ 
+-	clk_prepare_enable(ctrl->hclk);
++	ret = clk_prepare_enable(ctrl->hclk);
++	if (ret)
++		goto err_wake;
+ 
+ 	if (ctrl->clock_stop_not_supported) {
+-		reinit_completion(&ctrl->enumeration);
+-		ctrl->reg_write(ctrl, SWRM_COMP_SW_RESET, 0x01);
+-		usleep_range(100, 105);
+-
+-		qcom_swrm_init(ctrl);
+-
+-		usleep_range(100, 105);
+-		if (!swrm_wait_for_frame_gen_enabled(ctrl))
+-			dev_err(ctrl->dev, "link failed to connect\n");
+-
+-		/* wait for hw enumeration to complete */
+-		wait_for_completion_timeout(&ctrl->enumeration,
+-					    msecs_to_jiffies(TIMEOUT_MS));
+-		qcom_swrm_get_device_status(ctrl);
+-		sdw_handle_slave_status(&ctrl->bus, ctrl->status);
++		ret = qcom_swrm_reenumerate(ctrl);
++		if (ret)
++			goto err_clk;
+ 	} else {
+ 		reset_control_reset(ctrl->audio_cgcr);
+ 
+@@ -1762,7 +1926,7 @@
+ 			ctrl->reg_write(ctrl, SWRM_MCP_BUS_CTRL, SWRM_MCP_BUS_CLK_START);
+ 		}
+ 		ctrl->reg_write(ctrl, ctrl->reg_layout[SWRM_REG_INTERRUPT_CLEAR],
+-			SWRM_INTERRUPT_STATUS_MASTER_CLASH_DET);
++				SWRM_INTERRUPT_STATUS_MASTER_CLASH_DET);
+ 
+ 		ctrl->intr_mask |= SWRM_INTERRUPT_STATUS_MASTER_CLASH_DET;
+ 		if (ctrl->version < SWRM_VERSION_2_0_0)
+@@ -1773,25 +1937,53 @@
+ 				ctrl->intr_mask);
+ 
+ 		usleep_range(100, 105);
+-		if (!swrm_wait_for_frame_gen_enabled(ctrl))
+-			dev_err(ctrl->dev, "link failed to connect\n");
+-
+-		ret = sdw_bus_exit_clk_stop(&ctrl->bus);
+-		if (ret < 0)
+-			dev_err(ctrl->dev, "bus failed to exit clock stop %d\n", ret);
++		if (!swrm_wait_for_frame_gen_enabled(ctrl)) {
++			ret = -ETIMEDOUT;
++			goto err_clk;
++		}
++
++		ctrl->reg_read(ctrl, SWRM_MCP_SLV_STATUS, &status);
++		if (qcom_swrm_context_lost(ctrl, status)) {
++			dev_info(dev, "restoring SoundWire peripheral enumeration\n");
++			ret = qcom_swrm_reenumerate(ctrl);
++		} else {
++			ret = sdw_bus_exit_clk_stop(&ctrl->bus);
++		}
++		if (ret)
++			goto err_clk;
+ 	}
+ 
+ 	return 0;
++
++err_clk:
++	clk_disable_unprepare(ctrl->hclk);
++err_wake:
++	if (ctrl->wake_irq > 0 &&
++	    irqd_irq_disabled(irq_get_irq_data(ctrl->wake_irq)))
++		enable_irq(ctrl->wake_irq);
++	return ret;
+ }
+ 
+ static int __maybe_unused swrm_runtime_suspend(struct device *dev)
+ {
+ 	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(dev);
+ 	int ret;
+-
++	bool unbound = false;
++	struct sdw_slave *slave;
++
++	ctrl->clock_stop_not_supported = qcom_swrm_needs_reset(ctrl);
++	mutex_lock(&ctrl->bus.bus_lock);
++	list_for_each_entry(slave, &ctrl->bus.slaves, node) {
++		if (!slave->probed) {
++			unbound = true;
++			break;
++		}
++	}
++	mutex_unlock(&ctrl->bus.bus_lock);
++	ctrl->reg_read(ctrl, SWRM_MCP_SLV_STATUS, &ctrl->suspended_slave_status);
+ 	swrm_wait_for_wr_fifo_done(ctrl);
+-	if (!ctrl->clock_stop_not_supported) {
+-		/* Mask bus clash interrupt */
++	if (!ctrl->clock_stop_not_supported || unbound) {
++		/* Mask bus clash interrupt before stopping the bus. */
+ 		ctrl->intr_mask &= ~SWRM_INTERRUPT_STATUS_MASTER_CLASH_DET;
+ 		if (ctrl->version < SWRM_VERSION_2_0_0)
+ 			ctrl->reg_write(ctrl,
+@@ -1799,6 +1991,8 @@
+ 					ctrl->intr_mask);
+ 		ctrl->reg_write(ctrl, ctrl->reg_layout[SWRM_REG_INTERRUPT_CPU_EN],
+ 				ctrl->intr_mask);
++	}
++	if (!ctrl->clock_stop_not_supported) {
+ 		/* Prepare slaves for clock stop */
+ 		ret = sdw_bus_prep_clk_stop(&ctrl->bus);
+ 		if (ret < 0 && ret != -ENODATA) {
+@@ -1806,6 +2000,9 @@
+ 			return ret;
+ 		}
+ 
++	}
++	/* Reset recovery must still quiesce an unbound peripheral's live bus. */
++	if (!ctrl->clock_stop_not_supported || unbound) {
+ 		ret = sdw_bus_clk_stop(&ctrl->bus);
+ 		if (ret < 0 && ret != -ENODATA) {
+ 			dev_err(dev, "bus clock stop failed %d", ret);
+diff --git a/drivers/soundwire/bus.c b/drivers/soundwire/bus.c
+--- a/drivers/soundwire/bus.c
++++ b/drivers/soundwire/bus.c
+@@ -1188,7 +1188,7 @@
+ 	bool simple_clk_stop = true;
+ 	struct sdw_slave *slave;
+ 	bool is_slave = false;
+-	int ret;
++	int ret, first_error = 0;
+ 
+ 	/*
+ 	 * In order to save on transition time, de-prepare
+@@ -1208,8 +1208,11 @@
+ 
+ 		ret = sdw_slave_clk_stop_callback(slave, SDW_CLK_STOP_MODE0,
+ 						  SDW_CLK_PRE_DEPREPARE);
+-		if (ret < 0)
++		if (ret < 0) {
+ 			dev_warn(&slave->dev, "clock stop pre-deprepare cb failed:%d\n", ret);
++			if (!first_error)
++				first_error = ret;
++		}
+ 
+ 		/* Only de-prepare a Slave device if needed */
+ 		if (!slave->prop.simple_clk_stop_capable) {
+@@ -1218,8 +1221,11 @@
+ 			ret = sdw_slave_clk_stop_prepare(slave, SDW_CLK_STOP_MODE0,
+ 							 false);
+ 
+-			if (ret < 0)
++			if (ret < 0) {
+ 				dev_warn(&slave->dev, "clock stop deprepare failed:%d\n", ret);
++				if (!first_error)
++					first_error = ret;
++			}
+ 		}
+ 	}
+ 
+@@ -1233,8 +1239,11 @@
+ 	 */
+ 	if (!simple_clk_stop) {
+ 		ret = sdw_bus_wait_for_clk_prep_deprep(bus, SDW_BROADCAST_DEV_NUM, false);
+-		if (ret < 0)
++		if (ret < 0) {
+ 			dev_warn(bus->dev, "clock stop deprepare wait failed:%d\n", ret);
++			if (!first_error)
++				first_error = ret;
++		}
+ 	}
+ 
+ 	list_for_each_entry(slave, &bus->slaves, node) {
+@@ -1247,11 +1256,14 @@
+ 
+ 		ret = sdw_slave_clk_stop_callback(slave, SDW_CLK_STOP_MODE0,
+ 						  SDW_CLK_POST_DEPREPARE);
+-		if (ret < 0)
++		if (ret < 0) {
+ 			dev_warn(&slave->dev, "clock stop post-deprepare cb failed:%d\n", ret);
+-	}
+-
+-	return 0;
++			if (!first_error)
++				first_error = ret;
++		}
++	}
++
++	return first_error;
+ }
+ EXPORT_SYMBOL(sdw_bus_exit_clk_stop);
+ 
+diff --git a/drivers/soundwire/debugfs.c b/drivers/soundwire/debugfs.c
+--- a/drivers/soundwire/debugfs.c
++++ b/drivers/soundwire/debugfs.c
+@@ -47,6 +47,25 @@
+ 				"%3x\t%2x\n", reg, value);
+ }
+ 
++/* Never access an unpowered, unbound or unassigned peripheral. */
++static int sdw_debugfs_resume(struct sdw_slave *slave)
++{
++	int ret;
++
++	ret = pm_runtime_resume_and_get(&slave->dev);
++	if (ret < 0)
++		return ret;
++
++	if (!slave->dev_num ||
++	    (slave->status != SDW_SLAVE_ATTACHED &&
++	     slave->status != SDW_SLAVE_ALERT)) {
++		pm_runtime_put(&slave->dev);
++		return -ENODEV;
++	}
++
++	return 0;
++}
++
+ static int sdw_slave_reg_show(struct seq_file *s_file, void *data)
+ {
+ 	struct sdw_slave *slave = s_file->private;
+@@ -57,11 +76,9 @@
+ 	if (!buf)
+ 		return -ENOMEM;
+ 
+-	ret = pm_runtime_get_sync(&slave->dev);
+-	if (ret < 0 && ret != -EACCES) {
+-		pm_runtime_put_noidle(&slave->dev);
++	ret = sdw_debugfs_resume(slave);
++	if (ret < 0)
+ 		return ret;
+-	}
+ 
+ 	ret = scnprintf(buf, RD_BUF, "Register  Value\n");
+ 
+@@ -258,11 +275,9 @@
+ 	    num_bytes == 0 || num_bytes > MAX_CMD_BYTES)
+ 		return -EINVAL;
+ 
+-	ret = pm_runtime_get_sync(&slave->dev);
+-	if (ret < 0 && ret != -EACCES) {
+-		pm_runtime_put_noidle(&slave->dev);
++	ret = sdw_debugfs_resume(slave);
++	if (ret < 0)
+ 		return ret;
+-	}
+ 
+ 	if (cmd == 0) {
+ 		ret = request_firmware(&fw, firmware_file, &slave->dev);
+diff --git a/sound/soc/codecs/wcd938x-sdw.c b/sound/soc/codecs/wcd938x-sdw.c
+--- a/sound/soc/codecs/wcd938x-sdw.c
++++ b/sound/soc/codecs/wcd938x-sdw.c
+@@ -1247,6 +1247,13 @@
+ 	struct wcd938x_sdw_priv *wcd = dev_get_drvdata(dev);
+ 	int ret;
+ 
++	/* Manager reset completes attachment outside its own PM callback. */
++	if (wcd->sdev->unattach_request) {
++		ret = sdw_slave_wait_for_init(wcd->sdev, 5000);
++		if (ret)
++			return ret;
++	}
++
+ 	if (wcd->regmap) {
+ 		regcache_cache_only(wcd->regmap, false);
+ 		ret = regcache_sync(wcd->regmap);

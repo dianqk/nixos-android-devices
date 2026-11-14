@@ -325,3 +325,14 @@ commands are available through SSH. All supported boards provide the
 [shared `install-initial` flow](initial-install.md) for a prepared empty root and
 FAT boot partition. It installs the EFI generation. Use the
 [separate U-Boot procedure](u-boot-install.md) for firmware and reboot explicitly.
+
+## Whole-userdata Linux layout
+
+`androidDevices.recovery.daemon.linuxOnly` defaults to `false`; Unicorn enables
+it. On supported A/B devices this replaces the entire userdata allocation with
+a Linux ESP and root, leaving other GPT entries unchanged. It rejects
+`--android-userdata` sizes. The CLI and screen first show a read-only plan and
+require explicit erasure confirmation. Both check and write paths preserve the
+original GPT in RAM; `restore-gpt` validates the saved extent and unrelated
+entries before restoring it. GPT restoration does not recover overwritten
+filesystem data. Other devices retain their current preparation flow.

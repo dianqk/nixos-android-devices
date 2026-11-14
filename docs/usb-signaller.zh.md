@@ -161,3 +161,13 @@ CC/VBUS/角色/mux 工作。未实现多接口仲裁。仅完成驱动配置不�
 
 
 软件包补丁和上游细节记录在[软件包说明](../pkgs/usb-signaller/README.md)中。
+
+## 可选扩展模式
+
+现有设备默认保留上游 USB daemon。启用 `usb.signaller.followRole`、MTP、网络共享、
+HID 触摸、镜像存储或 UVC 后，才会选择串行管理 USB 切换的后端。扩展模式目前要求
+`manageRole = true`；由外部端口管理器控制角色的设备保留原后端。两种后端都保护
+已连接的 NBD netboot，拒绝 USB 重配置。USB 网络按接口名和 gadget MAC 匹配，
+主机模式下的网卡可继续由 NetworkManager 管理。配置和测试边界见
+[Unicorn USB](unicorn/usb.zh.md) 与[附加 gadget 模式](unicorn/usb-gadgets.zh.md)，
+其他设备仍需各自进行硬件验收。

@@ -818,6 +818,105 @@ impl Gpt {
         );
         Ok(())
     }
+
+    pub fn linux_only(&self, esp_bytes: u64, minimum_root: u64) -> Result<Vec<Partition>> {
+        ensure!(
+            self.sector == SECTOR,
+            "partition planning supports 4 KiB GPT only"
+        );
+        self.partition("super")?;
+        ensure!(
+            !self
+                .partitions
+                .iter()
+                .any(|p| p.name == "linux" || p.name == "linux-boot"),
+            "Linux partitions already exist"
+        );
+        let user = self.partition("userdata")?;
+        ensure!(
+            [ANDROID, LINUX].contains(&user.kind.as_str()) && user.attributes == 0,
+            "unexpected userdata type/attributes"
+        );
+        ensure!(
+            user.end == self.headers[0].last
+                && self
+                    .partitions
+                    .iter()
+                    .all(|p| p == user || p.end < user.start),
+            "userdata must be the last allocation"
+        );
+        let esp_bytes = if esp_bytes == 0 { 1 << 30 } else { esp_bytes };
+        ensure!(
+            esp_bytes % (1 << 20) == 0 && esp_bytes < user.bytes(),
+            "invalid ESP size"
+        );
+        let root_start = user
+            .start
+            .checked_add(esp_bytes / SECTOR)
+            .context("ESP overflow")?;
+        ensure!(
+            (user.end + 1 - root_start) * SECTOR >= minimum_root,
+            "Linux root is too small"
+        );
+        let free = (1..=self.headers[0].count)
+            .find(|n| {
+                self.tables[0][(n - 1) * 128..n * 128]
+                    .iter()
+                    .all(|b| *b == 0)
+            })
+            .context("no free GPT entry")?;
+        let mut parts: Vec<_> = self
+            .partitions
+            .iter()
+            .filter(|p| *p != user)
+            .cloned()
+            .collect();
+        for (number, name, start, end, kind) in [
+            (user.number, "linux-boot", user.start, root_start - 1, ESP),
+            (free, "linux", root_start, user.end, LINUX),
+        ] {
+            parts.push(Partition {
+                number,
+                name: name.into(),
+                start,
+                end,
+                kind: kind.into(),
+                uuid: new_guid()?,
+                attributes: 0,
+                sector: SECTOR,
+            });
+        }
+        parts.sort_by_key(|p| p.number);
+        Ok(parts)
+    }
+    pub fn check_linux_only_layout(&self, esp_bytes: u64, minimum_root: u64) -> Result<()> {
+        self.partition("super")?;
+        ensure!(
+            !self.partitions.iter().any(|p| p.name == "userdata"),
+            "Linux-only layout still has userdata"
+        );
+        let root = self.partition("linux")?;
+        let esp = self.partition("linux-boot")?;
+        ensure!(
+            root.kind == LINUX && esp.kind == ESP,
+            "unexpected Linux partition types"
+        );
+        ensure!(
+            (esp_bytes == 0 || esp.bytes() == esp_bytes) && root.bytes() >= minimum_root,
+            "invalid Linux/ESP sizes"
+        );
+        ensure!(
+            esp.end + 1 == root.start && root.end == self.headers[0].last,
+            "Linux-only allocation must occupy the disk tail"
+        );
+        ensure!(
+            self.partitions
+                .iter()
+                .all(|p| ["linux", "linux-boot"].contains(&p.name.as_str()) || p.end < esp.start),
+            "other partitions overlap the Linux allocation"
+        );
+        Ok(())
+    }
     pub fn regions(&self, parts: &[Partition]) -> Result<Vec<(u64, Vec<u8>)>> {
         self.regions_with_count(parts, self.headers[0].count)
     }
@@ -2065,5 +2164,35 @@ pub(crate) mod tests {
         drop(file);
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_file(&path);
+    }
+    #[test]
+    fn linux_only_reuses_userdata_and_preserves_other_entries() {
+        let f = fixture();
+        let g = Gpt::read(&f.file, f.size).unwrap();
+        let original_user = g.partition("userdata").unwrap();
+        let parts = g.linux_only(1 << 30, 16 << 30).unwrap();
+        assert!(!parts.iter().any(|p| p.name == "userdata"));
+        let esp = parts.iter().find(|p| p.name == "linux-boot").unwrap();
+        let root = parts.iter().find(|p| p.name == "linux").unwrap();
+        assert_eq!(esp.number, original_user.number);
+        assert_eq!(esp.start, original_user.start);
+        assert_eq!(esp.bytes(), 1 << 30);
+        assert_eq!(root.start, esp.end + 1);
+        assert_eq!(root.end, original_user.end);
+        assert_eq!(esp.bytes() + root.bytes(), original_user.bytes());
+        let original_super = g.partition("super").unwrap().clone();
+        let sentinel = original_super.start * SECTOR;
+        f.file.write_all_at(b"preserve-super", sentinel).unwrap();
+        g.write_split(&f.file, &parts).unwrap();
+        let after = Gpt::read(&f.file, f.size).unwrap();
+        after.check_linux_only_layout(1 << 30, 16 << 30).unwrap();
+        assert_eq!(after.partition("super").unwrap(), &original_super);
+        assert_eq!(read_at(&f.file, sentinel, 14).unwrap(), b"preserve-super");
+        assert_eq!(&after.tables[0][..128], &g.tables[0][..128]);
+        assert_eq!(&after.tables[1][..128], &g.tables[1][..128]);
+        assert!(after.linux_only(1 << 30, 16 << 30).is_err());
+        assert!(after.check_linux_layout(1 << 30, 16 << 30).is_err());
+        assert!(g.linux_only(1, 16 << 30).is_err());
+        assert!(g.linux_only(1 << 30, f.size).is_err());
     }
 }

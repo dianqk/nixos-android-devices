@@ -1,0 +1,3935 @@
+Subject: [PATCH] media: add Xiaomi 12S Pro D-PHY sensor pipelines
+
+Add the board-specific 19.2 MHz S5KJN1 and OV32B40 modes, runtime power
+sequencing and V4L2 exposure/gain controls. Wire ultra, tele and front to
+CCI and CSI PHYs using the OEM module addresses and board regulator map.
+Pass the bit clock to the generic D-PHY API while retaining DDR link
+frequency for the Qualcomm settle-time and clock-scaling calculations.
+
+IMX707 remains disabled: it requires three-trio C-PHY receiver support.
+Register provenance and unverified hardware limitations are documented in
+docs/unicorn/camera.md in the parent nixos-android-devices repository.
+
+diff --git a/drivers/media/i2c/Kconfig b/drivers/media/i2c/Kconfig
+--- a/drivers/media/i2c/Kconfig
++++ b/drivers/media/i2c/Kconfig
+@@ -4,6 +4,17 @@
+ #
+ 
+ if VIDEO_DEV
++
++config VIDEO_UNICORN_SENSORS
++	tristate "Xiaomi 12S Pro S5KJN1 and OV32B40 camera modules"
++	depends on I2C && VIDEO_DEV
++	select V4L2_CCI_I2C
++	select V4L2_FWNODE
++	select VIDEO_V4L2_SUBDEV_API
++	help
++	  Native RAW10 capture for the Unicorn ultra-wide, telephoto and
++	  front camera modules using their stock 19.2 MHz mode settings.
++	  The IMX707 main camera uses C-PHY and is not supported here.
+ 
+ comment "IR I2C driver auto-selected by 'Autoselect ancillary drivers'"
+ 	depends on MEDIA_SUBDRV_AUTOSELECT && I2C && RC_CORE
+diff --git a/drivers/media/i2c/Makefile b/drivers/media/i2c/Makefile
+--- a/drivers/media/i2c/Makefile
++++ b/drivers/media/i2c/Makefile
+@@ -174,3 +174,5 @@
+ obj-$(CONFIG_VIDEO_WM8739) += wm8739.o
+ obj-$(CONFIG_VIDEO_WM8775) += wm8775.o
+ obj-$(CONFIG_VIDEO_INTEL_CVS) += cvs/
++
++obj-$(CONFIG_VIDEO_UNICORN_SENSORS) += unicorn-sensors.o
+diff --git a/drivers/media/i2c/unicorn-sensor-regs.h b/drivers/media/i2c/unicorn-sensor-regs.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/media/i2c/unicorn-sensor-regs.h
+@@ -0,0 +1,2987 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Xiaomi 12S Pro register settings, 19.2 MHz, RAW10 binned modes.
++ * Hardware register data decoded from the stock sensor modules; no OTP,
++ * EEPROM calibration or Android executable code is included.
++ * See docs/unicorn/camera.md in nixos-android-devices for provenance.
++ */
++
++static const struct unicorn_reg s5kjn1_init[] = {
++	{ CCI_REG16(0x6028), 0x4000, 0 },
++	{ CCI_REG16(0x0000), 0x0001, 0 },
++	{ CCI_REG16(0x0000), 0x38e1, 0 },
++	{ CCI_REG16(0x001e), 0x0007, 0 },
++	{ CCI_REG16(0x6028), 0x4000, 0 },
++	{ CCI_REG16(0x6010), 0x0001, 5000 },
++	{ CCI_REG16(0x6226), 0x0001, 10000 },
++	{ CCI_REG16(0x6028), 0x2400, 0 },
++	{ CCI_REG16(0x602a), 0x1354, 0 },
++	{ CCI_REG16(0x6f12), 0x0100, 0 },
++	{ CCI_REG16(0x6f12), 0x7017, 0 },
++	{ CCI_REG16(0x602a), 0x13b2, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x602a), 0x1236, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x602a), 0x1a0a, 0 },
++	{ CCI_REG16(0x6f12), 0x4c0a, 0 },
++	{ CCI_REG16(0x602a), 0x2210, 0 },
++	{ CCI_REG16(0x6f12), 0x3401, 0 },
++	{ CCI_REG16(0x602a), 0x2176, 0 },
++	{ CCI_REG16(0x6f12), 0x6400, 0 },
++	{ CCI_REG16(0x602a), 0x222e, 0 },
++	{ CCI_REG16(0x6f12), 0x0001, 0 },
++	{ CCI_REG16(0x602a), 0x06b6, 0 },
++	{ CCI_REG16(0x6f12), 0x0a00, 0 },
++	{ CCI_REG16(0x602a), 0x06bc, 0 },
++	{ CCI_REG16(0x6f12), 0x1001, 0 },
++	{ CCI_REG16(0x602a), 0x2140, 0 },
++	{ CCI_REG16(0x6f12), 0x0101, 0 },
++	{ CCI_REG16(0x602a), 0x1a0e, 0 },
++	{ CCI_REG16(0x6f12), 0x9600, 0 },
++	{ CCI_REG16(0x6028), 0x4000, 0 },
++	{ CCI_REG16(0xf44e), 0x0011, 0 },
++	{ CCI_REG16(0xf44c), 0x0b0b, 0 },
++	{ CCI_REG16(0xf44a), 0x0006, 0 },
++	{ CCI_REG16(0x0118), 0x0002, 0 },
++	{ CCI_REG16(0x011a), 0x0001, 0 },
++	{ CCI_REG16(0x6028), 0x4000, 0 },
++	{ CCI_REG8(0x0106), 0x0001, 0 },
++	{ CCI_REG16(0x0bcc), 0x0000, 0 },
++};
++
++static const struct unicorn_reg s5kjn1_mode[] = {
++	{ CCI_REG16(0x6028), 0x2400, 0 },
++	{ CCI_REG16(0x602a), 0x1a28, 0 },
++	{ CCI_REG16(0x6f12), 0x4c00, 0 },
++	{ CCI_REG16(0x602a), 0x065a, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x602a), 0x139e, 0 },
++	{ CCI_REG16(0x6f12), 0x0100, 0 },
++	{ CCI_REG16(0x602a), 0x139c, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x602a), 0x13a0, 0 },
++	{ CCI_REG16(0x6f12), 0x0a00, 0 },
++	{ CCI_REG16(0x6f12), 0x0120, 0 },
++	{ CCI_REG16(0x602a), 0x2072, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x602a), 0x1a64, 0 },
++	{ CCI_REG16(0x6f12), 0x0301, 0 },
++	{ CCI_REG16(0x6f12), 0xff00, 0 },
++	{ CCI_REG16(0x602a), 0x19e6, 0 },
++	{ CCI_REG16(0x6f12), 0x0200, 0 },
++	{ CCI_REG16(0x602a), 0x1a30, 0 },
++	{ CCI_REG16(0x6f12), 0x3401, 0 },
++	{ CCI_REG16(0x602a), 0x19fc, 0 },
++	{ CCI_REG16(0x6f12), 0x0b00, 0 },
++	{ CCI_REG16(0x602a), 0x19f4, 0 },
++	{ CCI_REG16(0x6f12), 0x0606, 0 },
++	{ CCI_REG16(0x602a), 0x19f8, 0 },
++	{ CCI_REG16(0x6f12), 0x1010, 0 },
++	{ CCI_REG16(0x602a), 0x1b26, 0 },
++	{ CCI_REG16(0x6f12), 0x6f80, 0 },
++	{ CCI_REG16(0x6f12), 0xa060, 0 },
++	{ CCI_REG16(0x602a), 0x1a3c, 0 },
++	{ CCI_REG16(0x6f12), 0x6207, 0 },
++	{ CCI_REG16(0x602a), 0x1a48, 0 },
++	{ CCI_REG16(0x6f12), 0x6207, 0 },
++	{ CCI_REG16(0x602a), 0x1444, 0 },
++	{ CCI_REG16(0x6f12), 0x2000, 0 },
++	{ CCI_REG16(0x6f12), 0x2000, 0 },
++	{ CCI_REG16(0x602a), 0x144c, 0 },
++	{ CCI_REG16(0x6f12), 0x3f00, 0 },
++	{ CCI_REG16(0x6f12), 0x3f00, 0 },
++	{ CCI_REG16(0x602a), 0x7f6c, 0 },
++	{ CCI_REG16(0x6f12), 0x0100, 0 },
++	{ CCI_REG16(0x6f12), 0x2f00, 0 },
++	{ CCI_REG16(0x6f12), 0xfa00, 0 },
++	{ CCI_REG16(0x6f12), 0x2400, 0 },
++	{ CCI_REG16(0x6f12), 0xe500, 0 },
++	{ CCI_REG16(0x602a), 0x0650, 0 },
++	{ CCI_REG16(0x6f12), 0x0600, 0 },
++	{ CCI_REG16(0x602a), 0x0654, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x602a), 0x1a46, 0 },
++	{ CCI_REG16(0x6f12), 0x8a00, 0 },
++	{ CCI_REG16(0x602a), 0x1a52, 0 },
++	{ CCI_REG16(0x6f12), 0xbf00, 0 },
++	{ CCI_REG16(0x602a), 0x0674, 0 },
++	{ CCI_REG16(0x6f12), 0x0500, 0 },
++	{ CCI_REG16(0x6f12), 0x0500, 0 },
++	{ CCI_REG16(0x6f12), 0x0500, 0 },
++	{ CCI_REG16(0x6f12), 0x0500, 0 },
++	{ CCI_REG16(0x602a), 0x0668, 0 },
++	{ CCI_REG16(0x6f12), 0x0800, 0 },
++	{ CCI_REG16(0x6f12), 0x0800, 0 },
++	{ CCI_REG16(0x6f12), 0x0800, 0 },
++	{ CCI_REG16(0x6f12), 0x0800, 0 },
++	{ CCI_REG16(0x602a), 0x0684, 0 },
++	{ CCI_REG16(0x6f12), 0x4001, 0 },
++	{ CCI_REG16(0x602a), 0x0688, 0 },
++	{ CCI_REG16(0x6f12), 0x4001, 0 },
++	{ CCI_REG16(0x602a), 0x147c, 0 },
++	{ CCI_REG16(0x6f12), 0x1000, 0 },
++	{ CCI_REG16(0x602a), 0x1480, 0 },
++	{ CCI_REG16(0x6f12), 0x1000, 0 },
++	{ CCI_REG16(0x602a), 0x19f6, 0 },
++	{ CCI_REG16(0x6f12), 0x0904, 0 },
++	{ CCI_REG16(0x602a), 0x0812, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x602a), 0x1a02, 0 },
++	{ CCI_REG16(0x6f12), 0x1800, 0 },
++	{ CCI_REG16(0x602a), 0x2148, 0 },
++	{ CCI_REG16(0x6f12), 0x0100, 0 },
++	{ CCI_REG16(0x602a), 0x2042, 0 },
++	{ CCI_REG16(0x6f12), 0x1a00, 0 },
++	{ CCI_REG16(0x602a), 0x0874, 0 },
++	{ CCI_REG16(0x6f12), 0x0100, 0 },
++	{ CCI_REG16(0x602a), 0x09c0, 0 },
++	{ CCI_REG16(0x6f12), 0x2008, 0 },
++	{ CCI_REG16(0x602a), 0x09c4, 0 },
++	{ CCI_REG16(0x6f12), 0x2000, 0 },
++	{ CCI_REG16(0x602a), 0x19fe, 0 },
++	{ CCI_REG16(0x6f12), 0x0e1c, 0 },
++	{ CCI_REG16(0x602a), 0x4d92, 0 },
++	{ CCI_REG16(0x6f12), 0x0100, 0 },
++	{ CCI_REG16(0x602a), 0x8104, 0 },
++	{ CCI_REG16(0x6f12), 0x0100, 0 },
++	{ CCI_REG16(0x602a), 0x4d94, 0 },
++	{ CCI_REG16(0x6f12), 0x0005, 0 },
++	{ CCI_REG16(0x6f12), 0x000a, 0 },
++	{ CCI_REG16(0x6f12), 0x0010, 0 },
++	{ CCI_REG16(0x6f12), 0x0810, 0 },
++	{ CCI_REG16(0x6f12), 0x000a, 0 },
++	{ CCI_REG16(0x6f12), 0x0040, 0 },
++	{ CCI_REG16(0x6f12), 0x0810, 0 },
++	{ CCI_REG16(0x6f12), 0x0810, 0 },
++	{ CCI_REG16(0x6f12), 0x8002, 0 },
++	{ CCI_REG16(0x6f12), 0xfd03, 0 },
++	{ CCI_REG16(0x6f12), 0x0010, 0 },
++	{ CCI_REG16(0x6f12), 0x1510, 0 },
++	{ CCI_REG16(0x602a), 0x3570, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x602a), 0x3574, 0 },
++	{ CCI_REG16(0x6f12), 0x1201, 0 },
++	{ CCI_REG16(0x602a), 0x21e4, 0 },
++	{ CCI_REG16(0x6f12), 0x0400, 0 },
++	{ CCI_REG16(0x602a), 0x21ec, 0 },
++	{ CCI_REG16(0x6f12), 0x1f04, 0 },
++	{ CCI_REG16(0x602a), 0x2080, 0 },
++	{ CCI_REG16(0x6f12), 0x0101, 0 },
++	{ CCI_REG16(0x6f12), 0xff00, 0 },
++	{ CCI_REG16(0x6f12), 0x7f01, 0 },
++	{ CCI_REG16(0x6f12), 0x0001, 0 },
++	{ CCI_REG16(0x6f12), 0x8001, 0 },
++	{ CCI_REG16(0x6f12), 0xd244, 0 },
++	{ CCI_REG16(0x6f12), 0xd244, 0 },
++	{ CCI_REG16(0x6f12), 0x14f4, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x602a), 0x20ba, 0 },
++	{ CCI_REG16(0x6f12), 0x141c, 0 },
++	{ CCI_REG16(0x6f12), 0x111c, 0 },
++	{ CCI_REG16(0x6f12), 0x54f4, 0 },
++	{ CCI_REG16(0x602a), 0x120e, 0 },
++	{ CCI_REG16(0x6f12), 0x1000, 0 },
++	{ CCI_REG16(0x602a), 0x212e, 0 },
++	{ CCI_REG16(0x6f12), 0x0200, 0 },
++	{ CCI_REG16(0x602a), 0x13ae, 0 },
++	{ CCI_REG16(0x6f12), 0x0101, 0 },
++	{ CCI_REG16(0x602a), 0x0718, 0 },
++	{ CCI_REG16(0x6f12), 0x0001, 0 },
++	{ CCI_REG16(0x602a), 0x0710, 0 },
++	{ CCI_REG16(0x6f12), 0x0002, 0 },
++	{ CCI_REG16(0x6f12), 0x0804, 0 },
++	{ CCI_REG16(0x6f12), 0x0100, 0 },
++	{ CCI_REG16(0x602a), 0x1b5c, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x602a), 0x0786, 0 },
++	{ CCI_REG16(0x6f12), 0x7701, 0 },
++	{ CCI_REG16(0x602a), 0x2022, 0 },
++	{ CCI_REG16(0x6f12), 0x0500, 0 },
++	{ CCI_REG16(0x6f12), 0x0500, 0 },
++	{ CCI_REG16(0x602a), 0x1360, 0 },
++	{ CCI_REG16(0x6f12), 0x0100, 0 },
++	{ CCI_REG16(0x602a), 0x1376, 0 },
++	{ CCI_REG16(0x6f12), 0x0100, 0 },
++	{ CCI_REG16(0x6f12), 0x6038, 0 },
++	{ CCI_REG16(0x6f12), 0x7038, 0 },
++	{ CCI_REG16(0x6f12), 0x8038, 0 },
++	{ CCI_REG16(0x602a), 0x1386, 0 },
++	{ CCI_REG16(0x6f12), 0x0b00, 0 },
++	{ CCI_REG16(0x602a), 0x06fa, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x602a), 0x4a94, 0 },
++	{ CCI_REG16(0x6f12), 0x0900, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0300, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0300, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0900, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x602a), 0x0a76, 0 },
++	{ CCI_REG16(0x6f12), 0x1000, 0 },
++	{ CCI_REG16(0x602a), 0x0aee, 0 },
++	{ CCI_REG16(0x6f12), 0x1000, 0 },
++	{ CCI_REG16(0x602a), 0x0b66, 0 },
++	{ CCI_REG16(0x6f12), 0x1000, 0 },
++	{ CCI_REG16(0x602a), 0x0bde, 0 },
++	{ CCI_REG16(0x6f12), 0x1000, 0 },
++	{ CCI_REG16(0x602a), 0x0be8, 0 },
++	{ CCI_REG16(0x6f12), 0x3000, 0 },
++	{ CCI_REG16(0x6f12), 0x3000, 0 },
++	{ CCI_REG16(0x602a), 0x0c56, 0 },
++	{ CCI_REG16(0x6f12), 0x1000, 0 },
++	{ CCI_REG16(0x602a), 0x0c60, 0 },
++	{ CCI_REG16(0x6f12), 0x3000, 0 },
++	{ CCI_REG16(0x6f12), 0x3000, 0 },
++	{ CCI_REG16(0x602a), 0x0cb6, 0 },
++	{ CCI_REG16(0x6f12), 0x0100, 0 },
++	{ CCI_REG16(0x602a), 0x0cf2, 0 },
++	{ CCI_REG16(0x6f12), 0x0001, 0 },
++	{ CCI_REG16(0x602a), 0x0cf0, 0 },
++	{ CCI_REG16(0x6f12), 0x0101, 0 },
++	{ CCI_REG16(0x602a), 0x11b8, 0 },
++	{ CCI_REG16(0x6f12), 0x0100, 0 },
++	{ CCI_REG16(0x602a), 0x11f6, 0 },
++	{ CCI_REG16(0x6f12), 0x0020, 0 },
++	{ CCI_REG16(0x602a), 0x4a74, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0xd8ff, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0xd8ff, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x602a), 0x218e, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x602a), 0x2268, 0 },
++	{ CCI_REG16(0x6f12), 0xf279, 0 },
++	{ CCI_REG16(0x602a), 0x5006, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x602a), 0x500e, 0 },
++	{ CCI_REG16(0x6f12), 0x0100, 0 },
++	{ CCI_REG16(0x602a), 0x4e70, 0 },
++	{ CCI_REG16(0x6f12), 0x2062, 0 },
++	{ CCI_REG16(0x6f12), 0x5501, 0 },
++	{ CCI_REG16(0x602a), 0x06dc, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6f12), 0x0000, 0 },
++	{ CCI_REG16(0x6028), 0x4000, 0 },
++	{ CCI_REG16(0xf46a), 0xae80, 0 },
++	{ CCI_REG16(0x0344), 0x0000, 0 },
++	{ CCI_REG16(0x0346), 0x0000, 0 },
++	{ CCI_REG16(0x0348), 0x1fff, 0 },
++	{ CCI_REG16(0x034a), 0x181f, 0 },
++	{ CCI_REG16(0x034c), 0x0ff0, 0 },
++	{ CCI_REG16(0x034e), 0x0c00, 0 },
++	{ CCI_REG16(0x0350), 0x0008, 0 },
++	{ CCI_REG16(0x0352), 0x0008, 0 },
++	{ CCI_REG16(0x0900), 0x0122, 0 },
++	{ CCI_REG16(0x0380), 0x0002, 0 },
++	{ CCI_REG16(0x0382), 0x0002, 0 },
++	{ CCI_REG16(0x0384), 0x0002, 0 },
++	{ CCI_REG16(0x0386), 0x0002, 0 },
++	{ CCI_REG16(0x0110), 0x1002, 0 },
++	{ CCI_REG16(0x0114), 0x0301, 0 },
++	{ CCI_REG16(0x0116), 0x3000, 0 },
++	{ CCI_REG16(0x0136), 0x1300, 0 },
++	{ CCI_REG16(0x013e), 0x00c8, 0 },
++	{ CCI_REG16(0x0300), 0x0006, 0 },
++	{ CCI_REG16(0x0302), 0x0001, 0 },
++	{ CCI_REG16(0x0304), 0x0003, 0 },
++	{ CCI_REG16(0x0306), 0x0083, 0 },
++	{ CCI_REG16(0x0308), 0x0008, 0 },
++	{ CCI_REG16(0x030a), 0x0001, 0 },
++	{ CCI_REG16(0x030c), 0x0000, 0 },
++	{ CCI_REG16(0x030e), 0x0003, 0 },
++	{ CCI_REG16(0x0310), 0x0088, 0 },
++	{ CCI_REG16(0x0312), 0x0000, 0 },
++	{ CCI_REG16(0x080e), 0x0000, 0 },
++	{ CCI_REG16(0x0340), 0x0c5a, 0 },
++	{ CCI_REG16(0x0342), 0x1700, 0 },
++	{ CCI_REG16(0x0702), 0x0000, 0 },
++	{ CCI_REG16(0x0202), 0x0100, 0 },
++	{ CCI_REG16(0x0200), 0x0100, 0 },
++	{ CCI_REG16(0x0d00), 0x0101, 0 },
++	{ CCI_REG16(0x0d02), 0x0101, 0 },
++	{ CCI_REG16(0x0d04), 0x0102, 0 },
++	{ CCI_REG16(0x6226), 0x0000, 0 },
++};
++
++static const struct unicorn_reg ov32b40_init[] = {
++	{ CCI_REG8(0x0103), 0x0001, 5000 },
++	{ CCI_REG8(0x5000), 0x005d, 0 },
++	{ CCI_REG8(0x5001), 0x0020, 0 },
++	{ CCI_REG8(0x5002), 0x0037, 0 },
++	{ CCI_REG8(0x5003), 0x0000, 0 },
++	{ CCI_REG8(0x5004), 0x00c0, 0 },
++	{ CCI_REG8(0x5005), 0x0042, 0 },
++	{ CCI_REG8(0x5006), 0x0004, 0 },
++	{ CCI_REG8(0x5015), 0x0020, 0 },
++	{ CCI_REG8(0x5053), 0x0004, 0 },
++	{ CCI_REG8(0x5061), 0x0050, 0 },
++	{ CCI_REG8(0x5068), 0x0003, 0 },
++	{ CCI_REG8(0x506c), 0x0004, 0 },
++	{ CCI_REG8(0x506d), 0x000c, 0 },
++	{ CCI_REG8(0x506e), 0x000c, 0 },
++	{ CCI_REG8(0x50c1), 0x0000, 0 },
++	{ CCI_REG8(0x5115), 0x000b, 0 },
++	{ CCI_REG8(0x511c), 0x0001, 0 },
++	{ CCI_REG8(0x511d), 0x0001, 0 },
++	{ CCI_REG8(0x511e), 0x0001, 0 },
++	{ CCI_REG8(0x511f), 0x0001, 0 },
++	{ CCI_REG8(0x5180), 0x00c1, 0 },
++	{ CCI_REG8(0x518a), 0x0004, 0 },
++	{ CCI_REG8(0x51b0), 0x0030, 0 },
++	{ CCI_REG8(0x51d0), 0x00c2, 0 },
++	{ CCI_REG8(0x51d1), 0x0068, 0 },
++	{ CCI_REG8(0x51d8), 0x0008, 0 },
++	{ CCI_REG8(0x51d9), 0x0010, 0 },
++	{ CCI_REG8(0x51da), 0x0002, 0 },
++	{ CCI_REG8(0x51db), 0x0002, 0 },
++	{ CCI_REG8(0x51dc), 0x0006, 0 },
++	{ CCI_REG8(0x51dd), 0x0006, 0 },
++	{ CCI_REG8(0x51de), 0x0002, 0 },
++	{ CCI_REG8(0x51df), 0x0006, 0 },
++	{ CCI_REG8(0x51e0), 0x000a, 0 },
++	{ CCI_REG8(0x51e1), 0x000e, 0 },
++	{ CCI_REG8(0x51e2), 0x0000, 0 },
++	{ CCI_REG8(0x51e3), 0x0000, 0 },
++	{ CCI_REG8(0x5200), 0x0012, 0 },
++	{ CCI_REG8(0x5201), 0x0020, 0 },
++	{ CCI_REG8(0x5202), 0x000d, 0 },
++	{ CCI_REG8(0x5203), 0x00a0, 0 },
++	{ CCI_REG8(0x5205), 0x0010, 0 },
++	{ CCI_REG8(0x5207), 0x0010, 0 },
++	{ CCI_REG8(0x5208), 0x0012, 0 },
++	{ CCI_REG8(0x5209), 0x0000, 0 },
++	{ CCI_REG8(0x520a), 0x000d, 0 },
++	{ CCI_REG8(0x520b), 0x0080, 0 },
++	{ CCI_REG8(0x520d), 0x0008, 0 },
++	{ CCI_REG8(0x5250), 0x0014, 0 },
++	{ CCI_REG8(0x5331), 0x0006, 0 },
++	{ CCI_REG8(0x5332), 0x0043, 0 },
++	{ CCI_REG8(0x5333), 0x0045, 0 },
++	{ CCI_REG8(0x53c1), 0x0000, 0 },
++	{ CCI_REG8(0x5415), 0x000b, 0 },
++	{ CCI_REG8(0x541c), 0x0001, 0 },
++	{ CCI_REG8(0x541d), 0x0001, 0 },
++	{ CCI_REG8(0x541e), 0x0001, 0 },
++	{ CCI_REG8(0x541f), 0x0001, 0 },
++	{ CCI_REG8(0x5480), 0x00c1, 0 },
++	{ CCI_REG8(0x548a), 0x0004, 0 },
++	{ CCI_REG8(0x54b0), 0x0030, 0 },
++	{ CCI_REG8(0x54d0), 0x00c2, 0 },
++	{ CCI_REG8(0x54d1), 0x0068, 0 },
++	{ CCI_REG8(0x54d8), 0x0008, 0 },
++	{ CCI_REG8(0x54d9), 0x0010, 0 },
++	{ CCI_REG8(0x54da), 0x0002, 0 },
++	{ CCI_REG8(0x54db), 0x0002, 0 },
++	{ CCI_REG8(0x54dc), 0x0006, 0 },
++	{ CCI_REG8(0x54dd), 0x0006, 0 },
++	{ CCI_REG8(0x54de), 0x0002, 0 },
++	{ CCI_REG8(0x54df), 0x0006, 0 },
++	{ CCI_REG8(0x54e0), 0x000a, 0 },
++	{ CCI_REG8(0x54e1), 0x000e, 0 },
++	{ CCI_REG8(0x54e2), 0x0000, 0 },
++	{ CCI_REG8(0x54e3), 0x0000, 0 },
++	{ CCI_REG8(0x5500), 0x0012, 0 },
++	{ CCI_REG8(0x5501), 0x0020, 0 },
++	{ CCI_REG8(0x5502), 0x000d, 0 },
++	{ CCI_REG8(0x5503), 0x00a0, 0 },
++	{ CCI_REG8(0x5505), 0x0010, 0 },
++	{ CCI_REG8(0x5507), 0x0010, 0 },
++	{ CCI_REG8(0x5508), 0x0012, 0 },
++	{ CCI_REG8(0x5509), 0x0000, 0 },
++	{ CCI_REG8(0x550a), 0x000d, 0 },
++	{ CCI_REG8(0x550b), 0x0080, 0 },
++	{ CCI_REG8(0x550d), 0x0008, 0 },
++	{ CCI_REG8(0x5550), 0x0014, 0 },
++	{ CCI_REG8(0x5631), 0x0006, 0 },
++	{ CCI_REG8(0x5632), 0x0043, 0 },
++	{ CCI_REG8(0x5633), 0x0045, 0 },
++	{ CCI_REG8(0x56c1), 0x0000, 0 },
++	{ CCI_REG8(0x5715), 0x000b, 0 },
++	{ CCI_REG8(0x571c), 0x0001, 0 },
++	{ CCI_REG8(0x571d), 0x0001, 0 },
++	{ CCI_REG8(0x571e), 0x0001, 0 },
++	{ CCI_REG8(0x571f), 0x0001, 0 },
++	{ CCI_REG8(0x5780), 0x00c1, 0 },
++	{ CCI_REG8(0x578a), 0x0004, 0 },
++	{ CCI_REG8(0x57b0), 0x0030, 0 },
++	{ CCI_REG8(0x57d0), 0x00c2, 0 },
++	{ CCI_REG8(0x57d1), 0x0068, 0 },
++	{ CCI_REG8(0x57d8), 0x0008, 0 },
++	{ CCI_REG8(0x57d9), 0x0010, 0 },
++	{ CCI_REG8(0x57da), 0x0002, 0 },
++	{ CCI_REG8(0x57db), 0x0002, 0 },
++	{ CCI_REG8(0x57dc), 0x0006, 0 },
++	{ CCI_REG8(0x57dd), 0x0006, 0 },
++	{ CCI_REG8(0x57de), 0x0002, 0 },
++	{ CCI_REG8(0x57df), 0x0006, 0 },
++	{ CCI_REG8(0x57e0), 0x000a, 0 },
++	{ CCI_REG8(0x57e1), 0x000e, 0 },
++	{ CCI_REG8(0x57e2), 0x0000, 0 },
++	{ CCI_REG8(0x57e3), 0x0000, 0 },
++	{ CCI_REG8(0x5800), 0x0012, 0 },
++	{ CCI_REG8(0x5801), 0x0020, 0 },
++	{ CCI_REG8(0x5802), 0x000d, 0 },
++	{ CCI_REG8(0x5803), 0x00a0, 0 },
++	{ CCI_REG8(0x5805), 0x0010, 0 },
++	{ CCI_REG8(0x5807), 0x0010, 0 },
++	{ CCI_REG8(0x5808), 0x0012, 0 },
++	{ CCI_REG8(0x5809), 0x0000, 0 },
++	{ CCI_REG8(0x580a), 0x000d, 0 },
++	{ CCI_REG8(0x580b), 0x0080, 0 },
++	{ CCI_REG8(0x580d), 0x0008, 0 },
++	{ CCI_REG8(0x5850), 0x0014, 0 },
++	{ CCI_REG8(0x5931), 0x0006, 0 },
++	{ CCI_REG8(0x5932), 0x0043, 0 },
++	{ CCI_REG8(0x5933), 0x0045, 0 },
++	{ CCI_REG8(0x598a), 0x0000, 0 },
++	{ CCI_REG8(0x598b), 0x0008, 0 },
++	{ CCI_REG8(0x598c), 0x0000, 0 },
++	{ CCI_REG8(0x598d), 0x0004, 0 },
++	{ CCI_REG8(0x598e), 0x0000, 0 },
++	{ CCI_REG8(0x598f), 0x0002, 0 },
++	{ CCI_REG8(0x5990), 0x0000, 0 },
++	{ CCI_REG8(0x5991), 0x0000, 0 },
++	{ CCI_REG8(0x5992), 0x0000, 0 },
++	{ CCI_REG8(0x5993), 0x0002, 0 },
++	{ CCI_REG8(0x5994), 0x0004, 0 },
++	{ CCI_REG8(0x5995), 0x0006, 0 },
++	{ CCI_REG8(0x5996), 0x0008, 0 },
++	{ CCI_REG8(0x5997), 0x000c, 0 },
++	{ CCI_REG8(0x5998), 0x000f, 0 },
++	{ CCI_REG8(0x5999), 0x0012, 0 },
++	{ CCI_REG8(0x599a), 0x0016, 0 },
++	{ CCI_REG8(0x599b), 0x001a, 0 },
++	{ CCI_REG8(0x599c), 0x001e, 0 },
++	{ CCI_REG8(0x599d), 0x0022, 0 },
++	{ CCI_REG8(0x599e), 0x0027, 0 },
++	{ CCI_REG8(0x599f), 0x002c, 0 },
++	{ CCI_REG8(0x59c4), 0x0008, 0 },
++	{ CCI_REG8(0x59c5), 0x0008, 0 },
++	{ CCI_REG8(0x59c6), 0x000a, 0 },
++	{ CCI_REG8(0x59c7), 0x000c, 0 },
++	{ CCI_REG8(0x59c8), 0x000c, 0 },
++	{ CCI_REG8(0x59c9), 0x000e, 0 },
++	{ CCI_REG8(0x59ca), 0x000e, 0 },
++	{ CCI_REG8(0x59cb), 0x0000, 0 },
++	{ CCI_REG8(0x59fd), 0x00f1, 0 },
++	{ CCI_REG8(0x5a12), 0x000f, 0 },
++	{ CCI_REG8(0x5a1a), 0x0019, 0 },
++	{ CCI_REG8(0x5a1b), 0x0080, 0 },
++	{ CCI_REG8(0x5a1c), 0x0013, 0 },
++	{ CCI_REG8(0x5a1d), 0x0020, 0 },
++	{ CCI_REG8(0x6525), 0x0000, 0 },
++	{ CCI_REG8(0x5f80), 0x0040, 0 },
++	{ CCI_REG8(0x5f81), 0x0040, 0 },
++	{ CCI_REG8(0x5f82), 0x0040, 0 },
++	{ CCI_REG8(0x5f83), 0x0040, 0 },
++	{ CCI_REG8(0x5f84), 0x0040, 0 },
++	{ CCI_REG8(0x5f85), 0x0040, 0 },
++	{ CCI_REG8(0x5f86), 0x0040, 0 },
++	{ CCI_REG8(0x5f87), 0x0040, 0 },
++	{ CCI_REG8(0x5f88), 0x0040, 0 },
++	{ CCI_REG8(0x5f89), 0x0040, 0 },
++	{ CCI_REG8(0x5f8a), 0x0040, 0 },
++	{ CCI_REG8(0x5f8b), 0x0040, 0 },
++	{ CCI_REG8(0x5f8c), 0x0040, 0 },
++	{ CCI_REG8(0x5f8d), 0x0040, 0 },
++	{ CCI_REG8(0x5f8e), 0x0040, 0 },
++	{ CCI_REG8(0x5f8f), 0x0040, 0 },
++	{ CCI_REG8(0x5f90), 0x0040, 0 },
++	{ CCI_REG8(0x5f91), 0x0040, 0 },
++	{ CCI_REG8(0x5f92), 0x0040, 0 },
++	{ CCI_REG8(0x5f93), 0x0040, 0 },
++	{ CCI_REG8(0x5f94), 0x0040, 0 },
++	{ CCI_REG8(0x5f95), 0x0040, 0 },
++	{ CCI_REG8(0x5f96), 0x0040, 0 },
++	{ CCI_REG8(0x5f97), 0x0040, 0 },
++	{ CCI_REG8(0x5f98), 0x0040, 0 },
++	{ CCI_REG8(0x5f99), 0x0040, 0 },
++	{ CCI_REG8(0x5f9a), 0x0040, 0 },
++	{ CCI_REG8(0x5f9b), 0x0040, 0 },
++	{ CCI_REG8(0x5f9c), 0x0040, 0 },
++	{ CCI_REG8(0x5f9d), 0x0040, 0 },
++	{ CCI_REG8(0x5f9e), 0x0040, 0 },
++	{ CCI_REG8(0x5f9f), 0x0040, 0 },
++	{ CCI_REG8(0x5fa0), 0x0040, 0 },
++	{ CCI_REG8(0x5fa1), 0x0040, 0 },
++	{ CCI_REG8(0x5fa2), 0x0040, 0 },
++	{ CCI_REG8(0x5fa3), 0x0040, 0 },
++	{ CCI_REG8(0x5fa4), 0x0040, 0 },
++	{ CCI_REG8(0x5fa5), 0x0040, 0 },
++	{ CCI_REG8(0x5fa6), 0x0040, 0 },
++	{ CCI_REG8(0x5fa7), 0x0040, 0 },
++	{ CCI_REG8(0x5fa8), 0x0040, 0 },
++	{ CCI_REG8(0x5fa9), 0x0040, 0 },
++	{ CCI_REG8(0x5faa), 0x0040, 0 },
++	{ CCI_REG8(0x5fab), 0x0040, 0 },
++	{ CCI_REG8(0x5fac), 0x0040, 0 },
++	{ CCI_REG8(0x5fad), 0x0040, 0 },
++	{ CCI_REG8(0x5fae), 0x0040, 0 },
++	{ CCI_REG8(0x5faf), 0x0040, 0 },
++	{ CCI_REG8(0x5fb0), 0x0040, 0 },
++	{ CCI_REG8(0x5fb1), 0x0040, 0 },
++	{ CCI_REG8(0x5fb2), 0x0040, 0 },
++	{ CCI_REG8(0x5fb3), 0x0040, 0 },
++	{ CCI_REG8(0x5fb4), 0x0040, 0 },
++	{ CCI_REG8(0x5fb5), 0x0040, 0 },
++	{ CCI_REG8(0x5fb6), 0x0040, 0 },
++	{ CCI_REG8(0x5fb7), 0x0040, 0 },
++	{ CCI_REG8(0x5fb8), 0x0040, 0 },
++	{ CCI_REG8(0x5fb9), 0x0040, 0 },
++	{ CCI_REG8(0x5fba), 0x0040, 0 },
++	{ CCI_REG8(0x5fbb), 0x0040, 0 },
++	{ CCI_REG8(0x5fbc), 0x0040, 0 },
++	{ CCI_REG8(0x5fbd), 0x0040, 0 },
++	{ CCI_REG8(0x5fbe), 0x0040, 0 },
++	{ CCI_REG8(0x5fbf), 0x0040, 0 },
++	{ CCI_REG8(0x5fc0), 0x0040, 0 },
++	{ CCI_REG8(0x5fc1), 0x0040, 0 },
++	{ CCI_REG8(0x5fc2), 0x0040, 0 },
++	{ CCI_REG8(0x5fc3), 0x0040, 0 },
++	{ CCI_REG8(0x5fc4), 0x0040, 0 },
++	{ CCI_REG8(0x5fc5), 0x0040, 0 },
++	{ CCI_REG8(0x5fc6), 0x0040, 0 },
++	{ CCI_REG8(0x5fc7), 0x0040, 0 },
++	{ CCI_REG8(0x5fc8), 0x0040, 0 },
++	{ CCI_REG8(0x5fc9), 0x0040, 0 },
++	{ CCI_REG8(0x5fca), 0x0040, 0 },
++	{ CCI_REG8(0x5fcb), 0x0040, 0 },
++	{ CCI_REG8(0x5fcc), 0x0040, 0 },
++	{ CCI_REG8(0x5fcd), 0x0040, 0 },
++	{ CCI_REG8(0x5fce), 0x0040, 0 },
++	{ CCI_REG8(0x5fcf), 0x0040, 0 },
++	{ CCI_REG8(0x5fd0), 0x0040, 0 },
++	{ CCI_REG8(0x5fd1), 0x0040, 0 },
++	{ CCI_REG8(0x5fd2), 0x0040, 0 },
++	{ CCI_REG8(0x5fd3), 0x0040, 0 },
++	{ CCI_REG8(0x5fd4), 0x0040, 0 },
++	{ CCI_REG8(0x5fd5), 0x0040, 0 },
++	{ CCI_REG8(0x5fd6), 0x0040, 0 },
++	{ CCI_REG8(0x5fd7), 0x0040, 0 },
++	{ CCI_REG8(0x5fd8), 0x0040, 0 },
++	{ CCI_REG8(0x5fd9), 0x0040, 0 },
++	{ CCI_REG8(0x5fda), 0x0040, 0 },
++	{ CCI_REG8(0x5fdb), 0x0040, 0 },
++	{ CCI_REG8(0x5fdc), 0x0040, 0 },
++	{ CCI_REG8(0x5fdd), 0x0040, 0 },
++	{ CCI_REG8(0x5fde), 0x0040, 0 },
++	{ CCI_REG8(0x5fdf), 0x0040, 0 },
++	{ CCI_REG8(0x5fe0), 0x0040, 0 },
++	{ CCI_REG8(0x5fe1), 0x0040, 0 },
++	{ CCI_REG8(0x5fe2), 0x0040, 0 },
++	{ CCI_REG8(0x5fe3), 0x0040, 0 },
++	{ CCI_REG8(0x5fe4), 0x0040, 0 },
++	{ CCI_REG8(0x5fe5), 0x0040, 0 },
++	{ CCI_REG8(0x5fe6), 0x0040, 0 },
++	{ CCI_REG8(0x5fe7), 0x0040, 0 },
++	{ CCI_REG8(0x5fe8), 0x0040, 0 },
++	{ CCI_REG8(0x5fe9), 0x0040, 0 },
++	{ CCI_REG8(0x5fea), 0x0040, 0 },
++	{ CCI_REG8(0x5feb), 0x0040, 0 },
++	{ CCI_REG8(0x5fec), 0x0040, 0 },
++	{ CCI_REG8(0x5fed), 0x0040, 0 },
++	{ CCI_REG8(0x5fee), 0x0040, 0 },
++	{ CCI_REG8(0x5fef), 0x0040, 0 },
++	{ CCI_REG8(0x5ff0), 0x0040, 0 },
++	{ CCI_REG8(0x5ff1), 0x0040, 0 },
++	{ CCI_REG8(0x5ff2), 0x0040, 0 },
++	{ CCI_REG8(0x5ff3), 0x0040, 0 },
++	{ CCI_REG8(0x5ff4), 0x0040, 0 },
++	{ CCI_REG8(0x5ff5), 0x0040, 0 },
++	{ CCI_REG8(0x5ff6), 0x0040, 0 },
++	{ CCI_REG8(0x5ff7), 0x0040, 0 },
++	{ CCI_REG8(0x5ff8), 0x0040, 0 },
++	{ CCI_REG8(0x5ff9), 0x0040, 0 },
++	{ CCI_REG8(0x5ffa), 0x0040, 0 },
++	{ CCI_REG8(0x5ffb), 0x0040, 0 },
++	{ CCI_REG8(0x5ffc), 0x0040, 0 },
++	{ CCI_REG8(0x5ffd), 0x0040, 0 },
++	{ CCI_REG8(0x5ffe), 0x0040, 0 },
++	{ CCI_REG8(0x5fff), 0x0040, 0 },
++	{ CCI_REG8(0x6000), 0x0040, 0 },
++	{ CCI_REG8(0x6001), 0x0040, 0 },
++	{ CCI_REG8(0x6002), 0x0040, 0 },
++	{ CCI_REG8(0x6003), 0x0040, 0 },
++	{ CCI_REG8(0x6004), 0x0040, 0 },
++	{ CCI_REG8(0x6005), 0x0040, 0 },
++	{ CCI_REG8(0x6006), 0x0040, 0 },
++	{ CCI_REG8(0x6007), 0x0040, 0 },
++	{ CCI_REG8(0x6008), 0x0040, 0 },
++	{ CCI_REG8(0x6009), 0x0040, 0 },
++	{ CCI_REG8(0x600a), 0x0040, 0 },
++	{ CCI_REG8(0x600b), 0x0040, 0 },
++	{ CCI_REG8(0x600c), 0x0040, 0 },
++	{ CCI_REG8(0x600d), 0x0040, 0 },
++	{ CCI_REG8(0x600e), 0x0040, 0 },
++	{ CCI_REG8(0x600f), 0x0040, 0 },
++	{ CCI_REG8(0x6010), 0x0040, 0 },
++	{ CCI_REG8(0x6011), 0x0040, 0 },
++	{ CCI_REG8(0x6012), 0x0040, 0 },
++	{ CCI_REG8(0x6013), 0x0040, 0 },
++	{ CCI_REG8(0x6014), 0x0040, 0 },
++	{ CCI_REG8(0x6015), 0x0040, 0 },
++	{ CCI_REG8(0x6016), 0x0040, 0 },
++	{ CCI_REG8(0x6017), 0x0040, 0 },
++	{ CCI_REG8(0x6018), 0x0040, 0 },
++	{ CCI_REG8(0x6019), 0x0040, 0 },
++	{ CCI_REG8(0x601a), 0x0040, 0 },
++	{ CCI_REG8(0x601b), 0x0040, 0 },
++	{ CCI_REG8(0x601c), 0x0040, 0 },
++	{ CCI_REG8(0x601d), 0x0040, 0 },
++	{ CCI_REG8(0x601e), 0x0040, 0 },
++	{ CCI_REG8(0x601f), 0x0040, 0 },
++	{ CCI_REG8(0x6020), 0x0040, 0 },
++	{ CCI_REG8(0x6021), 0x0040, 0 },
++	{ CCI_REG8(0x6022), 0x0040, 0 },
++	{ CCI_REG8(0x6023), 0x0040, 0 },
++	{ CCI_REG8(0x6024), 0x0040, 0 },
++	{ CCI_REG8(0x6025), 0x0040, 0 },
++	{ CCI_REG8(0x6026), 0x0040, 0 },
++	{ CCI_REG8(0x6027), 0x0040, 0 },
++	{ CCI_REG8(0x6028), 0x0040, 0 },
++	{ CCI_REG8(0x6029), 0x0040, 0 },
++	{ CCI_REG8(0x602a), 0x0040, 0 },
++	{ CCI_REG8(0x602b), 0x0040, 0 },
++	{ CCI_REG8(0x602c), 0x0040, 0 },
++	{ CCI_REG8(0x602d), 0x0040, 0 },
++	{ CCI_REG8(0x602e), 0x0040, 0 },
++	{ CCI_REG8(0x602f), 0x0040, 0 },
++	{ CCI_REG8(0x6030), 0x0040, 0 },
++	{ CCI_REG8(0x6031), 0x0040, 0 },
++	{ CCI_REG8(0x6032), 0x0040, 0 },
++	{ CCI_REG8(0x6033), 0x0040, 0 },
++	{ CCI_REG8(0x6034), 0x00cd, 0 },
++	{ CCI_REG8(0x6035), 0x00cd, 0 },
++	{ CCI_REG8(0x6036), 0x00cd, 0 },
++	{ CCI_REG8(0x6037), 0x00cd, 0 },
++	{ CCI_REG8(0x6038), 0x00cd, 0 },
++	{ CCI_REG8(0x6039), 0x00cd, 0 },
++	{ CCI_REG8(0x603a), 0x00cd, 0 },
++	{ CCI_REG8(0x603b), 0x00cd, 0 },
++	{ CCI_REG8(0x603c), 0x00cd, 0 },
++	{ CCI_REG8(0x603d), 0x00cd, 0 },
++	{ CCI_REG8(0x603e), 0x00cd, 0 },
++	{ CCI_REG8(0x603f), 0x00cd, 0 },
++	{ CCI_REG8(0x6040), 0x00cd, 0 },
++	{ CCI_REG8(0x6041), 0x00cd, 0 },
++	{ CCI_REG8(0x6042), 0x00cd, 0 },
++	{ CCI_REG8(0x6043), 0x00cd, 0 },
++	{ CCI_REG8(0x6044), 0x00cd, 0 },
++	{ CCI_REG8(0x6045), 0x00cd, 0 },
++	{ CCI_REG8(0x6046), 0x00cd, 0 },
++	{ CCI_REG8(0x6047), 0x00cd, 0 },
++	{ CCI_REG8(0x6048), 0x00cd, 0 },
++	{ CCI_REG8(0x6049), 0x00cd, 0 },
++	{ CCI_REG8(0x604a), 0x00cd, 0 },
++	{ CCI_REG8(0x604b), 0x00cd, 0 },
++	{ CCI_REG8(0x604c), 0x00cd, 0 },
++	{ CCI_REG8(0x604d), 0x00cd, 0 },
++	{ CCI_REG8(0x604e), 0x00cd, 0 },
++	{ CCI_REG8(0x604f), 0x00cd, 0 },
++	{ CCI_REG8(0x6050), 0x00cd, 0 },
++	{ CCI_REG8(0x6051), 0x00cd, 0 },
++	{ CCI_REG8(0x6052), 0x00cd, 0 },
++	{ CCI_REG8(0x6053), 0x00cd, 0 },
++	{ CCI_REG8(0x6054), 0x00cd, 0 },
++	{ CCI_REG8(0x6055), 0x00cd, 0 },
++	{ CCI_REG8(0x6056), 0x00cd, 0 },
++	{ CCI_REG8(0x6057), 0x00cd, 0 },
++	{ CCI_REG8(0x6058), 0x00cd, 0 },
++	{ CCI_REG8(0x6059), 0x00cd, 0 },
++	{ CCI_REG8(0x605a), 0x00cd, 0 },
++	{ CCI_REG8(0x605b), 0x00cd, 0 },
++	{ CCI_REG8(0x605c), 0x00cd, 0 },
++	{ CCI_REG8(0x605d), 0x00cd, 0 },
++	{ CCI_REG8(0x605e), 0x00cd, 0 },
++	{ CCI_REG8(0x605f), 0x00cd, 0 },
++	{ CCI_REG8(0x6060), 0x00cd, 0 },
++	{ CCI_REG8(0x6061), 0x00cd, 0 },
++	{ CCI_REG8(0x6062), 0x00cd, 0 },
++	{ CCI_REG8(0x6063), 0x00cd, 0 },
++	{ CCI_REG8(0x6064), 0x00cd, 0 },
++	{ CCI_REG8(0x6065), 0x00cd, 0 },
++	{ CCI_REG8(0x6066), 0x00cd, 0 },
++	{ CCI_REG8(0x6067), 0x00cd, 0 },
++	{ CCI_REG8(0x6068), 0x00cd, 0 },
++	{ CCI_REG8(0x6069), 0x00cd, 0 },
++	{ CCI_REG8(0x606a), 0x00cd, 0 },
++	{ CCI_REG8(0x606b), 0x00cd, 0 },
++	{ CCI_REG8(0x606c), 0x00cd, 0 },
++	{ CCI_REG8(0x606d), 0x00cd, 0 },
++	{ CCI_REG8(0x606e), 0x00cd, 0 },
++	{ CCI_REG8(0x606f), 0x00cd, 0 },
++	{ CCI_REG8(0x6070), 0x00cd, 0 },
++	{ CCI_REG8(0x6071), 0x00cd, 0 },
++	{ CCI_REG8(0x6072), 0x00cd, 0 },
++	{ CCI_REG8(0x6073), 0x00cd, 0 },
++	{ CCI_REG8(0x6074), 0x00cd, 0 },
++	{ CCI_REG8(0x6075), 0x00cd, 0 },
++	{ CCI_REG8(0x6076), 0x00cd, 0 },
++	{ CCI_REG8(0x6077), 0x00cd, 0 },
++	{ CCI_REG8(0x6078), 0x00cd, 0 },
++	{ CCI_REG8(0x6079), 0x00cd, 0 },
++	{ CCI_REG8(0x607a), 0x00cd, 0 },
++	{ CCI_REG8(0x607b), 0x00cd, 0 },
++	{ CCI_REG8(0x607c), 0x00cd, 0 },
++	{ CCI_REG8(0x607d), 0x00cd, 0 },
++	{ CCI_REG8(0x607e), 0x00cd, 0 },
++	{ CCI_REG8(0x607f), 0x00cd, 0 },
++	{ CCI_REG8(0x6080), 0x00cd, 0 },
++	{ CCI_REG8(0x6081), 0x00cd, 0 },
++	{ CCI_REG8(0x6082), 0x00cd, 0 },
++	{ CCI_REG8(0x6083), 0x00cd, 0 },
++	{ CCI_REG8(0x6084), 0x00cd, 0 },
++	{ CCI_REG8(0x6085), 0x00cd, 0 },
++	{ CCI_REG8(0x6086), 0x00cd, 0 },
++	{ CCI_REG8(0x6087), 0x00cd, 0 },
++	{ CCI_REG8(0x6088), 0x00cd, 0 },
++	{ CCI_REG8(0x6089), 0x00cd, 0 },
++	{ CCI_REG8(0x608a), 0x00cd, 0 },
++	{ CCI_REG8(0x608b), 0x00cd, 0 },
++	{ CCI_REG8(0x608c), 0x00cd, 0 },
++	{ CCI_REG8(0x608d), 0x00cd, 0 },
++	{ CCI_REG8(0x608e), 0x00cd, 0 },
++	{ CCI_REG8(0x608f), 0x00cd, 0 },
++	{ CCI_REG8(0x6090), 0x00cd, 0 },
++	{ CCI_REG8(0x6091), 0x00cd, 0 },
++	{ CCI_REG8(0x6092), 0x00cd, 0 },
++	{ CCI_REG8(0x6093), 0x00cd, 0 },
++	{ CCI_REG8(0x6094), 0x00cd, 0 },
++	{ CCI_REG8(0x6095), 0x00cd, 0 },
++	{ CCI_REG8(0x6096), 0x00cd, 0 },
++	{ CCI_REG8(0x6097), 0x00cd, 0 },
++	{ CCI_REG8(0x6098), 0x00cd, 0 },
++	{ CCI_REG8(0x6099), 0x00cd, 0 },
++	{ CCI_REG8(0x609a), 0x00cd, 0 },
++	{ CCI_REG8(0x609b), 0x00cd, 0 },
++	{ CCI_REG8(0x609c), 0x00cd, 0 },
++	{ CCI_REG8(0x609d), 0x00cd, 0 },
++	{ CCI_REG8(0x609e), 0x00cd, 0 },
++	{ CCI_REG8(0x609f), 0x00cd, 0 },
++	{ CCI_REG8(0x60a0), 0x00cd, 0 },
++	{ CCI_REG8(0x60a1), 0x00cd, 0 },
++	{ CCI_REG8(0x60a2), 0x00cd, 0 },
++	{ CCI_REG8(0x60a3), 0x00cd, 0 },
++	{ CCI_REG8(0x60a4), 0x00cd, 0 },
++	{ CCI_REG8(0x60a5), 0x00cd, 0 },
++	{ CCI_REG8(0x60a6), 0x00cd, 0 },
++	{ CCI_REG8(0x60a7), 0x00cd, 0 },
++	{ CCI_REG8(0x60a8), 0x00cd, 0 },
++	{ CCI_REG8(0x60a9), 0x00cd, 0 },
++	{ CCI_REG8(0x60aa), 0x00cd, 0 },
++	{ CCI_REG8(0x60ab), 0x00cd, 0 },
++	{ CCI_REG8(0x60ac), 0x00cd, 0 },
++	{ CCI_REG8(0x60ad), 0x00cd, 0 },
++	{ CCI_REG8(0x60ae), 0x00cd, 0 },
++	{ CCI_REG8(0x60af), 0x00cd, 0 },
++	{ CCI_REG8(0x60b0), 0x00cd, 0 },
++	{ CCI_REG8(0x60b1), 0x00cd, 0 },
++	{ CCI_REG8(0x60b2), 0x00cd, 0 },
++	{ CCI_REG8(0x60b3), 0x00cd, 0 },
++	{ CCI_REG8(0x60b4), 0x00cd, 0 },
++	{ CCI_REG8(0x60b5), 0x00cd, 0 },
++	{ CCI_REG8(0x60b6), 0x00cd, 0 },
++	{ CCI_REG8(0x60b7), 0x00cd, 0 },
++	{ CCI_REG8(0x60b8), 0x00cd, 0 },
++	{ CCI_REG8(0x60b9), 0x00cd, 0 },
++	{ CCI_REG8(0x60ba), 0x00cd, 0 },
++	{ CCI_REG8(0x60bb), 0x00cd, 0 },
++	{ CCI_REG8(0x60bc), 0x00cd, 0 },
++	{ CCI_REG8(0x60bd), 0x00cd, 0 },
++	{ CCI_REG8(0x60be), 0x00cd, 0 },
++	{ CCI_REG8(0x60bf), 0x00cd, 0 },
++	{ CCI_REG8(0x60c0), 0x00cd, 0 },
++	{ CCI_REG8(0x60c1), 0x00cd, 0 },
++	{ CCI_REG8(0x60c2), 0x00cd, 0 },
++	{ CCI_REG8(0x60c3), 0x00cd, 0 },
++	{ CCI_REG8(0x60c4), 0x00cd, 0 },
++	{ CCI_REG8(0x60c5), 0x00cd, 0 },
++	{ CCI_REG8(0x60c6), 0x00cd, 0 },
++	{ CCI_REG8(0x60c7), 0x00cd, 0 },
++	{ CCI_REG8(0x60c8), 0x00cd, 0 },
++	{ CCI_REG8(0x60c9), 0x00cd, 0 },
++	{ CCI_REG8(0x60ca), 0x00cd, 0 },
++	{ CCI_REG8(0x60cb), 0x00cd, 0 },
++	{ CCI_REG8(0x60cc), 0x00cd, 0 },
++	{ CCI_REG8(0x60cd), 0x00cd, 0 },
++	{ CCI_REG8(0x60ce), 0x00cd, 0 },
++	{ CCI_REG8(0x60cf), 0x00cd, 0 },
++	{ CCI_REG8(0x60d0), 0x00cd, 0 },
++	{ CCI_REG8(0x60d1), 0x00cd, 0 },
++	{ CCI_REG8(0x60d2), 0x00cd, 0 },
++	{ CCI_REG8(0x60d3), 0x00cd, 0 },
++	{ CCI_REG8(0x60d4), 0x00cd, 0 },
++	{ CCI_REG8(0x60d5), 0x00cd, 0 },
++	{ CCI_REG8(0x60d6), 0x00cd, 0 },
++	{ CCI_REG8(0x60d7), 0x00cd, 0 },
++	{ CCI_REG8(0x60d8), 0x00cd, 0 },
++	{ CCI_REG8(0x60d9), 0x00cd, 0 },
++	{ CCI_REG8(0x60da), 0x00cd, 0 },
++	{ CCI_REG8(0x60db), 0x00cd, 0 },
++	{ CCI_REG8(0x60dc), 0x00cd, 0 },
++	{ CCI_REG8(0x60dd), 0x00cd, 0 },
++	{ CCI_REG8(0x60de), 0x00cd, 0 },
++	{ CCI_REG8(0x60df), 0x00cd, 0 },
++	{ CCI_REG8(0x60e0), 0x00cd, 0 },
++	{ CCI_REG8(0x60e1), 0x00cd, 0 },
++	{ CCI_REG8(0x60e2), 0x00cd, 0 },
++	{ CCI_REG8(0x60e3), 0x00cd, 0 },
++	{ CCI_REG8(0x60e4), 0x00cd, 0 },
++	{ CCI_REG8(0x60e5), 0x00cd, 0 },
++	{ CCI_REG8(0x60e6), 0x00cd, 0 },
++	{ CCI_REG8(0x60e7), 0x00cd, 0 },
++	{ CCI_REG8(0x60e8), 0x00cd, 0 },
++	{ CCI_REG8(0x60e9), 0x00cd, 0 },
++	{ CCI_REG8(0x60ea), 0x00cd, 0 },
++	{ CCI_REG8(0x60eb), 0x00cd, 0 },
++	{ CCI_REG8(0x60ec), 0x00cd, 0 },
++	{ CCI_REG8(0x60ed), 0x00cd, 0 },
++	{ CCI_REG8(0x60ee), 0x00cd, 0 },
++	{ CCI_REG8(0x60ef), 0x00cd, 0 },
++	{ CCI_REG8(0x60f0), 0x00cd, 0 },
++	{ CCI_REG8(0x60f1), 0x00cd, 0 },
++	{ CCI_REG8(0x60f2), 0x00cd, 0 },
++	{ CCI_REG8(0x60f3), 0x00cd, 0 },
++	{ CCI_REG8(0x60f4), 0x00cd, 0 },
++	{ CCI_REG8(0x60f5), 0x00cd, 0 },
++	{ CCI_REG8(0x60f6), 0x00cd, 0 },
++	{ CCI_REG8(0x60f7), 0x00cd, 0 },
++	{ CCI_REG8(0x60f8), 0x00cd, 0 },
++	{ CCI_REG8(0x60f9), 0x00cd, 0 },
++	{ CCI_REG8(0x60fa), 0x00cd, 0 },
++	{ CCI_REG8(0x60fb), 0x00cd, 0 },
++	{ CCI_REG8(0x60fc), 0x00cd, 0 },
++	{ CCI_REG8(0x60fd), 0x00cd, 0 },
++	{ CCI_REG8(0x60fe), 0x00cd, 0 },
++	{ CCI_REG8(0x60ff), 0x00cd, 0 },
++	{ CCI_REG8(0x6100), 0x00cd, 0 },
++	{ CCI_REG8(0x6101), 0x00cd, 0 },
++	{ CCI_REG8(0x6102), 0x00cd, 0 },
++	{ CCI_REG8(0x6103), 0x00cd, 0 },
++	{ CCI_REG8(0x6104), 0x00cd, 0 },
++	{ CCI_REG8(0x6105), 0x00cd, 0 },
++	{ CCI_REG8(0x6106), 0x00cd, 0 },
++	{ CCI_REG8(0x6107), 0x00cd, 0 },
++	{ CCI_REG8(0x6108), 0x00cd, 0 },
++	{ CCI_REG8(0x6109), 0x00cd, 0 },
++	{ CCI_REG8(0x610a), 0x00cd, 0 },
++	{ CCI_REG8(0x610b), 0x00cd, 0 },
++	{ CCI_REG8(0x610c), 0x00cd, 0 },
++	{ CCI_REG8(0x610d), 0x00cd, 0 },
++	{ CCI_REG8(0x610e), 0x00cd, 0 },
++	{ CCI_REG8(0x610f), 0x00cd, 0 },
++	{ CCI_REG8(0x6110), 0x00cd, 0 },
++	{ CCI_REG8(0x6111), 0x00cd, 0 },
++	{ CCI_REG8(0x6112), 0x00cd, 0 },
++	{ CCI_REG8(0x6113), 0x00cd, 0 },
++	{ CCI_REG8(0x6114), 0x00cd, 0 },
++	{ CCI_REG8(0x6115), 0x00cd, 0 },
++	{ CCI_REG8(0x6116), 0x00cd, 0 },
++	{ CCI_REG8(0x6117), 0x00cd, 0 },
++	{ CCI_REG8(0x6118), 0x00cd, 0 },
++	{ CCI_REG8(0x6119), 0x00cd, 0 },
++	{ CCI_REG8(0x611a), 0x00cd, 0 },
++	{ CCI_REG8(0x611b), 0x00cd, 0 },
++	{ CCI_REG8(0x611c), 0x00cd, 0 },
++	{ CCI_REG8(0x611d), 0x00cd, 0 },
++	{ CCI_REG8(0x611e), 0x00cd, 0 },
++	{ CCI_REG8(0x611f), 0x00cd, 0 },
++	{ CCI_REG8(0x6120), 0x00cd, 0 },
++	{ CCI_REG8(0x6121), 0x00cd, 0 },
++	{ CCI_REG8(0x6122), 0x00cd, 0 },
++	{ CCI_REG8(0x6123), 0x00cd, 0 },
++	{ CCI_REG8(0x6124), 0x00cd, 0 },
++	{ CCI_REG8(0x6125), 0x00cd, 0 },
++	{ CCI_REG8(0x6126), 0x00cd, 0 },
++	{ CCI_REG8(0x6127), 0x00cd, 0 },
++	{ CCI_REG8(0x6128), 0x00cd, 0 },
++	{ CCI_REG8(0x6129), 0x00cd, 0 },
++	{ CCI_REG8(0x612a), 0x00cd, 0 },
++	{ CCI_REG8(0x612b), 0x00cd, 0 },
++	{ CCI_REG8(0x612c), 0x00cd, 0 },
++	{ CCI_REG8(0x612d), 0x00cd, 0 },
++	{ CCI_REG8(0x612e), 0x00cd, 0 },
++	{ CCI_REG8(0x612f), 0x00cd, 0 },
++	{ CCI_REG8(0x6130), 0x00cd, 0 },
++	{ CCI_REG8(0x6131), 0x00cd, 0 },
++	{ CCI_REG8(0x6132), 0x00cd, 0 },
++	{ CCI_REG8(0x6133), 0x00cd, 0 },
++	{ CCI_REG8(0x6134), 0x00cd, 0 },
++	{ CCI_REG8(0x6135), 0x00cd, 0 },
++	{ CCI_REG8(0x6136), 0x00cd, 0 },
++	{ CCI_REG8(0x6137), 0x00cd, 0 },
++	{ CCI_REG8(0x6138), 0x00cd, 0 },
++	{ CCI_REG8(0x6139), 0x00cd, 0 },
++	{ CCI_REG8(0x613a), 0x00cd, 0 },
++	{ CCI_REG8(0x613b), 0x00cd, 0 },
++	{ CCI_REG8(0x613c), 0x00cd, 0 },
++	{ CCI_REG8(0x613d), 0x00cd, 0 },
++	{ CCI_REG8(0x613e), 0x00cd, 0 },
++	{ CCI_REG8(0x613f), 0x00cd, 0 },
++	{ CCI_REG8(0x6140), 0x00cd, 0 },
++	{ CCI_REG8(0x6141), 0x00cd, 0 },
++	{ CCI_REG8(0x6142), 0x00cd, 0 },
++	{ CCI_REG8(0x6143), 0x00cd, 0 },
++	{ CCI_REG8(0x6144), 0x00cd, 0 },
++	{ CCI_REG8(0x6145), 0x00cd, 0 },
++	{ CCI_REG8(0x6146), 0x00cd, 0 },
++	{ CCI_REG8(0x6147), 0x00cd, 0 },
++	{ CCI_REG8(0x6148), 0x00cd, 0 },
++	{ CCI_REG8(0x6149), 0x00cd, 0 },
++	{ CCI_REG8(0x614a), 0x00cd, 0 },
++	{ CCI_REG8(0x614b), 0x00cd, 0 },
++	{ CCI_REG8(0x614c), 0x00cd, 0 },
++	{ CCI_REG8(0x614d), 0x00cd, 0 },
++	{ CCI_REG8(0x614e), 0x00cd, 0 },
++	{ CCI_REG8(0x614f), 0x00cd, 0 },
++	{ CCI_REG8(0x6150), 0x00cd, 0 },
++	{ CCI_REG8(0x6151), 0x00cd, 0 },
++	{ CCI_REG8(0x6152), 0x00cd, 0 },
++	{ CCI_REG8(0x6153), 0x00cd, 0 },
++	{ CCI_REG8(0x6154), 0x00cd, 0 },
++	{ CCI_REG8(0x6155), 0x00cd, 0 },
++	{ CCI_REG8(0x6156), 0x00cd, 0 },
++	{ CCI_REG8(0x6157), 0x00cd, 0 },
++	{ CCI_REG8(0x6158), 0x00cd, 0 },
++	{ CCI_REG8(0x6159), 0x00cd, 0 },
++	{ CCI_REG8(0x615a), 0x00cd, 0 },
++	{ CCI_REG8(0x615b), 0x00cd, 0 },
++	{ CCI_REG8(0x615c), 0x00cd, 0 },
++	{ CCI_REG8(0x615d), 0x00cd, 0 },
++	{ CCI_REG8(0x615e), 0x00cd, 0 },
++	{ CCI_REG8(0x615f), 0x00cd, 0 },
++	{ CCI_REG8(0x6160), 0x00cd, 0 },
++	{ CCI_REG8(0x6161), 0x00cd, 0 },
++	{ CCI_REG8(0x6162), 0x00cd, 0 },
++	{ CCI_REG8(0x6163), 0x00cd, 0 },
++	{ CCI_REG8(0x6164), 0x00cd, 0 },
++	{ CCI_REG8(0x6165), 0x00cd, 0 },
++	{ CCI_REG8(0x6166), 0x00cd, 0 },
++	{ CCI_REG8(0x6167), 0x00cd, 0 },
++	{ CCI_REG8(0x6168), 0x00cd, 0 },
++	{ CCI_REG8(0x6169), 0x00cd, 0 },
++	{ CCI_REG8(0x616a), 0x00cd, 0 },
++	{ CCI_REG8(0x616b), 0x00cd, 0 },
++	{ CCI_REG8(0x616c), 0x00cd, 0 },
++	{ CCI_REG8(0x616d), 0x00cd, 0 },
++	{ CCI_REG8(0x616e), 0x00cd, 0 },
++	{ CCI_REG8(0x616f), 0x00cd, 0 },
++	{ CCI_REG8(0x6170), 0x00cd, 0 },
++	{ CCI_REG8(0x6171), 0x00cd, 0 },
++	{ CCI_REG8(0x6172), 0x00cd, 0 },
++	{ CCI_REG8(0x6173), 0x00cd, 0 },
++	{ CCI_REG8(0x6174), 0x00cd, 0 },
++	{ CCI_REG8(0x6175), 0x00cd, 0 },
++	{ CCI_REG8(0x6176), 0x00cd, 0 },
++	{ CCI_REG8(0x6177), 0x00cd, 0 },
++	{ CCI_REG8(0x6178), 0x00cd, 0 },
++	{ CCI_REG8(0x6179), 0x00cd, 0 },
++	{ CCI_REG8(0x617a), 0x00cd, 0 },
++	{ CCI_REG8(0x617b), 0x00cd, 0 },
++	{ CCI_REG8(0x617c), 0x00cd, 0 },
++	{ CCI_REG8(0x617d), 0x00cd, 0 },
++	{ CCI_REG8(0x617e), 0x00cd, 0 },
++	{ CCI_REG8(0x617f), 0x00cd, 0 },
++	{ CCI_REG8(0x6180), 0x00cd, 0 },
++	{ CCI_REG8(0x6181), 0x00cd, 0 },
++	{ CCI_REG8(0x6182), 0x00cd, 0 },
++	{ CCI_REG8(0x6183), 0x00cd, 0 },
++	{ CCI_REG8(0x6184), 0x00cd, 0 },
++	{ CCI_REG8(0x6185), 0x00cd, 0 },
++	{ CCI_REG8(0x6186), 0x00cd, 0 },
++	{ CCI_REG8(0x6187), 0x00cd, 0 },
++	{ CCI_REG8(0x6188), 0x00cd, 0 },
++	{ CCI_REG8(0x6189), 0x00cd, 0 },
++	{ CCI_REG8(0x618a), 0x00cd, 0 },
++	{ CCI_REG8(0x618b), 0x00cd, 0 },
++	{ CCI_REG8(0x618c), 0x00cd, 0 },
++	{ CCI_REG8(0x618d), 0x00cd, 0 },
++	{ CCI_REG8(0x618e), 0x00cd, 0 },
++	{ CCI_REG8(0x618f), 0x00cd, 0 },
++	{ CCI_REG8(0x6190), 0x00cd, 0 },
++	{ CCI_REG8(0x6191), 0x00cd, 0 },
++	{ CCI_REG8(0x6192), 0x00cd, 0 },
++	{ CCI_REG8(0x6193), 0x00cd, 0 },
++	{ CCI_REG8(0x6194), 0x00cd, 0 },
++	{ CCI_REG8(0x6195), 0x00cd, 0 },
++	{ CCI_REG8(0x6196), 0x00cd, 0 },
++	{ CCI_REG8(0x6197), 0x00cd, 0 },
++	{ CCI_REG8(0x6198), 0x00cd, 0 },
++	{ CCI_REG8(0x6199), 0x00cd, 0 },
++	{ CCI_REG8(0x619a), 0x00cd, 0 },
++	{ CCI_REG8(0x619b), 0x00cd, 0 },
++	{ CCI_REG8(0x619c), 0x00cd, 0 },
++	{ CCI_REG8(0x619d), 0x00cd, 0 },
++	{ CCI_REG8(0x619e), 0x00cd, 0 },
++	{ CCI_REG8(0x619f), 0x00cd, 0 },
++	{ CCI_REG8(0x61a0), 0x00cd, 0 },
++	{ CCI_REG8(0x61a1), 0x00cd, 0 },
++	{ CCI_REG8(0x61a2), 0x00cd, 0 },
++	{ CCI_REG8(0x61a3), 0x00cd, 0 },
++	{ CCI_REG8(0x61a4), 0x00cd, 0 },
++	{ CCI_REG8(0x61a5), 0x00cd, 0 },
++	{ CCI_REG8(0x61a6), 0x00cd, 0 },
++	{ CCI_REG8(0x61a7), 0x00cd, 0 },
++	{ CCI_REG8(0x61a8), 0x00cd, 0 },
++	{ CCI_REG8(0x61a9), 0x00cd, 0 },
++	{ CCI_REG8(0x61aa), 0x00cd, 0 },
++	{ CCI_REG8(0x61ab), 0x00cd, 0 },
++	{ CCI_REG8(0x61ac), 0x00cd, 0 },
++	{ CCI_REG8(0x61ad), 0x00cd, 0 },
++	{ CCI_REG8(0x61ae), 0x00cd, 0 },
++	{ CCI_REG8(0x61af), 0x00cd, 0 },
++	{ CCI_REG8(0x61b0), 0x00cd, 0 },
++	{ CCI_REG8(0x61b1), 0x00cd, 0 },
++	{ CCI_REG8(0x61b2), 0x00cd, 0 },
++	{ CCI_REG8(0x61b3), 0x00cd, 0 },
++	{ CCI_REG8(0x61b4), 0x00cd, 0 },
++	{ CCI_REG8(0x61b5), 0x00cd, 0 },
++	{ CCI_REG8(0x61b6), 0x00cd, 0 },
++	{ CCI_REG8(0x61b7), 0x00cd, 0 },
++	{ CCI_REG8(0x61b8), 0x00cd, 0 },
++	{ CCI_REG8(0x61b9), 0x00cd, 0 },
++	{ CCI_REG8(0x61ba), 0x00cd, 0 },
++	{ CCI_REG8(0x61bb), 0x00cd, 0 },
++	{ CCI_REG8(0x61bc), 0x00cd, 0 },
++	{ CCI_REG8(0x61bd), 0x00cd, 0 },
++	{ CCI_REG8(0x61be), 0x00cd, 0 },
++	{ CCI_REG8(0x61bf), 0x00cd, 0 },
++	{ CCI_REG8(0x61c0), 0x00cd, 0 },
++	{ CCI_REG8(0x61c1), 0x00cd, 0 },
++	{ CCI_REG8(0x61c2), 0x00cd, 0 },
++	{ CCI_REG8(0x61c3), 0x00cd, 0 },
++	{ CCI_REG8(0x61c4), 0x00cd, 0 },
++	{ CCI_REG8(0x61c5), 0x00cd, 0 },
++	{ CCI_REG8(0x61c6), 0x00cd, 0 },
++	{ CCI_REG8(0x61c7), 0x00cd, 0 },
++	{ CCI_REG8(0x61c8), 0x00cd, 0 },
++	{ CCI_REG8(0x61c9), 0x00cd, 0 },
++	{ CCI_REG8(0x61ca), 0x00cd, 0 },
++	{ CCI_REG8(0x61cb), 0x00cd, 0 },
++	{ CCI_REG8(0x61cc), 0x00cd, 0 },
++	{ CCI_REG8(0x61cd), 0x00cd, 0 },
++	{ CCI_REG8(0x61ce), 0x00cd, 0 },
++	{ CCI_REG8(0x61cf), 0x00cd, 0 },
++	{ CCI_REG8(0x61d0), 0x00cd, 0 },
++	{ CCI_REG8(0x61d1), 0x00cd, 0 },
++	{ CCI_REG8(0x61d2), 0x00cd, 0 },
++	{ CCI_REG8(0x61d3), 0x00cd, 0 },
++	{ CCI_REG8(0x61d4), 0x00cd, 0 },
++	{ CCI_REG8(0x61d5), 0x00cd, 0 },
++	{ CCI_REG8(0x61d6), 0x00cd, 0 },
++	{ CCI_REG8(0x61d7), 0x00cd, 0 },
++	{ CCI_REG8(0x61d8), 0x00cd, 0 },
++	{ CCI_REG8(0x61d9), 0x00cd, 0 },
++	{ CCI_REG8(0x61da), 0x00cd, 0 },
++	{ CCI_REG8(0x61db), 0x00cd, 0 },
++	{ CCI_REG8(0x61dc), 0x00cd, 0 },
++	{ CCI_REG8(0x61dd), 0x00cd, 0 },
++	{ CCI_REG8(0x61de), 0x00cd, 0 },
++	{ CCI_REG8(0x61df), 0x00cd, 0 },
++	{ CCI_REG8(0x61e0), 0x00cd, 0 },
++	{ CCI_REG8(0x61e1), 0x00cd, 0 },
++	{ CCI_REG8(0x61e2), 0x00cd, 0 },
++	{ CCI_REG8(0x61e3), 0x00cd, 0 },
++	{ CCI_REG8(0x61e4), 0x00cd, 0 },
++	{ CCI_REG8(0x61e5), 0x00cd, 0 },
++	{ CCI_REG8(0x61e6), 0x00cd, 0 },
++	{ CCI_REG8(0x61e7), 0x00cd, 0 },
++	{ CCI_REG8(0x61e8), 0x00cd, 0 },
++	{ CCI_REG8(0x61e9), 0x00cd, 0 },
++	{ CCI_REG8(0x61ea), 0x00cd, 0 },
++	{ CCI_REG8(0x61eb), 0x00cd, 0 },
++	{ CCI_REG8(0x61ec), 0x00cd, 0 },
++	{ CCI_REG8(0x61ed), 0x00cd, 0 },
++	{ CCI_REG8(0x61ee), 0x00cd, 0 },
++	{ CCI_REG8(0x61ef), 0x00cd, 0 },
++	{ CCI_REG8(0x61f0), 0x00cd, 0 },
++	{ CCI_REG8(0x61f1), 0x00cd, 0 },
++	{ CCI_REG8(0x61f2), 0x00cd, 0 },
++	{ CCI_REG8(0x61f3), 0x00cd, 0 },
++	{ CCI_REG8(0x61f4), 0x00cd, 0 },
++	{ CCI_REG8(0x61f5), 0x00cd, 0 },
++	{ CCI_REG8(0x61f6), 0x00cd, 0 },
++	{ CCI_REG8(0x61f7), 0x00cd, 0 },
++	{ CCI_REG8(0x61f8), 0x00cd, 0 },
++	{ CCI_REG8(0x61f9), 0x00cd, 0 },
++	{ CCI_REG8(0x61fa), 0x00cd, 0 },
++	{ CCI_REG8(0x61fb), 0x00cd, 0 },
++	{ CCI_REG8(0x61fc), 0x00cd, 0 },
++	{ CCI_REG8(0x61fd), 0x00cd, 0 },
++	{ CCI_REG8(0x61fe), 0x00cd, 0 },
++	{ CCI_REG8(0x61ff), 0x00cd, 0 },
++	{ CCI_REG8(0x6200), 0x00cd, 0 },
++	{ CCI_REG8(0x6201), 0x00cd, 0 },
++	{ CCI_REG8(0x6202), 0x00cd, 0 },
++	{ CCI_REG8(0x6203), 0x00cd, 0 },
++	{ CCI_REG8(0x6204), 0x00cd, 0 },
++	{ CCI_REG8(0x6205), 0x00cd, 0 },
++	{ CCI_REG8(0x6206), 0x00cd, 0 },
++	{ CCI_REG8(0x6207), 0x00cd, 0 },
++	{ CCI_REG8(0x6208), 0x00cd, 0 },
++	{ CCI_REG8(0x6209), 0x00cd, 0 },
++	{ CCI_REG8(0x620a), 0x00cd, 0 },
++	{ CCI_REG8(0x620b), 0x00cd, 0 },
++	{ CCI_REG8(0x620c), 0x00cd, 0 },
++	{ CCI_REG8(0x620d), 0x00cd, 0 },
++	{ CCI_REG8(0x620e), 0x00cd, 0 },
++	{ CCI_REG8(0x620f), 0x00cd, 0 },
++	{ CCI_REG8(0x6210), 0x00cd, 0 },
++	{ CCI_REG8(0x6211), 0x00cd, 0 },
++	{ CCI_REG8(0x6212), 0x00cd, 0 },
++	{ CCI_REG8(0x6213), 0x00cd, 0 },
++	{ CCI_REG8(0x6214), 0x00cd, 0 },
++	{ CCI_REG8(0x6215), 0x00cd, 0 },
++	{ CCI_REG8(0x6216), 0x00cd, 0 },
++	{ CCI_REG8(0x6217), 0x00cd, 0 },
++	{ CCI_REG8(0x6218), 0x00cd, 0 },
++	{ CCI_REG8(0x6219), 0x00cd, 0 },
++	{ CCI_REG8(0x621a), 0x00cd, 0 },
++	{ CCI_REG8(0x621b), 0x00cd, 0 },
++	{ CCI_REG8(0x621c), 0x00cd, 0 },
++	{ CCI_REG8(0x621d), 0x00cd, 0 },
++	{ CCI_REG8(0x621e), 0x00cd, 0 },
++	{ CCI_REG8(0x621f), 0x00cd, 0 },
++	{ CCI_REG8(0x6220), 0x00cd, 0 },
++	{ CCI_REG8(0x6221), 0x00cd, 0 },
++	{ CCI_REG8(0x6222), 0x00cd, 0 },
++	{ CCI_REG8(0x6223), 0x00cd, 0 },
++	{ CCI_REG8(0x6224), 0x00cd, 0 },
++	{ CCI_REG8(0x6225), 0x00cd, 0 },
++	{ CCI_REG8(0x6226), 0x00cd, 0 },
++	{ CCI_REG8(0x6227), 0x00cd, 0 },
++	{ CCI_REG8(0x6228), 0x00cd, 0 },
++	{ CCI_REG8(0x6229), 0x00cd, 0 },
++	{ CCI_REG8(0x622a), 0x00cd, 0 },
++	{ CCI_REG8(0x622b), 0x00cd, 0 },
++	{ CCI_REG8(0x622c), 0x00cd, 0 },
++	{ CCI_REG8(0x622d), 0x00cd, 0 },
++	{ CCI_REG8(0x622e), 0x00cd, 0 },
++	{ CCI_REG8(0x622f), 0x00cd, 0 },
++	{ CCI_REG8(0x6230), 0x00cd, 0 },
++	{ CCI_REG8(0x6231), 0x00cd, 0 },
++	{ CCI_REG8(0x6232), 0x00cd, 0 },
++	{ CCI_REG8(0x6233), 0x00cd, 0 },
++	{ CCI_REG8(0x6234), 0x00cd, 0 },
++	{ CCI_REG8(0x6235), 0x00cd, 0 },
++	{ CCI_REG8(0x6236), 0x00cd, 0 },
++	{ CCI_REG8(0x6237), 0x00cd, 0 },
++	{ CCI_REG8(0x6238), 0x00cd, 0 },
++	{ CCI_REG8(0x6239), 0x00cd, 0 },
++	{ CCI_REG8(0x623a), 0x00cd, 0 },
++	{ CCI_REG8(0x623b), 0x00cd, 0 },
++	{ CCI_REG8(0x623c), 0x00cd, 0 },
++	{ CCI_REG8(0x623d), 0x00cd, 0 },
++	{ CCI_REG8(0x623e), 0x00cd, 0 },
++	{ CCI_REG8(0x623f), 0x00cd, 0 },
++	{ CCI_REG8(0x6240), 0x00cd, 0 },
++	{ CCI_REG8(0x6241), 0x00cd, 0 },
++	{ CCI_REG8(0x6242), 0x00cd, 0 },
++	{ CCI_REG8(0x6243), 0x00cd, 0 },
++	{ CCI_REG8(0x6244), 0x00cd, 0 },
++	{ CCI_REG8(0x6245), 0x00cd, 0 },
++	{ CCI_REG8(0x6246), 0x00cd, 0 },
++	{ CCI_REG8(0x6247), 0x00cd, 0 },
++	{ CCI_REG8(0x6248), 0x00cd, 0 },
++	{ CCI_REG8(0x6249), 0x00cd, 0 },
++	{ CCI_REG8(0x624a), 0x00cd, 0 },
++	{ CCI_REG8(0x624b), 0x00cd, 0 },
++	{ CCI_REG8(0x624c), 0x00cd, 0 },
++	{ CCI_REG8(0x624d), 0x00cd, 0 },
++	{ CCI_REG8(0x624e), 0x00cd, 0 },
++	{ CCI_REG8(0x624f), 0x00cd, 0 },
++	{ CCI_REG8(0x5a40), 0x0075, 0 },
++	{ CCI_REG8(0x5a41), 0x0075, 0 },
++	{ CCI_REG8(0x5a42), 0x0075, 0 },
++	{ CCI_REG8(0x5a43), 0x0075, 0 },
++	{ CCI_REG8(0x5a44), 0x0075, 0 },
++	{ CCI_REG8(0x5a45), 0x0075, 0 },
++	{ CCI_REG8(0x5a46), 0x0075, 0 },
++	{ CCI_REG8(0x5a47), 0x0075, 0 },
++	{ CCI_REG8(0x5a48), 0x0075, 0 },
++	{ CCI_REG8(0x5a49), 0x0075, 0 },
++	{ CCI_REG8(0x5a4a), 0x0075, 0 },
++	{ CCI_REG8(0x5a4b), 0x0075, 0 },
++	{ CCI_REG8(0x5a4c), 0x0075, 0 },
++	{ CCI_REG8(0x5a4d), 0x0075, 0 },
++	{ CCI_REG8(0x5a4e), 0x0075, 0 },
++	{ CCI_REG8(0x5a4f), 0x0075, 0 },
++	{ CCI_REG8(0x5a50), 0x0075, 0 },
++	{ CCI_REG8(0x5a51), 0x0075, 0 },
++	{ CCI_REG8(0x5a52), 0x0075, 0 },
++	{ CCI_REG8(0x5a53), 0x0075, 0 },
++	{ CCI_REG8(0x5a54), 0x0075, 0 },
++	{ CCI_REG8(0x5a55), 0x0075, 0 },
++	{ CCI_REG8(0x5a56), 0x0075, 0 },
++	{ CCI_REG8(0x5a57), 0x0075, 0 },
++	{ CCI_REG8(0x5a58), 0x0075, 0 },
++	{ CCI_REG8(0x5a59), 0x0075, 0 },
++	{ CCI_REG8(0x5a5a), 0x0075, 0 },
++	{ CCI_REG8(0x5a5b), 0x0075, 0 },
++	{ CCI_REG8(0x5a5c), 0x0075, 0 },
++	{ CCI_REG8(0x5a5d), 0x0075, 0 },
++	{ CCI_REG8(0x5a5e), 0x0075, 0 },
++	{ CCI_REG8(0x5a5f), 0x0075, 0 },
++	{ CCI_REG8(0x5a60), 0x0075, 0 },
++	{ CCI_REG8(0x5a61), 0x0075, 0 },
++	{ CCI_REG8(0x5a62), 0x0075, 0 },
++	{ CCI_REG8(0x5a63), 0x0075, 0 },
++	{ CCI_REG8(0x5a64), 0x0075, 0 },
++	{ CCI_REG8(0x5a65), 0x0075, 0 },
++	{ CCI_REG8(0x5a66), 0x0075, 0 },
++	{ CCI_REG8(0x5a67), 0x0075, 0 },
++	{ CCI_REG8(0x5a68), 0x0075, 0 },
++	{ CCI_REG8(0x5a69), 0x0075, 0 },
++	{ CCI_REG8(0x5a6a), 0x0075, 0 },
++	{ CCI_REG8(0x5a6b), 0x0075, 0 },
++	{ CCI_REG8(0x5a6c), 0x0075, 0 },
++	{ CCI_REG8(0x5a6d), 0x0075, 0 },
++	{ CCI_REG8(0x5a6e), 0x0075, 0 },
++	{ CCI_REG8(0x5a6f), 0x0075, 0 },
++	{ CCI_REG8(0x5a70), 0x0075, 0 },
++	{ CCI_REG8(0x5a71), 0x0075, 0 },
++	{ CCI_REG8(0x5a72), 0x0075, 0 },
++	{ CCI_REG8(0x5a73), 0x0075, 0 },
++	{ CCI_REG8(0x5a74), 0x0075, 0 },
++	{ CCI_REG8(0x5a75), 0x0075, 0 },
++	{ CCI_REG8(0x5a76), 0x0075, 0 },
++	{ CCI_REG8(0x5a77), 0x0075, 0 },
++	{ CCI_REG8(0x5a78), 0x0075, 0 },
++	{ CCI_REG8(0x5a79), 0x0075, 0 },
++	{ CCI_REG8(0x5a7a), 0x0075, 0 },
++	{ CCI_REG8(0x5a7b), 0x0075, 0 },
++	{ CCI_REG8(0x5a7c), 0x0075, 0 },
++	{ CCI_REG8(0x5a7d), 0x0075, 0 },
++	{ CCI_REG8(0x5a7e), 0x0075, 0 },
++	{ CCI_REG8(0x5a7f), 0x0075, 0 },
++	{ CCI_REG8(0x5a80), 0x0075, 0 },
++	{ CCI_REG8(0x5a81), 0x0075, 0 },
++	{ CCI_REG8(0x5a82), 0x0075, 0 },
++	{ CCI_REG8(0x5a83), 0x0075, 0 },
++	{ CCI_REG8(0x5a84), 0x0075, 0 },
++	{ CCI_REG8(0x5a85), 0x0075, 0 },
++	{ CCI_REG8(0x5a86), 0x0075, 0 },
++	{ CCI_REG8(0x5a87), 0x0075, 0 },
++	{ CCI_REG8(0x5a88), 0x0075, 0 },
++	{ CCI_REG8(0x5a89), 0x0075, 0 },
++	{ CCI_REG8(0x5a8a), 0x0075, 0 },
++	{ CCI_REG8(0x5a8b), 0x0075, 0 },
++	{ CCI_REG8(0x5a8c), 0x0075, 0 },
++	{ CCI_REG8(0x5a8d), 0x0075, 0 },
++	{ CCI_REG8(0x5a8e), 0x0075, 0 },
++	{ CCI_REG8(0x5a8f), 0x0075, 0 },
++	{ CCI_REG8(0x5a90), 0x0075, 0 },
++	{ CCI_REG8(0x5a91), 0x0075, 0 },
++	{ CCI_REG8(0x5a92), 0x0075, 0 },
++	{ CCI_REG8(0x5a93), 0x0075, 0 },
++	{ CCI_REG8(0x5a94), 0x0075, 0 },
++	{ CCI_REG8(0x5a95), 0x0075, 0 },
++	{ CCI_REG8(0x5a96), 0x0075, 0 },
++	{ CCI_REG8(0x5a97), 0x0075, 0 },
++	{ CCI_REG8(0x5a98), 0x0075, 0 },
++	{ CCI_REG8(0x5a99), 0x0075, 0 },
++	{ CCI_REG8(0x5a9a), 0x0075, 0 },
++	{ CCI_REG8(0x5a9b), 0x0075, 0 },
++	{ CCI_REG8(0x5a9c), 0x0075, 0 },
++	{ CCI_REG8(0x5a9d), 0x0075, 0 },
++	{ CCI_REG8(0x5a9e), 0x0075, 0 },
++	{ CCI_REG8(0x5a9f), 0x0075, 0 },
++	{ CCI_REG8(0x5aa0), 0x0075, 0 },
++	{ CCI_REG8(0x5aa1), 0x0075, 0 },
++	{ CCI_REG8(0x5aa2), 0x0075, 0 },
++	{ CCI_REG8(0x5aa3), 0x0075, 0 },
++	{ CCI_REG8(0x5aa4), 0x0075, 0 },
++	{ CCI_REG8(0x5aa5), 0x0075, 0 },
++	{ CCI_REG8(0x5aa6), 0x0075, 0 },
++	{ CCI_REG8(0x5aa7), 0x0075, 0 },
++	{ CCI_REG8(0x5aa8), 0x0075, 0 },
++	{ CCI_REG8(0x5aa9), 0x0075, 0 },
++	{ CCI_REG8(0x5aaa), 0x0075, 0 },
++	{ CCI_REG8(0x5aab), 0x0075, 0 },
++	{ CCI_REG8(0x5aac), 0x0075, 0 },
++	{ CCI_REG8(0x5aad), 0x0075, 0 },
++	{ CCI_REG8(0x5aae), 0x0075, 0 },
++	{ CCI_REG8(0x5aaf), 0x0075, 0 },
++	{ CCI_REG8(0x5ab0), 0x0075, 0 },
++	{ CCI_REG8(0x5ab1), 0x0075, 0 },
++	{ CCI_REG8(0x5ab2), 0x0075, 0 },
++	{ CCI_REG8(0x5ab3), 0x0075, 0 },
++	{ CCI_REG8(0x5ab4), 0x0075, 0 },
++	{ CCI_REG8(0x5ab5), 0x0075, 0 },
++	{ CCI_REG8(0x5ab6), 0x0075, 0 },
++	{ CCI_REG8(0x5ab7), 0x0075, 0 },
++	{ CCI_REG8(0x5ab8), 0x0075, 0 },
++	{ CCI_REG8(0x5ab9), 0x0075, 0 },
++	{ CCI_REG8(0x5aba), 0x0075, 0 },
++	{ CCI_REG8(0x5abb), 0x0075, 0 },
++	{ CCI_REG8(0x5abc), 0x0075, 0 },
++	{ CCI_REG8(0x5abd), 0x0075, 0 },
++	{ CCI_REG8(0x5abe), 0x0075, 0 },
++	{ CCI_REG8(0x5abf), 0x0075, 0 },
++	{ CCI_REG8(0x5ac0), 0x0075, 0 },
++	{ CCI_REG8(0x5ac1), 0x0075, 0 },
++	{ CCI_REG8(0x5ac2), 0x0075, 0 },
++	{ CCI_REG8(0x5ac3), 0x0075, 0 },
++	{ CCI_REG8(0x5ac4), 0x0075, 0 },
++	{ CCI_REG8(0x5ac5), 0x0075, 0 },
++	{ CCI_REG8(0x5ac6), 0x0075, 0 },
++	{ CCI_REG8(0x5ac7), 0x0075, 0 },
++	{ CCI_REG8(0x5ac8), 0x0075, 0 },
++	{ CCI_REG8(0x5ac9), 0x0075, 0 },
++	{ CCI_REG8(0x5aca), 0x0075, 0 },
++	{ CCI_REG8(0x5acb), 0x0075, 0 },
++	{ CCI_REG8(0x5acc), 0x0075, 0 },
++	{ CCI_REG8(0x5acd), 0x0075, 0 },
++	{ CCI_REG8(0x5ace), 0x0075, 0 },
++	{ CCI_REG8(0x5acf), 0x0075, 0 },
++	{ CCI_REG8(0x5ad0), 0x0075, 0 },
++	{ CCI_REG8(0x5ad1), 0x0075, 0 },
++	{ CCI_REG8(0x5ad2), 0x0075, 0 },
++	{ CCI_REG8(0x5ad3), 0x0075, 0 },
++	{ CCI_REG8(0x5ad4), 0x0075, 0 },
++	{ CCI_REG8(0x5ad5), 0x0075, 0 },
++	{ CCI_REG8(0x5ad6), 0x0075, 0 },
++	{ CCI_REG8(0x5ad7), 0x0075, 0 },
++	{ CCI_REG8(0x5ad8), 0x0075, 0 },
++	{ CCI_REG8(0x5ad9), 0x0075, 0 },
++	{ CCI_REG8(0x5ada), 0x0075, 0 },
++	{ CCI_REG8(0x5adb), 0x0075, 0 },
++	{ CCI_REG8(0x5adc), 0x0075, 0 },
++	{ CCI_REG8(0x5add), 0x0075, 0 },
++	{ CCI_REG8(0x5ade), 0x0075, 0 },
++	{ CCI_REG8(0x5adf), 0x0075, 0 },
++	{ CCI_REG8(0x5ae0), 0x0075, 0 },
++	{ CCI_REG8(0x5ae1), 0x0075, 0 },
++	{ CCI_REG8(0x5ae2), 0x0075, 0 },
++	{ CCI_REG8(0x5ae3), 0x0075, 0 },
++	{ CCI_REG8(0x5ae4), 0x0075, 0 },
++	{ CCI_REG8(0x5ae5), 0x0075, 0 },
++	{ CCI_REG8(0x5ae6), 0x0075, 0 },
++	{ CCI_REG8(0x5ae7), 0x0075, 0 },
++	{ CCI_REG8(0x5ae8), 0x0075, 0 },
++	{ CCI_REG8(0x5ae9), 0x0075, 0 },
++	{ CCI_REG8(0x5aea), 0x0075, 0 },
++	{ CCI_REG8(0x5aeb), 0x0075, 0 },
++	{ CCI_REG8(0x5aec), 0x0075, 0 },
++	{ CCI_REG8(0x5aed), 0x0075, 0 },
++	{ CCI_REG8(0x5aee), 0x0075, 0 },
++	{ CCI_REG8(0x5aef), 0x0075, 0 },
++	{ CCI_REG8(0x5af0), 0x0075, 0 },
++	{ CCI_REG8(0x5af1), 0x0075, 0 },
++	{ CCI_REG8(0x5af2), 0x0075, 0 },
++	{ CCI_REG8(0x5af3), 0x0075, 0 },
++	{ CCI_REG8(0x5af4), 0x0075, 0 },
++	{ CCI_REG8(0x5af5), 0x0075, 0 },
++	{ CCI_REG8(0x5af6), 0x0075, 0 },
++	{ CCI_REG8(0x5af7), 0x0075, 0 },
++	{ CCI_REG8(0x5af8), 0x0075, 0 },
++	{ CCI_REG8(0x5af9), 0x0075, 0 },
++	{ CCI_REG8(0x5afa), 0x0075, 0 },
++	{ CCI_REG8(0x5afb), 0x0075, 0 },
++	{ CCI_REG8(0x5afc), 0x0075, 0 },
++	{ CCI_REG8(0x5afd), 0x0075, 0 },
++	{ CCI_REG8(0x5afe), 0x0075, 0 },
++	{ CCI_REG8(0x5aff), 0x0075, 0 },
++	{ CCI_REG8(0x5b00), 0x0075, 0 },
++	{ CCI_REG8(0x5b01), 0x0075, 0 },
++	{ CCI_REG8(0x5b02), 0x0075, 0 },
++	{ CCI_REG8(0x5b03), 0x0075, 0 },
++	{ CCI_REG8(0x5b04), 0x0075, 0 },
++	{ CCI_REG8(0x5b05), 0x0075, 0 },
++	{ CCI_REG8(0x5b06), 0x0075, 0 },
++	{ CCI_REG8(0x5b07), 0x0075, 0 },
++	{ CCI_REG8(0x5b08), 0x0075, 0 },
++	{ CCI_REG8(0x5b09), 0x0075, 0 },
++	{ CCI_REG8(0x5b0a), 0x0075, 0 },
++	{ CCI_REG8(0x5b0b), 0x0075, 0 },
++	{ CCI_REG8(0x5b0c), 0x0075, 0 },
++	{ CCI_REG8(0x5b0d), 0x0075, 0 },
++	{ CCI_REG8(0x5b0e), 0x0075, 0 },
++	{ CCI_REG8(0x5b0f), 0x0075, 0 },
++	{ CCI_REG8(0x5b10), 0x0075, 0 },
++	{ CCI_REG8(0x5b11), 0x0075, 0 },
++	{ CCI_REG8(0x5b12), 0x0075, 0 },
++	{ CCI_REG8(0x5b13), 0x0075, 0 },
++	{ CCI_REG8(0x5b14), 0x0075, 0 },
++	{ CCI_REG8(0x5b15), 0x0075, 0 },
++	{ CCI_REG8(0x5b16), 0x0075, 0 },
++	{ CCI_REG8(0x5b17), 0x0075, 0 },
++	{ CCI_REG8(0x5b18), 0x0075, 0 },
++	{ CCI_REG8(0x5b19), 0x0075, 0 },
++	{ CCI_REG8(0x5b1a), 0x0075, 0 },
++	{ CCI_REG8(0x5b1b), 0x0075, 0 },
++	{ CCI_REG8(0x5b1c), 0x0075, 0 },
++	{ CCI_REG8(0x5b1d), 0x0075, 0 },
++	{ CCI_REG8(0x5b1e), 0x0075, 0 },
++	{ CCI_REG8(0x5b1f), 0x0075, 0 },
++	{ CCI_REG8(0x5b20), 0x0075, 0 },
++	{ CCI_REG8(0x5b21), 0x0075, 0 },
++	{ CCI_REG8(0x5b22), 0x0075, 0 },
++	{ CCI_REG8(0x5b23), 0x0075, 0 },
++	{ CCI_REG8(0x5b24), 0x0075, 0 },
++	{ CCI_REG8(0x5b25), 0x0075, 0 },
++	{ CCI_REG8(0x5b26), 0x0075, 0 },
++	{ CCI_REG8(0x5b27), 0x0075, 0 },
++	{ CCI_REG8(0x5b28), 0x0075, 0 },
++	{ CCI_REG8(0x5b29), 0x0075, 0 },
++	{ CCI_REG8(0x5b2a), 0x0075, 0 },
++	{ CCI_REG8(0x5b2b), 0x0075, 0 },
++	{ CCI_REG8(0x5b2c), 0x0075, 0 },
++	{ CCI_REG8(0x5b2d), 0x0075, 0 },
++	{ CCI_REG8(0x5b2e), 0x0075, 0 },
++	{ CCI_REG8(0x5b2f), 0x0075, 0 },
++	{ CCI_REG8(0x5b30), 0x0075, 0 },
++	{ CCI_REG8(0x5b31), 0x0075, 0 },
++	{ CCI_REG8(0x5b32), 0x0075, 0 },
++	{ CCI_REG8(0x5b33), 0x0075, 0 },
++	{ CCI_REG8(0x5b34), 0x0075, 0 },
++	{ CCI_REG8(0x5b35), 0x0075, 0 },
++	{ CCI_REG8(0x5b36), 0x0075, 0 },
++	{ CCI_REG8(0x5b37), 0x0075, 0 },
++	{ CCI_REG8(0x5b38), 0x0075, 0 },
++	{ CCI_REG8(0x5b39), 0x0075, 0 },
++	{ CCI_REG8(0x5b3a), 0x0075, 0 },
++	{ CCI_REG8(0x5b3b), 0x0075, 0 },
++	{ CCI_REG8(0x5b3c), 0x0075, 0 },
++	{ CCI_REG8(0x5b3d), 0x0075, 0 },
++	{ CCI_REG8(0x5b3e), 0x0075, 0 },
++	{ CCI_REG8(0x5b3f), 0x0075, 0 },
++	{ CCI_REG8(0x5b40), 0x0075, 0 },
++	{ CCI_REG8(0x5b41), 0x0075, 0 },
++	{ CCI_REG8(0x5b42), 0x0075, 0 },
++	{ CCI_REG8(0x5b43), 0x0075, 0 },
++	{ CCI_REG8(0x5b44), 0x0075, 0 },
++	{ CCI_REG8(0x5b45), 0x0075, 0 },
++	{ CCI_REG8(0x5b46), 0x0075, 0 },
++	{ CCI_REG8(0x5b47), 0x0075, 0 },
++	{ CCI_REG8(0x5b48), 0x0075, 0 },
++	{ CCI_REG8(0x5b49), 0x0075, 0 },
++	{ CCI_REG8(0x5b4a), 0x0075, 0 },
++	{ CCI_REG8(0x5b4b), 0x0075, 0 },
++	{ CCI_REG8(0x5b4c), 0x0075, 0 },
++	{ CCI_REG8(0x5b4d), 0x0075, 0 },
++	{ CCI_REG8(0x5b4e), 0x0075, 0 },
++	{ CCI_REG8(0x5b4f), 0x0075, 0 },
++	{ CCI_REG8(0x5b50), 0x0075, 0 },
++	{ CCI_REG8(0x5b51), 0x0075, 0 },
++	{ CCI_REG8(0x5b52), 0x0075, 0 },
++	{ CCI_REG8(0x5b53), 0x0075, 0 },
++	{ CCI_REG8(0x5b54), 0x0075, 0 },
++	{ CCI_REG8(0x5b55), 0x0075, 0 },
++	{ CCI_REG8(0x5b56), 0x0075, 0 },
++	{ CCI_REG8(0x5b57), 0x0075, 0 },
++	{ CCI_REG8(0x5b58), 0x0075, 0 },
++	{ CCI_REG8(0x5b59), 0x0075, 0 },
++	{ CCI_REG8(0x5b5a), 0x0075, 0 },
++	{ CCI_REG8(0x5b5b), 0x0075, 0 },
++	{ CCI_REG8(0x5b5c), 0x0075, 0 },
++	{ CCI_REG8(0x5b5d), 0x0075, 0 },
++	{ CCI_REG8(0x5b5e), 0x0075, 0 },
++	{ CCI_REG8(0x5b5f), 0x0075, 0 },
++	{ CCI_REG8(0x5b80), 0x0075, 0 },
++	{ CCI_REG8(0x5b81), 0x0075, 0 },
++	{ CCI_REG8(0x5b82), 0x0075, 0 },
++	{ CCI_REG8(0x5b83), 0x0075, 0 },
++	{ CCI_REG8(0x5b84), 0x0075, 0 },
++	{ CCI_REG8(0x5b85), 0x0075, 0 },
++	{ CCI_REG8(0x5b86), 0x0075, 0 },
++	{ CCI_REG8(0x5b87), 0x0075, 0 },
++	{ CCI_REG8(0x5b88), 0x0075, 0 },
++	{ CCI_REG8(0x5b89), 0x0075, 0 },
++	{ CCI_REG8(0x5b8a), 0x0075, 0 },
++	{ CCI_REG8(0x5b8b), 0x0075, 0 },
++	{ CCI_REG8(0x5b8c), 0x0075, 0 },
++	{ CCI_REG8(0x5b8d), 0x0075, 0 },
++	{ CCI_REG8(0x5b8e), 0x0075, 0 },
++	{ CCI_REG8(0x5b8f), 0x0075, 0 },
++	{ CCI_REG8(0x5b90), 0x0075, 0 },
++	{ CCI_REG8(0x5b91), 0x0075, 0 },
++	{ CCI_REG8(0x5b92), 0x0075, 0 },
++	{ CCI_REG8(0x5b93), 0x0075, 0 },
++	{ CCI_REG8(0x5b94), 0x0075, 0 },
++	{ CCI_REG8(0x5b95), 0x0075, 0 },
++	{ CCI_REG8(0x5b96), 0x0075, 0 },
++	{ CCI_REG8(0x5b97), 0x0075, 0 },
++	{ CCI_REG8(0x5b98), 0x0075, 0 },
++	{ CCI_REG8(0x5b99), 0x0075, 0 },
++	{ CCI_REG8(0x5b9a), 0x0075, 0 },
++	{ CCI_REG8(0x5b9b), 0x0075, 0 },
++	{ CCI_REG8(0x5b9c), 0x0075, 0 },
++	{ CCI_REG8(0x5b9d), 0x0075, 0 },
++	{ CCI_REG8(0x5b9e), 0x0075, 0 },
++	{ CCI_REG8(0x5b9f), 0x0075, 0 },
++	{ CCI_REG8(0x5ba0), 0x0075, 0 },
++	{ CCI_REG8(0x5ba1), 0x0075, 0 },
++	{ CCI_REG8(0x5ba2), 0x0075, 0 },
++	{ CCI_REG8(0x5ba3), 0x0075, 0 },
++	{ CCI_REG8(0x5ba4), 0x0075, 0 },
++	{ CCI_REG8(0x5ba5), 0x0075, 0 },
++	{ CCI_REG8(0x5ba6), 0x0075, 0 },
++	{ CCI_REG8(0x5ba7), 0x0075, 0 },
++	{ CCI_REG8(0x5ba8), 0x0075, 0 },
++	{ CCI_REG8(0x5ba9), 0x0075, 0 },
++	{ CCI_REG8(0x5baa), 0x0075, 0 },
++	{ CCI_REG8(0x5bab), 0x0075, 0 },
++	{ CCI_REG8(0x5bac), 0x0075, 0 },
++	{ CCI_REG8(0x5bad), 0x0075, 0 },
++	{ CCI_REG8(0x5bae), 0x0075, 0 },
++	{ CCI_REG8(0x5baf), 0x0075, 0 },
++	{ CCI_REG8(0x5bb0), 0x0075, 0 },
++	{ CCI_REG8(0x5bb1), 0x0075, 0 },
++	{ CCI_REG8(0x5bb2), 0x0075, 0 },
++	{ CCI_REG8(0x5bb3), 0x0075, 0 },
++	{ CCI_REG8(0x5bb4), 0x0075, 0 },
++	{ CCI_REG8(0x5bb5), 0x0075, 0 },
++	{ CCI_REG8(0x5bb6), 0x0075, 0 },
++	{ CCI_REG8(0x5bb7), 0x0075, 0 },
++	{ CCI_REG8(0x5bb8), 0x0075, 0 },
++	{ CCI_REG8(0x5bb9), 0x0075, 0 },
++	{ CCI_REG8(0x5bba), 0x0075, 0 },
++	{ CCI_REG8(0x5bbb), 0x0075, 0 },
++	{ CCI_REG8(0x5bbc), 0x0075, 0 },
++	{ CCI_REG8(0x5bbd), 0x0075, 0 },
++	{ CCI_REG8(0x5bbe), 0x0075, 0 },
++	{ CCI_REG8(0x5bbf), 0x0075, 0 },
++	{ CCI_REG8(0x5bc0), 0x0075, 0 },
++	{ CCI_REG8(0x5bc1), 0x0075, 0 },
++	{ CCI_REG8(0x5bc2), 0x0075, 0 },
++	{ CCI_REG8(0x5bc3), 0x0075, 0 },
++	{ CCI_REG8(0x5bc4), 0x0075, 0 },
++	{ CCI_REG8(0x5bc5), 0x0075, 0 },
++	{ CCI_REG8(0x5bc6), 0x0075, 0 },
++	{ CCI_REG8(0x5bc7), 0x0075, 0 },
++	{ CCI_REG8(0x5bc8), 0x0075, 0 },
++	{ CCI_REG8(0x5bc9), 0x0075, 0 },
++	{ CCI_REG8(0x5bca), 0x0075, 0 },
++	{ CCI_REG8(0x5bcb), 0x0075, 0 },
++	{ CCI_REG8(0x5bcc), 0x0075, 0 },
++	{ CCI_REG8(0x5bcd), 0x0075, 0 },
++	{ CCI_REG8(0x5bce), 0x0075, 0 },
++	{ CCI_REG8(0x5bcf), 0x0075, 0 },
++	{ CCI_REG8(0x5bd0), 0x0075, 0 },
++	{ CCI_REG8(0x5bd1), 0x0075, 0 },
++	{ CCI_REG8(0x5bd2), 0x0075, 0 },
++	{ CCI_REG8(0x5bd3), 0x0075, 0 },
++	{ CCI_REG8(0x5bd4), 0x0075, 0 },
++	{ CCI_REG8(0x5bd5), 0x0075, 0 },
++	{ CCI_REG8(0x5bd6), 0x0075, 0 },
++	{ CCI_REG8(0x5bd7), 0x0075, 0 },
++	{ CCI_REG8(0x5bd8), 0x0075, 0 },
++	{ CCI_REG8(0x5bd9), 0x0075, 0 },
++	{ CCI_REG8(0x5bda), 0x0075, 0 },
++	{ CCI_REG8(0x5bdb), 0x0075, 0 },
++	{ CCI_REG8(0x5bdc), 0x0075, 0 },
++	{ CCI_REG8(0x5bdd), 0x0075, 0 },
++	{ CCI_REG8(0x5bde), 0x0075, 0 },
++	{ CCI_REG8(0x5bdf), 0x0075, 0 },
++	{ CCI_REG8(0x5be0), 0x0075, 0 },
++	{ CCI_REG8(0x5be1), 0x0075, 0 },
++	{ CCI_REG8(0x5be2), 0x0075, 0 },
++	{ CCI_REG8(0x5be3), 0x0075, 0 },
++	{ CCI_REG8(0x5be4), 0x0075, 0 },
++	{ CCI_REG8(0x5be5), 0x0075, 0 },
++	{ CCI_REG8(0x5be6), 0x0075, 0 },
++	{ CCI_REG8(0x5be7), 0x0075, 0 },
++	{ CCI_REG8(0x5be8), 0x0075, 0 },
++	{ CCI_REG8(0x5be9), 0x0075, 0 },
++	{ CCI_REG8(0x5bea), 0x0075, 0 },
++	{ CCI_REG8(0x5beb), 0x0075, 0 },
++	{ CCI_REG8(0x5bec), 0x0075, 0 },
++	{ CCI_REG8(0x5bed), 0x0075, 0 },
++	{ CCI_REG8(0x5bee), 0x0075, 0 },
++	{ CCI_REG8(0x5bef), 0x0075, 0 },
++	{ CCI_REG8(0x5bf0), 0x0075, 0 },
++	{ CCI_REG8(0x5bf1), 0x0075, 0 },
++	{ CCI_REG8(0x5bf2), 0x0075, 0 },
++	{ CCI_REG8(0x5bf3), 0x0075, 0 },
++	{ CCI_REG8(0x5bf4), 0x0075, 0 },
++	{ CCI_REG8(0x5bf5), 0x0075, 0 },
++	{ CCI_REG8(0x5bf6), 0x0075, 0 },
++	{ CCI_REG8(0x5bf7), 0x0075, 0 },
++	{ CCI_REG8(0x5bf8), 0x0075, 0 },
++	{ CCI_REG8(0x5bf9), 0x0075, 0 },
++	{ CCI_REG8(0x5bfa), 0x0075, 0 },
++	{ CCI_REG8(0x5bfb), 0x0075, 0 },
++	{ CCI_REG8(0x5bfc), 0x0075, 0 },
++	{ CCI_REG8(0x5bfd), 0x0075, 0 },
++	{ CCI_REG8(0x5bfe), 0x0075, 0 },
++	{ CCI_REG8(0x5bff), 0x0075, 0 },
++	{ CCI_REG8(0x5c00), 0x0075, 0 },
++	{ CCI_REG8(0x5c01), 0x0075, 0 },
++	{ CCI_REG8(0x5c02), 0x0075, 0 },
++	{ CCI_REG8(0x5c03), 0x0075, 0 },
++	{ CCI_REG8(0x5c04), 0x0075, 0 },
++	{ CCI_REG8(0x5c05), 0x0075, 0 },
++	{ CCI_REG8(0x5c06), 0x0075, 0 },
++	{ CCI_REG8(0x5c07), 0x0075, 0 },
++	{ CCI_REG8(0x5c08), 0x0075, 0 },
++	{ CCI_REG8(0x5c09), 0x0075, 0 },
++	{ CCI_REG8(0x5c0a), 0x0075, 0 },
++	{ CCI_REG8(0x5c0b), 0x0075, 0 },
++	{ CCI_REG8(0x5c0c), 0x0075, 0 },
++	{ CCI_REG8(0x5c0d), 0x0075, 0 },
++	{ CCI_REG8(0x5c0e), 0x0075, 0 },
++	{ CCI_REG8(0x5c0f), 0x0075, 0 },
++	{ CCI_REG8(0x5c10), 0x0075, 0 },
++	{ CCI_REG8(0x5c11), 0x0075, 0 },
++	{ CCI_REG8(0x5c12), 0x0075, 0 },
++	{ CCI_REG8(0x5c13), 0x0075, 0 },
++	{ CCI_REG8(0x5c14), 0x0075, 0 },
++	{ CCI_REG8(0x5c15), 0x0075, 0 },
++	{ CCI_REG8(0x5c16), 0x0075, 0 },
++	{ CCI_REG8(0x5c17), 0x0075, 0 },
++	{ CCI_REG8(0x5c18), 0x0075, 0 },
++	{ CCI_REG8(0x5c19), 0x0075, 0 },
++	{ CCI_REG8(0x5c1a), 0x0075, 0 },
++	{ CCI_REG8(0x5c1b), 0x0075, 0 },
++	{ CCI_REG8(0x5c1c), 0x0075, 0 },
++	{ CCI_REG8(0x5c1d), 0x0075, 0 },
++	{ CCI_REG8(0x5c1e), 0x0075, 0 },
++	{ CCI_REG8(0x5c1f), 0x0075, 0 },
++	{ CCI_REG8(0x5c20), 0x0075, 0 },
++	{ CCI_REG8(0x5c21), 0x0075, 0 },
++	{ CCI_REG8(0x5c22), 0x0075, 0 },
++	{ CCI_REG8(0x5c23), 0x0075, 0 },
++	{ CCI_REG8(0x5c24), 0x0075, 0 },
++	{ CCI_REG8(0x5c25), 0x0075, 0 },
++	{ CCI_REG8(0x5c26), 0x0075, 0 },
++	{ CCI_REG8(0x5c27), 0x0075, 0 },
++	{ CCI_REG8(0x5c28), 0x0075, 0 },
++	{ CCI_REG8(0x5c29), 0x0075, 0 },
++	{ CCI_REG8(0x5c2a), 0x0075, 0 },
++	{ CCI_REG8(0x5c2b), 0x0075, 0 },
++	{ CCI_REG8(0x5c2c), 0x0075, 0 },
++	{ CCI_REG8(0x5c2d), 0x0075, 0 },
++	{ CCI_REG8(0x5c2e), 0x0075, 0 },
++	{ CCI_REG8(0x5c2f), 0x0075, 0 },
++	{ CCI_REG8(0x5c30), 0x0075, 0 },
++	{ CCI_REG8(0x5c31), 0x0075, 0 },
++	{ CCI_REG8(0x5c32), 0x0075, 0 },
++	{ CCI_REG8(0x5c33), 0x0075, 0 },
++	{ CCI_REG8(0x5c34), 0x0075, 0 },
++	{ CCI_REG8(0x5c35), 0x0075, 0 },
++	{ CCI_REG8(0x5c36), 0x0075, 0 },
++	{ CCI_REG8(0x5c37), 0x0075, 0 },
++	{ CCI_REG8(0x5c38), 0x0075, 0 },
++	{ CCI_REG8(0x5c39), 0x0075, 0 },
++	{ CCI_REG8(0x5c3a), 0x0075, 0 },
++	{ CCI_REG8(0x5c3b), 0x0075, 0 },
++	{ CCI_REG8(0x5c3c), 0x0075, 0 },
++	{ CCI_REG8(0x5c3d), 0x0075, 0 },
++	{ CCI_REG8(0x5c3e), 0x0075, 0 },
++	{ CCI_REG8(0x5c3f), 0x0075, 0 },
++	{ CCI_REG8(0x5c40), 0x0075, 0 },
++	{ CCI_REG8(0x5c41), 0x0075, 0 },
++	{ CCI_REG8(0x5c42), 0x0075, 0 },
++	{ CCI_REG8(0x5c43), 0x0075, 0 },
++	{ CCI_REG8(0x5c44), 0x0075, 0 },
++	{ CCI_REG8(0x5c45), 0x0075, 0 },
++	{ CCI_REG8(0x5c46), 0x0075, 0 },
++	{ CCI_REG8(0x5c47), 0x0075, 0 },
++	{ CCI_REG8(0x5c48), 0x0075, 0 },
++	{ CCI_REG8(0x5c49), 0x0075, 0 },
++	{ CCI_REG8(0x5c4a), 0x0075, 0 },
++	{ CCI_REG8(0x5c4b), 0x0075, 0 },
++	{ CCI_REG8(0x5c4c), 0x0075, 0 },
++	{ CCI_REG8(0x5c4d), 0x0075, 0 },
++	{ CCI_REG8(0x5c4e), 0x0075, 0 },
++	{ CCI_REG8(0x5c4f), 0x0075, 0 },
++	{ CCI_REG8(0x5c50), 0x0075, 0 },
++	{ CCI_REG8(0x5c51), 0x0075, 0 },
++	{ CCI_REG8(0x5c52), 0x0075, 0 },
++	{ CCI_REG8(0x5c53), 0x0075, 0 },
++	{ CCI_REG8(0x5c54), 0x0075, 0 },
++	{ CCI_REG8(0x5c55), 0x0075, 0 },
++	{ CCI_REG8(0x5c56), 0x0075, 0 },
++	{ CCI_REG8(0x5c57), 0x0075, 0 },
++	{ CCI_REG8(0x5c58), 0x0075, 0 },
++	{ CCI_REG8(0x5c59), 0x0075, 0 },
++	{ CCI_REG8(0x5c5a), 0x0075, 0 },
++	{ CCI_REG8(0x5c5b), 0x0075, 0 },
++	{ CCI_REG8(0x5c5c), 0x0075, 0 },
++	{ CCI_REG8(0x5c5d), 0x0075, 0 },
++	{ CCI_REG8(0x5c5e), 0x0075, 0 },
++	{ CCI_REG8(0x5c5f), 0x0075, 0 },
++	{ CCI_REG8(0x5c60), 0x0075, 0 },
++	{ CCI_REG8(0x5c61), 0x0075, 0 },
++	{ CCI_REG8(0x5c62), 0x0075, 0 },
++	{ CCI_REG8(0x5c63), 0x0075, 0 },
++	{ CCI_REG8(0x5c64), 0x0075, 0 },
++	{ CCI_REG8(0x5c65), 0x0075, 0 },
++	{ CCI_REG8(0x5c66), 0x0075, 0 },
++	{ CCI_REG8(0x5c67), 0x0075, 0 },
++	{ CCI_REG8(0x5c68), 0x0075, 0 },
++	{ CCI_REG8(0x5c69), 0x0075, 0 },
++	{ CCI_REG8(0x5c6a), 0x0075, 0 },
++	{ CCI_REG8(0x5c6b), 0x0075, 0 },
++	{ CCI_REG8(0x5c6c), 0x0075, 0 },
++	{ CCI_REG8(0x5c6d), 0x0075, 0 },
++	{ CCI_REG8(0x5c6e), 0x0075, 0 },
++	{ CCI_REG8(0x5c6f), 0x0075, 0 },
++	{ CCI_REG8(0x5c70), 0x0075, 0 },
++	{ CCI_REG8(0x5c71), 0x0075, 0 },
++	{ CCI_REG8(0x5c72), 0x0075, 0 },
++	{ CCI_REG8(0x5c73), 0x0075, 0 },
++	{ CCI_REG8(0x5c74), 0x0075, 0 },
++	{ CCI_REG8(0x5c75), 0x0075, 0 },
++	{ CCI_REG8(0x5c76), 0x0075, 0 },
++	{ CCI_REG8(0x5c77), 0x0075, 0 },
++	{ CCI_REG8(0x5c78), 0x0075, 0 },
++	{ CCI_REG8(0x5c79), 0x0075, 0 },
++	{ CCI_REG8(0x5c7a), 0x0075, 0 },
++	{ CCI_REG8(0x5c7b), 0x0075, 0 },
++	{ CCI_REG8(0x5c7c), 0x0075, 0 },
++	{ CCI_REG8(0x5c7d), 0x0075, 0 },
++	{ CCI_REG8(0x5c7e), 0x0075, 0 },
++	{ CCI_REG8(0x5c7f), 0x0075, 0 },
++	{ CCI_REG8(0x5c80), 0x0075, 0 },
++	{ CCI_REG8(0x5c81), 0x0075, 0 },
++	{ CCI_REG8(0x5c82), 0x0075, 0 },
++	{ CCI_REG8(0x5c83), 0x0075, 0 },
++	{ CCI_REG8(0x5c84), 0x0075, 0 },
++	{ CCI_REG8(0x5c85), 0x0075, 0 },
++	{ CCI_REG8(0x5c86), 0x0075, 0 },
++	{ CCI_REG8(0x5c87), 0x0075, 0 },
++	{ CCI_REG8(0x5c88), 0x0075, 0 },
++	{ CCI_REG8(0x5c89), 0x0075, 0 },
++	{ CCI_REG8(0x5c8a), 0x0075, 0 },
++	{ CCI_REG8(0x5c8b), 0x0075, 0 },
++	{ CCI_REG8(0x5c8c), 0x0075, 0 },
++	{ CCI_REG8(0x5c8d), 0x0075, 0 },
++	{ CCI_REG8(0x5c8e), 0x0075, 0 },
++	{ CCI_REG8(0x5c8f), 0x0075, 0 },
++	{ CCI_REG8(0x5c90), 0x0075, 0 },
++	{ CCI_REG8(0x5c91), 0x0075, 0 },
++	{ CCI_REG8(0x5c92), 0x0075, 0 },
++	{ CCI_REG8(0x5c93), 0x0075, 0 },
++	{ CCI_REG8(0x5c94), 0x0075, 0 },
++	{ CCI_REG8(0x5c95), 0x0075, 0 },
++	{ CCI_REG8(0x5c96), 0x0075, 0 },
++	{ CCI_REG8(0x5c97), 0x0075, 0 },
++	{ CCI_REG8(0x5c98), 0x0075, 0 },
++	{ CCI_REG8(0x5c99), 0x0075, 0 },
++	{ CCI_REG8(0x5c9a), 0x0075, 0 },
++	{ CCI_REG8(0x5c9b), 0x0075, 0 },
++	{ CCI_REG8(0x5c9c), 0x0075, 0 },
++	{ CCI_REG8(0x5c9d), 0x0075, 0 },
++	{ CCI_REG8(0x5c9e), 0x0075, 0 },
++	{ CCI_REG8(0x5c9f), 0x0075, 0 },
++	{ CCI_REG8(0x5ca0), 0x0075, 0 },
++	{ CCI_REG8(0x5ca1), 0x0075, 0 },
++	{ CCI_REG8(0x5ca2), 0x0075, 0 },
++	{ CCI_REG8(0x5ca3), 0x0075, 0 },
++	{ CCI_REG8(0x5ca4), 0x0075, 0 },
++	{ CCI_REG8(0x5ca5), 0x0075, 0 },
++	{ CCI_REG8(0x5ca6), 0x0075, 0 },
++	{ CCI_REG8(0x5ca7), 0x0075, 0 },
++	{ CCI_REG8(0x5ca8), 0x0075, 0 },
++	{ CCI_REG8(0x5ca9), 0x0075, 0 },
++	{ CCI_REG8(0x5caa), 0x0075, 0 },
++	{ CCI_REG8(0x5cab), 0x0075, 0 },
++	{ CCI_REG8(0x5cac), 0x0075, 0 },
++	{ CCI_REG8(0x5cad), 0x0075, 0 },
++	{ CCI_REG8(0x5cae), 0x0075, 0 },
++	{ CCI_REG8(0x5caf), 0x0075, 0 },
++	{ CCI_REG8(0x5cb0), 0x0075, 0 },
++	{ CCI_REG8(0x5cb1), 0x0075, 0 },
++	{ CCI_REG8(0x5cb2), 0x0075, 0 },
++	{ CCI_REG8(0x5cb3), 0x0075, 0 },
++	{ CCI_REG8(0x5cb4), 0x0075, 0 },
++	{ CCI_REG8(0x5cb5), 0x0075, 0 },
++	{ CCI_REG8(0x5cb6), 0x0075, 0 },
++	{ CCI_REG8(0x5cb7), 0x0075, 0 },
++	{ CCI_REG8(0x5cb8), 0x0075, 0 },
++	{ CCI_REG8(0x5cb9), 0x0075, 0 },
++	{ CCI_REG8(0x5cba), 0x0075, 0 },
++	{ CCI_REG8(0x5cbb), 0x0075, 0 },
++	{ CCI_REG8(0x5cbc), 0x0075, 0 },
++	{ CCI_REG8(0x5cbd), 0x0075, 0 },
++	{ CCI_REG8(0x5cbe), 0x0075, 0 },
++	{ CCI_REG8(0x5cbf), 0x0075, 0 },
++	{ CCI_REG8(0x5cc0), 0x0075, 0 },
++	{ CCI_REG8(0x5cc1), 0x0075, 0 },
++	{ CCI_REG8(0x5cc2), 0x0075, 0 },
++	{ CCI_REG8(0x5cc3), 0x0075, 0 },
++	{ CCI_REG8(0x5cc4), 0x0075, 0 },
++	{ CCI_REG8(0x5cc5), 0x0075, 0 },
++	{ CCI_REG8(0x5cc6), 0x0075, 0 },
++	{ CCI_REG8(0x5cc7), 0x0075, 0 },
++	{ CCI_REG8(0x5cc8), 0x0075, 0 },
++	{ CCI_REG8(0x5cc9), 0x0075, 0 },
++	{ CCI_REG8(0x5cca), 0x0075, 0 },
++	{ CCI_REG8(0x5ccb), 0x0075, 0 },
++	{ CCI_REG8(0x5ccc), 0x0075, 0 },
++	{ CCI_REG8(0x5ccd), 0x0075, 0 },
++	{ CCI_REG8(0x5cce), 0x0075, 0 },
++	{ CCI_REG8(0x5ccf), 0x0075, 0 },
++	{ CCI_REG8(0x5cd0), 0x0075, 0 },
++	{ CCI_REG8(0x5cd1), 0x0075, 0 },
++	{ CCI_REG8(0x5cd2), 0x0075, 0 },
++	{ CCI_REG8(0x5cd3), 0x0075, 0 },
++	{ CCI_REG8(0x5cd4), 0x0075, 0 },
++	{ CCI_REG8(0x5cd5), 0x0075, 0 },
++	{ CCI_REG8(0x5cd6), 0x0075, 0 },
++	{ CCI_REG8(0x5cd7), 0x0075, 0 },
++	{ CCI_REG8(0x5cd8), 0x0075, 0 },
++	{ CCI_REG8(0x5cd9), 0x0075, 0 },
++	{ CCI_REG8(0x5cda), 0x0075, 0 },
++	{ CCI_REG8(0x5cdb), 0x0075, 0 },
++	{ CCI_REG8(0x5cdc), 0x0075, 0 },
++	{ CCI_REG8(0x5cdd), 0x0075, 0 },
++	{ CCI_REG8(0x5cde), 0x0075, 0 },
++	{ CCI_REG8(0x5cdf), 0x0075, 0 },
++	{ CCI_REG8(0x5ce0), 0x0075, 0 },
++	{ CCI_REG8(0x5ce1), 0x0075, 0 },
++	{ CCI_REG8(0x5ce2), 0x0075, 0 },
++	{ CCI_REG8(0x5ce3), 0x0075, 0 },
++	{ CCI_REG8(0x5ce4), 0x0075, 0 },
++	{ CCI_REG8(0x5ce5), 0x0075, 0 },
++	{ CCI_REG8(0x5ce6), 0x0075, 0 },
++	{ CCI_REG8(0x5ce7), 0x0075, 0 },
++	{ CCI_REG8(0x5ce8), 0x0075, 0 },
++	{ CCI_REG8(0x5ce9), 0x0075, 0 },
++	{ CCI_REG8(0x5cea), 0x0075, 0 },
++	{ CCI_REG8(0x5ceb), 0x0075, 0 },
++	{ CCI_REG8(0x5cec), 0x0075, 0 },
++	{ CCI_REG8(0x5ced), 0x0075, 0 },
++	{ CCI_REG8(0x5cee), 0x0075, 0 },
++	{ CCI_REG8(0x5cef), 0x0075, 0 },
++	{ CCI_REG8(0x5cf0), 0x0075, 0 },
++	{ CCI_REG8(0x5cf1), 0x0075, 0 },
++	{ CCI_REG8(0x5cf2), 0x0075, 0 },
++	{ CCI_REG8(0x5cf3), 0x0075, 0 },
++	{ CCI_REG8(0x5cf4), 0x0075, 0 },
++	{ CCI_REG8(0x5cf5), 0x0075, 0 },
++	{ CCI_REG8(0x5cf6), 0x0075, 0 },
++	{ CCI_REG8(0x5cf7), 0x0075, 0 },
++	{ CCI_REG8(0x5cf8), 0x0075, 0 },
++	{ CCI_REG8(0x5cf9), 0x0075, 0 },
++	{ CCI_REG8(0x5cfa), 0x0075, 0 },
++	{ CCI_REG8(0x5cfb), 0x0075, 0 },
++	{ CCI_REG8(0x5cfc), 0x0075, 0 },
++	{ CCI_REG8(0x5cfd), 0x0075, 0 },
++	{ CCI_REG8(0x5cfe), 0x0075, 0 },
++	{ CCI_REG8(0x5cff), 0x0075, 0 },
++	{ CCI_REG8(0x5d00), 0x0075, 0 },
++	{ CCI_REG8(0x5d01), 0x0075, 0 },
++	{ CCI_REG8(0x5d02), 0x0075, 0 },
++	{ CCI_REG8(0x5d03), 0x0075, 0 },
++	{ CCI_REG8(0x5d04), 0x0075, 0 },
++	{ CCI_REG8(0x5d05), 0x0075, 0 },
++	{ CCI_REG8(0x5d06), 0x0075, 0 },
++	{ CCI_REG8(0x5d07), 0x0075, 0 },
++	{ CCI_REG8(0x5d08), 0x0075, 0 },
++	{ CCI_REG8(0x5d09), 0x0075, 0 },
++	{ CCI_REG8(0x5d0a), 0x0075, 0 },
++	{ CCI_REG8(0x5d0b), 0x0075, 0 },
++	{ CCI_REG8(0x5d0c), 0x0075, 0 },
++	{ CCI_REG8(0x5d0d), 0x0075, 0 },
++	{ CCI_REG8(0x5d0e), 0x0075, 0 },
++	{ CCI_REG8(0x5d0f), 0x0075, 0 },
++	{ CCI_REG8(0x5d10), 0x0075, 0 },
++	{ CCI_REG8(0x5d11), 0x0075, 0 },
++	{ CCI_REG8(0x5d12), 0x0075, 0 },
++	{ CCI_REG8(0x5d13), 0x0075, 0 },
++	{ CCI_REG8(0x5d14), 0x0075, 0 },
++	{ CCI_REG8(0x5d15), 0x0075, 0 },
++	{ CCI_REG8(0x5d16), 0x0075, 0 },
++	{ CCI_REG8(0x5d17), 0x0075, 0 },
++	{ CCI_REG8(0x5d18), 0x0075, 0 },
++	{ CCI_REG8(0x5d19), 0x0075, 0 },
++	{ CCI_REG8(0x5d1a), 0x0075, 0 },
++	{ CCI_REG8(0x5d1b), 0x0075, 0 },
++	{ CCI_REG8(0x5d1c), 0x0075, 0 },
++	{ CCI_REG8(0x5d1d), 0x0075, 0 },
++	{ CCI_REG8(0x5d1e), 0x0075, 0 },
++	{ CCI_REG8(0x5d1f), 0x0075, 0 },
++	{ CCI_REG8(0x5d20), 0x0075, 0 },
++	{ CCI_REG8(0x5d21), 0x0075, 0 },
++	{ CCI_REG8(0x5d22), 0x0075, 0 },
++	{ CCI_REG8(0x5d23), 0x0075, 0 },
++	{ CCI_REG8(0x5d24), 0x0075, 0 },
++	{ CCI_REG8(0x5d25), 0x0075, 0 },
++	{ CCI_REG8(0x5d26), 0x0075, 0 },
++	{ CCI_REG8(0x5d27), 0x0075, 0 },
++	{ CCI_REG8(0x5d28), 0x0075, 0 },
++	{ CCI_REG8(0x5d29), 0x0075, 0 },
++	{ CCI_REG8(0x5d2a), 0x0075, 0 },
++	{ CCI_REG8(0x5d2b), 0x0075, 0 },
++	{ CCI_REG8(0x5d2c), 0x0075, 0 },
++	{ CCI_REG8(0x5d2d), 0x0075, 0 },
++	{ CCI_REG8(0x5d2e), 0x0075, 0 },
++	{ CCI_REG8(0x5d2f), 0x0075, 0 },
++	{ CCI_REG8(0x5d30), 0x0075, 0 },
++	{ CCI_REG8(0x5d31), 0x0075, 0 },
++	{ CCI_REG8(0x5d32), 0x0075, 0 },
++	{ CCI_REG8(0x5d33), 0x0075, 0 },
++	{ CCI_REG8(0x5d34), 0x0075, 0 },
++	{ CCI_REG8(0x5d35), 0x0075, 0 },
++	{ CCI_REG8(0x5d36), 0x0075, 0 },
++	{ CCI_REG8(0x5d37), 0x0075, 0 },
++	{ CCI_REG8(0x5d38), 0x0075, 0 },
++	{ CCI_REG8(0x5d39), 0x0075, 0 },
++	{ CCI_REG8(0x5d3a), 0x0075, 0 },
++	{ CCI_REG8(0x5d3b), 0x0075, 0 },
++	{ CCI_REG8(0x5d3c), 0x0075, 0 },
++	{ CCI_REG8(0x5d3d), 0x0075, 0 },
++	{ CCI_REG8(0x5d3e), 0x0075, 0 },
++	{ CCI_REG8(0x5d3f), 0x0075, 0 },
++	{ CCI_REG8(0x5d40), 0x0075, 0 },
++	{ CCI_REG8(0x5d41), 0x0075, 0 },
++	{ CCI_REG8(0x5d42), 0x0075, 0 },
++	{ CCI_REG8(0x5d43), 0x0075, 0 },
++	{ CCI_REG8(0x5d44), 0x0075, 0 },
++	{ CCI_REG8(0x5d45), 0x0075, 0 },
++	{ CCI_REG8(0x5d46), 0x0075, 0 },
++	{ CCI_REG8(0x5d47), 0x0075, 0 },
++	{ CCI_REG8(0x5d48), 0x0075, 0 },
++	{ CCI_REG8(0x5d49), 0x0075, 0 },
++	{ CCI_REG8(0x5d4a), 0x0075, 0 },
++	{ CCI_REG8(0x5d4b), 0x0075, 0 },
++	{ CCI_REG8(0x5d4c), 0x0075, 0 },
++	{ CCI_REG8(0x5d4d), 0x0075, 0 },
++	{ CCI_REG8(0x5d4e), 0x0075, 0 },
++	{ CCI_REG8(0x5d4f), 0x0075, 0 },
++	{ CCI_REG8(0x5d50), 0x0075, 0 },
++	{ CCI_REG8(0x5d51), 0x0075, 0 },
++	{ CCI_REG8(0x5d52), 0x0075, 0 },
++	{ CCI_REG8(0x5d53), 0x0075, 0 },
++	{ CCI_REG8(0x5d54), 0x0075, 0 },
++	{ CCI_REG8(0x5d55), 0x0075, 0 },
++	{ CCI_REG8(0x5d56), 0x0075, 0 },
++	{ CCI_REG8(0x5d57), 0x0075, 0 },
++	{ CCI_REG8(0x5d58), 0x0075, 0 },
++	{ CCI_REG8(0x5d59), 0x0075, 0 },
++	{ CCI_REG8(0x5d5a), 0x0075, 0 },
++	{ CCI_REG8(0x5d5b), 0x0075, 0 },
++	{ CCI_REG8(0x5d5c), 0x0075, 0 },
++	{ CCI_REG8(0x5d5d), 0x0075, 0 },
++	{ CCI_REG8(0x5d5e), 0x0075, 0 },
++	{ CCI_REG8(0x5d5f), 0x0075, 0 },
++	{ CCI_REG8(0x5d60), 0x0075, 0 },
++	{ CCI_REG8(0x5d61), 0x0075, 0 },
++	{ CCI_REG8(0x5d62), 0x0075, 0 },
++	{ CCI_REG8(0x5d63), 0x0075, 0 },
++	{ CCI_REG8(0x5d64), 0x0075, 0 },
++	{ CCI_REG8(0x5d65), 0x0075, 0 },
++	{ CCI_REG8(0x5d66), 0x0075, 0 },
++	{ CCI_REG8(0x5d67), 0x0075, 0 },
++	{ CCI_REG8(0x5d68), 0x0075, 0 },
++	{ CCI_REG8(0x5d69), 0x0075, 0 },
++	{ CCI_REG8(0x5d6a), 0x0075, 0 },
++	{ CCI_REG8(0x5d6b), 0x0075, 0 },
++	{ CCI_REG8(0x5d6c), 0x0075, 0 },
++	{ CCI_REG8(0x5d6d), 0x0075, 0 },
++	{ CCI_REG8(0x5d6e), 0x0075, 0 },
++	{ CCI_REG8(0x5d6f), 0x0075, 0 },
++	{ CCI_REG8(0x5d70), 0x0075, 0 },
++	{ CCI_REG8(0x5d71), 0x0075, 0 },
++	{ CCI_REG8(0x5d72), 0x0075, 0 },
++	{ CCI_REG8(0x5d73), 0x0075, 0 },
++	{ CCI_REG8(0x5d74), 0x0075, 0 },
++	{ CCI_REG8(0x5d75), 0x0075, 0 },
++	{ CCI_REG8(0x5d76), 0x0075, 0 },
++	{ CCI_REG8(0x5d77), 0x0075, 0 },
++	{ CCI_REG8(0x5d78), 0x0075, 0 },
++	{ CCI_REG8(0x5d79), 0x0075, 0 },
++	{ CCI_REG8(0x5d7a), 0x0075, 0 },
++	{ CCI_REG8(0x5d7b), 0x0075, 0 },
++	{ CCI_REG8(0x5d7c), 0x0075, 0 },
++	{ CCI_REG8(0x5d7d), 0x0075, 0 },
++	{ CCI_REG8(0x5d7e), 0x0075, 0 },
++	{ CCI_REG8(0x5d7f), 0x0075, 0 },
++	{ CCI_REG8(0x5d80), 0x0075, 0 },
++	{ CCI_REG8(0x5d81), 0x0075, 0 },
++	{ CCI_REG8(0x5d82), 0x0075, 0 },
++	{ CCI_REG8(0x5d83), 0x0075, 0 },
++	{ CCI_REG8(0x5d84), 0x0075, 0 },
++	{ CCI_REG8(0x5d85), 0x0075, 0 },
++	{ CCI_REG8(0x5d86), 0x0075, 0 },
++	{ CCI_REG8(0x5d87), 0x0075, 0 },
++	{ CCI_REG8(0x5d88), 0x0075, 0 },
++	{ CCI_REG8(0x5d89), 0x0075, 0 },
++	{ CCI_REG8(0x5d8a), 0x0075, 0 },
++	{ CCI_REG8(0x5d8b), 0x0075, 0 },
++	{ CCI_REG8(0x5d8c), 0x0075, 0 },
++	{ CCI_REG8(0x5d8d), 0x0075, 0 },
++	{ CCI_REG8(0x5d8e), 0x0075, 0 },
++	{ CCI_REG8(0x5d8f), 0x0075, 0 },
++	{ CCI_REG8(0x5d90), 0x0075, 0 },
++	{ CCI_REG8(0x5d91), 0x0075, 0 },
++	{ CCI_REG8(0x5d92), 0x0075, 0 },
++	{ CCI_REG8(0x5d93), 0x0075, 0 },
++	{ CCI_REG8(0x5d94), 0x0075, 0 },
++	{ CCI_REG8(0x5d95), 0x0075, 0 },
++	{ CCI_REG8(0x5d96), 0x0075, 0 },
++	{ CCI_REG8(0x5d97), 0x0075, 0 },
++	{ CCI_REG8(0x5d98), 0x0075, 0 },
++	{ CCI_REG8(0x5d99), 0x0075, 0 },
++	{ CCI_REG8(0x5d9a), 0x0075, 0 },
++	{ CCI_REG8(0x5d9b), 0x0075, 0 },
++	{ CCI_REG8(0x5d9c), 0x0075, 0 },
++	{ CCI_REG8(0x5d9d), 0x0075, 0 },
++	{ CCI_REG8(0x5d9e), 0x0075, 0 },
++	{ CCI_REG8(0x5d9f), 0x0075, 0 },
++	{ CCI_REG8(0x5da0), 0x0075, 0 },
++	{ CCI_REG8(0x5da1), 0x0075, 0 },
++	{ CCI_REG8(0x5da2), 0x0075, 0 },
++	{ CCI_REG8(0x5da3), 0x0075, 0 },
++	{ CCI_REG8(0x5da4), 0x0075, 0 },
++	{ CCI_REG8(0x5da5), 0x0075, 0 },
++	{ CCI_REG8(0x5da6), 0x0075, 0 },
++	{ CCI_REG8(0x5da7), 0x0075, 0 },
++	{ CCI_REG8(0x5da8), 0x0075, 0 },
++	{ CCI_REG8(0x5da9), 0x0075, 0 },
++	{ CCI_REG8(0x5daa), 0x0075, 0 },
++	{ CCI_REG8(0x5dab), 0x0075, 0 },
++	{ CCI_REG8(0x5dac), 0x0075, 0 },
++	{ CCI_REG8(0x5dad), 0x0075, 0 },
++	{ CCI_REG8(0x5dae), 0x0075, 0 },
++	{ CCI_REG8(0x5daf), 0x0075, 0 },
++	{ CCI_REG8(0x5db0), 0x0075, 0 },
++	{ CCI_REG8(0x5db1), 0x0075, 0 },
++	{ CCI_REG8(0x5db2), 0x0075, 0 },
++	{ CCI_REG8(0x5db3), 0x0075, 0 },
++	{ CCI_REG8(0x5db4), 0x0075, 0 },
++	{ CCI_REG8(0x5db5), 0x0075, 0 },
++	{ CCI_REG8(0x5db6), 0x0075, 0 },
++	{ CCI_REG8(0x5db7), 0x0075, 0 },
++	{ CCI_REG8(0x5db8), 0x0075, 0 },
++	{ CCI_REG8(0x5db9), 0x0075, 0 },
++	{ CCI_REG8(0x5dba), 0x0075, 0 },
++	{ CCI_REG8(0x5dbb), 0x0075, 0 },
++	{ CCI_REG8(0x5dbc), 0x0075, 0 },
++	{ CCI_REG8(0x5dbd), 0x0075, 0 },
++	{ CCI_REG8(0x5dbe), 0x0075, 0 },
++	{ CCI_REG8(0x5dbf), 0x0075, 0 },
++	{ CCI_REG8(0x5dc0), 0x0075, 0 },
++	{ CCI_REG8(0x5dc1), 0x0075, 0 },
++	{ CCI_REG8(0x5dc2), 0x0075, 0 },
++	{ CCI_REG8(0x5dc3), 0x0075, 0 },
++	{ CCI_REG8(0x5dc4), 0x0075, 0 },
++	{ CCI_REG8(0x5dc5), 0x0075, 0 },
++	{ CCI_REG8(0x5dc6), 0x0075, 0 },
++	{ CCI_REG8(0x5dc7), 0x0075, 0 },
++	{ CCI_REG8(0x5dc8), 0x0075, 0 },
++	{ CCI_REG8(0x5dc9), 0x0075, 0 },
++	{ CCI_REG8(0x5dca), 0x0075, 0 },
++	{ CCI_REG8(0x5dcb), 0x0075, 0 },
++	{ CCI_REG8(0x5dcc), 0x0075, 0 },
++	{ CCI_REG8(0x5dcd), 0x0075, 0 },
++	{ CCI_REG8(0x5dce), 0x0075, 0 },
++	{ CCI_REG8(0x5dcf), 0x0075, 0 },
++	{ CCI_REG8(0x5dd0), 0x0075, 0 },
++	{ CCI_REG8(0x5dd1), 0x0075, 0 },
++	{ CCI_REG8(0x5dd2), 0x0075, 0 },
++	{ CCI_REG8(0x5dd3), 0x0075, 0 },
++	{ CCI_REG8(0x5dd4), 0x0075, 0 },
++	{ CCI_REG8(0x5dd5), 0x0075, 0 },
++	{ CCI_REG8(0x5dd6), 0x0075, 0 },
++	{ CCI_REG8(0x5dd7), 0x0075, 0 },
++	{ CCI_REG8(0x5dd8), 0x0075, 0 },
++	{ CCI_REG8(0x5dd9), 0x0075, 0 },
++	{ CCI_REG8(0x5dda), 0x0075, 0 },
++	{ CCI_REG8(0x5ddb), 0x0075, 0 },
++	{ CCI_REG8(0x5ddc), 0x0075, 0 },
++	{ CCI_REG8(0x5ddd), 0x0075, 0 },
++	{ CCI_REG8(0x5dde), 0x0075, 0 },
++	{ CCI_REG8(0x5ddf), 0x0075, 0 },
++	{ CCI_REG8(0x5de0), 0x0075, 0 },
++	{ CCI_REG8(0x5de1), 0x0075, 0 },
++	{ CCI_REG8(0x5de2), 0x0075, 0 },
++	{ CCI_REG8(0x5de3), 0x0075, 0 },
++	{ CCI_REG8(0x5de4), 0x0075, 0 },
++	{ CCI_REG8(0x5de5), 0x0075, 0 },
++	{ CCI_REG8(0x5de6), 0x0075, 0 },
++	{ CCI_REG8(0x5de7), 0x0075, 0 },
++	{ CCI_REG8(0x5de8), 0x0075, 0 },
++	{ CCI_REG8(0x5de9), 0x0075, 0 },
++	{ CCI_REG8(0x5dea), 0x0075, 0 },
++	{ CCI_REG8(0x5deb), 0x0075, 0 },
++	{ CCI_REG8(0x5dec), 0x0075, 0 },
++	{ CCI_REG8(0x5ded), 0x0075, 0 },
++	{ CCI_REG8(0x5dee), 0x0075, 0 },
++	{ CCI_REG8(0x5def), 0x0075, 0 },
++	{ CCI_REG8(0x5df0), 0x0075, 0 },
++	{ CCI_REG8(0x5df1), 0x0075, 0 },
++	{ CCI_REG8(0x5df2), 0x0075, 0 },
++	{ CCI_REG8(0x5df3), 0x0075, 0 },
++	{ CCI_REG8(0x5df4), 0x0075, 0 },
++	{ CCI_REG8(0x5df5), 0x0075, 0 },
++	{ CCI_REG8(0x5df6), 0x0075, 0 },
++	{ CCI_REG8(0x5df7), 0x0075, 0 },
++	{ CCI_REG8(0x5df8), 0x0075, 0 },
++	{ CCI_REG8(0x5df9), 0x0075, 0 },
++	{ CCI_REG8(0x5dfa), 0x0075, 0 },
++	{ CCI_REG8(0x5dfb), 0x0075, 0 },
++	{ CCI_REG8(0x5dfc), 0x0075, 0 },
++	{ CCI_REG8(0x5dfd), 0x0075, 0 },
++	{ CCI_REG8(0x5dfe), 0x0075, 0 },
++	{ CCI_REG8(0x5dff), 0x0075, 0 },
++	{ CCI_REG8(0x5e00), 0x0075, 0 },
++	{ CCI_REG8(0x5e01), 0x0075, 0 },
++	{ CCI_REG8(0x5e02), 0x0075, 0 },
++	{ CCI_REG8(0x5e03), 0x0075, 0 },
++	{ CCI_REG8(0x5e04), 0x0075, 0 },
++	{ CCI_REG8(0x5e05), 0x0075, 0 },
++	{ CCI_REG8(0x5e06), 0x0075, 0 },
++	{ CCI_REG8(0x5e07), 0x0075, 0 },
++	{ CCI_REG8(0x5e08), 0x0075, 0 },
++	{ CCI_REG8(0x5e09), 0x0075, 0 },
++	{ CCI_REG8(0x5e0a), 0x0075, 0 },
++	{ CCI_REG8(0x5e0b), 0x0075, 0 },
++	{ CCI_REG8(0x5e0c), 0x0075, 0 },
++	{ CCI_REG8(0x5e0d), 0x0075, 0 },
++	{ CCI_REG8(0x5e0e), 0x0075, 0 },
++	{ CCI_REG8(0x5e0f), 0x0075, 0 },
++	{ CCI_REG8(0x5e10), 0x0075, 0 },
++	{ CCI_REG8(0x5e11), 0x0075, 0 },
++	{ CCI_REG8(0x5e12), 0x0075, 0 },
++	{ CCI_REG8(0x5e13), 0x0075, 0 },
++	{ CCI_REG8(0x5e14), 0x0075, 0 },
++	{ CCI_REG8(0x5e15), 0x0075, 0 },
++	{ CCI_REG8(0x5e16), 0x0075, 0 },
++	{ CCI_REG8(0x5e17), 0x0075, 0 },
++	{ CCI_REG8(0x5e18), 0x0075, 0 },
++	{ CCI_REG8(0x5e19), 0x0075, 0 },
++	{ CCI_REG8(0x5e1a), 0x0075, 0 },
++	{ CCI_REG8(0x5e1b), 0x0075, 0 },
++	{ CCI_REG8(0x5e1c), 0x0075, 0 },
++	{ CCI_REG8(0x5e1d), 0x0075, 0 },
++	{ CCI_REG8(0x5e1e), 0x0075, 0 },
++	{ CCI_REG8(0x5e1f), 0x0075, 0 },
++	{ CCI_REG8(0x5e20), 0x0075, 0 },
++	{ CCI_REG8(0x5e21), 0x0075, 0 },
++	{ CCI_REG8(0x5e22), 0x0075, 0 },
++	{ CCI_REG8(0x5e23), 0x0075, 0 },
++	{ CCI_REG8(0x5e24), 0x0075, 0 },
++	{ CCI_REG8(0x5e25), 0x0075, 0 },
++	{ CCI_REG8(0x5e26), 0x0075, 0 },
++	{ CCI_REG8(0x5e27), 0x0075, 0 },
++	{ CCI_REG8(0x5e28), 0x0075, 0 },
++	{ CCI_REG8(0x5e29), 0x0075, 0 },
++	{ CCI_REG8(0x5e2a), 0x0075, 0 },
++	{ CCI_REG8(0x5e2b), 0x0075, 0 },
++	{ CCI_REG8(0x5e2c), 0x0075, 0 },
++	{ CCI_REG8(0x5e2d), 0x0075, 0 },
++	{ CCI_REG8(0x5e2e), 0x0075, 0 },
++	{ CCI_REG8(0x5e2f), 0x0075, 0 },
++	{ CCI_REG8(0x5e30), 0x0075, 0 },
++	{ CCI_REG8(0x5e31), 0x0075, 0 },
++	{ CCI_REG8(0x5e32), 0x0075, 0 },
++	{ CCI_REG8(0x5e33), 0x0075, 0 },
++	{ CCI_REG8(0x5e34), 0x0075, 0 },
++	{ CCI_REG8(0x5e35), 0x0075, 0 },
++	{ CCI_REG8(0x5e36), 0x0075, 0 },
++	{ CCI_REG8(0x5e37), 0x0075, 0 },
++	{ CCI_REG8(0x5e38), 0x0075, 0 },
++	{ CCI_REG8(0x5e39), 0x0075, 0 },
++	{ CCI_REG8(0x5e3a), 0x0075, 0 },
++	{ CCI_REG8(0x5e3b), 0x0075, 0 },
++	{ CCI_REG8(0x5e3c), 0x0075, 0 },
++	{ CCI_REG8(0x5e3d), 0x0075, 0 },
++	{ CCI_REG8(0x5e3e), 0x0075, 0 },
++	{ CCI_REG8(0x5e3f), 0x0075, 0 },
++	{ CCI_REG8(0x5e40), 0x0075, 0 },
++	{ CCI_REG8(0x5e41), 0x0075, 0 },
++	{ CCI_REG8(0x5e42), 0x0075, 0 },
++	{ CCI_REG8(0x5e43), 0x0075, 0 },
++	{ CCI_REG8(0x5e44), 0x0075, 0 },
++	{ CCI_REG8(0x5e45), 0x0075, 0 },
++	{ CCI_REG8(0x5e46), 0x0075, 0 },
++	{ CCI_REG8(0x5e47), 0x0075, 0 },
++	{ CCI_REG8(0x5e48), 0x0075, 0 },
++	{ CCI_REG8(0x5e49), 0x0075, 0 },
++	{ CCI_REG8(0x5e4a), 0x0075, 0 },
++	{ CCI_REG8(0x5e4b), 0x0075, 0 },
++	{ CCI_REG8(0x5e4c), 0x0075, 0 },
++	{ CCI_REG8(0x5e4d), 0x0075, 0 },
++	{ CCI_REG8(0x5e4e), 0x0075, 0 },
++	{ CCI_REG8(0x5e4f), 0x0075, 0 },
++	{ CCI_REG8(0x5e50), 0x0075, 0 },
++	{ CCI_REG8(0x5e51), 0x0075, 0 },
++	{ CCI_REG8(0x5e52), 0x0075, 0 },
++	{ CCI_REG8(0x5e53), 0x0075, 0 },
++	{ CCI_REG8(0x5e54), 0x0075, 0 },
++	{ CCI_REG8(0x5e55), 0x0075, 0 },
++	{ CCI_REG8(0x5e56), 0x0075, 0 },
++	{ CCI_REG8(0x5e57), 0x0075, 0 },
++	{ CCI_REG8(0x5e58), 0x0075, 0 },
++	{ CCI_REG8(0x5e59), 0x0075, 0 },
++	{ CCI_REG8(0x5e5a), 0x0075, 0 },
++	{ CCI_REG8(0x5e5b), 0x0075, 0 },
++	{ CCI_REG8(0x5e5c), 0x0075, 0 },
++	{ CCI_REG8(0x5e5d), 0x0075, 0 },
++	{ CCI_REG8(0x5e5e), 0x0075, 0 },
++	{ CCI_REG8(0x5e5f), 0x0075, 0 },
++	{ CCI_REG8(0x5e60), 0x0075, 0 },
++	{ CCI_REG8(0x5e61), 0x0075, 0 },
++	{ CCI_REG8(0x5e62), 0x0075, 0 },
++	{ CCI_REG8(0x5e63), 0x0075, 0 },
++	{ CCI_REG8(0x5e64), 0x0075, 0 },
++	{ CCI_REG8(0x5e65), 0x0075, 0 },
++	{ CCI_REG8(0x5e66), 0x0075, 0 },
++	{ CCI_REG8(0x5e67), 0x0075, 0 },
++	{ CCI_REG8(0x5e68), 0x0075, 0 },
++	{ CCI_REG8(0x5e69), 0x0075, 0 },
++	{ CCI_REG8(0x5e6a), 0x0075, 0 },
++	{ CCI_REG8(0x5e6b), 0x0075, 0 },
++	{ CCI_REG8(0x5e6c), 0x0075, 0 },
++	{ CCI_REG8(0x5e6d), 0x0075, 0 },
++	{ CCI_REG8(0x5e6e), 0x0075, 0 },
++	{ CCI_REG8(0x5e6f), 0x0075, 0 },
++	{ CCI_REG8(0x5e70), 0x0075, 0 },
++	{ CCI_REG8(0x5e71), 0x0075, 0 },
++	{ CCI_REG8(0x5e72), 0x0075, 0 },
++	{ CCI_REG8(0x5e73), 0x0075, 0 },
++	{ CCI_REG8(0x5e74), 0x0075, 0 },
++	{ CCI_REG8(0x5e75), 0x0075, 0 },
++	{ CCI_REG8(0x5e76), 0x0075, 0 },
++	{ CCI_REG8(0x5e77), 0x0075, 0 },
++	{ CCI_REG8(0x5e78), 0x0075, 0 },
++	{ CCI_REG8(0x5e79), 0x0075, 0 },
++	{ CCI_REG8(0x5e7a), 0x0075, 0 },
++	{ CCI_REG8(0x5e7b), 0x0075, 0 },
++	{ CCI_REG8(0x5e7c), 0x0075, 0 },
++	{ CCI_REG8(0x5e7d), 0x0075, 0 },
++	{ CCI_REG8(0x5e7e), 0x0075, 0 },
++	{ CCI_REG8(0x5e7f), 0x0075, 0 },
++	{ CCI_REG8(0x5e80), 0x0075, 0 },
++	{ CCI_REG8(0x5e81), 0x0075, 0 },
++	{ CCI_REG8(0x5e82), 0x0075, 0 },
++	{ CCI_REG8(0x5e83), 0x0075, 0 },
++	{ CCI_REG8(0x5e84), 0x0075, 0 },
++	{ CCI_REG8(0x5e85), 0x0075, 0 },
++	{ CCI_REG8(0x5e86), 0x0075, 0 },
++	{ CCI_REG8(0x5e87), 0x0075, 0 },
++	{ CCI_REG8(0x5e88), 0x0075, 0 },
++	{ CCI_REG8(0x5e89), 0x0075, 0 },
++	{ CCI_REG8(0x5e8a), 0x0075, 0 },
++	{ CCI_REG8(0x5e8b), 0x0075, 0 },
++	{ CCI_REG8(0x5e8c), 0x0075, 0 },
++	{ CCI_REG8(0x5e8d), 0x0075, 0 },
++	{ CCI_REG8(0x5e8e), 0x0075, 0 },
++	{ CCI_REG8(0x5e8f), 0x0075, 0 },
++	{ CCI_REG8(0x5e90), 0x0075, 0 },
++	{ CCI_REG8(0x5e91), 0x0075, 0 },
++	{ CCI_REG8(0x5e92), 0x0075, 0 },
++	{ CCI_REG8(0x5e93), 0x0075, 0 },
++	{ CCI_REG8(0x5e94), 0x0075, 0 },
++	{ CCI_REG8(0x5e95), 0x0075, 0 },
++	{ CCI_REG8(0x5e96), 0x0075, 0 },
++	{ CCI_REG8(0x5e97), 0x0075, 0 },
++	{ CCI_REG8(0x5e98), 0x0075, 0 },
++	{ CCI_REG8(0x5e99), 0x0075, 0 },
++	{ CCI_REG8(0x5e9a), 0x0075, 0 },
++	{ CCI_REG8(0x5e9b), 0x0075, 0 },
++	{ CCI_REG8(0x5e9c), 0x0075, 0 },
++	{ CCI_REG8(0x5e9d), 0x0075, 0 },
++	{ CCI_REG8(0x5e9e), 0x0075, 0 },
++	{ CCI_REG8(0x5e9f), 0x0075, 0 },
++	{ CCI_REG8(0x5ea0), 0x0075, 0 },
++	{ CCI_REG8(0x5ea1), 0x0075, 0 },
++	{ CCI_REG8(0x5ea2), 0x0075, 0 },
++	{ CCI_REG8(0x5ea3), 0x0075, 0 },
++	{ CCI_REG8(0x5ea4), 0x0075, 0 },
++	{ CCI_REG8(0x5ea5), 0x0075, 0 },
++	{ CCI_REG8(0x5ea6), 0x0075, 0 },
++	{ CCI_REG8(0x5ea7), 0x0075, 0 },
++	{ CCI_REG8(0x5ea8), 0x0075, 0 },
++	{ CCI_REG8(0x5ea9), 0x0075, 0 },
++	{ CCI_REG8(0x5eaa), 0x0075, 0 },
++	{ CCI_REG8(0x5eab), 0x0075, 0 },
++	{ CCI_REG8(0x5eac), 0x0075, 0 },
++	{ CCI_REG8(0x5ead), 0x0075, 0 },
++	{ CCI_REG8(0x5eae), 0x0075, 0 },
++	{ CCI_REG8(0x5eaf), 0x0075, 0 },
++	{ CCI_REG8(0x5eb0), 0x0075, 0 },
++	{ CCI_REG8(0x5eb1), 0x0075, 0 },
++	{ CCI_REG8(0x5eb2), 0x0075, 0 },
++	{ CCI_REG8(0x5eb3), 0x0075, 0 },
++	{ CCI_REG8(0x5eb4), 0x0075, 0 },
++	{ CCI_REG8(0x5eb5), 0x0075, 0 },
++	{ CCI_REG8(0x5eb6), 0x0075, 0 },
++	{ CCI_REG8(0x5eb7), 0x0075, 0 },
++	{ CCI_REG8(0x5eb8), 0x0075, 0 },
++	{ CCI_REG8(0x5eb9), 0x0075, 0 },
++	{ CCI_REG8(0x5eba), 0x0075, 0 },
++	{ CCI_REG8(0x5ebb), 0x0075, 0 },
++	{ CCI_REG8(0x5ebc), 0x0075, 0 },
++	{ CCI_REG8(0x5ebd), 0x0075, 0 },
++	{ CCI_REG8(0x5ebe), 0x0075, 0 },
++	{ CCI_REG8(0x5ebf), 0x0075, 0 },
++	{ CCI_REG8(0x5ec0), 0x0075, 0 },
++	{ CCI_REG8(0x5ec1), 0x0075, 0 },
++	{ CCI_REG8(0x5ec2), 0x0075, 0 },
++	{ CCI_REG8(0x5ec3), 0x0075, 0 },
++	{ CCI_REG8(0x5ec4), 0x0075, 0 },
++	{ CCI_REG8(0x5ec5), 0x0075, 0 },
++	{ CCI_REG8(0x5ec6), 0x0075, 0 },
++	{ CCI_REG8(0x5ec7), 0x0075, 0 },
++	{ CCI_REG8(0x5ec8), 0x0075, 0 },
++	{ CCI_REG8(0x5ec9), 0x0075, 0 },
++	{ CCI_REG8(0x5eca), 0x0075, 0 },
++	{ CCI_REG8(0x5ecb), 0x0075, 0 },
++	{ CCI_REG8(0x5ecc), 0x0075, 0 },
++	{ CCI_REG8(0x5ecd), 0x0075, 0 },
++	{ CCI_REG8(0x5ece), 0x0075, 0 },
++	{ CCI_REG8(0x5ecf), 0x0075, 0 },
++	{ CCI_REG8(0x5ed0), 0x0075, 0 },
++	{ CCI_REG8(0x5ed1), 0x0075, 0 },
++	{ CCI_REG8(0x5ed2), 0x0075, 0 },
++	{ CCI_REG8(0x5ed3), 0x0075, 0 },
++	{ CCI_REG8(0x5ed4), 0x0075, 0 },
++	{ CCI_REG8(0x5ed5), 0x0075, 0 },
++	{ CCI_REG8(0x5ed6), 0x0075, 0 },
++	{ CCI_REG8(0x5ed7), 0x0075, 0 },
++	{ CCI_REG8(0x5ed8), 0x0075, 0 },
++	{ CCI_REG8(0x5ed9), 0x0075, 0 },
++	{ CCI_REG8(0x5eda), 0x0075, 0 },
++	{ CCI_REG8(0x5edb), 0x0075, 0 },
++	{ CCI_REG8(0x5edc), 0x0075, 0 },
++	{ CCI_REG8(0x5edd), 0x0075, 0 },
++	{ CCI_REG8(0x5ede), 0x0075, 0 },
++	{ CCI_REG8(0x5edf), 0x0075, 0 },
++	{ CCI_REG8(0x0301), 0x0048, 0 },
++	{ CCI_REG8(0x0303), 0x0002, 0 },
++	{ CCI_REG8(0x0304), 0x0001, 0 },
++	{ CCI_REG8(0x0305), 0x00a1, 0 },
++	{ CCI_REG8(0x0306), 0x0004, 0 },
++	{ CCI_REG8(0x0307), 0x0000, 0 },
++	{ CCI_REG8(0x0309), 0x0051, 0 },
++	{ CCI_REG8(0x0316), 0x0033, 0 },
++	{ CCI_REG8(0x0320), 0x0002, 0 },
++	{ CCI_REG8(0x0321), 0x0001, 0 },
++	{ CCI_REG8(0x0323), 0x0002, 0 },
++	{ CCI_REG8(0x0324), 0x0001, 0 },
++	{ CCI_REG8(0x0325), 0x00e0, 0 },
++	{ CCI_REG8(0x0326), 0x00c4, 0 },
++	{ CCI_REG8(0x0327), 0x0004, 0 },
++	{ CCI_REG8(0x0329), 0x0000, 0 },
++	{ CCI_REG8(0x032c), 0x0000, 0 },
++	{ CCI_REG8(0x032d), 0x0001, 0 },
++	{ CCI_REG8(0x032e), 0x0002, 0 },
++	{ CCI_REG8(0x032f), 0x00c1, 0 },
++	{ CCI_REG8(0x0343), 0x0002, 0 },
++	{ CCI_REG8(0x0350), 0x0000, 0 },
++	{ CCI_REG8(0x0360), 0x0009, 0 },
++	{ CCI_REG8(0x0361), 0x0007, 0 },
++	{ CCI_REG8(0x3009), 0x0000, 0 },
++	{ CCI_REG8(0x3012), 0x0041, 0 },
++	{ CCI_REG8(0x3015), 0x0000, 0 },
++	{ CCI_REG8(0x3019), 0x00d2, 0 },
++	{ CCI_REG8(0x301a), 0x00b0, 0 },
++	{ CCI_REG8(0x301e), 0x0088, 0 },
++	{ CCI_REG8(0x3025), 0x0089, 0 },
++	{ CCI_REG8(0x3026), 0x0030, 0 },
++	{ CCI_REG8(0x3027), 0x0008, 0 },
++	{ CCI_REG8(0x3044), 0x00c2, 0 },
++	{ CCI_REG8(0x3400), 0x000c, 0 },
++	{ CCI_REG8(0x340c), 0x0010, 0 },
++	{ CCI_REG8(0x340d), 0x0000, 0 },
++	{ CCI_REG8(0x340e), 0x00ff, 0 },
++	{ CCI_REG8(0x3421), 0x0008, 0 },
++	{ CCI_REG8(0x3422), 0x0000, 0 },
++	{ CCI_REG8(0x3423), 0x0000, 0 },
++	{ CCI_REG8(0x3424), 0x0015, 0 },
++	{ CCI_REG8(0x3425), 0x0040, 0 },
++	{ CCI_REG8(0x3426), 0x0010, 0 },
++	{ CCI_REG8(0x3427), 0x0010, 0 },
++	{ CCI_REG8(0x3500), 0x0000, 0 },
++	{ CCI_REG8(0x3501), 0x0014, 0 },
++	{ CCI_REG8(0x3502), 0x00b4, 0 },
++	{ CCI_REG8(0x3504), 0x004c, 0 },
++	{ CCI_REG8(0x3506), 0x0020, 0 },
++	{ CCI_REG8(0x3507), 0x0000, 0 },
++	{ CCI_REG8(0x3508), 0x0008, 0 },
++	{ CCI_REG8(0x3509), 0x0000, 0 },
++	{ CCI_REG8(0x3540), 0x0000, 0 },
++	{ CCI_REG8(0x3541), 0x0000, 0 },
++	{ CCI_REG8(0x3542), 0x0010, 0 },
++	{ CCI_REG8(0x3544), 0x004c, 0 },
++	{ CCI_REG8(0x3546), 0x0020, 0 },
++	{ CCI_REG8(0x3548), 0x0001, 0 },
++	{ CCI_REG8(0x3549), 0x0000, 0 },
++	{ CCI_REG8(0x3580), 0x0000, 0 },
++	{ CCI_REG8(0x3581), 0x0000, 0 },
++	{ CCI_REG8(0x3582), 0x0008, 0 },
++	{ CCI_REG8(0x3584), 0x004c, 0 },
++	{ CCI_REG8(0x3586), 0x0020, 0 },
++	{ CCI_REG8(0x3588), 0x0001, 0 },
++	{ CCI_REG8(0x3589), 0x0000, 0 },
++	{ CCI_REG8(0x3605), 0x00d0, 0 },
++	{ CCI_REG8(0x360a), 0x005d, 0 },
++	{ CCI_REG8(0x360b), 0x00c0, 0 },
++	{ CCI_REG8(0x360c), 0x009e, 0 },
++	{ CCI_REG8(0x360d), 0x0025, 0 },
++	{ CCI_REG8(0x360e), 0x0008, 0 },
++	{ CCI_REG8(0x3618), 0x0080, 0 },
++	{ CCI_REG8(0x3622), 0x000a, 0 },
++	{ CCI_REG8(0x3623), 0x0008, 0 },
++	{ CCI_REG8(0x3624), 0x0014, 0 },
++	{ CCI_REG8(0x3628), 0x0099, 0 },
++	{ CCI_REG8(0x362b), 0x0077, 0 },
++	{ CCI_REG8(0x362d), 0x000a, 0 },
++	{ CCI_REG8(0x3635), 0x00cb, 0 },
++	{ CCI_REG8(0x3659), 0x006a, 0 },
++	{ CCI_REG8(0x3684), 0x0081, 0 },
++	{ CCI_REG8(0x3688), 0x0002, 0 },
++	{ CCI_REG8(0x3689), 0x0088, 0 },
++	{ CCI_REG8(0x368a), 0x002e, 0 },
++	{ CCI_REG8(0x368e), 0x0071, 0 },
++	{ CCI_REG8(0x3694), 0x007f, 0 },
++	{ CCI_REG8(0x3695), 0x0000, 0 },
++	{ CCI_REG8(0x3696), 0x0051, 0 },
++	{ CCI_REG8(0x369a), 0x0000, 0 },
++	{ CCI_REG8(0x36a4), 0x0000, 0 },
++	{ CCI_REG8(0x36a6), 0x0000, 0 },
++	{ CCI_REG8(0x36a7), 0x0000, 0 },
++	{ CCI_REG8(0x36a8), 0x0000, 0 },
++	{ CCI_REG8(0x3700), 0x002c, 0 },
++	{ CCI_REG8(0x3701), 0x0030, 0 },
++	{ CCI_REG8(0x3702), 0x004b, 0 },
++	{ CCI_REG8(0x3703), 0x0042, 0 },
++	{ CCI_REG8(0x3706), 0x0031, 0 },
++	{ CCI_REG8(0x3708), 0x003a, 0 },
++	{ CCI_REG8(0x3709), 0x00f6, 0 },
++	{ CCI_REG8(0x370b), 0x006a, 0 },
++	{ CCI_REG8(0x3711), 0x0000, 0 },
++	{ CCI_REG8(0x3712), 0x0051, 0 },
++	{ CCI_REG8(0x3713), 0x0000, 0 },
++	{ CCI_REG8(0x3714), 0x006f, 0 },
++	{ CCI_REG8(0x3716), 0x0040, 0 },
++	{ CCI_REG8(0x3717), 0x0002, 0 },
++	{ CCI_REG8(0x371d), 0x0024, 0 },
++	{ CCI_REG8(0x371e), 0x0013, 0 },
++	{ CCI_REG8(0x371f), 0x000c, 0 },
++	{ CCI_REG8(0x3720), 0x0008, 0 },
++	{ CCI_REG8(0x3721), 0x0015, 0 },
++	{ CCI_REG8(0x3725), 0x0032, 0 },
++	{ CCI_REG8(0x3730), 0x0000, 0 },
++	{ CCI_REG8(0x3731), 0x0000, 0 },
++	{ CCI_REG8(0x3732), 0x0000, 0 },
++	{ CCI_REG8(0x3734), 0x0020, 0 },
++	{ CCI_REG8(0x3736), 0x0004, 0 },
++	{ CCI_REG8(0x3743), 0x0020, 0 },
++	{ CCI_REG8(0x3745), 0x00ff, 0 },
++	{ CCI_REG8(0x3753), 0x0021, 0 },
++	{ CCI_REG8(0x3754), 0x0014, 0 },
++	{ CCI_REG8(0x3755), 0x000c, 0 },
++	{ CCI_REG8(0x375e), 0x0000, 0 },
++	{ CCI_REG8(0x375f), 0x0082, 0 },
++	{ CCI_REG8(0x3760), 0x0008, 0 },
++	{ CCI_REG8(0x3761), 0x0010, 0 },
++	{ CCI_REG8(0x3762), 0x0008, 0 },
++	{ CCI_REG8(0x3763), 0x0008, 0 },
++	{ CCI_REG8(0x3764), 0x0008, 0 },
++	{ CCI_REG8(0x3765), 0x0010, 0 },
++	{ CCI_REG8(0x3766), 0x0018, 0 },
++	{ CCI_REG8(0x3767), 0x0028, 0 },
++	{ CCI_REG8(0x3768), 0x0000, 0 },
++	{ CCI_REG8(0x3769), 0x0008, 0 },
++	{ CCI_REG8(0x376b), 0x0000, 0 },
++	{ CCI_REG8(0x3770), 0x000d, 0 },
++	{ CCI_REG8(0x3774), 0x000e, 0 },
++	{ CCI_REG8(0x3791), 0x0031, 0 },
++	{ CCI_REG8(0x3793), 0x006a, 0 },
++	{ CCI_REG8(0x3795), 0x0000, 0 },
++	{ CCI_REG8(0x3797), 0x0000, 0 },
++	{ CCI_REG8(0x3799), 0x000d, 0 },
++	{ CCI_REG8(0x379a), 0x000d, 0 },
++	{ CCI_REG8(0x379b), 0x000d, 0 },
++	{ CCI_REG8(0x37a4), 0x000d, 0 },
++	{ CCI_REG8(0x37ff), 0x0000, 0 },
++	{ CCI_REG8(0x3800), 0x0000, 0 },
++	{ CCI_REG8(0x3801), 0x0000, 0 },
++	{ CCI_REG8(0x3802), 0x0000, 0 },
++	{ CCI_REG8(0x3803), 0x0000, 0 },
++	{ CCI_REG8(0x3804), 0x0019, 0 },
++	{ CCI_REG8(0x3805), 0x009f, 0 },
++	{ CCI_REG8(0x3806), 0x0013, 0 },
++	{ CCI_REG8(0x3807), 0x003f, 0 },
++	{ CCI_REG8(0x3808), 0x0019, 0 },
++	{ CCI_REG8(0x3809), 0x0080, 0 },
++	{ CCI_REG8(0x380a), 0x0013, 0 },
++	{ CCI_REG8(0x380b), 0x0020, 0 },
++	{ CCI_REG8(0x380c), 0x0005, 0 },
++	{ CCI_REG8(0x380d), 0x00a0, 0 },
++	{ CCI_REG8(0x380e), 0x0014, 0 },
++	{ CCI_REG8(0x380f), 0x00d4, 0 },
++	{ CCI_REG8(0x3810), 0x0000, 0 },
++	{ CCI_REG8(0x3811), 0x0011, 0 },
++	{ CCI_REG8(0x3812), 0x0000, 0 },
++	{ CCI_REG8(0x3813), 0x0010, 0 },
++	{ CCI_REG8(0x3814), 0x0011, 0 },
++	{ CCI_REG8(0x3815), 0x0011, 0 },
++	{ CCI_REG8(0x3820), 0x0000, 0 },
++	{ CCI_REG8(0x3821), 0x0006, 0 },
++	{ CCI_REG8(0x3822), 0x0000, 0 },
++	{ CCI_REG8(0x3823), 0x0004, 0 },
++	{ CCI_REG8(0x3824), 0x0000, 0 },
++	{ CCI_REG8(0x3825), 0x0000, 0 },
++	{ CCI_REG8(0x3826), 0x0000, 0 },
++	{ CCI_REG8(0x3827), 0x0040, 0 },
++	{ CCI_REG8(0x3828), 0x000f, 0 },
++	{ CCI_REG8(0x382a), 0x0082, 0 },
++	{ CCI_REG8(0x382e), 0x0041, 0 },
++	{ CCI_REG8(0x3835), 0x0000, 0 },
++	{ CCI_REG8(0x3836), 0x0000, 0 },
++	{ CCI_REG8(0x3837), 0x001f, 0 },
++	{ CCI_REG8(0x383a), 0x0000, 0 },
++	{ CCI_REG8(0x383b), 0x0000, 0 },
++	{ CCI_REG8(0x383e), 0x0000, 0 },
++	{ CCI_REG8(0x3840), 0x0000, 0 },
++	{ CCI_REG8(0x3847), 0x0000, 0 },
++	{ CCI_REG8(0x384a), 0x0000, 0 },
++	{ CCI_REG8(0x384c), 0x0005, 0 },
++	{ CCI_REG8(0x384d), 0x00a0, 0 },
++	{ CCI_REG8(0x3856), 0x0050, 0 },
++	{ CCI_REG8(0x3857), 0x0030, 0 },
++	{ CCI_REG8(0x3858), 0x0080, 0 },
++	{ CCI_REG8(0x3859), 0x0040, 0 },
++	{ CCI_REG8(0x3865), 0x0000, 0 },
++	{ CCI_REG8(0x3888), 0x0000, 0 },
++	{ CCI_REG8(0x3889), 0x0000, 0 },
++	{ CCI_REG8(0x388a), 0x0000, 0 },
++	{ CCI_REG8(0x388b), 0x0000, 0 },
++	{ CCI_REG8(0x388c), 0x0000, 0 },
++	{ CCI_REG8(0x388d), 0x0000, 0 },
++	{ CCI_REG8(0x388e), 0x0000, 0 },
++	{ CCI_REG8(0x388f), 0x0000, 0 },
++	{ CCI_REG8(0x3894), 0x0000, 0 },
++	{ CCI_REG8(0x390c), 0x003f, 0 },
++	{ CCI_REG8(0x390f), 0x0057, 0 },
++	{ CCI_REG8(0x3911), 0x003c, 0 },
++	{ CCI_REG8(0x3914), 0x0040, 0 },
++	{ CCI_REG8(0x3920), 0x0080, 0 },
++	{ CCI_REG8(0x3921), 0x0000, 0 },
++	{ CCI_REG8(0x3922), 0x0000, 0 },
++	{ CCI_REG8(0x3924), 0x00a5, 0 },
++	{ CCI_REG8(0x3973), 0x0006, 0 },
++	{ CCI_REG8(0x3976), 0x0006, 0 },
++	{ CCI_REG8(0x3978), 0x0006, 0 },
++	{ CCI_REG8(0x397b), 0x0006, 0 },
++	{ CCI_REG8(0x3994), 0x00ee, 0 },
++	{ CCI_REG8(0x399b), 0x0004, 0 },
++	{ CCI_REG8(0x39cd), 0x0018, 0 },
++	{ CCI_REG8(0x39ce), 0x0048, 0 },
++	{ CCI_REG8(0x39cf), 0x0048, 0 },
++	{ CCI_REG8(0x39d0), 0x0048, 0 },
++	{ CCI_REG8(0x39d2), 0x001b, 0 },
++	{ CCI_REG8(0x39d3), 0x004b, 0 },
++	{ CCI_REG8(0x39d4), 0x004b, 0 },
++	{ CCI_REG8(0x39d5), 0x004b, 0 },
++	{ CCI_REG8(0x39f5), 0x0004, 0 },
++	{ CCI_REG8(0x39f6), 0x000e, 0 },
++	{ CCI_REG8(0x39fd), 0x0001, 0 },
++	{ CCI_REG8(0x39ff), 0x0000, 0 },
++	{ CCI_REG8(0x3a01), 0x0003, 0 },
++	{ CCI_REG8(0x3a03), 0x0000, 0 },
++	{ CCI_REG8(0x3a05), 0x0005, 0 },
++	{ CCI_REG8(0x3a07), 0x0007, 0 },
++	{ CCI_REG8(0x3a2d), 0x0020, 0 },
++	{ CCI_REG8(0x3a2e), 0x0020, 0 },
++	{ CCI_REG8(0x3a2f), 0x0020, 0 },
++	{ CCI_REG8(0x3a30), 0x0020, 0 },
++	{ CCI_REG8(0x3a31), 0x0020, 0 },
++	{ CCI_REG8(0x3a32), 0x0020, 0 },
++	{ CCI_REG8(0x3a33), 0x0020, 0 },
++	{ CCI_REG8(0x3a34), 0x0020, 0 },
++	{ CCI_REG8(0x3a35), 0x0055, 0 },
++	{ CCI_REG8(0x3a43), 0x0011, 0 },
++	{ CCI_REG8(0x3a44), 0x000a, 0 },
++	{ CCI_REG8(0x3a45), 0x0006, 0 },
++	{ CCI_REG8(0x3a46), 0x0002, 0 },
++	{ CCI_REG8(0x3a47), 0x0011, 0 },
++	{ CCI_REG8(0x3a48), 0x000a, 0 },
++	{ CCI_REG8(0x3a49), 0x0006, 0 },
++	{ CCI_REG8(0x3a4a), 0x0002, 0 },
++	{ CCI_REG8(0x3a4b), 0x0007, 0 },
++	{ CCI_REG8(0x3a4c), 0x0008, 0 },
++	{ CCI_REG8(0x3a4d), 0x0008, 0 },
++	{ CCI_REG8(0x3a4e), 0x0008, 0 },
++	{ CCI_REG8(0x3a4f), 0x0008, 0 },
++	{ CCI_REG8(0x3a50), 0x0008, 0 },
++	{ CCI_REG8(0x3a51), 0x0008, 0 },
++	{ CCI_REG8(0x3a57), 0x0000, 0 },
++	{ CCI_REG8(0x3a5a), 0x0000, 0 },
++	{ CCI_REG8(0x3a5f), 0x0000, 0 },
++	{ CCI_REG8(0x3a60), 0x0000, 0 },
++	{ CCI_REG8(0x3a61), 0x0000, 0 },
++	{ CCI_REG8(0x3a62), 0x0000, 0 },
++	{ CCI_REG8(0x3a63), 0x0000, 0 },
++	{ CCI_REG8(0x3a64), 0x0000, 0 },
++	{ CCI_REG8(0x3a65), 0x0000, 0 },
++	{ CCI_REG8(0x3a66), 0x0000, 0 },
++	{ CCI_REG8(0x3a67), 0x0000, 0 },
++	{ CCI_REG8(0x3a68), 0x0000, 0 },
++	{ CCI_REG8(0x3a69), 0x0000, 0 },
++	{ CCI_REG8(0x3a6a), 0x0000, 0 },
++	{ CCI_REG8(0x3a6b), 0x0000, 0 },
++	{ CCI_REG8(0x3a6c), 0x0000, 0 },
++	{ CCI_REG8(0x3a6d), 0x0000, 0 },
++	{ CCI_REG8(0x3a6e), 0x0000, 0 },
++	{ CCI_REG8(0x3a7d), 0x00f0, 0 },
++	{ CCI_REG8(0x3a7f), 0x0000, 0 },
++	{ CCI_REG8(0x3a80), 0x000e, 0 },
++	{ CCI_REG8(0x3a82), 0x0000, 0 },
++	{ CCI_REG8(0x3a85), 0x0000, 0 },
++	{ CCI_REG8(0x3a86), 0x0000, 0 },
++	{ CCI_REG8(0x3a8c), 0x000c, 0 },
++	{ CCI_REG8(0x3aa3), 0x0014, 0 },
++	{ CCI_REG8(0x3aa4), 0x0012, 0 },
++	{ CCI_REG8(0x3aa5), 0x000f, 0 },
++	{ CCI_REG8(0x3aa6), 0x0008, 0 },
++	{ CCI_REG8(0x3aad), 0x00ff, 0 },
++	{ CCI_REG8(0x3d85), 0x008b, 0 },
++	{ CCI_REG8(0x3d8c), 0x0075, 0 },
++	{ CCI_REG8(0x3d8d), 0x00a0, 0 },
++	{ CCI_REG8(0x3daa), 0x0070, 0 },
++	{ CCI_REG8(0x3dab), 0x0010, 0 },
++	{ CCI_REG8(0x3dac), 0x0074, 0 },
++	{ CCI_REG8(0x3dad), 0x00e8, 0 },
++	{ CCI_REG8(0x3dae), 0x0075, 0 },
++	{ CCI_REG8(0x3daf), 0x0067, 0 },
++	{ CCI_REG8(0x3f00), 0x0010, 0 },
++	{ CCI_REG8(0x4009), 0x0002, 0 },
++	{ CCI_REG8(0x4010), 0x00e8, 0 },
++	{ CCI_REG8(0x4011), 0x0081, 0 },
++	{ CCI_REG8(0x4012), 0x000c, 0 },
++	{ CCI_REG8(0x4015), 0x0002, 0 },
++	{ CCI_REG8(0x4016), 0x001d, 0 },
++	{ CCI_REG8(0x4017), 0x0000, 0 },
++	{ CCI_REG8(0x4018), 0x000f, 0 },
++	{ CCI_REG8(0x401a), 0x0040, 0 },
++	{ CCI_REG8(0x401e), 0x0000, 0 },
++	{ CCI_REG8(0x401f), 0x00f4, 0 },
++	{ CCI_REG8(0x4020), 0x0004, 0 },
++	{ CCI_REG8(0x4021), 0x0000, 0 },
++	{ CCI_REG8(0x4022), 0x0004, 0 },
++	{ CCI_REG8(0x4023), 0x0000, 0 },
++	{ CCI_REG8(0x4024), 0x0004, 0 },
++	{ CCI_REG8(0x4025), 0x0000, 0 },
++	{ CCI_REG8(0x4026), 0x0004, 0 },
++	{ CCI_REG8(0x4027), 0x0000, 0 },
++	{ CCI_REG8(0x402e), 0x0002, 0 },
++	{ CCI_REG8(0x4288), 0x00a7, 0 },
++	{ CCI_REG8(0x4289), 0x0000, 0 },
++	{ CCI_REG8(0x428e), 0x0004, 0 },
++	{ CCI_REG8(0x4300), 0x0000, 0 },
++	{ CCI_REG8(0x4301), 0x0000, 0 },
++	{ CCI_REG8(0x4302), 0x0000, 0 },
++	{ CCI_REG8(0x4303), 0x0000, 0 },
++	{ CCI_REG8(0x4304), 0x0000, 0 },
++	{ CCI_REG8(0x4305), 0x0000, 0 },
++	{ CCI_REG8(0x4306), 0x0000, 0 },
++	{ CCI_REG8(0x4307), 0x0000, 0 },
++	{ CCI_REG8(0x4308), 0x0000, 0 },
++	{ CCI_REG8(0x430b), 0x00ff, 0 },
++	{ CCI_REG8(0x430c), 0x00ff, 0 },
++	{ CCI_REG8(0x430d), 0x0000, 0 },
++	{ CCI_REG8(0x430e), 0x0000, 0 },
++	{ CCI_REG8(0x4500), 0x0007, 0 },
++	{ CCI_REG8(0x4502), 0x0000, 0 },
++	{ CCI_REG8(0x4504), 0x0080, 0 },
++	{ CCI_REG8(0x4506), 0x0001, 0 },
++	{ CCI_REG8(0x4509), 0x0005, 0 },
++	{ CCI_REG8(0x450c), 0x0000, 0 },
++	{ CCI_REG8(0x450d), 0x0020, 0 },
++	{ CCI_REG8(0x450e), 0x0000, 0 },
++	{ CCI_REG8(0x450f), 0x0000, 0 },
++	{ CCI_REG8(0x4510), 0x0000, 0 },
++	{ CCI_REG8(0x4523), 0x0000, 0 },
++	{ CCI_REG8(0x4526), 0x0000, 0 },
++	{ CCI_REG8(0x4542), 0x0000, 0 },
++	{ CCI_REG8(0x4543), 0x0000, 0 },
++	{ CCI_REG8(0x4544), 0x0000, 0 },
++	{ CCI_REG8(0x4545), 0x0000, 0 },
++	{ CCI_REG8(0x4546), 0x0000, 0 },
++	{ CCI_REG8(0x4547), 0x0010, 0 },
++	{ CCI_REG8(0x4602), 0x0000, 0 },
++	{ CCI_REG8(0x4603), 0x0015, 0 },
++	{ CCI_REG8(0x4609), 0x0020, 0 },
++	{ CCI_REG8(0x460b), 0x0003, 0 },
++	{ CCI_REG8(0x4640), 0x0000, 0 },
++	{ CCI_REG8(0x4641), 0x0032, 0 },
++	{ CCI_REG8(0x4643), 0x0008, 0 },
++	{ CCI_REG8(0x4644), 0x0040, 0 },
++	{ CCI_REG8(0x4645), 0x00b3, 0 },
++	{ CCI_REG8(0x464a), 0x0000, 0 },
++	{ CCI_REG8(0x464b), 0x0030, 0 },
++	{ CCI_REG8(0x464c), 0x0001, 0 },
++	{ CCI_REG8(0x4800), 0x0064, 0 },
++	{ CCI_REG8(0x480b), 0x0010, 0 },
++	{ CCI_REG8(0x480c), 0x0080, 0 },
++	{ CCI_REG8(0x480e), 0x0000, 0 },
++	{ CCI_REG8(0x480f), 0x0032, 0 },
++	{ CCI_REG8(0x4829), 0x0064, 0 },
++	{ CCI_REG8(0x4833), 0x0020, 0 },
++	{ CCI_REG8(0x4837), 0x0008, 0 },
++	{ CCI_REG8(0x484b), 0x0027, 0 },
++	{ CCI_REG8(0x4850), 0x0047, 0 },
++	{ CCI_REG8(0x4853), 0x0004, 0 },
++	{ CCI_REG8(0x4860), 0x0000, 0 },
++	{ CCI_REG8(0x4861), 0x00ec, 0 },
++	{ CCI_REG8(0x4862), 0x0005, 0 },
++	{ CCI_REG8(0x4883), 0x0000, 0 },
++	{ CCI_REG8(0x4888), 0x0010, 0 },
++	{ CCI_REG8(0x4889), 0x0003, 0 },
++	{ CCI_REG8(0x4d00), 0x0004, 0 },
++	{ CCI_REG8(0x4d01), 0x00ea, 0 },
++	{ CCI_REG8(0x4d02), 0x00b9, 0 },
++	{ CCI_REG8(0x4d03), 0x0032, 0 },
++	{ CCI_REG8(0x4d04), 0x00fb, 0 },
++	{ CCI_REG8(0x4d05), 0x0050, 0 },
++	{ CCI_REG8(0x3220), 0x0012, 0 },
++	{ CCI_REG8(0x3221), 0x0028, 0 },
++	{ CCI_REG8(0x36aa), 0x0012, 0 },
++	{ CCI_REG8(0x36ab), 0x0028, 0 },
++	{ CCI_REG8(0x3d86), 0x0012, 0 },
++	{ CCI_REG8(0x3d87), 0x0028, 0 },
++	{ CCI_REG8(0x40c2), 0x0012, 0 },
++	{ CCI_REG8(0x40c3), 0x0028, 0 },
++	{ CCI_REG8(0x4540), 0x0012, 0 },
++	{ CCI_REG8(0x4541), 0x0028, 0 },
++	{ CCI_REG8(0x4606), 0x0012, 0 },
++	{ CCI_REG8(0x4607), 0x0028, 0 },
++	{ CCI_REG8(0x4648), 0x0012, 0 },
++	{ CCI_REG8(0x4649), 0x0028, 0 },
++	{ CCI_REG8(0x5110), 0x0000, 0 },
++	{ CCI_REG8(0x5111), 0x0010, 0 },
++	{ CCI_REG8(0x5112), 0x0005, 0 },
++	{ CCI_REG8(0x5113), 0x0067, 0 },
++	{ CCI_REG8(0x481f), 0x0030, 0 },
++	{ CCI_REG8(0x4854), 0x0007, 0 },
++	{ CCI_REG8(0x4885), 0x003d, 0 },
++	{ CCI_REG8(0x0102), 0x0001, 0 },
++};
++
++static const struct unicorn_reg ov32b40_mode[] = {
++	{ CCI_REG8(0x4813), 0x0000, 0 },
++	{ CCI_REG8(0x0305), 0x005f, 0 },
++	{ CCI_REG8(0x0307), 0x0000, 0 },
++	{ CCI_REG8(0x4837), 0x0009, 0 },
++	{ CCI_REG8(0x5000), 0x0055, 0 },
++	{ CCI_REG8(0x5001), 0x0000, 0 },
++	{ CCI_REG8(0x5002), 0x0037, 0 },
++	{ CCI_REG8(0x5003), 0x0000, 0 },
++	{ CCI_REG8(0x5015), 0x0020, 0 },
++	{ CCI_REG8(0x5068), 0x0002, 0 },
++	{ CCI_REG8(0x5115), 0x000b, 0 },
++	{ CCI_REG8(0x511c), 0x0001, 0 },
++	{ CCI_REG8(0x511d), 0x0001, 0 },
++	{ CCI_REG8(0x511e), 0x0001, 0 },
++	{ CCI_REG8(0x511f), 0x0001, 0 },
++	{ CCI_REG8(0x5180), 0x00c1, 0 },
++	{ CCI_REG8(0x518a), 0x0004, 0 },
++	{ CCI_REG8(0x51b0), 0x0030, 0 },
++	{ CCI_REG8(0x51d0), 0x0028, 0 },
++	{ CCI_REG8(0x51d8), 0x0008, 0 },
++	{ CCI_REG8(0x51d9), 0x0010, 0 },
++	{ CCI_REG8(0x51da), 0x0002, 0 },
++	{ CCI_REG8(0x51db), 0x0002, 0 },
++	{ CCI_REG8(0x51dc), 0x0006, 0 },
++	{ CCI_REG8(0x51dd), 0x0006, 0 },
++	{ CCI_REG8(0x51de), 0x0002, 0 },
++	{ CCI_REG8(0x51df), 0x0006, 0 },
++	{ CCI_REG8(0x51e0), 0x000a, 0 },
++	{ CCI_REG8(0x51e1), 0x000e, 0 },
++	{ CCI_REG8(0x51e2), 0x0000, 0 },
++	{ CCI_REG8(0x51e3), 0x0000, 0 },
++	{ CCI_REG8(0x5200), 0x0012, 0 },
++	{ CCI_REG8(0x5201), 0x0020, 0 },
++	{ CCI_REG8(0x5202), 0x000d, 0 },
++	{ CCI_REG8(0x5203), 0x00a0, 0 },
++	{ CCI_REG8(0x5205), 0x0010, 0 },
++	{ CCI_REG8(0x5207), 0x0010, 0 },
++	{ CCI_REG8(0x5208), 0x0012, 0 },
++	{ CCI_REG8(0x5209), 0x0000, 0 },
++	{ CCI_REG8(0x520a), 0x000d, 0 },
++	{ CCI_REG8(0x520b), 0x0080, 0 },
++	{ CCI_REG8(0x520d), 0x0008, 0 },
++	{ CCI_REG8(0x5250), 0x0014, 0 },
++	{ CCI_REG8(0x5331), 0x0006, 0 },
++	{ CCI_REG8(0x5332), 0x0042, 0 },
++	{ CCI_REG8(0x5333), 0x0024, 0 },
++	{ CCI_REG8(0x53c1), 0x0000, 0 },
++	{ CCI_REG8(0x5415), 0x000b, 0 },
++	{ CCI_REG8(0x541c), 0x0001, 0 },
++	{ CCI_REG8(0x541d), 0x0001, 0 },
++	{ CCI_REG8(0x541e), 0x0001, 0 },
++	{ CCI_REG8(0x541f), 0x0001, 0 },
++	{ CCI_REG8(0x5480), 0x00c1, 0 },
++	{ CCI_REG8(0x548a), 0x0004, 0 },
++	{ CCI_REG8(0x54b0), 0x0030, 0 },
++	{ CCI_REG8(0x54d0), 0x0028, 0 },
++	{ CCI_REG8(0x54d1), 0x0068, 0 },
++	{ CCI_REG8(0x54d8), 0x0008, 0 },
++	{ CCI_REG8(0x54d9), 0x0010, 0 },
++	{ CCI_REG8(0x54da), 0x0002, 0 },
++	{ CCI_REG8(0x54db), 0x0002, 0 },
++	{ CCI_REG8(0x54dc), 0x0006, 0 },
++	{ CCI_REG8(0x54dd), 0x0006, 0 },
++	{ CCI_REG8(0x54de), 0x0002, 0 },
++	{ CCI_REG8(0x54df), 0x0006, 0 },
++	{ CCI_REG8(0x54e0), 0x000a, 0 },
++	{ CCI_REG8(0x54e1), 0x000e, 0 },
++	{ CCI_REG8(0x54e2), 0x0000, 0 },
++	{ CCI_REG8(0x54e3), 0x0000, 0 },
++	{ CCI_REG8(0x5500), 0x0012, 0 },
++	{ CCI_REG8(0x5501), 0x0020, 0 },
++	{ CCI_REG8(0x5502), 0x000d, 0 },
++	{ CCI_REG8(0x5503), 0x00a0, 0 },
++	{ CCI_REG8(0x5505), 0x0010, 0 },
++	{ CCI_REG8(0x5507), 0x0010, 0 },
++	{ CCI_REG8(0x5508), 0x0012, 0 },
++	{ CCI_REG8(0x5509), 0x0000, 0 },
++	{ CCI_REG8(0x550a), 0x000d, 0 },
++	{ CCI_REG8(0x550b), 0x0080, 0 },
++	{ CCI_REG8(0x550d), 0x0008, 0 },
++	{ CCI_REG8(0x5550), 0x0014, 0 },
++	{ CCI_REG8(0x5631), 0x0006, 0 },
++	{ CCI_REG8(0x5632), 0x0042, 0 },
++	{ CCI_REG8(0x5633), 0x0024, 0 },
++	{ CCI_REG8(0x56c1), 0x0000, 0 },
++	{ CCI_REG8(0x5715), 0x000b, 0 },
++	{ CCI_REG8(0x571c), 0x0001, 0 },
++	{ CCI_REG8(0x571d), 0x0001, 0 },
++	{ CCI_REG8(0x571e), 0x0001, 0 },
++	{ CCI_REG8(0x571f), 0x0001, 0 },
++	{ CCI_REG8(0x5780), 0x00c1, 0 },
++	{ CCI_REG8(0x578a), 0x0004, 0 },
++	{ CCI_REG8(0x57b0), 0x0030, 0 },
++	{ CCI_REG8(0x57d0), 0x0028, 0 },
++	{ CCI_REG8(0x57d8), 0x0008, 0 },
++	{ CCI_REG8(0x57d9), 0x0010, 0 },
++	{ CCI_REG8(0x57da), 0x0002, 0 },
++	{ CCI_REG8(0x57db), 0x0002, 0 },
++	{ CCI_REG8(0x57dc), 0x0006, 0 },
++	{ CCI_REG8(0x57dd), 0x0006, 0 },
++	{ CCI_REG8(0x57de), 0x0002, 0 },
++	{ CCI_REG8(0x57df), 0x0006, 0 },
++	{ CCI_REG8(0x57e0), 0x000a, 0 },
++	{ CCI_REG8(0x57e1), 0x000e, 0 },
++	{ CCI_REG8(0x57e2), 0x0000, 0 },
++	{ CCI_REG8(0x57e3), 0x0000, 0 },
++	{ CCI_REG8(0x5800), 0x0012, 0 },
++	{ CCI_REG8(0x5801), 0x0020, 0 },
++	{ CCI_REG8(0x5802), 0x000d, 0 },
++	{ CCI_REG8(0x5803), 0x00a0, 0 },
++	{ CCI_REG8(0x5805), 0x0010, 0 },
++	{ CCI_REG8(0x5807), 0x0010, 0 },
++	{ CCI_REG8(0x5808), 0x0012, 0 },
++	{ CCI_REG8(0x5809), 0x0000, 0 },
++	{ CCI_REG8(0x580a), 0x000d, 0 },
++	{ CCI_REG8(0x580b), 0x0080, 0 },
++	{ CCI_REG8(0x580d), 0x0008, 0 },
++	{ CCI_REG8(0x5850), 0x0014, 0 },
++	{ CCI_REG8(0x5931), 0x0006, 0 },
++	{ CCI_REG8(0x5932), 0x0042, 0 },
++	{ CCI_REG8(0x5933), 0x0024, 0 },
++	{ CCI_REG8(0x3400), 0x000c, 0 },
++	{ CCI_REG8(0x340c), 0x0010, 0 },
++	{ CCI_REG8(0x340d), 0x0000, 0 },
++	{ CCI_REG8(0x3500), 0x0000, 0 },
++	{ CCI_REG8(0x3501), 0x000a, 0 },
++	{ CCI_REG8(0x3502), 0x0000, 0 },
++	{ CCI_REG8(0x3541), 0x0000, 0 },
++	{ CCI_REG8(0x3542), 0x0010, 0 },
++	{ CCI_REG8(0x360b), 0x0050, 0 },
++	{ CCI_REG8(0x360d), 0x0005, 0 },
++	{ CCI_REG8(0x3635), 0x00ac, 0 },
++	{ CCI_REG8(0x3712), 0x0050, 0 },
++	{ CCI_REG8(0x3714), 0x0063, 0 },
++	{ CCI_REG8(0x3800), 0x0000, 0 },
++	{ CCI_REG8(0x3801), 0x0000, 0 },
++	{ CCI_REG8(0x3802), 0x0000, 0 },
++	{ CCI_REG8(0x3803), 0x0000, 0 },
++	{ CCI_REG8(0x3804), 0x0019, 0 },
++	{ CCI_REG8(0x3805), 0x009f, 0 },
++	{ CCI_REG8(0x3806), 0x0013, 0 },
++	{ CCI_REG8(0x3807), 0x003f, 0 },
++	{ CCI_REG8(0x3808), 0x000c, 0 },
++	{ CCI_REG8(0x3809), 0x00c0, 0 },
++	{ CCI_REG8(0x380a), 0x0009, 0 },
++	{ CCI_REG8(0x380b), 0x0090, 0 },
++	{ CCI_REG8(0x380c), 0x0002, 0 },
++	{ CCI_REG8(0x380d), 0x00d0, 0 },
++	{ CCI_REG8(0x380e), 0x0014, 0 },
++	{ CCI_REG8(0x380f), 0x00d4, 0 },
++	{ CCI_REG8(0x3810), 0x0000, 0 },
++	{ CCI_REG8(0x3811), 0x0009, 0 },
++	{ CCI_REG8(0x3812), 0x0000, 0 },
++	{ CCI_REG8(0x3813), 0x0008, 0 },
++	{ CCI_REG8(0x3814), 0x0011, 0 },
++	{ CCI_REG8(0x3815), 0x0011, 0 },
++	{ CCI_REG8(0x3820), 0x0002, 0 },
++	{ CCI_REG8(0x3821), 0x0014, 0 },
++	{ CCI_REG8(0x3822), 0x0000, 0 },
++	{ CCI_REG8(0x3823), 0x0004, 0 },
++	{ CCI_REG8(0x3837), 0x0007, 0 },
++	{ CCI_REG8(0x384c), 0x0002, 0 },
++	{ CCI_REG8(0x384d), 0x00d0, 0 },
++	{ CCI_REG8(0x3856), 0x0050, 0 },
++	{ CCI_REG8(0x3857), 0x0030, 0 },
++	{ CCI_REG8(0x3858), 0x0080, 0 },
++	{ CCI_REG8(0x3859), 0x0040, 0 },
++	{ CCI_REG8(0x3894), 0x0000, 0 },
++	{ CCI_REG8(0x3922), 0x0001, 0 },
++	{ CCI_REG8(0x3976), 0x0001, 0 },
++	{ CCI_REG8(0x397b), 0x0001, 0 },
++	{ CCI_REG8(0x3994), 0x00ff, 0 },
++	{ CCI_REG8(0x39f5), 0x0001, 0 },
++	{ CCI_REG8(0x39fd), 0x0002, 0 },
++	{ CCI_REG8(0x3a01), 0x0004, 0 },
++	{ CCI_REG8(0x3a4d), 0x000c, 0 },
++	{ CCI_REG8(0x3a4e), 0x000c, 0 },
++	{ CCI_REG8(0x3a4f), 0x000c, 0 },
++	{ CCI_REG8(0x3a50), 0x000c, 0 },
++	{ CCI_REG8(0x3a51), 0x000c, 0 },
++	{ CCI_REG8(0x3a57), 0x0015, 0 },
++	{ CCI_REG8(0x3a5a), 0x0001, 0 },
++	{ CCI_REG8(0x3a7d), 0x0060, 0 },
++	{ CCI_REG8(0x3a80), 0x000f, 0 },
++	{ CCI_REG8(0x3a82), 0x0001, 0 },
++	{ CCI_REG8(0x3a85), 0x0001, 0 },
++	{ CCI_REG8(0x3aa3), 0x0013, 0 },
++	{ CCI_REG8(0x3aa4), 0x0010, 0 },
++	{ CCI_REG8(0x3aa5), 0x000b, 0 },
++	{ CCI_REG8(0x3aa6), 0x0000, 0 },
++	{ CCI_REG8(0x3aad), 0x0000, 0 },
++	{ CCI_REG8(0x4016), 0x000d, 0 },
++	{ CCI_REG8(0x4018), 0x0007, 0 },
++	{ CCI_REG8(0x4504), 0x0080, 0 },
++	{ CCI_REG8(0x4542), 0x0000, 0 },
++	{ CCI_REG8(0x4545), 0x0000, 0 },
++	{ CCI_REG8(0x4602), 0x0000, 0 },
++	{ CCI_REG8(0x4603), 0x0015, 0 },
++	{ CCI_REG8(0x460b), 0x0003, 0 },
++	{ CCI_REG8(0x4641), 0x0019, 0 },
++	{ CCI_REG8(0x4643), 0x000c, 0 },
++	{ CCI_REG8(0x480e), 0x0000, 0 },
++};
+diff --git a/drivers/media/i2c/unicorn-sensors.c b/drivers/media/i2c/unicorn-sensors.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/media/i2c/unicorn-sensors.c
+@@ -0,0 +1,591 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Xiaomi 12S Pro D-PHY sensors: two S5KJN1 modules and OV32B40. */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/pm_runtime.h>
++#include <linux/regulator/consumer.h>
++#include <media/v4l2-cci.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-fwnode.h>
++
++struct unicorn_reg {
++	u32 reg;
++	u32 val;
++	u32 delay_us;
++};
++
++#include "unicorn-sensor-regs.h"
++
++struct unicorn_sensor_info {
++	const char *name;
++	const struct unicorn_reg *init;
++	u32 init_count;
++	const struct unicorn_reg *mode;
++	u32 mode_count;
++	u32 chip_id_reg;
++	u32 chip_id;
++	u32 width, height, hts, vts, pixel_rate;
++	u32 code;
++	s64 link_freq;
++	u32 exposure_reg, vts_reg, gain_reg;
++	u32 exposure_min, exposure_margin, exposure_default;
++	u32 gain_min, gain_max, gain_step;
++	struct v4l2_rect native, crop;
++	bool omnivision;
++};
++
++static const struct unicorn_sensor_info unicorn_s5kjn1 = {
++	.name = "s5kjn1-unicorn",
++	.init = s5kjn1_init, .init_count = ARRAY_SIZE(s5kjn1_init),
++	.mode = s5kjn1_mode, .mode_count = ARRAY_SIZE(s5kjn1_mode),
++	.chip_id_reg = CCI_REG16(0x0000), .chip_id = 0x38e1,
++	.width = 4080, .height = 3072, .hts = 5888, .vts = 3162,
++	/* VT: 19.2 MHz / 3 * 131 / 6 * 4. OP: 19.2 MHz / 3 * 136. */
++	.pixel_rate = 558933333, .link_freq = 870400000,
++	.code = MEDIA_BUS_FMT_SGRBG10_1X10,
++	.exposure_reg = CCI_REG16(0x0202), .vts_reg = CCI_REG16(0x0340),
++	.gain_reg = CCI_REG16(0x0204),
++	.exposure_min = 8, .exposure_margin = 12, .exposure_default = 256,
++	.gain_min = 32, .gain_max = 2048, .gain_step = 1,
++	.native = { .width = 8192, .height = 6176 },
++	.crop = { .left = 16, .top = 16, .width = 8160, .height = 6144 },
++};
++
++static const struct unicorn_sensor_info unicorn_ov32b40 = {
++	.name = "ov32b40-unicorn",
++	.init = ov32b40_init, .init_count = ARRAY_SIZE(ov32b40_init),
++	.mode = ov32b40_mode, .mode_count = ARRAY_SIZE(ov32b40_mode),
++	.chip_id_reg = CCI_REG24(0x300a), .chip_id = 0x563242,
++	.width = 3264, .height = 2448, .hts = 720 * 6, .vts = 5332,
++	/* OEM output clock; HTS is expressed in six-pixel units. */
++	.pixel_rate = 673920000, .link_freq = 842400000,
++	.code = MEDIA_BUS_FMT_SBGGR10_1X10,
++	.exposure_reg = CCI_REG24(0x3500), .vts_reg = CCI_REG16(0x380e),
++	.gain_reg = CCI_REG16(0x3508),
++	.exposure_min = 16, .exposure_margin = 16, .exposure_default = 2560,
++	/* Register gain is 1/256; 16-unit steps also cover gains above 8x. */
++	.gain_min = 256, .gain_max = 4080, .gain_step = 16,
++	.native = { .width = 6560, .height = 4928 },
++	.crop = { .left = 16, .top = 16, .width = 6528, .height = 4896 },
++	.omnivision = true,
++};
++
++struct unicorn_sensor {
++	struct device *dev;
++	const struct unicorn_sensor_info *info;
++	struct regmap *regmap;
++	struct clk *clk;
++	struct gpio_desc *reset;
++	struct regulator *avdd, *dvdd, *iovdd;
++	struct v4l2_subdev sd;
++	struct media_pad pad;
++	struct v4l2_ctrl_handler ctrls;
++	struct v4l2_ctrl *exposure, *vblank;
++	bool streaming;
++};
++
++static struct unicorn_sensor *to_unicorn(struct v4l2_subdev *sd)
++{
++	return container_of(sd, struct unicorn_sensor, sd);
++}
++
++static int unicorn_write_table(struct unicorn_sensor *sensor,
++			       const struct unicorn_reg *regs, unsigned int count)
++{
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < count; i++) {
++		ret = cci_write(sensor->regmap, regs[i].reg, regs[i].val, NULL);
++		if (ret)
++			return ret;
++		if (regs[i].delay_us)
++			usleep_range(regs[i].delay_us, regs[i].delay_us + 1000);
++	}
++	return 0;
++}
++
++static int unicorn_power_off(struct device *dev)
++{
++	struct unicorn_sensor *sensor = to_unicorn(dev_get_drvdata(dev));
++
++	if (!sensor->info->omnivision) {
++		clk_disable_unprepare(sensor->clk);
++		usleep_range(1000, 2000);
++	}
++	gpiod_set_value_cansleep(sensor->reset, 1);
++	usleep_range(1000, 2000);
++	if (sensor->info->omnivision) {
++		clk_disable_unprepare(sensor->clk);
++		usleep_range(1000, 2000);
++		regulator_disable(sensor->dvdd);
++		regulator_disable(sensor->iovdd);
++		regulator_disable(sensor->avdd);
++		return 0;
++	}
++	regulator_disable(sensor->avdd);
++	usleep_range(3000, 4000);
++	regulator_disable(sensor->dvdd);
++	usleep_range(1000, 2000);
++	regulator_disable(sensor->iovdd);
++	return 0;
++}
++
++static int unicorn_power_on(struct device *dev)
++{
++	struct unicorn_sensor *sensor = to_unicorn(dev_get_drvdata(dev));
++	int ret;
++
++	gpiod_set_value_cansleep(sensor->reset, 1);
++	usleep_range(1000, 2000);
++	/* Keep the stock order: JN1 I/O -> digital -> analog; OV analog -> I/O -> digital. */
++	if (sensor->info->omnivision) {
++		ret = regulator_enable(sensor->avdd);
++		if (ret)
++			return ret;
++		usleep_range(1000, 2000);
++	}
++	ret = regulator_enable(sensor->iovdd);
++	if (ret)
++		goto disable_avdd;
++	usleep_range(1000, 2000);
++	ret = regulator_enable(sensor->dvdd);
++	if (ret)
++		goto disable_iovdd;
++	usleep_range(5000, 6000);
++	if (!sensor->info->omnivision) {
++		ret = regulator_enable(sensor->avdd);
++		if (ret)
++			goto disable_dvdd;
++		usleep_range(3000, 4000);
++		gpiod_set_value_cansleep(sensor->reset, 0);
++		usleep_range(5000, 6000);
++	}
++	ret = clk_prepare_enable(sensor->clk);
++	if (ret)
++		goto assert_reset;
++	if (sensor->info->omnivision) {
++		usleep_range(1000, 2000);
++		gpiod_set_value_cansleep(sensor->reset, 0);
++	}
++	usleep_range(10000, 11000);
++	return 0;
++
++assert_reset:
++	gpiod_set_value_cansleep(sensor->reset, 1);
++	if (!sensor->info->omnivision)
++		regulator_disable(sensor->avdd);
++disable_dvdd:
++	regulator_disable(sensor->dvdd);
++disable_iovdd:
++	regulator_disable(sensor->iovdd);
++disable_avdd:
++	if (sensor->info->omnivision)
++		regulator_disable(sensor->avdd);
++	return ret;
++}
++
++static int unicorn_set_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct unicorn_sensor *sensor = container_of(ctrl->handler,
++						    struct unicorn_sensor, ctrls);
++	const struct unicorn_sensor_info *info = sensor->info;
++	u32 reg, val;
++	int ret, release_ret;
++
++	if (ctrl->id == V4L2_CID_VBLANK)
++		__v4l2_ctrl_modify_range(sensor->exposure, info->exposure_min,
++			info->height + ctrl->val - info->exposure_margin, 1,
++			info->exposure_default);
++
++	switch (ctrl->id) {
++	case V4L2_CID_EXPOSURE:
++		reg = info->exposure_reg;
++		val = ctrl->val;
++		break;
++	case V4L2_CID_ANALOGUE_GAIN:
++		reg = info->gain_reg;
++		val = ctrl->val;
++		break;
++	case V4L2_CID_VBLANK:
++		reg = info->vts_reg;
++		val = info->height + ctrl->val;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	if (!pm_runtime_get_if_in_use(sensor->dev))
++		return 0;
++
++	/* Hold/release even on a failed write, so a recoverable I2C error cannot
++	 * leave all subsequent exposure updates latched indefinitely.
++	 */
++	ret = cci_write(sensor->regmap,
++		info->omnivision ? CCI_REG8(0x3208) : CCI_REG8(0x0104),
++		info->omnivision ? 3 : 1, NULL);
++	cci_write(sensor->regmap, reg, val, &ret);
++	release_ret = cci_write(sensor->regmap,
++		info->omnivision ? CCI_REG8(0x3208) : CCI_REG8(0x0104),
++		info->omnivision ? 0x13 : 0, NULL);
++	if (info->omnivision)
++		cci_write(sensor->regmap, CCI_REG8(0x3208), 0xa3, &release_ret);
++	pm_runtime_put_autosuspend(sensor->dev);
++	return ret ? ret : release_ret;
++}
++
++static const struct v4l2_ctrl_ops unicorn_ctrl_ops = {
++	.s_ctrl = unicorn_set_ctrl,
++};
++
++static int unicorn_init_controls(struct unicorn_sensor *sensor)
++{
++	const struct unicorn_sensor_info *info = sensor->info;
++	struct v4l2_fwnode_device_properties props;
++	struct v4l2_ctrl_handler *hdl = &sensor->ctrls;
++	struct v4l2_ctrl *ctrl;
++	u32 hblank = info->hts - info->width;
++	int ret;
++
++	v4l2_ctrl_handler_init(hdl, 8);
++	ctrl = v4l2_ctrl_new_int_menu(hdl, NULL, V4L2_CID_LINK_FREQ, 0, 0,
++				      &info->link_freq);
++	if (ctrl)
++		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++	v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_PIXEL_RATE,
++			  info->pixel_rate, info->pixel_rate, 1, info->pixel_rate);
++	ctrl = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_HBLANK,
++				hblank, hblank, 1, hblank);
++	if (ctrl)
++		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++	sensor->vblank = v4l2_ctrl_new_std(hdl, &unicorn_ctrl_ops, V4L2_CID_VBLANK,
++		info->vts - info->height, 0xffff - info->height, 1,
++		info->vts - info->height);
++	sensor->exposure = v4l2_ctrl_new_std(hdl, &unicorn_ctrl_ops, V4L2_CID_EXPOSURE,
++		info->exposure_min, info->vts - info->exposure_margin, 1,
++		info->exposure_default);
++	v4l2_ctrl_new_std(hdl, &unicorn_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
++		info->gain_min, info->gain_max, info->gain_step, info->gain_min);
++	if (hdl->error)
++		return hdl->error;
++	ret = v4l2_fwnode_device_parse(sensor->dev, &props);
++	if (ret)
++		return ret;
++	ret = v4l2_ctrl_new_fwnode_properties(hdl, &unicorn_ctrl_ops, &props);
++	if (ret)
++		return ret;
++	sensor->sd.ctrl_handler = hdl;
++	sensor->sd.state_lock = hdl->lock;
++	return 0;
++}
++
++static void unicorn_format(struct unicorn_sensor *sensor,
++			   struct v4l2_mbus_framefmt *format)
++{
++	*format = (struct v4l2_mbus_framefmt) {
++		.width = sensor->info->width, .height = sensor->info->height,
++		.code = sensor->info->code, .field = V4L2_FIELD_NONE,
++		.colorspace = V4L2_COLORSPACE_RAW,
++		.quantization = V4L2_QUANTIZATION_FULL_RANGE,
++		.xfer_func = V4L2_XFER_FUNC_NONE,
++	};
++}
++
++static int unicorn_init_state(struct v4l2_subdev *sd,
++			      struct v4l2_subdev_state *state)
++{
++	unicorn_format(to_unicorn(sd), v4l2_subdev_state_get_format(state, 0));
++	return 0;
++}
++
++static int unicorn_set_fmt(struct v4l2_subdev *sd,
++			   struct v4l2_subdev_state *state,
++			   struct v4l2_subdev_format *fmt)
++{
++	struct unicorn_sensor *sensor = to_unicorn(sd);
++
++	if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE && sensor->streaming)
++		return -EBUSY;
++	unicorn_format(sensor, &fmt->format);
++	*v4l2_subdev_state_get_format(state, 0) = fmt->format;
++	return 0;
++}
++
++static int unicorn_enum_code(struct v4l2_subdev *sd,
++			     struct v4l2_subdev_state *state,
++			     struct v4l2_subdev_mbus_code_enum *code)
++{
++	if (code->index)
++		return -EINVAL;
++	code->code = to_unicorn(sd)->info->code;
++	return 0;
++}
++
++static int unicorn_enum_size(struct v4l2_subdev *sd,
++			     struct v4l2_subdev_state *state,
++			     struct v4l2_subdev_frame_size_enum *fse)
++{
++	const struct unicorn_sensor_info *info = to_unicorn(sd)->info;
++
++	if (fse->index || fse->code != info->code)
++		return -EINVAL;
++	fse->min_width = fse->max_width = info->width;
++	fse->min_height = fse->max_height = info->height;
++	return 0;
++}
++
++static int unicorn_get_selection(struct v4l2_subdev *sd,
++				struct v4l2_subdev_state *state,
++				struct v4l2_subdev_selection *sel)
++{
++	const struct unicorn_sensor_info *info = to_unicorn(sd)->info;
++
++	switch (sel->target) {
++	case V4L2_SEL_TGT_NATIVE_SIZE:
++		sel->r = info->native;
++		return 0;
++	case V4L2_SEL_TGT_CROP:
++	case V4L2_SEL_TGT_CROP_DEFAULT:
++	case V4L2_SEL_TGT_CROP_BOUNDS:
++		sel->r = info->crop;
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static int unicorn_enable_streams(struct v4l2_subdev *sd,
++				  struct v4l2_subdev_state *state,
++				  u32 pad, u64 streams_mask)
++{
++	struct unicorn_sensor *sensor = to_unicorn(sd);
++	const struct unicorn_sensor_info *info = sensor->info;
++	int ret;
++
++	ret = pm_runtime_resume_and_get(sensor->dev);
++	if (ret < 0)
++		return ret;
++	ret = unicorn_write_table(sensor, info->init, info->init_count);
++	if (ret)
++		goto power_down;
++	ret = unicorn_write_table(sensor, info->mode, info->mode_count);
++	if (ret)
++		goto power_down;
++	/* JN1 native GRBG order; do not silently set the OEM's 180-degree flip. */
++	if (!info->omnivision)
++		cci_write(sensor->regmap, CCI_REG8(0x0101), 0, &ret);
++	if (ret)
++		goto power_down;
++	ret = __v4l2_ctrl_handler_setup(&sensor->ctrls);
++	cci_write(sensor->regmap, CCI_REG8(0x0100), 1, &ret);
++	if (ret)
++		goto power_down;
++	sensor->streaming = true;
++	return 0;
++
++power_down:
++	cci_write(sensor->regmap, CCI_REG8(0x0100), 0, NULL);
++	pm_runtime_put_sync_suspend(sensor->dev);
++	return ret;
++}
++
++static int unicorn_disable_streams(struct v4l2_subdev *sd,
++				   struct v4l2_subdev_state *state,
++				   u32 pad, u64 streams_mask)
++{
++	struct unicorn_sensor *sensor = to_unicorn(sd);
++	int ret;
++
++	ret = cci_write(sensor->regmap, CCI_REG8(0x0100), 0, NULL);
++	/* Let the last frame drain before an immediate stream restart. */
++	usleep_range(35000, 36000);
++	sensor->streaming = false;
++	pm_runtime_put_sync_suspend(sensor->dev);
++	return ret;
++}
++
++static const struct v4l2_subdev_pad_ops unicorn_pad_ops = {
++	.enum_mbus_code = unicorn_enum_code,
++	.enum_frame_size = unicorn_enum_size,
++	.get_fmt = v4l2_subdev_get_fmt,
++	.set_fmt = unicorn_set_fmt,
++	.get_selection = unicorn_get_selection,
++	.enable_streams = unicorn_enable_streams,
++	.disable_streams = unicorn_disable_streams,
++};
++
++static const struct v4l2_subdev_video_ops unicorn_video_ops = {
++	.s_stream = v4l2_subdev_s_stream_helper,
++};
++
++static const struct v4l2_subdev_ops unicorn_subdev_ops = {
++	.pad = &unicorn_pad_ops,
++	.video = &unicorn_video_ops,
++};
++
++static const struct v4l2_subdev_internal_ops unicorn_internal_ops = {
++	.init_state = unicorn_init_state,
++};
++
++static const struct media_entity_operations unicorn_entity_ops = {
++	.link_validate = v4l2_subdev_link_validate,
++};
++
++static int unicorn_check_endpoint(struct unicorn_sensor *sensor)
++{
++	struct v4l2_fwnode_endpoint ep = { .bus_type = V4L2_MBUS_CSI2_DPHY };
++	struct fwnode_handle *fwnode;
++	unsigned long bitmap;
++	int ret;
++
++	fwnode = fwnode_graph_get_next_endpoint(dev_fwnode(sensor->dev), NULL);
++	if (!fwnode)
++		return -EINVAL;
++	ret = v4l2_fwnode_endpoint_alloc_parse(fwnode, &ep);
++	fwnode_handle_put(fwnode);
++	if (ret)
++		return ret;
++	if (ep.bus.mipi_csi2.num_data_lanes != 4) {
++		ret = -EINVAL;
++		goto out;
++	}
++	ret = v4l2_link_freq_to_bitmap(sensor->dev, ep.link_frequencies,
++		ep.nr_of_link_frequencies, &sensor->info->link_freq, 1, &bitmap);
++out:
++	v4l2_fwnode_endpoint_free(&ep);
++	return ret;
++}
++
++static int unicorn_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct unicorn_sensor *sensor;
++	u64 id;
++	int ret;
++
++	sensor = devm_kzalloc(dev, sizeof(*sensor), GFP_KERNEL);
++	if (!sensor)
++		return -ENOMEM;
++	sensor->dev = dev;
++	sensor->info = i2c_get_match_data(client);
++	v4l2_i2c_subdev_init(&sensor->sd, client, &unicorn_subdev_ops);
++	snprintf(sensor->sd.name, sizeof(sensor->sd.name), "%s %d-%04x",
++		sensor->info->name, i2c_adapter_id(client->adapter), client->addr);
++	sensor->regmap = devm_cci_regmap_init_i2c(client, 16);
++	if (IS_ERR(sensor->regmap))
++		return dev_err_probe(dev, PTR_ERR(sensor->regmap), "CCI regmap\n");
++	sensor->clk = devm_v4l2_sensor_clk_get(dev, NULL);
++	if (IS_ERR(sensor->clk))
++		return dev_err_probe(dev, PTR_ERR(sensor->clk), "MCLK\n");
++	if (clk_get_rate(sensor->clk) != 19200000)
++		return dev_err_probe(dev, -EINVAL, "19.2 MHz MCLK required\n");
++	ret = unicorn_check_endpoint(sensor);
++	if (ret)
++		return dev_err_probe(dev, ret, "invalid CSI endpoint\n");
++	sensor->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(sensor->reset))
++		return dev_err_probe(dev, PTR_ERR(sensor->reset), "reset GPIO\n");
++	sensor->avdd = devm_regulator_get(dev, "avdd");
++	if (IS_ERR(sensor->avdd))
++		return dev_err_probe(dev, PTR_ERR(sensor->avdd), "AVDD\n");
++	sensor->dvdd = devm_regulator_get(dev, "dvdd");
++	if (IS_ERR(sensor->dvdd))
++		return dev_err_probe(dev, PTR_ERR(sensor->dvdd), "DVDD\n");
++	sensor->iovdd = devm_regulator_get(dev, "iovdd");
++	if (IS_ERR(sensor->iovdd))
++		return dev_err_probe(dev, PTR_ERR(sensor->iovdd), "IOVDD\n");
++	ret = unicorn_power_on(dev);
++	if (ret)
++		return dev_err_probe(dev, ret, "power on\n");
++	ret = cci_read(sensor->regmap, sensor->info->chip_id_reg, &id, NULL);
++	if (!ret && id != sensor->info->chip_id) {
++		dev_err(dev, "unexpected sensor ID 0x%llx\n", id);
++		ret = -ENODEV;
++	}
++	if (ret)
++		goto power_off;
++	ret = unicorn_init_controls(sensor);
++	if (ret)
++		goto free_controls;
++	sensor->sd.internal_ops = &unicorn_internal_ops;
++	sensor->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
++	sensor->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
++	sensor->sd.entity.ops = &unicorn_entity_ops;
++	sensor->pad.flags = MEDIA_PAD_FL_SOURCE;
++	ret = media_entity_pads_init(&sensor->sd.entity, 1, &sensor->pad);
++	if (ret)
++		goto free_controls;
++	ret = v4l2_subdev_init_finalize(&sensor->sd);
++	if (ret)
++		goto cleanup_entity;
++	ret = pm_runtime_set_active(dev);
++	if (ret)
++		goto cleanup_subdev;
++	pm_runtime_get_noresume(dev);
++	pm_runtime_enable(dev);
++	pm_runtime_set_autosuspend_delay(dev, 1000);
++	pm_runtime_use_autosuspend(dev);
++	ret = v4l2_async_register_subdev_sensor(&sensor->sd);
++	if (ret)
++		goto disable_pm;
++	pm_runtime_put_autosuspend(dev);
++	return 0;
++
++disable_pm:
++	pm_runtime_disable(dev);
++	pm_runtime_put_noidle(dev);
++	pm_runtime_set_suspended(dev);
++cleanup_subdev:
++	v4l2_subdev_cleanup(&sensor->sd);
++cleanup_entity:
++	media_entity_cleanup(&sensor->sd.entity);
++free_controls:
++	v4l2_ctrl_handler_free(&sensor->ctrls);
++power_off:
++	unicorn_power_off(dev);
++	return ret;
++}
++
++static void unicorn_remove(struct i2c_client *client)
++{
++	struct unicorn_sensor *sensor = to_unicorn(i2c_get_clientdata(client));
++
++	v4l2_async_unregister_subdev(&sensor->sd);
++	v4l2_subdev_cleanup(&sensor->sd);
++	media_entity_cleanup(&sensor->sd.entity);
++	v4l2_ctrl_handler_free(&sensor->ctrls);
++	pm_runtime_disable(sensor->dev);
++	if (!pm_runtime_status_suspended(sensor->dev))
++		unicorn_power_off(sensor->dev);
++	pm_runtime_set_suspended(sensor->dev);
++}
++
++static const struct dev_pm_ops unicorn_pm_ops = {
++	SET_RUNTIME_PM_OPS(unicorn_power_off, unicorn_power_on, NULL)
++};
++
++static const struct of_device_id unicorn_of_match[] = {
++	{ .compatible = "xiaomi,unicorn-s5kjn1", .data = &unicorn_s5kjn1 },
++	{ .compatible = "xiaomi,unicorn-ov32b40", .data = &unicorn_ov32b40 },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, unicorn_of_match);
++
++static struct i2c_driver unicorn_driver = {
++	.driver = {
++		.name = "unicorn-sensors",
++		.of_match_table = unicorn_of_match,
++		.pm = pm_ptr(&unicorn_pm_ops),
++	},
++	.probe = unicorn_probe,
++	.remove = unicorn_remove,
++};
++module_i2c_driver(unicorn_driver);
++
++MODULE_DESCRIPTION("Xiaomi 12S Pro S5KJN1 and OV32B40 sensors");
++MODULE_LICENSE("GPL");
+diff --git a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-camera.dtsi b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-camera.dtsi
+--- a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-camera.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-camera.dtsi
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: (GPL-2.0-only OR BSD-3-Clause)
+-/* Existing SoC CCI controllers only. Sensor identities and pipelines are separate. */
++/* Stock Unicorn routing and supplies; main IMX707 requires C-PHY support. */
+ &cci0 {
+ 	status = "okay";
+ };
+@@ -8,12 +8,12 @@
+ 	status = "okay";
+ };
+ 
+-/* Digital capture controller; physical PHYs and sensors remain disabled. */
++/* CAMSS receives the three D-PHY sensors below. */
+ &camss {
+ 	status = "okay";
+ };
+ 
+-/* PM8008J regulator provider. No camera consumer or LDO boot request. */
++/* Camera PMIC, enabled by GPIO11. */
+ &i2c5 {
+ 	pm8008j: pmic@c {
+ 		compatible = "qcom,pm8008";
+@@ -26,13 +26,17 @@
+ 		vdd-l6-supply = <&vreg_bob>;
+ 		vdd-l7-supply = <&vreg_bob>;
+ 
+-		/* Name-only constraints: registration must not program voltages. */
++		/* L1/L2 digital cores and L5 shared I/O are used by these sensors. */
+ 		regulators {
+ 			pm8008j_l1: ldo1 {
+ 				regulator-name = "pm8008j_l1";
++				regulator-min-microvolt = <1056000>;
++				regulator-max-microvolt = <1056000>;
+ 			};
+ 			pm8008j_l2: ldo2 {
+ 				regulator-name = "pm8008j_l2";
++				regulator-min-microvolt = <1056000>;
++				regulator-max-microvolt = <1056000>;
+ 			};
+ 			pm8008j_l3: ldo3 {
+ 				regulator-name = "pm8008j_l3";
+@@ -42,6 +46,8 @@
+ 			};
+ 			pm8008j_l5: ldo5 {
+ 				regulator-name = "pm8008j_l5";
++				regulator-min-microvolt = <1800000>;
++				regulator-max-microvolt = <1800000>;
+ 			};
+ 			pm8008j_l6: ldo6 {
+ 				regulator-name = "pm8008j_l6";
+@@ -62,3 +68,226 @@
+ 		output-high;
+ 	};
+ };
++
++/ {
++	camera_ultra_avdd: regulator-camera-ultra-avdd {
++		compatible = "regulator-fixed";
++		regulator-name = "camera_ultra_avdd";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&tlmm 6 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <100>;
++		vin-supply = <&vreg_bob>;
++	};
++
++	camera_tele_avdd: regulator-camera-tele-avdd {
++		compatible = "regulator-fixed";
++		regulator-name = "camera_tele_avdd";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&tlmm 71 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <100>;
++		vin-supply = <&vreg_bob>;
++	};
++
++	camera_front_avdd: regulator-camera-front-avdd {
++		compatible = "regulator-fixed";
++		regulator-name = "camera_front_avdd";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&tlmm 64 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <100>;
++	};
++
++	camera_front_dvdd: regulator-camera-front-dvdd {
++		compatible = "regulator-fixed";
++		regulator-name = "camera_front_dvdd";
++		regulator-min-microvolt = <1104000>;
++		regulator-max-microvolt = <1104000>;
++		gpio = <&tlmm 44 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <100>;
++		vin-supply = <&pm8350_s12>;
++	};
++
++};
++
++&cci0_i2c0 {
++	status = "okay";
++	clock-frequency = <400000>;
++
++	camera_ultra: camera@3d {
++		compatible = "xiaomi,unicorn-s5kjn1";
++		reg = <0x3d>;
++		clocks = <&camcc CAM_CC_MCLK1_CLK>;
++		assigned-clocks = <&camcc CAM_CC_MCLK1_CLK>;
++		assigned-clock-rates = <19200000>;
++		pinctrl-names = "default", "sleep";
++		pinctrl-0 = <&cam1_default &camera_ultra_reset>;
++		pinctrl-1 = <&cam1_sleep &camera_ultra_reset>;
++		reset-gpios = <&tlmm 24 GPIO_ACTIVE_LOW>;
++		avdd-supply = <&camera_ultra_avdd>;
++		dvdd-supply = <&pm8008j_l2>;
++		iovdd-supply = <&pm8008j_l5>;
++		orientation = <1>;
++		rotation = <90>;
++
++		port {
++			camera_ultra_ep: endpoint {
++				remote-endpoint = <&csiphy0_in_ep>;
++				bus-type = <4>;
++				clock-lanes = <0>;
++				data-lanes = <1 2 3 4>;
++				link-frequencies = /bits/ 64 <870400000>;
++			};
++		};
++	};
++};
++
++&csiphy0 {
++	vdda-0p9-supply = <&pm8350_l5>;
++	vdda-1p2-supply = <&pm8350c_l10>;
++	status = "okay";
++};
++
++&csiphy0_in_ep {
++	remote-endpoint = <&camera_ultra_ep>;
++	bus-type = <4>;
++	clock-lanes = <0>;
++	data-lanes = <1 2 3 4>;
++};
++
++&camss_csiphy0_inep {
++	bus-type = <4>;
++	clock-lanes = <0>;
++	data-lanes = <1 2 3 4>;
++};
++
++&cci1_i2c0 {
++	status = "okay";
++	clock-frequency = <400000>;
++
++	camera_tele: camera@2d {
++		compatible = "xiaomi,unicorn-s5kjn1";
++		reg = <0x2d>;
++		clocks = <&camcc CAM_CC_MCLK0_CLK>;
++		assigned-clocks = <&camcc CAM_CC_MCLK0_CLK>;
++		assigned-clock-rates = <19200000>;
++		pinctrl-names = "default", "sleep";
++		pinctrl-0 = <&cam0_default &camera_tele_reset>;
++		pinctrl-1 = <&cam0_sleep &camera_tele_reset>;
++		reset-gpios = <&tlmm 128 GPIO_ACTIVE_LOW>;
++		avdd-supply = <&camera_tele_avdd>;
++		dvdd-supply = <&pm8008j_l1>;
++		iovdd-supply = <&pm8008j_l5>;
++		orientation = <1>;
++		rotation = <90>;
++
++		port {
++			camera_tele_ep: endpoint {
++				remote-endpoint = <&csiphy1_in_ep>;
++				bus-type = <4>;
++				clock-lanes = <0>;
++				data-lanes = <1 2 3 4>;
++				link-frequencies = /bits/ 64 <870400000>;
++			};
++		};
++	};
++};
++
++&csiphy1 {
++	vdda-0p9-supply = <&pm8350_l5>;
++	vdda-1p2-supply = <&pm8350c_l10>;
++	status = "okay";
++};
++
++&csiphy1_in_ep {
++	remote-endpoint = <&camera_tele_ep>;
++	bus-type = <4>;
++	clock-lanes = <0>;
++	data-lanes = <1 2 3 4>;
++};
++
++&camss_csiphy1_inep {
++	bus-type = <4>;
++	clock-lanes = <0>;
++	data-lanes = <1 2 3 4>;
++};
++
++&cci1_i2c0 {
++	status = "okay";
++	clock-frequency = <400000>;
++
++	camera_front: camera@10 {
++		compatible = "xiaomi,unicorn-ov32b40";
++		reg = <0x10>;
++		clocks = <&camcc CAM_CC_MCLK5_CLK>;
++		assigned-clocks = <&camcc CAM_CC_MCLK5_CLK>;
++		assigned-clock-rates = <19200000>;
++		pinctrl-names = "default", "sleep";
++		pinctrl-0 = <&cam5_default &camera_front_reset>;
++		pinctrl-1 = <&cam5_sleep &camera_front_reset>;
++		reset-gpios = <&tlmm 127 GPIO_ACTIVE_LOW>;
++		avdd-supply = <&camera_front_avdd>;
++		dvdd-supply = <&camera_front_dvdd>;
++		iovdd-supply = <&pm8008j_l5>;
++		orientation = <0>;
++		rotation = <270>;
++
++		port {
++			camera_front_ep: endpoint {
++				remote-endpoint = <&csiphy3_in_ep>;
++				bus-type = <4>;
++				clock-lanes = <0>;
++				data-lanes = <1 2 3 4>;
++				link-frequencies = /bits/ 64 <842400000>;
++			};
++		};
++	};
++};
++
++&csiphy3 {
++	vdda-0p9-supply = <&pm8350_l5>;
++	vdda-1p2-supply = <&pm8350c_l10>;
++	status = "okay";
++};
++
++&csiphy3_in_ep {
++	remote-endpoint = <&camera_front_ep>;
++	bus-type = <4>;
++	clock-lanes = <0>;
++	data-lanes = <1 2 3 4>;
++};
++
++&camss_csiphy3_inep {
++	bus-type = <4>;
++	clock-lanes = <0>;
++	data-lanes = <1 2 3 4>;
++};
++
++&tlmm {
++	camera_ultra_reset: camera-ultra-reset-state {
++		pins = "gpio24";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++
++	camera_tele_reset: camera-tele-reset-state {
++		pins = "gpio128";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++
++	camera_front_reset: camera-front-reset-state {
++		pins = "gpio127";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++
++};
+diff --git a/drivers/media/platform/qcom/camss/camss-csiphy.c b/drivers/media/platform/qcom/camss/camss-csiphy.c
+--- a/drivers/media/platform/qcom/camss/camss-csiphy.c
++++ b/drivers/media/platform/qcom/camss/camss-csiphy.c
+@@ -344,7 +344,7 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	ret = phy_mipi_dphy_get_default_config_for_hsclk(link_freq, num_lanes,
++	ret = phy_mipi_dphy_get_default_config_for_hsclk(2 * link_freq, num_lanes,
+ 							 dphy_cfg);
+ 	if (ret < 0) {
+ 		dev_err(dev, "Invalid config for link frequency %lld\n",
+diff --git a/drivers/phy/qualcomm/phy-qcom-mipi-csi2-core.c b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-core.c
+--- a/drivers/phy/qualcomm/phy-qcom-mipi-csi2-core.c
++++ b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-core.c
+@@ -114,7 +114,8 @@
+ 	if (dphy_cfg->lanes != stream_cfg->num_data_lanes)
+ 		return -EINVAL;
+ 
+-	stream_cfg->link_freq = dphy_cfg->hs_clk_rate;
++	/* Lane settle and clock scaling below use the DDR link clock. */
++	stream_cfg->link_freq = dphy_cfg->hs_clk_rate / 2;
+ 
+ 	return 0;
+ }

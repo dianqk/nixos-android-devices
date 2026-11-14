@@ -1,0 +1,381 @@
+Subject: [PATCH] mfd: qcom-pm8008: support regulator-only providers
+
+Allow a PM8008 regulator provider without an interrupt controller and keep
+name-only regulator constraints from programming unrequested voltages.
+
+diff --git a/Documentation/devicetree/bindings/mfd/qcom,pm8008.yaml b/Documentation/devicetree/bindings/mfd/qcom,pm8008.yaml
+--- a/Documentation/devicetree/bindings/mfd/qcom,pm8008.yaml
++++ b/Documentation/devicetree/bindings/mfd/qcom,pm8008.yaml
+@@ -13,6 +13,36 @@
+   Qualcomm Technologies, Inc. PM8008 is a dedicated camera PMIC that integrates
+   all the necessary power management, housekeeping, and interface support
+   functions into a single IC.
++  When the board does not provide an AP interrupt, only the regulator block
++  is available. GPIO, interrupt-controller and thermal-sensor services require
++  the interrupt connection. Internal hardware protection is not disabled.
++
++allOf:
++  - if:
++      anyOf:
++        - required:
++            - interrupts
++        - required:
++            - interrupts-extended
++    then:
++      required:
++        - gpio-controller
++        - "#gpio-cells"
++        - gpio-ranges
++        - interrupt-controller
++        - "#interrupt-cells"
++        - "#thermal-sensor-cells"
++    else:
++      required:
++        - regulators
++      properties:
++        gpio-controller: false
++        "#gpio-cells": false
++        gpio-ranges: false
++        interrupt-controller: false
++        "#interrupt-cells": false
++        "#thermal-sensor-cells": false
++        pinctrl: false
+ 
+ properties:
+   compatible:
+@@ -22,6 +52,9 @@
+     maxItems: 1
+ 
+   interrupts:
++    maxItems: 1
++
++  interrupts-extended:
+     maxItems: 1
+ 
+   reset-gpios:
+@@ -88,22 +121,39 @@
+ required:
+   - compatible
+   - reg
+-  - interrupts
+   - vdd-l1-l2-supply
+   - vdd-l3-l4-supply
+   - vdd-l5-supply
+   - vdd-l6-supply
+   - vdd-l7-supply
+-  - gpio-controller
+-  - "#gpio-cells"
+-  - gpio-ranges
+-  - interrupt-controller
+-  - "#interrupt-cells"
+-  - "#thermal-sensor-cells"
+ 
+ additionalProperties: false
+ 
+ examples:
++  - |
++    i2c {
++      #address-cells = <1>;
++      #size-cells = <0>;
++
++      pmic@c {
++        compatible = "qcom,pm8008";
++        reg = <0xc>;
++        vdd-l1-l2-supply = <&vreg_s8b_1p2>;
++        vdd-l3-l4-supply = <&vreg_s1b_1p8>;
++        vdd-l5-supply = <&vreg_bob>;
++        vdd-l6-supply = <&vreg_bob>;
++        vdd-l7-supply = <&vreg_bob>;
++
++        regulators {
++          ldo2 {
++            regulator-name = "vreg_l2";
++            regulator-min-microvolt = <1056000>;
++            regulator-max-microvolt = <1056000>;
++          };
++        };
++      };
++    };
++
+   - |
+     #include <dt-bindings/gpio/gpio.h>
+     #include <dt-bindings/interrupt-controller/irq.h>
+diff --git a/drivers/mfd/qcom-pm8008.c b/drivers/mfd/qcom-pm8008.c
+--- a/drivers/mfd/qcom-pm8008.c
++++ b/drivers/mfd/qcom-pm8008.c
+@@ -183,6 +183,11 @@
+ 	MFD_CELL_NAME("pm8008-gpio"),
+ };
+ 
++/* Boards without an AP interrupt can still use the regulator block. */
++static const struct mfd_cell pm8008_regulator_only_cells[] = {
++	MFD_CELL_NAME("pm8008-regulator"),
++};
++
+ static void devm_irq_domain_fwnode_release(void *data)
+ {
+ 	struct fwnode_handle *fwnode = data;
+@@ -201,6 +206,9 @@
+ 	char *name;
+ 	int ret;
+ 
++	if (client->irq < 0)
++		return client->irq;
++
+ 	dummy = devm_i2c_new_dummy_device(dev, client->adapter, client->addr + 1);
+ 	if (IS_ERR(dummy)) {
+ 		ret = PTR_ERR(dummy);
+@@ -230,6 +238,12 @@
+ 	 * for a millisecond for now anyway.
+ 	 */
+ 	usleep_range(1000, 2000);
++
++	if (!client->irq)
++		return devm_mfd_add_devices(dev, PLATFORM_DEVID_AUTO,
++				pm8008_regulator_only_cells,
++				ARRAY_SIZE(pm8008_regulator_only_cells), NULL, 0,
++				NULL);
+ 
+ 	name = devm_kasprintf(dev, GFP_KERNEL, "%pOF-internal", dev->of_node);
+ 	if (!name)
+diff --git a/drivers/regulator/qcom-pm8008-regulator.c b/drivers/regulator/qcom-pm8008-regulator.c
+--- a/drivers/regulator/qcom-pm8008-regulator.c
++++ b/drivers/regulator/qcom-pm8008-regulator.c
+@@ -8,8 +8,11 @@
+ #include <linux/array_size.h>
+ #include <linux/bits.h>
+ #include <linux/device.h>
++#include <linux/delay.h>
++#include <linux/i2c.h>
+ #include <linux/math.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
+@@ -26,9 +29,22 @@
+ 
+ #define LDO_ENABLE_REG			0x46
+ #define ENABLE_BIT			BIT(7)
++#define LDO_STATUS1_REG			0x08
++#define VREG_READY_BIT			BIT(7)
++#define MISC_CHIP_ENABLE_REG		0x0950
++#define CHIP_ENABLE_BIT			BIT(0)
++
++/* The regulator-only configuration has no GPIO or thermal clients. */
++struct pm8008_chip_gate {
++	struct regmap *regmap;
++	struct mutex lock;
++	unsigned long enabled;
++};
+ 
+ struct pm8008_regulator {
+ 	struct regmap		*regmap;
++	struct pm8008_chip_gate *gate;
++	unsigned long		mask;
+ 	struct regulator_desc	desc;
+ 	unsigned int		base;
+ };
+@@ -108,12 +124,173 @@
+ 	.is_enabled		= regulator_is_enabled_regmap,
+ };
+ 
++static int pm8008_regulator_only_is_enabled(struct regulator_dev *rdev)
++{
++	struct pm8008_regulator *preg = rdev_get_drvdata(rdev);
++	unsigned int val;
++	int ret;
++
++	mutex_lock(&preg->gate->lock);
++	ret = regmap_read(preg->gate->regmap, MISC_CHIP_ENABLE_REG, &val);
++	if (!ret)
++		ret = val & CHIP_ENABLE_BIT ? regulator_is_enabled_regmap(rdev) : 0;
++	mutex_unlock(&preg->gate->lock);
++
++	return ret;
++}
++
++static int pm8008_regulator_only_enable(struct regulator_dev *rdev)
++{
++	struct pm8008_regulator *preg = rdev_get_drvdata(rdev);
++	struct pm8008_chip_gate *gate = preg->gate;
++	unsigned int val, delay_us;
++	bool changed_gate = false;
++	int ret, cleanup_ret, voltage, i;
++
++	mutex_lock(&gate->lock);
++	ret = pm8008_regulator_get_voltage_sel(rdev);
++	if (ret < 0)
++		goto out;
++	voltage = regulator_list_voltage_linear(rdev, ret);
++	if (voltage < 0) {
++		ret = voltage;
++		goto out;
++	}
++	delay_us = 20 + DIV_ROUND_UP(voltage, preg->desc.ramp_delay);
++
++	ret = regmap_read(gate->regmap, MISC_CHIP_ENABLE_REG, &val);
++	if (ret)
++		goto out;
++	if (!(val & CHIP_ENABLE_BIT)) {
++		/* Do not power other pre-existing LDO votes by lifting the gate. */
++		if (gate->enabled & ~preg->mask) {
++			ret = -EBUSY;
++			goto out;
++		}
++		ret = regmap_update_bits(gate->regmap, MISC_CHIP_ENABLE_REG,
++					 CHIP_ENABLE_BIT, CHIP_ENABLE_BIT);
++		if (ret)
++			goto out;
++		changed_gate = true;
++	}
++
++	ret = regulator_enable_regmap(rdev);
++	if (ret)
++		goto restore_gate;
++
++	/* Match the OEM's ten bounded VREG_READY attempts and startup budget. */
++	for (i = 0; i < 10; i++) {
++		usleep_range(delay_us, delay_us + 100);
++		ret = regmap_read(preg->regmap, preg->base + LDO_STATUS1_REG, &val);
++		if (ret)
++			goto disable_ldo;
++		if (val & VREG_READY_BIT) {
++			gate->enabled |= preg->mask;
++			goto out;
++		}
++	}
++	ret = -ETIME;
++
++disable_ldo:
++	if (!(gate->enabled & preg->mask)) {
++		cleanup_ret = regulator_disable_regmap(rdev);
++		if (cleanup_ret) {
++			/* Conservatively retain an unknown LDO vote after bus failure. */
++			gate->enabled |= preg->mask;
++			dev_err(&rdev->dev, "failed to roll back LDO enable: %d\n",
++				cleanup_ret);
++		}
++	}
++restore_gate:
++	if (changed_gate) {
++		cleanup_ret = regmap_update_bits(gate->regmap, MISC_CHIP_ENABLE_REG,
++						 CHIP_ENABLE_BIT, 0);
++		if (cleanup_ret)
++			dev_err(&rdev->dev, "failed to restore chip gate: %d\n",
++				cleanup_ret);
++	}
++out:
++	mutex_unlock(&gate->lock);
++	return ret;
++}
++
++static int pm8008_regulator_only_disable(struct regulator_dev *rdev)
++{
++	struct pm8008_regulator *preg = rdev_get_drvdata(rdev);
++	struct pm8008_chip_gate *gate = preg->gate;
++	int ret;
++
++	mutex_lock(&gate->lock);
++	ret = regulator_disable_regmap(rdev);
++	if (!ret) {
++		gate->enabled &= ~preg->mask;
++		if (!gate->enabled)
++			ret = regmap_update_bits(gate->regmap, MISC_CHIP_ENABLE_REG,
++						 CHIP_ENABLE_BIT, 0);
++	}
++	mutex_unlock(&gate->lock);
++
++	return ret;
++}
++
++static const struct regulator_ops pm8008_regulator_only_ops = {
++	.enable = pm8008_regulator_only_enable,
++	.disable = pm8008_regulator_only_disable,
++	.is_enabled = pm8008_regulator_only_is_enabled,
++	.set_voltage_sel = pm8008_regulator_set_voltage_sel,
++	.get_voltage_sel = pm8008_regulator_get_voltage_sel,
++	.list_voltage = regulator_list_voltage_linear,
++};
++
++static struct pm8008_chip_gate *pm8008_init_chip_gate(struct device *dev,
++						   struct regmap *regmap)
++{
++	struct i2c_client *client = i2c_verify_client(dev->parent);
++	struct pm8008_chip_gate *gate;
++	unsigned int val;
++	int i, ret;
++
++	if (!client)
++		return ERR_PTR(-ENODEV);
++	/* Keep the existing IRQ-capable configuration's regulator path intact. */
++	if (client->irq)
++		return NULL;
++	gate = devm_kzalloc(dev, sizeof(*gate), GFP_KERNEL);
++	if (!gate)
++		return ERR_PTR(-ENOMEM);
++	gate->regmap = dev_get_regmap(dev->parent, "primary");
++	if (!gate->regmap)
++		return ERR_PTR(-EINVAL);
++	ret = regmap_read(gate->regmap, 0x0104, &val);
++	if (ret)
++		return ERR_PTR(ret);
++	if (val != 0x51)
++		return ERR_PTR(-ENODEV);
++	ret = regmap_read(gate->regmap, 0x0105, &val);
++	if (ret)
++		return ERR_PTR(ret);
++	if (val != 0x2c)
++		return ERR_PTR(-ENODEV);
++	mutex_init(&gate->lock);
++	for (i = 0; i < ARRAY_SIZE(pm8008_reg_data); i++) {
++		ret = regmap_read(regmap, pm8008_reg_data[i].base + LDO_ENABLE_REG,
++				  &val);
++		if (ret)
++			return ERR_PTR(ret);
++		if (val & ENABLE_BIT)
++			gate->enabled |= BIT(i);
++	}
++
++	return gate;
++}
++
+ static int pm8008_regulator_probe(struct platform_device *pdev)
+ {
+ 	const struct pm8008_regulator_data *data;
+ 	struct regulator_config config = {};
+ 	struct device *dev = &pdev->dev;
+ 	struct pm8008_regulator *preg;
++	struct pm8008_chip_gate *gate;
+ 	struct regulator_desc *desc;
+ 	struct regulator_dev *rdev;
+ 	struct regmap *regmap;
+@@ -124,6 +301,10 @@
+ 	if (!regmap)
+ 		return -EINVAL;
+ 
++	gate = pm8008_init_chip_gate(dev, regmap);
++	if (IS_ERR(gate))
++		return PTR_ERR(gate);
++
+ 	for (i = 0; i < ARRAY_SIZE(pm8008_reg_data); i++) {
+ 		data = &pm8008_reg_data[i];
+ 
+@@ -132,6 +313,8 @@
+ 			return -ENOMEM;
+ 
+ 		preg->regmap = regmap;
++		preg->gate = gate;
++		preg->mask = BIT(i);
+ 		preg->base = data->base;
+ 
+ 		desc = &preg->desc;
+@@ -140,7 +323,7 @@
+ 		desc->supply_name = data->supply_name;
+ 		desc->of_match = data->name;
+ 		desc->regulators_node = of_match_ptr("regulators");
+-		desc->ops = &pm8008_regulator_ops;
++		desc->ops = gate ? &pm8008_regulator_only_ops : &pm8008_regulator_ops;
+ 		desc->type = REGULATOR_VOLTAGE;
+ 		desc->owner = THIS_MODULE;
+ 

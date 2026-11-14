@@ -1,0 +1,30 @@
+From: Unicorn maintainers
+Subject: [PATCH] Fit the control queue within unprivileged Linux defaults
+
+The service runs without CAP_SYS_RESOURCE in a private IPC namespace. Its
+fresh msg_max limit is 10; asking for 20 messages fails with EINVAL even
+when POSIX_MQUEUE is enabled. This queue carries control commands, not file
+payloads. Keep its capacity within the namespace default and treat ENOENT
+as an expected result when probing whether a responder is already running.
+
+--- a/src/msgqueue.c
++++ b/src/msgqueue.c
+@@ -62,7 +62,7 @@
+ 
+ static struct mq_attr qattrs = {
+   0,  // flags
+-  20, // max number of messages on the queue
++  10, // unprivileged Linux IPC namespace default (fs.mqueue.msg_max)
+   MAX_MSG_SIZE,
+   0   // number of messages currently on the queue
+ };
+@@ -263,7 +263,8 @@ mqd_t get_message_queue(int create) {
+ 	mqd_t qid = mq_open(MQ_PATH, flags, 0600, &qattrs);
+ 	if (qid < 0)
+ 	{
+-		PRINT_ERROR("%s : mq_open error %d (%s)", __func__, errno, strerror(errno));
++		if (create || errno != ENOENT)
++			PRINT_ERROR("%s : mq_open error %d (%s)", __func__, errno, strerror(errno));
+ 	}
+ 	else
+ 	{

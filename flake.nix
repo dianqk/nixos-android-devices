@@ -1,5 +1,5 @@
 {
-  description = "NixOS on Android devices: Asphalt, Polaris, Sheng, Aurora, Clover, Marble, T880 and Dodge";
+  description = "NixOS on Android devices: Asphalt, Polaris, Sheng, Aurora, Clover, Marble, T880, Dodge and Unicorn";
 
   inputs.nixpkgs.url = "https://channels.nixos.org/nixos-unstable/nixexprs.tar.zst";
 
@@ -25,6 +25,8 @@
             config.allowUnfreePredicate =
               package:
               builtins.elem (nixpkgsLib.getName package) [
+                "unicorn-firmware"
+                "unicorn-firmware-zstd"
                 "dodge-firmware"
                 "dodge-firmware-zstd"
                 "aurora-firmware"
@@ -50,6 +52,8 @@
             nixosSystem {
               modules = [ deviceModules.${device} ] ++ modules;
             };
+          unicornSystem = make "unicorn" [ ./examples/unicorn/system.nix ];
+          unicornRecovery = make "unicorn" [ ./examples/unicorn/recovery.nix ];
           polarisSystem = make "polaris" [ ./examples/polaris/system.nix ];
           polarisRecovery = make "polaris" [ ./examples/polaris/recovery.nix ];
           asphaltSystem = make "asphalt" [ ./examples/asphalt/system.nix ];
@@ -77,6 +81,18 @@
           devices.dodge.firmware = devicePackages.devices.dodge.firmware;
           devices.dodge.boot-firmware = devicePackages.mkUBoot { device = "dodge"; };
           devices.dodge.recovery = dodgeRecovery.config.system.build.mobileRecoveryFit;
+          devices.unicorn.system = unicornSystem.config.system.build.toplevel;
+          devices.unicorn.boot = unicornSystem.config.system.build.mobileBootImage;
+          devices.unicorn.u-boot = devicePackages.mkUBoot { device = "unicorn"; };
+          devices.unicorn.boot-files = unicornSystem.config.system.build.mobileBootFiles;
+          devices.unicorn.bootstrap-info = buildPackages.closureInfo {
+            rootPaths = [ unicornSystem.config.system.build.toplevel ];
+          };
+          devices.unicorn.recovery = unicornRecovery.config.system.build.mobileBootImage;
+          devices.unicorn.kernel = devicePackages.devices.unicorn.kernel;
+          devices.unicorn.mipps-auth = devicePackages.devices.unicorn.mipps-auth;
+          devices.unicorn.firmware = devicePackages.devices.unicorn.firmware;
+          devices.unicorn.boot-kernel = unicornSystem.config.system.build.mobileDirectBootImage;
           devices.aurora.system = auroraSystem.config.system.build.toplevel;
           devices.aurora.boot = auroraSystem.config.system.build.mobileBootImage;
           devices.aurora.boot-files = auroraSystem.config.system.build.mobileBootFiles;
@@ -238,6 +254,72 @@
           boot-actions = evaluation "android-boot-actions" ./tests/boot-actions.nix;
           usb-signaller = evaluation "android-usb-signaller" ./tests/usb-signaller.nix;
           usb-signaller-role = evaluation "android-usb-signaller-role" ./tests/usb-signaller-role-config.nix;
+          unicorn-usb-kernel = import ./tests/unicorn-usb-kernel.nix { flake = self; };
+          usb-modes = pkgs.writeText "android-usb-modes.json" (
+            builtins.unsafeDiscardStringContext (
+              builtins.toJSON (import ./tests/usb-modes.nix { flake = self; })
+            )
+          );
+          usb-gadgets =
+            pkgs.runCommand "usb-gadgets-tests"
+              {
+                nativeBuildInputs = [
+                  pkgs.python3
+                  pkgs.dosfstools
+                ];
+              }
+              ''
+                export PYTHONDONTWRITEBYTECODE=1
+                mkdir -p tests pkgs/mobile/usb-gadgets
+                cp ${./tests/usb-gadgets.py} tests/usb-gadgets.py
+                cp ${./pkgs/mobile/usb-gadgets}/*.py pkgs/mobile/usb-gadgets/
+                python3 tests/usb-gadgets.py
+                touch "$out"
+              '';
+          usb-gadgets-vm = import ./tests/usb-gadgets-vm.nix { flake = self; };
+          # Run state-machine unit tests natively on the workstation; usb-tools
+          # separately verifies the cross-compiled ARM64 daemon/responder.
+          usb-manager = (
+            (deviceLib.mkBuildEnvironment { buildSystem = "x86_64-linux"; }).buildPackages.callPackage
+              ./pkgs/usb-signaller/default.nix
+              { withExtendedModes = true; }
+          );
+          umtp-mqueue =
+            ((deviceLib.mkBuildEnvironment { buildSystem = "x86_64-linux"; }).buildPackages.callPackage
+              ./pkgs/mobile/umtp-responder.nix
+              { }
+            ).overrideAttrs
+              { doCheck = true; };
+          usb-tethering = pkgs.runCommand "usb-tethering-tests" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+            mkdir -p tests modules/mobile
+            cp ${./tests/usb-tethering.py} tests/usb-tethering.py
+            cp ${./modules/mobile/usb-tethering.py} modules/mobile/usb-tethering.py
+            python3 tests/usb-tethering.py
+            touch "$out"
+          '';
+          usb-serial-lifecycle = import ./tests/usb-serial-lifecycle.nix {
+            flake = self;
+            inherit pkgs buildSystem;
+          };
+          unicorn = evaluation "android-unicorn" ./tests/unicorn.nix;
+          unicorn-charging = import ./tests/unicorn-charging.nix {
+            flake = self;
+            inherit pkgs buildSystem;
+          };
+          unicorn-display-lifecycle = import ./tests/unicorn-display-lifecycle.nix {
+            flake = self;
+            inherit pkgs buildSystem;
+          };
+          unicorn-hardware-keys =
+            pkgs.runCommand "unicorn-hardware-keys-tests" { nativeBuildInputs = [ pkgs.python3 ]; }
+              ''
+                export PYTHONDONTWRITEBYTECODE=1
+                mkdir -p tests pkgs/unicorn
+                cp ${./tests/unicorn-hardware-keys.py} tests/unicorn-hardware-keys.py
+                cp ${./pkgs/unicorn/hardware-keys.py} pkgs/unicorn/hardware-keys.py
+                python3 tests/unicorn-hardware-keys.py
+                touch "$out"
+              '';
           recovery-host-key = evaluation "android-recovery-host-key" ./tests/recovery-host-key.nix;
           recovery-artifact = evaluation "android-recovery-artifact" ./tests/recovery-artifact.nix;
           package-scope = evaluation "android-package-scope" ./tests/package-scope.nix;

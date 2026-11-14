@@ -98,6 +98,10 @@ pkgs.lib.makeScope packaging.newScope (
     sensor-rotate = self.callPackage ./mobile/sensor-rotate { };
     audio-orientation = self.callPackage ./mobile/audio-orientation { };
     umtp-responder = compile ./mobile/umtp-responder.nix { };
+    uvc-gadget = compile ./mobile/uvc-gadget.nix { inherit (self) libcamera; };
+    usb-gadgets = self.callPackage ./mobile/usb-gadgets {
+      inherit (packaging.pkgsBuildBuild) makeWrapper;
+    };
     # Upstream handles dlopen SONAME alternatives; use the unmodified host tool.
     inherit (packaging.buildPackages) makeInitrdNGTool;
 
@@ -122,6 +126,22 @@ pkgs.lib.makeScope packaging.newScope (
     modemmanager-mtk-soc = pkgs.callPackage ./modemmanager/mtk-soc.nix { };
 
     devices = {
+      unicorn = pkgs.lib.makeScope self.newScope (device: {
+        kernel = self.mkKernel { device = "unicorn"; };
+        mipps-auth = device.callPackage ./unicorn/mipps-auth.nix { };
+        audio-topology = device.callPackage ./unicorn/audio {
+          inherit (packaging.buildPackages) m4;
+          alsa-utils = packaging.buildPackages.alsa-utils.override { withPipewireLib = false; };
+        };
+        audio-ucm = device.callPackage ./unicorn/audio-normal { };
+        firmware-source = device.callPackage ./unicorn/firmware-source.nix { };
+        firmware = device.callPackage ./unicorn/firmware.nix {
+          inherit (packaging.buildPackages) python3;
+        };
+        initrd-firmware = device.callPackage ./unicorn/initrd-firmware.nix {
+          unicorn-firmware = device.firmware;
+        };
+      });
       dodge = pkgs.lib.makeScope self.newScope (device: {
         kernel = self.mkKernel { device = "dodge"; };
         firmware-source = device.callPackage ./dodge/firmware-source.nix { };

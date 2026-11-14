@@ -1,0 +1,46 @@
+Subject: [PATCH] iio: adc: qcom: check ADC7 conversion completion
+
+Reject incomplete conversions and allow the ADC7 arbiter timeout interval
+before reporting a timeout.
+
+diff --git a/drivers/iio/adc/qcom-spmi-adc5.c b/drivers/iio/adc/qcom-spmi-adc5.c
+--- a/drivers/iio/adc/qcom-spmi-adc5.c
++++ b/drivers/iio/adc/qcom-spmi-adc5.c
+@@ -86,7 +86,8 @@
+ /* For PMIC7 */
+ #define ADC_APP_SID				0x40
+ #define ADC_APP_SID_MASK			GENMASK(3, 0)
+-#define ADC7_CONV_TIMEOUT			msecs_to_jiffies(10)
++/* Allow the PMIC7 arbiter's 500 ms worst-case conversion timeout. */
++#define ADC7_CONV_TIMEOUT			msecs_to_jiffies(501)
+ 
+ enum adc5_cal_method {
+ 	ADC5_NO_CAL = 0,
+@@ -368,14 +369,25 @@
+ 	}
+ 
+ 	/* No support for polling mode at present */
+-	wait_for_completion_timeout(&adc->complete, ADC7_CONV_TIMEOUT);
++	if (!wait_for_completion_timeout(&adc->complete, ADC7_CONV_TIMEOUT)) {
++		dev_err_ratelimited(adc->dev, "ADC conversion timed out\n");
++		ret = -ETIMEDOUT;
++		goto unlock;
++	}
+ 
+ 	ret = adc5_read(adc, ADC5_USR_STATUS1, &status, 1);
+ 	if (ret)
+ 		goto unlock;
+ 
+ 	if (status & ADC5_USR_STATUS1_CONV_FAULT) {
+-		dev_err(adc->dev, "Unexpected conversion fault\n");
++		dev_err_ratelimited(adc->dev, "Unexpected conversion fault\n");
++		ret = -EIO;
++		goto unlock;
++	}
++
++	if (!(status & ADC5_USR_STATUS1_EOC)) {
++		dev_err_ratelimited(adc->dev, "EOC bit not set, status=%#x\n",
++				    status);
+ 		ret = -EIO;
+ 		goto unlock;
+ 	}

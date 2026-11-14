@@ -1,0 +1,876 @@
+Subject: [PATCH] ASoC: cs35l41: support Unicorn speakers with protection
+
+Load paired firmware and coefficients, validate device calibration and
+DSP readiness, and configure the speaker transport and Class H controls.
+Keep Main AMP disabled on protection failures and roll back failed power-up.
+
+diff --git a/sound/soc/codecs/cs35l41.c b/sound/soc/codecs/cs35l41.c
+--- a/sound/soc/codecs/cs35l41.c
++++ b/sound/soc/codecs/cs35l41.c
+@@ -10,12 +10,15 @@
+ #include <acpi/acpi_bus.h>
+ #include <linux/delay.h>
+ #include <linux/err.h>
++#include <linux/firmware.h>
+ #include <linux/init.h>
++#include <linux/iopoll.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/moduleparam.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/property.h>
++#include <linux/unaligned.h>
+ #include <sound/initval.h>
+ #include <sound/pcm.h>
+ #include <sound/pcm_params.h>
+@@ -210,24 +213,324 @@
+ 	}
+ }
+ 
++static int cs35l41_unicorn_check_protection_locked(struct cs35l41_private *cs35l41);
++
++/* Read the command from memory: its flags=3 coefficient read is cache-only. */
++static int cs35l41_unicorn_music_snapshot(struct cs35l41_private *cs35l41,
++					struct cs_dsp_coeff_ctl **controls,
++					unsigned int sample, u32 *state)
++{
++	struct cs_dsp *core = &cs35l41->dsp.cs_dsp;
++	u32 command, values[3];
++	__be32 value;
++	int i, ret;
++
++	lockdep_assert_held(&core->pwr_lock);
++	ret = cs_dsp_read_data_word(core, WMFW_ADSP2_XM,
++				    controls[1]->alg_region.base + controls[1]->offset,
++				    &command);
++	if (ret)
++		return ret;
++	for (i = 0; i < ARRAY_SIZE(values); i++) {
++		/* Exact readable+volatile descriptors were checked under this lock. */
++		ret = cs_dsp_coeff_read_ctrl(controls[i + 2], 0, &value, sizeof(value));
++		if (ret)
++			return ret;
++		values[i] = be32_to_cpu(value) & 0x00ffffff;
++	}
++	dev_info(cs35l41->dev,
++		 "Unicorn Music observation %u: command=%u state=%u errno=%u updt=%u\n",
++		 sample, command, values[0], values[1], values[2]);
++	*state = values[0];
++	/* Nonzero errno is rejected conservatively; no UPDT acknowledgement ABI is known. */
++	if (values[0] == 1 || values[1])
++		return -EIO;
++	return 0;
++}
++
++static int cs35l41_unicorn_music_controls(struct cs_dsp *core,
++					 struct cs_dsp_coeff_ctl **controls)
++{
++	static const struct {
++		const char *name;
++		unsigned int mem, offset, len, flags;
++	} specs[] = {
++		{ "CSPL_UPDATE_PARAMS_CONFIG", WMFW_ADSP2_YM, 0, 400, 3 },
++		{ "CSPL_COMMAND", WMFW_ADSP2_XM, 1, 4, 3 },
++		{ "CSPL_STATE", WMFW_ADSP2_XM, 2, 4, 5 },
++		{ "CSPL_ERRORNO", WMFW_ADSP2_XM, 3, 4, 5 },
++		{ "UPDT_PRMS", WMFW_ADSP2_XM, 5, 4, 5 },
++	};
++	unsigned int limit, i;
++
++	lockdep_assert_held(&core->pwr_lock);
++	for (i = 0; i < ARRAY_SIZE(specs); i++) {
++		struct cs_dsp_coeff_ctl *ctl;
++
++		ctl = cs_dsp_get_ctl(core, specs[i].name, specs[i].mem, 0xcd);
++		controls[i] = ctl;
++		if (!ctl || ctl->dsp != core || !ctl->enabled || !ctl->cache ||
++		    ctl->fw_name != core->fw_name || !ctl->subname ||
++		    ctl->subname_len != strlen(specs[i].name) ||
++		    memcmp(ctl->subname, specs[i].name, ctl->subname_len) ||
++		    ctl->alg_region.alg != 0xcd ||
++		    ctl->alg_region.type != specs[i].mem || ctl->offset != specs[i].offset ||
++		    ctl->type != WMFW_CTL_TYPE_BYTES || ctl->flags != specs[i].flags ||
++		    ctl->len != specs[i].len) {
++			return -EINVAL;
++		}
++		/* Keep raw reads within the real volatile, unpacked24 memory windows. */
++		if (specs[i].mem == WMFW_ADSP2_YM)
++			limit = (CS35L41_DSP1_YMEM_UNPACK24_2045 -
++				 CS35L41_DSP1_YMEM_UNPACK24_0) / sizeof(u32) + 1;
++		else
++			limit = (CS35L41_DSP1_XMEM_UNPACK24_4093 -
++				 CS35L41_DSP1_XMEM_UNPACK24_0) / sizeof(u32) + 1;
++		if (ctl->alg_region.base >= limit ||
++		    ctl->offset >= limit - ctl->alg_region.base ||
++		    ctl->len / sizeof(u32) > limit - ctl->alg_region.base - ctl->offset) {
++			return -EINVAL;
++		}
++	}
++	return 0;
++}
++
++static int cs35l41_unicorn_halo_controls(struct cs_dsp *core,
++					struct cs_dsp_coeff_ctl **controls)
++{
++	static const char * const names[] = { "HALO_STATE", "HALO_HEARTBEAT" };
++	unsigned int limit = (CS35L41_DSP1_XMEM_UNPACK24_4093 -
++			      CS35L41_DSP1_XMEM_UNPACK24_0) / sizeof(u32) + 1;
++	unsigned int i;
++
++	lockdep_assert_held(&core->pwr_lock);
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		struct cs_dsp_coeff_ctl *ctl;
++
++		ctl = cs_dsp_get_ctl(core, names[i], WMFW_ADSP2_XM, 0x400a4);
++		controls[i] = ctl;
++		if (!ctl || ctl->dsp != core || !ctl->enabled || !ctl->cache ||
++		    ctl->fw_name != core->fw_name || !ctl->subname ||
++		    ctl->subname_len != strlen(names[i]) ||
++		    memcmp(ctl->subname, names[i], ctl->subname_len) ||
++		    ctl->alg_region.alg != 0x400a4 || ctl->alg_region.type != WMFW_ADSP2_XM ||
++		    ctl->offset != i || ctl->len != sizeof(__be32) ||
++		    ctl->type != WMFW_CTL_TYPE_BYTES ||
++		    ctl->flags != (WMFW_CTL_FLAG_READABLE | WMFW_CTL_FLAG_VOLATILE))
++			return -EINVAL;
++		if (ctl->alg_region.base >= limit || ctl->offset >= limit - ctl->alg_region.base)
++			return -EINVAL;
++	}
++	return 0;
++}
++
++static int cs35l41_unicorn_halo_ready(struct cs35l41_private *cs35l41,
++				     struct cs_dsp_coeff_ctl *ctl)
++{
++	__be32 state = 0;
++	int ret, read_ret;
++
++	lockdep_assert_held(&cs35l41->dsp.cs_dsp.pwr_lock);
++	/* Same-chip HDA startup waits for HALO RUN2 at 1ms/15ms. */
++	ret = read_poll_timeout(cs_dsp_coeff_read_ctrl, read_ret,
++			       read_ret || be32_to_cpu(state) == 2,
++			       1000, 15000, false, ctl, 0, &state, sizeof(state));
++	if (read_ret)
++		ret = read_ret;
++	dev_info(cs35l41->dev, "Unicorn HALO readiness: valid=%u state=%u error=%d\n",
++		 !read_ret, be32_to_cpu(state), ret);
++	return ret;
++}
++
++static int cs35l41_unicorn_core_snapshot(struct cs35l41_private *cs35l41,
++					struct cs_dsp_coeff_ctl **controls, bool after)
++{
++	static const unsigned int regs[] = {
++		CS35L41_DSP1_CCM_CORE_CTRL, CS35L41_DSP_MBOX_2, CS35L41_PWR_CTRL2,
++		CS35L41_PLL_CLK_CTRL, CS35L41_GLOBAL_CLK_CTRL, CS35L41_SP_ENABLES,
++	};
++	unsigned int values[ARRAY_SIZE(regs)], i;
++	__be32 halo[2];
++	int ret;
++
++	lockdep_assert_held(&cs35l41->dsp.cs_dsp.pwr_lock);
++	for (i = 0; i < ARRAY_SIZE(regs); i++) {
++		ret = regmap_read_bypassed(cs35l41->regmap, regs[i], &values[i]);
++		if (ret)
++			return ret;
++	}
++	for (i = 0; i < ARRAY_SIZE(halo); i++) {
++		ret = cs_dsp_coeff_read_ctrl(controls[i], 0, &halo[i], sizeof(halo[i]));
++		if (ret)
++			return ret;
++	}
++	dev_info(cs35l41->dev,
++		 "Unicorn core %s Music: ctrl=%#x mbox=%#x pwr2=%#x pll=%#x clk=%#x asp=%#x halo=%u heartbeat=%u\n",
++		 after ? "after" : "before", values[0], values[1], values[2], values[3],
++		 values[4], values[5], be32_to_cpu(halo[0]), be32_to_cpu(halo[1]));
++	if (values[2] & CS35L41_AMP_EN_MASK)
++		return -EBUSY;
++	if (after && be32_to_cpu(halo[0]) != 2)
++		return -EPIPE;
++	/* Other fields are observations, not invented HALT or acknowledgement bits. */
++	return 0;
++}
++
++/* MainAMP-Off observation only. This does not authorize an output endpoint. */
++static int cs35l41_unicorn_music(struct cs35l41_private *cs35l41)
++{
++	struct wm_adsp *dsp = &cs35l41->dsp;
++	struct cs_dsp *core = &dsp->cs_dsp;
++	struct cs_dsp_coeff_ctl *controls[5], *halo_controls[2];
++	const struct firmware *fw;
++	const char *file, *prefix;
++	__be32 readback[75], command = cpu_to_be32(8);
++	unsigned int words, amp, i;
++	u32 state;
++	int ret;
++
++	if (!dsp->system_name || strcmp(dsp->system_name, "xiaomi-unicorn"))
++		return 0;
++	if (!dsp->component || !dsp->component->name_prefix)
++		return -EINVAL;
++	prefix = dsp->component->name_prefix;
++	if (!strcmp(prefix, "T")) {
++		file = "cirrus/cs35l41-xiaomi-unicorn-t-music.be32";
++		words = 75;
++	} else if (!strcmp(prefix, "B")) {
++		file = "cirrus/cs35l41-xiaomi-unicorn-b-music.be32";
++		words = 16;
++	} else {
++		return -EINVAL;
++	}
++	ret = request_firmware_direct(&fw, file, core->dev);
++	if (ret)
++		return ret;
++	/* BE32 word0 includes itself in the exact per-amp Music prefix. */
++	if (!fw->data || fw->size != words * sizeof(__be32) ||
++	    get_unaligned_be32(fw->data) != words) {
++		ret = -EINVAL;
++		goto out_release;
++	}
++
++	mutex_lock(&core->pwr_lock);
++	if (!dsp->bin_mandatory || !dsp->fwf_exact_match || dsp->fw != 9 ||
++	    core->fw_id != 0x400a4 || core->fw_id_version != 0x2b01) {
++		ret = -EINVAL;
++		goto out_unlock;
++	}
++	if (!core->booted || !core->running || core->hibernating) {
++		ret = -EPIPE;
++		goto out_unlock;
++	}
++	/* CAL reads and Music writes must describe the same locked core lifetime. */
++	ret = cs35l41_unicorn_check_protection_locked(cs35l41);
++	if (ret)
++		goto out_unlock;
++	/* PWR_CTRL2 is cached; explicitly bypass it for this output-off check. */
++	ret = regmap_read_bypassed(cs35l41->regmap, CS35L41_PWR_CTRL2, &amp);
++	if (ret)
++		goto out_unlock;
++	if (amp & CS35L41_AMP_EN_MASK) {
++		ret = -EBUSY;
++		goto out_unlock;
++	}
++	ret = cs35l41_unicorn_halo_controls(core, halo_controls);
++	if (ret)
++		goto out_unlock;
++	ret = cs35l41_unicorn_core_snapshot(cs35l41, halo_controls, false);
++	if (ret)
++		goto out_unlock;
++	ret = cs35l41_unicorn_halo_ready(cs35l41, halo_controls[0]);
++	if (ret)
++		goto out_unlock;
++	ret = cs35l41_unicorn_music_controls(core, controls);
++	if (ret)
++		goto out_unlock;
++	controls[0]->set = 0;
++	controls[1]->set = 0;
++	ret = cs35l41_unicorn_music_snapshot(cs35l41, controls, 0, &state);
++	if (ret)
++		goto out_unlock;
++	if (state) {
++		ret = -EAGAIN;
++		goto out_unlock;
++	}
++
++	/* buf==cache forces a real write even for a repeated, identical prefix. */
++	memcpy(controls[0]->cache, fw->data, fw->size);
++	ret = cs_dsp_coeff_write_ctrl(controls[0], 0, controls[0]->cache, fw->size);
++	/* These transactions must not replay from coefficient sync before core start. */
++	controls[0]->set = 0;
++	if (ret < 0)
++		goto out_unlock;
++	ret = cs_dsp_read_raw_data_block(core, WMFW_ADSP2_YM,
++			controls[0]->alg_region.base, words, readback);
++	if (ret)
++		goto out_unlock;
++	for (i = 0; i < words; i++) {
++		/* Unpacked24 hardware reads zero-pad each signed32 input's high byte. */
++		if ((be32_to_cpu(readback[i]) & 0x00ffffff) !=
++		    (get_unaligned_be32(fw->data + i * sizeof(__be32)) & 0x00ffffff)) {
++			ret = -EIO;
++			goto out_unlock;
++		}
++	}
++	memcpy(controls[1]->cache, &command, sizeof(command));
++	ret = cs_dsp_coeff_write_ctrl(controls[1], 0, controls[1]->cache, sizeof(command));
++	controls[1]->set = 0;
++	if (ret < 0)
++		goto out_unlock;
++	/* Five bounded observations, not a fresh-ack protocol or an accepted-profile flag. */
++	for (i = 1; i <= 5; i++) {
++		ret = cs35l41_unicorn_music_snapshot(cs35l41, controls, i, &state);
++		if (ret)
++			goto out_unlock;
++		if (i < 5)
++			usleep_range(100, 200);
++	}
++	ret = state ? -ETIMEDOUT : 0;
++	if (!ret)
++		ret = cs35l41_unicorn_core_snapshot(cs35l41, halo_controls, true);
++	if (!ret)
++		dev_info(cs35l41->dev, "Unicorn %s Music prefix %u words hardware-compared; observation only\n",
++			 prefix, words);
++out_unlock:
++	mutex_unlock(&core->pwr_lock);
++out_release:
++	release_firmware(fw);
++	return ret;
++}
++
+ static int cs35l41_dsp_audio_ev(struct snd_soc_dapm_widget *w,
+ 				struct snd_kcontrol *kcontrol, int event)
+ {
+ 	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
+ 	struct cs35l41_private *cs35l41 = snd_soc_component_get_drvdata(component);
+ 	unsigned int fw_status;
++	bool unicorn = cs35l41->dsp.system_name &&
++		       !strcmp(cs35l41->dsp.system_name, "xiaomi-unicorn");
+ 	int ret;
+ 
+ 	switch (event) {
+ 	case SND_SOC_DAPM_POST_PMU:
+-		if (!cs35l41->dsp.cs_dsp.running)
+-			return wm_adsp_event(w, kcontrol, event);
++		if (!cs35l41->dsp.cs_dsp.running) {
++			ret = wm_adsp_event(w, kcontrol, event);
++			if (ret)
++				return ret;
++			ret = cs35l41_unicorn_music(cs35l41);
++			if (ret) {
++				dev_err(cs35l41->dev, "Unicorn Music transaction failed: %d\n", ret);
++				wm_adsp_stop(&cs35l41->dsp);
++			}
++			return ret;
++		}
+ 
+ 		ret = regmap_read(cs35l41->regmap, CS35L41_DSP_MBOX_2, &fw_status);
+ 		if (ret < 0) {
+ 			dev_err(cs35l41->dev,
+ 				"Failed to read firmware status: %d\n", ret);
+-			return ret;
++			goto post_error;
+ 		}
+ 
+ 		switch (fw_status) {
+@@ -237,12 +540,23 @@
+ 		default:
+ 			dev_err(cs35l41->dev, "Firmware status is invalid: %u\n",
+ 				fw_status);
+-			return -EINVAL;
++			ret = -EINVAL;
++			goto post_error;
+ 		}
+ 
+-		return cs35l41_set_cspl_mbox_cmd(cs35l41->dev, cs35l41->regmap,
+-						 CSPL_MBOX_CMD_RESUME);
++		ret = cs35l41_set_cspl_mbox_cmd(cs35l41->dev, cs35l41->regmap,
++					     CSPL_MBOX_CMD_RESUME);
++post_error:
++		/* DAPM logs event errors but continues its power sequence. */
++		if (ret && unicorn)
++			wm_adsp_stop(&cs35l41->dsp);
++		return ret;
+ 	case SND_SOC_DAPM_PRE_PMD:
++		/* A failed Unicorn transaction already stopped the core; allow unload. */
++		if (cs35l41->dsp.system_name &&
++		    !strcmp(cs35l41->dsp.system_name, "xiaomi-unicorn") &&
++		    !cs35l41->dsp.cs_dsp.running)
++			return 0;
+ 		return cs35l41_set_cspl_mbox_cmd(cs35l41->dev, cs35l41->regmap,
+ 						 CSPL_MBOX_CMD_PAUSE);
+ 	default:
+@@ -505,6 +819,61 @@
+ 	{ CS35L41_TEST_KEY_CTL, 0x00000033 },
+ };
+ 
++/* Check existing device calibration; never substitute or measure CAL_R here. */
++static int cs35l41_unicorn_check_protection_locked(struct cs35l41_private *cs35l41)
++{
++	static const char * const names[] = { "CAL_R", "CAL_STATUS", "CAL_CHECKSUM" };
++	struct wm_adsp *dsp = &cs35l41->dsp;
++	struct cs_dsp *core = &dsp->cs_dsp;
++	struct cs_dsp_coeff_ctl *controls[ARRAY_SIZE(names)];
++	__be32 values[ARRAY_SIZE(names)];
++	u32 resistance;
++	int i, ret;
++
++	lockdep_assert_held(&core->pwr_lock);
++	if (!dsp->system_name || strcmp(dsp->system_name, "xiaomi-unicorn"))
++		return -EPERM;
++	if (!dsp->bin_mandatory || !dsp->fwf_exact_match || dsp->fw != 9)
++		return -EPERM;
++	if (!core->running || core->hibernating)
++		return -EPIPE;
++	if (core->fw_id != 0x400a4 || core->fw_id_version != 0x2b01)
++		return -EINVAL;
++
++	/* Flags=0 reads hardware only while enabled, running and awake. */
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		controls[i] = cs_dsp_get_ctl(core, names[i], WMFW_ADSP2_XM, 0xcd);
++		if (!controls[i] || !controls[i]->enabled || controls[i]->flags ||
++		    controls[i]->len != sizeof(__be32) || controls[i]->type != WMFW_CTL_TYPE_BYTES)
++			return -EINVAL;
++	}
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		ret = cs_dsp_coeff_read_ctrl(controls[i], 0, &values[i], sizeof(values[i]));
++		if (ret)
++			return ret;
++	}
++
++	resistance = be32_to_cpu(values[0]);
++	if (resistance < 8000 || resistance > 12000 || be32_to_cpu(values[1]) != 1 ||
++	    be32_to_cpu(values[2]) != resistance + 1) {
++		dev_err(cs35l41->dev, "Unicorn speaker calibration is not ready\n");
++		return -ENODATA;
++	}
++
++	return 0;
++}
++
++static int cs35l41_unicorn_check_protection(struct cs35l41_private *cs35l41)
++{
++	struct wm_adsp *dsp = &cs35l41->dsp;
++
++	if (!dsp->system_name || strcmp(dsp->system_name, "xiaomi-unicorn"))
++		return 0;
++	/* read_ctl would relock this mutex. Keep the original Main AMP checks. */
++	guard(mutex)(&dsp->cs_dsp.pwr_lock);
++	return cs35l41_unicorn_check_protection_locked(cs35l41);
++}
++
+ static int cs35l41_main_amp_event(struct snd_soc_dapm_widget *w,
+ 				  struct snd_kcontrol *kcontrol, int event)
+ {
+@@ -514,6 +883,10 @@
+ 
+ 	switch (event) {
+ 	case SND_SOC_DAPM_PRE_PMU:
++		ret = cs35l41_unicorn_check_protection(cs35l41);
++		if (ret)
++			return ret;
++
+ 		regmap_multi_reg_write_bypassed(cs35l41->regmap,
+ 						cs35l41_pup_patch,
+ 						ARRAY_SIZE(cs35l41_pup_patch));
+@@ -535,6 +908,131 @@
+ 	}
+ 
+ 	return ret;
++}
++
++static int cs35l41_unicorn_amp_readback_locked(struct cs35l41_private *cs35l41,
++					    bool enable, int first_error)
++{
++	unsigned int amp = 0, global = 0;
++	int amp_ret, global_ret, ret;
++
++	lockdep_assert_held(&cs35l41->dsp.cs_dsp.pwr_lock);
++	amp_ret = regmap_read_bypassed(cs35l41->regmap, CS35L41_PWR_CTRL2, &amp);
++	global_ret = regmap_read_bypassed(cs35l41->regmap, CS35L41_PWR_CTRL1, &global);
++	ret = amp_ret ? amp_ret : global_ret;
++	if (!ret && (!!(amp & CS35L41_AMP_EN_MASK) != enable ||
++		     !!(global & CS35L41_GLOBAL_EN_MASK) != enable))
++		ret = -EIO;
++	if (!first_error)
++		first_error = ret;
++	dev_info(cs35l41->dev,
++		 "Unicorn AMP %s: pwr2=%#x pwr1=%#x readerr=%d/%d result=%d\n",
++		 enable ? "on" : "off", amp, global, amp_ret, global_ret, first_error);
++	return first_error;
++}
++
++/* Caller holds pwr_lock; only Unicorn's verified internal-boost path uses this. */
++static int cs35l41_unicorn_amp_off_locked(struct cs35l41_private *cs35l41)
++{
++	int ret, err;
++
++	lockdep_assert_held(&cs35l41->dsp.cs_dsp.pwr_lock);
++	/* Force the clear onto the bus even after a failed write updated regcache. */
++	ret = regmap_write_bits(cs35l41->regmap, CS35L41_PWR_CTRL2, CS35L41_AMP_EN_MASK, 0);
++	if (ret)
++		dev_err(cs35l41->dev, "Unicorn AMP disable failed: %d\n", ret);
++	err = cs35l41_global_enable(cs35l41->dev, cs35l41->regmap,
++				    cs35l41->hw_cfg.bst_type, 0, &cs35l41->dsp.cs_dsp);
++	if (err) {
++		dev_err(cs35l41->dev, "Unicorn global disable failed: %d\n", err);
++		if (!ret)
++			ret = err;
++	}
++	err = regmap_multi_reg_write_bypassed(cs35l41->regmap, cs35l41_pdn_patch,
++					     ARRAY_SIZE(cs35l41_pdn_patch));
++	if (err) {
++		dev_err(cs35l41->dev, "Unicorn power-down patch failed: %d\n", err);
++		if (!ret)
++			ret = err;
++	}
++	return cs35l41_unicorn_amp_readback_locked(cs35l41, false, ret);
++}
++
++static int cs35l41_unicorn_main_amp_event(struct snd_soc_dapm_widget *w,
++					struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
++	struct cs35l41_private *cs35l41 = snd_soc_component_get_drvdata(component);
++	struct cs_dsp *core = &cs35l41->dsp.cs_dsp;
++	int ret, err;
++
++	if (cs35l41->hw_cfg.bst_type != CS35L41_INT_BOOST)
++		return -EINVAL;
++
++	mutex_lock(&core->pwr_lock);
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		ret = cs35l41_unicorn_check_protection_locked(cs35l41);
++		if (ret)
++			goto rollback;
++		ret = regmap_multi_reg_write_bypassed(cs35l41->regmap, cs35l41_pup_patch,
++						     ARRAY_SIZE(cs35l41_pup_patch));
++		if (ret)
++			goto rollback;
++		ret = cs35l41_global_enable(cs35l41->dev, cs35l41->regmap,
++					    cs35l41->hw_cfg.bst_type, 1, core);
++		if (ret)
++			goto rollback;
++		ret = regmap_write_bits(cs35l41->regmap, CS35L41_PWR_CTRL2,
++					CS35L41_AMP_EN_MASK, CS35L41_AMP_EN_MASK);
++		if (ret)
++			goto rollback;
++		ret = cs35l41_unicorn_amp_readback_locked(cs35l41, true, 0);
++		if (ret)
++			goto rollback;
++		break;
++	case SND_SOC_DAPM_POST_PMD:
++		ret = cs35l41_unicorn_amp_off_locked(cs35l41);
++		break;
++	default:
++		ret = -EINVAL;
++		goto rollback;
++	}
++	goto out;
++
++rollback:
++	err = cs35l41_unicorn_amp_off_locked(cs35l41);
++	if (err)
++		dev_err(cs35l41->dev, "Unicorn AMP rollback failed: %d (trigger %d)\n", err, ret);
++out:
++	mutex_unlock(&core->pwr_lock);
++	/* Stop takes pwr_lock itself. Never call it within the transaction lock. */
++	if (ret && core->running)
++		wm_adsp_stop(&cs35l41->dsp);
++	return ret;
++}
++
++static const struct snd_soc_dapm_widget cs35l41_main_amp_widget =
++	SND_SOC_DAPM_OUT_DRV_E("Main AMP", CS35L41_PWR_CTRL2, 0, 0, NULL, 0,
++			       cs35l41_main_amp_event,
++			       SND_SOC_DAPM_POST_PMD | SND_SOC_DAPM_PRE_PMU);
++
++static int cs35l41_add_main_amp_widget(struct snd_soc_component *component)
++{
++	struct cs35l41_private *cs35l41 = snd_soc_component_get_drvdata(component);
++	struct snd_soc_dapm_widget widget = cs35l41_main_amp_widget;
++
++	if (cs35l41->dsp.system_name &&
++	    !strcmp(cs35l41->dsp.system_name, "xiaomi-unicorn")) {
++		if (cs35l41->hw_cfg.bst_type != CS35L41_INT_BOOST)
++			return -EINVAL;
++		/* No DAPM register write may bypass a rejected event. */
++		widget.reg = SND_SOC_NOPM;
++		widget.event = cs35l41_unicorn_main_amp_event;
++		/* Run after DSP1 on power-up, before DSP1 on power-down. */
++		widget.subseq = 1;
++	}
++	return snd_soc_dapm_new_controls(snd_soc_component_to_dapm(component), &widget, 1);
+ }
+ 
+ static const struct snd_soc_dapm_widget cs35l41_dapm_widgets[] = {
+@@ -574,10 +1072,6 @@
+ 	SND_SOC_DAPM_ADC("TEMPMON ADC", NULL, SND_SOC_NOPM, 0, 0),
+ 
+ 	SND_SOC_DAPM_ADC("CLASS H", NULL, CS35L41_PWR_CTRL3, 4, 0),
+-
+-	SND_SOC_DAPM_OUT_DRV_E("Main AMP", CS35L41_PWR_CTRL2, 0, 0, NULL, 0,
+-			       cs35l41_main_amp_event,
+-			       SND_SOC_DAPM_POST_PMD |	SND_SOC_DAPM_PRE_PMU),
+ 
+ 	SND_SOC_DAPM_MUX("ASP TX1 Source", SND_SOC_NOPM, 0, 0, &asp_tx1_mux),
+ 	SND_SOC_DAPM_MUX("ASP TX2 Source", SND_SOC_NOPM, 0, 0, &asp_tx2_mux),
+@@ -681,6 +1175,44 @@
+ 	return cs35l41_set_channels(cs35l41->dev, cs35l41->regmap, tx_n, tx_slot, rx_n, rx_slot);
+ }
+ 
++static int cs35l41_xlate_tdm_slot_mask(unsigned int slots,
++				       unsigned int *tx_mask, unsigned int *rx_mask)
++{
++	/* Channel placement is configured separately by set_channel_map. */
++	if (*tx_mask || *rx_mask)
++		return -EOPNOTSUPP;
++
++	/* Keep zero masks so ASoC does not change the PCM channel count. */
++	return 0;
++}
++
++static int cs35l41_set_tdm_slot(struct snd_soc_dai *dai,
++				unsigned int tx_mask, unsigned int rx_mask,
++				int slots, int slot_width)
++{
++	struct cs35l41_private *cs35l41 = snd_soc_component_get_drvdata(dai->component);
++
++	if (!slots) {
++		cs35l41->slot_width = 0;
++		return 0;
++	}
++
++	/* ASP channel positions are six bits wide. */
++	if (slots < 0 || slots > 64 || tx_mask || rx_mask)
++		return -EINVAL;
++
++	switch (slot_width) {
++	case 0:
++	case CS35L41_ASP_WIDTH_16:
++	case CS35L41_ASP_WIDTH_24:
++	case CS35L41_ASP_WIDTH_32:
++		cs35l41->slot_width = slot_width;
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
+ static int cs35l41_set_dai_fmt(struct snd_soc_dai *dai, unsigned int fmt)
+ {
+ 	struct cs35l41_private *cs35l41 = snd_soc_component_get_drvdata(dai->component);
+@@ -758,7 +1290,7 @@
+ {
+ 	struct cs35l41_private *cs35l41 = snd_soc_component_get_drvdata(dai->component);
+ 	unsigned int rate = params_rate(params);
+-	u8 asp_wl;
++	u8 asp_width, asp_wl;
+ 	int i;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(cs35l41_fs_rates); i++) {
+@@ -772,6 +1304,9 @@
+ 	}
+ 
+ 	asp_wl = params_width(params);
++	asp_width = cs35l41->slot_width ?: asp_wl;
++	if (asp_width < asp_wl)
++		return -EINVAL;
+ 
+ 	regmap_update_bits(cs35l41->regmap, CS35L41_GLOBAL_CLK_CTRL,
+ 			   CS35L41_GLOBAL_FS_MASK,
+@@ -780,14 +1315,14 @@
+ 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+ 		regmap_update_bits(cs35l41->regmap, CS35L41_SP_FORMAT,
+ 				   CS35L41_ASP_WIDTH_RX_MASK,
+-				   asp_wl << CS35L41_ASP_WIDTH_RX_SHIFT);
++				   asp_width << CS35L41_ASP_WIDTH_RX_SHIFT);
+ 		regmap_update_bits(cs35l41->regmap, CS35L41_SP_RX_WL,
+ 				   CS35L41_ASP_RX_WL_MASK,
+ 				   asp_wl << CS35L41_ASP_RX_WL_SHIFT);
+ 	} else {
+ 		regmap_update_bits(cs35l41->regmap, CS35L41_SP_FORMAT,
+ 				   CS35L41_ASP_WIDTH_TX_MASK,
+-				   asp_wl << CS35L41_ASP_WIDTH_TX_SHIFT);
++				   asp_width << CS35L41_ASP_WIDTH_TX_SHIFT);
+ 		regmap_update_bits(cs35l41->regmap, CS35L41_SP_TX_WL,
+ 				   CS35L41_ASP_TX_WL_MASK,
+ 				   asp_wl << CS35L41_ASP_TX_WL_SHIFT);
+@@ -931,6 +1466,10 @@
+ 	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(component);
+ 	int ret;
+ 
++	ret = cs35l41_add_main_amp_widget(component);
++	if (ret)
++		return ret;
++
+ 	if (cs35l41->hw_cfg.bst_type == CS35L41_EXT_BOOST) {
+ 		ret = snd_soc_dapm_new_controls(dapm, cs35l41_ext_bst_widget,
+ 						ARRAY_SIZE(cs35l41_ext_bst_widget));
+@@ -958,6 +1497,8 @@
+ 	.hw_params = cs35l41_pcm_hw_params,
+ 	.set_sysclk = cs35l41_dai_set_sysclk,
+ 	.set_channel_map = cs35l41_set_channel_map,
++	.set_tdm_slot = cs35l41_set_tdm_slot,
++	.xlate_tdm_slot_mask = cs35l41_xlate_tdm_slot_mask,
+ };
+ 
+ #define CS35L41_RATES (		    \
+@@ -1079,6 +1620,92 @@
+ 	return 0;
+ }
+ 
++/* The original libcrussp format is two little-endian u32 values, T then B. */
++static int cs35l41_unicorn_parse_calibration(const struct firmware *fw,
++					     const char *prefix, u32 *resistance)
++{
++	u32 top, bottom;
++
++	if (!fw || fw->size != 8 || !fw->data || !prefix)
++		return -EINVAL;
++
++	top = get_unaligned_le32(fw->data);
++	bottom = get_unaligned_le32(fw->data + sizeof(u32));
++	/* Original library limits; these are validation bounds, not defaults. */
++	if (top < 8000 || top > 12000 || bottom < 8000 || bottom > 12000)
++		return -ERANGE;
++
++	if (!strcmp(prefix, "T"))
++		*resistance = top;
++	else if (!strcmp(prefix, "B"))
++		*resistance = bottom;
++	else
++		return -EINVAL;
++
++	return 0;
++}
++
++static int cs35l41_unicorn_pre_run(struct wm_adsp *dsp)
++{
++	static const char calibration_file[] = "cirrus/cs35l41-xiaomi-unicorn-calibration.bin";
++	static const char * const names[] = { "CAL_R", "CAL_STATUS", "CAL_CHECKSUM" };
++	struct cs_dsp_coeff_ctl *controls[ARRAY_SIZE(names)], *music_controls[5];
++	struct cs_dsp *core = &dsp->cs_dsp;
++	const struct firmware *fw;
++	__be32 values[ARRAY_SIZE(names)], invalid = 0;
++	u32 resistance;
++	int i, ret;
++
++	/* cs_dsp_run holds this lock; wm_adsp_write_ctl would lock it again. */
++	lockdep_assert_held(&core->pwr_lock);
++	if (!dsp->system_name || strcmp(dsp->system_name, "xiaomi-unicorn") ||
++	    !dsp->bin_mandatory || !dsp->fwf_exact_match || dsp->fw != 9)
++		return -EPERM;
++	if (!core->booted || core->running || !dsp->component)
++		return -EPIPE;
++	if (core->fw_id != 0x400a4 || core->fw_id_version != 0x2b01)
++		return -EINVAL;
++
++	/* Never replay a cached Music command/prefix during pre-start sync. */
++	ret = cs35l41_unicorn_music_controls(core, music_controls);
++	if (ret)
++		return ret;
++	music_controls[0]->set = 0;
++	music_controls[1]->set = 0;
++
++	ret = request_firmware_direct(&fw, calibration_file, core->dev);
++	if (ret)
++		return ret;
++	ret = cs35l41_unicorn_parse_calibration(fw, dsp->component->name_prefix,
++						&resistance);
++	release_firmware(fw);
++	if (ret)
++		return ret;
++
++	/* These exact firmware controls use the legacy, cached flags=0 ABI. */
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		controls[i] = cs_dsp_get_ctl(core, names[i], WMFW_ADSP2_XM, 0xcd);
++		if (!controls[i] || !controls[i]->enabled || controls[i]->flags ||
++		    controls[i]->len != sizeof(__be32) || controls[i]->type != WMFW_CTL_TYPE_BYTES)
++			return -EINVAL;
++	}
++
++	values[0] = cpu_to_be32(resistance);
++	values[1] = cpu_to_be32(1);
++	values[2] = cpu_to_be32(resistance + 1);
++	ret = cs_dsp_coeff_write_ctrl(controls[1], 0, &invalid, sizeof(invalid));
++	if (ret < 0)
++		return ret;
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		ret = cs_dsp_coeff_write_ctrl(controls[i], 0, &values[i], sizeof(values[i]));
++		if (ret < 0)
++			return ret;
++	}
++
++	/* cs_dsp_run checks coefficient sync errors before starting the core. */
++	return 0;
++}
++
+ static int cs35l41_dsp_init(struct cs35l41_private *cs35l41)
+ {
+ 	struct wm_adsp *dsp;
+@@ -1088,6 +1715,12 @@
+ 	dsp = &cs35l41->dsp;
+ 	dsp->part = "cs35l41";
+ 	dsp->fw = 9; /* 9 is WM_ADSP_FW_SPK_PROT in wm_adsp.c */
++
++	if (dsp->system_name && !strcmp(dsp->system_name, "xiaomi-unicorn")) {
++		dsp->bin_mandatory = true;
++		dsp->fwf_exact_match = true;
++		dsp->pre_run = cs35l41_unicorn_pre_run;
++	}
+ 	dsp->toggle_preload = true;
+ 
+ 	cs35l41_configure_cs_dsp(cs35l41->dev, cs35l41->regmap, &dsp->cs_dsp);
+@@ -1122,9 +1755,12 @@
+ 		dev_err(cs35l41->dev, "Write DSP1RX5_SRC: %d failed: %d\n", dsp1rx5_src, ret);
+ 		goto err_dsp;
+ 	}
+-	ret = regmap_write(cs35l41->regmap, CS35L41_DSP1_RX6_SRC, CS35L41_INPUT_SRC_VBSTMON);
++	/* Match the vendor RX6 source for Unicorn. */
++	ret = regmap_write(cs35l41->regmap, CS35L41_DSP1_RX6_SRC,
++			   dsp->system_name && !strcmp(dsp->system_name, "xiaomi-unicorn") ?
++			   CS35L41_INPUT_SRC_CLASSH : CS35L41_INPUT_SRC_VBSTMON);
+ 	if (ret < 0) {
+-		dev_err(cs35l41->dev, "Write CS35L41_INPUT_SRC_VBSTMON failed: %d\n", ret);
++		dev_err(cs35l41->dev, "Write DSP1RX6_SRC failed: %d\n", ret);
+ 		goto err_dsp;
+ 	}
+ 	ret = regmap_write(cs35l41->regmap, CS35L41_DSP1_RX7_SRC,
+@@ -1496,3 +2132,4 @@
+ MODULE_DESCRIPTION("ASoC CS35L41 driver");
+ MODULE_AUTHOR("David Rhodes, Cirrus Logic Inc, <david.rhodes@cirrus.com>");
+ MODULE_LICENSE("GPL");
++MODULE_IMPORT_NS("FW_CS_DSP");
+diff --git a/sound/soc/codecs/cs35l41.h b/sound/soc/codecs/cs35l41.h
+--- a/sound/soc/codecs/cs35l41.h
++++ b/sound/soc/codecs/cs35l41.h
+@@ -30,6 +30,7 @@
+ 	struct device *dev;
+ 	struct regmap *regmap;
+ 	struct regulator_bulk_data supplies[CS35L41_NUM_SUPPLIES];
++	unsigned int slot_width;
+ 	int irq;
+ 	/* GPIO for /RST */
+ 	struct gpio_desc *reset_gpio;
+diff --git a/sound/soc/codecs/wm_adsp.c b/sound/soc/codecs/wm_adsp.c
+--- a/sound/soc/codecs/wm_adsp.c
++++ b/sound/soc/codecs/wm_adsp.c
+@@ -804,6 +804,26 @@
+ 	if (dsp->fwf_suffix)
+ 		suffix = dsp->fwf_suffix;
+ 
++	if (dsp->fwf_exact_match) {
++		if (!system_name || !suffix) {
++			ret = -EINVAL;
++			goto err;
++		}
++		ret = wm_adsp_request_firmware_file(dsp, &fw->wmfw, cirrus_dir,
++						    system_name, suffix, "wmfw");
++		if (ret)
++			goto err;
++		ret = wm_adsp_request_firmware_file(dsp, &fw->coeff, cirrus_dir,
++						    system_name, suffix, "bin");
++		if (ret)
++			goto err;
++		if (!fw->wmfw.firmware || !fw->coeff.firmware) {
++			ret = -ENOENT;
++			goto err;
++		}
++		return 0;
++	}
++
+ 	if (system_name) {
+ 		ret = wm_adsp_request_firmware_file(dsp, &fw->wmfw,
+ 						    cirrus_dir, system_name,
+diff --git a/sound/soc/codecs/wm_adsp.h b/sound/soc/codecs/wm_adsp.h
+--- a/sound/soc/codecs/wm_adsp.h
++++ b/sound/soc/codecs/wm_adsp.h
+@@ -37,6 +37,8 @@
+ 	int fw;
+ 	bool wmfw_optional;
+ 	bool bin_mandatory;
++	/* Require system/component-specific firmware and coefficients. */
++	bool fwf_exact_match;
+ 
+ 	struct work_struct boot_work;
+ 	int (*control_add)(struct wm_adsp *dsp, struct cs_dsp_coeff_ctl *cs_ctl);

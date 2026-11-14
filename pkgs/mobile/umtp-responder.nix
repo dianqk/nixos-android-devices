@@ -17,7 +17,21 @@ stdenv.mkDerivation {
   };
 
   buildInputs = [ systemd ];
+  patches = [ ./umtp-nonroot-mqueue.patch ];
   makeFlags = [ "SYSTEMD=1" ];
+
+  # Exercise the kernel-dependent queue test in the native workstation check.
+  # A phone builder may still be running the old kernel without POSIX_MQUEUE.
+  doCheck = false;
+  checkPhase = ''
+    runHook preCheck
+    $CC -Iinc -ffunction-sections -fdata-sections -c src/msgqueue.c -o msgqueue-test.o
+    $CC -Iinc -Wl,--gc-sections ${../../tests/umtp-mqueue.c} \
+      msgqueue-test.o obj/logs_out.o -pthread -lrt -o mqueue-test
+    ./mqueue-test 2>mqueue-test.stderr
+    test ! -s mqueue-test.stderr
+    runHook postCheck
+  '';
 
   # Keep resolved children within the storage directory. Upstream's prefix-only
   # check also accepted siblings such as /share-private for a /share root.

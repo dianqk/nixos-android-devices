@@ -1,0 +1,281 @@
+Subject: [PATCH] Input: aw86927: support the Unicorn motor profile
+
+Use the 130 Hz motor profile after checking the chip ID. Stop and drain
+force-feedback work for suspend, shutdown and removal.
+
+diff --git a/Documentation/devicetree/bindings/input/awinic,aw86927.yaml b/Documentation/devicetree/bindings/input/awinic,aw86927.yaml
+--- a/Documentation/devicetree/bindings/input/awinic,aw86927.yaml
++++ b/Documentation/devicetree/bindings/input/awinic,aw86927.yaml
+@@ -16,6 +16,7 @@
+       - items:
+           - enum:
+               - awinic,aw86938
++              - xiaomi,unicorn-aw86927
+           - const: awinic,aw86927
+ 
+   reg:
+diff --git a/drivers/input/misc/aw86927.c b/drivers/input/misc/aw86927.c
+--- a/drivers/input/misc/aw86927.c
++++ b/drivers/input/misc/aw86927.c
+@@ -14,6 +14,7 @@
+ #include <linux/i2c.h>
+ #include <linux/input.h>
+ #include <linux/module.h>
++#include <linux/pm.h>
+ #include <linux/regmap.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/types.h>
+@@ -185,8 +186,16 @@
+ 	AW86938,
+ };
+ 
++struct aw86927_profile {
++	const u8 *waveform;
++	size_t waveform_size;
++	u8 boost_level;
++	bool requires_aw86927;
++};
++
+ struct aw86927_data {
+ 	enum aw86927_model model;
++	const struct aw86927_profile *profile;
+ 	struct work_struct play_work;
+ 	struct device *dev;
+ 	struct input_dev *input_dev;
+@@ -194,6 +203,7 @@
+ 	struct regmap *regmap;
+ 	struct gpio_desc *reset_gpio;
+ 	u16 level;
++	bool suspended;
+ };
+ 
+ static const struct regmap_config aw86927_regmap_config = {
+@@ -220,19 +230,48 @@
+ 	0xe1, 0xe6, 0xeb, 0xf0, 0xf5, 0xfb
+ };
+ 
++/*
++ * unicorn's vendor DT specifies a 130 Hz LRA (f0_pre = 1300, in 0.1 Hz)
++ * and boost register level 0x47. At 24 kHz, 185 samples give 129.73 Hz.
++ * One complete sine period: round(84 * sin(2 * pi * i / 185)).
++ * This is a basic rumble waveform, not the vendor's calibrated effect library.
++ */
++static const u8 aw86927_unicorn_waveform[] = {
++	0x00, 0x03, 0x06, 0x09, 0x0b, 0x0e, 0x11, 0x14, 0x17, 0x19, 0x1c, 0x1f,
++	0x21, 0x24, 0x26, 0x29, 0x2b, 0x2e, 0x30, 0x33, 0x35, 0x37, 0x39, 0x3b,
++	0x3d, 0x3f, 0x41, 0x43, 0x44, 0x46, 0x48, 0x49, 0x4a, 0x4c, 0x4d, 0x4e,
++	0x4f, 0x50, 0x51, 0x51, 0x52, 0x53, 0x53, 0x53, 0x54, 0x54, 0x54, 0x54,
++	0x54, 0x54, 0x53, 0x53, 0x52, 0x52, 0x51, 0x50, 0x4f, 0x4e, 0x4d, 0x4c,
++	0x4b, 0x4a, 0x48, 0x47, 0x45, 0x44, 0x42, 0x40, 0x3e, 0x3c, 0x3a, 0x38,
++	0x36, 0x34, 0x31, 0x2f, 0x2d, 0x2a, 0x28, 0x25, 0x23, 0x20, 0x1d, 0x1b,
++	0x18, 0x15, 0x12, 0x10, 0x0d, 0x0a, 0x07, 0x04, 0x01, 0xff, 0xfc, 0xf9,
++	0xf6, 0xf3, 0xf0, 0xee, 0xeb, 0xe8, 0xe5, 0xe3, 0xe0, 0xdd, 0xdb, 0xd8,
++	0xd6, 0xd3, 0xd1, 0xcf, 0xcc, 0xca, 0xc8, 0xc6, 0xc4, 0xc2, 0xc0, 0xbe,
++	0xbc, 0xbb, 0xb9, 0xb8, 0xb6, 0xb5, 0xb4, 0xb3, 0xb2, 0xb1, 0xb0, 0xaf,
++	0xae, 0xae, 0xad, 0xad, 0xac, 0xac, 0xac, 0xac, 0xac, 0xac, 0xad, 0xad,
++	0xad, 0xae, 0xaf, 0xaf, 0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb6, 0xb7, 0xb8,
++	0xba, 0xbc, 0xbd, 0xbf, 0xc1, 0xc3, 0xc5, 0xc7, 0xc9, 0xcb, 0xcd, 0xd0,
++	0xd2, 0xd5, 0xd7, 0xda, 0xdc, 0xdf, 0xe1, 0xe4, 0xe7, 0xe9, 0xec, 0xef,
++	0xf2, 0xf5, 0xf7, 0xfa, 0xfd,
++};
++
++static const struct aw86927_profile aw86927_unicorn_profile = {
++	.waveform = aw86927_unicorn_waveform,
++	.waveform_size = ARRAY_SIZE(aw86927_unicorn_waveform),
++	.boost_level = 0x47,
++	.requires_aw86927 = true,
++};
++
+ struct aw86927_sram_waveform_header {
+ 	u8 version;
+ 	__be16 start_address;
+ 	__be16 end_address;
+ } __packed;
+ 
+-static const struct aw86927_sram_waveform_header sram_waveform_header = {
+-	.version = 0x01,
+-	.start_address = cpu_to_be16(AW86927_RAM_BASE_ADDR +
+-			sizeof(struct aw86927_sram_waveform_header)),
+-	.end_address = cpu_to_be16(AW86927_RAM_BASE_ADDR +
+-			sizeof(struct aw86927_sram_waveform_header) +
+-			ARRAY_SIZE(aw86927_waveform) - 1),
++static const struct aw86927_profile aw86927_default_profile = {
++	.waveform = aw86927_waveform,
++	.waveform_size = ARRAY_SIZE(aw86927_waveform),
++	.boost_level = AW86927_PLAYCFG1_BST_8500MV,
+ };
+ 
+ static int aw86927_wait_enter_standby(struct aw86927_data *haptics)
+@@ -334,6 +373,9 @@
+ 	struct aw86927_data *haptics = input_get_drvdata(dev);
+ 	int level;
+ 
++	if (haptics->suspended)
++		return 0;
++
+ 	level = effect->u.rumble.strong_magnitude;
+ 	if (!level)
+ 		level = effect->u.rumble.weak_magnitude;
+@@ -409,6 +451,7 @@
+ 	int err;
+ 
+ 	cancel_work_sync(&haptics->play_work);
++	haptics->level = 0;
+ 
+ 	err = aw86927_stop(haptics);
+ 	if (err)
+@@ -584,7 +627,7 @@
+ 					 AW86927_PLAYCFG1_REG,
+ 					 AW86927_PLAYCFG1_BST_VOUT_VREFSET_MASK,
+ 					 FIELD_PREP(AW86927_PLAYCFG1_BST_VOUT_VREFSET_MASK,
+-						    AW86927_PLAYCFG1_BST_8500MV));
++						    haptics->profile->boost_level));
+ 		if (err)
+ 			return err;
+ 		break;
+@@ -612,6 +655,13 @@
+ 
+ static int aw86927_ram_init(struct aw86927_data *haptics)
+ {
++	const struct aw86927_profile *profile = haptics->profile;
++	const struct aw86927_sram_waveform_header header = {
++		.version = 0x01,
++		.start_address = cpu_to_be16(AW86927_RAM_BASE_ADDR + sizeof(header)),
++		.end_address = cpu_to_be16(AW86927_RAM_BASE_ADDR + sizeof(header) +
++					   profile->waveform_size - 1),
++	};
+ 	int err;
+ 
+ 	err = aw86927_wait_enter_standby(haptics);
+@@ -624,6 +674,8 @@
+ 				 AW86927_SYSCTRL3_EN_RAMINIT_MASK,
+ 				 FIELD_PREP(AW86927_SYSCTRL3_EN_RAMINIT_MASK,
+ 					    AW86927_SYSCTRL3_EN_RAMINIT_ON));
++	if (err)
++		return err;
+ 
+ 	/* AW86938 wants a 1ms delay here */
+ 	usleep_range(1000, 1500);
+@@ -652,13 +704,13 @@
+ 
+ 	/* Write waveform header to SRAM */
+ 	err = regmap_noinc_write(haptics->regmap, AW86927_RAMDATA_REG,
+-				 &sram_waveform_header, sizeof(sram_waveform_header));
++				 &header, sizeof(header));
+ 	if (err)
+ 		return err;
+ 
+ 	/* Write waveform to SRAM */
+ 	err = regmap_noinc_write(haptics->regmap, AW86927_RAMDATA_REG,
+-				 aw86927_waveform, ARRAY_SIZE(aw86927_waveform));
++				 profile->waveform, profile->waveform_size);
+ 	if (err)
+ 		return err;
+ 
+@@ -772,6 +824,9 @@
+ 
+ 	haptics->dev = &client->dev;
+ 	haptics->client = client;
++	haptics->profile = device_get_match_data(haptics->dev);
++	if (!haptics->profile)
++		haptics->profile = &aw86927_default_profile;
+ 
+ 	i2c_set_clientdata(client, haptics);
+ 
+@@ -803,6 +858,9 @@
+ 	err = aw86927_detect(haptics);
+ 	if (err)
+ 		return dev_err_probe(haptics->dev, err, "Failed to find chip\n");
++	if (haptics->profile->requires_aw86927 && haptics->model != AW86927)
++		return dev_err_probe(haptics->dev, -ENODEV,
++				     "Board profile requires AW86927\n");
+ 
+ 	/* IRQ config */
+ 	err = regmap_write(haptics->regmap, AW86927_SYSCTRL4_REG,
+@@ -860,7 +918,74 @@
+ 	return 0;
+ }
+ 
++static int aw86927_quiesce(struct aw86927_data *haptics)
++{
++	int err;
++
++	/* FF callbacks run under event_lock and cannot schedule new work now. */
++	scoped_guard(spinlock_irq, &haptics->input_dev->event_lock) {
++		haptics->suspended = true;
++		haptics->level = 0;
++	}
++	cancel_work_sync(&haptics->play_work);
++	err = aw86927_stop(haptics);
++
++	return err;
++}
++
++static int aw86927_suspend(struct device *dev)
++{
++	struct aw86927_data *haptics = dev_get_drvdata(dev);
++	int err;
++
++	guard(mutex)(&haptics->input_dev->mutex);
++
++	err = aw86927_quiesce(haptics);
++	if (err) {
++		scoped_guard(spinlock_irq, &haptics->input_dev->event_lock) {
++			haptics->suspended = false;
++		}
++	}
++
++	return err;
++}
++
++static int aw86927_resume(struct device *dev)
++{
++	struct aw86927_data *haptics = dev_get_drvdata(dev);
++
++	guard(mutex)(&haptics->input_dev->mutex);
++
++	/* Resume permits new requests without restarting an interrupted effect. */
++	scoped_guard(spinlock_irq, &haptics->input_dev->event_lock) {
++		haptics->suspended = false;
++	}
++
++	return 0;
++}
++
++static void aw86927_remove(struct i2c_client *client)
++{
++	struct aw86927_data *haptics = i2c_get_clientdata(client);
++	int err;
++
++	err = aw86927_quiesce(haptics);
++	if (err)
++		dev_err(haptics->dev, "Failed to stop playback: %d\n", err);
++}
++
++static void aw86927_shutdown(struct i2c_client *client)
++{
++	struct aw86927_data *haptics = i2c_get_clientdata(client);
++
++	aw86927_remove(client);
++	gpiod_set_value_cansleep(haptics->reset_gpio, 1);
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(aw86927_pm_ops, aw86927_suspend, aw86927_resume);
++
+ static const struct of_device_id aw86927_of_id[] = {
++	{ .compatible = "xiaomi,unicorn-aw86927", .data = &aw86927_unicorn_profile },
+ 	{ .compatible = "awinic,aw86927" },
+ 	{ /* sentinel */ }
+ };
+@@ -871,8 +996,11 @@
+ 	.driver = {
+ 		.name = "aw86927-haptics",
+ 		.of_match_table = aw86927_of_id,
++		.pm = pm_sleep_ptr(&aw86927_pm_ops),
+ 	},
+ 	.probe = aw86927_probe,
++	.remove = aw86927_remove,
++	.shutdown = aw86927_shutdown,
+ };
+ 
+ module_i2c_driver(aw86927_driver);

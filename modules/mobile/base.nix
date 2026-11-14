@@ -90,10 +90,17 @@ in
         )
       ]
       ++ cfg.hardwareKernelParams;
-    # Camera applications using the software ISP allocate from this DMA heap.
-    services.udev.extraRules = ''
-      SUBSYSTEM=="dma_heap", KERNEL=="system", GROUP="video", MODE="0660"
-    '';
+    # Tag before systemd's 73-seat-late.rules schedules the uaccess builtin.
+    # extraRules is written to 99-local.rules, which is too late for this tag.
+    services.udev.packages = [
+      (pkgs.writeTextFile {
+        name = "android-camera-dma-heap-udev-rules";
+        destination = "/etc/udev/rules.d/70-android-camera-dma-heap.rules";
+        text = ''
+          SUBSYSTEM=="dma_heap", KERNEL=="system", GROUP="video", MODE="0660", TAG+="uaccess"
+        '';
+      })
+    ];
     documentation.enable = lib.mkDefault false;
   };
 }

@@ -1,0 +1,24 @@
+Subject: [PATCH] arm64: dts: qcom: unicorn: retain the OEM amplifier bus rate
+
+The OEM live tree leaves SE15's bus rate unspecified. Its i2c-msm-geni
+probe defaults to 400 kHz, whereas upstream i2c-qcom-geni defaults to
+100 kHz. At 100 kHz, the 20420-byte CS35L41 PM firmware region alone needs
+at least 1.84 seconds, exceeding upstream's one-second transfer timeout.
+Both amplifiers fail this firmware write on Unicorn. Make the original
+400 kHz setting explicit; do not change calibration or amplifier protection.
+
+Source: Unicorn OEM live i2c@880000 and OEM drivers/i2c/busses/i2c-msm-geni.c
+probe default (gi2c->i2c_rsc.clk_freq_out = KHz(400)).
+
+---
+diff --git a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-speakers.dtsi b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-speakers.dtsi
+--- a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-speakers.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-speakers.dtsi
+@@ -2,6 +2,7 @@
+ /* Unicorn CS35L41 amplifiers and protected 96 kHz TDM transport. */
+ 
+ &i2c15 {
++	clock-frequency = <400000>;
+ 	status = "okay";
+ 
+ 	cs35l41_bottom: amplifier@40 {

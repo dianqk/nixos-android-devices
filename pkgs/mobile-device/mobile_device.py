@@ -323,7 +323,7 @@ def fastboot(args):
         raise ToolError(f"Refusing {board}: {UNVERIFIED_BOARDS[board]}")
     serial = choose_serial("fastboot", args.serial, "fastboot")
     product = fastboot_var(serial, "product").lower()
-    products = {"clover": {"clover"}, "polaris": {"polaris"},
+    products = {"unicorn": {"unicorn"}, "clover": {"clover"}, "polaris": {"polaris"},
                 "aurora": {"aurora"}, "sheng": {"sheng"}, "asphalt": {"asphalt", "tb320fc"},
                 # PLACEHOLDER: no T880 or marble fastboot product has been observed.
                 "t880": set(), "marble": set()}
@@ -341,7 +341,7 @@ def fastboot(args):
             identity = True
     if product not in products[board] and not identity:
         raise ToolError(f"Image is for {board}, connected fastboot product is {product}")
-    ab = board in ("asphalt", "sheng", "aurora", "marble")
+    ab = board in ("unicorn", "asphalt", "sheng", "aurora", "marble")
     if ab and fastboot_var(serial, "current-slot").removeprefix("_") != "b":
         raise ToolError("Select slot B explicitly before using this image; slot A must be preserved")
     operation = ["fastboot", "-s", serial, args.operation]

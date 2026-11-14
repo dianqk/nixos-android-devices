@@ -5,6 +5,7 @@ libcamera.overrideAttrs (old: {
     ./imx363.patch
     ./asphalt.patch
     ./sheng.patch
+    ./unicorn.patch
     ./aurora.patch
     ./marble.patch
     ./0001-libcamera-software_isp-debayer_egl-Use-untransposed-.patch

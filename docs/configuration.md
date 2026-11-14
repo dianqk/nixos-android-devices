@@ -1,6 +1,6 @@
 # Configure your own system
 
-Device-specific settings use `hardware.<device>.*` for `asphalt`, `polaris`, `sheng`, `aurora`, `clover`, `marble`, `t880` and `dodge`.
+Device-specific settings use `hardware.<device>.*` for `asphalt`, `polaris`, `sheng`, `aurora`, `clover`, `marble`, `t880`, `dodge` and `unicorn`.
 Shared boot, USB and recovery settings use `androidDevices.*`.
 
 [中文](configuration.zh.md) · [Installation guides](README.md) · [USB access](usb-signaller.md)
@@ -133,7 +133,7 @@ EFI menu booting. Direct-kernel boot remains unverified on both devices.
 ## Choose a device and role
 
 `lib.mkSystem { device; buildSystem; modules; }` returns a normal NixOS system
-configuration. Device names are `asphalt`, `polaris`, `sheng`, `aurora`, `clover`, `marble`, `t880` and `dodge`.
+configuration. Device names are `asphalt`, `polaris`, `sheng`, `aurora`, `clover`, `marble`, `t880`, `dodge` and `unicorn`.
 `modules` holds your ordinary NixOS modules; optional `specialArgs`, `overlays`,
 and `nixpkgsConfig` configure arguments and packages.
 
@@ -189,7 +189,7 @@ its board-specific support. For example:
 imports = [ inputs.androidDevices.nixosModules.polaris ];
 ```
 
-Use `asphalt`, `sheng`, `aurora`, `clover`, `marble`, `t880` or `dodge` in place of `polaris` for the other boards.
+Use `asphalt`, `sheng`, `aurora`, `clover`, `marble`, `t880`, `dodge` or `unicorn` in place of `polaris` for the other boards.
 No separate common-module import or `androidDevices.enable = true` is needed.
 Device modules do not select a desktop or supply device identities.
 

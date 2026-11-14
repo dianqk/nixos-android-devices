@@ -1,0 +1,34 @@
+Subject: [PATCH] scsi: ufs: qcom: preserve SM8475 divider during testbus writes
+
+SM8475 uses UFS_TEST_BUS_CTRL_2 bit 4 as a live HCI turbo clock divider.
+The generic UTP_HCI testbus selector overlaps that bit: error dumps sweep
+all 32 selectors and change the divider on half of the writes. Restoring
+the final value cannot prevent transient timing changes during recovery.
+
+Exclude bit 4 from the UTP_HCI write mask on the SM8475 controller. Also
+match SM8475 machines whose controller retains the SM8450 compatible, as
+on Asphalt. ufshcd_rmwl masks the selector value with the write mask, so
+the divider remains unchanged on every register update, in both turbo
+states. Keep the complete dump traversal and other controllers unchanged.
+
+diff --git a/drivers/ufs/host/ufs-qcom.c b/drivers/ufs/host/ufs-qcom.c
+--- a/drivers/ufs/host/ufs-qcom.c
++++ b/drivers/ufs/host/ufs-qcom.c
+@@ -2044,6 +2044,17 @@
+ 	case TSTBUS_UTP_HCI:
+ 		reg = UFS_TEST_BUS_CTRL_2;
+ 		offset = 0;
++		/*
++		 * SM8475 reuses bit 4 as the HCI turbo clock divider. Keep it
++		 * out of every testbus write, including error-dump traversal.
++		 * Older SM8475 trees identify the controller as SM8450.
++		 */
++		if (of_device_is_compatible(host->hba->dev->of_node,
++					   "qcom,sm8475-ufshc") ||
++		    (of_machine_is_compatible("qcom,sm8475") &&
++		     of_device_is_compatible(host->hba->dev->of_node,
++					     "qcom,sm8450-ufshc")))
++			mask &= ~BIT(4);
+ 		break;
+ 	case TSTBUS_UNIPRO:
+ 		reg = UFS_UNIPRO_CFG;

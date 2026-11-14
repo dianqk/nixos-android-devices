@@ -190,3 +190,17 @@ reconfiguring gadgets, including charging-only changes over D-Bus and service
 shutdown. A stop failure aborts the change. Developer mode queues the console
 start after successful gadget setup; it does not wait for a USB client.
 Systemd also orders console shutdown before usb-signaller during stop/restart.
+
+## Optional extended modes
+
+Existing devices keep the stock daemon. Enabling `usb.signaller.followRole`, MTP,
+tethering, HID touch, image-backed storage or UVC selects the serialized USB
+backend. Extended modes currently require `manageRole = true`; devices whose
+external port manager owns the role keep the stock backend. Both backends
+protect an active NBD netboot connection from USB reconfiguration.
+
+The USB network matches both interface name and gadget MAC, allowing host-mode
+Ethernet adapters to remain available to NetworkManager. Mode
+configuration and test limits are documented in the [Unicorn USB guide](unicorn/usb.md)
+and [gadget backend guide](unicorn/usb-gadgets.md); hardware support must be
+validated separately on each board.

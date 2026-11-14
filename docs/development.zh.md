@@ -2,6 +2,53 @@
 
 [配置指南](configuration.zh.md) · [内核源码](../pkgs/linux-kernel/README.zh.md) · [English](development.md)
 
+## just 命令入口
+
+运行 `just` 查看 [justfile](../justfile) 命令。命令需要 Bash，为子进程启用
+Nix 的 `nix-command` / `flakes`，保留其他设置及 `flake.lock`；`queue` 还需要
+下文列出的补丁队列工具。
+
+```sh
+just devices
+just artifacts unicorn          # 可用产物
+just plan unicorn kernel        # 预览编译任务和下载
+just drv unicorn kernel         # 只求值 derivation 路径
+just build unicorn kernel       # result-unicorn-kernel
+just build unicorn recovery     # result-unicorn-recovery
+just build unicorn              # 默认构建 system
+just log unicorn kernel         # 查看已有构建日志
+just size result-unicorn-system # 已构建系统的闭包大小
+just eval --all-systems          # 两种平台，只求值
+just check-one public-api       # 单项主机检查
+just dev                        # 内核开发 shell
+just tools                      # Android、部署和内核工具
+just queue --help
+```
+
+将 `unicorn` 和 `kernel` 换为目标设备与产物，也支持 `minimal.system` 等嵌套名。
+输出链接为 `result-<device>-<artifact>`；末尾可追加 Nix 参数，例如
+`just build unicorn kernel --max-jobs 1 --cores 8`。日志、闭包大小和工具命令
+均可由 `just` 查看；`mobile` 原样转发参数给
+[mobile-device](../pkgs/mobile-device/README.zh.md)。
+
+## 构建迭代
+
+保留锁定输入及需要的产物以复用缓存，只构建当前需要的产物；同一构建平台上的
+system/recovery 复用设备内核，避免频繁 GC 清除后续构建需要的产物。
+并行任务数（`--max-jobs`）与每任务线程数
+（`--cores`）应共同调整，见 [Nix 并行度说明](https://nix.dev/manual/nix/stable/advanced-topics/cores-vs-jobs.html)。
+单个内核可从 `--max-jobs 1 --cores 8` 开始，按内存和 CPU 余量调整；
+不要把两项都设为 CPU 数，以免并发线程过多。
+未命中缓存的 ARM 原生任务可交给 [ARM 远程构建机](https://nix.dev/manual/nix/stable/advanced-topics/distributed-builds.html)，
+减少 QEMU 编译；原生与交叉编译的项目产物使用不同缓存。
+
+内核迭代可使用 `just dev`、已准备的源码和 Nix 内核有效配置，为每台设备保留
+独立输出目录：`make O=/absolute/build-dir CC='ccache clang' -j8 Image dtbs`，
+通过 `ccache -s` 检查命中。普通 Nix 构建缓存完整产物，不保留增量对象文件；
+进入开发 shell 不会为其启用 ccache。最终仍用正式产物构建验证仓库输入。
+
+## 求值与测试
+
 公开 API、平台、原生用户态、模块边界、直接启动和发布配置的求值检查已在两种构建
 平台的 `checks` 中注册。`nix flake check` 还会运行仅在主机上执行的镜像/fastboot
 和存储回归测试，从不连接设备。

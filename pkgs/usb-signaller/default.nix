@@ -5,6 +5,7 @@
   pkg-config,
   systemd,
   util-linux,
+  withExtendedModes ? false,
 }:
 rustPlatform.buildRustPackage (finalAttrs: {
   pname = "usb-signaller";
@@ -18,27 +19,41 @@ rustPlatform.buildRustPackage (finalAttrs: {
   cargoHash = "sha256-cmsxh7ZjU4z2LvwsnqZNlS5P9aeL05eZrg+mPDR9ShQ=";
   nativeBuildInputs = [ pkg-config ];
   buildInputs = [ systemd ];
-  patches = [
-    ./nixos-integration.patch
-    ./external-role.patch
-    ./acm-lifecycle.patch
-    ./optional-acm.patch
-    # Request 900 mA (capped by the kernel at 500 mA below SuperSpeed)
-    # instead of the 2 mA configfs default, as Android does.
-    ./max-power.patch
-    ./netboot-connected-nbd.patch
-    ./ncm-mode-identity.patch
-  ];
-  postPatch = ''
-    substituteInPlace src/service.rs \
-      --replace-fail /usr/bin/systemctl ${systemd}/bin/systemctl \
-      --replace-fail 'Command::new("systemctl")' 'Command::new("${systemd}/bin/systemctl")'
-    substituteInPlace src/sysfs.rs \
-      --replace-fail 'Command::new("mount")' 'Command::new("${util-linux}/bin/mount")' \
-      --replace-fail 'Command::new("umount")' 'Command::new("${util-linux}/bin/umount")' \
-      --replace-fail 'sysfs_symlink("/sys", "/home")' 'sysfs_symlink("/", ".")' \
-      --replace-fail 'sysfs_mkdir("/sys")' 'sysfs_mkdir("/")'
-  '';
+  patches =
+    if withExtendedModes then
+      [
+        ./nixos-integration.patch
+        ./optional-acm.patch
+        ./lifecycle.patch
+        ./max-power.patch
+      ]
+    else
+      [
+        ./nixos-integration.patch
+        ./external-role.patch
+        ./acm-lifecycle.patch
+        ./optional-acm.patch
+        # Request 900 mA (capped by the kernel at 500 mA below SuperSpeed)
+        # instead of the 2 mA configfs default, as Android does.
+        ./max-power.patch
+        ./netboot-connected-nbd.patch
+        ./ncm-mode-identity.patch
+      ];
+  postPatch =
+    lib.optionalString withExtendedModes ''
+      cp ${./manager.rs} src/manager.rs
+      substituteInPlace src/manager.rs --replace-fail '@systemctl@' '${systemd}/bin/systemctl'
+    ''
+    + ''
+      substituteInPlace src/service.rs \
+        --replace-fail /usr/bin/systemctl ${systemd}/bin/systemctl \
+        --replace-fail 'Command::new("systemctl")' 'Command::new("${systemd}/bin/systemctl")'
+      substituteInPlace src/sysfs.rs \
+        --replace-fail 'Command::new("mount")' 'Command::new("${util-linux}/bin/mount")' \
+        --replace-fail 'Command::new("umount")' 'Command::new("${util-linux}/bin/umount")' \
+        --replace-fail 'sysfs_symlink("/sys", "/home")' 'sysfs_symlink("/", ".")' \
+        --replace-fail 'sysfs_mkdir("/sys")' 'sysfs_mkdir("/")'
+    '';
   meta = {
     description = "USB gadget and role manager for mainline Linux mobile devices";
     homepage = "https://codeberg.org/DylanVanAssche/usb-signaller";

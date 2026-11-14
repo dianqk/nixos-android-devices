@@ -1,4 +1,5 @@
 {
+  unicorn = ./sm8475/unicorn;
   dodge = ./sm8750/dodge;
   aurora = ./sm8650/aurora;
   clover = ./sdm660/clover;

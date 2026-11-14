@@ -1,0 +1,126 @@
+Subject: [PATCH] arm64: dts: qcom: configure Unicorn SM8475 controllers
+
+Set the USB reference gate, UFS timing compatible, PCIe PHY and A730
+operating points used by Unicorn. The UFS PHY power domain is shared.
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8475.dtsi b/arch/arm64/boot/dts/qcom/sm8475.dtsi
+--- a/arch/arm64/boot/dts/qcom/sm8475.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8475.dtsi
+@@ -7,6 +7,7 @@
+ 
+ /delete-node/ &usb_1_hsphy;
+ /delete-node/ &ufs_mem_phy;
++/delete-node/ &gpu_opp_table;
+ 
+ &soc {
+ 	usb_1_hsphy: phy@88e3000 {
+@@ -15,8 +16,9 @@
+ 		reg = <0 0x088e3000 0 0x154>;
+ 		#phy-cells = <0>;
+ 
+-		clocks = <&rpmhcc RPMH_CXO_CLK>;
+-		clock-names = "ref";
++		clocks = <&rpmhcc RPMH_CXO_CLK>,
++			 <&gcc GCC_EUSB3_0_CLKREF_EN>;
++		clock-names = "ref", "ref_aux";
+ 
+ 		resets = <&gcc GCC_QUSB2PHY_PRIM_BCR>;
+ 
+@@ -46,23 +48,90 @@
+ 	};
+ };
+ 
+-&camcc {
+-	compatible = "qcom,sm8475-camcc";
++&gcc {
++	compatible = "qcom,sm8475-gcc";
++};
++
++/* SM8475 uses its own gen3x1 SerDes programming, already in the PHY driver. */
++&pcie0_phy {
++	compatible = "qcom,sm8475-qmp-gen3x1-pcie-phy";
++};
++
++&tlmm {
++	compatible = "qcom,sm8475-tlmm";
++};
++
++&ufs_mem_hc {
++	compatible = "qcom,sm8475-ufshc", "qcom,ufshc", "jedec,ufs-2.0";
+ };
+ 
+ &dispcc {
+ 	compatible = "qcom,sm8475-dispcc";
+ };
+ 
+-&gcc {
+-	compatible = "qcom,sm8475-gcc";
++&gpu {
++	gpu_opp_table: opp-table {
++		compatible = "operating-points-v2";
++		opp-900000000 {
++			opp-hz = /bits/ 64 <900000000>;
++			opp-level = <RPMH_REGULATOR_LEVEL_TURBO_L1>;
++		};
++		opp-862000000 {
++			opp-hz = /bits/ 64 <862000000>;
++			opp-level = <RPMH_REGULATOR_LEVEL_TURBO>;
++		};
++		opp-815000000 {
++			opp-hz = /bits/ 64 <815000000>;
++			opp-level = <RPMH_REGULATOR_LEVEL_NOM_L1>;
++		};
++		opp-765000000 {
++			opp-hz = /bits/ 64 <765000000>;
++			opp-level = <RPMH_REGULATOR_LEVEL_NOM>;
++		};
++		opp-710000000 {
++			opp-hz = /bits/ 64 <710000000>;
++			opp-level = <RPMH_REGULATOR_LEVEL_SVS_L2>;
++		};
++		opp-645000000 {
++			opp-hz = /bits/ 64 <645000000>;
++			opp-level = <RPMH_REGULATOR_LEVEL_SVS_L1>;
++		};
++		opp-580000000 {
++			opp-hz = /bits/ 64 <580000000>;
++			opp-level = <RPMH_REGULATOR_LEVEL_SVS_L0>;
++		};
++		opp-515000000 {
++			opp-hz = /bits/ 64 <515000000>;
++			opp-level = <RPMH_REGULATOR_LEVEL_SVS>;
++		};
++		opp-439000000 {
++			opp-hz = /bits/ 64 <439000000>;
++			opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_L2>;
++		};
++		opp-364000000 {
++			opp-hz = /bits/ 64 <364000000>;
++			opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_L1>;
++		};
++		opp-324000000 {
++			opp-hz = /bits/ 64 <324000000>;
++			opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS>;
++		};
++		opp-285000000 {
++			opp-hz = /bits/ 64 <285000000>;
++			opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_D1>;
++		};
++		opp-220000000 {
++			opp-hz = /bits/ 64 <220000000>;
++			opp-level = <RPMH_REGULATOR_LEVEL_MIN_SVS>;
++		};
++	};
+ };
+ 
+ &gpucc {
+ 	compatible = "qcom,sm8475-gpucc";
+ };
+ 
+-&tlmm {
+-	compatible = "qcom,sm8475-tlmm";
++/* Use the existing SM8475 PLL programming in camcc-sm8450.c. */
++&camcc {
++	compatible = "qcom,sm8475-camcc";
+ };
+-

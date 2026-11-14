@@ -1,0 +1,24 @@
+Subject: [PATCH] ufs: qcom: propagate Hibern8 exit failures after clock scaling
+
+The post-change callback discards ufshcd_uic_hibern8_exit() failures and
+reports success to the UFS core. On SM8475 the first failure is a Hibern8
+exit power-control status 5, followed by an attempted gear 1 to 4 change
+on the already broken link and an eventual root filesystem I/O failure.
+
+Return the existing Hibern8 exit result so clock scaling can report the
+failed transition instead of proceeding as if it succeeded. Preserve the
+underlying error log, recovery and clock-scaling rollback behavior.
+This fixes error propagation; it does not claim to cure the link failure.
+
+diff --git a/drivers/ufs/host/ufs-qcom.c b/drivers/ufs/host/ufs-qcom.c
+--- a/drivers/ufs/host/ufs-qcom.c
++++ b/drivers/ufs/host/ufs-qcom.c
+@@ -2031,7 +2031,7 @@
+ 		}
+ 
+ 		ufs_qcom_icc_update_bw(host);
+-		ufshcd_uic_hibern8_exit(hba);
++		return ufshcd_uic_hibern8_exit(hba);
+ 	}
+ 
+ 	return 0;

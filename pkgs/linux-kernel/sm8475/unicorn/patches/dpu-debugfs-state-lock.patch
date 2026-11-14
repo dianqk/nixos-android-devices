@@ -1,0 +1,32 @@
+Subject: [PATCH] drm/msm/dpu: lock the CRTC while reading debugfs state
+
+Reading crtc-*/state invokes dpu_crtc_get_intf_mode(), which asserts that
+the CRTC mutex is held. The debugfs show callback omitted this lock and
+reliably triggers a WARN on a running display. Take the CRTC modeset lock
+for the getters and performance snapshot, propagate acquisition errors,
+and release it after the read. Do not change runtime display behavior.
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -1800,6 +1800,11 @@
+ {
+ 	struct drm_crtc *crtc = s->private;
+ 	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
++	int ret;
++
++	ret = drm_modeset_lock(&crtc->mutex, NULL);
++	if (ret)
++		return ret;
+ 
+ 	seq_printf(s, "client type: %d\n", dpu_crtc_get_client_type(crtc));
+ 	seq_printf(s, "intf_mode: %d\n", dpu_crtc_get_intf_mode(crtc));
+@@ -1809,6 +1814,8 @@
+ 		   (u32)DIV_ROUND_UP_ULL(dpu_crtc->cur_perf.bw_ctl, 1000));
+ 	seq_printf(s, "max_per_pipe_ib: %u\n",
+ 				dpu_crtc->cur_perf.max_per_pipe_ib);
++
++	drm_modeset_unlock(&crtc->mutex);
+ 
+ 	return 0;
+ }

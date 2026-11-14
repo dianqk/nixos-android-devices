@@ -1,4 +1,5 @@
 {
+  unicorn = ../modules/devices/unicorn;
   polaris = ../modules/devices/polaris;
   aurora = ../modules/devices/aurora;
   asphalt = ../modules/devices/asphalt;

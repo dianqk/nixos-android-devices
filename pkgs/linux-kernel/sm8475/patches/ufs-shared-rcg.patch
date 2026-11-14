@@ -1,0 +1,43 @@
+Subject: [PATCH] clk: qcom: gcc-sm8450: use shared RCG protocol for SM8475 UFS
+
+SM8475 UFS AXI and UniPro CMD_UPDATE requests time out at probe with
+ROOT_EN clear. After boot votes are released, the ordinary RCG operations
+also allow the source PLL to be disabled without first parking the RCG.
+A root left sourcing a disabled PLL can wedge later clock/domain changes.
+
+Use the existing shared RCG operations for the three SM8475 UFS roots,
+as the SM8550 GCC already does. These force the root on during live
+updates, cache configuration while disabled, and park it before its
+parent can be shut off. Keep frequency tables, parent selection, domain
+votes and WARN/error reporting unchanged. SM8450 selections are unchanged.
+
+diff --git a/drivers/clk/qcom/gcc-sm8450.c b/drivers/clk/qcom/gcc-sm8450.c
+--- a/drivers/clk/qcom/gcc-sm8450.c
++++ b/drivers/clk/qcom/gcc-sm8450.c
+@@ -1077,7 +1077,7 @@
+ 	.parent_data = sm8475_gcc_parent_data_3,
+ 	.num_parents = ARRAY_SIZE(sm8475_gcc_parent_map_3),
+ 	.flags = CLK_SET_RATE_PARENT,
+-	.ops = &clk_rcg2_ops,
++	.ops = &clk_rcg2_shared_ops,
+ };
+ 
+ static const struct freq_tbl ftbl_gcc_ufs_phy_axi_clk_src[] = {
+@@ -1119,7 +1119,7 @@
+ 	.parent_data = sm8475_gcc_parent_data_3,
+ 	.num_parents = ARRAY_SIZE(sm8475_gcc_parent_map_3),
+ 	.flags = CLK_SET_RATE_PARENT,
+-	.ops = &clk_rcg2_ops,
++	.ops = &clk_rcg2_shared_ops,
+ };
+ 
+ static const struct freq_tbl ftbl_gcc_ufs_phy_ice_core_clk_src[] = {
+@@ -1172,7 +1172,7 @@
+ 	.parent_data = sm8475_gcc_parent_data_3,
+ 	.num_parents = ARRAY_SIZE(sm8475_gcc_parent_map_3),
+ 	.flags = CLK_SET_RATE_PARENT,
+-	.ops = &clk_rcg2_ops,
++	.ops = &clk_rcg2_shared_ops,
+ };
+ 
+ static struct clk_rcg2 gcc_ufs_phy_unipro_core_clk_src = {

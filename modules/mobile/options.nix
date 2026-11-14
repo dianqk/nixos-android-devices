@@ -47,6 +47,11 @@ in
       };
     };
     boot.android = {
+      dtbProperties = mkOption {
+        type = types.attrsOf (types.listOf types.ints.u32);
+        default = { };
+        description = "Root DTB u32 loader selectors, added only to Android-format images.";
+      };
       kernelFile = mkOption {
         type = types.str;
         default = "Image.gz";

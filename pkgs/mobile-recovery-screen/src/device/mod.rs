@@ -8,9 +8,30 @@
     feature = "device-aurora",
     feature = "device-marble",
     feature = "device-t880",
-    feature = "device-dodge"
+    feature = "device-dodge",
+    feature = "device-unicorn"
 )))]
 compile_error!("select one supported device feature");
+#[cfg(all(
+    feature = "device-unicorn",
+    any(
+        feature = "device-polaris",
+        feature = "device-asphalt",
+        feature = "device-clover",
+        feature = "device-sheng",
+        feature = "device-aurora",
+        feature = "device-marble",
+        feature = "device-t880",
+        feature = "device-dodge"
+    )
+))]
+compile_error!("select only one device feature");
+#[cfg(all(feature = "device-unicorn", not(feature = "ab-partitions")))]
+compile_error!("Unicorn requires the ab-partitions capability");
+#[cfg(feature = "device-unicorn")]
+mod unicorn;
+#[cfg(feature = "device-unicorn")]
+use unicorn as selected;
 #[cfg(all(
     feature = "device-dodge",
     any(

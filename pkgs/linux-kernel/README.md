@@ -74,14 +74,16 @@ the required pin controllers:
 
 | Device | SoC controller | Audio controller | PMIC support |
 | --- | --- | --- | --- |
-| Asphalt | `PINCTRL_SM8475` | `PINCTRL_SM8450_LPASS_LPI` | `PINCTRL_QCOM_SPMI_PMIC` |
+| Asphalt / Unicorn | `PINCTRL_SM8475` | `PINCTRL_SM8450_LPASS_LPI` | `PINCTRL_QCOM_SPMI_PMIC` |
 | Polaris | `PINCTRL_SDM845` | WCD9340 GPIO in `drivers/gpio` | `PINCTRL_QCOM_SPMI_PMIC` |
 | Sheng | `PINCTRL_SM8550` | `PINCTRL_SM8550_LPASS_LPI` | `PINCTRL_QCOM_SPMI_PMIC` |
 | Clover | `PINCTRL_SDM660` | `PINCTRL_SDM660_LPASS_LPI` | `PINCTRL_QCOM_SPMI_PMIC` |
 | Marble | `PINCTRL_SM8475` | `PINCTRL_SM8450_LPASS_LPI` | `PINCTRL_QCOM_SPMI_PMIC` |
 
-Audio pinctrl also needs `PINCTRL_LPASS_LPI`; Asphalt uses the SM8450 audio
-controller compatible. Configuration checks do not establish hardware function.
+Audio pinctrl also needs `PINCTRL_LPASS_LPI`; Asphalt and Unicorn use the SM8450
+audio controller compatible. See the [Unicorn SM8475 queue](sm8475/README.md);
+Asphalt retains its independent upstream queue.
+Configuration checks do not establish hardware function.
 Test display, touch, storage, audio and external peripherals on the target
 before deploying a changed kernel.
 

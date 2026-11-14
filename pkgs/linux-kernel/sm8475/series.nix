@@ -1,0 +1,16 @@
+[
+  ./patches/pinctrl.patch
+  ./patches/soc.patch
+  ./patches/ubwc.patch
+  ./patches/lucid-ole-preserve-enabled-pll.patch
+  ./patches/ufs-clock-parent.patch
+  ./patches/ufs-no-phy-retention.patch
+  ./patches/gcc-cx-binding.patch
+  ./patches/gcc-cx-runtime-pm.patch
+  ./patches/gcc-cx-domain.patch
+  ./patches/ufs-performance-opps.patch
+  ../patches/ufs-opp-init-order.patch
+  ./patches/ufs-shared-rcg.patch
+  ../patches/ufs-qcom-hibern8-exit-error.patch
+  ./patches/ufs-testbus-divider.patch
+]

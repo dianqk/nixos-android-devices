@@ -96,6 +96,8 @@ pub struct Requirements {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub linux_only: bool,
     pub identity: String,
     pub compatible: String,
     pub controller: String,
@@ -308,6 +310,10 @@ impl Config {
     }
     fn check(&self) -> Result<()> {
         let c = self;
+        ensure!(
+            !c.linux_only || c.slot_model == "ab",
+            "Linux-only layout requires the A/B adapter"
+        );
         ensure!(
             ["argument", "bcb"].contains(&c.boot_request.as_str())
                 && !c.firmware_compatible.is_empty(),
@@ -671,7 +677,10 @@ impl Config {
         let root = self.partition(j, "linux")?;
         let esp = self.partition(j, "linux-boot")?;
         ensure!(root.disk == esp.disk, "root and ESP are on different disks");
-        if self.mediatek_a() {
+        if self.linux_only {
+            root.gpt
+                .check_linux_only_layout(self.esp_bytes, self.minimum_root_bytes)?;
+        } else if self.mediatek_a() {
             root.gpt
                 .check_userdata_layout(self.esp_size(), self.minimum_root_bytes)?;
         } else {

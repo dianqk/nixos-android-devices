@@ -1,0 +1,31 @@
+Subject: [PATCH] ufs: core: apply initial clock rates through OPP when configured
+
+Do not set each clock to its maximum before the OPP core has applied the
+required performance state. Acquire all clock handles first, then let the
+existing OPP callback raise the initial rates after the required OPPs.
+Keep the legacy frequency-table path unchanged. Track current rates in
+the OPP callback so clock scaling and error recovery see the applied rate.
+
+diff --git a/drivers/ufs/core/ufshcd.c b/drivers/ufs/core/ufshcd.c
+--- a/drivers/ufs/core/ufshcd.c
++++ b/drivers/ufs/core/ufshcd.c
+@@ -1156,7 +1156,8 @@
+ 
+ 			trace_ufshcd_clk_scaling(hba,
+ 				(scaling_down ? "scaled down" : "scaled up"),
+-				clki->name, hba->clk_scaling.target_freq, freq);
++				clki->name, clki->curr_freq, freq);
++			clki->curr_freq = freq;
+ 		}
+ 	}
+ 
+@@ -9928,7 +9929,8 @@
+ 		if (!strcmp(clki->name, "ref_clk"))
+ 			ufshcd_parse_dev_ref_clk_freq(hba, clki->clk);
+ 
+-		if (clki->max_freq) {
++		/* OPP core raises required performance states before clocks. */
++		if (clki->max_freq && !hba->use_pm_opp) {
+ 			ret = clk_set_rate(clki->clk, clki->max_freq);
+ 			if (ret) {
+ 				dev_err(hba->dev, "%s: %s clk set rate(%dHz) failed, %d\n",

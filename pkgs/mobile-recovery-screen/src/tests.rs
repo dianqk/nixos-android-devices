@@ -675,3 +675,31 @@ fn lock_without_events_invalidates_an_existing_confirmation_press() {
     );
     assert!(!menu.busy && menu.confirming && menu.yes);
 }
+
+#[test]
+fn linux_only_screen_uses_the_daemon_plan_and_explicit_erase() {
+    use crate::app::{parse_plan_check, parse_userdata_check, prepare_args, LINUX_ONLY_CHOICE};
+    let output = "Linux-only layout: entire userdata\nPlan: Replace all Android userdata with a Linux ESP and root\nRecovery task 12";
+    let check = parse_userdata_check(output, true);
+    assert_eq!(check.choices.unwrap(), vec![LINUX_ONLY_CHOICE]);
+    assert_eq!(check.task, Some(12));
+    assert!(parse_userdata_check(output, false).choices.is_err());
+    assert!(!parse_plan_check(output, true).choices.unwrap().is_empty());
+    assert_eq!(
+        prepare_args(LINUX_ONLY_CHOICE, false),
+        vec!["prepare-install", "--check"]
+    );
+    assert_eq!(
+        prepare_args(LINUX_ONLY_CHOICE, true),
+        vec!["prepare-install", "--confirm-erase-userdata"]
+    );
+    assert_eq!(
+        prepare_args("64G", true),
+        vec![
+            "prepare-install",
+            "--android-userdata",
+            "64G",
+            "--confirm-erase-userdata"
+        ]
+    );
+}

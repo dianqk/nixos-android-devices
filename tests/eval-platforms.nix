@@ -13,6 +13,8 @@ let
     "sheng"
     "aurora"
   ];
+  # Unicorn uses a console example and USB2-only wiring; its two-platform
+  # hardware/configuration contract is covered by tests/unicorn.nix.
   recoveryDevices = devices;
 in
 lib.genAttrs systems (
@@ -144,6 +146,16 @@ lib.genAttrs systems (
           "devices.t880.recovery"
           "devices.t880.system"
           "devices.t880.u-boot"
+          "devices.unicorn.boot"
+          "devices.unicorn.boot-files"
+          "devices.unicorn.boot-kernel"
+          "devices.unicorn.bootstrap-info"
+          "devices.unicorn.firmware"
+          "devices.unicorn.kernel"
+          "devices.unicorn.mipps-auth"
+          "devices.unicorn.recovery"
+          "devices.unicorn.system"
+          "devices.unicorn.u-boot"
           "fastrpc"
           "kernel-tools"
           "libva-v4l2"
