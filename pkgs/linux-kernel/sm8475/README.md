@@ -10,7 +10,8 @@ select the remaining patches.
 The shared SoC supplies the UFS PHY's `UFS_PHY_GDSC` dependency. TLMM marks
 EGPIO as a GPIO function; its explicit interrupt offsets match the core's
 fallback. Asphalt retains its separate upstream queue under `asphalt/`; this
-queue does not change its kernel. The
+queue is imported only by Unicorn. Asphalt selects its UFS follow-up
+patches explicitly. The
 Lucid OLE PLL patch preserves bootloader-enabled PLLs; GCC binding, runtime PM
 and the CX domain reference are applied together.
 
@@ -24,7 +25,13 @@ errors propagate to the core, and testbus writes preserve the live divider.
 
 Unicorn selects `ufs-performance-opps.patch` and `ufs-opp-init-order.patch`
 through this queue. These add ICE scaling and coordinated CX/MX requests.
-Asphalt keeps upstream's independent UFS PHY, OPP and media integration.
+Asphalt extends upstream's existing OPPs with
+`asphalt/patches/local/0036-sm8475-ufs-ice-mx-opps.patch` and selects the same
+initialization-order fix explicitly. Its SM8475 turbo compatible, full UFS PHY
+sequence and media integration are retained. The follow-up removes the host's
+permanent NOM vote so the coordinated OPP request can use LOW_SVS at 75 MHz.
+This changes Asphalt clock/power management; it does not add a higher maximum
+frequency or establish a throughput improvement.
 The OPP implementation provides two states:
 
 | AXI / UniPro / ICE | Required CX / MX level |

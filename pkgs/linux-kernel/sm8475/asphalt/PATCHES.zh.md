@@ -41,6 +41,8 @@
 | 0033 | `qcom,sm8475-ufshc` binding |
 | 0034 | SM8475 UFS 300 MHz 以上的 turbo 模式配置 |
 | 0035 | 带 CX 档位的 SM8475 UFS operating points（75 与 850 MHz） |
+| 0036 | 联动 AXI/UniPro/ICE 调频及 CX/MX 请求；ICE 以 75 MHz/LOW_SVS 启动 |
+| [共享 OPP 初始化](../../patches/ufs-opp-init-order.patch) | 初始升频前先应用所需性能档 |
 
 在 x86_64 或 AArch64 Linux 主机上运行 `nix build .#devices.asphalt.kernel`。在 x86_64
 主机上，derivation 由 x86_64 运行并生成 AArch64 内核。Kbuild 使用
@@ -61,6 +63,14 @@ UniPro 1 µs/40 ns 周期数为 213 与 9；不高于 300 MHz 时清除这两个
 移入基础表并补充 `BG_TIMER`，与下游所有 gear 共用的表一致。0031（上游
 f07317a8d57f）现为共享 Qualcomm 补丁。实测结果见
 [UFS 时钟上限](../../../../docs/asphalt/hardware.zh.md#ufs-时钟上限)。
+
+0036 将已有 OPP 扩展为九项时钟，将 ICE 加入 AXI/UniPro 的切频过程，并为 GCC
+增加 MX 父域。ICE 在驱动开启时钟前以 75 MHz/LOW_SVS 启动。移除主机永久 NOM
+请求后，UFS OPP 通过 GDSC 父域请求 LOW_SVS 或 TURBO_L1。共享初始化修复先取得
+全部时钟句柄，再通过 OPP 先提高性能档、后提高时钟频率，并记录已应用频率。
+保留上游 turbo compatible、控制器时序与 PHY 序列。这会改变启动与切频时的电源
+管理，可能影响功耗及存储稳定性；最高频率仍为 850 MHz，不代表吞吐量提升。
+详见 [SM8475 说明](../README.zh.md)。
 
 ## 共享 PCIe 修复
 

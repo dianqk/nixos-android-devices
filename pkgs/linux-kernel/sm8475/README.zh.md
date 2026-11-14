@@ -8,7 +8,7 @@ UBWC、PLL 交接、UFS 父时钟/状态保持修复及 GCC CX 电源管理。
 
 共用 SoC 补充 UFS PHY 的 `UFS_PHY_GDSC` 依赖。TLMM 将 EGPIO 标记为 GPIO
 功能，显式中断偏移与核心回退路径一致。Asphalt 保留 `asphalt/` 下独立的上游队列，
-这里的队列不会修改其内核。Lucid OLE PLL 修复保留引导程序已启用的 PLL；GCC binding、
+此处队列仅由 Unicorn 导入，Asphalt 显式选择 UFS 后续补丁。Lucid OLE PLL 修复保留引导程序已启用的 PLL；GCC binding、
 runtime PM 驱动及 CX 域引用成组应用。
 
 ## UFS 时钟与电源
@@ -19,8 +19,11 @@ UFS AXI、ICE 在 850 MHz 档选择 GPLL3。SM8450/SM8475 控制器在挂起时�
 前切换到安全源。Hibern8 回调向上传递退出错误，testbus 写入保留实时分频位。
 
 Unicorn 通过此队列选择 `ufs-performance-opps.patch` 和 `ufs-opp-init-order.patch`，
-新增 ICE 联动及协调的 CX/MX 性能请求。Asphalt 保留上游独立的 UFS PHY、OPP
-和媒体集成。此 OPP 实现提供两个状态：
+新增 ICE 联动及协调的 CX/MX 性能请求。Asphalt 在上游已有 OPP 上显式选择
+`asphalt/patches/local/0036-sm8475-ufs-ice-mx-opps.patch` 及相同的初始化顺序修复，
+保留上游 SM8475 turbo compatible、完整 UFS PHY 序列和媒体集成。后续补丁移除
+主机永久 NOM 请求，使 75 MHz 档可由联动 OPP 请求 LOW_SVS。它改变 Asphalt 的
+时钟与电源管理，不提高最高频率，也不代表吞吐量提升。此 OPP 实现提供两个状态：
 
 | AXI / UniPro / ICE | CX / MX 所需性能档 |
 | --- | --- |

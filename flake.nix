@@ -324,6 +324,7 @@
           recovery-artifact = evaluation "android-recovery-artifact" ./tests/recovery-artifact.nix;
           package-scope = evaluation "android-package-scope" ./tests/package-scope.nix;
           asphalt-uefi = evaluation "android-asphalt-uefi" ./tests/asphalt-uefi.nix;
+          asphalt-ufs = import ./tests/asphalt-ufs.nix { flake = self; };
           # This suite evaluates one fixed AArch64 recovery configuration.
           recovery-usb = builtins.seq (builtins.stringLength (
             builtins.toJSON (import ./tests/recovery-usb.nix { flake = self; })
