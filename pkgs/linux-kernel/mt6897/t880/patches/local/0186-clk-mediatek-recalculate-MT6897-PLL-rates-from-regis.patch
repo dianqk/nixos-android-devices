@@ -1,0 +1,248 @@
+From 452c8578ef7c6f111565bddcf0bd1fb57351b221 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 20:36:54 +0800
+Subject: [PATCH 186/187] clk: mediatek: recalculate MT6897 PLL rates from
+ registers
+
+Read programmed PCW/postdivider rates on direct PLL queries instead of
+retaining boot snapshots, including full-width APLL PCWs. Sample shared
+CON1 fields together and disable the PLL rate cache. Leave non-TVDPLL
+programming unchanged; downstream CCF caches are not synchronized here.
+
+Propagate TVDPLL voter register failures, preserve inherited AP votes,
+and roll back newly requested votes after failed preparation. Keep own
+vote state after failed cleanup so a later acquisition cannot mistake
+it for inherited firmware state. Retain the vendor CLR-drain sequence.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/clk/mediatek/clk-pll.c
+---
+ drivers/clk/mediatek/clk-mt6897-apmixedsys.c | 117 ++++++++++++-------
+ 1 file changed, 73 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/clk/mediatek/clk-mt6897-apmixedsys.c b/drivers/clk/mediatek/clk-mt6897-apmixedsys.c
+index ea55c4fc45..e3e28bbef0 100644
+--- a/drivers/clk/mediatek/clk-mt6897-apmixedsys.c
++++ b/drivers/clk/mediatek/clk-mt6897-apmixedsys.c
+@@ -4,8 +4,8 @@
+  *
+  * Five of the PLLs (mainpll, univpll, mmpll, tvdpll, imgpll) are switched
+  * through the hardware voter and the others run as the bootloader left
+- * them. Most are registered as a fixed rate read from their PCW/postdiv at
+- * probe, and nothing of theirs is ever written. TVDPLL, the DisplayPort
++ * them. Firmware-owned PLL rates are read from PCW/postdiv on each PLL
++ * rate query; nothing of theirs is written. TVDPLL, the DisplayPort
+  * pixel clock source, is a real PLL when the node has a hardware voter:
+  * prepare/unprepare vote for it through the voter's AP bank (the AP vote
+  * only; other masters' votes are untouched) and set_rate writes its
+@@ -70,29 +70,15 @@ static const struct mt6897_pll mt6897_plls[] = {
+ 	PLL(CLK_APMIXED_IMGPLL, "imgpll", 0x370, 0x374, 0x374, 22),
+ };
+ 
+-static unsigned long mt6897_pll_rate(void __iomem *base,
+-				     const struct mt6897_pll *pll)
+-{
+-	u32 pcw, pd;
+-
+-	if (!(readl(base + pll->con0) & MT6897_PLL_EN))
+-		return 0;
+-
+-	pcw = readl(base + pll->pcw_reg);
+-	if (pll->pcw_bits < 32)
+-		pcw &= GENMASK(pll->pcw_bits - 1, 0);
+-	pd = (readl(base + pll->pd_reg) >> 24) & 0x7;
+-
+-	return div_u64(MT6897_PLL_FIN * pcw,
+-		       1ULL << (pll->pcw_bits - MT6897_PCW_INT_BITS)) >> pd;
+-}
+-
+ struct mt6897_hwv_pll {
+ 	struct clk_hw hw;
+ 	void __iomem *base;
+ 	struct regmap *hwv;
+ 	const struct mt6897_pll *pll;
+ 	u32 bit;
++	bool classified;
++	bool inherited;
++	bool owned;
+ };
+ 
+ static struct mt6897_hwv_pll *to_hwv_pll(struct clk_hw *hw)
+@@ -105,24 +91,27 @@ static struct mt6897_hwv_pll *to_hwv_pll(struct clk_hw *hw)
+  * has drained; when voting on, the PLL enable bit must also be set (the
+  * vendor's HWV_CHK_FULL_STA).
+  */
+-static bool mt6897_hwv_pll_done(struct mt6897_hwv_pll *p, bool on)
++static int mt6897_hwv_pll_done(struct mt6897_hwv_pll *p, bool on)
+ {
+ 	u32 done, sta;
++	int ret;
+ 
+-	regmap_read(p->hwv, HWV_PLL_DONE, &done);
++	ret = regmap_read(p->hwv, HWV_PLL_DONE, &done);
++	if (ret)
++		return ret;
+ 	if (!(done & p->bit))
+-		return false;
+-
+-	regmap_read(p->hwv, on ? HWV_PLL_SET_STA : HWV_PLL_CLR_STA, &sta);
++		return 0;
++	ret = regmap_read(p->hwv, on ? HWV_PLL_SET_STA : HWV_PLL_CLR_STA, &sta);
++	if (ret)
++		return ret;
+ 	if (sta & p->bit)
+-		return false;
+-
++		return 0;
+ 	return !on || (readl(p->base + p->pll->con0) & MT6897_PLL_EN);
+ }
+ 
+ static int mt6897_hwv_pll_vote(struct mt6897_hwv_pll *p, u32 ofs, bool on)
+ {
+-	bool done;
++	int done;
+ 	u32 val;
+ 	int ret;
+ 
+@@ -133,8 +122,12 @@ static int mt6897_hwv_pll_vote(struct mt6897_hwv_pll *p, u32 ofs, bool on)
+ 		return ret;
+ 
+ 	/* a dummy read clears the idle signal of the voter bus */
+-	regmap_read(p->hwv, ofs, &val);
+-	regmap_write(p->hwv, ofs, p->bit);
++	ret = regmap_read(p->hwv, ofs, &val);
++	if (ret)
++		return ret;
++	ret = regmap_write(p->hwv, ofs, p->bit);
++	if (ret)
++		return ret;
+ 
+ 	/* the vote is registered */
+ 	ret = regmap_read_poll_timeout_atomic(p->hwv, ofs, val,
+@@ -148,26 +141,53 @@ static int mt6897_hwv_pll_vote(struct mt6897_hwv_pll *p, u32 ofs, bool on)
+ 		udelay(100);
+ 
+ 	/* and done */
+-	return read_poll_timeout_atomic(mt6897_hwv_pll_done, done, done,
+-					1, 100000, false, p, on);
++	ret = read_poll_timeout_atomic(mt6897_hwv_pll_done, done, done,
++				       1, 100000, false, p, on);
++	return ret ? ret : (done < 0 ? done : 0);
+ }
+ 
+ static int mt6897_hwv_pll_prepare(struct clk_hw *hw)
+ {
+ 	struct mt6897_hwv_pll *p = to_hwv_pll(hw);
+-	int ret = mt6897_hwv_pll_vote(p, HWV_PLL_SET, true);
++	u32 val;
++	int ret, cleanup;
+ 
++	ret = regmap_read(p->hwv, HWV_PLL_SET, &val);
+ 	if (ret)
+-		pr_err("%s: vote timeout\n", clk_hw_get_name(hw));
++		return ret;
++	if (!p->classified) {
++		p->inherited = !!(val & p->bit);
++		p->classified = true;
++	}
++	if (!(val & p->bit))
++		p->owned = true;
++	ret = mt6897_hwv_pll_vote(p, HWV_PLL_SET, true);
++	if (!ret) {
++		p->owned = !p->inherited;
++		return 0;
++	}
++	if (!(val & p->bit)) {
++		cleanup = mt6897_hwv_pll_vote(p, HWV_PLL_CLR, false);
++		if (cleanup)
++			pr_err("%s: failed vote rollback: %d\n", clk_hw_get_name(hw), cleanup);
++		else
++			p->owned = false;
++	}
+ 	return ret;
+ }
+ 
+ static void mt6897_hwv_pll_unprepare(struct clk_hw *hw)
+ {
+ 	struct mt6897_hwv_pll *p = to_hwv_pll(hw);
++	int ret;
+ 
+-	if (mt6897_hwv_pll_vote(p, HWV_PLL_CLR, false))
+-		pr_err("%s: unvote timeout\n", clk_hw_get_name(hw));
++	if (!p->owned)
++		return;
++	ret = mt6897_hwv_pll_vote(p, HWV_PLL_CLR, false);
++	if (ret)
++		pr_err("%s: failed AP unvote: %d\n", clk_hw_get_name(hw), ret);
++	else
++		p->owned = false;
+ }
+ 
+ /* Only the AP's own vote; other masters may keep the PLL running */
+@@ -175,9 +195,10 @@ static int mt6897_hwv_pll_is_prepared(struct clk_hw *hw)
+ {
+ 	struct mt6897_hwv_pll *p = to_hwv_pll(hw);
+ 	u32 val;
++	int ret;
+ 
+-	regmap_read(p->hwv, HWV_PLL_SET, &val);
+-	return !!(val & p->bit);
++	ret = regmap_read(p->hwv, HWV_PLL_SET, &val);
++	return ret ? ret : !!(val & p->bit);
+ }
+ 
+ static unsigned long mt6897_hwv_pll_recalc_rate(struct clk_hw *hw,
+@@ -185,10 +206,15 @@ static unsigned long mt6897_hwv_pll_recalc_rate(struct clk_hw *hw,
+ {
+ 	struct mt6897_hwv_pll *p = to_hwv_pll(hw);
+ 	const struct mt6897_pll *pll = p->pll;
+-	u32 pcw, pd;
++	u32 pcw, pd, con;
+ 
+-	pcw = readl(p->base + pll->pcw_reg) & GENMASK(pll->pcw_bits - 1, 0);
+-	pd = (readl(p->base + pll->pd_reg) & MT6897_POSTDIV_MASK) >>
++	con = readl(p->base + pll->pcw_reg);
++	pcw = con;
++	if (pll->pcw_bits < 32)
++		pcw &= GENMASK(pll->pcw_bits - 1, 0);
++	/* Most PLLs keep PCW and postdiv in one coherent CON1 read. */
++	pd = ((pll->pd_reg == pll->pcw_reg ? con :
++	       readl(p->base + pll->pd_reg)) & MT6897_POSTDIV_MASK) >>
+ 	     MT6897_POSTDIV_SHIFT;
+ 
+ 	return div_u64(MT6897_PLL_FIN * pcw,
+@@ -253,6 +279,10 @@ static const struct clk_ops mt6897_hwv_pll_ops = {
+ 	.set_rate = mt6897_hwv_pll_set_rate,
+ };
+ 
++static const struct clk_ops mt6897_firmware_pll_ops = {
++	.recalc_rate = mt6897_hwv_pll_recalc_rate,
++};
++
+ static struct clk_hw *mt6897_hwv_pll_register(struct device *dev,
+ 					      void __iomem *base,
+ 					      struct regmap *hwv,
+@@ -273,9 +303,9 @@ static struct clk_hw *mt6897_hwv_pll_register(struct device *dev,
+ 	p->bit = BIT(bit);
+ 
+ 	init.name = pll->name;
+-	init.ops = &mt6897_hwv_pll_ops;
++	init.ops = hwv ? &mt6897_hwv_pll_ops : &mt6897_firmware_pll_ops;
+ 	/* running or not, it belongs to the voter: never "unused" here */
+-	init.flags = CLK_IGNORE_UNUSED;
++	init.flags = CLK_IGNORE_UNUSED | CLK_GET_RATE_NOCACHE;
+ 	p->hw.init = &init;
+ 
+ 	ret = devm_clk_hw_register(dev, &p->hw);
+@@ -316,8 +346,7 @@ static int clk_mt6897_apmixed_probe(struct platform_device *pdev)
+ 			hw = mt6897_hwv_pll_register(dev, base, hwv, pll,
+ 						     HWV_PLL_TVDPLL_BIT);
+ 		else
+-			hw = devm_clk_hw_register_fixed_rate(dev, pll->name, NULL, 0,
+-							     mt6897_pll_rate(base, pll));
++			hw = mt6897_hwv_pll_register(dev, base, NULL, pll, 0);
+ 		if (IS_ERR(hw))
+ 			return PTR_ERR(hw);
+ 		clk_data->hws[pll->id] = hw;
+-- 
+2.56.0
+

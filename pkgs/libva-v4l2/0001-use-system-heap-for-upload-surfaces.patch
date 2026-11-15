@@ -10,49 +10,35 @@ provides attachment-specific synchronization for the existing VA image map
 and unmap DMA_BUF_IOCTL_SYNC calls. Keep the linear layout, fd lifetime and
 direct DMA-BUF encoding path, and require access to /dev/dma_heap/system.
 
---- a/src/backend.cpp
-+++ b/src/backend.cpp
-@@ -2,6 +2,7 @@
+
+Adapted to qcom-va-driver 0980a1decf26: move the allocation policy to the shared allocate_surface helper; do not fall back to MSM GEM for CPU-written upload surfaces.
+
+diff --git a/src/surface-copy.cpp b/src/surface-copy.cpp
+index a4d6df3..8183947 100644
+--- a/src/surface-copy.cpp
++++ b/src/surface-copy.cpp
+@@ -1,6 +1,8 @@
+ // SPDX-License-Identifier: MIT
  #include "internal.hpp"
- #include <drm_fourcc.h>
  #include <linux/dma-buf.h>
 +#include <linux/dma-heap.h>
++#include <fcntl.h>
  #include <sys/ioctl.h>
- #include <fcntl.h>
+ #include <poll.h>
  #include <unistd.h>
-@@ -232,13 +233,15 @@
- }
- 
- static std::shared_ptr<Memory> allocate_undecoded_surface(VADriverContextP ctx, const Surface &s) {
--    // mpv probes GPU import before creating a decoder context. Use an actual
--    // linear MSM GEM allocation for these otherwise unbacked VA surfaces.
--    // The PRIME fd owns the storage after the temporary GEM handle is closed.
--    // If exported before decode, keep this allocation for the surface's
--    // lifetime. A consumer may keep its fd without calling export again.
--    check(ctx->drm_state, "surface allocation requires a DRM display");
--    int fd = static_cast<drm_state *>(ctx->drm_state)->fd;
-+    // These surfaces can be CPU-written by VA image upload and then imported
-+    // by Iris. MSM_BO_CACHED_COHERENT only establishes GPU coherency: the MSM
-+    // PRIME exporter has no CPU-access callbacks to flush dirty CPU cache lines
-+    // for a noncoherent VPU. Use the system heap, whose DMA_BUF_IOCTL_SYNC
-+    // callbacks synchronize each mapped device attachment.
-+    // mpv also probes GPU import before creating a decoder context. This linear
-+    // DMA-BUF remains importable, and an early export must keep its allocation
-+    // for the surface's lifetime because a consumer may cache the fd.
-+    (void)ctx;
-     auto m = std::make_shared<Memory>();
-     m->width = s.width;
-     m->height = s.height;
-@@ -250,12 +253,18 @@
-     check(page_size > 0, "cannot determine page size");
-     size_t size = size_t(m->stride) * m->storage_height * 3 / 2;
+@@ -80,12 +82,21 @@ std::shared_ptr<Memory> allocate_surface(int render_fd, unsigned width, unsigned
+     if (!is_rgb(fourcc))
+         size = size * 3 / 2;
      m->size = (size + size_t(page_size) - 1) / size_t(page_size) * size_t(page_size);
 -    int coherent = 0;
--    m->fd = irisva_msm_allocate(fd, m->size, &coherent);
+-    m->fd = irisva_msm_allocate(render_fd, m->size, &coherent);
 -    m->origin = coherent ? MemoryOrigin::MsmCoherent : MemoryOrigin::MsmWriteCombined;
--    check(m->fd >= 0, "allocate/export undecoded MSM surface", VA_STATUS_ERROR_ALLOCATION_FAILED);
--    trace("allocated undecoded surface %ux%u fourcc=%#x pitch=%u size=%zu coherent=%d", s.width,
--          s.height, s.fourcc, m->stride, m->size, coherent);
+-    check(m->fd >= 0, "allocate/export MSM surface", VA_STATUS_ERROR_ALLOCATION_FAILED);
+-    trace("allocated surface %ux%u fourcc=%#x pitch=%u size=%zu coherent=%d", width, height, fourcc,
+-          m->stride, m->size, coherent);
++    // CPU upload surfaces are imported by the noncoherent VPU. MSM GEM
++    // GPU coherency alone does not provide its CPU-access synchronization.
++    (void)render_fd;
 +    int heap = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
 +    check(heap >= 0, "open system DMA heap for upload surface", VA_STATUS_ERROR_ALLOCATION_FAILED);
 +    dma_heap_allocation_data allocation{};
@@ -63,8 +49,8 @@ direct DMA-BUF encoding path, and require access to /dev/dma_heap/system.
 +    check(result == 0, "allocate upload DMA-BUF", VA_STATUS_ERROR_ALLOCATION_FAILED);
 +    m->fd = allocation.fd;
 +    m->origin = MemoryOrigin::DmaHeap;
-+    trace("allocated undecoded surface %ux%u fourcc=%#x pitch=%u size=%zu dma-heap=system", s.width,
-+          s.height, s.fourcc, m->stride, m->size);
++    trace("allocated surface %ux%u fourcc=%#x pitch=%u size=%zu dma-heap=system", width, height,
++          fourcc, m->stride, m->size);
      return m;
  }
- 
+ void fill_neutral_surface(Memory &memory, unsigned width, unsigned height) {

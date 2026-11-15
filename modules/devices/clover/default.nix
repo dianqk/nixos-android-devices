@@ -15,8 +15,9 @@
       [ "hardware" "clover" "storageRoles" "root" "fsUuid" ]
     )
     (lib.mkRemovedOptionModule [ "hardware" "clover" "storageRolesFile" ] ''
-      The Rust recovery daemon reads structured roles. Move this tablet's
-      measured values to hardware.clover.storageRoles.<root|firmware|recovery|misc>.{partuuid,number,offset,bytes}.
+      The Rust recovery daemon reads structured roles. Move measured values to
+      hardware.clover.storageRoles.<root|esp|firmware|recovery|misc>.{partuuid,number,offset,bytes};
+      without measurements each role is found by its stock GPT name.
     '')
   ];
 

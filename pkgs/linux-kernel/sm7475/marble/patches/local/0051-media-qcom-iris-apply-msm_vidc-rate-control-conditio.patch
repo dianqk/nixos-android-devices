@@ -1,0 +1,121 @@
+From fa6d3c9862eb896be601e92b2a99b3fd3b0d9c52 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 25 Oct 2026 09:06:44 +0800
+Subject: [PATCH 51/51] media: qcom: iris: apply msm_vidc rate-control
+ conditions to VPU2 encoder properties
+
+The VPU2 encoder sends a fixed list of properties captured from an
+Android H.264 VBR session, regardless of codec and rate control. The
+stock msm_vidc driver (waipio capability table and msm_vidc_adjust_*())
+adjusts several of them to the session:
+
+- CONTENT_ADAPTIVE_CODING, BITRATE_BOOST and MAINTAIN_MIN_QUALITY are
+  only sent with VBR (msm_vidc_set_vbr_related_properties());
+- adaptive BLUR_TYPES falls back to none without VBR;
+- TIME_DELTA_BASED_RC is off with CQ or without rate control;
+- BASELAYER_PRIORITYID is an H.264-only capability.
+
+On SM7475 (Poco F5), HEVC CBR encoding returns the first IDR frame and
+then empty CAPTURE buffers flagged as errors for every P frame, with the
+next frame coded as I (direct V4L2 encoding, 1280x720, 4 and 20 Mbit/s).
+HEVC VBR and CQ, all-intra HEVC CBR, and H.264 CBR work. Apply the
+msm_vidc conditions so CBR sessions no longer receive the VBR settings.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/media/platform/qcom/iris/iris_venc.c | 48 ++++++++++++++++----
+ 1 file changed, 39 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/media/platform/qcom/iris/iris_venc.c b/drivers/media/platform/qcom/iris/iris_venc.c
+index 949aac262085..978650cc92dd 100644
+--- a/drivers/media/platform/qcom/iris/iris_venc.c
++++ b/drivers/media/platform/qcom/iris/iris_venc.c
+@@ -9,6 +9,7 @@
+ #include "iris_buffer.h"
+ #include "iris_common.h"
+ #include "iris_ctrls.h"
++#include "iris_hfi_gen2_defines.h"
+ #include "iris_instance.h"
+ #include "iris_power.h"
+ #include "iris_venc.h"
+@@ -496,30 +497,49 @@ int iris_venc_streamon_input(struct iris_inst *inst)
+ 	return iris_process_streamon_input(inst);
+ }
+ 
++/* iris_venc_vpu2_props[].when: rate-control and codec conditions */
++#define VPU2_PROP_H264_ONLY	BIT(0)	/* not sent for other codecs */
++#define VPU2_PROP_VBR_ONLY	BIT(1)	/* not sent without VBR */
++#define VPU2_PROP_VBR_VALUE	BIT(2)	/* value 0 (none) without VBR */
++#define VPU2_PROP_RC_VALUE	BIT(3)	/* value 0 with CQ or rate control off */
++
+ /*
+  * Properties the stock msm_vidc driver sends for a VPU2 (SM8450/SM8475) H.264
+  * encode session that the VPU3 oriented capability tables here do not cover.
+- * Values captured from Android (c2.qti.avc.encoder, 1280x720).
++ * Values captured from Android (c2.qti.avc.encoder, 1280x720, VBR). msm_vidc
++ * adjusts several of them to the session (waipio capability table and
++ * msm_vidc_adjust_*()): content-adaptive coding, bitrate boost and minimum
++ * quality are only sent with VBR, adaptive blur falls back to none without
++ * VBR, time-delta rate control is off with CQ or without rate control, and
++ * the base-layer priority ID is H.264 only. Apply the same conditions.
++ * With the VBR values sent unconditionally, SM7475 firmware returned empty
++ * buffers for every HEVC P frame in a CBR session.
+  */
+ static const struct {
+-	u32 id, port, type, value;
++	u32 id, port, type, value, when;
+ } iris_venc_vpu2_props[] = {
+ 	{ 0x03000157, HFI_PORT_BITSTREAM, HFI_PAYLOAD_U32, 0 },		/* CSC */
+ 	{ 0x0300014b, HFI_PORT_BITSTREAM, HFI_PAYLOAD_U32, 0 },		/* ROTATION */
+ 	{ 0x0300017b, HFI_PORT_BITSTREAM, HFI_PAYLOAD_U32_ENUM, 0 },	/* NAL_LENGTH_FIELD */
+-	{ 0x03000142, HFI_PORT_BITSTREAM, HFI_PAYLOAD_U32, 0 },		/* BASELAYER_PRIORITYID */
++	{ 0x03000142, HFI_PORT_BITSTREAM, HFI_PAYLOAD_U32, 0,
++	  VPU2_PROP_H264_ONLY },					/* BASELAYER_PRIORITYID */
+ 	{ 0x03000151, HFI_PORT_BITSTREAM, HFI_PAYLOAD_U32, 0 },		/* AUD */
+ 	{ 0x03000129, HFI_PORT_BITSTREAM, HFI_PAYLOAD_32_PACKED, 0x60600 },	/* DEBLOCKING_MODE */
+ 	{ 0x0300010b, HFI_PORT_NONE,      HFI_PAYLOAD_U32, 4 },		/* PIPE */
+ 	{ 0x03000106, HFI_PORT_NONE,      HFI_PAYLOAD_U32, 0 },		/* SESSION_PRIORITY */
+ 	{ 0x03000134, HFI_PORT_BITSTREAM, HFI_PAYLOAD_U32, 0 },		/* LTR_COUNT */
+-	{ 0x0300012b, HFI_PORT_BITSTREAM, HFI_PAYLOAD_U32, 1 },		/* TIME_DELTA_BASED_RC */
++	{ 0x0300012b, HFI_PORT_BITSTREAM, HFI_PAYLOAD_U32, 1,
++	  VPU2_PROP_RC_VALUE },						/* TIME_DELTA_BASED_RC */
+ 	{ 0x03000138, HFI_PORT_BITSTREAM, HFI_PAYLOAD_U32_ENUM, 1 },	/* LAYER_ENCODING_TYPE */
+ 	{ 0x03000139, HFI_PORT_BITSTREAM, HFI_PAYLOAD_U32, 1 },		/* LAYER_COUNT */
+-	{ 0x0300017d, HFI_PORT_BITSTREAM, HFI_PAYLOAD_U32, 0 },		/* MAINTAIN_MIN_QUALITY */
+-	{ 0x0300012d, HFI_PORT_BITSTREAM, HFI_PAYLOAD_U32, 0x19 },	/* BITRATE_BOOST */
+-	{ 0x0300012c, HFI_PORT_BITSTREAM, HFI_PAYLOAD_U32, 1 },		/* CONTENT_ADAPTIVE_CODING */
+-	{ 0x0300014e, HFI_PORT_BITSTREAM, HFI_PAYLOAD_U32_ENUM, 2 },	/* BLUR_TYPES */
++	{ 0x0300017d, HFI_PORT_BITSTREAM, HFI_PAYLOAD_U32, 0,
++	  VPU2_PROP_VBR_ONLY },						/* MAINTAIN_MIN_QUALITY */
++	{ 0x0300012d, HFI_PORT_BITSTREAM, HFI_PAYLOAD_U32, 0x19,
++	  VPU2_PROP_VBR_ONLY },						/* BITRATE_BOOST */
++	{ 0x0300012c, HFI_PORT_BITSTREAM, HFI_PAYLOAD_U32, 1,
++	  VPU2_PROP_VBR_ONLY },						/* CONTENT_ADAPTIVE_CODING */
++	{ 0x0300014e, HFI_PORT_BITSTREAM, HFI_PAYLOAD_U32_ENUM, 2,
++	  VPU2_PROP_VBR_VALUE },					/* BLUR_TYPES */
+ 	{ 0x03000148, HFI_PORT_BITSTREAM, HFI_PAYLOAD_U32_ENUM, 1 },	/* QUALITY_MODE */
+ 	{ 0x03000194, HFI_PORT_BITSTREAM, HFI_PAYLOAD_U32, 1 },		/* DISABLE_VUI_TIMING_INFO */
+ };
+@@ -527,11 +547,21 @@ static const struct {
+ static int iris_venc_set_vpu2_props(struct iris_inst *inst)
+ {
+ 	const struct iris_hfi_session_ops *hfi_ops = inst->hfi_session_ops;
+-	u32 i, val;
++	bool vbr = inst->hfi_rc_type == HFI_RC_VBR_CFR;
++	bool rc = inst->hfi_rc_type != HFI_RC_CQ && inst->hfi_rc_type != HFI_RC_OFF;
++	bool h264 = inst->codec == V4L2_PIX_FMT_H264;
++	u32 i, val, when;
+ 	int ret;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(iris_venc_vpu2_props); i++) {
++		when = iris_venc_vpu2_props[i].when;
++		if ((when & VPU2_PROP_H264_ONLY && !h264) ||
++		    (when & VPU2_PROP_VBR_ONLY && !vbr))
++			continue;
+ 		val = iris_venc_vpu2_props[i].value;
++		if ((when & VPU2_PROP_VBR_VALUE && !vbr) ||
++		    (when & VPU2_PROP_RC_VALUE && !rc))
++			val = 0;
+ 		ret = hfi_ops->session_set_property(inst, iris_venc_vpu2_props[i].id,
+ 						   HFI_HOST_FLAGS_NONE,
+ 						   iris_venc_vpu2_props[i].port,

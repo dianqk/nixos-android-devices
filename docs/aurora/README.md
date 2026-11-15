@@ -1,8 +1,8 @@
 # Xiaomi 14 Ultra (aurora): experimental recovery and EFI system
 
-[中文](README.zh.md)
+[中文](README.zh.md) · [Support status](status.md)
 
-Support: Tier 2. See [support criteria](../README.md#support-tiers).
+Status: see the [hardware page](hardware.md) and [support status](status.md).
 
 Aurora provides an experimental B-slot U-Boot → systemd-boot → NixOS system
 and independent RAM recovery. Follow the firmware, configuration and installation
@@ -11,18 +11,19 @@ for audio, USB host, suspend and other validation limits.
 
 ## Required factory firmware before installation
 
-**NixOS installation requires the Xiaomi China fastboot ROM OS1.0.3.0.UNACNXM, based on Android 14. Flash this exact
-factory base before installing NixOS.** An arbitrary Android 14 ROM, another
-region, or Android 16 is not an interchangeable prerequisite.
+**NixOS installation requires the Xiaomi China fastboot ROM OS3.0.308.0.WNACNXM, based on Android 16. Flash this exact
+factory base before installing NixOS.** Another Android 16 build, another
+region, or the previously supported Android 14 base OS1.0.3.0.UNACNXM is not an
+interchangeable prerequisite.
 
 | Item | Required value |
 | --- | --- |
 | Device | Xiaomi 14 Ultra, `aurora` |
-| Factory fastboot package | `aurora_images_OS1.0.3.0.UNACNXM_14.0` |
-| Android release | `14` |
-| Runtime incremental build | `V816.0.3.0.UNACNXM` |
-| Android security patch | `2024-02-01` |
-| NixOS runtime firmware selection | `hardware.aurora.firmwareVariant = "android14";` (default) |
+| Factory fastboot package | China fastboot ROM `OS3.0.308.0.WNACNXM` |
+| Android release | `16` (build `BP2A.250605.031.A3`) |
+| Incremental build | `OS3.0.308.0.WNACNXM` |
+| Android security patch | `2026-08-01` |
+| NixOS runtime firmware | OS3.0.308.0.WNACNXM payloads (fixed) |
 
 Prepare and flash the matching factory base first, then boot stock Android and
 check its identity before following the B-slot recovery/installation steps:
@@ -42,16 +43,36 @@ complete it **before** Linux partitioning/installation. Once the base is prepare
 preserve Android A and use only B for Linux. Do not rerun a factory flash script
 as a routine NixOS update or assume it restores the original userdata/GPT layout.
 
-The module, standalone firmware package and repository examples default to
-Android 14. Select the same variant for recovery and the installed system;
-custom firmware-package/NVM overrides must match too. Rebuild the initrd and
-reboot when changing variants. The [legacy Android 16 variant](firmware.md#legacy-android-16-variant)
-is not a supported installation base, and Android 14 runtime firmware on an
-Android 16 base is not verified.
-Factory reflashing or Android OTA may change the base; recheck it before using
-NixOS again. See [firmware contents and limits](firmware.md).
+The module and the standalone firmware package carry only the Android 16
+(OS3.0.308.0.WNACNXM) runtime firmware, for recovery and the installed system;
+custom firmware-package/NVM overrides must come from the same release. Android
+14 runtime firmware is no longer packaged, and the Android 14 base is no longer
+supported. Factory reflashing or Android OTA may change the base; recheck it
+before using NixOS again. See [firmware contents and limits](firmware.md).
 
-Before the first B-slot boot, also verify the [factory display firmware](#keep-b-slot-boot-display-firmware-intact).
+Before the first B-slot boot, also prepare [`vbmeta_b`](#ram-boot-prerequisites)
+and verify the [factory display firmware](#keep-b-slot-boot-display-firmware-intact).
+
+### Moving an existing installation from OS1.0.3.0.UNACNXM
+
+The Android 14 security firmware rejects the Android 16 ADSP image, so update
+the factory base and the NixOS configuration together:
+
+1. Flash the OS3.0.308.0.WNACNXM factory images from fastboot **without**
+   erasing userdata or rewriting the partition table: the Linux `linux-boot`
+   and `linux` partitions live in the original userdata allocation. The factory
+   images replace the Android slots, AVB and DTBO and may also replace `boot_b`
+   and `recovery_b`; plan to reinstall U-Boot and the recovery afterwards.
+2. Boot Android A once, check the identity properties above and that the
+   `linux-boot` and `linux` partitions still exist.
+3. Prepare `vbmeta_b` and check `imagefv_b` as described below.
+4. Select B, RAM-boot the U-Boot image built from this release (`fastboot boot`)
+   to start the existing generation, and update the installed system.
+5. Install the new U-Boot in `boot_b` and the recovery in `recovery_b` with the
+   [U-Boot installation workflow](../u-boot-install.md) and the
+   [recovery steps](#install-the-independent-recovery-on-b).
+6. Regenerate a custom Bluetooth NVM (`bluetoothNvm`) from the new release; an
+   Android 14-derived NVM does not match the Android 16 controller firmware.
 
 ## Configure and build
 
@@ -62,17 +83,7 @@ androidDevices.lib.mkSystem {
   device = "aurora";
   buildSystem = "aarch64-linux"; # or "x86_64-linux"
   nixpkgsConfig.allowUnfree = true; # OEM GPU/OEM firmware
-  modules = [ {
-    hardware.aurora.firmwareVariant = "android14";
-    androidDevices.recovery.enable = true;
-    androidDevices.initrdUsb = {
-      enable = true;
-      acm.enable = true;
-      network.enable = true;
-      address = "172.16.46.1/24";
-    };
-    boot.kernelParams = [ "clk_ignore_unused" "pd_ignore_unused" ];
-  } ];
+  modules = [ { androidDevices.recovery.enable = true; } ];
 }
 ```
 
@@ -82,7 +93,7 @@ The repository example can be built with:
 nix build .#devices.aurora.recovery --out-link result-recovery
 ```
 
-The image selects Linux 7.3-rc6 with the Aurora patch queue, an appended board
+The image selects Linux 7.3 with the Aurora patch queue, an appended board
 DTB and a systemd initrd in an Android header-v0 container. Kernel and initrd
 are self-contained. The
 board DT enables USB OTG with a peripheral default and a 5-Gbit/s limit, using
@@ -97,7 +108,7 @@ for the supported boot paths.
 `nix build .#devices.aurora.u-boot --out-link result-u-boot`
 builds the USB-console RAM firmware without changing the Linux recovery. ACM,
 six UFS LUNs and read-only GPT/block access have been tested. See the
-[firmware guide](../../pkgs/u-boot/sm8650/README.md) for prerequisites, automatic
+the U-Boot firmware notes for prerequisites, automatic
 reset behavior and limitations. Installed EFI-to-Linux handoff is verified.
 Keep the independent recovery in `recovery_b` and use the checked
 [installation workflow](../u-boot-install.md) for `boot_b`; preserve A.
@@ -105,30 +116,41 @@ Keep the independent recovery in `recovery_b` and use the checked
 ## RAM boot prerequisites
 
 Keep the stock A slot intact and use B for experiments. Back up device-specific
-calibration/NV state and `dtbo_b` separately; confirm that factory images and
-bootloader access are available. Stock DTBO contains downstream references
-that the mainline DT does not provide. An already zero-filled `dtbo_b` needs
-no write. After preparing the required factory base above, do not erase `dtbo_a` or
-rerun factory flashing scripts for this RAM test.
+calibration/NV state separately; confirm that factory images and bootloader
+access are available. Keep the stock `dtbo_b`: its overlay targets downstream
+labels that the mainline DT does not provide, and the U-Boot image carries
+empty sink nodes for every label of the OS3.0.308.0.WNACNXM stock DTBO, so ABL's
+merge succeeds without changing real nodes (see the
+the U-Boot firmware notes). A zero-filled `dtbo_b` also
+works. After preparing the required factory base above, do not erase `dtbo_a`
+or rerun factory flashing scripts for this RAM test.
 
-Some bootloader versions (for example the Android 16 OS3.0.7.0.WNACNXM base)
-also verify the active slot's physical AVB chain during `fastboot boot`. An
-empty `boot_b` then causes an invalid AVB footer/header error and automatic
-fallback to A before Linux runs, even after a successful download. Inspect the
-OEM logs at `/dev/logfs/UefiLog*.txt` from stock Android when this happens. A
-usable B-slot verification setup is a prerequisite; changing the RAM image alone
-does not repair missing on-disk chain metadata. On an unlocked bootloader,
-setting only `vbmeta_b`'s verification-disabled flag (2) passes authentication;
-`vbmeta_system_a/b` can stay unchanged. Use the matching factory `vbmeta.img`
-as the restore source and verify the written flags before another boot attempt.
-The standard fastboot option is `--disable-verification` with `flash`; it is not
-a standalone `disable-verify` command. Never omit the explicit `_b` partition.
+The required bootloader verifies the active slot's physical AVB chain during
+`fastboot boot`. Without a prepared `vbmeta_b`, an empty or Linux `boot_b`
+causes an invalid AVB footer/header error and automatic fallback to A before
+Linux runs, even after a successful download. On the unlocked bootloader,
+flash the factory package's own `vbmeta.img` to `vbmeta_b` with the
+verification-disabled flag (2); `vbmeta_system_a/b` and `vbmeta_a` stay
+unchanged:
+
+```sh
+fastboot -s SERIAL getvar current-slot
+fastboot -s SERIAL flash --disable-verification vbmeta_b /path/to/factory/images/vbmeta.img
+```
+
+The flags are the big-endian 32-bit field at offset 120 of the `AVB0` header;
+after the write it reads `00000002` (for example
+`dd if=/dev/disk/by-partlabel/vbmeta_b bs=1 skip=120 count=4 | xxd -p`
+from Linux or rooted Android). The fastboot option is `--disable-verification`
+with `flash`; it is not a standalone `disable-verify` command. Never omit the
+explicit `_b` partition. The unmodified `vbmeta.img` is the restore source.
+Inspect the OEM logs at `/dev/logfs/UefiLog*.txt` from stock Android when a B
+boot falls back to A.
 
 ABL also rejects a zero OS version in this mode. The module supplies the stock
-boot header's 14.0.0 / 2026-02-01 metadata through
-`androidDevices.boot.android.osVersion` and `osPatchLevel`; this metadata
-boots on the required Android 14 base. It is not the required ROM's security-patch date
-or the Linux recovery's operating system version.
+OS3.0.308.0.WNACNXM boot header's 14.0.0 / 2026-08-01 metadata through
+`androidDevices.boot.android.osVersion` and `osPatchLevel`. It is not the
+Linux recovery's operating system version.
 The DT exports symbols and an `arch_timer` label for the firmware's hypervisor
 overlay, which can be applied even when `dtbo_b` is empty. Check the UEFI log
 for overlay failures separately from Linux driver failures.
@@ -199,7 +221,7 @@ This does not provide a B-slot Android fallback or an installed Linux system.
 
 ## First partition, installation and updates (experimental)
 
-The full recovery includes a [Rust daemon, UI and shell](../../pkgs/mobile-recovery-screen/daemon.md)
+The full recovery includes a Rust daemon, UI and shell
 for first installation and offline `nixos-rebuild`. Its initrd has no Python
 runtime or shell storage/install backend. Standard NixOS tools run from
 the installed target closure and may use that closure's own Python dependency.
@@ -219,13 +241,16 @@ nix build .#devices.aurora.bootstrap-info --out-link result-bootstrap-info
 From a healthy, independent B recovery:
 
 ```sh
-recovery prepare-install --check
-recovery prepare-install --confirm-erase-userdata
+recovery prepare-install --check                  # lists the offered sizes
+recovery prepare-install --android-userdata 128G --check
+recovery prepare-install --android-userdata 128G --confirm-erase-userdata
 ```
 
-The second command **destroys Android userdata**. It retains approximately half
-of the original userdata allocation for Android, and divides the other half into
-an aligned 1 GiB FAT32 `linux-boot` ESP and ext4 `linux` root. It does not resize
+The last command **destroys Android userdata**. It retains the chosen size
+(32/64/128/256/512 GiB, offered while Linux keeps at least 64 GiB; see
+[recovery](../recovery.md#ab-devices-preparing-linux-storage)) of the original
+userdata allocation for Android, and divides the rest into an aligned 1 GiB
+FAT32 `linux-boot` ESP and ext4 `linux` root. It does not resize
 F2FS or preserve Android apps, encryption keys or ADB authorization. It leaves
 Android A, super, metadata, calibration and recovery unchanged. Android's
 hardware-wrapped encrypted userdata requires a separate factory reset before
@@ -248,9 +273,10 @@ loaded the current RAM image; it never invents a `slot_suffix` parameter.
 
 After preparing storage, use the [shared first-install workflow](../initial-install.md)
 with host name `aurora`. It verifies the closure and Nix database, installs and
-checks the EFI generation, and writes `boot_b` firmware last. Keep recovery_b
-independently bootable. Do not flash experimental firmware before a successful
-RAM EFI/kernel handoff and software recovery-return test.
+checks the EFI generation. Keep recovery_b independently bootable.
+For a separate `boot_b` firmware update, use the
+[checked recovery operation](../u-boot-install.md#build-and-flash-u-boot-independently)
+after a successful RAM EFI/kernel handoff and software recovery-return test.
 
 For later updates from recovery:
 
@@ -296,8 +322,10 @@ display toggling and unplug behavior are not verified yet.
 
 ### Keep B-slot boot display firmware intact
 
-During initial B-slot preparation, explicitly flash `imagefv_b` from the required
-factory package using the command below, then preserve it across NixOS updates.
+During initial B-slot preparation, check `imagefv_b` and, if it differs from the
+required factory package, flash it using the command below; then preserve it
+across NixOS updates. Some factory flashing scripts erase both `imagefv` slots
+and rewrite only one.
 Do not assume that a working Android A proves this B partition is populated.
 It is part of the OEM boot display path, even when `boot_b` contains U-Boot. An empty `imagefv_b` can
 leave both OEM fastboot and U-Boot/EFI physically black while USB and framebuffer
@@ -309,16 +337,18 @@ If this symptom occurs, inspect the factory UEFI logs (available under
 `pil-imagefv Failed to load metadata` and a zero-length `logo.img`.
 For an existing installation, check `imagefv_b` against the factory image before
 changing panel shutdown, virtual terminals, or reset mode. Restore only the affected B partition from
-**OS1.0.3.0.UNACNXM**, without running the full factory flashing script:
+**OS3.0.308.0.WNACNXM**, without running the full factory flashing script:
 
 ```sh
-fastboot -s SERIAL flash imagefv_b /path/to/aurora_images_OS1.0.3.0.UNACNXM_14.0/images/imagefv.elf
+fastboot -s SERIAL flash imagefv_b /path/to/factory/images/imagefv.elf
 fastboot -s SERIAL set_active b
 fastboot -s SERIAL reboot bootloader
 ```
 
-The matching `imagefv.elf` is 6,299,448 bytes, SHA-256
-`96d1f21d8c2802c6144832ab9117e6fd4bf9df01647298befb2449090e577d00`.
+The OS3.0.308.0.WNACNXM `imagefv` is a 6,299,448-byte ELF, SHA-256
+`9b5cea4ff6e827895c0b8071ef442c8363530736af2f0de7afefdca687168b09`
+(the rest of the 48 MiB partition is zero). Compare the partition's first
+6,299,448 bytes with it.
 Verify the B-slot fastboot display and then a Linux-to-bootloader round trip.
 This targeted repair does not require erasing `misc` or modifying Android A.
 

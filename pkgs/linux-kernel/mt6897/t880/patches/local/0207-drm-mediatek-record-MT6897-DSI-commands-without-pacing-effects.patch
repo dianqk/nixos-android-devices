@@ -1,0 +1,408 @@
+From e79fcf9bd42d799ce71eb970fe23dd4221ac1e35 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 7 Nov 2026 09:42:35 +0800
+Subject: [PATCH] drm/mediatek: record MT6897 DSI commands without pacing
+ effects
+
+The per-command C-PHY cmd send/start/done dev_info trace added about 0.7 ms per line and could change command pacing. A later panel command then left DSI_BUSY set past the 100 ms poll and panel init failed, but the 8-command bound meant its pre-state was unknown.
+
+Replace the success-path logging with a 16-entry in-memory ring per DSI instance, recording type, tx bytes, pre/post INTSTA, START, CMDQ, CMDQ_SIZE and result for every command. Only a poll or IRQ timeout dumps the failing message, the ring oldest-to-newest and the engine/PHY registers, once per power-on. Add a once-per-power-on post-route clock-rate line.
+
+All reads are read-only; command pacing is unchanged and no new hardware write is added.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/gpu/drm/mediatek/mtk_dsi.c            | 161 +++++++++++++++---
+ .../selftests/mtk_clk/dsi_routing_cases.c     |  45 ++++-
+ .../selftests/mtk_clk/test_dsi_routing.py     |  19 ++-
+ 3 files changed, 193 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_dsi.c b/drivers/gpu/drm/mediatek/mtk_dsi.c
+index 115607e17a..1543a7345f 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dsi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dsi.c
+@@ -294,6 +294,34 @@ struct mtk_dsi_tx_buf {
+ 
+ struct phy;
+ 
++#define MTK_DSI_CMD_RING_SIZE	16
++
++/**
++ * struct mtk_dsi_cmd_record - one command in the in-memory trace ring
++ * @type: MIPI DSI message type
++ * @tx_len: transmitted payload length
++ * @tx: first four transmitted bytes, zero padded
++ * @pre_intsta: INTSTA before the command queue was written
++ * @post_start_intsta: INTSTA after START was raised
++ * @post_done_intsta: INTSTA after completion or timeout
++ * @start: START register at completion
++ * @cmdq: CMDQ register at completion
++ * @cmdq_size: CMDQ_SIZE register at completion
++ * @result: host command result
++ */
++struct mtk_dsi_cmd_record {
++	u8 type;
++	size_t tx_len;
++	u8 tx[4];
++	u32 pre_intsta;
++	u32 post_start_intsta;
++	u32 post_done_intsta;
++	u32 start;
++	u32 cmdq;
++	u32 cmdq_size;
++	int result;
++};
++
+ struct mtk_dsi_driver_data {
+ 	const u16 *reg_main;
+ 	const u16 *reg_adv;
+@@ -339,7 +367,10 @@ struct mtk_dsi {
+ 	bool diag_post_route;
+ 	bool diag_first_cmd;
+ 	bool diag_timeout;
+-	u8 cmd_trace_count;
++	struct mtk_dsi_cmd_record cmd_ring[MTK_DSI_CMD_RING_SIZE];
++	u8 cmd_ring_head;
++	u8 cmd_ring_count;
++	bool cmd_timeout_dumped;
+ 	u8 irq_trace_count;
+ 
+ 	u32 data_rate;
+@@ -1329,20 +1360,86 @@ static void mtk_dsi_dump_regs(struct mtk_dsi *dsi, const char *phase)
+ 		 readl(dsi->regs + data->reg_main[DSI_CPHY_CON0]));
+ }
+ 
+-static void mtk_dsi_trace_cmd(struct mtk_dsi *dsi, const char *phase,
+-			      const struct mipi_dsi_msg *msg, u8 flag, int result)
++static u8 mtk_dsi_msg_tx(const struct mipi_dsi_msg *msg, size_t index)
++{
++	if (!msg->tx_buf || index >= msg->tx_len)
++		return 0;
++	return ((const u8 *)msg->tx_buf)[index];
++}
++
++static void mtk_dsi_record_cmd(struct mtk_dsi *dsi,
++			       const struct mipi_dsi_msg *msg, u32 pre_intsta,
++			       u32 post_start_intsta, u32 post_done_intsta,
++			       int result)
+ {
+ 	const struct mtk_dsi_driver_data *data = dsi->driver_data;
++	struct mtk_dsi_cmd_record *rec = &dsi->cmd_ring[dsi->cmd_ring_head];
++	size_t i;
++
++	rec->type = msg->type;
++	rec->tx_len = msg->tx_len;
++	for (i = 0; i < ARRAY_SIZE(rec->tx); i++)
++		rec->tx[i] = mtk_dsi_msg_tx(msg, i);
++	rec->pre_intsta = pre_intsta;
++	rec->post_start_intsta = post_start_intsta;
++	rec->post_done_intsta = post_done_intsta;
++	rec->start = readl(dsi->regs + data->reg_main[DSI_START]);
++	rec->cmdq = readl(dsi->regs + data->reg_adv[DSI_CMDQ]);
++	rec->cmdq_size = readl(dsi->regs + data->reg_main[DSI_CMDQ_SIZE]);
++	rec->result = result;
++	dsi->cmd_ring_head = (dsi->cmd_ring_head + 1) % MTK_DSI_CMD_RING_SIZE;
++	if (dsi->cmd_ring_count < MTK_DSI_CMD_RING_SIZE)
++		dsi->cmd_ring_count++;
++}
++
++static void mtk_dsi_dump_ring(struct mtk_dsi *dsi, const char *phase)
++{
++	const struct mtk_dsi_cmd_record *rec;
++	u8 start, count, i;
++
++	if (!dsi->cmd_ring_count)
++		return;
++	start = (dsi->cmd_ring_head + MTK_DSI_CMD_RING_SIZE -
++		 dsi->cmd_ring_count) % MTK_DSI_CMD_RING_SIZE;
++	count = dsi->cmd_ring_count;
++	dev_info(dsi->host.dev, "C-PHY ring %s: %u entries\n", phase, count);
++	for (i = 0; i < count; i++) {
++		rec = &dsi->cmd_ring[(start + i) % MTK_DSI_CMD_RING_SIZE];
++		dev_info(dsi->host.dev,
++			 "C-PHY ring %s[%u]: type=%u tx_len=%zu tx=%02x%02x%02x%02x pre=%08x startsta=%08x donesta=%08x start=%08x cmdq=%08x cmdq_size=%08x result=%d\n",
++			 phase, i, rec->type, rec->tx_len, rec->tx[0],
++			 rec->tx[1], rec->tx[2], rec->tx[3], rec->pre_intsta,
++			 rec->post_start_intsta, rec->post_done_intsta,
++			 rec->start, rec->cmdq, rec->cmdq_size, rec->result);
++	}
++}
+ 
++static void mtk_dsi_dump_cmd_failure(struct mtk_dsi *dsi,
++				     const struct mipi_dsi_msg *msg, int result,
++				     const char *phase, bool dump_regs)
++{
++	if (!dsi->config_clk || READ_ONCE(dsi->cmd_timeout_dumped))
++		return;
++	WRITE_ONCE(dsi->cmd_timeout_dumped, true);
+ 	dev_info(dsi->host.dev,
+-		 "C-PHY cmd %s: type=%u tx_len=%zu flag=%02x result=%d intsta=%08x start=%08x cmdq=%08x cmdq_size=%08x con=%08x mode=%08x\n",
+-		 phase, msg->type, msg->tx_len, flag, result,
+-		 readl(dsi->regs + data->reg_main[DSI_INTSTA]),
+-		 readl(dsi->regs + data->reg_main[DSI_START]),
+-		 readl(dsi->regs + data->reg_adv[DSI_CMDQ]),
+-		 readl(dsi->regs + data->reg_main[DSI_CMDQ_SIZE]),
+-		 readl(dsi->regs + data->reg_main[DSI_CON_CTRL]),
+-		 readl(dsi->regs + data->reg_main[DSI_MODE_CTRL]));
++		 "C-PHY cmd failure %s: type=%u tx_len=%zu tx=%02x%02x%02x%02x result=%d\n",
++		 phase, msg->type, msg->tx_len, mtk_dsi_msg_tx(msg, 0),
++		 mtk_dsi_msg_tx(msg, 1), mtk_dsi_msg_tx(msg, 2),
++		 mtk_dsi_msg_tx(msg, 3), result);
++	mtk_dsi_dump_ring(dsi, phase);
++	if (dump_regs)
++		mtk_dsi_dump_regs(dsi, phase);
++}
++
++static void mtk_dsi_dump_clocks(struct mtk_dsi *dsi, const char *phase)
++{
++	if (!dsi->config_clk)
++		return;
++	dev_info(dsi->host.dev,
++		 "C-PHY clocks %s: config=%lu 26m=%lu engine=%lu digital=%lu hs=%lu\n",
++		 phase, clk_get_rate(dsi->config_clk),
++		 clk_get_rate(dsi->clk26m), clk_get_rate(dsi->engine_clk),
++		 clk_get_rate(dsi->digital_clk), clk_get_rate(dsi->hs_clk));
+ }
+ 
+ static s32 mtk_dsi_wait_for_irq_done(struct mtk_dsi *dsi, u32 irq_flag,
+@@ -1444,7 +1541,9 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
+ 	WRITE_ONCE(dsi->diag_post_route, false);
+ 	WRITE_ONCE(dsi->diag_first_cmd, false);
+ 	WRITE_ONCE(dsi->diag_timeout, false);
+-	WRITE_ONCE(dsi->cmd_trace_count, 0);
++	WRITE_ONCE(dsi->cmd_ring_head, 0);
++	WRITE_ONCE(dsi->cmd_ring_count, 0);
++	WRITE_ONCE(dsi->cmd_timeout_dumped, false);
+ 	WRITE_ONCE(dsi->irq_trace_count, 0);
+ 
+ 	ret = mipi_dsi_pixel_format_to_bpp(dsi->format);
+@@ -1488,6 +1587,7 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
+ 		if (!READ_ONCE(dsi->diag_post_route)) {
+ 			WRITE_ONCE(dsi->diag_post_route, true);
+ 			mtk_dsi_dump_mmsys_state(dsi, "post-route");
++			mtk_dsi_dump_clocks(dsi, "post-route");
+ 		}
+ 	}
+ 
+@@ -2165,32 +2265,45 @@ static void mtk_dsi_cmdq(struct mtk_dsi *dsi, const struct mipi_dsi_msg *msg)
+ static ssize_t mtk_dsi_host_send_cmd(struct mtk_dsi *dsi,
+ 				     const struct mipi_dsi_msg *msg, u8 flag)
+ {
+-	bool trace = false;
++	u32 pre_intsta, post_start_intsta, post_done_intsta;
++	bool poll_failed = false, irq_failed = false;
+ 	int ret;
+ 
+ 	mtk_dsi_wait_for_idle(dsi);
+ 	mtk_dsi_irq_data_clear(dsi, flag);
+-	if (dsi->config_clk && dsi->cmd_trace_count < 8) {
+-		dsi->cmd_trace_count++;
+-		trace = true;
+-		mtk_dsi_trace_cmd(dsi, "send", msg, flag, 0);
+-	}
++	pre_intsta = readl(dsi->regs +
++			   dsi->driver_data->reg_main[DSI_INTSTA]);
+ 	mtk_dsi_cmdq(dsi, msg);
+ 	mtk_dsi_start(dsi);
+-	if (trace)
+-		mtk_dsi_trace_cmd(dsi, "start", msg, flag, 0);
++	post_start_intsta = readl(dsi->regs +
++				  dsi->driver_data->reg_main[DSI_INTSTA]);
+ 
+ 	if (dsi->driver_data->poll_command_done) {
+ 		ret = mtk_dsi_poll_for_idle(dsi);
++		poll_failed = ret != 0;
+ 		if (!ret && MTK_DSI_HOST_IS_READ(msg->type) &&
+-		    !mtk_dsi_wait_for_irq_done(dsi, LPRX_RD_RDY_INT_FLAG, 2000))
++		    !mtk_dsi_wait_for_irq_done(dsi, LPRX_RD_RDY_INT_FLAG,
++					       2000)) {
+ 			ret = -ETIME;
++			irq_failed = true;
++		}
+ 	} else {
+-		ret = mtk_dsi_wait_for_irq_done(dsi, flag, 2000) ? 0 : -ETIME;
++		if (!mtk_dsi_wait_for_irq_done(dsi, flag, 2000)) {
++			ret = -ETIME;
++			irq_failed = true;
++		} else {
++			ret = 0;
++		}
+ 	}
+ 
+-	if (trace)
+-		mtk_dsi_trace_cmd(dsi, "done", msg, flag, ret);
++	post_done_intsta = readl(dsi->regs +
++				 dsi->driver_data->reg_main[DSI_INTSTA]);
++	mtk_dsi_record_cmd(dsi, msg, pre_intsta, post_start_intsta,
++			   post_done_intsta, ret);
++	if (poll_failed)
++		mtk_dsi_dump_cmd_failure(dsi, msg, ret, "poll-timeout", true);
++	else if (irq_failed)
++		mtk_dsi_dump_cmd_failure(dsi, msg, ret, "irq-timeout", false);
+ 	return ret;
+ }
+ 
+diff --git a/tools/testing/selftests/mtk_clk/dsi_routing_cases.c b/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
+index 1d282f79bf..ebe3e65841 100644
+--- a/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
++++ b/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
+@@ -19,9 +19,13 @@ typedef int irqreturn_t;
+ #define LPRX_RD_RDY_INT_FLAG 2
+ #define DSI_RX_DATA0 0
+ #define MTK_DSI_HOST_IS_READ(type) ((type) == 1)
++#define MTK_DSI_CMD_RING_SIZE 16
++#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
++static int log_count;
+ static void test_log(const char *fmt, ...)
+ {
+ 	(void)fmt;
++	log_count++;
+ }
+ #define drm_info(dev, ...) ((void)(dev))
+ #define dev_info(dev, fmt, ...) ((void)(dev), test_log(fmt, ##__VA_ARGS__))
+@@ -77,6 +81,14 @@ struct drm_atomic_commit {
+ struct mtk_mmsys_dsi_cphy_state {
+ 	u32 routing_lsb, routing_msb, cg2, intmerge;
+ };
++struct mtk_dsi_cmd_record {
++	u8 type;
++	size_t tx_len;
++	u8 tx[4];
++	u32 pre_intsta, post_start_intsta, post_done_intsta;
++	u32 start, cmdq, cmdq_size;
++	int result;
++};
+ struct mtk_dsi_driver_data {
+ 	u16 reg_adv[4], reg_main[16];
+ 	bool tx_buf;
+@@ -115,7 +127,10 @@ struct mtk_dsi {
+ 	bool cphy, is_slave, power_ready, bridge_powered, ddp_powered,
+ 		lanes_ready, diag_pre_26m, diag_post_route, diag_first_cmd,
+ 		diag_timeout;
+-	u8 cmd_trace_count, irq_trace_count;
++	struct mtk_dsi_cmd_record cmd_ring[16];
++	u8 cmd_ring_head, cmd_ring_count;
++	bool cmd_timeout_dumped;
++	u8 irq_trace_count;
+ 	u32 irq_data;
+ 	void *irq_wait_queue;
+ 	u32 *regs;
+@@ -138,6 +153,12 @@ static int clk_set_rate(struct clk *c, unsigned long rate)
+ {
+ 	return step(10 + c->id);
+ }
++static int clk_rate_calls;
++static unsigned long clk_get_rate(struct clk *c)
++{
++	clk_rate_calls++;
++	return 1000000 + c->id;
++}
+ static int pm_runtime_resume_and_get(struct device *d)
+ {
+ 	int ret = step(20 + d->id);
+@@ -309,6 +330,7 @@ static void setup(bool dual)
+ 	calls = writes = n = fail_at = 0;
+ 	state_reads = reg_reads = timeout_ret = 0;
+ 	poll_calls = idle_waits = cmdq_calls = irq_waits = 0;
++	log_count = clk_rate_calls = 0;
+ 	poll_intsta = 0;
+ 	legacy = false;
+ 	for (int i = 0; i < 2; i++) {
+@@ -438,7 +460,8 @@ int main(void)
+ 				     CMD_DONE_INT_FLAG) == 0);
+ 	assert(idle_waits == 1 && cmdq_calls == 1 && poll_calls == 1 &&
+ 	       irq_waits == 0);
+-	assert(d[0].cmd_trace_count == 1);
++	assert(log_count == 0 && d[0].cmd_ring_count == 1 &&
++	       d[0].cmd_ring_head == 1);
+ 	setup(false);
+ 	legacy = true;
+ 	d[0].driver_data = &poll_data;
+@@ -446,6 +469,9 @@ int main(void)
+ 	assert(mtk_dsi_host_send_cmd(&d[0], &write_msg,
+ 				     CMD_DONE_INT_FLAG) == -ETIME);
+ 	assert(poll_calls == 1 && irq_waits == 0);
++	assert(d[0].cmd_timeout_dumped && log_count > 0 &&
++	       d[0].cmd_ring_count == 1 &&
++	       d[0].cmd_ring[0].result == -ETIME);
+ 	setup(false);
+ 	legacy = true;
+ 	d[0].driver_data = &poll_data;
+@@ -465,10 +491,21 @@ int main(void)
+ 	legacy = true;
+ 	d[0].driver_data = &poll_data;
+ 	timeout_ret = 1;
+-	for (int i = 0; i < 10; i++)
++	for (int i = 0; i < 20; i++)
+ 		assert(mtk_dsi_host_send_cmd(&d[0], &write_msg,
+ 					     CMD_DONE_INT_FLAG) == 0);
+-	assert(d[0].cmd_trace_count == 8);
++	assert(log_count == 0 && d[0].cmd_ring_count == 16 &&
++	       d[0].cmd_ring_head == 4);
++	setup(false);
++	assert(!mtk_dsi_poweron(&d[0]));
++	assert(clk_rate_calls == 5);
++	mtk_dsi_poweroff(&d[0]);
++	balanced();
++	setup(false);
++	assert(!mtk_dsi_poweron(&d[0]));
++	assert(clk_rate_calls == 5);
++	mtk_dsi_poweroff(&d[0]);
++	balanced();
+ 	setup(false);
+ 	d[0].driver_data = &poll_data;
+ 	mtk_dsi_set_interrupt_enable(&d[0]);
+diff --git a/tools/testing/selftests/mtk_clk/test_dsi_routing.py b/tools/testing/selftests/mtk_clk/test_dsi_routing.py
+index 6579f0aed4..a06bb958c4 100755
+--- a/tools/testing/selftests/mtk_clk/test_dsi_routing.py
++++ b/tools/testing/selftests/mtk_clk/test_dsi_routing.py
+@@ -13,7 +13,7 @@ source = (repo / 'drivers/gpu/drm/mediatek/mtk_dsi.c').read_text()
+ 
+ 
+ def function(name, text=source):
+-    match = re.search(r'^(?:static )?(?:int|void|ssize_t|s32|irqreturn_t)\s*' + name + r'\(', text, re.M)
++    match = re.search(r'^(?:static )?(?:int|void|ssize_t|s32|u8|irqreturn_t)\s*' + name + r'\(', text, re.M)
+     start = match.start()
+     end = text.index('{', start) + 1
+     depth = 1
+@@ -25,8 +25,9 @@ def function(name, text=source):
+ 
+ production = '\n'.join(function(name) for name in [
+     'mtk_dsi_irq_data_set', 'mtk_dsi_irq_data_clear',
+-    'mtk_dsi_dump_mmsys_state', 'mtk_dsi_dump_regs',
+-    'mtk_dsi_trace_cmd', 'mtk_dsi_wait_for_irq_done', 'mtk_dsi_irq',
++    'mtk_dsi_dump_mmsys_state', 'mtk_dsi_dump_regs', 'mtk_dsi_msg_tx',
++    'mtk_dsi_record_cmd', 'mtk_dsi_dump_ring', 'mtk_dsi_dump_cmd_failure',
++    'mtk_dsi_dump_clocks', 'mtk_dsi_wait_for_irq_done', 'mtk_dsi_irq',
+     'mtk_dsi_poll_for_idle', 'mtk_dsi_host_send_cmd',
+     'mtk_dsi_set_interrupt_enable',
+     'mtk_dsi_poweron', 'mtk_dsi_poweroff', 'mtk_dsi_bridge_atomic_disable',
+@@ -36,7 +37,16 @@ production = '\n'.join(function(name) for name in [
+ send_cmd = function('mtk_dsi_host_send_cmd')
+ assert send_cmd.index('poll_command_done') < send_cmd.index('mtk_dsi_poll_for_idle')
+ assert send_cmd.index('LPRX_RD_RDY_INT_FLAG') > send_cmd.index('mtk_dsi_poll_for_idle')
+-assert 'cmd_trace_count < 8' in send_cmd
++assert 'dev_info' not in send_cmd
++assert 'mtk_dsi_record_cmd' in send_cmd
++assert 'mtk_dsi_dump_cmd_failure' in send_cmd
++record = function('mtk_dsi_record_cmd')
++assert 'dev_info' not in record
++dump = function('mtk_dsi_dump_cmd_failure')
++assert 'dev_info' in dump and 'mtk_dsi_dump_ring' in dump and \
++    'mtk_dsi_dump_regs' in dump
++clocks = function('mtk_dsi_dump_clocks')
++assert 'clk_get_rate' in clocks
+ inten = function('mtk_dsi_set_interrupt_enable')
+ assert inten.index('poll_command_done') < inten.index('CMD_DONE_INT_FLAG')
+ irq = function('mtk_dsi_irq')
+@@ -53,6 +63,7 @@ assert poweron.index('pm_runtime_resume_and_get') < \
+     poweron.index('clk_prepare_enable(dsi->clk26m)') < \
+     poweron.index('mtk_mmsys_dsi_cphy_config') < \
+     poweron.index('mtk_dsi_dump_mmsys_state(dsi, "post-route")') < \
++    poweron.index('mtk_dsi_dump_clocks(dsi, "post-route")') < \
+     poweron.index('clk_set_rate')
+ poweroff = function('mtk_dsi_poweroff')
+ assert poweroff.index('phy_power_off') < \
+-- 
+2.56.0
+

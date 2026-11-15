@@ -1,0 +1,1171 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Thu, 5 Nov 2026 16:00:00 +0800
+Subject: [PATCH] qcom: enable bounded read-only UFS and EFI diagnostics
+
+Use SM8750 GCC/TCSR offsets from the existing Linux source attribution in
+0001 (Linux 05441d697f7f9a927264f4058cbbc6a03dfcac9d snapshot).
+Keep media write/erase and persistent UFS query changes disabled. Expose
+EFI Block IO read-only capability, reserve the RAM transfer buffer and
+provide a read-only EFI app that reports protocols/memory then returns.
+Fix stale RCG divider bits and propagate UFS initialization failures.
+Honor inherited hardware-gated mode for the five UFS CBCR branches, using
+Linux clk-branch.c register semantics, without changing the mode:
+https://github.com/torvalds/linux/blob/05441d697f7f9a927264f4058cbbc6a03dfcac9d/drivers/clk/qcom/clk-branch.c
+Host PHY reset uses the Linux ufs-qcom.c register and settling semantics:
+https://github.com/torvalds/linux/blob/05441d697f7f9a927264f4058cbbc6a03dfcac9d/drivers/ufs/host/ufs-qcom.c
+The U-Boot reset provider and driver-model binding are independently adapted.
+Initialize the mandatory HC v4+ SYS1CLK_1US before link startup, following
+Linux ufs_qcom_cfg_timers. Select core_clk independently from its own OPP
+and use the successfully programmed rate; preserve DME setup failures.
+Read-only reset, symbol-mux and UIC diagnostics retain cleared interrupt
+status across the existing bounded polling loop.
+Use the source-supported host PARAM0 maximum for initial SM8750 PHY gear
+calibration, independently from the Dodge negotiated link cap of G3. Linux
+ufs_qcom_set_phy_gear documents maximum calibration as backward compatible
+with lower link gears. Do not change PHY tables or clock rates.
+Check Ctrl-C before each SCSI inquiry and report the first SM8750 UTP failure
+with bounded status, error and automatic-hibernation diagnostics.
+Local changes include compiled multi-clock OPP sizing and bounded transfer
+stdio handoff; no Linux clock-branch implementation is copied.
+---
+diff --git a/arch/arm/mach-snapdragon/Kconfig b/arch/arm/mach-snapdragon/Kconfig
+index a7cf8b9e..e82ac5b6 100644
+--- a/arch/arm/mach-snapdragon/Kconfig
++++ b/arch/arm/mach-snapdragon/Kconfig
+@@ -2,6 +2,7 @@ if ARCH_SNAPDRAGON
+ 
+ config QCOM_DODGE
+ 	bool "OnePlus 13 ABL runtime memory handoff"
++	select LMB_LIMIT_DMA_BELOW_RAM_TOP if LMB
+ 
+ 
+ config SYS_SOC
+diff --git a/arch/arm/mach-snapdragon/board.c b/arch/arm/mach-snapdragon/board.c
+index 9734cb5e..599702d7 100644
+--- a/arch/arm/mach-snapdragon/board.c
++++ b/arch/arm/mach-snapdragon/board.c
+@@ -578,6 +578,21 @@ int board_late_init(void)
+ 	struct fdt_header *fdt_blob = (struct fdt_header *)gd->fdt_blob;
+ 
+ 	if (!fdt_node_check_compatible(gd->fdt_blob, 0, "oneplus,dodge")) {
++		bool transfer_valid = false;
++		int i;
++		addr = 0xc0000000;
++		for (i = 0; i < CONFIG_NR_DRAM_BANKS; i++)
++			if (gd->dram[i].start <= addr &&
++			    gd->dram[i].size >= SZ_64M &&
++			    addr - gd->dram[i].start <=
++				    gd->dram[i].size - SZ_64M)
++				transfer_valid = true;
++		if (!transfer_valid ||
++		    lmb_alloc_mem(LMB_MEM_ALLOC_ADDR, SZ_4K, &addr, SZ_64M,
++				  LMB_NOOVERWRITE))
++			panic("Dodge: no safe 64MiB transfer region\n");
++		env_set_hex("loadaddr", addr);
++		env_set_hex("fastboot_addr_r", addr);
+ 		env_set("board", "oneplus-dodge");
+ 		env_set("soc", "sm8750");
+ 		qcom_show_boot_source();
+diff --git a/drivers/clk/qcom/clock-qcom.c b/drivers/clk/qcom/clock-qcom.c
+index 6b46d9db..df908397 100644
+--- a/drivers/clk/qcom/clock-qcom.c
++++ b/drivers/clk/qcom/clock-qcom.c
+@@ -177,7 +177,8 @@ void clk_rcg_set_rate(phys_addr_t base, uint32_t cmd_rcgr, int div,
+ 
+ 	/* setup src select and divider */
+ 	cfg  = readl(base + cmd_rcgr + RCG_CFG_REG);
+-	cfg &= ~(CFG_SRC_SEL_MASK | CFG_MODE_MASK | CFG_HW_CLK_CTRL_MASK);
++	cfg &= ~(CFG_SRC_SEL_MASK | CFG_SRC_DIV_MASK | CFG_MODE_MASK |
++		 CFG_HW_CLK_CTRL_MASK);
+ 	cfg |= source & CFG_CLK_SRC_MASK; /* Select clock source */
+ 
+ 	/*
+diff --git a/drivers/clk/qcom/clock-sm8750.c b/drivers/clk/qcom/clock-sm8750.c
+index 56f83189..5bbb72e9 100644
+--- a/drivers/clk/qcom/clock-sm8750.c
++++ b/drivers/clk/qcom/clock-sm8750.c
+@@ -1,7 +1,7 @@
+ // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+ /*
+  * Copyright (c) 2024, Qualcomm Innovation Center, Inc. All rights reserved.
+- * Minimal USB2 support adapted from Linux gcc-sm8750.c/tcsrcc-sm8750.c
++ * USB2 and UFS support adapted from Linux gcc-sm8750.c/tcsrcc-sm8750.c
+  * by Taniya Das; see the patch message for source revisions.
+  */
+ #include <clk-uclass.h>
+@@ -24,15 +24,31 @@ static ulong sm8750_set_rate(struct clk *clk, ulong rate)
+ 	struct msm_clk_priv *priv = dev_get_priv(clk->dev);
+ 	const struct freq_tbl *f;
+ 	switch (clk->id) {
++	case GCC_UFS_PHY_AXI_CLK:
++	case GCC_UFS_PHY_UNIPRO_CORE_CLK:
++		/* First read-only profile uses the documented 100MHz OPP/GPLL0 divider. */
++		if (rate != 100000000)
++			return -EINVAL;
++		clk_rcg_set_rate(priv->base,
++				 clk->id == GCC_UFS_PHY_AXI_CLK ? 0x77034 :
++								  0x770a4,
++				 3, CFG_CLK_SRC_GPLL0_EVEN);
++		return rate;
++	case GCC_UFS_PHY_PHY_AUX_CLK:
++		if (rate != 19200000)
++			return -EINVAL;
++		clk_rcg_set_rate(priv->base, 0x770c0, 1, CFG_CLK_SRC_CXO);
++		return rate;
+ 	case GCC_USB30_PRIM_MASTER_CLK:
+ 		f = qcom_find_freq(usb_master_rates, rate);
+ 		clk_rcg_set_rate_mnd(priv->base, 0x39030, f->pre_div, f->m,
+ 				     f->n, f->src, 8);
+ 		return f->freq;
+ 	case GCC_USB30_PRIM_MOCK_UTMI_CLK:
+-		/* CXO is 19.2MHz after the SM8750 GCC input divide-by-two.
+-   * Preserve the read-only postdivider; reject an unexpected divider.
+-   */
++		/*
++		 * CXO is 19.2MHz after the SM8750 GCC input divide-by-two.
++		 * Preserve the read-only postdivider; reject an unexpected divider.
++		 */
+ 		if (rate != 19200000 || (readl(priv->base + 0x39060) & 0xf))
+ 			return -EINVAL;
+ 		clk_rcg_set_rate(priv->base, 0x39048, 1, CFG_CLK_SRC_CXO);
+@@ -42,6 +58,14 @@ static ulong sm8750_set_rate(struct clk *clk, ulong rate)
+ 	}
+ }
+ static const struct gate_clk sm8750_clks[] = {
++	GATE_CLK_POLLED(GCC_AGGRE_UFS_PHY_AXI_CLK, 0x770f0, BIT(0), 0x770f0),
++	GATE_CLK_POLLED(GCC_UFS_PHY_AXI_CLK, 0x77018, BIT(0), 0x77018),
++	GATE_CLK_POLLED(GCC_UFS_PHY_AHB_CLK, 0x77028, BIT(0), 0x77028),
++	GATE_CLK_POLLED(GCC_UFS_PHY_UNIPRO_CORE_CLK, 0x7706c, BIT(0), 0x7706c),
++	GATE_CLK_POLLED(GCC_UFS_PHY_PHY_AUX_CLK, 0x770bc, BIT(0), 0x770bc),
++	GATE_CLK(GCC_UFS_PHY_TX_SYMBOL_0_CLK, 0x7702c, BIT(0)),
++	GATE_CLK(GCC_UFS_PHY_RX_SYMBOL_0_CLK, 0x77030, BIT(0)),
++	GATE_CLK(GCC_UFS_PHY_RX_SYMBOL_1_CLK, 0x770d8, BIT(0)),
+ 	GATE_CLK_POLLED(GCC_CFG_NOC_USB3_PRIM_AXI_CLK, 0x3908c, BIT(0),
+ 			0x3908c),
+ 	GATE_CLK_POLLED(GCC_USB30_PRIM_MASTER_CLK, 0x39018, BIT(0), 0x39018),
+@@ -52,13 +76,52 @@ static const struct gate_clk sm8750_clks[] = {
+ static int sm8750_enable(struct clk *clk)
+ {
+ 	struct msm_clk_priv *priv = dev_get_priv(clk->dev);
+-	return qcom_gate_clk_en(priv, clk->id);
++	u32 cbcr;
++	int ret;
++
++	switch (clk->id) {
++	case GCC_AGGRE_UFS_PHY_AXI_CLK:
++	case GCC_UFS_PHY_AXI_CLK:
++	case GCC_UFS_PHY_AHB_CLK:
++	case GCC_UFS_PHY_UNIPRO_CORE_CLK:
++	case GCC_UFS_PHY_PHY_AUX_CLK:
++		/* Linux clk-branch.c does not poll halt in hardware-gated mode. */
++		setbits_le32(priv->base + sm8750_clks[clk->id].reg, BIT(0));
++		cbcr = readl(priv->base + sm8750_clks[clk->id].reg);
++		printf("UFS clock %lu CBCR=%#010x HWCG=%u\n", clk->id, cbcr,
++		       !!(cbcr & BIT(1)));
++		if (cbcr & BIT(1))
++			return 0;
++		break;
++	default:
++		break;
++	}
++
++	ret = qcom_gate_clk_en(priv, clk->id);
++	if (ret && clk->id < ARRAY_SIZE(sm8750_clks) && sm8750_clks[clk->id].reg)
++		printf("Clock %lu failed: raw CBCR=%#010x\n", clk->id,
++		       readl(priv->base + sm8750_clks[clk->id].reg));
++	if (!ret && (clk->id == GCC_UFS_PHY_TX_SYMBOL_0_CLK ||
++		     clk->id == GCC_UFS_PHY_RX_SYMBOL_0_CLK ||
++		     clk->id == GCC_UFS_PHY_RX_SYMBOL_1_CLK)) {
++		u32 mux = clk->id == GCC_UFS_PHY_TX_SYMBOL_0_CLK ? 0x77058 :
++			  clk->id == GCC_UFS_PHY_RX_SYMBOL_0_CLK ? 0x77068 : 0x770ec;
++		u32 val = readl(priv->base + mux);
++
++		printf("UFS symbol clock %lu mux[%#x]=%#x selector=%u\n",
++		       clk->id, mux, val, val & 3);
++		udelay(10); /* Linux BRANCH_HALT_DELAY. */
++	}
++	return ret;
+ }
+ static const struct qcom_reset_map sm8750_resets[] = {
++	[GCC_UFS_PHY_BCR] = { 0x77000 },
+ 	[GCC_QUSB2PHY_PRIM_BCR] = { 0x12000 },
+ 	[GCC_USB30_PRIM_BCR] = { 0x39000 },
+ };
+ static const struct qcom_power_map sm8750_domains[] = {
++	[GCC_UFS_PHY_GDSC] = { 0x77004 },
++	[GCC_UFS_MEM_PHY_GDSC] = { 0x9e000 },
+ 	[GCC_USB30_PRIM_GDSC] = { 0x39004 },
+ };
+ static struct msm_clk_data sm8750_data = {
+@@ -85,9 +148,16 @@ U_BOOT_DRIVER(gcc_sm8750) = {
+ static int tcsr_enable(struct clk *clk)
+ {
+ 	fdt_addr_t base = dev_read_addr(clk->dev);
+-	if (clk->id != TCSR_USB2_CLKREF_EN)
++	switch (clk->id) {
++	case TCSR_UFS_CLKREF_EN:
++		setbits_le32(base + 0x1000, BIT(0));
++		break;
++	case TCSR_USB2_CLKREF_EN:
++		setbits_le32(base + 0x2000, BIT(0));
++		break;
++	default:
+ 		return -EINVAL;
+-	setbits_le32(base + 0x2000, BIT(0));
++	}
+ 	udelay(10);
+ 	return 0;
+ }
+diff --git a/drivers/scsi/Kconfig b/drivers/scsi/Kconfig
+index fc87d34c..6dd9c0d4 100644
+--- a/drivers/scsi/Kconfig
++++ b/drivers/scsi/Kconfig
+@@ -8,3 +8,12 @@ config SCSI
+ 	  interfaces as well as protocols for controlling devices and
+ 	  tranferring data. For every device configuration (IDs/LUNs) a block
+ 	  device is created with RAW read/write and filesystem support.
++
++config SCSI_READ_ONLY
++ bool "Read-only SCSI media access"
++ depends on SCSI
++ help
++   Omit block write/erase operations and reject SCSI commands other than
++   read, capacity and discovery before controller dispatch. UFS device
++   descriptor/attribute writes are also disabled; normal transient link
++   initialization remains available.
+diff --git a/drivers/scsi/scsi-uclass.c b/drivers/scsi/scsi-uclass.c
+index 39b4c747..54132e2c 100644
+--- a/drivers/scsi/scsi-uclass.c
++++ b/drivers/scsi/scsi-uclass.c
+@@ -14,11 +14,16 @@
+ #include <dm.h>
+ #include <part.h>
+ #include <scsi.h>
++#include <scsi_read_only.h>
+ 
+ int scsi_exec(struct udevice *dev, struct scsi_cmd *pccb)
+ {
+ 	struct scsi_ops *ops = scsi_get_ops(dev);
+ 
++	if (IS_ENABLED(CONFIG_SCSI_READ_ONLY) &&
++	    !scsi_command_is_read_only(pccb->cmd, pccb->cmdlen))
++		return -EROFS;
++
+ 	if (!ops->exec)
+ 		return -ENOSYS;
+ 
+diff --git a/drivers/scsi/scsi.c b/drivers/scsi/scsi.c
+index 50e7d749..24ef7206 100644
+--- a/drivers/scsi/scsi.c
++++ b/drivers/scsi/scsi.c
+@@ -9,6 +9,7 @@
+ #include <blk.h>
+ #include <bootdev.h>
+ #include <bootstage.h>
++#include <console.h>
+ #include <dm.h>
+ #include <env.h>
+ #include <libata.h>
+@@ -103,6 +104,7 @@ static void scsi_setup_read_ext(struct scsi_cmd *pccb, lbaint_t start,
+ 	      pccb->cmd[7], pccb->cmd[8]);
+ }
+ 
++#if !IS_ENABLED(CONFIG_SCSI_READ_ONLY)
+ static void scsi_setup_write_ext(struct scsi_cmd *pccb, lbaint_t start,
+ 				 lbaint_t blocks)
+ {
+@@ -170,6 +172,8 @@ static void scsi_setup_erase_ext(struct scsi_cmd *pccb, lbaint_t start,
+ 	      pccb->cmd[7], pccb->cmd[8]);
+ }
+ 
++#endif
++
+ static ulong scsi_read(struct udevice *dev, lbaint_t blknr, lbaint_t blkcnt,
+ 		       void *buffer)
+ {
+@@ -236,6 +240,7 @@ static ulong scsi_read(struct udevice *dev, lbaint_t blknr, lbaint_t blkcnt,
+  * scsi_write
+  */
+ 
++#if !IS_ENABLED(CONFIG_SCSI_READ_ONLY)
+ static ulong scsi_write(struct udevice *dev, lbaint_t blknr, lbaint_t blkcnt,
+ 			const void *buffer)
+ {
+@@ -332,6 +337,8 @@ static ulong scsi_erase(struct udevice *dev, lbaint_t blknr, lbaint_t blkcnt)
+ 	return blkcnt;
+ }
+ 
++#endif
++
+ #if IS_ENABLED(CONFIG_BOUNCE_BUFFER)
+ static int scsi_buffer_aligned(struct udevice *dev, struct bounce_buffer *state)
+ {
+@@ -631,9 +638,13 @@ int scsi_scan_dev(struct udevice *dev, bool verbose)
+ 	/* Get controller plat */
+ 	uc_plat = dev_get_uclass_plat(dev);
+ 
+-	for (i = 0; i < uc_plat->max_id; i++)
+-		for (lun = 0; lun < uc_plat->max_lun; lun++)
++	for (i = 0; i < uc_plat->max_id; i++) {
++		for (lun = 0; lun < uc_plat->max_lun; lun++) {
++			if (ctrlc())
++				return -EINTR;
+ 			do_scsi_scan_one(dev, i, lun, verbose);
++		}
++	}
+ 
+ 	return 0;
+ }
+@@ -674,11 +685,13 @@ int scsi_scan(bool verbose)
+ }
+ 
+ static const struct blk_ops scsi_blk_ops = {
+-	.read	= scsi_read,
+-	.write	= scsi_write,
+-	.erase  = scsi_erase,
++	.read = scsi_read,
++#if !IS_ENABLED(CONFIG_SCSI_READ_ONLY)
++	.write = scsi_write,
++	.erase = scsi_erase,
++#endif
+ #if IS_ENABLED(CONFIG_BOUNCE_BUFFER)
+-	.buffer_aligned	= scsi_buffer_aligned,
++	.buffer_aligned = scsi_buffer_aligned,
+ #endif	/* CONFIG_BOUNCE_BUFFER */
+ };
+ 
+diff --git a/drivers/ufs/Kconfig b/drivers/ufs/Kconfig
+index 6dffdc00..1fcb2f7b 100644
+--- a/drivers/ufs/Kconfig
++++ b/drivers/ufs/Kconfig
+@@ -93,3 +93,10 @@ config UFS_TI_J721E
+ 	  present on TI's J721E devices.
+ 
+ endmenu
++
++config UFS_REQUIRE_LEGACY
++ bool "Require legacy UTP controller mode"
++ depends on UFS
++ help
++   Diagnose controller capability and mode after reset, and fail startup
++   if legacy single-doorbell access is unavailable or MCQ remains selected.
+diff --git a/drivers/ufs/ufs-qcom.c b/drivers/ufs/ufs-qcom.c
+index f5f5a6eb..b9eac357 100644
+--- a/drivers/ufs/ufs-qcom.c
++++ b/drivers/ufs/ufs-qcom.c
+@@ -12,6 +12,8 @@
+ #include <asm/io.h>
+ #include <clk.h>
+ #include <dm.h>
++#include <dm/lists.h>
++#include <reset-uclass.h>
+ #include <dm/device_compat.h>
+ #include <generic-phy.h>
+ #include <asm/gpio.h>
+@@ -122,7 +124,7 @@ static int ufs_qcom_reset(struct ufs_hba *hba)
+ 
+ 	udelay(1100);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ /**
+@@ -175,17 +177,35 @@ static int ufs_qcom_setup_clocks(struct ufs_hba *hba, bool on,
+ static u32 ufs_qcom_get_hs_gear(struct ufs_hba *hba)
+ {
+ 	struct ufs_qcom_priv *priv = dev_get_priv(hba->dev);
+-
+ 	/*
+-	 * TOFIX: v4 controllers *should* be able to support HS Gear 4
+-	 * but so far pwr_mode switch is failing on v4 controllers and HS Gear 4.
+-	 * only enable HS Gear > 3 for Controlers major version 5 and later.
++	 * Power-mode switching above G3 is not yet reliable on v4 controllers;
++	 * preserve their existing fallback while newer hardware uses PARAM0.
+ 	 */
+-	if (priv->hw_ver.major > 0x4)
+-		return UFS_QCOM_MAX_GEAR(ufshcd_readl(hba, REG_UFS_PARAM0));
++	u32 param0 = 0;
++	u32 gear = UFS_HS_G3;
++	u32 limit = dev_read_u32_default(hba->dev, "limit-hs-gear", 0);
++	if (priv->hw_ver.major > 4) {
++		param0 = ufshcd_readl(hba, REG_UFS_PARAM0);
++		gear = UFS_QCOM_MAX_GEAR(param0);
++	}
++	gear = limit ? min(gear, limit) : gear;
++	if (device_is_compatible(hba->dev, "qcom,sm8750-ufshc"))
++		dev_info(hba->dev, "negotiated gear cap=%u PARAM0=%#x limit=%u\n",
++			 gear, param0, limit);
++	return gear;
++}
+ 
+-	/* Default is HS-G3 */
+-	return UFS_HS_G3;
++/* Initial maximum-gear PHY calibration supports lower negotiated gears. */
++static u32 ufs_qcom_get_phy_gear(struct ufs_hba *hba)
++{
++	u32 param0, gear;
++
++	if (!device_is_compatible(hba->dev, "qcom,sm8750-ufshc"))
++		return ufs_qcom_get_hs_gear(hba);
++	param0 = ufshcd_readl(hba, REG_UFS_PARAM0);
++	gear = UFS_QCOM_MAX_GEAR(param0);
++	dev_info(hba->dev, "initial PHY gear=%u PARAM0=%#x\n", gear, param0);
++	return gear;
+ }
+ 
+ static int ufs_get_max_pwr_mode(struct ufs_hba *hba,
+@@ -217,8 +237,7 @@ static int ufs_qcom_power_up_sequence(struct ufs_hba *hba)
+ 	/* Reset UFS Host Controller and PHY */
+ 	ret = ufs_qcom_reset(hba);
+ 	if (ret)
+-		dev_warn(hba->dev, "%s: host reset returned %d\n",
+-			 __func__, ret);
++		return ret;
+ 
+ 	/* get phy */
+ 	ret = generic_phy_get_by_name(hba->dev, "ufsphy", &phy);
+@@ -228,6 +247,11 @@ static int ufs_qcom_power_up_sequence(struct ufs_hba *hba)
+ 		return ret;
+ 	}
+ 
++	ret = generic_phy_set_mode(&phy, PHY_MODE_UFS_HS_B,
++				   ufs_qcom_get_phy_gear(hba));
++	if (ret)
++		return ret;
++
+ 	/* phy initialization */
+ 	ret = generic_phy_init(&phy);
+ 	if (ret) {
+@@ -279,7 +303,9 @@ static int ufs_qcom_hce_enable_notify(struct ufs_hba *hba,
+ 
+ 	switch (status) {
+ 	case PRE_CHANGE:
+-		ufs_qcom_power_up_sequence(hba);
++		err = ufs_qcom_power_up_sequence(hba);
++		if (err)
++			return err;
+ 		/*
+ 		 * The PHY PLL output is the source of tx/rx lane symbol
+ 		 * clocks, hence, enable the lane clocks only after PHY
+@@ -301,8 +327,8 @@ static int ufs_qcom_hce_enable_notify(struct ufs_hba *hba,
+ 	return err;
+ }
+ 
+-/* Look for the maximum core_clk_unipro clock value */
+-static u32 ufs_qcom_get_core_clk_unipro_max_freq(struct ufs_hba *hba)
++/* Look up each clock independently in the multi-clock OPP table. */
++static u32 ufs_qcom_get_clk_max_freq(struct ufs_hba *hba, const char *name)
+ {
+ 	struct ufs_qcom_priv *priv = dev_get_priv(hba->dev);
+ 	ofnode node = dev_ofnode(priv->hba->dev);
+@@ -310,15 +336,16 @@ static u32 ufs_qcom_get_core_clk_unipro_max_freq(struct ufs_hba *hba)
+ 	int pos, ret;
+ 	u32 clk = 0;
+ 
+-	/* Get core_clk_unipro clock index */
+-	pos = ofnode_stringlist_search(node, "clock-names", "core_clk_unipro");
++	/* Get the matching clock index. */
++	pos = ofnode_stringlist_search(node, "clock-names", name);
+ 	if (pos < 0)
+ 		goto fallback;
+ 
+ 	/* Try parsing the opps */
+-	if (!ofnode_parse_phandle_with_args(node, "required-opps",
+-					    NULL, 0, 0, &opp_table) &&
+-	    ofnode_device_is_compatible(opp_table.node, "operating-points-v2")) {
++	if (!ofnode_parse_phandle_with_args(node, "operating-points-v2", NULL,
++					    0, 0, &opp_table) &&
++	    ofnode_device_is_compatible(opp_table.node,
++					"operating-points-v2")) {
+ 		ofnode opp_node;
+ 
+ 		ofnode_for_each_subnode(opp_node, opp_table.node) {
+@@ -352,6 +379,30 @@ fallback:
+ 	return UNIPRO_CORE_CLK_FREQ_150_MHZ * 1000 * 1000;
+ };
+ 
++static u32 ufs_qcom_get_core_clk_unipro_max_freq(struct ufs_hba *hba)
++{
++	return ufs_qcom_get_clk_max_freq(hba, "core_clk_unipro");
++}
++
++/* HC v4+ requires SYS1CLK_1US before link startup (Linux cfg_timers). */
++static int ufs_qcom_cfg_sys1clk(struct ufs_hba *hba)
++{
++	struct ufs_qcom_priv *priv = dev_get_priv(hba->dev);
++	u32 cycles, programmed;
++
++	if (!device_is_compatible(hba->dev, "qcom,sm8750-ufshc"))
++		return 0;
++	if (priv->core_clk_rate < 1000000 || priv->core_clk_rate % 1000000)
++		return -EINVAL;
++	cycles = priv->core_clk_rate / 1000000;
++	ufshcd_writel(hba, cycles, REG_UFS_SYS1CLK_1US);
++	programmed = ufshcd_readl(hba, REG_UFS_SYS1CLK_1US);
++	dev_info(hba->dev, "core_clk=%lu SYS1CLK_1US=%u CFG1=%#x\n",
++		 priv->core_clk_rate, programmed,
++		 ufshcd_readl(hba, REG_UFS_CFG1));
++	return 0;
++}
++
+ static int ufs_qcom_set_clk_40ns_cycles(struct ufs_hba *hba,
+ 					u32 cycles_in_1us)
+ {
+@@ -473,9 +524,14 @@ static int ufs_qcom_link_startup_notify(struct ufs_hba *hba,
+ 
+ 	switch (status) {
+ 	case PRE_CHANGE:
+-		err = ufs_qcom_set_core_clk_ctrl(hba);
++		err = ufs_qcom_cfg_sys1clk(hba);
+ 		if (err)
++			return err;
++		err = ufs_qcom_set_core_clk_ctrl(hba);
++		if (err) {
+ 			dev_err(hba->dev, "cfg core clk ctrl failed\n");
++			return err;
++		}
+ 		/*
+ 		 * Some UFS devices (and may be host) have issues if LCC is
+ 		 * enabled. So we are setting PA_Local_TX_LCC_Enable to 0
+@@ -535,6 +591,29 @@ static void ufs_qcom_dev_ref_clk_ctrl(struct ufs_hba *hba, bool enable)
+ 	}
+ }
+ 
++static int ufs_qcom_set_host_clk(struct ufs_hba *hba)
++{
++	struct ufs_qcom_priv *priv = dev_get_priv(hba->dev);
++	struct udevice *dev = hba->dev;
++	struct clk clk;
++	long rate;
++	int err;
++
++	if (device_is_compatible(dev, "qcom,sm8750-ufshc")) {
++		err = clk_get_by_name(dev, "core_clk", &clk);
++		if (err)
++			return err;
++		rate = clk_set_rate(&clk, ufs_qcom_get_clk_max_freq(hba, "core_clk"));
++		if (rate < 0)
++			return rate;
++		if (rate < 1000000 || rate % 1000000)
++			return -EINVAL;
++		priv->core_clk_rate = rate;
++	}
++
++	return 0;
++}
++
+ /**
+  * ufs_qcom_init - bind phy with controller
+  * @hba: host controller instance
+@@ -569,8 +648,13 @@ static int ufs_qcom_init(struct ufs_hba *hba)
+ 	if (rate < 0) {
+ 		dev_err(dev, "Failed to set core_clk_unipro rate to %u Hz: %ld\n",
+ 			max_freq, rate);
++		return rate;
+ 	}
+ 
++	err = ufs_qcom_set_host_clk(hba);
++	if (err)
++		return err;
++
+ 	/* Get all clocks */
+ 	err = clk_get_bulk(dev, &priv->clks);
+ 	if (err) {
+@@ -678,6 +762,69 @@ static int ufs_qcom_probe(struct udevice *dev)
+ 	return 0;
+ }
+ 
++/*
++ * Host PHY reset semantics match Linux ufs-qcom.c (05441d697f7f):
++ * REG_UFS_CFG1 bit 1, with a 1 ms settling interval after each transition.
++ */
++static int ufs_qcom_phy_reset_request(struct reset_ctl *reset)
++{
++	return reset->id ? -EINVAL : 0;
++}
++
++static int ufs_qcom_phy_reset_set(struct reset_ctl *reset, bool assert)
++{
++	void __iomem *base = dev_read_addr_ptr(reset->dev);
++	u32 val;
++
++	if (reset->id || !base)
++		return -EINVAL;
++	val = readl(base + REG_UFS_CFG1);
++	if (assert)
++		val |= UFS_PHY_SOFT_RESET;
++	else
++		val &= ~UFS_PHY_SOFT_RESET;
++	writel(val, base + REG_UFS_CFG1);
++	/* Complete the posted write before the settling interval. */
++	val = readl(base + REG_UFS_CFG1);
++	mdelay(1);
++	dev_info(reset->dev, "host PHY reset %s CFG1=%#x\n",
++		 assert ? "assert" : "deassert", val);
++	return 0;
++}
++
++static int ufs_qcom_phy_reset_assert(struct reset_ctl *reset)
++{
++	return ufs_qcom_phy_reset_set(reset, true);
++}
++
++static int ufs_qcom_phy_reset_deassert(struct reset_ctl *reset)
++{
++	return ufs_qcom_phy_reset_set(reset, false);
++}
++
++static const struct reset_ops ufs_qcom_phy_reset_ops = {
++	.request = ufs_qcom_phy_reset_request,
++	.rst_assert = ufs_qcom_phy_reset_assert,
++	.rst_deassert = ufs_qcom_phy_reset_deassert,
++};
++
++U_BOOT_DRIVER(qcom_ufs_phy_reset) = {
++	.name = "qcom-ufs-phy-reset",
++	.id = UCLASS_RESET,
++	.ops = &ufs_qcom_phy_reset_ops,
++};
++
++static int ufs_qcom_bind(struct udevice *dev)
++{
++	if (!dev_read_bool(dev, "#reset-cells") ||
++	    !device_is_compatible(dev, "qcom,sm8750-ufshc"))
++		return 0;
++
++	/* A sibling can be probed by the PHY without re-entering UFS probe. */
++	return device_bind_driver_to_node(dev->parent, "qcom-ufs-phy-reset",
++					 "ufs-phy-reset", dev_ofnode(dev), NULL);
++}
++
+ static const struct udevice_id ufs_qcom_ids[] = {
+ 	{ .compatible = "qcom,ufshc" },
+ 	{},
+@@ -687,6 +834,7 @@ U_BOOT_DRIVER(qcom_ufshcd) = {
+ 	.name		= "qcom-ufshcd",
+ 	.id		= UCLASS_UFS,
+ 	.of_match	= ufs_qcom_ids,
++	.bind		= ufs_qcom_bind,
+ 	.probe		= ufs_qcom_probe,
+ 	.priv_auto	= sizeof(struct ufs_qcom_priv),
+ };
+diff --git a/drivers/ufs/ufs-qcom.h b/drivers/ufs/ufs-qcom.h
+index de957ae6..fa1f8f69 100644
+--- a/drivers/ufs/ufs-qcom.h
++++ b/drivers/ufs/ufs-qcom.h
+@@ -131,6 +131,7 @@ struct ufs_qcom_priv {
+ 	struct phy *generic_phy;
+ 	struct ufs_hba *hba;
+ 
++	ulong core_clk_rate;
+ 	struct clk_bulk clks;
+ 	bool is_clks_enabled;
+ 
+diff --git a/drivers/ufs/ufs-uclass.c b/drivers/ufs/ufs-uclass.c
+index 6ef01f8e..8f12bec3 100644
+--- a/drivers/ufs/ufs-uclass.c
++++ b/drivers/ufs/ufs-uclass.c
+@@ -175,6 +175,7 @@ static int ufshcd_send_uic_cmd(struct ufs_hba *hba, struct uic_command *uic_cmd)
+ {
+ 	unsigned long start = 0;
+ 	u32 intr_status;
++	u32 observed_intr_status = 0;
+ 	u32 enabled_intr_status;
+ 
+ 	if (!ufshcd_ready_for_uic_cmd(hba)) {
+@@ -197,13 +198,28 @@ static int ufshcd_send_uic_cmd(struct ufs_hba *hba, struct uic_command *uic_cmd)
+ 	start = get_timer(0);
+ 	do {
+ 		intr_status = ufshcd_readl(hba, REG_INTERRUPT_STATUS);
++		observed_intr_status |= intr_status;
+ 		enabled_intr_status = intr_status & hba->intr_mask;
+ 		ufshcd_writel(hba, intr_status, REG_INTERRUPT_STATUS);
+ 
+ 		if (get_timer(start) > UFS_UIC_CMD_TIMEOUT) {
+ 			dev_err(hba->dev,
+-				"Timedout waiting for UIC response\n");
+-
++				"Timedout waiting for UIC command %#x response\n",
++				uic_cmd->command);
++
++			if (device_is_compatible(hba->dev, "qcom,sm8750-ufshc")) {
++				dev_err(hba->dev, "UIC timeout HCS=%#x HCE=%#x IS=%#x IE=%#x observed_IS=%#x\n",
++					ufshcd_readl(hba, REG_CONTROLLER_STATUS),
++					ufshcd_readl(hba, REG_CONTROLLER_ENABLE),
++					intr_status, ufshcd_readl(hba, REG_INTERRUPT_ENABLE),
++					observed_intr_status);
++				dev_err(hba->dev, "UIC errors PA=%#x DL=%#x N=%#x T=%#x DME=%#x\n",
++					ufshcd_readl(hba, REG_UIC_ERROR_CODE_PHY_ADAPTER_LAYER),
++					ufshcd_readl(hba, REG_UIC_ERROR_CODE_DATA_LINK_LAYER),
++					ufshcd_readl(hba, REG_UIC_ERROR_CODE_NETWORK_LAYER),
++					ufshcd_readl(hba, REG_UIC_ERROR_CODE_TRANSPORT_LAYER),
++					ufshcd_readl(hba, REG_UIC_ERROR_CODE_DME));
++			}
+ 			return -ETIMEDOUT;
+ 		}
+ 
+@@ -909,6 +925,23 @@ static int ufshcd_comp_devman_upiu(struct ufs_hba *hba,
+ 	return ret;
+ }
+ 
++/* Read each diagnostic register once on the first SM8750 transfer failure. */
++static void ufshcd_log_transfer_error_once(struct ufs_hba *hba, u32 status)
++{
++	if (!device_is_compatible(hba->dev, "qcom,sm8750-ufshc") ||
++	    hba->transfer_error_logged)
++		return;
++	hba->transfer_error_logged = true;
++	dev_err(hba->dev, "first UTP failure IS=%#x HCS=%#x HCE=%#x IE=%#x AHIT=%#x\n",
++		status, ufshcd_readl(hba, REG_CONTROLLER_STATUS),
++		ufshcd_readl(hba, REG_CONTROLLER_ENABLE),
++		ufshcd_readl(hba, REG_INTERRUPT_ENABLE),
++		ufshcd_readl(hba, REG_AUTO_HIBERNATE_IDLE_TIMER));
++	dev_err(hba->dev, "first UTP errors PA=%#x DL=%#x\n",
++		ufshcd_readl(hba, REG_UIC_ERROR_CODE_PHY_ADAPTER_LAYER),
++		ufshcd_readl(hba, REG_UIC_ERROR_CODE_DATA_LINK_LAYER));
++}
++
+ static int ufshcd_send_command(struct ufs_hba *hba, unsigned int task_tag)
+ {
+ 	unsigned long start;
+@@ -931,6 +964,7 @@ static int ufshcd_send_command(struct ufs_hba *hba, unsigned int task_tag)
+ 			if (get_timer(start) > QUERY_REQ_TIMEOUT) {
+ 				dev_err(hba->dev,
+ 					"Timedout waiting for UTP response\n");
++				ufshcd_log_transfer_error_once(hba, intr_status);
+ 				return -ETIMEDOUT;
+ 			}
+ 		}
+@@ -939,6 +973,7 @@ static int ufshcd_send_command(struct ufs_hba *hba, unsigned int task_tag)
+ 			dev_err(hba->dev, "Error in status:%08x\n",
+ 				enabled_intr_status);
+ 
++			ufshcd_log_transfer_error_once(hba, intr_status);
+ 			return -1;
+ 		}
+ 	} while (!(enabled_intr_status & UTP_TRANSFER_REQ_COMPL));
+@@ -1098,6 +1133,12 @@ static int ufshcd_query_flag(struct ufs_hba *hba, enum query_opcode opcode,
+ 	int err, index = 0, selector = 0;
+ 	int timeout = QUERY_REQ_TIMEOUT;
+ 
++	if (IS_ENABLED(CONFIG_SCSI_READ_ONLY) &&
++	    opcode != UPIU_QUERY_OPCODE_READ_FLAG &&
++	    !(opcode == UPIU_QUERY_OPCODE_SET_FLAG &&
++	      idn == QUERY_FLAG_IDN_FDEVICEINIT))
++		return -EROFS;
++
+ 	ufshcd_init_query(hba, &request, &response, opcode, idn, index,
+ 			  selector);
+ 
+@@ -1184,6 +1225,10 @@ int ufshcd_query_attr(struct ufs_hba *hba, enum query_opcode opcode,
+ 	struct ufs_query_res *response = NULL;
+ 	int err;
+ 
++	if (IS_ENABLED(CONFIG_SCSI_READ_ONLY) &&
++	    opcode != UPIU_QUERY_OPCODE_READ_ATTR)
++		return -EROFS;
++
+ 	if (!attr_val) {
+ 		dev_err(hba->dev,
+ 			"%s: attribute value required for opcode 0x%x\n",
+@@ -1270,6 +1315,10 @@ static int __ufshcd_query_descriptor(struct ufs_hba *hba,
+ 	struct ufs_query_res *response = NULL;
+ 	int err;
+ 
++	if (IS_ENABLED(CONFIG_SCSI_READ_ONLY) &&
++	    opcode != UPIU_QUERY_OPCODE_READ_DESC)
++		return -EROFS;
++
+ 	if (!desc_buf) {
+ 		dev_err(hba->dev, "%s: descriptor buffer required for opcode 0x%x\n",
+ 			__func__, opcode);
+@@ -1701,6 +1750,8 @@ static int ufs_scsi_exec(struct udevice *scsi_dev, struct scsi_cmd *pccb)
+ 		break;
+ 	default:
+ 		dev_err(hba->dev, "OCS error from controller = %x\n", ocs);
++		ufshcd_log_transfer_error_once(hba,
++			ufshcd_readl(hba, REG_INTERRUPT_STATUS));
+ 		return -EINVAL;
+ 	}
+ 
+@@ -1878,7 +1929,7 @@ enum ufs_ref_clk_freq ufshcd_parse_dev_ref_clk_freq(struct ufs_hba *hba, struct
+ 
+ static int ufshcd_set_dev_ref_clk(struct ufs_hba *hba)
+ {
+-	int err;
++	int err = -EINVAL;
+ 	struct clk *ref_clk;
+ 	u32 host_ref_clk_freq;
+ 	u32 dev_ref_clk_freq;
+@@ -1909,6 +1960,14 @@ static int ufshcd_set_dev_ref_clk(struct ufs_hba *hba)
+ 	if (dev_ref_clk_freq == host_ref_clk_freq)
+ 		goto out; /* nothing to update */
+ 
++	if (IS_ENABLED(CONFIG_SCSI_READ_ONLY)) {
++		dev_err(hba->dev,
++			"read-only: bRefClkFreq mismatch (device %u, host %u)\n",
++			dev_ref_clk_freq, host_ref_clk_freq);
++		err = -EROFS;
++		goto out;
++	}
++
+ 	err = ufshcd_query_attr_retry(hba, UPIU_QUERY_OPCODE_WRITE_ATTR,
+ 				      QUERY_ATTR_IDN_REF_CLK_FREQ, 0, 0, &host_ref_clk_freq);
+ 
+@@ -2152,7 +2211,9 @@ static int ufs_start(struct ufs_hba *hba)
+ 		return ret;
+ 	}
+ 
+-	ufshcd_set_dev_ref_clk(hba);
++	ret = ufshcd_set_dev_ref_clk(hba);
++	if (ret)
++		return ret;
+ 
+ 	if (ufshcd_get_max_pwr_mode(hba)) {
+ 		dev_err(hba->dev,
+@@ -2265,6 +2326,19 @@ int ufshcd_probe(struct udevice *ufs_dev, struct ufs_hba_ops *hba_ops)
+ 		return err;
+ 	}
+ 
++	if (IS_ENABLED(CONFIG_UFS_REQUIRE_LEGACY)) {
++		u32 cap = ufshcd_readl(hba, REG_CONTROLLER_CAPABILITIES);
++		u32 mode = ufshcd_readl(hba, REG_UFS_MEM_CFG);
++		dev_info(hba->dev, "legacy UTP check: CAP=%#x MEM_CFG=%#x\n",
++			 cap, mode);
++		if ((cap & MASK_LSDB_SUPPORT_REMOVED) ||
++		    (mode & MCQ_MODE_SELECT)) {
++			dev_err(hba->dev,
++				"legacy UTP unavailable or MCQ mode still selected\n");
++			return -EOPNOTSUPP;
++		}
++	}
++
+ 	err = ufs_start(hba);
+ 	if (err)
+ 		return err;
+diff --git a/drivers/ufs/ufs.h b/drivers/ufs/ufs.h
+index 0f6c93fb..e9877289 100644
+--- a/drivers/ufs/ufs.h
++++ b/drivers/ufs/ufs.h
+@@ -701,6 +701,7 @@ struct ufs_hba {
+ 	u32			capabilities;
+ 	u32			version;
+ 	u32			intr_mask;
++	bool			transfer_error_logged;
+ 	enum ufshcd_quirks	quirks;
+ 
+ 	/* Virtual memory reference */
+diff --git a/drivers/ufs/ufshci.h b/drivers/ufs/ufshci.h
+index 90cbf87a..d42baf26 100644
+--- a/drivers/ufs/ufshci.h
++++ b/drivers/ufs/ufshci.h
+@@ -68,6 +68,7 @@ enum {
+ 	MASK_CRYPTO_SUPPORT			= 0x10000000,
+ 	MASK_LSDB_SUPPORT			= 0x20000000,
+ 	MASK_MCQ_SUPPORT			= 0x40000000,
++	MASK_LSDB_SUPPORT_REMOVED = 0x20000000,
+ };
+ 
+ /* MCQ capability mask */
+diff --git a/dts/upstream/src/arm64/qcom/sm8750-oneplus-dodge.dts b/dts/upstream/src/arm64/qcom/sm8750-oneplus-dodge.dts
+index 671f976e..855d2dcc 100644
+--- a/dts/upstream/src/arm64/qcom/sm8750-oneplus-dodge.dts
++++ b/dts/upstream/src/arm64/qcom/sm8750-oneplus-dodge.dts
+@@ -2,6 +2,7 @@
+ /dts-v1/;
+ #include <dt-bindings/clock/qcom,sm8750-gcc.h>
+ #include <dt-bindings/clock/qcom,sm8750-tcsr.h>
++#include <dt-bindings/gpio/gpio.h>
+ / {
+ 	model = "OnePlus 13";
+ 	compatible = "oneplus,dodge", "qcom,sm8750";
+@@ -30,6 +31,65 @@
+ 			reg = <0 0xf204008 0 0x2004>;
+ 			#clock-cells = <1>;
+ 		};
++		ufs_ref: ufs-ref-clock {
++			compatible = "fixed-clock";
++			#clock-cells = <0>;
++			clock-frequency = <38400000>;
++		};
++		tlmm: pinctrl@f100000 {
++			compatible = "qcom,sm8750-tlmm";
++			reg = <0 0xf100000 0 0x102000>;
++			gpio-controller;
++			#gpio-cells = <2>;
++			gpio-ranges = <&tlmm 0 0 216>;
++		};
++		apps_smmu: iommu@15000000 {
++			compatible = "qcom,sm8750-smmu-500", "qcom,smmu-500", "arm,mmu-500";
++			reg = <0 0x15000000 0 0x100000>;
++			#iommu-cells = <2>;
++		};
++		ufs_phy: phy@1d80000 {
++			compatible = "qcom,sm8750-qmp-ufs-phy";
++			reg = <0 0x1d80000 0 0x2000>;
++			clocks = <&tcsrcc TCSR_UFS_CLKREF_EN>, <&ufs_ref>, <&gcc GCC_UFS_PHY_PHY_AUX_CLK>;
++			clock-names = "qref", "ref", "ref_aux";
++			assigned-clocks = <&gcc GCC_UFS_PHY_PHY_AUX_CLK>;
++			assigned-clock-rates = <19200000>;
++			power-domains = <&gcc GCC_UFS_MEM_PHY_GDSC>;
++			resets = <&ufs 0>;
++			reset-names = "ufsphy";
++			#phy-cells = <0>;
++		};
++		ufs: ufs@1d84000 {
++			compatible = "qcom,sm8750-ufshc", "qcom,ufshc", "jedec,ufs-2.0";
++			reg = <0 0x1d84000 0 0x3000>;
++			clocks = <&gcc GCC_UFS_PHY_AXI_CLK>, <&gcc GCC_AGGRE_UFS_PHY_AXI_CLK>,
++				<&gcc GCC_UFS_PHY_AHB_CLK>, <&gcc GCC_UFS_PHY_UNIPRO_CORE_CLK>,
++				<&ufs_ref>, <&gcc GCC_UFS_PHY_TX_SYMBOL_0_CLK>,
++				<&gcc GCC_UFS_PHY_RX_SYMBOL_0_CLK>, <&gcc GCC_UFS_PHY_RX_SYMBOL_1_CLK>;
++			clock-names = "core_clk", "bus_aggr_clk", "iface_clk", "core_clk_unipro",
++				"ref_clk", "tx_lane0_sync_clk", "rx_lane0_sync_clk", "rx_lane1_sync_clk";
++			assigned-clocks = <&gcc GCC_UFS_PHY_AXI_CLK>, <&gcc GCC_UFS_PHY_UNIPRO_CORE_CLK>;
++			assigned-clock-rates = <100000000>, <100000000>;
++			operating-points-v2 = <&ufs_opp>;
++			resets = <&gcc GCC_UFS_PHY_BCR>;
++			reset-names = "rst";
++			reset-gpios = <&tlmm 215 GPIO_ACTIVE_LOW>;
++			power-domains = <&gcc GCC_UFS_PHY_GDSC>;
++			iommus = <&apps_smmu 0x60 0>;
++			dma-coherent;
++			lanes-per-direction = <2>;
++			limit-hs-gear = <3>;
++			phys = <&ufs_phy>;
++			phy-names = "ufsphy";
++			#reset-cells = <1>;
++			ufs_opp: opp-table {
++				compatible = "operating-points-v2";
++				opp-100000000 {
++					opp-hz = /bits/ 64 <100000000 0 0 100000000 0 0 0 0>;
++				};
++			};
++		};
+ 		spmi: spmi@c400000 {
+ 			compatible = "qcom,spmi-pmic-arb";
+ 			reg = <0 0xc400000 0 0x3000>, <0 0xc500000 0 0x400000>,
+diff --git a/include/scsi_read_only.h b/include/scsi_read_only.h
+new file mode 100644
+index 00000000..99dc12e8
+--- /dev/null
++++ b/include/scsi_read_only.h
+@@ -0,0 +1,27 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++#ifndef __SCSI_READ_ONLY_H
++#define __SCSI_READ_ONLY_H
++/* Default-deny: these commands cannot modify media or persistent settings. */
++static inline int scsi_command_is_read_only(const unsigned char *cdb,
++					    unsigned int length)
++{
++	if (!length)
++		return 0;
++	switch (cdb[0]) {
++	case 0x00: /* TEST UNIT READY */
++	case 0x03: /* REQUEST SENSE */
++	case 0x08: /* READ(6) */
++	case 0x12: /* INQUIRY */
++	case 0x25: /* READ CAPACITY(10) */
++	case 0x28: /* READ(10) */
++	case 0x88: /* READ(16) */
++	case 0xa0: /* REPORT LUNS */
++	case 0xa8: /* READ(12) */
++		return 1;
++	case 0x9e: /* SERVICE ACTION IN: only READ CAPACITY(16) */
++		return length >= 16 && (cdb[1] & 0x1f) == 0x10;
++	default:
++		return 0;
++	}
++}
++#endif
+diff --git a/lib/efi_loader/Kconfig b/lib/efi_loader/Kconfig
+index 4cb13ae7..584bb31f 100644
+--- a/lib/efi_loader/Kconfig
++++ b/lib/efi_loader/Kconfig
+@@ -621,6 +621,13 @@ config EFI_HTTP_BOOT
+ 	  directly boot from network.
+ endmenu
+ 
++config EFI_DODGE_PROBE_COMPILE
++ bool "Build the Dodge read-only EFI diagnostic app"
++ depends on EFI_LOADER && QCOM_DODGE
++ help
++   Build dodge_probe.efi, a standalone application that reports its loaded
++   image, memory map and Block IO read-only flags, reads metadata and returns.
++
+ config BOOTEFI_HELLO_COMPILE
+ 	bool "Compile a standard EFI hello world binary for testing"
+ 	default y
+diff --git a/lib/efi_loader/Makefile b/lib/efi_loader/Makefile
+index 567db518..dd8720ab 100644
+--- a/lib/efi_loader/Makefile
++++ b/lib/efi_loader/Makefile
+@@ -15,6 +15,7 @@ CFLAGS_efi_boottime.o += \
+ # These are the apps that are built
+ apps-$(CONFIG_RISCV) += boothart
+ apps-$(CONFIG_BOOTEFI_HELLO_COMPILE) += helloworld
++apps-$(CONFIG_EFI_DODGE_PROBE_COMPILE) += dodge_probe
+ apps-$(CONFIG_GENERATE_SMBIOS_TABLE) += smbiosdump
+ apps-$(CONFIG_EFI_LOAD_FILE2_INITRD) += initrddump
+ ifeq ($(CONFIG_GENERATE_ACPI_TABLE),)
+diff --git a/lib/efi_loader/dodge_probe.c b/lib/efi_loader/dodge_probe.c
+new file mode 100644
+index 00000000..ee5b4c5c
+--- /dev/null
++++ b/lib/efi_loader/dodge_probe.c
+@@ -0,0 +1,140 @@
++// SPDX-License-Identifier: GPL-2.0+
++/* Read-only, return-to-caller UEFI protocol probe. Never writes media/variables. */
++#include <efi_api.h>
++
++static struct efi_system_table *st;
++static const efi_guid_t image_guid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
++static const efi_guid_t block_guid = EFI_BLOCK_IO_PROTOCOL_GUID;
++
++static void field(const u16 *name, u64 value)
++{
++	u16 text[19];
++	unsigned int i;
++
++	text[0] = '0';
++	text[1] = 'x';
++	for (i = 0; i < 16; i++) {
++		u32 n = (value >> (60 - i * 4)) & 15;
++		text[i + 2] = n < 10 ? '0' + n : 'a' + n - 10;
++	}
++	text[18] = 0;
++	st->con_out->output_string(st->con_out, name);
++	st->con_out->output_string(st->con_out, text);
++	st->con_out->output_string(st->con_out, u"\r\n");
++}
++
++efi_status_t EFIAPI efi_main(efi_handle_t handle,
++			     struct efi_system_table *table)
++{
++	struct efi_boot_services *bs = table->boottime;
++	struct efi_loaded_image *image;
++	struct efi_mem_desc *map = NULL, *desc;
++	efi_handle_t *handles = NULL;
++	efi_uintn_t size = 0, key, stride = 0, count = 0, i, raw = 0;
++	efi_physical_addr_t buffer = 0xefffffff;
++	efi_status_t ret;
++	u32 version, crc;
++	u64 conventional_end = 0;
++
++	st = table;
++	st->con_out->output_string(st->con_out, u"EFI-DODGE-PROBE v1\r\n");
++	ret = bs->open_protocol(handle, &image_guid, (void **)&image, handle,
++				NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL);
++	if (ret != EFI_SUCCESS)
++		goto out;
++	field(u"image_base=", (uintptr_t)image->image_base);
++	field(u"image_size=", image->image_size);
++	ret = bs->get_memory_map(&size, NULL, &key, &stride, &version);
++	if (ret != EFI_BUFFER_TOO_SMALL || !stride)
++		goto out;
++	size += 8 * stride;
++	ret = bs->allocate_pool(EFI_LOADER_DATA, size, (void **)&map);
++	if (ret != EFI_SUCCESS)
++		goto out;
++	ret = bs->get_memory_map(&size, map, &key, &stride, &version);
++	if (ret != EFI_SUCCESS)
++		goto out;
++	field(u"memory_descriptors=", size / stride);
++	for (i = 0; i < size / stride; i++) {
++		u64 end;
++		desc = (void *)((u8 *)map + i * stride);
++		if (desc->type != EFI_CONVENTIONAL_MEMORY)
++			continue;
++		end = desc->physical_start + desc->num_pages * EFI_PAGE_SIZE;
++		if (end > conventional_end)
++			conventional_end = end;
++		if (desc->physical_start < 0xc4000000 && end > 0xc0000000) {
++			ret = EFI_ABORTED;
++			goto out;
++		}
++	}
++	field(u"conventional_memory_end=", conventional_end);
++	if (conventional_end > 0xf0000000) {
++		ret = EFI_ABORTED;
++		goto out;
++	}
++	ret = bs->allocate_pages(EFI_ALLOCATE_MAX_ADDRESS, EFI_LOADER_DATA, 1,
++				 &buffer);
++	if (ret != EFI_SUCCESS) {
++		buffer = 0;
++		goto out;
++	}
++	field(u"read_buffer=", buffer);
++	if (buffer < 0x90000000 || buffer + EFI_PAGE_SIZE > 0xf0000000 ||
++	    (buffer < 0xc4000000 && buffer + EFI_PAGE_SIZE > 0xc0000000)) {
++		ret = EFI_ABORTED;
++		goto out;
++	}
++	ret = bs->locate_handle_buffer(BY_PROTOCOL, &block_guid, NULL, &count,
++				       &handles);
++	if (ret == EFI_NOT_FOUND)
++		goto out;
++	if (ret != EFI_SUCCESS)
++		goto out;
++	for (i = 0; i < count; i++) {
++		struct efi_block_io *io;
++		ret = bs->open_protocol(handles[i], &block_guid, (void **)&io,
++					handle, NULL,
++					EFI_OPEN_PROTOCOL_GET_PROTOCOL);
++		if (ret != EFI_SUCCESS)
++			goto out;
++		if (io->media->logical_partition)
++			continue;
++		field(u"raw_disk=", raw++);
++		field(u"read_only=", io->media->read_only);
++		field(u"block_size=", io->media->block_size);
++		field(u"last_block=", io->media->last_block);
++		if (!io->media->read_only || !io->media->media_present ||
++		    io->media->block_size != EFI_PAGE_SIZE ||
++		    !io->media->last_block) {
++			ret = EFI_ABORTED;
++			goto out;
++		}
++		ret = io->read_blocks(io, io->media->media_id, 0,
++				      io->media->block_size,
++				      (void *)(uintptr_t)buffer);
++		if (ret != EFI_SUCCESS)
++			goto out;
++		ret = bs->calculate_crc32((void *)(uintptr_t)buffer,
++					  io->media->block_size, &crc);
++		if (ret != EFI_SUCCESS)
++			goto out;
++		field(u"lba0_crc32=", crc);
++	}
++	if (raw != 6)
++		ret = EFI_NOT_FOUND;
++
++out:
++	field(u"raw_disks=", raw);
++	field(u"status=", ret);
++	if (handles)
++		bs->free_pool(handles);
++	if (buffer && buffer != 0xefffffff)
++		bs->free_pages(buffer, 1);
++	if (map)
++		bs->free_pool(map);
++	st->con_out->output_string(
++		st->con_out, ret == EFI_SUCCESS ? u"EFI-DODGE-PROBE PASS\r\n" :
++						  u"EFI-DODGE-PROBE FAIL\r\n");
++	return ret;
++}
+diff --git a/lib/efi_loader/efi_disk.c b/lib/efi_loader/efi_disk.c
+index 4a3ace3a..e70b8959 100644
+--- a/lib/efi_loader/efi_disk.c
++++ b/lib/efi_loader/efi_disk.c
+@@ -548,6 +548,9 @@ static efi_status_t efi_disk_add_dev(
+ 	/* Fill in EFI IO Media info (for read/write callbacks) */
+ 	diskobj->media.removable_media = desc->removable;
+ 	diskobj->media.media_present = 1;
++	/* Reflect the provider's actual capability for disks and partitions. */
++	diskobj->media.read_only =
++		!((const struct blk_ops *)dev_get_driver_ops(desc->bdev))->write;
+ 	/*
+ 	 * MediaID is just an arbitrary counter.
+ 	 * We have to change it if the medium is removed or changed.

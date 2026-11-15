@@ -43,6 +43,44 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual((files / "DIR").read_text(), "DIR")
             self.assertEqual((state / "registry/parsed_file_list.csv").read_text().splitlines(), listed)
 
+    def test_group_config_input(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("MOBILE_TEST_TMP")) as temp:
+            # Real board defaults exercise selection, nested groups and filenames.
+            source = ROOT / "pkgs/asphalt/sensors/config"
+            out = Path(temp) / "out"
+            registry.generate(source, out, "MTP", "531", "7", config_input=True)
+            configs = out / "etc/sensors/config"
+            selected = json.loads((out / "selected-configs.json").read_text())
+            self.assertEqual((configs / "json.lst").read_text().splitlines(), selected)
+            for name in selected:
+                self.assertTrue(json.loads((configs / name).read_text()))
+            self.assertEqual((configs / "json_list").read_bytes(), (configs / "json.lst").read_bytes())
+            config = (out / "etc/sensors/sns_reg_config").read_text()
+            self.assertIn("file=config=/vendor/etc/sensors/config\n", config)
+            self.assertIn("file=input=json.lst\n", config)
+            self.assertIn("file=output=/mnt/vendor/persist/sensors/registry/registry\n", config)
+            self.assertTrue((out / "seed/registry/registry/bmi3x0_0_platform.orient").is_file())
+            # GROUP metadata names the plain group files read by the firmware,
+            # independently of config input filenames or directory/version markers.
+            files = out / "seed/registry/registry"
+            parsed_list = out / "seed/registry/parsed_file_list.csv"
+            listed = parsed_list.read_text().splitlines()
+            self.assertEqual(set(listed), {file.name for file in files.iterdir()})
+            self.assertEqual(len(listed), len(set(listed)))
+            self.assertIn("bmi3x0_0_platform.orient", listed)
+            self.assertNotIn("DIR", listed)
+            self.assertNotIn("sns_reg_version", listed)
+            for name in listed:
+                self.assertEqual(list(json.loads((files / name).read_text())), [name])
+            before = parsed_list.read_bytes()
+            registry.normalize_state(out / "seed")
+            self.assertEqual(parsed_list.read_bytes(), before)
+            plain = Path(temp) / "plain"
+            registry.generate(source, plain, "MTP", "531", "7")
+            self.assertNotIn("file=input=", (plain / "etc/sensors/sns_reg_config").read_text())
+            self.assertNotIn("file=config=", (plain / "etc/sensors/sns_reg_config").read_text())
+            self.assertFalse((plain / "seed/registry/parsed_file_list.csv").exists())
+
     def test_board_defaults(self):
         for board, platform, soc, version, sensor, axes in (
             ("asphalt", "MTP", "531", "7", "bmi3x0", [-1, 1, -1]),

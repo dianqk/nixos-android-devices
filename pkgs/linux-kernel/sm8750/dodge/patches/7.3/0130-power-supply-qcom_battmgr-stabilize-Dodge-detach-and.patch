@@ -1,0 +1,373 @@
+From 1c7d82fc03c0f7198b539b31dc36e72f9a792ecc Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 11 Nov 2026 10:25:00 +0800
+Subject: [PATCH 135/144] power: supply: qcom_battmgr: stabilize Dodge detach
+ and CID handling
+
+Consolidate detach policy, CID settling, fresh disable and debounce handling.
+
+Consolidated from local follow-ups:
+  3b96b023e1087c987d8c44a311a201bd587d36e8 power: supply: qcom_battmgr: handle Dodge Type-C detach
+  6f0b2685386b7ec9d6a75c94f51b1d62f2061cc9 power: supply: qcom_battmgr: wait for Dodge CID to settle
+  08b143a89077c955744cc9fdbd9f9b6346e6f287 power: supply: qcom_battmgr: honor fresh Dodge OTG disable
+  937d1a187456759f5e59cb174929e815d74f0eae power: supply: qcom_battmgr: complete Dodge detached CID policy
+  ef0b5c361fc157714db2a7b9b0654aa0705b5dd8 power: supply: qcom_battmgr: debounce Dodge CID events
+---
+ drivers/power/supply/qcom_battmgr.c | 179 +++++++++++++++++++++++++---
+ 1 file changed, 165 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 8baf6e1b1b..f245e6c283 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -36,15 +36,20 @@ enum qcom_battmgr_variant {
+ 
+ /* OnePlus ADSP USB properties and notifications (non-SoCCP protocol). */
+ #define DODGE_USB_OTG_AP_ENABLE		17
++#define DODGE_USB_OTG_SWITCH		18
+ #define DODGE_USB_OTG_VBUS_ENABLE		24
+ #define DODGE_USB_OTG_BOOST_CURRENT	64
+ #define DODGE_USB_CID_STATUS		21
+ #define DODGE_USB_TYPEC_MODE		22
+ #define DODGE_USB_CCDETECT_HAPPENED	31
+ #define DODGE_TYPEC_MODE_DRP		0
++#define DODGE_TYPEC_MODE_SINK		1
++#define DODGE_CID_SETTLE_MS		55
++#define DODGE_CID_DEBOUNCE_MS		50
+ #define DODGE_NOTIF_OTG_ENABLE		0x50
+ #define DODGE_NOTIF_OTG_DISABLE		0x51
+ #define DODGE_NOTIF_CID_DETECT		0x53
++#define DODGE_NOTIF_TYPEC_STATE_CHANGE	0x55
+ #define DODGE_NOTIF_PD_SOFT_RESET	0x5a
+ #define DODGE_NOTIF_PD_SOURCECAP_DONE	0x79
+ #define DODGE_BATT_SET_PDO		25
+@@ -390,10 +395,15 @@ struct qcom_battmgr {
+ 	/* Callbacks cannot sleep; firmware requests are serialized by lock. */
+ 	spinlock_t dodge_otg_lock;
+ 	struct delayed_work dodge_otg_work;
+-	struct work_struct dodge_cid_work;
++	struct delayed_work dodge_cid_work;
+ 	u32 dodge_cid_sequence;
++	unsigned long dodge_cid_deadline;
+ 	bool dodge_cid_pending;
+ 	bool dodge_cid_retried;
++	struct delayed_work dodge_typec_work;
++	u32 dodge_typec_sequence;
++	bool dodge_typec_pending;
++	bool dodge_typec_retried;
+ 	u32 dodge_otg_epoch;
+ 	struct completion dodge_otg_ack;
+ 	u32 dodge_otg_opcode;
+@@ -407,6 +417,7 @@ struct qcom_battmgr {
+ 	bool dodge_otg_stopping;
+ 	bool dodge_otg_prohibited;
+ 	bool dodge_power_ambiguous;
++	bool dodge_power_off_pending;
+ 	/* Power state below is owned by lock, never changed by callbacks. */
+ 	enum qcom_battmgr_dodge_power_state dodge_power_state;
+ 	u32 dodge_power_generation;
+@@ -2273,13 +2284,17 @@ static int qcom_battmgr_dodge_power_off(struct qcom_battmgr *battmgr, u32 genera
+ 		.property = cpu_to_le32(DODGE_USB_OTG_VBUS_ENABLE),
+ 	};
+ 	unsigned long flags;
+-	bool ambiguous, connected;
++	bool ambiguous, connected, off_pending;
+ 	int ret;
+ 
+ 	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
+ 	ambiguous = battmgr->dodge_power_ambiguous;
+ 	connected = battmgr->service_up &&
+ 		generation == battmgr->dodge_service_generation;
++	/* Consume only this service's obligation; a new disable can arrive in flight. */
++	off_pending = connected && battmgr->dodge_power_off_pending;
++	if (connected)
++		battmgr->dodge_power_off_pending = false;
+ 	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
+ 	if (!connected) {
+ 		battmgr->dodge_power_state = DODGE_POWER_UNKNOWN;
+@@ -2287,7 +2302,7 @@ static int qcom_battmgr_dodge_power_off(struct qcom_battmgr *battmgr, u32 genera
+ 	}
+ 	if (battmgr->dodge_power_generation != generation)
+ 		battmgr->dodge_power_state = DODGE_POWER_UNKNOWN;
+-	if (battmgr->dodge_power_state == DODGE_POWER_OFF && !ambiguous)
++	if (battmgr->dodge_power_state == DODGE_POWER_OFF && !ambiguous && !off_pending)
+ 		return 0;
+ 	if (battmgr->dodge_power_emergency_sent &&
+ 	    battmgr->dodge_power_emergency_generation == generation)
+@@ -2365,12 +2380,15 @@ static bool qcom_battmgr_dodge_cid_current(struct qcom_battmgr *battmgr,
+ 	return valid;
+ }
+ 
++static bool qcom_battmgr_dodge_typec_current(struct qcom_battmgr *battmgr,
++					   u32 generation, u32 epoch, u32 sequence);
++
+ static void qcom_battmgr_dodge_cid_worker(struct work_struct *work)
+ {
+-	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr,
+-						 dodge_cid_work);
+-	unsigned long flags;
+-	u32 generation, epoch, sequence, cid, mode;
++	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
++						 struct qcom_battmgr, dodge_cid_work);
++	unsigned long flags, now;
++	u32 generation, epoch, sequence, typec_sequence, cid, mode;
+ 	int ret = 0, ack_ret;
+ 
+ 	mutex_lock(&battmgr->lock);
+@@ -2378,12 +2396,21 @@ static void qcom_battmgr_dodge_cid_worker(struct work_struct *work)
+ 	generation = battmgr->dodge_service_generation;
+ 	epoch = battmgr->dodge_otg_epoch;
+ 	sequence = battmgr->dodge_cid_sequence;
++	typec_sequence = battmgr->dodge_typec_sequence;
+ 	if (!battmgr->dodge_cid_pending || !battmgr->dodge_otg_ready ||
+ 	    !battmgr->service_up || battmgr->dodge_otg_stopping ||
+ 	    battmgr->dodge_otg_broken) {
+ 		spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
+ 		goto out;
+ 	}
++	now = jiffies;
++	/* A fresh event may have restarted debounce while this callback waited for lock. */
++	if (time_before(now, battmgr->dodge_cid_deadline)) {
++		mod_delayed_work(system_percpu_wq, &battmgr->dodge_cid_work,
++				 battmgr->dodge_cid_deadline - now);
++		spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++		goto unlock;
++	}
+ 	battmgr->dodge_cid_pending = false;
+ 	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
+ 
+@@ -2397,8 +2424,24 @@ static void qcom_battmgr_dodge_cid_worker(struct work_struct *work)
+ 	if (cid > 1 || !qcom_battmgr_dodge_cid_current(battmgr,
+ 						generation, epoch, sequence))
+ 		goto out;
+-	if (!cid)
++	if (!cid) {
++		/* Complete the OEM detached policy before acknowledging detection. */
++		if (!qcom_battmgr_dodge_typec_current(battmgr,
++						generation, epoch, typec_sequence))
++			goto acknowledge;
++		ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_USB_PROPERTY_GET,
++					DODGE_USB_OTG_SWITCH, 0, generation);
++		if (ret || battmgr->dodge_otg_value != 0 ||
++		    !qcom_battmgr_dodge_typec_current(battmgr,
++						generation, epoch, typec_sequence))
++			goto acknowledge;
++		ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_USB_PROPERTY_SET,
++					DODGE_USB_TYPEC_MODE, DODGE_TYPEC_MODE_SINK, generation);
++		if (!ret)
++			dev_info_ratelimited(battmgr->dev,
++					     "restored Type-C sink before CID completion\n");
+ 		goto acknowledge;
++	}
+ 	ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_USB_PROPERTY_GET,
+ 				DODGE_USB_TYPEC_MODE, 0, generation);
+ 	if (ret)
+@@ -2438,14 +2481,92 @@ static void qcom_battmgr_dodge_cid_worker(struct work_struct *work)
+ 	    !battmgr->dodge_otg_broken && !battmgr->dodge_cid_retried) {
+ 		battmgr->dodge_cid_pending = true;
+ 		battmgr->dodge_cid_retried = true;
+-		schedule_work(&battmgr->dodge_cid_work);
++		battmgr->dodge_cid_deadline = jiffies +
++			msecs_to_jiffies(DODGE_CID_DEBOUNCE_MS);
++		mod_delayed_work(system_percpu_wq, &battmgr->dodge_cid_work,
++				 msecs_to_jiffies(DODGE_CID_DEBOUNCE_MS));
+ 	}
+ 	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++unlock:
+ 	mutex_unlock(&battmgr->lock);
+ 	if (ret)
+ 		dev_warn_ratelimited(battmgr->dev, "CID attach handling failed: %d\n", ret);
+ }
+ 
++static bool qcom_battmgr_dodge_typec_current(struct qcom_battmgr *battmgr,
++					   u32 generation, u32 epoch, u32 sequence)
++{
++	unsigned long flags;
++	bool valid;
++
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	valid = battmgr->service_up && battmgr->dodge_otg_ready &&
++		!battmgr->dodge_otg_stopping && !battmgr->dodge_otg_broken &&
++		!battmgr->dodge_otg_requested &&
++		generation == battmgr->dodge_service_generation &&
++		epoch == battmgr->dodge_otg_epoch &&
++		sequence == battmgr->dodge_typec_sequence;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	return valid;
++}
++
++static void qcom_battmgr_dodge_typec_worker(struct work_struct *work)
++{
++	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
++						 struct qcom_battmgr, dodge_typec_work);
++	unsigned long flags;
++	u32 generation, epoch, sequence;
++	int ret = 0;
++
++	mutex_lock(&battmgr->lock);
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	generation = battmgr->dodge_service_generation;
++	epoch = battmgr->dodge_otg_epoch;
++	sequence = battmgr->dodge_typec_sequence;
++	if (!battmgr->dodge_typec_pending || !battmgr->dodge_otg_ready ||
++	    !battmgr->service_up || battmgr->dodge_otg_stopping ||
++	    battmgr->dodge_otg_broken) {
++		spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++		goto out;
++	}
++	battmgr->dodge_typec_pending = false;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++
++	ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_USB_PROPERTY_GET,
++				DODGE_USB_CID_STATUS, 0, generation);
++	if (ret || battmgr->dodge_otg_value != 0 ||
++	    !qcom_battmgr_dodge_typec_current(battmgr, generation, epoch, sequence))
++		goto out;
++	ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_USB_PROPERTY_GET,
++				DODGE_USB_OTG_SWITCH, 0, generation);
++	if (ret || battmgr->dodge_otg_value != 0 ||
++	    !qcom_battmgr_dodge_typec_current(battmgr, generation, epoch, sequence))
++		goto out;
++	/* OEM Type-C state work selects sink only after detach with OTG disabled. */
++	ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_USB_PROPERTY_SET,
++				DODGE_USB_TYPEC_MODE, DODGE_TYPEC_MODE_SINK, generation);
++	if (!ret)
++		dev_info_ratelimited(battmgr->dev, "restored Type-C sink after detach\n");
++out:
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	/* Recheck once if a concurrent power event invalidated the observation. */
++	if (!ret && generation == battmgr->dodge_service_generation &&
++	    sequence == battmgr->dodge_typec_sequence &&
++	    epoch != battmgr->dodge_otg_epoch && battmgr->service_up &&
++	    battmgr->dodge_otg_ready && !battmgr->dodge_otg_stopping &&
++	    !battmgr->dodge_otg_broken && !battmgr->dodge_otg_requested &&
++	    !battmgr->dodge_typec_retried) {
++		battmgr->dodge_typec_pending = true;
++		battmgr->dodge_typec_retried = true;
++		mod_delayed_work(system_percpu_wq, &battmgr->dodge_typec_work,
++				 msecs_to_jiffies(DODGE_CID_SETTLE_MS));
++	}
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	mutex_unlock(&battmgr->lock);
++	if (ret)
++		dev_warn_ratelimited(battmgr->dev, "Type-C detach handling failed: %d\n", ret);
++}
++
+ static bool qcom_battmgr_dodge_otg_allowed(struct qcom_battmgr *battmgr,
+ 					 u32 generation, u32 epoch)
+ {
+@@ -2495,17 +2616,19 @@ static void qcom_battmgr_dodge_otg_worker(struct work_struct *work)
+ 	union power_supply_propval soc, current_sample;
+ 	unsigned long flags;
+ 	u32 generation, epoch, limit;
++	bool off_pending;
+ 	int ret = 0;
+ 
+ 	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
+ 	generation = battmgr->dodge_service_generation;
+ 	epoch = battmgr->dodge_otg_epoch;
++	off_pending = battmgr->dodge_power_off_pending;
+ 	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
+ 	mutex_lock(&battmgr->lock);
+ 	if (!qcom_battmgr_dodge_otg_allowed(battmgr, generation, epoch))
+ 		goto off;
+ 	/* Drain a raced OFF before honoring a later ON or wireless recheck. */
+-	if (battmgr->dodge_power_generation != generation ||
++	if (off_pending || battmgr->dodge_power_generation != generation ||
+ 	    (battmgr->dodge_power_state == DODGE_POWER_ON &&
+ 	     battmgr->dodge_power_epoch != epoch)) {
+ 		ret = qcom_battmgr_dodge_power_off(battmgr, generation);
+@@ -2627,16 +2750,31 @@ static bool qcom_battmgr_dodge_otg_notification(struct qcom_battmgr *battmgr,
+ 		battmgr->dodge_pd_revision++;
+ 		break;
+ 	case DODGE_NOTIF_CID_DETECT:
++		battmgr->dodge_typec_sequence++;
+ 		battmgr->dodge_cid_sequence++;
+ 		battmgr->dodge_cid_pending = true;
+ 		battmgr->dodge_cid_retried = false;
+-		schedule_work(&battmgr->dodge_cid_work);
++		battmgr->dodge_cid_deadline = jiffies +
++			msecs_to_jiffies(DODGE_CID_DEBOUNCE_MS);
++		mod_delayed_work(system_percpu_wq, &battmgr->dodge_cid_work,
++				 msecs_to_jiffies(DODGE_CID_DEBOUNCE_MS));
++		handled = true;
++		break;
++	case DODGE_NOTIF_TYPEC_STATE_CHANGE:
++		/* CID can still report attached here; use the OEM settled-state interval. */
++		battmgr->dodge_typec_sequence++;
++		battmgr->dodge_typec_pending = true;
++		battmgr->dodge_typec_retried = false;
++		mod_delayed_work(system_percpu_wq, &battmgr->dodge_typec_work,
++				 msecs_to_jiffies(DODGE_CID_SETTLE_MS));
+ 		handled = true;
+ 		break;
+ 	case DODGE_NOTIF_OTG_ENABLE:
+ 	case DODGE_NOTIF_OTG_DISABLE:
+ 		battmgr->dodge_otg_requested = notification == DODGE_NOTIF_OTG_ENABLE;
+ 		if (!battmgr->dodge_otg_requested) {
++			/* PD source power can have changed without an AP enable request. */
++			battmgr->dodge_power_off_pending = true;
+ 			battmgr->dodge_otg_prohibited = false;
+ 			battmgr->dodge_otg_epoch++;
+ 		}
+@@ -2753,10 +2891,16 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
+ 		    generation == battmgr->dodge_service_generation &&
+ 		    !battmgr->dodge_otg_stopping) {
+ 			battmgr->dodge_otg_ready = true;
++			if (battmgr->dodge_typec_pending)
++				mod_delayed_work(system_percpu_wq, &battmgr->dodge_typec_work,
++						 msecs_to_jiffies(DODGE_CID_SETTLE_MS));
+ 			/* A cable present before subscription may not emit a fresh CID event. */
+ 			battmgr->dodge_cid_pending = true;
+ 			battmgr->dodge_cid_retried = false;
+-			schedule_work(&battmgr->dodge_cid_work);
++			battmgr->dodge_cid_deadline = jiffies +
++				msecs_to_jiffies(DODGE_CID_DEBOUNCE_MS);
++			mod_delayed_work(system_percpu_wq, &battmgr->dodge_cid_work,
++					 msecs_to_jiffies(DODGE_CID_DEBOUNCE_MS));
+ 			mod_delayed_work(system_percpu_wq, &battmgr->dodge_otg_work, 0);
+ 		}
+ 		spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
+@@ -2780,10 +2924,13 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
+ 			battmgr->dodge_pd_attempted = false;
+ 			battmgr->dodge_pd_broken = false;
+ 			battmgr->dodge_otg_ready = false;
++			battmgr->dodge_typec_pending = false;
++			battmgr->dodge_typec_sequence++;
+ 			battmgr->dodge_cid_pending = false;
+ 			battmgr->dodge_cid_sequence++;
+ 			battmgr->dodge_otg_epoch++;
+ 			battmgr->dodge_otg_requested = false;
++			battmgr->dodge_power_off_pending = false;
+ 			battmgr->dodge_otg_broken = false;
+ 			battmgr->dodge_power_ambiguous = false;
+ 			battmgr->dodge_otg_prohibited = false;
+@@ -2934,7 +3081,8 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 
+ 	if (battmgr->variant == QCOM_BATTMGR_DODGE) {
+ 		init_completion(&battmgr->dodge_otg_ack);
+-		INIT_WORK(&battmgr->dodge_cid_work, qcom_battmgr_dodge_cid_worker);
++		INIT_DELAYED_WORK(&battmgr->dodge_cid_work, qcom_battmgr_dodge_cid_worker);
++		INIT_DELAYED_WORK(&battmgr->dodge_typec_work, qcom_battmgr_dodge_typec_worker);
+ 		INIT_DELAYED_WORK(&battmgr->dodge_otg_work,
+ 				  qcom_battmgr_dodge_otg_worker);
+ 	}
+@@ -2962,6 +3110,8 @@ static void qcom_battmgr_remove(struct auxiliary_device *adev)
+ 	/* Keep the client alive while in-flight requests drain and OFF is sent. */
+ 	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
+ 	battmgr->dodge_otg_stopping = true;
++	battmgr->dodge_typec_pending = false;
++	battmgr->dodge_typec_sequence++;
+ 	battmgr->dodge_cid_pending = false;
+ 	battmgr->dodge_cid_sequence++;
+ 	battmgr->dodge_otg_ready = false;
+@@ -2969,7 +3119,8 @@ static void qcom_battmgr_remove(struct auxiliary_device *adev)
+ 	battmgr->dodge_otg_epoch++;
+ 	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
+ 	cancel_work_sync(&battmgr->enable_work);
+-	cancel_work_sync(&battmgr->dodge_cid_work);
++	cancel_delayed_work_sync(&battmgr->dodge_cid_work);
++	cancel_delayed_work_sync(&battmgr->dodge_typec_work);
+ 	cancel_delayed_work_sync(&battmgr->dodge_otg_work);
+ 	mutex_lock(&battmgr->lock);
+ 	qcom_battmgr_dodge_power_off(battmgr,

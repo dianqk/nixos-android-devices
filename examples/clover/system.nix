@@ -1,7 +1,6 @@
 { ... }:
 {
   imports = [
-    ./baseline.nix
     ../desktop.nix
     ../usb-network.nix
   ];

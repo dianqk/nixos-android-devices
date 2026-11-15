@@ -78,6 +78,11 @@ static int ab_open(struct ab_state *s, enum ab_purpose purpose)
 	int ret, matches = 0;
 	memset(s, 0, sizeof(*s));
 	s->ops = &ab_block_ops;
+#ifdef CONFIG_EFI_MOBILE_QCOM_AB_NON_SLOT_NAMES
+	s->non_slot_names = CONFIG_EFI_MOBILE_QCOM_AB_NON_SLOT_NAMES;
+#endif
+	/* Android/recovery switches still require identical GPT copies. */
+	s->tolerate_stale_backup = purpose == AB_CONFIRM;
 	ab_ufs = NULL;
 	ret = uclass_get(UCLASS_UFS, &ufs_class);
 	if (ret)
@@ -163,6 +168,9 @@ static int ab_open(struct ab_state *s, enum ab_purpose purpose)
 			printf("Mobile boot action: LUN %u GPT validation failed (%d)\n", d->lun, ret);
 			return ret;
 		}
+		if (s->disk[s->disks - 1].stale_backup)
+			printf("Mobile boot action: LUN %u backup GPT differs only in slot metadata; primary is authoritative\n",
+			       d->lun);
 	}
 	if (!enabled || seen != enabled)
 		return -ENODEV; /* An unscanned/missing LUN must never be omitted. */

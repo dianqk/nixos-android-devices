@@ -1,0 +1,337 @@
+From e7c61160be0c483a7a4df520f4d20b002d7940c4 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 31 Oct 2026 19:50:55 +0800
+Subject: [PATCH] arm64: dts: qcom: sdm660-xiaomi-clover: Enable CPU frequency
+ scaling
+
+Enable the CPRh, the OSM and the L2 SAWs, link the CPUs to their CPRh
+thread and OSM frequency domain, and add the speed bin 1 corner plan of
+the vendor kernel:
+
+- silver: 300, 633.6, 902.4, 1113.6, 1401.6, 1536, 1747.2, 1843.2 MHz
+- gold: 300, 1113.6, 1401.6, 1747.2, 1958.4, 2150.4, 2208 MHz
+
+with the vendor PLL override and MEM-ACC level of each OSM LUT row and
+the fuse corner of each CPRh corner.
+
+The CPU OPP tables are not opp-shared. Attaching a CPU to the CPRh
+domain fills an OPP table for the virtual device of the attachment, and
+the genpd core then links the CPU device to that domain through
+dev_pm_opp_set_config(), which refuses an OPP table that already holds
+OPPs. A shared table would be the same, already filled table. cpufreq
+marks the CPUs of each cluster as sharing their table instead.
+
+The OSM gets the full table, but LUT entries above 868 mV stay out of the
+cpufreq table (qcom,lut-max-microvolt): above the 872 mV APM threshold
+the memory arrays switch from MX to the APC supply, which is not
+validated yet. This limits silver to 1536 MHz and gold to 1747.2 MHz;
+deleting the property enables the remaining frequencies.
+
+Scope: Clover
+Porting notes: Local device tree addition (not upstream). Tables from the vendor crDroid 4.19 arch/arm64/boot/dts/vendor/qcom/sdm660.dtsi (qcom,pwrcl-speedbin1-v0, qcom,perfcl-speedbin1-v0) and sdm660-regulator.dtsi (qcom,cpr-corner-fmax-map).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../dts/qcom/sdm660-xiaomi-clover-common.dtsi | 268 ++++++++++++++++++
+ 1 file changed, 268 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm660-xiaomi-clover-common.dtsi b/arch/arm64/boot/dts/qcom/sdm660-xiaomi-clover-common.dtsi
+index 8f882a3ea7..6cea3b0747 100644
+--- a/arch/arm64/boot/dts/qcom/sdm660-xiaomi-clover-common.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm660-xiaomi-clover-common.dtsi
+@@ -161,6 +161,193 @@ zap_shader_region: gpu@f0b00000 {
+ 			no-map;
+ 		};
+ 	};
++	/*
++	 * CPRh corners of the speed bin 1 corner plan. Each level gives the
++	 * fuse corner of the <silver gold> thread; gold uses levels 1 to 7.
++	 */
++	cprh_opp_table: opp-table-cprh {
++		compatible = "operating-points-v2-qcom-level";
++		opp-shared;
++
++		cprh_opp1: opp-1 {
++			opp-level = <1>;
++			qcom,opp-fuse-level = <1 1>;
++			qcom,opp-oloop-vadj = <0 0>;
++			qcom,opp-cloop-vadj = <0 0>;
++		};
++
++		cprh_opp2: opp-2 {
++			opp-level = <2>;
++			qcom,opp-fuse-level = <1 1>;
++			qcom,opp-oloop-vadj = <0 0>;
++			qcom,opp-cloop-vadj = <0 0>;
++		};
++
++		cprh_opp3: opp-3 {
++			opp-level = <3>;
++			qcom,opp-fuse-level = <2 2>;
++			qcom,opp-oloop-vadj = <0 0>;
++			qcom,opp-cloop-vadj = <0 0>;
++		};
++
++		cprh_opp4: opp-4 {
++			opp-level = <4>;
++			qcom,opp-fuse-level = <3 3>;
++			qcom,opp-oloop-vadj = <0 0>;
++			qcom,opp-cloop-vadj = <0 0>;
++		};
++
++		cprh_opp5: opp-5 {
++			opp-level = <5>;
++			qcom,opp-fuse-level = <4 4>;
++			qcom,opp-oloop-vadj = <0 0>;
++			qcom,opp-cloop-vadj = <0 0>;
++		};
++
++		cprh_opp6: opp-6 {
++			opp-level = <6>;
++			qcom,opp-fuse-level = <5 4>;
++			qcom,opp-oloop-vadj = <0 0>;
++			qcom,opp-cloop-vadj = <0 0>;
++		};
++
++		cprh_opp7: opp-7 {
++			opp-level = <7>;
++			qcom,opp-fuse-level = <5 5>;
++			qcom,opp-oloop-vadj = <0 0>;
++			qcom,opp-cloop-vadj = <0 0>;
++		};
++
++		cprh_opp8: opp-8 {
++			opp-level = <8>;
++			qcom,opp-fuse-level = <5 5>;
++			qcom,opp-oloop-vadj = <0 0>;
++			qcom,opp-cloop-vadj = <0 0>;
++		};
++	};
++
++	/*
++	 * The CPU OPP tables are not opp-shared: the CPRh fills its own copy
++	 * when a CPU attaches to its power domain, and cpufreq marks the CPUs
++	 * of a cluster as sharing their table.
++	 */
++
++	/* Speed bin 1 OSM LUT of the gold cluster: PLL override, MEM-ACC level */
++	gold_cpu_opp_table: opp-table-gold {
++		compatible = "operating-points-v2";
++
++		opp-300000000 {
++			opp-hz = /bits/ 64 <300000000>;
++			required-opps = <&cprh_opp1>;
++			qcom,pll-override = <0x01200020>;
++			qcom,spare-data = <1>;
++		};
++
++		opp-1113600000 {
++			opp-hz = /bits/ 64 <1113600000>;
++			required-opps = <&cprh_opp2>;
++			qcom,pll-override = <0x052e002e>;
++			qcom,spare-data = <1>;
++		};
++
++		opp-1401600000 {
++			opp-hz = /bits/ 64 <1401600000>;
++			required-opps = <&cprh_opp3>;
++			qcom,pll-override = <0x073a003a>;
++			qcom,spare-data = <2>;
++		};
++
++		opp-1747200000 {
++			opp-hz = /bits/ 64 <1747200000>;
++			required-opps = <&cprh_opp4>;
++			qcom,pll-override = <0x09480048>;
++			qcom,spare-data = <2>;
++		};
++
++		opp-1958400000 {
++			opp-hz = /bits/ 64 <1958400000>;
++			required-opps = <&cprh_opp5>;
++			qcom,pll-override = <0x0a510051>;
++			qcom,spare-data = <2>;
++		};
++
++		opp-2150400000 {
++			opp-hz = /bits/ 64 <2150400000>;
++			required-opps = <&cprh_opp6>;
++			qcom,pll-override = <0x0b590059>;
++			qcom,spare-data = <2>;
++		};
++
++		opp-2208000000 {
++			opp-hz = /bits/ 64 <2208000000>;
++			required-opps = <&cprh_opp7>;
++			qcom,pll-override = <0x0b5c005c>;
++			qcom,spare-data = <3>;
++		};
++	};
++
++	/* Speed bin 1 OSM LUT of the silver cluster: PLL override, MEM-ACC level */
++	silver_cpu_opp_table: opp-table-silver {
++		compatible = "operating-points-v2";
++
++		opp-300000000 {
++			opp-hz = /bits/ 64 <300000000>;
++			required-opps = <&cprh_opp1>;
++			qcom,pll-override = <0x01200020>;
++			qcom,spare-data = <1>;
++		};
++
++		opp-633600000 {
++			opp-hz = /bits/ 64 <633600000>;
++			required-opps = <&cprh_opp2>;
++			qcom,pll-override = <0x03200020>;
++			qcom,spare-data = <1>;
++			qcom,pll-div = <1>;
++		};
++
++		opp-902400000 {
++			opp-hz = /bits/ 64 <902400000>;
++			required-opps = <&cprh_opp3>;
++			qcom,pll-override = <0x04260026>;
++			qcom,spare-data = <1>;
++		};
++
++		opp-1113600000 {
++			opp-hz = /bits/ 64 <1113600000>;
++			required-opps = <&cprh_opp4>;
++			qcom,pll-override = <0x052e002e>;
++			qcom,spare-data = <2>;
++		};
++
++		opp-1401600000 {
++			opp-hz = /bits/ 64 <1401600000>;
++			required-opps = <&cprh_opp5>;
++			qcom,pll-override = <0x073a003a>;
++			qcom,spare-data = <2>;
++		};
++
++		opp-1536000000 {
++			opp-hz = /bits/ 64 <1536000000>;
++			required-opps = <&cprh_opp6>;
++			qcom,pll-override = <0x08400040>;
++			qcom,spare-data = <2>;
++		};
++
++		opp-1747200000 {
++			opp-hz = /bits/ 64 <1747200000>;
++			required-opps = <&cprh_opp7>;
++			qcom,pll-override = <0x09480048>;
++			qcom,spare-data = <2>;
++		};
++
++		opp-1843200000 {
++			opp-hz = /bits/ 64 <1843200000>;
++			required-opps = <&cprh_opp8>;
++			qcom,pll-override = <0x094c004c>;
++			qcom,spare-data = <3>;
++		};
++	};
++
+ };
+ 
+ &adreno_gpu {
+@@ -172,6 +359,12 @@ &adreno_gpu_zap {
+ 	memory-region = <&zap_shader_region>;
+ };
+ 
++&apc_cprh {
++	operating-points-v2 = <&cprh_opp_table>;
++
++	status = "okay";
++};
++
+ &blsp2_uart1 {
+ 	status = "okay";
+ 
+@@ -185,6 +378,73 @@ bluetooth {
+ 	};
+ };
+ 
++&cpu0 {
++	operating-points-v2 = <&gold_cpu_opp_table>;
++	power-domains = <&apc_cprh 1>;
++	power-domain-names = "perf";
++	qcom,freq-domain = <&cpufreq_hw 1>;
++};
++
++&cpu1 {
++	operating-points-v2 = <&gold_cpu_opp_table>;
++	power-domains = <&apc_cprh 1>;
++	power-domain-names = "perf";
++	qcom,freq-domain = <&cpufreq_hw 1>;
++};
++
++&cpu2 {
++	operating-points-v2 = <&gold_cpu_opp_table>;
++	power-domains = <&apc_cprh 1>;
++	power-domain-names = "perf";
++	qcom,freq-domain = <&cpufreq_hw 1>;
++};
++
++&cpu3 {
++	operating-points-v2 = <&gold_cpu_opp_table>;
++	power-domains = <&apc_cprh 1>;
++	power-domain-names = "perf";
++	qcom,freq-domain = <&cpufreq_hw 1>;
++};
++
++&cpu4 {
++	operating-points-v2 = <&silver_cpu_opp_table>;
++	power-domains = <&apc_cprh 0>;
++	power-domain-names = "perf";
++	qcom,freq-domain = <&cpufreq_hw 0>;
++};
++
++&cpu5 {
++	operating-points-v2 = <&silver_cpu_opp_table>;
++	power-domains = <&apc_cprh 0>;
++	power-domain-names = "perf";
++	qcom,freq-domain = <&cpufreq_hw 0>;
++};
++
++&cpu6 {
++	operating-points-v2 = <&silver_cpu_opp_table>;
++	power-domains = <&apc_cprh 0>;
++	power-domain-names = "perf";
++	qcom,freq-domain = <&cpufreq_hw 0>;
++};
++
++&cpu7 {
++	operating-points-v2 = <&silver_cpu_opp_table>;
++	power-domains = <&apc_cprh 0>;
++	power-domain-names = "perf";
++	qcom,freq-domain = <&cpufreq_hw 0>;
++};
++
++&cpufreq_hw {
++	/*
++	 * Keep the LUT entries that need the APC array supply (above the
++	 * 872 mV APM threshold) unused: silver up to 1536 MHz and gold up
++	 * to 1747.2 MHz.
++	 */
++	qcom,lut-max-microvolt = <868000>;
++
++	status = "okay";
++};
++
+ &mdss {
+ 	status = "okay";
+ };
+@@ -607,6 +867,14 @@ vreg_l19a_3p3: l19 {
+ 	};
+ };
+ 
++&saw_gold_l2 {
++	status = "okay";
++};
++
++&saw_silver_l2 {
++	status = "okay";
++};
++
+ &sdc2_state_on {
+ 	sd-cd-pins {
+ 		pins = "gpio54";

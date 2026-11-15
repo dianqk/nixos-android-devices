@@ -1,0 +1,162 @@
+From b70b3b050946ef58e8c3ee2ddb652bda5d268cf1 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 1 Nov 2026 20:32:11 +0800
+Subject: [PATCH] arm64: dts: qcom: aurora: wire the IMX858 ultra-wide
+ camera
+
+Enable CCI0 and CAMSS for the ultra-wide Sony IMX858 at 0x1a on CCI0
+bus 0, connected to CSIPHY1 with four D-PHY lanes (link frequency
+1249.92 MHz), as in the stock Aurora camera description:
+
+- MCLK1 on gpio101 at 19.2 MHz (stock 4 mA drive), reset on gpio109
+  (active low).
+- AVDD 2.8 V from the external LDO enabled by gpio126, DVDD 1.104 V
+  from PM8010 L2N and DOVDD 1.8 V from PM8010 L5N. BOB2 supplies the
+  AVDD LDO (it comes up first in the stock sequence) and, as on the
+  SM8650 QRD, L5N.
+- The sensor sits in the camera top GDSC power domain, which gates
+  MCLK1.
+- CSIPHY0/1 supplies: PM8550VE L2I (0.88 V) and L3I (1.2 V).
+- Rear camera, rotation 90 (stock sensor position roll).
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ .../boot/dts/qcom/sm8650-xiaomi-aurora.dts    | 128 ++++++++++++++++++
+ 1 file changed, 128 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts b/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
+index 11a392f370..3ade6d55c5 100644
+--- a/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
++++ b/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
+@@ -881,3 +881,131 @@ &usb_dp_qmpphy_out {
+ &mdss_dp0 {
+ 	status = "okay";
+ };
++
++/*
++ * Ultra-wide camera: Sony IMX858 on CCI0 bus 0 and CSIPHY1 (four D-PHY
++ * lanes), from the stock Aurora camera description. AVDD is an external
++ * LDO switched by gpio126; DVDD and DOVDD come from the second PM8010.
++ */
++/ {
++	vreg_cam_ultra_avdd: regulator-cam-ultra-avdd {
++		compatible = "regulator-fixed";
++		regulator-name = "cam_ultra_avdd";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&tlmm 126 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <100>;
++		/* BOB2 comes up first, as in the stock sequence. */
++		vin-supply = <&vreg_bob2>;
++		pinctrl-0 = <&cam_ultra_avdd_default>;
++		pinctrl-names = "default";
++	};
++};
++
++&apps_rsc {
++	regulators-0 {
++		vreg_bob2: bob2 {
++			regulator-name = "vreg_bob2";
++			regulator-min-microvolt = <2704000>;
++			regulator-max-microvolt = <3296000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_AUTO>;
++		};
++	};
++	regulators-1 {
++		vreg_l2i: ldo2 {
++			regulator-name = "vreg_l2i";
++			regulator-min-microvolt = <880000>;
++			regulator-max-microvolt = <912000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++	regulators-7 {
++		compatible = "qcom,pm8010-rpmh-regulators";
++		qcom,pmic-id = "n";
++		/* As on the SM8650 QRD: L5N is fed from BOB2. */
++		vdd-l5-supply = <&vreg_bob2>;
++		vreg_l2n: ldo2 {
++			regulator-name = "vreg_l2n";
++			regulator-min-microvolt = <1104000>;
++			regulator-max-microvolt = <1104000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++		vreg_l5n: ldo5 {
++			regulator-name = "vreg_l5n";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++};
++
++&camss {
++	vdd-csiphy01-0p9-supply = <&vreg_l2i>;
++	vdd-csiphy01-1p2-supply = <&vreg_l3i>;
++	status = "okay";
++
++	ports {
++		port@1 {
++			csiphy1_ep: endpoint {
++				data-lanes = <0 1 2 3>;
++				remote-endpoint = <&cam_ultra_ep>;
++			};
++		};
++	};
++};
++
++&cci0 {
++	status = "okay";
++};
++
++&cci0_i2c0 {
++	clock-frequency = <400000>;
++
++	camera@1a {
++		compatible = "sony,imx858";
++		reg = <0x1a>;
++		clocks = <&camcc CAM_CC_MCLK1_CLK>;
++		assigned-clocks = <&camcc CAM_CC_MCLK1_CLK>;
++		assigned-clock-rates = <19200000>;
++		/* MCLK1 is gated by the camera top GDSC. */
++		power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>;
++		reset-gpios = <&tlmm 109 GPIO_ACTIVE_LOW>;
++		pinctrl-0 = <&cam1_default>, <&cam_ultra_reset_default>;
++		pinctrl-names = "default";
++		dovdd-supply = <&vreg_l5n>;
++		avdd-supply = <&vreg_cam_ultra_avdd>;
++		dvdd-supply = <&vreg_l2n>;
++		orientation = <1>;	/* rear */
++		rotation = <90>;
++
++		port {
++			cam_ultra_ep: endpoint {
++				data-lanes = <1 2 3 4>;
++				link-frequencies = /bits/ 64 <1249920000>;
++				remote-endpoint = <&csiphy1_ep>;
++			};
++		};
++	};
++};
++
++/* Stock MCLK1 drive strength. */
++&cam1_default {
++	drive-strength = <4>;
++};
++
++&tlmm {
++	cam_ultra_avdd_default: cam-ultra-avdd-default-state {
++		pins = "gpio126";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++
++	cam_ultra_reset_default: cam-ultra-reset-default-state {
++		pins = "gpio109";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++};

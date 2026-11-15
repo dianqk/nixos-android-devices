@@ -1,0 +1,91 @@
+From c573e3341405ec9536fd03a2fae5d217303a7b10 Mon Sep 17 00:00:00 2001
+From: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Date: Mon, 19 Oct 2026 16:46:07 +0200
+Subject: [PATCH 031/144] crypto: qce - Use fallback for fragmented skcipher
+ payloads
+
+The crypto engine reliably processes AES requests only when the payload
+is a single contiguous buffer. A payload split across multiple
+scatterlist entries makes the engine stall waiting for input, failing
+the request with a hardware operation error. This was uncovered by the
+crypto self-tests, which feed the algorithms randomly fragmented
+buffers.
+
+Detect a payload that spans more than one scatterlist entry, in either
+the source or the destination, and route the request to the software
+fallback.
+
+Cc: stable@vger.kernel.org
+Fixes: 25b71d61d631 ("crypto: qce - Improve the conditions for requesting AES fallback cipher")
+Tested-by: Kuldeep Singh <kuldeep.singh@oss.qualcomm.com>
+Tested-by: Pankaj Patil <pankaj.patil@oss.qualcomm.com>
+Signed-off-by: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Message-ID: <20261019-qce-fixes-skcipher-v12-3-046e6be9bd83@oss.qualcomm.com>
+Link: https://lore.kernel.org/r/20261019-qce-fixes-skcipher-v12-3-046e6be9bd83@oss.qualcomm.com
+(cherry picked from commit 67762d4bf8eec8256826e820b0fa63240e1a3598)
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0049-crypto-qce-Use-fallback-for-fragmented-skcipher-payl.patch
+Import-SHA256: f76ed6e2b41140cf5e0d5592cdd54db4e6a9088525c1f2c2c6b6cd8a217aa20e
+Import-Provenance: mail headers
+(cherry picked from commit cf93a865da117e8f8b5603fa53e920e10f4df785)
+---
+ drivers/crypto/qce/cipher.h   |  1 +
+ drivers/crypto/qce/skcipher.c | 13 +++++++++++--
+ 2 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/crypto/qce/cipher.h b/drivers/crypto/qce/cipher.h
+index 850f257d00..daea075511 100644
+--- a/drivers/crypto/qce/cipher.h
++++ b/drivers/crypto/qce/cipher.h
+@@ -14,6 +14,7 @@
+ struct qce_cipher_ctx {
+ 	u8 enc_key[QCE_MAX_KEY_SIZE];
+ 	unsigned int enc_keylen;
++	bool use_fallback;
+ 	struct crypto_skcipher *fallback;
+ };
+ 
+diff --git a/drivers/crypto/qce/skcipher.c b/drivers/crypto/qce/skcipher.c
+index 80a53db508..e13845debc 100644
+--- a/drivers/crypto/qce/skcipher.c
++++ b/drivers/crypto/qce/skcipher.c
+@@ -215,7 +215,7 @@ static int qce_skcipher_crypt(struct skcipher_request *req, int encrypt)
+ 	struct qce_cipher_reqctx *rctx = skcipher_request_ctx(req);
+ 	struct qce_alg_template *tmpl = to_cipher_tmpl(tfm);
+ 	unsigned int blocksize = crypto_skcipher_blocksize(tfm);
+-	int keylen;
++	int keylen, src_nents, dst_nents;
+ 
+ 	rctx->flags = tmpl->alg_flags;
+ 	rctx->flags |= encrypt ? QCE_ENCRYPT : QCE_DECRYPT;
+@@ -241,6 +241,11 @@ static int qce_skcipher_crypt(struct skcipher_request *req, int encrypt)
+ 		if (!IS_ALIGNED(req->cryptlen, blocksize))
+ 			return -EINVAL;
+ 
++	src_nents = sg_nents_for_len(req->src, req->cryptlen);
++	dst_nents = sg_nents_for_len(req->dst, req->cryptlen);
++	if (src_nents < 0 || dst_nents < 0)
++		return -EINVAL;
++
+ 	/*
+ 	 * Conditions for requesting a fallback cipher
+ 	 * AES-192 (not supported by crypto engine (CE))
+@@ -250,13 +255,17 @@ static int qce_skcipher_crypt(struct skcipher_request *req, int encrypt)
+ 	 * needed in all versions of CE)
+ 	 * AES-CTR with a partial final block (the CE stalls waiting for a full
+ 	 * block of input).
++	 * A payload fragmented across more than one scatterlist entry (the CE
++	 * stalls waiting for input in that case too).
+ 	 */
+ 	if (IS_AES(rctx->flags) &&
+ 	    ((keylen != AES_KEYSIZE_128 && keylen != AES_KEYSIZE_256) ||
+ 	    (IS_CTR(rctx->flags) && !IS_ALIGNED(req->cryptlen, AES_BLOCK_SIZE)) ||
+ 	    (IS_XTS(rctx->flags) && ((req->cryptlen <= aes_sw_max_len) ||
+ 	    (req->cryptlen > QCE_SECTOR_SIZE &&
+-	    req->cryptlen % QCE_SECTOR_SIZE))))) {
++	    req->cryptlen % QCE_SECTOR_SIZE))) ||
++	    (IS_XTS(rctx->flags) && ctx->use_fallback) ||
++	    src_nents > 1 || dst_nents > 1)) {
+ 		skcipher_request_set_tfm(&rctx->fallback_req, ctx->fallback);
+ 		skcipher_request_set_callback(&rctx->fallback_req,
+ 					      req->base.flags,

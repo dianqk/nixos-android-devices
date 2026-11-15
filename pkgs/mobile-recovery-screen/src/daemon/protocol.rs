@@ -5,6 +5,9 @@ use std::io::{BufRead, Read, Write};
 pub const SOCKET: &str = "/run/mobile-recovery/control.sock";
 pub const VERSION: u32 = 1;
 pub const MAX_MESSAGE: usize = 65536;
+/// Task phase set after every check and storage write of a reboot or
+/// poweroff, right before the restart itself; clients acknowledge it.
+pub const RESTART_PHASE: &str = "Restarting";
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {

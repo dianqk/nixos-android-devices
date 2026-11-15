@@ -1,0 +1,75 @@
+From 2dc302bd79853106cd7e68318e904db4b3c5487d Mon Sep 17 00:00:00 2001
+From: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Date: Mon, 27 Oct 2025 12:13:38 +0100
+Subject: [PATCH] clk: mediatek: clk-gate: Simplify and optimize registration
+ iter
+
+Simplify and optimize mtk_clk_register_all_gates() by removing and
+replacing the function-local clk_hw pointer assignment and check
+and as last step the consequent assignment to the array containing
+handles to the registered clocks with... just the last step.
+
+This removes a bunch of useless assignments, and in case any error
+happens, the tear down iterator will still do its job without any
+change required, effectively bringing no functional change, and a
+a small optimization.
+
+Signed-off-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Link: https://patch.msgid.link/20251027111343.21723-3-angelogioacchino.delregno@collabora.com
+---
+ drivers/clk/mediatek/clk-gate.c | 17 +++++++----------
+ 1 file changed, 7 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/clk/mediatek/clk-gate.c b/drivers/clk/mediatek/clk-gate.c
+index 3a5eaa5af9..f230bf3d5d 100644
+--- a/drivers/clk/mediatek/clk-gate.c
++++ b/drivers/clk/mediatek/clk-gate.c
+@@ -257,8 +257,7 @@ static int mtk_clk_register_all_gates(struct device *dev, struct device_node *no
+ 				      const struct mtk_gate *clks, int num,
+ 				      struct clk_hw_onecell_data *clk_data)
+ {
+-	int i;
+-	struct clk_hw *hw;
++	int i, ret;
+ 
+ 	if (!clk_data)
+ 		return -ENOMEM;
+@@ -272,21 +271,19 @@ static int mtk_clk_register_all_gates(struct device *dev, struct device_node *no
+ 			continue;
+ 		}
+ 
+-		hw = mtk_clk_register_gate(dev, gate, regmap, regmap_hwv);
+-
+-		if (IS_ERR(hw)) {
++		clk_data->hws[gate->id] = mtk_clk_register_gate(dev, gate, regmap, hwv_regmap);
++		if (IS_ERR(clk_data->hws[gate->id])) {
+ 			pr_err("Failed to register clk %s: %pe\n", gate->name,
+-			       hw);
++			       clk_data->hws[gate->id]);
++			ret = PTR_ERR(clk_data->hws[gate->id]);
+ 			goto err;
+ 		}
+-
+-		clk_data->hws[gate->id] = hw;
+ 	}
+ 
+ 	return 0;
+ 
+ err:
+-	while (--i >= 0) {
++	while (i-- >= 0) {
+ 		const struct mtk_gate *gate = &clks[i];
+ 
+ 		if (IS_ERR_OR_NULL(clk_data->hws[gate->id]))
+@@ -296,7 +293,7 @@ static int mtk_clk_register_all_gates(struct device *dev, struct device_node *no
+ 		clk_data->hws[gate->id] = ERR_PTR(-ENOENT);
+ 	}
+ 
+-	return PTR_ERR(hw);
++	return ret;
+ }
+ 
+ int mtk_clk_register_gates(struct device *dev, struct device_node *node,
+-- 
+2.56.0
+

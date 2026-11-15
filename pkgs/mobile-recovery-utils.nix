@@ -46,6 +46,7 @@ let
     (select dosfstools [
       "mkfs.fat"
       "fsck.fat"
+      "fatlabel"
     ])
     (select systemd [
       "reboot"

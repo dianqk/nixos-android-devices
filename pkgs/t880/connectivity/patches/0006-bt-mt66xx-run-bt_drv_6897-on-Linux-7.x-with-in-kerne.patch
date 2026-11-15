@@ -1,0 +1,395 @@
+From e7cde7c610849904a70c459136c5b4dd83333234 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 16 Oct 2026 12:35:48 +0800
+Subject: [PATCH] bt/mt66xx: run bt_drv_6897 on Linux 7.x with in-kernel HCI
+ (experimental)
+
+Build the MT6897 connsys Bluetooth driver (BEIF transport, no BTIF) out of
+tree and register it with the kernel Bluetooth stack for BlueZ:
+
+- Kbuild: CONN_SRC/KO_PATH for an out-of-tree build, the compat header,
+  USE_DEVICE_NODE=0; CFG_SUPPORT_BLUEZ=1 so HCI_SETUP is kept.
+- 7.x API: no hci_dev.dev_type, void platform remove, class_create(),
+  sched_set_fifo()/sched_set_normal() instead of sched_setscheduler().
+- bt_open waits for the platform probe instead of failing HCI setup.
+- bdaddr parameter (the device's nvdata address, supplied at runtime),
+  programmed with the 0xfc1a vendor command in setup as upstream
+  btmtk_set_bdaddr() does; without it the controller stays unconfigured.
+- Set HCI_QUIRK_BROKEN_READ_SYNC_TRAIN_PARAMS (the firmware rejects
+  0x0c77).
+- t880_no_sleep (experimental): keep the BGF powered and in driver own.
+  On this port the BGF does not come back from firmware-own sleep, nor
+  from a power off while Wi-Fi keeps conninfra up.
+- Debug dumps of the BGF power-domain registers in the power-on path.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ connectivity/bt/mt66xx/6897/Kbuild            |  2 +-
+ connectivity/bt/mt66xx/btif/Kbuild            | 11 ++-
+ connectivity/bt/mt66xx/btif/btmtk_btif_main.c | 24 ++++-
+ connectivity/bt/mt66xx/btif/btmtk_char_dev.c  |  2 +-
+ connectivity/bt/mt66xx/btif/btmtk_dbg.c       |  7 +-
+ connectivity/bt/mt66xx/btif/btmtk_mt66xx.c    |  4 +-
+ connectivity/bt/mt66xx/btmtk_fw_log.c         |  2 +-
+ connectivity/bt/mt66xx/btmtk_main.c           | 94 ++++++++++++++++++-
+ .../bt/mt66xx/include/btif/platform_6897.h    | 17 ++++
+ .../bt/mt66xx/include/btmtk_chip_if.h         |  2 +-
+ 10 files changed, 149 insertions(+), 16 deletions(-)
+
+diff --git a/connectivity/bt/mt66xx/6897/Kbuild b/connectivity/bt/mt66xx/6897/Kbuild
+index 312decc..e2cb0c0 100644
+--- a/connectivity/bt/mt66xx/6897/Kbuild
++++ b/connectivity/bt/mt66xx/6897/Kbuild
+@@ -1,4 +1,4 @@
+ BT_PLATFORM := 6897
+ LOG_TAG := [BT_Drv][btif]
+ 
+-include $(srctree)/$(src)/../btif/Kbuild
++include $(dir $(lastword $(MAKEFILE_LIST)))../btif/Kbuild
+diff --git a/connectivity/bt/mt66xx/btif/Kbuild b/connectivity/bt/mt66xx/btif/Kbuild
+index 4839a9e..d4c85ee 100644
+--- a/connectivity/bt/mt66xx/btif/Kbuild
++++ b/connectivity/bt/mt66xx/btif/Kbuild
+@@ -92,7 +92,8 @@ endif
+ ccflags-y += -D CHIP_IF_BTIF
+ 
+ # Use device node or hci_dev as native interface
+-ccflags-y += -D USE_DEVICE_NODE=1
++# T880: register an in-kernel hci_dev for BlueZ instead of /dev/stpbt.
++ccflags-y += -D USE_DEVICE_NODE=0
+ 
+ # Customized fw update feature
+ ccflags-y += -D CUSTOMER_FW_UPDATE=0
+@@ -109,9 +110,11 @@ ccflags-y += -D CONFIG_MP_WAKEUP_SOURCE_SYSFS_STAT=1
+ # ---------------------------------------------------
+ # Include Path
+ # ---------------------------------------------------
+-CONN_INFRA_SRC := $(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra
+-CONNFEM_SRC := $(TOP)/vendor/mediatek/kernel_modules/connectivity/connfem
+-WMT_SRC := $(TOP)/vendor/mediatek/kernel_modules/connectivity/common
++CONN_SRC ?= $(TOP)/vendor/mediatek/kernel_modules/connectivity
++CONN_INFRA_SRC := $(CONN_SRC)/conninfra
++CONNFEM_SRC := $(CONN_SRC)/connfem
++WMT_SRC := $(CONN_SRC)/common
++ccflags-y += -include $(CONN_SRC)/../compat/t880_compat.h -I$(CONN_SRC)/../compat/include -Wno-error -Wno-missing-prototypes -Wno-missing-declarations
+ BTIF_SRC := $(DEVICE_MODULES_PATH)/drivers/misc/mediatek/btif
+ ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/connectivity/common
+ ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/include/mt-plat/
+diff --git a/connectivity/bt/mt66xx/btif/btmtk_btif_main.c b/connectivity/bt/mt66xx/btif/btmtk_btif_main.c
+index db07b4b..cd8f0f4 100644
+--- a/connectivity/bt/mt66xx/btif/btmtk_btif_main.c
++++ b/connectivity/bt/mt66xx/btif/btmtk_btif_main.c
+@@ -578,7 +578,7 @@ void bt_notify_state(void)
+  *     0 if success, otherwise error code
+  *
+  */
+-void bt_report_hw_error()
++void bt_report_hw_error(void)
+ {
+ 	const uint8_t HCI_EVT_HW_ERROR[] = {0x04, 0x10, 0x01, 0x00};
+ 	btmtk_recv(g_sbdev->hdev, HCI_EVT_HW_ERROR, sizeof(HCI_EVT_HW_ERROR));
+@@ -1630,9 +1630,22 @@ int btmtk_cif_send_calibration(struct btmtk_dev *bdev)
+ 	return btmtk_intcmd_wmt_calibration(bdev->hdev);
+ }
+ #if SUPPORT_BEIF
++/*
++ * T880 (experimental): keep the BGF powered and in driver own. The BGF does
++ * not come back from firmware-own sleep, nor from a power off while conninfra
++ * stays up, on this port yet.
++ */
++bool t880_no_sleep;
++module_param(t880_no_sleep, bool, 0444);
++MODULE_PARM_DESC(t880_no_sleep, "keep Bluetooth powered and awake (experimental workaround)");
++
+ static void btmtk_set_normal_sleep(struct work_struct *work)
+ {
+ 	struct btmtk_btif_dev *cif_dev = (struct btmtk_btif_dev *)g_sbdev->cif_dev;
++	if (t880_no_sleep) {
++		BTMTK_INFO("T880: firmware-own sleep disabled");
++		return;
++	}
+ 	if (cif_dev->bt_state != FUNC_OFF) {
+ 		cif_dev->psm.force_on = FALSE;
+ 		btmtk_set_sleep(g_sbdev->hdev, FALSE);
+@@ -1747,6 +1760,13 @@ static int btmtk_cif_probe(struct platform_device *pdev)
+  * Return Value:
+  *     0 if success, otherwise error code
+  */
++static int btmtk_cif_remove(struct platform_device *pdev);
++/* T880: platform_driver.remove returns void since 6.11 */
++static void btmtk_cif_remove_void(struct platform_device *pdev)
++{
++	btmtk_cif_remove(pdev);
++}
++
+ static int btmtk_cif_remove(struct platform_device *pdev)
+ {
+ 	struct btmtk_btif_dev *cif_dev = (struct btmtk_btif_dev *)g_sbdev->cif_dev;
+@@ -1798,7 +1818,7 @@ int btmtk_cif_register(void)
+ 	struct hif_hook_ptr hook;
+ 
+ 	mtkbt_btif_driver.probe = btmtk_cif_probe;
+-	mtkbt_btif_driver.remove = btmtk_cif_remove;
++	mtkbt_btif_driver.remove = btmtk_cif_remove_void;
+ 
+ 	memset(&hook, 0, sizeof(struct hif_hook_ptr));
+ 	hook.init = BT_init;
+diff --git a/connectivity/bt/mt66xx/btif/btmtk_char_dev.c b/connectivity/bt/mt66xx/btif/btmtk_char_dev.c
+index 24bbdaa..7b379b0 100644
+--- a/connectivity/bt/mt66xx/btif/btmtk_char_dev.c
++++ b/connectivity/bt/mt66xx/btif/btmtk_char_dev.c
+@@ -554,7 +554,7 @@ int BT_init(void)
+ 	if (cdv_err)
+ 		goto cdv_error;
+ 
+-	BT_class = class_create(THIS_MODULE, BT_DRIVER_NODE_NAME);
++	BT_class = class_create(BT_DRIVER_NODE_NAME);
+ 	if (IS_ERR(BT_class))
+ 		goto create_node_error;
+ 	BT_dev = device_create(BT_class, NULL, dev, NULL, BT_DRIVER_NODE_NAME);
+diff --git a/connectivity/bt/mt66xx/btif/btmtk_dbg.c b/connectivity/bt/mt66xx/btif/btmtk_dbg.c
+index b8edb1a..b0adc66 100644
+--- a/connectivity/bt/mt66xx/btif/btmtk_dbg.c
++++ b/connectivity/bt/mt66xx/btif/btmtk_dbg.c
+@@ -313,7 +313,12 @@ int bt_dbg_set_rt_thread_runtime(int par1, int par2, int par3)
+ 	}
+ 	policy = par2;
+ 	params.sched_priority = par3;
+-	ret = sched_setscheduler(cif_dev->tx_thread, policy, &params);
++	/* T880: sched_setscheduler() is not exported to modules */
++	if (policy == SCHED_FIFO || policy == SCHED_RR)
++		sched_set_fifo(cif_dev->tx_thread);
++	else
++		sched_set_normal(cif_dev->tx_thread, 0);
++	ret = 0;
+ 	BTMTK_INFO("%s: ret[%d], policy[%d], sched_priority[%d]", __func__, ret, policy, params.sched_priority);
+ 
+ 	return 0;
+diff --git a/connectivity/bt/mt66xx/btif/btmtk_mt66xx.c b/connectivity/bt/mt66xx/btif/btmtk_mt66xx.c
+index 717aadc..92bb27e 100644
+--- a/connectivity/bt/mt66xx/btif/btmtk_mt66xx.c
++++ b/connectivity/bt/mt66xx/btif/btmtk_mt66xx.c
+@@ -1906,7 +1906,9 @@ int32_t btmtk_set_power_on(struct hci_dev *hdev, u_int8_t for_precal)
+ 
+ 	if(g_bt_dbg_st.rt_thd_enable) {
+ 		sch_param.sched_priority = MAX_RT_PRIO - 20;
+-		sch_ret = sched_setscheduler(cif_dev->tx_thread, SCHED_FIFO, &sch_param);
++		/* T880: sched_setscheduler() is not exported; RT priority via sched_set_fifo() */
++		sched_set_fifo(cif_dev->tx_thread);
++		sch_ret = 0;
+ 		BTMTK_INFO("sch_ret = %d", sch_ret);
+ 		if (sch_ret != 0)
+ 			BTMTK_INFO("set RT thread failed");
+diff --git a/connectivity/bt/mt66xx/btmtk_fw_log.c b/connectivity/bt/mt66xx/btmtk_fw_log.c
+index 6b1ab3d..292d01e 100644
+--- a/connectivity/bt/mt66xx/btmtk_fw_log.c
++++ b/connectivity/bt/mt66xx/btmtk_fw_log.c
+@@ -128,7 +128,7 @@ int btmtk_fops_initfwlog(void)
+ 	if (cdevErr)
+ 		goto cdv_error;
+ 
+-	g_fwlog->pBTClass = class_create(THIS_MODULE, BT_FWLOG_DEV_NODE);
++	g_fwlog->pBTClass = class_create(BT_FWLOG_DEV_NODE);
+ 	if (IS_ERR(g_fwlog->pBTClass)) {
+ 		BTMTK_ERR("%s: class create fail, error code(%ld)\n", __func__, PTR_ERR(g_fwlog->pBTClass));
+ 		goto create_node_error;
+diff --git a/connectivity/bt/mt66xx/btmtk_main.c b/connectivity/bt/mt66xx/btmtk_main.c
+index ecbcb76..eaa7ee7 100644
+--- a/connectivity/bt/mt66xx/btmtk_main.c
++++ b/connectivity/bt/mt66xx/btmtk_main.c
+@@ -14,6 +14,8 @@
+ #include "btmtk_define.h"
+ #include "btmtk_main.h"
+ #include "btmtk_fw_log.h"
++
++extern bool t880_no_sleep; /* btif/btmtk_btif_main.c */
+ #include "btmtk_chip_if.h"
+ 
+ #define MTKBT_UNSLEEPABLE_LOCK(x, y)	spin_lock_irqsave(x, y)
+@@ -3352,7 +3354,11 @@ static int bt_close(struct hci_dev *hdev)
+ 	/* Flush RX works */
+ 	flush_work(&bdev->rx_work);
+ 
+-	main_info.hif_hook.close(hdev);
++	/* T880: with t880_no_sleep the BGF stays powered across HCI close. */
++	if (!t880_no_sleep)
++		main_info.hif_hook.close(hdev);
++	else
++		BTMTK_INFO("%s: T880 keeps the BGF powered", __func__);
+ 
+ unlock:
+ 	btmtk_fops_set_state(bdev, BTMTK_FOPS_STATE_CLOSED);
+@@ -3399,6 +3405,23 @@ static int bt_open(struct hci_dev *hdev)
+ 		return -EFAULT;
+ 	}
+ 
++	/*
++	 * T880: hci_register_dev() queues the first power-on (HCI setup) right
++	 * away, which can run before the platform probe has moved the chip to
++	 * WORKING. Wait for the probe instead of failing setup with -EAGAIN.
++	 */
++	{
++		int wait_ms = 0;
++
++		while (wait_ms < 3000) {
++			state = btmtk_get_chip_state(bdev);
++			if (state != BTMTK_STATE_INIT && state != BTMTK_STATE_DISCONNECT)
++				break;
++			msleep(50);
++			wait_ms += 50;
++		}
++	}
++
+ 	if (main_info.hif_hook.cif_mutex_lock) {
+ 		main_info.hif_hook.cif_mutex_lock(bdev);
+ 	}
+@@ -3497,6 +3520,45 @@ exit:
+ 	return ret;
+ }
+ 
++/*
++ * T880 port: program the public address with the MediaTek vendor command
++ * 0xfc1a, as upstream drivers/bluetooth/btmtk.c:btmtk_set_bdaddr() does. The
++ * controller has no usable address of its own; the per-device address comes
++ * from nvdata at runtime (btmgmt public-addr).
++ */
++static char *t880_bdaddr;
++module_param_named(bdaddr, t880_bdaddr, charp, 0400);
++MODULE_PARM_DESC(bdaddr, "public address XX:XX:XX:XX:XX:XX (from the device's nvdata)");
++
++/* Parse t880_bdaddr (display order) into a bdaddr_t (little endian). */
++static bool btmtk_t880_get_bdaddr(bdaddr_t *out)
++{
++	unsigned int b[6];
++	int i;
++
++	if (!t880_bdaddr ||
++	    sscanf(t880_bdaddr, "%2x:%2x:%2x:%2x:%2x:%2x",
++		   &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6)
++		return false;
++	for (i = 0; i < 6; i++)
++		out->b[5 - i] = b[i];
++	return bacmp(out, BDADDR_ANY) != 0;
++}
++
++static int btmtk_t880_set_bdaddr(struct hci_dev *hdev, const bdaddr_t *bdaddr)
++{
++	struct sk_buff *skb;
++
++	skb = __hci_cmd_sync(hdev, 0xfc1a, 6, bdaddr, HCI_INIT_TIMEOUT);
++	if (IS_ERR(skb)) {
++		bt_dev_err(hdev, "changing Mediatek device address failed (%ld)",
++			   PTR_ERR(skb));
++		return PTR_ERR(skb);
++	}
++	kfree_skb(skb);
++	return 0;
++}
++
+ static int bt_setup(struct hci_dev *hdev)
+ {
+ 	int ret = 0;
+@@ -3505,9 +3567,24 @@ static int bt_setup(struct hci_dev *hdev)
+ 	BTMTK_INFO("%s", __func__);
+ 
+ 	if (is_mt66xx(bdev->chip_id)) {
++		bdaddr_t addr;
++
+ 		ret = main_info.hif_hook.open(hdev);
+-		if (ret)
++		if (ret) {
+ 			BTMTK_ERR("%s: fail", __func__);
++			return ret;
++		}
++		/*
++		 * T880: program the nvdata address before the core reads it,
++		 * and stay powered after setup (a BGF power cycle does not come
++		 * back yet; xaga likewise avoids the auto power-off).
++		 */
++		if (btmtk_t880_get_bdaddr(&addr)) {
++			ret = btmtk_t880_set_bdaddr(hdev, &addr);
++			if (ret)
++				return ret;
++		}
++		hci_dev_clear_flag(hdev, HCI_AUTO_OFF);
+ 		return ret;
+ 	}
+ 	return 0;
+@@ -3737,8 +3814,7 @@ int btmtk_allocate_hci_device(struct btmtk_dev *bdev, int hci_bus_type)
+ 	hdev->bus = hci_bus_type;
+ 	hci_set_drvdata(hdev, bdev);
+ 
+-	/* HCI_PRIMARY = 0x00 */
+-	hdev->dev_type = 0x00;
++	/* T880: hci_dev.dev_type is gone (6.x); every hci_dev is primary. */
+ 
+ 	bdev->hdev = hdev;
+ 
+@@ -3748,6 +3824,16 @@ int btmtk_allocate_hci_device(struct btmtk_dev *bdev, int hci_bus_type)
+ 	hdev->flush    = bt_flush;
+ 	hdev->send	   = bt_send_frame;
+ 	hdev->setup    = bt_setup;
++	hdev->set_bdaddr = btmtk_t880_set_bdaddr;
++	/* The firmware rejects HCI_OP_READ_SYNC_TRAIN_PARAMS (0x0c77). */
++	hci_set_quirk(hdev, HCI_QUIRK_BROKEN_READ_SYNC_TRAIN_PARAMS);
++	/* Unconfigured unless the bdaddr parameter provides the address. */
++	{
++		bdaddr_t addr;
++
++		if (!btmtk_t880_get_bdaddr(&addr))
++			hci_set_quirk(hdev, HCI_QUIRK_INVALID_BDADDR);
++	}
+ 
+ 	init_waitqueue_head(&bdev->p_wait_event_q);
+ 
+diff --git a/connectivity/bt/mt66xx/include/btif/platform_6897.h b/connectivity/bt/mt66xx/include/btif/platform_6897.h
+index 07063a7..61a4b52 100644
+--- a/connectivity/bt/mt66xx/include/btif/platform_6897.h
++++ b/connectivity/bt/mt66xx/include/btif/platform_6897.h
+@@ -1167,6 +1167,14 @@ static inline int32_t bgfsys_power_on(void)
+ 		goto error;
+ #else
+ 	ret = 0;
++	BTMTK_INFO("T880 pre-on on_top_pwr_ctl=0x%08x pwr_states=0x%08x off_ack_st=0x%08x bt_pwrctlcr0=0x%08x cpu_sw_rst=0x%08x conn2bt_gals=0x%08x bt2conn_gals=0x%08x",
++		REG_READL(CONN_INFRA_RGU_BGFSYS_ON_TOP_PWR_CTL),
++		REG_READL(CONN_HOST_CSR_TOP_CONNSYS_PWR_STATES),
++		REG_READL(CONN_INFRA_RGU_BGFSYS_OFF_TOP_PWR_ACK_ST),
++		REG_READL(CONN_INFRA_CFG_BT_PWRCTLCR0),
++		REG_READL(CONN_INFRA_RGU_BGFSYS_CPU_SW_RST),
++		REG_READL(CONN_INFRA_CONN2BT_GALS_SLP_STATUS),
++		REG_READL(CONN_INFRA_BT2CONN_GALS_SLP_STATUS));
+ 	/* reset n10 cpu core */
+ 	CLR_BIT(CONN_INFRA_RGU_BGFSYS_CPU_SW_RST, BGF_CPU_SW_RST_B);
+ 
+@@ -1217,6 +1225,15 @@ static inline int32_t bgfsys_power_on(void)
+ 
+ 	if (0 == retry) {
+ 		BTMTK_ERR("bgfsys off top power ack_b = 0x%08x", value);
++		/* T880 debug: power-domain state at the failure */
++		BTMTK_ERR("T880 on_top_pwr_ctl=0x%08x pwr_states=0x%08x off_ack_st=0x%08x bt_pwrctlcr0=0x%08x cpu_sw_rst=0x%08x conn2bt_gals=0x%08x bt2conn_gals=0x%08x",
++			REG_READL(CONN_INFRA_RGU_BGFSYS_ON_TOP_PWR_CTL),
++			REG_READL(CONN_HOST_CSR_TOP_CONNSYS_PWR_STATES),
++			REG_READL(CONN_INFRA_RGU_BGFSYS_OFF_TOP_PWR_ACK_ST),
++			REG_READL(CONN_INFRA_CFG_BT_PWRCTLCR0),
++			REG_READL(CONN_INFRA_RGU_BGFSYS_CPU_SW_RST),
++			REG_READL(CONN_INFRA_CONN2BT_GALS_SLP_STATUS),
++			REG_READL(CONN_INFRA_BT2CONN_GALS_SLP_STATUS));
+ 		goto error;
+ 	}
+ 
+diff --git a/connectivity/bt/mt66xx/include/btmtk_chip_if.h b/connectivity/bt/mt66xx/include/btmtk_chip_if.h
+index d5b40c1..4c08bfd 100644
+--- a/connectivity/bt/mt66xx/include/btmtk_chip_if.h
++++ b/connectivity/bt/mt66xx/include/btmtk_chip_if.h
+@@ -16,7 +16,7 @@
+ #include "btmtk_btif.h"
+ #define CFG_SUPPORT_BT_DL_WIFI_PATCH    0
+ #define CFG_SUPPORT_DVT                 0
+-#define CFG_SUPPORT_BLUEZ               0
++#define CFG_SUPPORT_BLUEZ               1 /* T880: BlueZ, keep HCI_SETUP */
+ 
+ #if (CONNAC20_CHIPID == 6885)
+ 	#include "platform_6885.h"
+-- 
+2.55.0
+

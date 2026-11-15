@@ -1,0 +1,117 @@
+Subject: [PATCH] avcodec/vaapi: allow explicit VBR buffering opt-out
+
+Keep the default HRD/VBV request. An explicit VBR caller may disable buffering
+constraints only when no buffer size or initial occupancy was supplied. Keep
+normal frame timing and the existing non-HRD rate-control window.
+
+Local extension against FFmpeg 9.0.2; upstream source and authors retained.
+Link: https://github.com/FFmpeg/FFmpeg/tree/n9.0.2
+
+diff --git a/libavcodec/vaapi_encode.c b/libavcodec/vaapi_encode.c
+index 0e50602e..2811f130 100644
+--- a/libavcodec/vaapi_encode.c
++++ b/libavcodec/vaapi_encode.c
+@@ -1356,6 +1356,19 @@ static av_cold int vaapi_encode_init_rate_control(AVCodecContext *avctx)
+     return AVERROR(EINVAL);
+ 
+ rc_mode_found:
++    if (!ctx->rc_buffering) {
++        if (ctx->explicit_rc_mode != RC_MODE_VBR || rc_mode->mode != RC_MODE_VBR) {
++            av_log(avctx, AV_LOG_ERROR, "rc_buffering=0 requires explicit VBR rate control.\n");
++            return AVERROR(EINVAL);
++        }
++        if (avctx->rc_buffer_size || avctx->rc_initial_buffer_occupancy) {
++            av_log(avctx, AV_LOG_ERROR, "rc_buffering=0 conflicts with buffer size or initial occupancy.\n");
++            return AVERROR(EINVAL);
++        }
++    }
++    ctx->rc_hrd = rc_mode->hrd && ctx->rc_buffering;
++    memset(&ctx->hrd_params, 0, sizeof(ctx->hrd_params));
++
+     if (rc_mode->bitrate) {
+         if (avctx->bit_rate <= 0) {
+             av_log(avctx, AV_LOG_ERROR, "Bitrate must be set for %s "
+@@ -1432,7 +1445,7 @@ rc_mode_found:
+         rc_quality = 0;
+     }
+ 
+-    if (rc_mode->hrd) {
++    if (ctx->rc_hrd) {
+         if (avctx->rc_buffer_size)
+             hrd_buffer_size = avctx->rc_buffer_size;
+         else if (avctx->rc_max_rate > 0)
+@@ -1540,7 +1553,7 @@ rc_mode_found:
+                                       sizeof(ctx->rc_params));
+     }
+ 
+-    if (rc_mode->hrd) {
++    if (ctx->rc_hrd) {
+         av_log(avctx, AV_LOG_VERBOSE, "RC buffer: %"PRId64" bits, "
+                "initial fullness %"PRId64" bits.\n",
+                hrd_buffer_size, hrd_initial_buffer_fullness);
+diff --git a/libavcodec/vaapi_encode.h b/libavcodec/vaapi_encode.h
+index 1fa1e99a..f9a9ee93 100644
+--- a/libavcodec/vaapi_encode.h
++++ b/libavcodec/vaapi_encode.h
+@@ -159,6 +159,9 @@ typedef struct VAAPIEncodeContext {
+     // available modes).
+     int             explicit_rc_mode;
+ 
++    // Request application HRD/VBV constraints (explicit VBR may opt out).
++    int             rc_buffering;
++
+     // Block Level based bitrate control.
+     int             blbrc;
+ 
+@@ -177,6 +180,8 @@ typedef struct VAAPIEncodeContext {
+ 
+     // Chosen rate control mode details.
+     const VAAPIEncodeRCMode *rc_mode;
++    // Effective instance policy; never mutate the shared RC-mode table.
++    int             rc_hrd;
+     // RC quality level - meaning depends on codec and RC mode.
+     // In CQP mode this sets the fixed quantiser value.
+     int             rc_quality;
+@@ -378,6 +383,10 @@ int ff_vaapi_encode_close(AVCodecContext *avctx);
+     VAAPI_ENCODE_RC_MODE(ICQ,  "Intelligent constant-quality"), \
+     VAAPI_ENCODE_RC_MODE(QVBR, "Quality-defined variable-bitrate"), \
+     VAAPI_ENCODE_RC_MODE(AVBR, "Average variable-bitrate"), \
++    { "rc_buffering", \
++      "Request HRD/VBV buffering constraints (disable only with explicit VBR and no buffer settings)", \
++      OFFSET(common.rc_buffering), AV_OPT_TYPE_BOOL, \
++      { .i64 = 1 }, 0, 1, FLAGS }, \
+     { "blbrc", \
+       "Block level based bitrate control",\
+       OFFSET(common.blbrc), AV_OPT_TYPE_BOOL, \
+diff --git a/libavcodec/vaapi_encode_h264.c b/libavcodec/vaapi_encode_h264.c
+index 27f65517..9321e599 100644
+--- a/libavcodec/vaapi_encode_h264.c
++++ b/libavcodec/vaapi_encode_h264.c
+@@ -907,7 +907,7 @@ static av_cold int vaapi_encode_h264_configure(AVCodecContext *avctx)
+         priv->fixed_qp_b   = 26;
+     }
+ 
+-    if (!ctx->rc_mode->hrd) {
++    if (!ctx->rc_hrd) {
+         // Timing SEI requires a mode respecting HRD parameters.
+         priv->sei &= ~SEI_TIMING;
+     }
+diff --git a/doc/encoders.texi b/doc/encoders.texi
+index 605638e0..7bdb8930 100644
+--- a/doc/encoders.texi
++++ b/doc/encoders.texi
+@@ -4514,6 +4514,14 @@ Quality-defined variable-bitrate.
+ Average variable bitrate.
+ @end table
+ 
++@item rc_buffering
++Request application HRD/VBV buffering constraints. Enabled by default.
++Set to 0 only with explicit @option{rc_mode VBR}, zero @option{bufsize}, and
++zero initial buffer occupancy. In this mode no HRD parameter buffer or H.264
++HRD timing SEI is requested; buffering is left to the driver without an
++application HRD/VBV guarantee. The ordinary non-HRD rate-control window remains
++1000 milliseconds. Frame-rate timing information is unaffected.
++
+ @item blbrc
+ Enable block level rate control, which assigns different bitrate block by block.
+ Invalid for CQP mode.

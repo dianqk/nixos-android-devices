@@ -1,0 +1,253 @@
+From e41df04151dc7ee037ea85d917271de6ff223925 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 19:28:41 +0800
+Subject: [PATCH] selftests: mediatek: exercise LK metadata parsing boundaries
+
+Extract the production descriptor, chain and argument-table functions for host ASan/UBSan tests with deterministic OF and mapping stubs. Cover truncation, malformed ranges and names, duplicate priority, capacity, transaction rollback and disabled/error control flow.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ tools/testing/selftests/mtk_ccci/Makefile     |  4 +
+ .../selftests/mtk_ccci/lk_metadata_cases.h    | 75 +++++++++++++++++++
+ .../mtk_ccci/lk_metadata_flow_stubs.h         | 27 +++++++
+ .../selftests/mtk_ccci/lk_metadata_stubs.h    | 50 +++++++++++++
+ .../selftests/mtk_ccci/test_lk_metadata.py    | 43 +++++++++++
+ 5 files changed, 199 insertions(+)
+ create mode 100644 tools/testing/selftests/mtk_ccci/Makefile
+ create mode 100644 tools/testing/selftests/mtk_ccci/lk_metadata_cases.h
+ create mode 100644 tools/testing/selftests/mtk_ccci/lk_metadata_flow_stubs.h
+ create mode 100644 tools/testing/selftests/mtk_ccci/lk_metadata_stubs.h
+ create mode 100755 tools/testing/selftests/mtk_ccci/test_lk_metadata.py
+
+diff --git a/tools/testing/selftests/mtk_ccci/Makefile b/tools/testing/selftests/mtk_ccci/Makefile
+new file mode 100644
+index 0000000000..e519d200e9
+--- /dev/null
++++ b/tools/testing/selftests/mtk_ccci/Makefile
+@@ -0,0 +1,4 @@
++# SPDX-License-Identifier: GPL-2.0-only
++TEST_PROGS := test_lk_metadata.py
++TEST_FILES := lk_metadata_stubs.h lk_metadata_flow_stubs.h lk_metadata_cases.h
++include ../lib.mk
+diff --git a/tools/testing/selftests/mtk_ccci/lk_metadata_cases.h b/tools/testing/selftests/mtk_ccci/lk_metadata_cases.h
+new file mode 100644
+index 0000000000..9822e3a443
+--- /dev/null
++++ b/tools/testing/selftests/mtk_ccci/lk_metadata_cases.h
+@@ -0,0 +1,75 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++static unsigned scenarios;
++static void reset(void) {
++ memset(backing,0,sizeof backing);memset(s_args_tbl,0,sizeof s_args_tbl);
++ s_args_num=0;s_init_done=1;s_g_lk_inf_base=NULL;s_g_tag_cnt=0;s_g_tag_inf_size=0;
++ s_g_lk_info_tag_version=0;s_g_lk_load_img_status=0;s_g_lk_ld_md_errno=0;lk_load_img_err_no=0;
++ append_calls=fail_append=0;node_present=prop_present=legacy=false;property.value=NULL;prop_len=0;s_g_md_usage_case=s_g_md_env_rdy_flag=consumers=fallbacks=unmaps=0;maps=0;reserve_ok=true;map_fail=alloc_fail=false;scenarios++;
++}
++static void put32(void*p,u32 v) {u8*b=p;for(unsigned i=0;i<4;i++)b[i]=v>>(8*i);}
++static void put64(void*p,u64 v) {put32(p,v);put32((u8*)p+4,v>>32);}
++static void desc(u8*d,u64 base,u32 size,u32 version,u32 count) {
++ memset(d,0,48);put64(d,base);put32(d+8,size);put32(d+16,version);put32(d+20,count);put32(d+24,1);
++}
++static void tag(unsigned off,const char *name,unsigned data,unsigned size,unsigned next) {
++ unsigned ns=s_g_lk_info_tag_version>=2?64:16;
++ memset(backing+off,0,ns+12);assert(strlen(name)<ns);strcpy((char*)backing+off,name);
++ put32(backing+off+ns,data);put32(backing+off+ns+4,size);put32(backing+off+ns+8,next);
++}
++static void setup(unsigned count,unsigned version) {
++ u8 d[48];reset();desc(d,0xbf2f0000,65536,version,count);
++ assert(lk_info_parsing_v2(d,48)==0);assert(maps==1);
++ for(unsigned i=0;i<count;i++){char k[32];snprintf(k,sizeof k,"k%u",i);tag(i*80,k,10000+i,1,(i+1)*80);}
++}
++static void add(const char*k,unsigned v) {assert(mtk_ccci_add_new_args(k,backing+v,1,FROM_LK_TAG)==1);}
++static void reject_unchanged(void) {
++ struct args_key_val before[73];unsigned n=s_args_num;memcpy(before,s_args_tbl,sizeof before);
++ assert(lk_tag_inf_parsing_to_args_table()<0);assert(s_args_num==n);assert(!memcmp(before,s_args_tbl,sizeof before));
++}
++int main(void) {
++ u8 d[48];
++ (void)s_g_tag_phy_addr;(void)s_g_lk_load_img_status;(void)lk_load_img_err_no;
++ for(int len=0;len<32;len++){reset();desc(d,0xbf2f0000,100,3,1);assert(lk_info_parsing_v2(d,len)==-EINVAL);assert(!maps);}
++ for(int len=0;len<16;len++){reset();desc(d,0xbf2f0000,100,3,1);assert(lk_info_parsing_v1(d,len)==-EINVAL);assert(!maps);}
++ for(unsigned v=1;v<=4;v++){setup(2,v);assert(!lk_tag_inf_parsing_to_args_table());assert(s_args_num==2);}
++ setup(2,INT32_MAX);assert(!lk_tag_inf_parsing_to_args_table());
++ reset();desc(d,0xbf2f0000,56,1,2);put32(d+12,2);assert(!lk_info_parsing_v1(d,16));tag(0,"one",0,0,28);tag(28,"two",56,0,UINT32_MAX);assert(!lk_tag_inf_parsing_to_args_table());assert(s_args_num==2);
++ for(unsigned i=0;i<9;i++){
++  reset();desc(d,0xbf2f0000,65536,3,1);
++  switch(i){case 0:put32(d+8,0);break;case 1:put32(d+8,65537);break;case 2:put32(d+20,0);break;case 3:put32(d+20,UINT32_MAX);break;case 4:put32(d+16,0);break;case 5:put32(d+16,UINT32_MAX);break;case 6:put64(d,0xbf2f0001);break;case 7:put64(d,UINT64_MAX-4095);break;case 8:put32(d+20,863);break;}
++  assert(lk_info_parsing_v2(d,48)<0);assert(!maps);
++ }
++ reset();desc(d,0,0,0,0);assert(lk_info_parsing_v2(d,48)==1);assert(!maps);
++ reset();desc(d,0,0,0,0);put32(d+12,1);assert(lk_info_parsing_v2(d,48)==-EINVAL);assert(!maps);
++ reset();desc(d,0,0,0,0);assert(lk_info_parsing_v1(d,16)==1);assert(!maps);
++ reset();desc(d,0xbf2f0000,76,3,1);reserve_ok=false;assert(lk_info_parsing_v2(d,48)==-EINVAL);assert(!maps);
++ reset();desc(d,0xbf2f0000,76,3,1);map_fail=true;assert(lk_info_parsing_v2(d,48)==-ENOMEM);assert(!s_g_lk_inf_base);
++ setup(3,3);add("ap_platform",20000);tag(0,"ap_platform",10000,1,80);tag(80,"same",10001,1,160);tag(160,"same",10002,1,0);assert(!lk_tag_inf_parsing_to_args_table());assert(s_args_num==2);assert(s_args_tbl[0].pdata==backing+20000);assert(s_args_tbl[1].pdata==backing+10001);
++ setup(73,3);assert(!lk_tag_inf_parsing_to_args_table());assert(s_args_num==73);assert(!lk_tag_inf_parsing_to_args_table());assert(s_args_num==73);assert(mtk_ccci_add_new_args("new",backing,1,FROM_LK_TAG)==-ENOSPC);
++ setup(74,3);reject_unchanged();
++ setup(73,3);add("dt",20000);reject_unchanged();
++ setup(74,3);tag(73*80,"k0",10073,1,0);assert(!lk_tag_inf_parsing_to_args_table());assert(s_args_num==73);
++ for(unsigned i=0;i<10;i++){
++  setup(3,3);add("dt",20000);
++  switch(i){case 0:put32(backing+80+72,0);break;case 1:put32(backing+72,65500);break;case 2:put32(backing+160+64,65537);break;case 3:put32(backing+160+68,UINT32_MAX);break;case 4:memset(backing+160,'x',64);break;case 5:backing[160]=0;break;case 6:memset(backing+160,'x',36);backing[196]=0;break;case 7:alloc_fail=true;break;case 8:s_g_tag_cnt=0;break;case 9:s_g_lk_inf_base=NULL;break;}
++  reject_unchanged();
++ }
++ setup(2,3);put32(backing+80+72,UINT32_MAX);assert(!lk_tag_inf_parsing_to_args_table());
++ setup(2,3);put32(backing+80+64,65536);put32(backing+80+68,0);assert(!lk_tag_inf_parsing_to_args_table());
++ setup(2,3);add("dt",20000);assert(!lk_tag_inf_parsing_to_args_table());mtk_ccci_args_rollback(1);assert(s_args_num==1&&mtk_ccci_args_has_key("dt")&&!mtk_ccci_args_has_key("k0"));
++ setup(2,3);s_init_done=0;reject_unchanged();
++ for(unsigned fail=1;fail<=3;fail++){setup(3,3);add("dt",20000);fail_append=fail;reject_unchanged();assert(append_calls==fail);}
++ for(unsigned test=0;test<5;test++) {
++  setup(2,3);s_g_lk_inf_base=NULL;node_present=prop_present=true;property.value=d;prop_len=48;
++  desc(d,0xbf2f0000,65536,3,2);
++  switch(test){case 0:prop_len=0;break;case 1:put64(d,0);break;case 2:put32(backing+80+68,UINT32_MAX);break;case 3:fail_append=2;break;case 4:put32(d+16,0);break;}
++  assert(ccci_util_fo_init()!=0);assert(!consumers&&!fallbacks&&!s_g_md_usage_case&&!s_g_md_env_rdy_flag&&!(s_g_lk_load_img_status&LK_LOAD_MD_EN));assert(!s_args_num);
++ }
++ setup(2,3);s_g_lk_inf_base=NULL;node_present=prop_present=true;property.value=d;prop_len=48;desc(d,0xbf2f0000,65536,3,2);assert(!ccci_util_fo_init());assert(consumers==7&&!fallbacks&&s_args_num==2&&s_g_md_usage_case==1&&(s_g_lk_load_img_status&LK_LOAD_MD_EN));
++ reset();assert(lk_info_parsing_v1(d,-1)==-EINVAL);
++ reset();assert(lk_info_parsing_v2(d,-1)==-EINVAL);
++ reset();assert(lk_info_parsing_v1(NULL,16)==-EINVAL);
++ reset();assert(lk_info_parsing_v2(NULL,32)==-EINVAL);
++ printf("PASS %u scenarios; extracted descriptor, walker, argument functions; ASan/UBSan\n",scenarios);
++ return 0;
++}
+diff --git a/tools/testing/selftests/mtk_ccci/lk_metadata_flow_stubs.h b/tools/testing/selftests/mtk_ccci/lk_metadata_flow_stubs.h
+new file mode 100644
+index 0000000000..fe9f8f3dc6
+--- /dev/null
++++ b/tools/testing/selftests/mtk_ccci/lk_metadata_flow_stubs.h
+@@ -0,0 +1,27 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#define __init
++#define CCCI_UTIL_INF_MSG(...) ((void)0)
++#define CCCI_UTIL_ERR_MSG(...) ((void)0)
++#define LK_LOAD_MD_EN 1
++#define LK_LOAD_MD_ERR_LK_INFO_FAIL 8
++#define MD_SYS1 0
++static unsigned s_g_md_usage_case,s_g_md_env_rdy_flag,consumers,fallbacks,unmaps;
++struct device_node {int dummy;};
++struct property {void *value;};
++static struct device_node device_node;
++static struct property property;
++static bool node_present,prop_present,legacy;
++static int prop_len;
++static struct device_node *of_find_compatible_node(void*a,void*b,const char*k) {(void)a;(void)b;return node_present&&!strcmp(k,"mediatek,mddriver")?&device_node:NULL;}
++static const struct property *of_find_property(struct device_node*n,const char*k,int*len) {(void)n;*len=prop_len;return prop_present&&(!strcmp(k,legacy?"ccci,modem_info":"ccci,modem_info_v2"))?&property:NULL;}
++static void of_node_put(struct device_node*n) {(void)n;}
++static void iounmap(void*p) {assert(p==backing);unmaps++;}
++static void mtk_ccci_dump_md_mem_layout(void) {consumers++;}
++static void mtk_ccci_md_smem_layout_init(void) {consumers++;}
++static void md_mem_info_parsing(void) {consumers++;}
++static void dump_retrieve_info(void) {consumers++;}
++static void md_chk_hdr_info_parse(void) {consumers++;}
++static void share_memory_info_parsing(void) {consumers++;}
++static void verify_md_enable_setting(void) {consumers++;}
++static void cal_md_settings(void) {fallbacks++;}
++static void cal_md_settings_v2(struct device_node*n) {(void)n;fallbacks++;}
+diff --git a/tools/testing/selftests/mtk_ccci/lk_metadata_stubs.h b/tools/testing/selftests/mtk_ccci/lk_metadata_stubs.h
+new file mode 100644
+index 0000000000..c1f8fb09f3
+--- /dev/null
++++ b/tools/testing/selftests/mtk_ccci/lk_metadata_stubs.h
+@@ -0,0 +1,50 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#include <stdint.h>
++#include <stdbool.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
++#include <assert.h>
++#include <errno.h>
++typedef uint8_t u8;
++typedef uint32_t u32;
++typedef uint64_t u64;
++typedef int32_t s32;
++#define __iomem
++#define GFP_KERNEL 0
++#define CCCI_ARGS_KEY_SIZE 36
++#define CCCI_ARGS_MAX_KEYS 73
++#define ARGS_KEY_VAL_KEY_SIZE CCCI_ARGS_KEY_SIZE
++#define ARGS_KEY_VAL_MAX_KEY_NUM CCCI_ARGS_MAX_KEYS
++#define ARGS_KEY_VAL_BUF_NUM 8
++#define ARGS_KEY_VAL_BUF_SIZE 4096
++#define MAX_LK_INFO_SIZE 65536
++#define CCCI_TAG_NAME_LEN 16
++#define CCCI_TAG_NAME_LEN_V2 64
++#define CCCI_LK_INFO_VER_V2 2
++#define PAGE_SIZE 4096
++#define U64_MAX UINT64_MAX
++#define IS_ALIGNED(x,a) (!((x)&((a)-1)))
++#define pr_info(...) ((void)0)
++#define LK_LOAD_MD_ERR_NO_MD_LOAD 4
++#define EXPORT_SYMBOL(x)
++enum args_src {FROM_KERNEL,FROM_LK_TAG};
++static unsigned char backing[65536];
++static bool reserve_ok=true,map_fail,alloc_fail;
++static unsigned maps;
++static void *s_g_lk_inf_base;
++static u64 s_g_tag_phy_addr;
++static unsigned s_g_tag_inf_size,s_g_tag_cnt,s_g_lk_info_tag_version,s_g_lk_load_img_status;
++static int s_g_lk_ld_md_errno,lk_load_img_err_no;
++static void *kmalloc(size_t n,int flags) {(void)flags;return malloc(n);}
++static void *kcalloc(size_t n,size_t s,int flags) {(void)flags;return alloc_fail?NULL:calloc(n,s);}
++#define kfree free
++static void memcpy_fromio(void *d,const void *s,size_t n) {
++ assert((uintptr_t)s>=(uintptr_t)backing);
++ assert((uintptr_t)s+n<=(uintptr_t)backing+s_g_tag_inf_size);
++ memcpy(d,s,n);
++}
++static u32 get_unaligned_le32(const void*p) {const u8*b=p;return b[0]|(u32)b[1]<<8|(u32)b[2]<<16|(u32)b[3]<<24;}
++static u64 get_unaligned_le64(const void*p) {return get_unaligned_le32(p)|((u64)get_unaligned_le32((const u8*)p+4)<<32);}
++static bool ccci_lk_reserved_range(u64 base) {(void)base;return reserve_ok;}
++static void *ccci_map_phy_addr(u64 base,unsigned size) {assert(base&&size==65536);maps++;return map_fail?NULL:backing;}
+diff --git a/tools/testing/selftests/mtk_ccci/test_lk_metadata.py b/tools/testing/selftests/mtk_ccci/test_lk_metadata.py
+new file mode 100755
+index 0000000000..3a61a22039
+--- /dev/null
++++ b/tools/testing/selftests/mtk_ccci/test_lk_metadata.py
+@@ -0,0 +1,43 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Exercise production LK parsers; OF reservation and mapping calls use stubs."""
++from pathlib import Path
++import hashlib,re,os,subprocess,tempfile
++assets=Path(__file__).resolve().parent
++work=tempfile.TemporaryDirectory(prefix='mtk-ccci-lk-')
++out=Path(work.name)
++repo=Path(os.environ.get('KERNEL_SRC',str(assets.parents[3])))
++root=repo/'drivers/misc/mediatek/ccci_util'
++a=(root/'ccci_util_boot_args.c').read_text(); f=(root/'ccci_util_lib_fo.c').read_text()
++def fn(src,n):
++ m=re.search(r'^.*\b'+re.escape(n)+r'\([^;]*?\)\n\{',src,re.M)
++ if not m: raise ValueError(n)
++ start=m.start(); i=m.end(); depth=1
++ while depth:
++  depth+=(src[i]=='{')-(src[i]=='}');i+=1
++ return src[start:i]+'\n'
++parts=[]
++parts.append(a[a.index('struct args_key_val {'):a.index('static int is_key_exist')])
++for n in ['is_key_exist','mtk_ccci_args_count','mtk_ccci_args_has_key','mtk_ccci_args_rollback','mtk_ccci_add_new_args']:
++ parts.append(fn(a,n))
++parts.append(f[f.index('struct _ccci_lk_info {'):f.index('/*====================================================== */',f.index('struct _ccci_lk_info {'))])
++parts.append(f[f.index('struct ccci_checked_tag {'):f.index('int lk_tag_inf_parsing_to_args_table')])
++for n in ['lk_tag_inf_parsing_to_args_table','ccci_lk_map_info','lk_info_parsing_v1','lk_info_parsing_v2']:
++ if n == 'lk_tag_inf_parsing_to_args_table':
++  parts.append('static unsigned append_calls, fail_append;\nstatic int fault_add(const char *k, unsigned char *v, unsigned s, enum args_src src) { if (++append_calls == fail_append) return -EIO; return mtk_ccci_add_new_args(k,v,s,src); }\n#define mtk_ccci_add_new_args fault_add\n')
++  parts.append(fn(f,n))
++  parts.append('#undef mtk_ccci_add_new_args\n')
++ else:
++  parts.append(fn(f,n))
++parts.append((assets/'lk_metadata_flow_stubs.h').read_text())
++for n in ['collect_lk_boot_arguments','ccci_util_fo_init']:
++ parts.append(fn(f,n))
++(out/'production-functions.c').write_text('\n'.join(parts))
++(out/'source.sha256').write_text(''.join(hashlib.sha256((root/n).read_bytes()).hexdigest()+'  '+n+'\n' for n in ['ccci_util_lib_fo.c','ccci_util_boot_args.c','ccci_util_lib_main.c','ccci_util_lib_main.h']))
++(out/'harness.c').write_text((assets/'lk_metadata_stubs.h').read_text()+'\n'+ '\n'.join(parts)+'\n'+(assets/'lk_metadata_cases.h').read_text())
++
++subprocess.run([os.environ.get('CC','cc'),'-std=gnu11','-Wall','-Wextra','-Werror',
++ '-Wno-unused-parameter','-Wno-sign-compare','-fsanitize=address,undefined','-O1',
++ str(out/'harness.c'),'-o',str(out/'harness')],check=True)
++subprocess.run([str(out/'harness')],check=True)
++work.cleanup()
+-- 
+2.56.0
+

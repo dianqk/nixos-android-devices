@@ -1,0 +1,92 @@
+From 72e035a57992ad3f8c05c2e183e48da71c22bd81 Mon Sep 17 00:00:00 2001
+From: Kuldeep Singh <kuldeep.singh@oss.qualcomm.com>
+Date: Mon, 19 Oct 2026 16:46:08 +0200
+Subject: [PATCH 032/144] crypto: qce - Fix xts-aes-qce for weak keys
+
+The QCE hardware does not support AES XTS mode when key1 and key2 are
+equal. The driver was handling this by unconditionally rejecting the
+keys with -ENOKEY(-126), regardless of whether FIPS mode is active or
+the FORBID_WEAK_KEYS flag is set.
+[    5.599170] alg: skcipher: xts-aes-qce setkey failed on test vector 0; expected_error=0, actual_error=-126, flags=0x1
+[    5.599184] alg: self-tests for xts(aes) using xts-aes-qce failed (rc=-126)
+
+In general for weak keys,
+- If FIPS mode is active or FORBID_WEAK_KEYS is set: return -EINVAL.
+- In non-FIPS mode, Accept the key and encrypt successfully.
+
+Since QCE was returning -ENOKEY for non-FIPS mode whereas the
+expectation is to encrypt content and return success, the selftest saw a
+mismatch and failed.
+
+There are two problems in QCE behavior:
+  * -ENOKEY is returned instead of -EINVAL for the FIPS/weak-key
+    rejection case.
+  * key1 == key2 is rejected even in non-FIPS mode
+
+Fix xts-aes-qce behavior by using generic helper xts_verify_key() to
+reject keys early with -EINVAL for FIPS mode active(or FORBID_WEAK_KEYS
+set). For non-FIPS mode, since QCE hardware cannot accept the keys, use
+software fallback mechanism to encrypt the data.
+
+Cc: stable@vger.kernel.org
+Fixes: f0d078dd6c49 ("crypto: qce - Return unsupported if key1 and key 2 are same for AES XTS algorithm")
+Signed-off-by: Kuldeep Singh <kuldeep.singh@oss.qualcomm.com>
+Tested-by: Kuldeep Singh <kuldeep.singh@oss.qualcomm.com>
+Tested-by: Pankaj Patil <pankaj.patil@oss.qualcomm.com>
+Signed-off-by: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Message-ID: <20261019-qce-fixes-skcipher-v12-4-046e6be9bd83@oss.qualcomm.com>
+Link: https://lore.kernel.org/r/20261019-qce-fixes-skcipher-v12-4-046e6be9bd83@oss.qualcomm.com
+(cherry picked from commit aba9ce7a888b1b0c098c86780ce67f3e5f4d2918)
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0050-crypto-qce-Fix-xts-aes-qce-for-weak-keys.patch
+Import-SHA256: 5d216081c95fb2c5f70afbaef4ee33ad36aa96a826db9cabaac6b38477710b38
+Import-Provenance: mail headers
+(cherry picked from commit 65c834971ebec05d6bd21f15b5bcb4c338e3bc2e)
+---
+ drivers/crypto/qce/skcipher.c | 17 +++++++++++------
+ 1 file changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/crypto/qce/skcipher.c b/drivers/crypto/qce/skcipher.c
+index e13845debc..7b534b5444 100644
+--- a/drivers/crypto/qce/skcipher.c
++++ b/drivers/crypto/qce/skcipher.c
+@@ -12,6 +12,7 @@
+ #include <linux/errno.h>
+ #include <crypto/aes.h>
+ #include <crypto/internal/skcipher.h>
++#include <crypto/xts.h>
+ 
+ #include "cipher.h"
+ 
+@@ -179,14 +180,17 @@ static int qce_skcipher_setkey(struct crypto_skcipher *ablk, const u8 *key,
+ 	if (!key || !keylen)
+ 		return -EINVAL;
+ 
+-	/*
+-	 * AES XTS key1 = key2 not supported by crypto engine.
+-	 * Revisit to request a fallback cipher in this case.
+-	 */
+ 	if (IS_XTS(flags)) {
++		ret = xts_verify_key(ablk, key, keylen);
++		if (ret)
++			return ret;
+ 		__keylen = keylen >> 1;
+-		if (!memcmp(key, key + __keylen, __keylen))
+-			return -ENOKEY;
++		/*
++		 * QCE does not support key1 == key2 for XTS.
++		 * Use fallback cipher in this case.
++		 */
++		ctx->use_fallback = !crypto_memneq(key, key + __keylen,
++						       __keylen);
+ 	} else {
+ 		__keylen = keylen;
+ 	}
+@@ -255,6 +259,7 @@ static int qce_skcipher_crypt(struct skcipher_request *req, int encrypt)
+ 	 * needed in all versions of CE)
+ 	 * AES-CTR with a partial final block (the CE stalls waiting for a full
+ 	 * block of input).
++	 * AES-XTS with key1 == key2 (not supported by the CE).
+ 	 * A payload fragmented across more than one scatterlist entry (the CE
+ 	 * stalls waiting for input in that case too).
+ 	 */

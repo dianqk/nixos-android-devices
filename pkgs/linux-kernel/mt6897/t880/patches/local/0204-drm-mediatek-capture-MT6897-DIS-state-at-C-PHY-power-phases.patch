@@ -1,0 +1,550 @@
+From a5483a49e98c6d16b6f71093ab3d70e8e63f6e3a Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 7 Nov 2026 04:47:13 +0800
+Subject: [PATCH] drm/mediatek: capture MT6897 DIS state at C-PHY power phases
+
+Add a read-only MMSYS helper returning the DIS routing registers, the configuration gate bank 2 status word and the DIS merge-interrupt register. The caller must already hold the parent runtime-PM and configuration-clock references, matching the routing restore contract.
+
+Use it from the MT6897 C-PHY link path to log bounded, once-per-power-on evidence before the 26M gate is enabled, after routing restore, at the first host command and at the first IRQ timeout before the existing enable/reset recovery. Also capture DSI INTEN/INTSTA/CON/MODE at the latter two points. The reads change no register or clock state.
+
+Portable tests cover the bounded capture, the 26M failure unwind and both banks' read-only state, and check the required phase ordering.
+
+These readbacks are trial evidence for the remaining physical resume failure; they do not assume that the 26M gate or interrupt routing is the cause.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/gpu/drm/mediatek/mtk_dsi.c            | 59 +++++++++++++++++
+ drivers/soc/mediatek/mt6897-mmsys.h           |  3 +
+ drivers/soc/mediatek/mtk-mmsys.c              | 37 +++++++++++
+ include/linux/soc/mediatek/mtk-mmsys.h        | 17 +++++
+ .../selftests/mtk_clk/dsi_mmsys_cases.c       | 56 ++++++++++++++--
+ .../selftests/mtk_clk/dsi_routing_cases.c     | 65 ++++++++++++++++---
+ .../selftests/mtk_clk/test_dsi_routing.py     | 26 +++++++-
+ 7 files changed, 244 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_dsi.c b/drivers/gpu/drm/mediatek/mtk_dsi.c
+index 6e6187da25..e81bfaa00e 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dsi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dsi.c
+@@ -334,6 +334,10 @@ struct mtk_dsi {
+ 	bool power_ready;
+ 	bool bridge_powered;
+ 	bool ddp_powered;
++	bool diag_pre_26m;
++	bool diag_post_route;
++	bool diag_first_cmd;
++	bool diag_timeout;
+ 
+ 	u32 data_rate;
+ 	/* Fixed per-lane (per-trio) bit rate requested by the peripheral */
+@@ -1270,6 +1274,36 @@ static void mtk_dsi_irq_data_clear(struct mtk_dsi *dsi, u32 irq_bit)
+ 	dsi->irq_data &= ~irq_bit;
+ }
+ 
++static void mtk_dsi_dump_mmsys_state(struct mtk_dsi *dsi, const char *phase)
++{
++	struct mtk_mmsys_dsi_cphy_state state;
++	int ret;
++
++	ret = mtk_mmsys_dsi_cphy_get_state(dsi->mmsys_dev, &state);
++	if (ret) {
++		dev_info(dsi->host.dev, "C-PHY state %s: read failed (%d)\n",
++			 phase, ret);
++		return;
++	}
++
++	dev_info(dsi->host.dev,
++		 "C-PHY state %s: route=%08x/%08x cg2=%08x intmerge=%08x\n",
++		 phase, state.routing_lsb, state.routing_msb, state.cg2,
++		 state.intmerge);
++}
++
++static void mtk_dsi_dump_regs(struct mtk_dsi *dsi, const char *phase)
++{
++	const struct mtk_dsi_driver_data *data = dsi->driver_data;
++
++	dev_info(dsi->host.dev,
++		 "C-PHY regs %s: inten=%08x intsta=%08x con=%08x mode=%08x\n",
++		 phase, readl(dsi->regs + data->reg_main[DSI_INTEN]),
++		 readl(dsi->regs + data->reg_main[DSI_INTSTA]),
++		 readl(dsi->regs + data->reg_main[DSI_CON_CTRL]),
++		 readl(dsi->regs + data->reg_main[DSI_MODE_CTRL]));
++}
++
+ static s32 mtk_dsi_wait_for_irq_done(struct mtk_dsi *dsi, u32 irq_flag,
+ 				     unsigned int timeout)
+ {
+@@ -1283,6 +1317,12 @@ static s32 mtk_dsi_wait_for_irq_done(struct mtk_dsi *dsi, u32 irq_flag,
+ 	if (ret == 0) {
+ 		drm_warn(drm, "Wait DSI IRQ(0x%08x) Timeout\n", irq_flag);
+ 
++		if (dsi->config_clk && !READ_ONCE(dsi->diag_timeout)) {
++			WRITE_ONCE(dsi->diag_timeout, true);
++			mtk_dsi_dump_regs(dsi, "irq-timeout");
++			mtk_dsi_dump_mmsys_state(dsi, "irq-timeout");
++		}
++
+ 		mtk_dsi_enable(dsi);
+ 		mtk_dsi_reset_engine(dsi);
+ 	}
+@@ -1352,6 +1392,11 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
+ 	if (++dsi->refcount != 1)
+ 		return 0;
+ 
++	WRITE_ONCE(dsi->diag_pre_26m, false);
++	WRITE_ONCE(dsi->diag_post_route, false);
++	WRITE_ONCE(dsi->diag_first_cmd, false);
++	WRITE_ONCE(dsi->diag_timeout, false);
++
+ 	ret = mipi_dsi_pixel_format_to_bpp(dsi->format);
+ 	if (ret < 0) {
+ 		dev_err(dev, "Unknown MIPI DSI format %d\n", dsi->format);
+@@ -1380,12 +1425,20 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
+ 		ret = clk_prepare_enable(dsi->config_clk);
+ 		if (ret)
+ 			goto err_put_mmsys;
++		if (!READ_ONCE(dsi->diag_pre_26m)) {
++			WRITE_ONCE(dsi->diag_pre_26m, true);
++			mtk_dsi_dump_mmsys_state(dsi, "pre-26m");
++		}
+ 		ret = clk_prepare_enable(dsi->clk26m);
+ 		if (ret)
+ 			goto err_disable_config_clk;
+ 		ret = mtk_mmsys_dsi_cphy_config(dsi->mmsys_dev, true);
+ 		if (ret)
+ 			goto err_disable_clk26m;
++		if (!READ_ONCE(dsi->diag_post_route)) {
++			WRITE_ONCE(dsi->diag_post_route, true);
++			mtk_dsi_dump_mmsys_state(dsi, "post-route");
++		}
+ 	}
+ 
+ 	ret = clk_set_rate(dsi->hs_clk, dsi->cphy ? dsi->symbol_rate : dsi->data_rate);
+@@ -2079,6 +2132,12 @@ static ssize_t mtk_dsi_host_transfer(struct mipi_dsi_host *host,
+ 	    (!READ_ONCE(dsi->power_ready) || !READ_ONCE(lead->power_ready)))
+ 		return -EIO;
+ 
++	if (dsi->config_clk && !READ_ONCE(dsi->diag_first_cmd)) {
++		WRITE_ONCE(dsi->diag_first_cmd, true);
++		mtk_dsi_dump_regs(dsi, "first-command");
++		mtk_dsi_dump_mmsys_state(dsi, "first-command");
++	}
++
+ 	dsi_mode = readl(lead->regs + lead->driver_data->reg_main[DSI_MODE_CTRL]);
+ 	/* Once the bridge is disabled, video stays off (panel off commands) */
+ 	restore = (dsi_mode & MODE) && lead->enabled;
+diff --git a/drivers/soc/mediatek/mt6897-mmsys.h b/drivers/soc/mediatek/mt6897-mmsys.h
+index 9bfedd4bfe..f1c86d6b80 100644
+--- a/drivers/soc/mediatek/mt6897-mmsys.h
++++ b/drivers/soc/mediatek/mt6897-mmsys.h
+@@ -26,6 +26,9 @@
+ 					 GENMASK(10, 8) | GENMASK(14, 12) | \
+ 					 GENMASK(18, 16))
+ #define MT6897_DSI_CPHY_NO_SWAP			0x62101
++/* Configuration gate bank 2 status and DIS merge-interrupt registers. */
++#define MT6897_DISPSYS_CG2			0x1a0
++#define MT6897_DISPSYS_INTMERGE			0x008
+ 
+ /* OVLSYS */
+ #define MT6897_OVL_CON				0xf08
+diff --git a/drivers/soc/mediatek/mtk-mmsys.c b/drivers/soc/mediatek/mtk-mmsys.c
+index 826bd7cf26..347cff29e5 100644
+--- a/drivers/soc/mediatek/mtk-mmsys.c
++++ b/drivers/soc/mediatek/mtk-mmsys.c
+@@ -258,6 +258,43 @@ int mtk_mmsys_dsi_cphy_config(struct device *dev, bool configure)
+ }
+ EXPORT_SYMBOL_GPL(mtk_mmsys_dsi_cphy_config);
+ 
++/**
++ * mtk_mmsys_dsi_cphy_get_state - read MT6897 C-PHY routing and gate state
++ * @dev: DSI controller's parent MMSYS device
++ * @state: receives the routing, configuration-gate and merge-interrupt words
++ *
++ * The caller must hold the DIS parent runtime-PM and configuration-clock
++ * references, as for mtk_mmsys_dsi_cphy_config(). This is a read-only helper
++ * for bounded trial evidence; it does not change hardware state.
++ *
++ * Return: zero on success, or a negative error for an unsupported/unready parent.
++ */
++int mtk_mmsys_dsi_cphy_get_state(struct device *dev,
++				 struct mtk_mmsys_dsi_cphy_state *state)
++{
++	struct mtk_mmsys *mmsys;
++	unsigned long flags;
++
++	if (!state)
++		return -EINVAL;
++	if (!dev || !dev->of_node ||
++	    (!of_device_is_compatible(dev->of_node, "mediatek,mt6897-dispsys0") &&
++	     !of_device_is_compatible(dev->of_node, "mediatek,mt6897-dispsys1")))
++		return -EINVAL;
++	mmsys = dev_get_drvdata(dev);
++	if (!mmsys || !mmsys->data->dsi_cphy_config)
++		return -EPROBE_DEFER;
++
++	spin_lock_irqsave(&mmsys->lock, flags);
++	state->routing_lsb = readl_relaxed(mmsys->regs + MT6897_DSI_SEL_CONFIG_LSB);
++	state->routing_msb = readl_relaxed(mmsys->regs + MT6897_DSI_SEL_CONFIG_MSB);
++	state->cg2 = readl_relaxed(mmsys->regs + MT6897_DISPSYS_CG2);
++	state->intmerge = readl_relaxed(mmsys->regs + MT6897_DISPSYS_INTMERGE);
++	spin_unlock_irqrestore(&mmsys->lock, flags);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(mtk_mmsys_dsi_cphy_get_state);
++
+ /**
+  * mtk_mmsys_hw_connect - Connect MultiMedia Subsystem (MMSYS) Hardware IPs
+  * @dev:            Device pointer
+diff --git a/include/linux/soc/mediatek/mtk-mmsys.h b/include/linux/soc/mediatek/mtk-mmsys.h
+index fe2934f1d1..614eff6799 100644
+--- a/include/linux/soc/mediatek/mtk-mmsys.h
++++ b/include/linux/soc/mediatek/mtk-mmsys.h
+@@ -9,11 +9,28 @@
+ #include <linux/mailbox_controller.h>
+ #include <linux/mailbox/mtk-cmdq-mailbox.h>
+ #include <linux/soc/mediatek/mtk-cmdq.h>
++#include <linux/types.h>
+ 
+ enum mtk_ddp_comp_id;
+ struct device;
+ 
++/**
++ * struct mtk_mmsys_dsi_cphy_state - MT6897 C-PHY routing and gate evidence
++ * @routing_lsb: DSI lane routing LSB register
++ * @routing_msb: DSI lane routing MSB register
++ * @cg2: configuration gate bank 2 status; the 26M gate is bit 10, active-low
++ * @intmerge: DIS merge-interrupt register
++ */
++struct mtk_mmsys_dsi_cphy_state {
++	u32 routing_lsb;
++	u32 routing_msb;
++	u32 cg2;
++	u32 intmerge;
++};
++
+ int mtk_mmsys_dsi_cphy_config(struct device *dev, bool configure);
++int mtk_mmsys_dsi_cphy_get_state(struct device *dev,
++				 struct mtk_mmsys_dsi_cphy_state *state);
+ 
+ enum mtk_dpi_out_format_con {
+ 	MTK_DPI_RGB888_SDR_CON,
+diff --git a/tools/testing/selftests/mtk_clk/dsi_mmsys_cases.c b/tools/testing/selftests/mtk_clk/dsi_mmsys_cases.c
+index 2d7725c5ac..c44e02cd79 100644
+--- a/tools/testing/selftests/mtk_clk/dsi_mmsys_cases.c
++++ b/tools/testing/selftests/mtk_clk/dsi_mmsys_cases.c
+@@ -18,7 +18,10 @@ struct mtk_mmsys_driver_data {
+ struct mtk_mmsys {
+ 	const struct mtk_mmsys_driver_data *data;
+ 	int lock;
+-	uint32_t regs[128];
++	uint8_t regs[512];
++};
++struct mtk_mmsys_dsi_cphy_state {
++	uint32_t routing_lsb, routing_msb, cg2, intmerge;
+ };
+ static int writes, offsets[4];
+ static bool of_device_is_compatible(const char *node, const char *compatible)
+@@ -31,12 +34,18 @@ static void *dev_get_drvdata(struct device *dev)
+ }
+ #define spin_lock_irqsave(lock, flags) ((void)(lock), (flags) = 0)
+ #define spin_unlock_irqrestore(lock, flags) ((void)(lock), (void)(flags))
++static uint32_t readl_relaxed(const void *p)
++{
++	return *(const uint32_t *)p;
++}
+ static void mtk_mmsys_update_bits(struct mtk_mmsys *m, unsigned int offset,
+ 				  unsigned int mask, unsigned int value,
+ 				  void *packet)
+ {
++	uint32_t *word = (uint32_t *)(m->regs + offset);
++
+ 	offsets[writes++] = offset;
+-	m->regs[offset / 4] = (m->regs[offset / 4] & ~mask) | (value & mask);
++	*word = (*word & ~mask) | (value & mask);
+ }
+ /* PRODUCTION */
+ int main(void)
+@@ -62,16 +71,49 @@ int main(void)
+ 		writes = 0;
+ 		assert(!mtk_mmsys_dsi_cphy_config(&d, false) && !writes);
+ 		for (int cycle = 0; cycle < 2; cycle++) {
+-			m.regs[0x170 / 4] = 0xa5ffffff;
+-			m.regs[0x174 / 4] = 0xfff8888e;
++			uint32_t *lsb = (uint32_t *)(m.regs + 0x170);
++			uint32_t *msb = (uint32_t *)(m.regs + 0x174);
++
++			*lsb = 0xa5ffffff;
++			*msb = 0xfff8888e;
+ 			writes = 0;
+ 			assert(!mtk_mmsys_dsi_cphy_config(&d, true));
+ 			assert(writes == 2 && offsets[0] == 0x174 &&
+ 			       offsets[1] == 0x170);
+-			assert(m.regs[0x170 / 4] == 0xa5f00000);
+-			assert(m.regs[0x174 / 4] == (0xfff8888e | 0x62101));
++			assert(*lsb == 0xa5f00000);
++			assert(*msb == (0xfff8888e | 0x62101));
+ 			/* Repeat after simulated context loss, preserving new reserved bits. */
+ 		}
+ 	}
+-	puts("MMSYS routing: both banks, validation purity, reserved bits and restore order passed");
++	struct mtk_mmsys_dsi_cphy_state st;
++	int state_writes = writes;
++
++	assert(mtk_mmsys_dsi_cphy_get_state(NULL, &st) == -EINVAL);
++	d.of_node = NULL;
++	assert(mtk_mmsys_dsi_cphy_get_state(&d, &st) == -EINVAL);
++	d.of_node = "mediatek,mt6897-ovlsys0";
++	assert(mtk_mmsys_dsi_cphy_get_state(&d, &st) == -EINVAL);
++	assert(mtk_mmsys_dsi_cphy_get_state(&d, NULL) == -EINVAL);
++	for (int bank = 0; bank < 2; bank++) {
++		d.of_node = bank ? "mediatek,mt6897-dispsys1" :
++				   "mediatek,mt6897-dispsys0";
++		d.data = NULL;
++		assert(mtk_mmsys_dsi_cphy_get_state(&d, &st) == -EPROBE_DEFER);
++		d.data = &m;
++		m.data = &unsupported;
++		assert(mtk_mmsys_dsi_cphy_get_state(&d, &st) == -EPROBE_DEFER);
++		m.data = &supported;
++		*(uint32_t *)(m.regs + 0x170) = 0x12345678;
++		*(uint32_t *)(m.regs + 0x174) = 0x9abcdef0;
++		*(uint32_t *)(m.regs + 0x1a0) = 0xfffffbff;
++		*(uint32_t *)(m.regs + 0x008) = 0x00000000;
++		state_writes = writes;
++		assert(!mtk_mmsys_dsi_cphy_get_state(&d, &st));
++		assert(st.routing_lsb == 0x12345678);
++		assert(st.routing_msb == 0x9abcdef0);
++		assert(st.cg2 == 0xfffffbff);
++		assert(st.intmerge == 0x00000000);
++		assert(writes == state_writes);
++	}
++	puts("MMSYS routing: both banks, validation purity, reserved bits, restore order and state reads passed");
+ }
+diff --git a/tools/testing/selftests/mtk_clk/dsi_routing_cases.c b/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
+index f8021bf93e..6f3d71d6e3 100644
+--- a/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
++++ b/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
+@@ -8,6 +8,7 @@
+ #include <string.h>
+ 
+ typedef uint8_t u8;
++typedef int32_t s32;
+ typedef uint32_t u32;
+ typedef uint64_t u64;
+ #define READ_ONCE(x) (x)
+@@ -15,7 +16,13 @@ typedef uint64_t u64;
+ #define LPRX_RD_RDY_INT_FLAG 2
+ #define DSI_RX_DATA0 0
+ #define MTK_DSI_HOST_IS_READ(type) ((type) == 1)
++static void test_log(const char *fmt, ...)
++{
++	(void)fmt;
++}
+ #define drm_info(dev, ...) ((void)(dev))
++#define dev_info(dev, fmt, ...) ((void)(dev), test_log(fmt, ##__VA_ARGS__))
++#define drm_warn(dev, fmt, ...) ((void)(dev), test_log(fmt, ##__VA_ARGS__))
+ #define WRITE_ONCE(x, v) ((x) = (v))
+ #define WARN_ON(x) (assert(!(x)), false)
+ #define DIV_ROUND_UP_ULL(a, b) (((a) + (b) - 1) / (b))
+@@ -31,6 +38,8 @@ typedef uint64_t u64;
+ #define DSI_CON_CTRL 1
+ #define DSI_MODE_CTRL 2
+ #define DSI_TXRX_CTRL 3
++#define DSI_INTEN 4
++#define DSI_INTSTA 5
+ struct clk {
+ 	int refs, id;
+ };
+@@ -50,8 +59,11 @@ struct drm_bridge {
+ struct drm_atomic_commit {
+ 	int unused;
+ };
++struct mtk_mmsys_dsi_cphy_state {
++	u32 routing_lsb, routing_msb, cg2, intmerge;
++};
+ struct mtk_dsi_driver_data {
+-	int reg_adv[4], reg_main[4];
++	int reg_adv[4], reg_main[6];
+ 	bool tx_buf;
+ 	int dsi_sram_bytes;
+ 	bool reg_qos;
+@@ -76,7 +88,7 @@ struct mtk_dsi {
+ 	struct {
+ 		int pixelclock;
+ 	} vm;
+-	struct clk *config_clk, *engine_clk, *digital_clk, *hs_clk;
++	struct clk *config_clk, *engine_clk, *digital_clk, *hs_clk, *clk26m;
+ 	struct device *mmsys_dev;
+ 	struct phy *phy;
+ 	struct mtk_dsi *slave, *master;
+@@ -84,10 +96,14 @@ struct mtk_dsi {
+ 	unsigned long hs_rate;
+ 	u32 data_rate, symbol_rate;
+ 	bool cphy, is_slave, power_ready, bridge_powered, ddp_powered,
+-		lanes_ready;
++		lanes_ready, diag_pre_26m, diag_post_route, diag_first_cmd,
++		diag_timeout;
++	u32 irq_data;
++	void *irq_wait_queue;
+ 	u32 *regs;
+ };
+ static int fail_at, calls, writes, route[2], event[256], n;
++static int state_reads, reg_reads, timeout_ret;
+ static bool legacy;
+ static int step(int id)
+ {
+@@ -134,6 +150,17 @@ static int mtk_mmsys_dsi_cphy_config(struct device *d, bool configure)
+ 		route[d->id] = 0x62101;
+ 	return ret;
+ }
++static int mtk_mmsys_dsi_cphy_get_state(struct device *d,
++					struct mtk_mmsys_dsi_cphy_state *s)
++{
++	assert(d->pm > 0);
++	state_reads++;
++	s->routing_lsb = 0;
++	s->routing_msb = route[d->id];
++	s->cg2 = 0;
++	s->intmerge = 0;
++	return 0;
++}
+ static int phy_power_on(struct phy *p)
+ {
+ 	assert(legacy || route[p->id] == 0x62101);
+@@ -201,8 +228,12 @@ static int mtk_dsi_switch_to_cmd_mode(struct mtk_dsi *d, int flag, int timeout)
+ }
+ static u32 readl(u32 *p)
+ {
++	reg_reads++;
+ 	return *p;
+ }
++#define msecs_to_jiffies(x) (x)
++#define wait_event_interruptible_timeout(q, cond, timeout) \
++	((void)(q), (void)(cond), (void)(timeout), timeout_ret)
+ static void writel(u32 v, u32 *p)
+ {
+ 	*p = v;
+@@ -232,19 +263,22 @@ static u8 readb(void *p)
+ 
+ static struct mtk_dsi d[2];
+ static struct device dev[2];
+-static struct clk clocks[2][4];
++static struct clk clocks[2][5];
+ static struct phy phys[2];
+-static u32 regs[2][4];
+-static const struct mtk_dsi_driver_data data = { .reg_main = { 0, 1, 2, 3 } };
++static u32 regs[2][8];
++static const struct mtk_dsi_driver_data data = {
++	.reg_main = { 0, 1, 2, 3, 4, 5 }
++};
+ static void setup(bool dual)
+ {
+ 	calls = writes = n = fail_at = 0;
++	state_reads = reg_reads = timeout_ret = 0;
+ 	legacy = false;
+ 	for (int i = 0; i < 2; i++) {
+ 		dev[i] = (struct device){ .id = i, .data = &d[i] };
+ 		phys[i] = (struct phy){ .id = i };
+-		for (int j = 0; j < 4; j++)
+-			clocks[i][j] = (struct clk){ .id = i * 4 + j };
++		for (int j = 0; j < 5; j++)
++			clocks[i][j] = (struct clk){ .id = i * 5 + j };
+ 		d[i] = (struct mtk_dsi){ .driver_data = &data,
+ 					 .host.dev = &dev[i],
+ 					 .mmsys_dev = &dev[i],
+@@ -254,6 +288,7 @@ static void setup(bool dual)
+ 					 .engine_clk = &clocks[i][1],
+ 					 .digital_clk = &clocks[i][2],
+ 					 .hs_clk = &clocks[i][3],
++					 .clk26m = &clocks[i][4],
+ 					 .cphy = true,
+ 					 .format = 24,
+ 					 .lanes = 3,
+@@ -268,7 +303,7 @@ static void balanced(void)
+ 	for (int i = 0; i < 2; i++) {
+ 		assert(!dev[i].pm && !phys[i].refs && !d[i].refcount &&
+ 		       !d[i].power_ready);
+-		for (int j = 0; j < 4; j++)
++		for (int j = 0; j < 5; j++)
+ 			assert(!clocks[i][j].refs);
+ 	}
+ }
+@@ -347,5 +382,15 @@ int main(void)
+ 	mtk_dsi_bridge_atomic_post_disable(&d[0].bridge, NULL);
+ 	mtk_dsi_ddp_stop(&dev[0]);
+ 	balanced();
+-	puts("DSI routing: dual-link acquisition failure sweep, ownership and context-loss replay passed");
++	setup(false);
++	assert(!mtk_dsi_poweron(&d[0]));
++	assert(state_reads == 2 && !reg_reads);
++	timeout_ret = 0;
++	assert(mtk_dsi_wait_for_irq_done(&d[0], LPRX_RD_RDY_INT_FLAG, 1) == 0);
++	assert(d[0].diag_timeout && state_reads == 3 && reg_reads == 4);
++	assert(mtk_dsi_wait_for_irq_done(&d[0], LPRX_RD_RDY_INT_FLAG, 1) == 0);
++	assert(state_reads == 3 && reg_reads == 4);
++	mtk_dsi_poweroff(&d[0]);
++	balanced();
++	puts("DSI routing: dual-link acquisition failure sweep, ownership, context-loss replay and bounded state capture passed");
+ }
+diff --git a/tools/testing/selftests/mtk_clk/test_dsi_routing.py b/tools/testing/selftests/mtk_clk/test_dsi_routing.py
+index 3a23f04c97..d81c05b953 100755
+--- a/tools/testing/selftests/mtk_clk/test_dsi_routing.py
++++ b/tools/testing/selftests/mtk_clk/test_dsi_routing.py
+@@ -13,7 +13,7 @@ source = (repo / 'drivers/gpu/drm/mediatek/mtk_dsi.c').read_text()
+ 
+ 
+ def function(name, text=source):
+-    match = re.search(r'^(?:static )?(?:int|void|ssize_t)\s*' + name + r'\(', text, re.M)
++    match = re.search(r'^(?:static )?(?:int|void|ssize_t|s32)\s*' + name + r'\(', text, re.M)
+     start = match.start()
+     end = text.index('{', start) + 1
+     depth = 1
+@@ -24,6 +24,7 @@ def function(name, text=source):
+ 
+ 
+ production = '\n'.join(function(name) for name in [
++    'mtk_dsi_dump_mmsys_state', 'mtk_dsi_dump_regs', 'mtk_dsi_wait_for_irq_done',
+     'mtk_dsi_poweron', 'mtk_dsi_poweroff', 'mtk_dsi_bridge_atomic_disable',
+     'mtk_dsi_bridge_atomic_enable', 'mtk_dsi_bridge_atomic_pre_enable',
+     'mtk_dsi_bridge_atomic_post_disable', 'mtk_dsi_ddp_start', 'mtk_dsi_ddp_stop',
+@@ -31,8 +32,29 @@ production = '\n'.join(function(name) for name in [
+ transfer = function('mtk_dsi_host_transfer')
+ assert transfer.index('!READ_ONCE(dsi->power_ready)') < transfer.index('readl(')
+ assert transfer.index('!READ_ONCE(lead->power_ready)') < transfer.index('readl(')
++assert transfer.index('!READ_ONCE(dsi->power_ready)') < \
++    transfer.index('mtk_dsi_dump_regs') < transfer.index('readl(')
++poweron = function('mtk_dsi_poweron')
++assert poweron.index('pm_runtime_resume_and_get') < \
++    poweron.index('clk_prepare_enable(dsi->config_clk)') < \
++    poweron.index('mtk_dsi_dump_mmsys_state(dsi, "pre-26m")') < \
++    poweron.index('clk_prepare_enable(dsi->clk26m)') < \
++    poweron.index('mtk_mmsys_dsi_cphy_config') < \
++    poweron.index('mtk_dsi_dump_mmsys_state(dsi, "post-route")') < \
++    poweron.index('clk_set_rate')
++poweroff = function('mtk_dsi_poweroff')
++assert poweroff.index('phy_power_off') < \
++    poweroff.index('clk_disable_unprepare(dsi->clk26m)') < \
++    poweroff.index('clk_disable_unprepare(dsi->config_clk)') < \
++    poweroff.index('pm_runtime_put')
++timeout = function('mtk_dsi_wait_for_irq_done')
++assert timeout.index('mtk_dsi_dump_regs') < timeout.index('mtk_dsi_enable')
++assert timeout.index('mtk_dsi_dump_regs') < timeout.index('mtk_dsi_reset_engine')
++assert timeout.index('!READ_ONCE(dsi->diag_timeout)') < \
++    timeout.index('mtk_dsi_dump_regs')
+ mmsys = (repo / 'drivers/soc/mediatek/mtk-mmsys.c').read_text()
+ routing = function('mtk_mmsys_dsi_cphy_config', mmsys)
++state = function('mtk_mmsys_dsi_cphy_get_state', mmsys)
+ header = (repo / 'drivers/soc/mediatek/mt6897-mmsys.h').read_text()
+ constants = header[header.index('#define MT6897_DSI_SEL_CONFIG_LSB'):
+                    header.index('/* OVLSYS */')]
+@@ -42,7 +64,7 @@ with tempfile.TemporaryDirectory(prefix='mtk-dsi-routing-') as tmp:
+         ('dsi', (assets / 'dsi_routing_cases.c').read_text().replace(
+             '/* PRODUCTION */', production)),
+         ('mmsys', (assets / 'dsi_mmsys_cases.c').read_text().replace(
+-            '/* PRODUCTION */', constants + routing)),
++            '/* PRODUCTION */', constants + routing + state)),
+     ]:
+         c = tmp / (filename + '.c')
+         c.write_text(body)
+-- 
+2.56.0
+

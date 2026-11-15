@@ -1,0 +1,41 @@
+From 63299d93fbd4ac23c379708a102166e7475eaffa Mon Sep 17 00:00:00 2001
+From: Tatsuki Tanaka <tatsuki@tanakatatsuki.dev>
+Date: Thu, 22 Oct 2026 01:28:09 +0800
+Subject: [PATCH 43/46] ASoC: qcom: audioreach: align shared memory read done
+ v2 descriptor with hardware
+
+The SM8475 ADSP returns a 56-byte payload for
+DATA_CMD_RSP_RD_SH_MEM_EP_DATA_BUFFER_V2: ten words of read done header
+followed by four metadata words (md_buf_addr_lsw, md_buf_addr_msw,
+md_mem_map_handle and md_status).
+
+The structure carried a fifth metadata field, md_size, which made the
+expected size 60 bytes. graph_callback() rejects payloads smaller than
+sizeof(*rd_done), so every capture buffer completion packet was dropped.
+No period was ever reported to the PCM core and capture failed with -EIO.
+
+Drop md_size so the structure is 56 bytes.
+
+Signed-off-by: Tatsuki Tanaka <tatsuki@tanakatatsuki.dev>
+(cherry picked from commit bc5e52db136e737a335fe0eb935361b97484cc2c)
+---
+ sound/soc/qcom/qdsp6/audioreach.h | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/sound/soc/qcom/qdsp6/audioreach.h b/sound/soc/qcom/qdsp6/audioreach.h
+index 58af247b39ca..46413f7821da 100644
+--- a/sound/soc/qcom/qdsp6/audioreach.h
++++ b/sound/soc/qcom/qdsp6/audioreach.h
+@@ -390,11 +390,10 @@ struct data_cmd_rsp_rd_sh_mem_ep_data_buffer_done_v2 {
+ 	uint32_t timestamp_msw;
+ 	uint32_t flags;
+ 	uint32_t num_frames;
+-	uint32_t md_status;
+ 	uint32_t md_buf_addr_lsw;
+ 	uint32_t md_buf_addr_msw;
+ 	uint32_t md_mem_map_handle;
+-	uint32_t md_size;
++	uint32_t md_status;
+ } __packed;
+ 
+ #define PARAM_ID_RD_SH_MEM_CFG				0x08001007

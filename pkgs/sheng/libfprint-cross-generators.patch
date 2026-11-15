@@ -1,0 +1,61 @@
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -303,38 +303,10 @@
+ 
+ udev_hwdb_list = 'fprint-list-udev-hwdb.c'
+ udev_hwdb_list_file = files(udev_hwdb_list)
+-udev_hwdb = executable('fprint-list-udev-hwdb',
+-    udev_hwdb_list_file,
+-    dependencies: libfprint_private_dep,
+-    link_with: libfprint_drivers,
+-    install: false,
+-    link_args: ['-Wl,--disable-new-dtags'],
+-)
+-
+-udev_hwdb_generator = custom_target('udev-hwdb',
+-    output: 'autosuspend.hwdb',
+-    depend_files: drivers_sources,
+-    capture: true,
+-    command: [ udev_hwdb ],
+-    install: false,
+-)
+-
+-metainfo = executable('fprint-list-metainfo',
+-    'fprint-list-metainfo.c',
+-    dependencies: libfprint_private_dep,
+-    link_with: libfprint_drivers,
+-    install: false,
+-    link_args: ['-Wl,--disable-new-dtags'],
+-)
+-
+-metainfo_generator = custom_target('metainfo',
+-    output: 'org.freedesktop.libfprint.metainfo.xml',
+-    depend_files: drivers_sources,
+-    capture: true,
+-    command: [ metainfo ],
+-    install: true,
+-    install_dir: datadir / 'metainfo'
+-)
++# This FPC1553-only cross package disables udev rules/hwdb installation.
++# Do not register target executable generators (including the USB AppStream
++# catalog): Meson requires an exe_wrapper even for a non-default target.
++# Fingerprint driver and backend runtime functionality is unaffected.
+ 
+ if install_udev_rules
+     udev_rules = executable('fprint-list-udev-rules',
+@@ -358,15 +330,6 @@
+ udev_hwdb_list_updater = custom_target('udev-hwdb-list-updater',
+     output: udev_hwdb_list,
+     command: [ sync_unsupported_files, udev_hwdb_list_file ],
+-)
+-
+-run_target('sync-udev-hwdb',
+-    depends: udev_hwdb_list_updater,
+-    command: [
+-        'cp', '-v',
+-        udev_hwdb_generator.full_path(),
+-        meson.project_source_root() / 'data'
+-    ]
+ )
+ 
+ alias_target('sync-unsupported-devices', udev_hwdb_list_updater)

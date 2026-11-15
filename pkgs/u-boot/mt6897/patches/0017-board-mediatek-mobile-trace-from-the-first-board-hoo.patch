@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 14 Oct 2026 22:06:02 +0800
+Subject: [PATCH 17/24] board: mediatek-mobile: trace from the first board
+ hook, save the console on reset
+
+Start the pstore record and restart the watchdog in board_fdt_blob_setup()
+(probe stage 1), since save_boot_params() may not touch memory beyond
+x0. Before the PSCI reset in reset_cpu(), copy the console record, which
+also holds output from before any console device existed (exception
+dumps, panics), into the pstore console zone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm/mach-mediatek/Kconfig                |  3 +-
+ arch/arm/mach-mediatek/mt6897/init.c          |  6 +++
+ .../mediatek-mobile/mediatek-mobile.c         | 37 +++++++++++++++++++
+ board/mediatek/mediatek-mobile/t880.env       | 34 +++++++++++++++++
+ 4 files changed, 79 insertions(+), 1 deletion(-)
+ create mode 100644 board/mediatek/mediatek-mobile/t880.env
+
+diff --git a/arch/arm/mach-mediatek/Kconfig b/arch/arm/mach-mediatek/Kconfig
+index f2bf3bfb417..e38c98e0c28 100644
+--- a/arch/arm/mach-mediatek/Kconfig
++++ b/arch/arm/mach-mediatek/Kconfig
+@@ -209,7 +209,7 @@ config MEDIATEK_MOBILE_ENTRY_TRACE
+ 	  Without UART or screen, record U-Boot's progress and console in the
+ 	  ramoops console zone the stock Android kernel reads after a reset
+ 	  (/sys/fs/pstore/console-ramoops-0), and restart the stock watchdog
+-	  at entry. Diagnostic aid for bring-up.
++	  from the first board hook on. Diagnostic aid for bring-up.
+ 
+ config MEDIATEK_MOBILE_PSTORE_CONSOLE
+ 	hex "Physical address of the ramoops console zone (0: none)"
+@@ -235,6 +235,7 @@ config MEDIATEK_MOBILE_PROBE_STAGE
+ 	  2 LK FDT parsed, 3 DRAM window chosen, 4 relocated, 5 misc_init_r
+ 	  done), set the RGU reboot mode to bootloader and reset, so the host
+ 	  sees the stock fastboot instead of a watchdog loop. 0 disables it.
++	  Stage 1 is the first board hook (board_fdt_blob_setup).
+ 
+ config MEDIATEK_MOBILE_ENTRY_WDT_RESTART_KEY
+ 	hex "Value written to the watchdog restart register"
+diff --git a/arch/arm/mach-mediatek/mt6897/init.c b/arch/arm/mach-mediatek/mt6897/init.c
+index be278043a52..4fc877da072 100644
+--- a/arch/arm/mach-mediatek/mt6897/init.c
++++ b/arch/arm/mach-mediatek/mt6897/init.c
+@@ -11,7 +11,13 @@ int print_cpuinfo(void)
+ 	return 0;
+ }
+ 
++/* Lets a board save diagnostics (for example the console record) first. */
++__weak void mediatek_mobile_reset_notify(void)
++{
++}
++
+ void reset_cpu(void)
+ {
++	mediatek_mobile_reset_notify();
+ 	psci_system_reset();
+ }
+diff --git a/board/mediatek/mediatek-mobile/mediatek-mobile.c b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+index af0273b198f..8a604603338 100644
+--- a/board/mediatek/mediatek-mobile/mediatek-mobile.c
++++ b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+@@ -27,6 +27,7 @@
+ #include <lmb.h>
+ #include <log.h>
+ #include <mapmem.h>
++#include <membuf.h>
+ #include <dm/ofnode.h>
+ #include <stdio_dev.h>
+ #include <time.h>
+@@ -275,6 +276,38 @@ static void __maybe_unused mtk_trace(const char *fmt, ...)
+ 	mtk_wdt_kick();
+ }
+ 
++/*
++ * On reset (panic, exception or "reset"), copy the console record, which
++ * also holds output from before any console device existed, so the reason
++ * survives into the next boot's pstore.
++ */
++void mediatek_mobile_reset_notify(void)
++{
++	static const char marker[] = "\n--- U-Boot console record at reset ---\n";
++	char *data;
++	int len;
++
++	mtk_pstore_write(marker, sizeof(marker) - 1);
++	if (!IS_ENABLED(CONFIG_CONSOLE_RECORD))
++		return;
++	while ((len = membuf_getraw(&gd->console_out, 4096, true, &data)) > 0)
++		mtk_pstore_write(data, len);
++	mtk_pstore_write("\n--- reset ---\n", 15);
++}
++
++/* Start a fresh record for this boot; the first board hook to run. */
++static void mtk_pstore_begin(void)
++{
++	struct mtk_pstore *p = (void *)CONFIG_MEDIATEK_MOBILE_PSTORE_CONSOLE;
++
++	mtk_wdt_kick();
++	if (CONFIG_MEDIATEK_MOBILE_PSTORE_CONSOLE) {
++		p->sig = 0x43474244;
++		p->start = 0;
++		p->size = 0;
++	}
++}
++
+ /* See MEDIATEK_MOBILE_PROBE_STAGE: prove progress by rebooting to fastboot. */
+ static void mtk_probe(int stage)
+ {
+@@ -327,6 +360,7 @@ static void mtk_pstore_console(void)
+ static inline void mtk_trace(const char *fmt, ...) {}
+ static inline void mtk_pstore_console(void) {}
+ static inline void mtk_probe(int stage) {}
++static inline void mtk_pstore_begin(void) {}
+ #endif
+ 
+ /* Keep our own control DT; LK's Android FDT only supplies runtime facts. */
+@@ -335,6 +369,9 @@ int board_fdt_blob_setup(void **fdtp)
+ 	void *prev = (void *)get_prev_bl_fdt_addr();
+ 	bool internal = !fdt_check_header(*fdtp);
+ 
++	mtk_pstore_begin();
++	mtk_trace("U-Boot: entry\n");
++	mtk_probe(1);
+ 	mtk_trace("U-Boot: board_fdt_blob_setup, LK FDT %p, own DT %s\n", prev,
+ 		  internal ? "valid" : "missing");
+ 	if (!prev || mtk_parse_prev_fdt(prev)) {
+diff --git a/board/mediatek/mediatek-mobile/t880.env b/board/mediatek/mediatek-mobile/t880.env
+new file mode 100644
+index 00000000000..11574ec2730
+--- /dev/null
++++ b/board/mediatek/mediatek-mobile/t880.env
+@@ -0,0 +1,34 @@
++# SPDX-License-Identifier: GPL-2.0+
++# No persistent environment and no automatic storage writes.
++# Without an ESP, U-Boot waits in USB fastboot (fastboot boot <FIT>,
++# fastboot oem console/run); the USB ACM console is in the menu.
++boot_esp=linux-boot
++stdin=serial,button-kbd
++stdout=vidconsole,serial
++stderr=vidconsole,serial
++bootdelay=0
++bootretry=-1
++serial_gadget=setenv stdin serial,button-kbd,usbacm; setenv stdout vidconsole,serial,usbacm,pstore; setenv stderr vidconsole,serial,usbacm,pstore
++# Fastboot needs the USB controller: release the ACM console first and
++# restore it when fastboot ends (host: fastboot continue).
++console_local=setenv stdin serial,button-kbd; setenv stdout vidconsole,serial,pstore; setenv stderr vidconsole,serial,pstore
++fastboot=run console_local; echo "Fastboot on USB (fastboot boot <image.itb>; fastboot continue returns)"; fastboot -l ${fastboot_addr_r} usb 0; run serial_gadget; echo "Fastboot ended"
++banner=echo "== Alldocube T880 U-Boot =="; echo "${ver}"
++ufs_probe=echo "UFS: scanning"; if scsi scan; then echo "UFS: scan done"; else echo "UFS: FAILED (USB still available)"; fi
++usb_probe=echo "USB: starting ACM console"; run serial_gadget; echo "USB: ACM console requested (usbacm)"
++preboot=run banner; run ufs_probe
++# 1) RAM recovery FIT from this boot image's ramdisk, 2) systemd-boot from
++# the FAT ${boot_esp} partition, 3) USB fastboot.
++boot_payload=if test -n "${payload_addr}"; then echo "Boot: RAM recovery payload at ${payload_addr}"; bootm ${payload_addr}; else echo "Boot: no RAM recovery payload"; fi
++boot_linux=for bootdev in 0 1 2 3 4 5 6 7; do if part number scsi ${bootdev} ${boot_esp} bootpart; then if fatload scsi ${bootdev}:${bootpart} ${kernel_addr_r} /EFI/BOOT/BOOTAA64.EFI; then bootefi ${kernel_addr_r}; fi; fi; done; echo "Boot: no ${boot_esp} partition with /EFI/BOOT/BOOTAA64.EFI"
++default_boot=run boot_payload; run boot_linux; run fastboot
++bootcmd=run default_boot
++# The menu times out to the default flow if the keys misread.
++menucmd=bootmenu 10
++bootmenu_0=Default boot (payload, ESP, fastboot)=run default_boot
++bootmenu_1=Fastboot (USB)=run fastboot
++bootmenu_2=USB ACM console=run usb_probe
++bootmenu_3=Drop to shell=echo "Shell"
++bootmenu_4=Reset device=reset
++button_cmd_0_name=Volume Down
++button_cmd_0=run menucmd
+-- 
+2.55.0
+

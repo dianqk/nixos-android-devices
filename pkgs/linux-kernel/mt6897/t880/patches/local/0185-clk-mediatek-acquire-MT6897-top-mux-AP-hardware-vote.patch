@@ -1,0 +1,257 @@
+From 599671f5fc1e3a2a38c49e3f7b566954880ce613 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 20:36:41 +0800
+Subject: [PATCH 185/187] clk: mediatek: acquire MT6897 top mux AP hardware
+ votes
+
+Replace the read-only gate behavior for eight top muxes with bounded AP
+SET/ACK/DONE/PDN acquisition and CLR/ACK/DONE release. Leave firmware
+parent choices and the four VCP IPI muxes read-only. Keep inherited AP
+votes until a boot ownership handoff exists and retain own-vote state
+through failed rollback or release. Missing voter DT data retains the
+read-only fallback.
+
+Adapt the MT6897 vendor protocol, rather than the incompatible FENC mux
+helper. This is a new implementation, not an imported vendor commit.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/clk/mediatek/clk-mux.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/clk/mediatek/clk-mt6897.c
+---
+ .../mt6897-alldocube-t880-mtkdrm.dtsi         |   4 +
+ drivers/clk/mediatek/clk-mt6897-topckgen.c    | 164 ++++++++++++++++--
+ 2 files changed, 156 insertions(+), 12 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-mtkdrm.dtsi b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-mtkdrm.dtsi
+index a6bef2edb8..301bfec0fd 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-mtkdrm.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-mtkdrm.dtsi
+@@ -1019,3 +1019,7 @@ &mminfra_config {
+ &apmixedsys {
+ 	mediatek,hardware-voter = <&hwv>;
+ };
++
++&topckgen {
++	mediatek,hardware-voter = <&hwv>;
++};
+diff --git a/drivers/clk/mediatek/clk-mt6897-topckgen.c b/drivers/clk/mediatek/clk-mt6897-topckgen.c
+index efbf60128a..9402b44425 100644
+--- a/drivers/clk/mediatek/clk-mt6897-topckgen.c
++++ b/drivers/clk/mediatek/clk-mt6897-topckgen.c
+@@ -3,14 +3,18 @@
+  * MediaTek MT6897 topckgen clocks.
+  *
+  * Data from the MediaTek vendor driver (MiCode MTK_kernel_device_modules
+- * 3c4ccd07, drivers/clk/mediatek/clk-mt6897.c). Muxes whose enable is a
+- * hardware-voter or VCP-firmware operation are registered read-only: their
+- * gate and parent are owned elsewhere and are never written here.
++ * 3c4ccd07, drivers/clk/mediatek/clk-mt6897.c). Eight hardware-voter
++ * muxes acquire only the AP vote. Their parent selection remains firmware
++ * owned; four VCP IPI muxes remain entirely read-only. Inherited AP votes
++ * are retained until a separate boot ownership handoff exists.
+  */
+ 
+ #include <dt-bindings/clock/mediatek,mt6897-clock.h>
+ #include <linux/clk-provider.h>
++#include <linux/iopoll.h>
++#include <linux/mfd/syscon.h>
+ #include <linux/module.h>
++#include <linux/regmap.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ 
+@@ -1492,6 +1496,7 @@ struct mt6897_ro_mux {
+ 	u32 reg;
+ 	u8 shift;
+ 	u8 width;
++	u16 vote_set, vote_clr, vote_done;
+ };
+ 
+ #define RO_MUX(_id, _name, _parents, _reg, _shift, _width) {		\
+@@ -1499,32 +1504,163 @@ struct mt6897_ro_mux {
+ 		.num_parents = ARRAY_SIZE(_parents), .reg = _reg,	\
+ 		.shift = _shift, .width = _width }
+ 
++#define HWV_MUX(_id, _name, _parents, _reg, _shift, _width, _bank) { \
++	.id = _id, .name = _name, .parents = _parents, \
++	.num_parents = ARRAY_SIZE(_parents), .reg = _reg, \
++	.shift = _shift, .width = _width, \
++	.vote_set = HW_CCF_CG_##_bank##_SET, \
++	.vote_clr = HW_CCF_CG_##_bank##_CLR, \
++	.vote_done = HW_CCF_CG_##_bank##_DONE }
++
+ static const struct mt6897_ro_mux top_ro_muxes[] = {
+-	RO_MUX(CLK_TOP_DISP0_SEL, "disp0_sel", disp0_parents, CLK_CFG_1, 0, 4),
+-	RO_MUX(CLK_TOP_DISP1_SEL, "disp1_sel", disp1_parents, CLK_CFG_1, 8, 4),
+-	RO_MUX(CLK_TOP_OVL0_SEL, "ovl0_sel", ovl0_parents, CLK_CFG_1, 16, 4),
+-	RO_MUX(CLK_TOP_OVL1_SEL, "ovl1_sel", ovl1_parents, CLK_CFG_1, 24, 4),
+-	RO_MUX(CLK_TOP_MMINFRA_SEL, "mminfra_sel", mminfra_parents, CLK_CFG_2, 16, 4),
+-	RO_MUX(CLK_TOP_DISP_PWM_SEL, "disp_pwm_sel", disp_pwm_parents, CLK_CFG_7, 8, 3),
+-	RO_MUX(CLK_TOP_I2C_SEL, "i2c_sel", i2c_parents, CLK_CFG_8, 0, 2),
+-	RO_MUX(CLK_TOP_VENC_SEL, "venc_sel", venc_parents, CLK_CFG_12, 24, 4),
++	HWV_MUX(CLK_TOP_DISP0_SEL, "disp0_sel", disp0_parents, CLK_CFG_1, 0, 4, 18),
++	HWV_MUX(CLK_TOP_DISP1_SEL, "disp1_sel", disp1_parents, CLK_CFG_1, 8, 4, 18),
++	HWV_MUX(CLK_TOP_OVL0_SEL, "ovl0_sel", ovl0_parents, CLK_CFG_1, 16, 4, 18),
++	HWV_MUX(CLK_TOP_OVL1_SEL, "ovl1_sel", ovl1_parents, CLK_CFG_1, 24, 4, 18),
++	HWV_MUX(CLK_TOP_MMINFRA_SEL, "mminfra_sel", mminfra_parents, CLK_CFG_2, 16, 4, 19),
++	HWV_MUX(CLK_TOP_DISP_PWM_SEL, "disp_pwm_sel", disp_pwm_parents, CLK_CFG_7, 8, 3, 20),
++	HWV_MUX(CLK_TOP_I2C_SEL, "i2c_sel", i2c_parents, CLK_CFG_8, 0, 2, 21),
++	HWV_MUX(CLK_TOP_VENC_SEL, "venc_sel", venc_parents, CLK_CFG_12, 24, 4, 22),
+ 	RO_MUX(CLK_TOP_VDEC_SEL, "vdec_sel", vdec_parents, CLK_CFG_13, 0, 4),
+ 	RO_MUX(CLK_TOP_IMG1_SEL, "img1_sel", img1_parents, CLK_CFG_15, 24, 4),
+ 	RO_MUX(CLK_TOP_IPE_SEL, "ipe_sel", ipe_parents, CLK_CFG_16, 0, 4),
+ 	RO_MUX(CLK_TOP_CAM_SEL, "cam_sel", cam_parents, CLK_CFG_21, 0, 4),
+ };
+ 
++/*
++ * MT6897 AP hardware voter protocol. DONE is latched before checking PDN.
++ * CLR releases only AP ownership; another master may keep PDN clear.
++ * Source: https://github.com/MiCode/MTK_kernel_device_modules/blob/
++ * 3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/clk/mediatek/clk-mux.c
++ */
++struct mt6897_voted_mux {
++	struct clk_hw hw;
++	const struct mt6897_ro_mux *data;
++	struct regmap *voter;
++	void __iomem *base;
++	bool classified;
++	bool inherited;
++	bool owned;
++};
++
++static int mt6897_mux_vote(struct mt6897_voted_mux *m, bool on)
++{
++	const struct mt6897_ro_mux *d = m->data;
++	u32 val, bit = BIT(d->shift + 7);
++	int ret;
++
++	ret = regmap_write(m->voter, on ? d->vote_set : d->vote_clr, bit);
++	if (ret)
++		return ret;
++	ret = regmap_read_poll_timeout(m->voter, d->vote_set, val,
++				      !!(val & bit) == on, 2, 1000);
++	if (ret)
++		return ret;
++	ret = regmap_read_poll_timeout(m->voter, d->vote_done, val,
++				      val & bit, 2, 100000);
++	if (ret || !on)
++		return ret;
++	return readl_poll_timeout(m->base + d->reg, val, !(val & bit),
++				  2, 100000);
++}
++
++static int mt6897_mux_prepare(struct clk_hw *hw)
++{
++	struct mt6897_voted_mux *m = container_of(hw, struct mt6897_voted_mux, hw);
++	u32 val, bit = BIT(m->data->shift + 7);
++	int ret, cleanup;
++
++	ret = regmap_read(m->voter, m->data->vote_set, &val);
++	if (ret)
++		return ret;
++	/* Preserve an AP vote established before this driver acquired ownership. */
++	if (!m->classified) {
++		m->inherited = !!(val & bit);
++		m->classified = true;
++	}
++	if (!(val & bit))
++		m->owned = true;
++	ret = mt6897_mux_vote(m, true);
++	if (!ret) {
++		m->owned = !m->inherited;
++		return 0;
++	}
++	if (!(val & bit)) {
++		cleanup = mt6897_mux_vote(m, false);
++		if (cleanup)
++			pr_err("%s: failed vote rollback: %d\n", clk_hw_get_name(hw), cleanup);
++		else
++			m->owned = false;
++	}
++	return ret;
++}
++
++static void mt6897_mux_unprepare(struct clk_hw *hw)
++{
++	struct mt6897_voted_mux *m = container_of(hw, struct mt6897_voted_mux, hw);
++	int ret;
++
++	if (!m->owned)
++		return;
++	ret = mt6897_mux_vote(m, false);
++	if (ret)
++		pr_err("%s: failed AP unvote: %d\n", clk_hw_get_name(hw), ret);
++	else
++		m->owned = false;
++}
++
++static u8 mt6897_mux_get_parent(struct clk_hw *hw)
++{
++	struct mt6897_voted_mux *m = container_of(hw, struct mt6897_voted_mux, hw);
++
++	return (readl(m->base + m->data->reg) >> m->data->shift) &
++		GENMASK(m->data->width - 1, 0);
++}
++
++static const struct clk_ops mt6897_mux_ops = {
++	.prepare = mt6897_mux_prepare,
++	.unprepare = mt6897_mux_unprepare,
++	.get_parent = mt6897_mux_get_parent,
++};
++
++static struct clk_hw *mt6897_mux_register(struct device *dev,
++		const struct mt6897_ro_mux *d, void __iomem *base, struct regmap *voter)
++{
++	struct mt6897_voted_mux *m;
++	struct clk_init_data init = {
++		.name = d->name, .ops = &mt6897_mux_ops,
++		.parent_names = d->parents, .num_parents = d->num_parents,
++		.flags = CLK_IGNORE_UNUSED,
++	};
++	int ret;
++
++	m = devm_kzalloc(dev, sizeof(*m), GFP_KERNEL);
++	if (!m)
++		return ERR_PTR(-ENOMEM);
++	m->hw.init = &init;
++	m->data = d;
++	m->base = base;
++	m->voter = voter;
++	ret = devm_clk_hw_register(dev, &m->hw);
++	return ret ? ERR_PTR(ret) : &m->hw;
++}
++
+ static int clk_mt6897_top_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+ 	struct clk_hw_onecell_data *clk_data;
+ 	void __iomem *base;
++	struct regmap *voter;
+ 	int i, ret;
+ 
+ 	base = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(base))
+ 		return PTR_ERR(base);
+ 
++	voter = syscon_regmap_lookup_by_phandle_optional(dev->of_node, "mediatek,hardware-voter");
++	if (IS_ERR(voter))
++		return dev_err_probe(dev, PTR_ERR(voter), "no hardware voter\n");
++
+ 	clk_data = mtk_devm_alloc_clk_data(dev, CLK_TOP_NR_CLK);
+ 	if (!clk_data)
+ 		return -ENOMEM;
+@@ -1544,7 +1680,11 @@ static int clk_mt6897_top_probe(struct platform_device *pdev)
+ 		const struct mt6897_ro_mux *m = &top_ro_muxes[i];
+ 		struct clk_hw *hw;
+ 
+-		hw = devm_clk_hw_register_mux(dev, m->name, m->parents,
++		/* Without the voter, keep firmware gate and parent ownership. */
++		if (m->vote_set && voter)
++			hw = mt6897_mux_register(dev, m, base, voter);
++		else
++			hw = devm_clk_hw_register_mux(dev, m->name, m->parents,
+ 					      m->num_parents, 0,
+ 					      base + m->reg, m->shift,
+ 					      m->width, CLK_MUX_READ_ONLY,
+-- 
+2.56.0
+

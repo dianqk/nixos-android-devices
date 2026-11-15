@@ -1,0 +1,124 @@
+From 38073748cfa2eb90c768497dd1a74f7113da2d97 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 20 Oct 2026 11:36:15 +0800
+Subject: [PATCH] mtk-soc: access technology from +COPS; keep CREG AcT out of
+ registration checks
+
+On the MediaTek SoC modem registered on NR (5G SA), ModemManager reported
+the access technology as GSM: the modem answers its CS/PS/EPS registration
+queries with the defaults (+CREG: 2,0,..,0, i.e. not registered, AcT 0)
+and reports the 5GS registration (+C5GREG: 0,1) without an AcT, while
++COPS? carries the serving RAT (AcT 11, NR connected to 5GCN).
+
+- the mtk-soc plugin loads the access technologies from the AcT of
+  AT+COPS? (periodic access technology checks);
+- the registration checks of MMBroadbandModem no longer override a modem's
+  own access technology loading with the CREG/CGREG/CEREG AcT, as the
+  unsolicited registration path already does.
+
+Local T880 change on top of the MT6895 mainline project's plugin
+(MT6895-Mainline/modemmanager-mtk-soc 53661270).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/mm-broadband-modem.c                      |  7 ++-
+ .../mtk-soc/mm-broadband-modem-mtk-soc.c      | 62 +++++++++++++++++++
+ 2 files changed, 68 insertions(+), 1 deletion(-)
+
+diff --git a/src/mm-broadband-modem.c b/src/mm-broadband-modem.c
+index c14bce3..a9f5aac 100644
+--- a/src/mm-broadband-modem.c
++++ b/src/mm-broadband-modem.c
+@@ -5760,7 +5760,12 @@ registration_status_check_ready (MMBroadbandModem *self,
+         mm_iface_modem_3gpp_update_cs_registration_state (MM_IFACE_MODEM_3GPP (self), state, FALSE);
+     }
+ 
+-    mm_iface_modem_3gpp_update_access_technologies (MM_IFACE_MODEM_3GPP (self), act);
++    /* As for the unsolicited registration reports: a modem with its own
++     * access technology loading is not overridden with the coarse
++     * CREG/CGREG/CEREG access technology. */
++    if (MM_IFACE_MODEM_GET_IFACE (self)->load_access_technologies == modem_load_access_technologies ||
++        MM_IFACE_MODEM_GET_IFACE (self)->load_access_technologies == NULL)
++        mm_iface_modem_3gpp_update_access_technologies (MM_IFACE_MODEM_3GPP (self), act);
+     mm_iface_modem_3gpp_update_location (MM_IFACE_MODEM_3GPP (self), lac, tac, cid);
+ 
+     run_registration_checks_context_step (task);
+diff --git a/src/plugins/mtk-soc/mm-broadband-modem-mtk-soc.c b/src/plugins/mtk-soc/mm-broadband-modem-mtk-soc.c
+index 710d640..6520a3d 100644
+--- a/src/plugins/mtk-soc/mm-broadband-modem-mtk-soc.c
++++ b/src/plugins/mtk-soc/mm-broadband-modem-mtk-soc.c
+@@ -611,9 +611,71 @@ load_current_capabilities_finish (MMIfaceModem  *self,
+     return (MMModemCapability) g_task_propagate_int (G_TASK (res), error);
+ }
+ 
++/*****************************************************************************/
++/* Access technologies from the operator query.                              */
++/*                                                                            */
++/* The modem leaves its CS/PS/EPS registration replies at their defaults      */
++/* (+CREG: 2,0,..,0: not registered, AcT 0 = GSM) while it is registered on   */
++/* NR through +C5GREG, which it reports without an AcT. The serving RAT is in */
++/* the AcT of +COPS? (11 = NR connected to 5GCN, 7 = E-UTRAN).                */
++
++static gboolean
++load_access_technologies_finish (MMIfaceModem             *self,
++                                 GAsyncResult             *res,
++                                 MMModemAccessTechnology  *access_technologies,
++                                 guint                    *mask,
++                                 GError                  **error)
++{
++    GError *inner_error = NULL;
++    gssize  value;
++
++    value = g_task_propagate_int (G_TASK (res), &inner_error);
++    if (inner_error) {
++        g_propagate_error (error, inner_error);
++        return FALSE;
++    }
++    *access_technologies = (MMModemAccessTechnology) value;
++    *mask = MM_MODEM_ACCESS_TECHNOLOGY_ANY;
++    return TRUE;
++}
++
++static void
++cops_access_tech_ready (MMBaseModem  *self,
++                        GAsyncResult *res,
++                        GTask        *task)
++{
++    GError                  *error = NULL;
++    const gchar             *response;
++    MMModemAccessTechnology  act = MM_MODEM_ACCESS_TECHNOLOGY_UNKNOWN;
++
++    response = mm_base_modem_at_command_finish (self, res, &error);
++    if (!response ||
++        !mm_3gpp_parse_cops_read_response (response, NULL, NULL, NULL, &act, self, &error)) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++    g_task_return_int (task, act);
++    g_object_unref (task);
++}
++
++static void
++load_access_technologies (MMIfaceModem        *self,
++                          GAsyncReadyCallback  callback,
++                          gpointer             user_data)
++{
++    GTask *task;
++
++    task = g_task_new (self, NULL, callback, user_data);
++    mm_base_modem_at_command (MM_BASE_MODEM (self), "+COPS?", 5, FALSE,
++                              (GAsyncReadyCallback) cops_access_tech_ready, task);
++}
++
+ static void
+ iface_modem_init (MMIfaceModemInterface *iface)
+ {
++    iface->load_access_technologies = load_access_technologies;
++    iface->load_access_technologies_finish = load_access_technologies_finish;
+     iface->load_sim_slots = load_sim_slots;
+     iface->load_sim_slots_finish = load_sim_slots_finish;
+     iface->set_primary_sim_slot = set_primary_sim_slot;
+-- 
+2.55.0
+

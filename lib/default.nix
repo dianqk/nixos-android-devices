@@ -48,12 +48,137 @@ let
           // {
             inherit pkgs;
             system = targetSystem;
+            modules =
+              (args.modules or [ ])
+              ++ nixpkgsLib.optional (buildSystem != targetSystem) (
+                { config, lib, ... }:
+                let
+                  targetPackages = config.nixpkgs.pkgs.appendOverlays config.nixpkgs.overlays;
+                  packaging = targetPackages.androidDevicePackages.packaging;
+                  hostPackages = compilationPkgs.pkgsBuildBuild;
+                  replaceVarsWith = targetPackages.replaceVarsWith.override {
+                    stdenvNoCC = compilationPkgs.stdenvNoCC;
+                  };
+                  nixosEnter = targetPackages.nixos-enter.override {
+                    inherit replaceVarsWith;
+                    inherit (hostPackages) installShellFiles;
+                  };
+                  perlHelpers = {
+                    buildEnv = targetPackages.perl.buildEnv.override {
+                      perl = perlPackage;
+                      buildEnv = hostPackages.buildEnv;
+                      makeBinaryWrapper = hostPackages.makeBinaryWrapper.override {
+                        cc = compilationPkgs.stdenv.cc;
+                      };
+                      stdenv = compilationPkgs.stdenv;
+                    };
+                    withPackages =
+                      f:
+                      perlHelpers.buildEnv.override {
+                        extraLibs = f targetPackages.perl.pkgs;
+                      };
+                  };
+                  perlPackage =
+                    targetPackages.perl
+                    // perlHelpers
+                    // {
+                      passthru = targetPackages.perl.passthru // perlHelpers;
+                    };
+                  generators = [
+                    "runCommand"
+                    "runCommandLocal"
+                    "writeText"
+                    "writeTextFile"
+                    "writeTextDir"
+                    "writeScript"
+                    "writeScriptBin"
+                    "writeShellScript"
+                    "writeShellScriptBin"
+                    "writeShellApplication"
+                    "linkFarm"
+                    "concatText"
+                    "concatTextFile"
+                    "symlinkJoin"
+                  ];
+                in
+                {
+                  # NixOS creates units/configuration locally; upstream runtime
+                  # packages remain the native target values from this set.
+                  _module.args.pkgs = lib.mkForce (
+                    targetPackages
+                    // lib.genAttrs generators (name: packaging.${name})
+                    // {
+                      stdenv = compilationPkgs.stdenv;
+                      stdenvNoCC = compilationPkgs.stdenvNoCC;
+                      makeBinaryWrapper = hostPackages.makeBinaryWrapper.override {
+                        cc = compilationPkgs.stdenv.cc;
+                      };
+                      inherit (hostPackages) compressFirmwareXz compressFirmwareZstd deviceTree;
+                      inherit replaceVarsWith;
+                      replaceVars = targetPackages.replaceVars.override { inherit replaceVarsWith; };
+                      substitute = targetPackages.substitute.override {
+                        stdenvNoCC = compilationPkgs.stdenvNoCC;
+                      };
+                      formats = hostPackages.formats // {
+                        nixConf =
+                          args:
+                          hostPackages.formats.nixConf (
+                            args
+                            // lib.optionalAttrs (args.checkConfig or true) {
+                              package =
+                                assert lib.assertMsg (
+                                  lib.getName args.package == lib.getName hostPackages.nix && args.version == hostPackages.nix.version
+                                ) "Nix configuration validation needs the same build-host package family and version.";
+                                hostPackages.nix;
+                            }
+                          );
+                      };
+                      nixos-enter = nixosEnter;
+                      nixos-install = targetPackages.nixos-install.override {
+                        inherit replaceVarsWith;
+                        inherit (hostPackages) installShellFiles;
+                        nixos-enter = nixosEnter;
+                      };
+                      nixos-build-vms = targetPackages.nixos-build-vms.override {
+                        inherit replaceVarsWith;
+                        inherit (hostPackages) installShellFiles;
+                      };
+                      aggregateModules =
+                        modules:
+                        targetPackages.callPackage (targetPackages.path + "/pkgs/os-specific/linux/kmod/aggregator.nix") {
+                          inherit modules;
+                          stdenvNoCC = compilationPkgs.stdenvNoCC;
+                          inherit (hostPackages) buildEnv kmod;
+                        };
+                      perl = perlPackage;
+                      makeFontsCache = targetPackages.makeFontsCache.override {
+                        inherit (packaging) runCommand writeText;
+                        stdenv = compilationPkgs.stdenv;
+                        buildPackages = hostPackages;
+                      };
+                      buildPackages = hostPackages // {
+                        # Shell setup hooks execute on the builder but generate
+                        # scripts for the target runtime.
+                        inherit (targetPackages) makeWrapper makeShellWrapper;
+                      };
+                      buildEnv = compilationPkgs.pkgsBuildBuild.buildEnv;
+                      libcap-text-verifier = compilationPkgs.pkgsBuildBuild.libcap-text-verifier;
+                      makeDBusConf = targetPackages.makeDBusConf.override {
+                        inherit (packaging) runCommand;
+                        inherit (compilationPkgs.pkgsBuildBuild) libxslt findXMLCatalogs;
+                      };
+                    }
+                  );
+                }
+              );
           }
         );
     };
 in
 {
   inherit mkBuildEnvironment;
+  # Rust source API: AOSP bootloader_control parser and slot helpers. Requires anyhow.
+  aospBootControlSource = ../pkgs/mobile-recovery-screen/src/daemon/boot_control.rs;
   mkPackageSet = import ../pkgs;
   mkSystem =
     {
@@ -84,11 +209,13 @@ in
     in
     {
       system = c.system.build.toplevel;
-      boot = c.system.build.mobileBootImage;
       kernel = c.androidDevices.kernelPackage;
       bootstrap-info = (pkgs.androidDevicePackages.buildPackages or pkgs.buildPackages).closureInfo {
         rootPaths = [ c.system.build.toplevel ];
       };
+    }
+    // nixpkgsLib.optionalAttrs (c.system.build ? mobileBootImage) {
+      boot = c.system.build.mobileBootImage;
     }
     //
       nixpkgsLib.optionalAttrs

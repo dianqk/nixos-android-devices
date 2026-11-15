@@ -1,0 +1,137 @@
+From 3357fbcee82375d9a3695795e37a615f9b725a95 Mon Sep 17 00:00:00 2001
+From: Martin Lund <mrlund@hotmail.com>
+Date: Tue, 20 Oct 2026 12:27:19 +0200
+Subject: [PATCH 063/144] arm64: dts: qcom: sm8750-oneplus-dodge: add the
+ WCD939x and microphones
+
+The OnePlus 13 has a WCD939x on the RX and TX SoundWire masters (reset
+on GPIO 101, supplies as on stock). Its built-in microphones are analog
+mics AMIC1 and AMIC5 on MIC BIAS1. Describe the codec and route its
+ADCs into TX codec DMA 3 so the card gets a capture PCM.
+
+Assisted-by: Grok
+Assisted-by: Grok Bot
+Signed-off-by: Martin Lund <mrlund@hotmail.com>
+(cherry picked from commit 400c7f35f8483c28434b16983ffd617f386f5ffa)
+Link: https://github.com/mrlund/linux-omarchy-mobile/commit/400c7f35f8483c28434b16983ffd617f386f5ffa
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0082-arm64-dts-qcom-sm8750-oneplus-dodge-add-the-WCD939x-.patch
+Import-SHA256: 86d50da2f6a164264fa10f721e6b59347d997b02c954018591712213f08efff5
+Import-Provenance: mail headers
+(cherry picked from commit b56261a50cff3dbe2191adc369867cb1fb913702)
+---
+ .../boot/dts/qcom/sm8750-oneplus-dodge.dts    | 83 +++++++++++++++++++
+ 1 file changed, 83 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+index bdb9f69959..227b8131a0 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
++++ b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+@@ -26,6 +26,33 @@ sound {
+ 		pinctrl-0 = <&i2s1_active>;
+ 		pinctrl-names = "default";
+ 
++		/* Mic bias wiring as on stock; AMIC2 is the USB-C headset mic. */
++		audio-routing = "AMIC1", "MIC BIAS1",
++				"AMIC2", "MIC BIAS2",
++				"AMIC3", "MIC BIAS4",
++				"AMIC4", "MIC BIAS3",
++				"AMIC5", "MIC BIAS1",
++				"TX SWR_INPUT0", "ADC1_OUTPUT",
++				"TX SWR_INPUT1", "ADC2_OUTPUT",
++				"TX SWR_INPUT2", "ADC3_OUTPUT",
++				"TX SWR_INPUT3", "ADC4_OUTPUT";
++
++		wcd-capture-dai-link {
++			link-name = "WCD Capture";
++
++			cpu {
++				sound-dai = <&q6apmbedai TX_CODEC_DMA_TX_3>;
++			};
++
++			codec {
++				sound-dai = <&wcd939x 1>, <&swr2 0>, <&lpass_txmacro 0>;
++			};
++
++			platform {
++				sound-dai = <&q6apm>;
++			};
++		};
++
+ 		speaker-dai-link {
+ 			link-name = "Speaker Playback";
+ 
+@@ -43,6 +70,33 @@ platform {
+ 		};
+ 	};
+ 
++	wcd939x: audio-codec {
++		compatible = "qcom,wcd9395-codec", "qcom,wcd9390-codec";
++
++		pinctrl-0 = <&wcd_default>;
++		pinctrl-names = "default";
++
++		/* Stock runs all four mic biases at 2.7 V. */
++		qcom,micbias1-microvolt = <2700000>;
++		qcom,micbias2-microvolt = <2700000>;
++		qcom,micbias3-microvolt = <2700000>;
++		qcom,micbias4-microvolt = <2700000>;
++		qcom,mbhc-buttons-vthreshold-microvolt = <75000 150000 237000 500000 500000 500000 500000 500000>;
++		qcom,mbhc-headset-vthreshold-microvolt = <1700000>;
++		qcom,mbhc-headphone-vthreshold-microvolt = <50000>;
++		qcom,rx-device = <&wcd_rx>;
++		qcom,tx-device = <&wcd_tx>;
++
++		reset-gpios = <&tlmm 101 GPIO_ACTIVE_LOW>;
++
++		vdd-buck-supply = <&vreg_l15b_1p8>;
++		vdd-rxtx-supply = <&vreg_l15b_1p8>;
++		vdd-io-supply = <&vreg_l15b_1p8>;
++		vdd-mic-bias-supply = <&vreg_bob1>;
++
++		#sound-dai-cells = <1>;
++	};
++
+ 	pmic-glink {
+ 		compatible = "oneplus,dodge-pmic-glink", "qcom,sm8350-pmic-glink",
+ 			     "qcom,pmic-glink";
+@@ -580,6 +634,13 @@ &pon_resin {
+ };
+ 
+ &tlmm {
++	wcd_default: wcd-reset-n-active-state {
++		pins = "gpio101";
++		function = "gpio";
++		drive-strength = <16>;
++		bias-disable;
++		output-low;
++	};
+ 	i2s1_active: i2s1-active-state {
+ 		sck-pins {
+ 			pins = "gpio121";
+@@ -927,3 +988,25 @@ &iris {
+ 	firmware-name = "qcom/sm8750/oneplus/dodge/vpu35_4v.mbn";
+ 	status = "okay";
+ };
++
++&swr1 {
++	status = "okay";
++
++	/* WCD939x RX */
++	wcd_rx: codec@0,4 {
++		compatible = "sdw20217010e00";
++		reg = <0 4>;
++		qcom,rx-port-mapping = <1 2 3 4 5 9>;
++	};
++};
++
++&swr2 {
++	status = "okay";
++
++	/* WCD939x TX */
++	wcd_tx: codec@0,3 {
++		compatible = "sdw20217010e00";
++		reg = <0 3>;
++		qcom,tx-port-mapping = <2 2 3 4>;
++	};
++};

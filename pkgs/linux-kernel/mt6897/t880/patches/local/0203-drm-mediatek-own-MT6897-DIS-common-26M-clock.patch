@@ -1,0 +1,118 @@
+From cc54b75e511b5711b5be9f8800efbe78b948029b Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 7 Nov 2026 04:46:19 +0800
+Subject: [PATCH] drm/mediatek: own MT6897 DIS common 26M clock for C-PHY power
+
+The vendor display controller owns a 48-clock top group from dispsys-config, including CLK_DISPSYS0_26M_CLK and CLK_DISPSYS1_26M_CLK (MiCode MTK_kernel_device_modules 3c4ccd07, mt6897.dts). Mainline owns the configuration gate per link but leaves the DIS common 26M gate unclaimed, so it is not re-enabled after a physical display-domain power loss.
+
+Use the fifth, named 26m clock on each C-PHY link and hold it from before the MMSYS routing restore until after PHY, engine and digital teardown: parent PM, configuration clock, 26M, routing, then the link clocks. Failed acquisition unwinds locally; the configuration clock and parent reference are released last, in reverse order.
+
+CG2 status +0x1a0 bit 10 is active-low. The exact DSI LP role of the gate is still a hypothesis, not a proven resume cause; this change closes the vendor ownership gap for the physical power-cycle trial.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/arch/arm64/boot/dts/mediatek/mt6897.dts
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_mipi_tx.c
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ .../mediatek/mt6897-alldocube-t880-mtkdrm.dtsi | 10 ++++++----
+ drivers/gpu/drm/mediatek/mtk_dsi.c             | 18 +++++++++++++++---
+ 2 files changed, 21 insertions(+), 7 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-mtkdrm.dtsi b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-mtkdrm.dtsi
+index bdd23a1c5f..142f31c318 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-mtkdrm.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-mtkdrm.dtsi
+@@ -801,8 +801,9 @@ dsi0: dsi@1400d000 {
+ 			clocks = <&dispsys0_config CLK_DISPSYS0_DISP_DSI0>,
+ 				 <&dispsys0_config CLK_DISPSYS0_DSI_CLK>,
+ 				 <&mipi_tx0>,
+-				 <&dispsys0_config CLK_DISPSYS0_DISPSYS_CONFIG>;
+-			clock-names = "engine", "digital", "hs", "config";
++				 <&dispsys0_config CLK_DISPSYS0_DISPSYS_CONFIG>,
++				 <&dispsys0_config CLK_DISPSYS0_26M_CLK>;
++			clock-names = "engine", "digital", "hs", "config", "26m";
+ 			power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_DIS0>;
+ 			phys = <&mipi_tx0>;
+ 			phy-names = "dphy";
+@@ -968,8 +969,9 @@ dsi1: dsi@1420d000 {
+ 			clocks = <&dispsys1_config CLK_DISPSYS1_DISP_DSI0>,
+ 				 <&dispsys1_config CLK_DISPSYS1_DSI_CLK>,
+ 				 <&mipi_tx1>,
+-				 <&dispsys1_config CLK_DISPSYS1_DISPSYS_CONFIG>;
+-			clock-names = "engine", "digital", "hs", "config";
++				 <&dispsys1_config CLK_DISPSYS1_DISPSYS_CONFIG>,
++				 <&dispsys1_config CLK_DISPSYS1_26M_CLK>;
++			clock-names = "engine", "digital", "hs", "config", "26m";
+ 			power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_DIS1>;
+ 			phys = <&mipi_tx1>;
+ 			phy-names = "dphy";
+diff --git a/drivers/gpu/drm/mediatek/mtk_dsi.c b/drivers/gpu/drm/mediatek/mtk_dsi.c
+index 027bad8ac2..6e6187da25 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dsi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dsi.c
+@@ -329,6 +329,7 @@ struct mtk_dsi {
+ 	struct clk *digital_clk;
+ 	struct clk *hs_clk;
+ 	struct clk *config_clk;
++	struct clk *clk26m;
+ 	struct device *mmsys_dev;
+ 	bool power_ready;
+ 	bool bridge_powered;
+@@ -1379,20 +1380,23 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
+ 		ret = clk_prepare_enable(dsi->config_clk);
+ 		if (ret)
+ 			goto err_put_mmsys;
+-		ret = mtk_mmsys_dsi_cphy_config(dsi->mmsys_dev, true);
++		ret = clk_prepare_enable(dsi->clk26m);
+ 		if (ret)
+ 			goto err_disable_config_clk;
++		ret = mtk_mmsys_dsi_cphy_config(dsi->mmsys_dev, true);
++		if (ret)
++			goto err_disable_clk26m;
+ 	}
+ 
+ 	ret = clk_set_rate(dsi->hs_clk, dsi->cphy ? dsi->symbol_rate : dsi->data_rate);
+ 	if (ret < 0) {
+ 		dev_err(dev, "Failed to set data rate: %d\n", ret);
+-		goto err_disable_config_clk;
++		goto err_disable_clk26m;
+ 	}
+ 
+ 	ret = phy_power_on(dsi->phy);
+ 	if (ret)
+-		goto err_disable_config_clk;
++		goto err_disable_clk26m;
+ 
+ 	ret = clk_prepare_enable(dsi->engine_clk);
+ 	if (ret < 0) {
+@@ -1465,6 +1469,9 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
+ 	clk_disable_unprepare(dsi->engine_clk);
+ err_phy_power_off:
+ 	phy_power_off(dsi->phy);
++err_disable_clk26m:
++	if (dsi->config_clk)
++		clk_disable_unprepare(dsi->clk26m);
+ err_disable_config_clk:
+ 	if (dsi->config_clk)
+ 		clk_disable_unprepare(dsi->config_clk);
+@@ -1533,6 +1540,7 @@ static void mtk_dsi_poweroff(struct mtk_dsi *dsi)
+ 		mtk_dsi_poweroff(dsi->slave);
+ 	}
+ 	if (dsi->config_clk) {
++		clk_disable_unprepare(dsi->clk26m);
+ 		clk_disable_unprepare(dsi->config_clk);
+ 		pm_runtime_put(dsi->mmsys_dev);
+ 	}
+@@ -2206,6 +2214,10 @@ static int mtk_dsi_probe(struct platform_device *pdev)
+ 		if (IS_ERR(dsi->config_clk))
+ 			return dev_err_probe(dev, PTR_ERR(dsi->config_clk),
+ 					     "Failed to get C-PHY config clock\n");
++		dsi->clk26m = devm_clk_get(dev, "26m");
++		if (IS_ERR(dsi->clk26m))
++			return dev_err_probe(dev, PTR_ERR(dsi->clk26m),
++					     "Failed to get DIS common 26M clock\n");
+ 	}
+ 
+ 	dsi->is_slave = of_property_present(dev->of_node, "mediatek,dual-dsi-master");
+-- 
+2.56.0
+

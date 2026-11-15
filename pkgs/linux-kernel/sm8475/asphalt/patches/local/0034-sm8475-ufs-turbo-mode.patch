@@ -1,0 +1,448 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Mon, 12 Oct 2026 21:53:43 +0800
+Subject: [PATCH 48/49] scsi: ufs: qcom: Add the SM8475 turbo mode
+ configuration
+
+The SM8475 UFS core, UniPro and ICE clocks run at up to 850 MHz with
+RPMh CX at TURBO_L1, while the shared SM8450 controller runs at
+300 MHz. Above 300 MHz (the NOM corner) Qualcomm's downstream driver
+switches the controller into a turbo configuration whenever the clocks
+are raised there, and back when they are lowered:
+
+ - set HCI_SEL_TURBO (bit 4) in UFS_TEST_BUS_CTRL_2;
+ - set ATTR_HW_CGC_EN (bit 8) of PA_VS_CLK_CFG_REG (0x9004), which must
+   be clear at or below 300 MHz on these SoCs (downstream "disable-cgc");
+ - program SYS1CLK_1US with half the core clock frequency (Fs/2);
+ - program DME_VS_CORE_CLK_CTRL and PA_VS_CORE_CLK_40NS_CYCLES with fixed
+   cycle counts (213 and 9 at 850 MHz) instead of values derived from
+   the clock rate.
+
+Without this, the current code cannot program the 40 ns cycle count for
+850 MHz at all. On a Lenovo Legion Y700 (2023), sustained writes with
+HS-G4 at 850 MHz (no turbo configuration) or at 300 MHz (with
+ATTR_HW_CGC_EN set) raised PA and data link errors and host resets.
+
+Add a turbo_mode flag to the driver data and a "qcom,sm8475-ufshc"
+match that sets it. Follow the downstream ordering: enter turbo mode
+before the timers and UniPro cycle counts when scaling up into it, and
+leave it before reprogramming them after scaling down. Link startup,
+which runs after every host reset and on resume from a powered-down
+link, selects the mode for the maximum frequency the clocks are scaled
+to beforehand. Map the turbo rates to HS-G4 for clock scaling.
+
+Reference: LineageOS/android_kernel_qcom_sm8450 lineage-20
+952aa00564cbb2cc788378c97e08958c4b889758, drivers/ufs/host/ufs-qcom.c
+(ufs_qcom_apply_turbo_setting(), __ufs_qcom_cfg_timers(),
+ufs_qcom_set_dme_vs_core_clk_ctrl_max_freq_mode(),
+ufs_qcom_enable_hw_clk_gating()) and the cape UFS node with
+"multi-level-clk-scaling-support" and "disable-cgc".
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/ufs/host/ufs-qcom.c | 200 +++++++++++++++++++++++++++++-------
+ drivers/ufs/host/ufs-qcom.h |  10 ++
+ 2 files changed, 173 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/ufs/host/ufs-qcom.c b/drivers/ufs/host/ufs-qcom.c
+index b30beb831f45..fd90fe8bca1b 100644
+--- a/drivers/ufs/host/ufs-qcom.c
++++ b/drivers/ufs/host/ufs-qcom.c
+@@ -672,6 +672,81 @@ static int ufs_qcom_fw_managed_hce_enable_notify(struct ufs_hba *hba,
+ 	return 0;
+ }
+ 
++/**
++ * ufs_qcom_core_clk_freq - Get the core_clk frequency for a configuration
++ *
++ * @hba: host controller instance
++ * @is_pre_scale_up: flag to check if pre scale up condition.
++ * @freq: target opp freq, or ULONG_MAX for the maximum frequency
++ * Return: the core_clk frequency in Hz, or zero if it is unknown.
++ */
++static unsigned long ufs_qcom_core_clk_freq(struct ufs_hba *hba,
++					    bool is_pre_scale_up,
++					    unsigned long freq)
++{
++	struct ufs_clk_info *clki;
++	unsigned long clk_freq;
++
++	if (hba->use_pm_opp && freq != ULONG_MAX) {
++		clk_freq = ufs_qcom_opp_freq_to_clk_freq(hba, freq, "core_clk");
++		if (clk_freq)
++			return clk_freq;
++	}
++
++	list_for_each_entry(clki, &hba->clk_list_head, list) {
++		if (!strcmp(clki->name, "core_clk")) {
++			if (freq == ULONG_MAX || is_pre_scale_up)
++				return clki->max_freq;
++
++			return clk_get_rate(clki->clk);
++		}
++	}
++
++	return 0;
++}
++
++static bool ufs_qcom_is_turbo_freq(struct ufs_qcom_host *host,
++				   unsigned long clk_freq)
++{
++	return host->turbo_mode && clk_freq > UFS_QCOM_NOM_FREQ;
++}
++
++/**
++ * ufs_qcom_set_turbo - Select the turbo or non-turbo controller configuration
++ *
++ * @hba: host controller instance
++ * @enable: true if the core clocks run above UFS_QCOM_NOM_FREQ
++ *
++ * Controllers whose core clocks run above the NOM frequency (850 MHz on
++ * SM8475) need the HCI turbo clock path and the UniPro ATTR_HW_CGC_EN bit
++ * of PA_VS_CLK_CFG_REG while they do. At or below the NOM frequency both
++ * must be cleared. Apply this before raising the clocks into turbo and
++ * after lowering them out of it, with the link in hibern8.
++ *
++ * Return: zero for success and non-zero in case of a failure.
++ */
++static int ufs_qcom_set_turbo(struct ufs_hba *hba, bool enable)
++{
++	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
++	int err;
++
++	if (!host->turbo_mode)
++		return 0;
++
++	ufshcd_rmwl(hba, TEST_BUS_CTRL_2_HCI_SEL_TURBO,
++		    enable ? TEST_BUS_CTRL_2_HCI_SEL_TURBO : 0,
++		    UFS_TEST_BUS_CTRL_2);
++
++	err = ufshcd_dme_rmw(hba, PA_VS_CLK_CFG_REG_HW_CGC_EN,
++			     enable ? PA_VS_CLK_CFG_REG_HW_CGC_EN : 0,
++			     PA_VS_CLK_CFG_REG);
++	if (err)
++		dev_err(hba->dev, "%s: failed to %s turbo mode: %d\n", __func__,
++			enable ? "enable" : "disable", err);
++
++	return err;
++}
++
+ /**
+  * ufs_qcom_cfg_timers - Configure ufs qcom cfg timers
+  *
+@@ -683,8 +758,7 @@ static int ufs_qcom_fw_managed_hce_enable_notify(struct ufs_hba *hba,
+ static int ufs_qcom_cfg_timers(struct ufs_hba *hba, bool is_pre_scale_up, unsigned long freq)
+ {
+ 	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
+-	struct ufs_clk_info *clki;
+-	unsigned long clk_freq = 0;
++	unsigned long clk_freq;
+ 	u32 core_clk_cycles_per_us;
+ 
+ 	/*
+@@ -696,34 +770,18 @@ static int ufs_qcom_cfg_timers(struct ufs_hba *hba, bool is_pre_scale_up, unsign
+ 	if (host->hw_ver.major < 4 && !ufshcd_is_intr_aggr_allowed(hba))
+ 		return 0;
+ 
+-	if (hba->use_pm_opp && freq != ULONG_MAX) {
+-		clk_freq = ufs_qcom_opp_freq_to_clk_freq(hba, freq, "core_clk");
+-		if (clk_freq)
+-			goto cfg_timers;
+-	}
++	clk_freq = ufs_qcom_core_clk_freq(hba, is_pre_scale_up, freq);
+ 
+-	list_for_each_entry(clki, &hba->clk_list_head, list) {
+-		if (!strcmp(clki->name, "core_clk")) {
+-			if (freq == ULONG_MAX) {
+-				clk_freq = clki->max_freq;
+-				break;
+-			}
+-
+-			if (is_pre_scale_up)
+-				clk_freq = clki->max_freq;
+-			else
+-				clk_freq = clk_get_rate(clki->clk);
+-			break;
+-		}
+-
+-	}
+-
+-cfg_timers:
+ 	/* If frequency is smaller than 1MHz, set to 1MHz */
+ 	if (clk_freq < DEFAULT_CLK_RATE_HZ)
+ 		clk_freq = DEFAULT_CLK_RATE_HZ;
+ 
+ 	core_clk_cycles_per_us = clk_freq / USEC_PER_SEC;
++
++	/* In turbo mode SYS1CLK_1US counts at half the core clock rate */
++	if (ufs_qcom_is_turbo_freq(host, clk_freq))
++		core_clk_cycles_per_us = DIV_ROUND_UP(core_clk_cycles_per_us, 2);
++
+ 	if (ufshcd_readl(hba, REG_UFS_SYS1CLK_1US) != core_clk_cycles_per_us) {
+ 		ufshcd_writel(hba, core_clk_cycles_per_us, REG_UFS_SYS1CLK_1US);
+ 		/*
+@@ -751,6 +809,12 @@ static int ufs_qcom_link_startup_notify(struct ufs_hba *hba,
+ 
+ 	switch (status) {
+ 	case PRE_CHANGE:
++		/* The link starts up with the clocks at their maximum frequency */
++		err = ufs_qcom_set_turbo(hba, ufs_qcom_is_turbo_freq(host,
++				ufs_qcom_core_clk_freq(hba, false, ULONG_MAX)));
++		if (err)
++			return err;
++
+ 		if (ufs_qcom_cfg_timers(hba, false, ULONG_MAX)) {
+ 			dev_err(hba->dev, "%s: ufs_qcom_cfg_timers() failed\n",
+ 				__func__);
+@@ -1614,6 +1678,7 @@ static int ufs_qcom_init(struct ufs_hba *hba)
+ 
+ 	/* Make a two way bind between the qcom host and the hba */
+ 	host->hba = hba;
++	host->turbo_mode = drvdata && drvdata->turbo_mode;
+ 	ufshcd_set_variant(hba, host);
+ 
+ 	/* Setup the optional reset control of HCI */
+@@ -1760,15 +1825,15 @@ static void ufs_qcom_fw_managed_exit(struct ufs_hba *hba)
+  *
+  * @hba: host controller instance
+  * @cycles_in_1us: No of cycles in 1us to be configured
++ * @cycles_in_40ns: No of cycles in 40ns, or 0 to derive it from @cycles_in_1us
+  *
+  * Returns error if dme get/set configuration for 40ns fails
+  * and returns zero on success.
+  */
+ static int ufs_qcom_set_clk_40ns_cycles(struct ufs_hba *hba,
+-					u32 cycles_in_1us)
++					u32 cycles_in_1us, u32 cycles_in_40ns)
+ {
+ 	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
+-	u32 cycles_in_40ns;
+ 	u32 reg;
+ 	int err;
+ 
+@@ -1780,6 +1845,9 @@ static int ufs_qcom_set_clk_40ns_cycles(struct ufs_hba *hba,
+ 	if (host->hw_ver.major < 4)
+ 		return 0;
+ 
++	if (cycles_in_40ns)
++		goto set_40ns_cycles;
++
+ 	/*
+ 	 * Generic formulae for cycles_in_40ns = (freq_unipro/25) is not
+ 	 * applicable for all frequencies. For ex: ceil(37.5 MHz/25) will
+@@ -1816,6 +1884,7 @@ static int ufs_qcom_set_clk_40ns_cycles(struct ufs_hba *hba,
+ 		return -EINVAL;
+ 	}
+ 
++set_40ns_cycles:
+ 	err = ufshcd_dme_get(hba, UIC_ARG_MIB(PA_VS_CORE_CLK_40NS_CYCLES), &reg);
+ 	if (err)
+ 		return err;
+@@ -1826,46 +1895,78 @@ static int ufs_qcom_set_clk_40ns_cycles(struct ufs_hba *hba,
+ 	return ufshcd_dme_set(hba, UIC_ARG_MIB(PA_VS_CORE_CLK_40NS_CYCLES), reg);
+ }
+ 
++/*
++ * UniPro core clock cycle counts in turbo mode. These are not derived from
++ * the clock frequency; the values come from Qualcomm's downstream driver.
++ */
++static const struct ufs_qcom_turbo_cycles {
++	unsigned long freq;
++	u32 cycles_in_1us;
++	u32 cycles_in_40ns;
++} ufs_qcom_turbo_cycles[] = {
++	{ 600000000, 300, 12 },
++	{ 806400000, 202, 9 },
++	{ 850000000, 213, 9 },
++};
++
+ static int ufs_qcom_set_core_clk_ctrl(struct ufs_hba *hba, bool is_scale_up, unsigned long freq)
+ {
+ 	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
+ 	struct list_head *head = &hba->clk_list_head;
+ 	struct ufs_clk_info *clki;
+-	u32 cycles_in_1us = 0;
++	unsigned long clk_freq = 0;
++	u32 cycles_in_1us;
++	u32 cycles_in_40ns = 0;
+ 	u32 core_clk_ctrl_reg;
+-	unsigned long clk_freq;
+-	int err;
++	int err, i;
+ 
+ 	if (hba->use_pm_opp && freq != ULONG_MAX) {
+ 		clk_freq = ufs_qcom_opp_freq_to_clk_freq(hba, freq, "core_clk_unipro");
+-		if (clk_freq) {
+-			cycles_in_1us = ceil(clk_freq, HZ_PER_MHZ);
++		if (clk_freq)
+ 			goto set_core_clk_ctrl;
+-		}
+ 	}
+ 
+ 	list_for_each_entry(clki, head, list) {
+ 		if (!IS_ERR_OR_NULL(clki->clk) &&
+ 		    !strcmp(clki->name, "core_clk_unipro")) {
+ 			if (!clki->max_freq) {
+-				cycles_in_1us = 150; /* default for backwards compatibility */
++				/* default for backwards compatibility */
++				clk_freq = 150 * HZ_PER_MHZ;
+ 				break;
+ 			}
+ 
+ 			if (freq == ULONG_MAX) {
+-				cycles_in_1us = ceil(clki->max_freq, HZ_PER_MHZ);
++				clk_freq = clki->max_freq;
+ 				break;
+ 			}
+ 
+ 			if (is_scale_up)
+-				cycles_in_1us = ceil(clki->max_freq, HZ_PER_MHZ);
++				clk_freq = clki->max_freq;
+ 			else
+-				cycles_in_1us = ceil(clk_get_rate(clki->clk), HZ_PER_MHZ);
++				clk_freq = clk_get_rate(clki->clk);
+ 			break;
+ 		}
+ 	}
+ 
+ set_core_clk_ctrl:
++	cycles_in_1us = ceil(clk_freq, HZ_PER_MHZ);
++
++	if (ufs_qcom_is_turbo_freq(host, clk_freq)) {
++		for (i = 0; i < ARRAY_SIZE(ufs_qcom_turbo_cycles); i++) {
++			if (ufs_qcom_turbo_cycles[i].freq == clk_freq)
++				break;
++		}
++
++		if (i == ARRAY_SIZE(ufs_qcom_turbo_cycles)) {
++			dev_err(hba->dev, "UNIPRO turbo clk freq %lu Hz not supported\n",
++				clk_freq);
++			return -EINVAL;
++		}
++
++		cycles_in_1us = ufs_qcom_turbo_cycles[i].cycles_in_1us;
++		cycles_in_40ns = ufs_qcom_turbo_cycles[i].cycles_in_40ns;
++	}
++
+ 	err = ufshcd_dme_get(hba,
+ 			    UIC_ARG_MIB(DME_VS_CORE_CLK_CTRL),
+ 			    &core_clk_ctrl_reg);
+@@ -1895,13 +1996,21 @@ static int ufs_qcom_set_core_clk_ctrl(struct ufs_hba *hba, bool is_scale_up, uns
+ 		return err;
+ 
+ 	/* Configure unipro core clk 40ns attribute */
+-	return ufs_qcom_set_clk_40ns_cycles(hba, cycles_in_1us);
++	return ufs_qcom_set_clk_40ns_cycles(hba, cycles_in_1us, cycles_in_40ns);
+ }
+ 
+ static int ufs_qcom_clk_scale_up_pre_change(struct ufs_hba *hba, unsigned long freq)
+ {
++	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
+ 	int ret;
+ 
++	/* Enter turbo mode before raising the clocks into it */
++	if (ufs_qcom_is_turbo_freq(host, ufs_qcom_core_clk_freq(hba, true, freq))) {
++		ret = ufs_qcom_set_turbo(hba, true);
++		if (ret)
++			return ret;
++	}
++
+ 	ret = ufs_qcom_cfg_timers(hba, true, freq);
+ 	if (ret) {
+ 		dev_err(hba->dev, "%s ufs cfg timer failed\n", __func__);
+@@ -1939,8 +2048,16 @@ static int ufs_qcom_clk_scale_down_pre_change(struct ufs_hba *hba)
+ 
+ static int ufs_qcom_clk_scale_down_post_change(struct ufs_hba *hba, unsigned long freq)
+ {
++	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
+ 	int ret;
+ 
++	/* Leave turbo mode after lowering the clocks out of it */
++	if (!ufs_qcom_is_turbo_freq(host, ufs_qcom_core_clk_freq(hba, false, freq))) {
++		ret = ufs_qcom_set_turbo(hba, false);
++		if (ret)
++			return ret;
++	}
++
+ 	ret = ufs_qcom_cfg_timers(hba, false, freq);
+ 	if (ret) {
+ 		dev_err(hba->dev, "%s: ufs_qcom_cfg_timers() failed\n",	__func__);
+@@ -2539,6 +2656,9 @@ static u32 ufs_qcom_freq_to_gear_speed(struct ufs_hba *hba, unsigned long freq)
+ 	case 403000000:
+ 		gear = UFS_HS_G5;
+ 		break;
++	case 850000000:
++	case 806400000:
++	case 600000000:
+ 	case 300000000:
+ 		gear = UFS_HS_G4;
+ 		break;
+@@ -3036,6 +3156,11 @@ static const struct ufs_qcom_drvdata ufs_qcom_sm8450_drvdata = {
+ 	.no_phy_retention = true,
+ };
+ 
++static const struct ufs_qcom_drvdata ufs_qcom_sm8475_drvdata = {
++	.no_phy_retention = true,
++	.turbo_mode = true,
++};
++
+ static const struct ufs_qcom_drvdata ufs_qcom_sm8550_drvdata = {
+ 	.quirks = UFSHCD_QUIRK_BROKEN_LSDBS_CAP,
+ 	.no_phy_retention = true,
+@@ -3048,6 +3173,7 @@ static const struct ufs_qcom_drvdata ufs_qcom_sa8255p_drvdata = {
+ static const struct of_device_id ufs_qcom_of_match[] __maybe_unused = {
+ 	{ .compatible = "qcom,ufshc" },
+ 	{ .compatible = "qcom,sm8450-ufshc", .data = &ufs_qcom_sm8450_drvdata },
++	{ .compatible = "qcom,sm8475-ufshc", .data = &ufs_qcom_sm8475_drvdata },
+ 	{ .compatible = "qcom,sm8550-ufshc", .data = &ufs_qcom_sm8550_drvdata },
+ 	{ .compatible = "qcom,sm8650-ufshc", .data = &ufs_qcom_sm8550_drvdata },
+ 	{ .compatible = "qcom,sa8255p-ufshc", .data = &ufs_qcom_sa8255p_drvdata },
+diff --git a/drivers/ufs/host/ufs-qcom.h b/drivers/ufs/host/ufs-qcom.h
+index 944b2e532a09..fdfefa8f5ee6 100644
+--- a/drivers/ufs/host/ufs-qcom.h
++++ b/drivers/ufs/host/ufs-qcom.h
+@@ -27,6 +27,7 @@
+ /* bit and mask definitions for PA_VS_CLK_CFG_REG attribute */
+ #define PA_VS_CLK_CFG_REG      0x9004
+ #define PA_VS_CLK_CFG_REG_MASK GENMASK(8, 0)
++#define PA_VS_CLK_CFG_REG_HW_CGC_EN	BIT(8)
+ 
+ /* bit and mask definitions for DL_VS_CLK_CFG attribute */
+ #define DL_VS_CLK_CFG          0xA00B
+@@ -191,6 +192,9 @@ enum {
+ /* bit definition for UFS_UFS_TEST_BUS_CTRL_n */
+ #define TEST_BUS_SUB_SEL_MASK	GENMASK(4, 0)  /* All XXX_SEL fields are 5 bits wide */
+ 
++/* bit definition for UFS_TEST_BUS_CTRL_2 */
++#define TEST_BUS_CTRL_2_HCI_SEL_TURBO	BIT(4)
++
+ /* bit definition for UFS Shared ICE config */
+ #define UFS_QCOM_CAP_ICE_CONFIG BIT(0)
+ 
+@@ -222,6 +226,9 @@ enum {
+ #define UNIPRO_CORE_CLK_FREQ_201_5_MHZ         202
+ #define UNIPRO_CORE_CLK_FREQ_403_MHZ           403
+ 
++/* Highest UFS core clock frequency at the NOM (non-turbo) voltage corner */
++#define UFS_QCOM_NOM_FREQ	(300 * HZ_PER_MHZ)
++
+ /* TX_HSG1_SYNC_LENGTH attr value */
+ #define PA_TX_HSG1_SYNC_LENGTH_VAL	0x4A
+ 
+@@ -334,6 +341,7 @@ struct ufs_qcom_host {
+ 	struct clk *rx_lane0_sync_clk;
+ 	struct clk *rx_lane1_sync_clk;
+ 	bool is_lane_clks_enabled;
++	bool turbo_mode;
+ 
+ 	struct icc_path *icc_ddr;
+ 	struct icc_path *icc_cpu;
+@@ -368,6 +376,8 @@ struct ufs_qcom_host {
+ struct ufs_qcom_drvdata {
+ 	enum ufshcd_quirks quirks;
+ 	bool no_phy_retention;
++	/* core clocks above UFS_QCOM_NOM_FREQ need the turbo configuration */
++	bool turbo_mode;
+ 	const struct ufs_hba_variant_ops *vops;
+ };
+ 

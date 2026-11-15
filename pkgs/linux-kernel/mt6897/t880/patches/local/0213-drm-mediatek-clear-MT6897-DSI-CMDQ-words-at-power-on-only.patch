@@ -1,0 +1,142 @@
+From 637985ae5f3b5f48e92b10fed4dff0ec6240b2dc Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 7 Nov 2026 15:58:18 +0800
+Subject: [PATCH] drm/mediatek: clear MT6897 DSI CMDQ words at power-on only
+
+The 0210 change combined a power-on CMDQ word clear with atomic zero-padded
+full-word programming. The 0212 revert showed that removing the whole change
+replaces the no-log resume hard hang with the explicit DSI poll timeout, so
+0210 caused the hard hang. Re-apply only the power-on clear of the MT6897 v1
+command words (zero to CMDQ word0 and word1 after the engine reset) and keep
+the per-byte read-modify-write programming, the command ring without the
+CMDQ+4 field and all other diagnostics.
+
+If the next trial still returns the explicit DSI timeout, the atomic
+full-word programming caused the hard hang; if it hard-hangs again, the
+power-on clear caused it. This is a bisection step, not a claim about the
+underlying resume failure.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/gpu/drm/mediatek/mtk_dsi.c            | 17 +++++++++++++
+ .../selftests/mtk_clk/dsi_routing_cases.c     | 24 +++++++++++++++++++
+ .../selftests/mtk_clk/test_dsi_routing.py     | 15 +++++++++++-
+ 3 files changed, 55 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_dsi.c b/drivers/gpu/drm/mediatek/mtk_dsi.c
+index 7fb85a83b2..89f76366d0 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dsi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dsi.c
+@@ -1187,6 +1187,22 @@ static void mtk_dsi_select_mm_reset(struct mtk_dsi *dsi)
+ 		     DSI_V1_MM_RST_SEL);
+ }
+ 
++/*
++ * The MT6897 command queue starts in the vendor's idle state after a domain
++ * reset; the engine reset leaves the SRAM words uninitialized. Clear both
++ * words before the first command, keeping the per-byte programming path.
++ */
++static void mtk_dsi_clear_cmdq(struct mtk_dsi *dsi)
++{
++	const struct mtk_dsi_driver_data *data = dsi->driver_data;
++
++	if (!data->tx_buf)
++		return;
++
++	writel(0, dsi->regs + data->reg_adv[DSI_CMDQ]);
++	writel(0, dsi->regs + data->reg_adv[DSI_CMDQ] + 4);
++}
++
+ /*
+  * TX buffer of the stock driver's v1 layout, in video mode, with its
+  * formulas (mtk_dsi_tx_buf_rw): the thresholds are microseconds of link
+@@ -1645,6 +1661,7 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
+ 	/* The engine reset must use the MM reset source on this layout. */
+ 	mtk_dsi_select_mm_reset(dsi);
+ 	mtk_dsi_reset_engine(dsi);
++	mtk_dsi_clear_cmdq(dsi);
+ 	/*
+ 	 * A bootloader may have left the link running in video mode, which
+ 	 * the engine reset does not clear: stop it and start from command
+diff --git a/tools/testing/selftests/mtk_clk/dsi_routing_cases.c b/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
+index 49921f6b29..c63e49a533 100644
+--- a/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
++++ b/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
+@@ -597,6 +597,30 @@ int main(void)
+ 	mtk_dsi_poweroff(&d[0]);
+ 	balanced();
+ 	setup(false);
++	d[0].driver_data = &v1_data;
++	u32 before[16];
++	regs[0][v1_data.reg_adv[DSI_CMDQ]] = 0xdeadbeef;
++	regs[0][v1_data.reg_adv[DSI_CMDQ] + 4] = 0xcafebabe;
++	memcpy(before, regs[0], sizeof(before));
++	assert(!mtk_dsi_poweron(&d[0]));
++	for (int i = 0; i < 16; i++) {
++		if (i == v1_data.reg_adv[DSI_CMDQ] ||
++		    i == v1_data.reg_adv[DSI_CMDQ] + 4)
++			assert(regs[0][i] == 0);
++		else
++			assert(regs[0][i] == before[i]);
++	}
++	mtk_dsi_poweroff(&d[0]);
++	balanced();
++	setup(false);
++	regs[0][data.reg_adv[DSI_CMDQ]] = 0xdeadbeef;
++	regs[0][data.reg_adv[DSI_CMDQ] + 4] = 0xcafebabe;
++	memcpy(before, regs[0], sizeof(before));
++	assert(!mtk_dsi_poweron(&d[0]));
++	assert(!memcmp(regs[0], before, sizeof(before)));
++	mtk_dsi_poweroff(&d[0]);
++	balanced();
++	setup(false);
+ 	d[0].driver_data = &poll_data;
+ 	mtk_dsi_set_interrupt_enable(&d[0]);
+ 	assert(regs[0][DSI_INTEN] ==
+diff --git a/tools/testing/selftests/mtk_clk/test_dsi_routing.py b/tools/testing/selftests/mtk_clk/test_dsi_routing.py
+index 88faeaeeb0..703cbdbe53 100755
+--- a/tools/testing/selftests/mtk_clk/test_dsi_routing.py
++++ b/tools/testing/selftests/mtk_clk/test_dsi_routing.py
+@@ -30,6 +30,7 @@ production = '\n'.join(function(name) for name in [
+     'mtk_dsi_dump_clocks', 'mtk_dsi_wait_for_irq_done', 'mtk_dsi_irq',
+     'mtk_dsi_poll_for_idle', 'mtk_dsi_cmdq', 'mtk_dsi_host_send_cmd',
+     'mtk_dsi_set_interrupt_enable', 'mtk_dsi_select_mm_reset',
++    'mtk_dsi_clear_cmdq',
+     'mtk_dsi_poweron', 'mtk_dsi_poweroff', 'mtk_dsi_bridge_atomic_disable',
+     'mtk_dsi_bridge_atomic_enable', 'mtk_dsi_bridge_atomic_pre_enable',
+     'mtk_dsi_bridge_atomic_post_disable', 'mtk_dsi_ddp_start', 'mtk_dsi_ddp_stop',
+@@ -50,8 +51,11 @@ assert 'clk_get_rate' in clocks
+ cmdq = function('mtk_dsi_cmdq')
+ assert 'cmdq_long_packet_ctl' in cmdq
+ assert 'CMDQ_SIZE_SEL' in cmdq
++assert 'mtk_dsi_mask' in cmdq
++assert 'writel' not in cmdq
+ mt6897 = source.split('mt6897_dsi_driver_data = {', 1)[1].split('};', 1)[0]
+ assert '.cmdq_long_packet_ctl = true' in mt6897
++assert '.cmdq_full_word = true' not in mt6897
+ inten = function('mtk_dsi_set_interrupt_enable')
+ assert inten.index('poll_command_done') < inten.index('CMD_DONE_INT_FLAG')
+ irq = function('mtk_dsi_irq')
+@@ -66,9 +70,18 @@ assert 'tx_buf' in select_reset
+ assert 'DSI_V1_DEBUG_SEL' in select_reset
+ assert 'DSI_V1_MM_RST_SEL' in select_reset
+ assert 'mtk_dsi_select_mm_reset' in function('mtk_dsi_config_tx_buf_v1')
++clear_cmdq = function('mtk_dsi_clear_cmdq')
++assert 'tx_buf' in clear_cmdq
++assert clear_cmdq.count('writel(') == 2
++assert 'cmdq_full_word' not in source
++assert 'mtk_dsi_cmdq_full_word' not in source
++assert 'cmdq1' not in function('mtk_dsi_record_cmd')
++assert 'cmdq1' not in function('mtk_dsi_dump_ring')
+ poweron = function('mtk_dsi_poweron')
+ assert poweron.index('mtk_dsi_select_mm_reset') < \
+-    poweron.index('mtk_dsi_reset_engine')
++    poweron.index('mtk_dsi_reset_engine') < \
++    poweron.index('mtk_dsi_clear_cmdq') < \
++    poweron.index('mtk_dsi_config_tx_buf_v1')
+ assert 'DSI_V1_DEBUG_SEL' in function('mtk_dsi_dump_regs')
+ assert 'debug_sel' in function('mtk_dsi_record_cmd')
+ assert 'debug_sel' in function('mtk_dsi_dump_ring')
+-- 
+2.56.0
+

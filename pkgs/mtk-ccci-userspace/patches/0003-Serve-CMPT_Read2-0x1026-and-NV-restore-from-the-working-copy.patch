@@ -1,0 +1,253 @@
+From fbeeef4c747294a11878018f5cefebf728b9118e Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 20 Oct 2026 11:09:39 +0800
+Subject: [PATCH] Serve CMPT_Read2 (0x1026) and NV restore from the working
+ copy
+
+MT6897 modems read their NV files with a handle-based compound op 0x1026
+(open, seek, read, close steps; a handle kept between requests) and ask
+for an NV restore (0x1021) of the IMEI file while booting. Answer both as
+the vendor FS server does on a running Android, as observed on its
+/dev/ccci_fs traffic:
+- 0x1026: reply {completed steps, status} {descriptor +16 echo} {bytes}
+  {data} {handle}; an absent file {0, -9} {..} {0} {} {-1}; reads see the
+  modem's earlier writes (working copy) first, then the read-only original;
+- 0x1021: Android restores the file from its NVRAM backup into nvdata; the
+  restored file equalled the original. Here the working copy is reset to
+  the read-only original and {0} is returned; the original is never
+  written, an absent original is -9.
+Offline test with synthetic files.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/mtk_ccci_userspace/mdinit.py | 122 ++++++++++++++++++++++++++++++-
+ tests/test_fs_contract.py        |  40 ++++++++++
+ tests/test_runner.py             |   3 +-
+ 3 files changed, 162 insertions(+), 3 deletions(-)
+
+diff --git a/src/mtk_ccci_userspace/mdinit.py b/src/mtk_ccci_userspace/mdinit.py
+index 94f72b1..6d37965 100644
+--- a/src/mtk_ccci_userspace/mdinit.py
++++ b/src/mtk_ccci_userspace/mdinit.py
+@@ -244,6 +244,7 @@ FS_OP_WRITE = 0x1004
+ FS_OP_CLOSE = 0x1005
+ FS_OP_GET_SIZE = 0x1009
+ FS_OP_CMPT_READ = 0x1022
++FS_OP_CMPT_READ2 = 0x1026
+ FS_OP_MOVE = 0x100c
+ FS_OP_CMPT_WRITE = 0x1024
+ FS_OP_MKDIR = 0x1007
+@@ -346,7 +347,7 @@ FS_OP_NAMES = {0x1001: "Open", 0x1002: "Seek", 0x1003: "Read", 0x1004: "Write",
+                0x1020: "OTPLock", 0x1021: "Restore", 0x1023: "Bin_Region_Access",
+                0x100c: "Move", 0x1012: "FindFirst", 0x1013: "FindNext",
+                0x1014: "FindClose", 0x1022: "CMPT_Read",
+-               0x1024: "CMPT_Write", 0x1025: "GetFileDetail",
++               0x1024: "CMPT_Write", 0x1025: "GetFileDetail", 0x1026: "CMPT_Read2",
+                0x1016: "UnlockAll", 0x101a: "GetDrive",
+                0x101c: "SetDiskFlag"}
+ 
+@@ -1217,6 +1218,118 @@ def do_move(src_mpath, dst_mpath, flags):
+     return 0, info + " -> MOVE(COPY) %d B ok" % n
+ 
+ 
++# ---------------------------------------------------- 0x1026 CMPT_Read2
++# The handle-based compound read of MT6897 modems, as answered by the vendor
++# FS server on a running Android (observed over /dev/ccci_fs, 837 requests).
++# Request block1 (48 B):
++#     +0  steps: 0x1 open, 0x4 seek, 0x8 read, 0x10 close (0x19, 0x1d, 0x0d,
++#         0x18, 0x08 seen)
++#     +12 0x700 (open flags)   +16 modem local (echoed in reply block1)
++#     +20 offset   +24 whence   +32 length   +40 handle (-1 when opening)
++# Reply: {completed steps, status} {+16 echo} {bytes} {data} {handle};
++# an absent file answers {0, -9} {+16} {0} {} {-1}.  Reads come from the
++# working copy when the modem has written the file, else from the read-only
++# original.
++WHENCE2 = {0: os.SEEK_SET, 1: os.SEEK_CUR, 2: os.SEEK_END}
++
++
++def do_cmpt_read2(mpath, desc):
++    d = desc + b"\0" * 48
++    steps = struct.unpack_from("<I", d, 0)[0]
++    echo = struct.unpack_from("<I", d, 16)[0]
++    off, whence = struct.unpack_from("<iI", d, 20)
++    ln = min(struct.unpack_from("<I", d, 32)[0], CMPT_MAX)
++    handle = struct.unpack_from("<i", d, 40)[0]
++    done, status, data, notes = 0, 0, b"", []
++    if steps & 0x1:
++        src, present, size, note = resolve_ro_path(mpath)
++        if not present:
++            status = FS_PATH_NOT_FOUND if src is None else FS_FILE_NOT_FOUND
++            notes.append("open: %s" % note)
++        else:
++            try:
++                fd = os.open(src, os.O_RDONLY)
++            except OSError as e:
++                status = fs_error_from_errno(e)
++                notes.append("open failed: %s" % e)
++            else:
++                handle, err = _alloc(fd, src, False)
++                if handle < 0:
++                    status = handle
++                    notes.append("alloc %s" % err)
++                else:
++                    done |= 0x1
++                    notes.append("open %s(%s) size=%d handle=%d" % (src, note, size, handle))
++    if status == 0 and steps & 0x4:
++        with hlock:
++            e = handles.get(handle)
++        if e is None:
++            status = -10
++            notes.append("seek: bad handle %d" % handle)
++        else:
++            e["pos"] = os.lseek(e["fd"], off, WHENCE2.get(whence & 3, os.SEEK_SET))
++            done |= 0x4
++            notes.append("seek %d/%d -> %d" % (off, whence, e["pos"]))
++    if status == 0 and steps & 0x8:
++        with hlock:
++            e = handles.get(handle)
++        if e is None:
++            status = -10
++            notes.append("read: bad handle %d" % handle)
++        else:
++            try:
++                data = os.read(e["fd"], ln)
++                e["pos"] += len(data)
++                done |= 0x8
++                notes.append("read want=%d got=%d" % (ln, len(data)))
++            except OSError as err:
++                status = fs_error_from_errno(err)
++                notes.append("read failed: %s" % err)
++    if steps & 0x10:
++        with hlock:
++            e = handles.pop(handle, None)
++        if e is not None:
++            os.close(e["fd"])
++            if status == 0:
++                done |= 0x10
++            notes.append("closed handle=%d" % handle)
++    if status:
++        done, data = 0, b""
++        if steps & 0x1:
++            handle = -1
++    extra = "path=%r steps=0x%x status=%d %s" % (mpath, steps, status, "; ".join(notes))
++    blocks = [struct.pack("<Ii", done, status),
++              struct.pack("<I", echo),
++              struct.pack("<I", len(data)),
++              data,
++              struct.pack("<i", handle)]
++    return blocks, extra
++
++
++# ---------------------------------------------------- 0x1021 Restore
++# On Android the FS server restores the file from the NVRAM backup partition
++# into nvdata and replies one block {0}.  Observed: the restored file equals
++# the nvdata original byte for byte.  Here the working copy is reset to the
++# read-only original (never the original itself); an absent original is -9.
++def do_restore(mpath):
++    ap, drive = map_md_path(mpath)
++    if ap is None:
++        return FS_PATH_NOT_FOUND, "RESTORE path=%r unmapped" % mpath
++    if not os.path.isfile(ap):
++        return FS_FILE_NOT_FOUND, "RESTORE path=%r original absent" % mpath
++    ov = os.path.join(OVERLAY, drive, os.path.relpath(ap, FSD_DIRS[drive]))
++    try:
++        os.makedirs(os.path.dirname(ov), exist_ok=True)
++        with open(ap, "rb") as fi, open(ov + ".tmp", "wb") as fo:
++            fo.write(fi.read())
++        os.replace(ov + ".tmp", ov)
++    except OSError as e:
++        return fs_error_from_errno(e), "RESTORE path=%r copy failed: %s" % (mpath, e)
++    cow_map[ap] = ov
++    _clear_whiteout(ap, drive)
++    return 0, "RESTORE path=%r working copy reset from original (%d B)" % (mpath, os.path.getsize(ov))
++
++
+ # ---------------------------------------------------- 0x1024 CMPT_Write
+ #
+ # ROOT-CAUSE CORRECTION (v450).  The descriptor is NOT "offset-at-+16"; it is
+@@ -2094,6 +2207,11 @@ def handle_one(n, data):
+             blocks, extra = do_cmpt_read(mpath, blks[1])
+             log("   CMPT_READ [DIAGNOSTIC APPROXIMATION] %s" % extra)
+             reply = build_reply(data, op, blocks)
++        elif op == FS_OP_CMPT_READ2 and len(blks) >= 2:
++            mpath = wcs2cs(blks[0])
++            blocks, extra = do_cmpt_read2(mpath, blks[1])
++            log("   CMPT_READ2 %s" % extra)
++            reply = build_reply(data, op, blocks)
+         elif op == FS_OP_FIND_FIRST and len(blks) >= 4:
+             _ra = blks[1][0] if blks[1] else 0
+             _fa = blks[2][0] if blks[2] else 0
+@@ -2175,7 +2293,7 @@ def handle_one(n, data):
+             log("   XDELETE %s" % extra)
+             reply = build_reply(data, op, [struct.pack("<i", val)])
+         elif op == FS_OP_RESTORE:
+-            val, extra = do_refuse_write("RESTORE", wcs2cs(blks[0]) if blks else "")
++            val, extra = do_restore(wcs2cs(blks[0])) if blks else (FS_PARAM_ERROR, "RESTORE no path")
+             log("   RESTORE %s" % extra)
+             reply = build_reply(data, op, [struct.pack("<i", val)])
+         elif op in (FS_OP_OTP_WRITE, FS_OP_OTP_LOCK):
+diff --git a/tests/test_fs_contract.py b/tests/test_fs_contract.py
+index e6d64a2..d004475 100644
+--- a/tests/test_fs_contract.py
++++ b/tests/test_fs_contract.py
+@@ -91,3 +91,43 @@ def test_private_drive_and_missing_ota():
+         assert ns["do_mkdir"]("Q:/cacerts")[0] == 0
+         assert (Path(ns["OVERLAY"]) / "Q/cacerts").is_dir()
+         assert not Path(ns["FSD_DIRS"]["Q"]).exists()
++
++
++def _read2(ns, path, steps, off=0, length=0, handle=-1, echo=0x1234):
++    desc = struct.pack("<12I", steps, 0, 0, 0x700, echo, off, 0, 0, length, 0,
++                       handle & 0xFFFFFFFF, 0)
++    blocks, _ = ns["do_cmpt_read2"](path, desc)
++    return blocks
++
++
++def test_cmpt_read2_and_restore_use_the_working_copy():
++    with tempfile.TemporaryDirectory() as directory:
++        ns = sandbox(Path(directory))
++        original = Path(ns["FSD_DIRS"]["Z"]) / "NVRAM/NVD_IMEI/NV01_000"
++        original.parent.mkdir(parents=True)
++        original.write_bytes(bytes(range(256)))
++        before = original.read_bytes()
++        # open+seek+read+close (0x1d), as seen for LID files
++        b = _read2(ns, "Z:/NVRAM/NVD_IMEI/NV01_000", 0x1D, 192, 64)
++        assert struct.unpack("<Ii", b[0]) == (0x1D, 0)
++        assert struct.unpack("<I", b[1])[0] == 0x1234
++        assert struct.unpack("<I", b[2])[0] == 64 and b[3] == before[192:256]
++        assert struct.unpack("<i", b[4])[0] > 0
++        # open+seek+read (0x0d) keeps a handle; read+close (0x18) uses it
++        b = _read2(ns, "Z:/NVRAM/NVD_IMEI/NV01_000", 0x0D, 0, 16)
++        h = struct.unpack("<i", b[4])[0]
++        b = _read2(ns, "Z:/NVRAM/NVD_IMEI/NV01_000", 0x18, 0, 16, h)
++        assert struct.unpack("<Ii", b[0]) == (0x18, 0) and b[3] == before[16:32]
++        # absent file: {0, -9} {echo} {0} {} {-1}
++        b = _read2(ns, "Z:/NVRA56C1012.log", 0x19, 0, 2)
++        assert struct.unpack("<Ii", b[0]) == (0, -9)
++        assert b[3] == b"" and struct.unpack("<i", b[4])[0] == -1
++        # restore resets the working copy from the read-only original only
++        desc = struct.pack("<11I", 0x35, 0, 0, 0x10000, 0, 0, 0, 3, 0xFFFFFFFF, 0, 0)
++        ns["do_cmpt_write"]("Z:/NVRAM/NVD_IMEI/NV01_000", desc, b"BAD")
++        assert _read2(ns, "Z:/NVRAM/NVD_IMEI/NV01_000", 0x19, 0, 3)[3] == b"BAD"
++        status, _ = ns["do_restore"]("Z:/NVRAM/NVD_IMEI/NV01_000")
++        assert status == 0
++        assert _read2(ns, "Z:/NVRAM/NVD_IMEI/NV01_000", 0x19, 0, 3)[3] == before[:3]
++        assert original.read_bytes() == before
++        assert ns["do_restore"]("Z:/missing")[0] == -9
+diff --git a/tests/test_runner.py b/tests/test_runner.py
+index 3c19cfb..017e252 100644
+--- a/tests/test_runner.py
++++ b/tests/test_runner.py
+@@ -19,7 +19,8 @@ def main():
+     test_fs_contract.test_cmpt_writes_only_overlay()
+     test_fs_contract.test_private_drive_and_missing_ota()
+     test_drdi.test_drdi_start_and_copies()
+-    print("PASS: 13 userspace source, RPC, FS, and launcher checks")
++    test_fs_contract.test_cmpt_read2_and_restore_use_the_working_copy()
++    print("PASS: 14 userspace source, RPC, FS, and launcher checks")
+ 
+ 
+ if __name__ == "__main__":
+-- 
+2.55.0
+

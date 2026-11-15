@@ -1,0 +1,72 @@
+From bdadd03bb26574e1a6fb511657803a493bdd1a6b Mon Sep 17 00:00:00 2001
+From: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Date: Tue, 14 Jul 2026 13:43:47 +0200
+Subject: [PATCH] drm/mediatek: mtk_crtc: Minimize spinlocked time in cmdq
+ callback
+
+In ddp_cmdq_cb (the CMDQ mailbox callback), the config_lock spin
+lock is being locked to read the config_updating variable in the
+mtk_crtc structure, as, if configuration is updating, the callback
+function shall not run (or shall run at a later time).
+
+It is therefore unnecessary to keep the spinlock until the end of
+the function, in case pending config, planes, or async planes
+bools need to be updated.
+
+Though the cmdq callback is not a performance path in this case,
+this may be running for each frame that is pushed to the display,
+so from 30 (or less) up to 144 times (or more) per second.
+
+Add a temporary "cfg_updating" variable to aid with readability,
+and unlock the spinlock as soon as the config_updating variable
+read operation is done as a micro-optimization.
+
+Signed-off-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Link: https://patchwork.kernel.org/project/linux-mediatek/list/?series=1127365
+[dianqk: from the Huge Restructuring v2 series, applied to v7.3-rc6; rc6 drift resolved]
+---
+ drivers/gpu/drm/mediatek/mtk_crtc.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_crtc.c b/drivers/gpu/drm/mediatek/mtk_crtc.c
+index 128acc5a24..f28116e3f5 100644
+--- a/drivers/gpu/drm/mediatek/mtk_crtc.c
++++ b/drivers/gpu/drm/mediatek/mtk_crtc.c
+@@ -288,6 +288,7 @@ static void ddp_cmdq_cb(struct mbox_client *cl, void *mssg)
+ 	struct mtk_crtc_state *state;
+ 	unsigned int i;
+ 	unsigned long flags;
++	bool cfg_updating;
+ 
+ 	/* release GCE HW usage and start autosuspend */
+ 	pm_runtime_mark_last_busy(cmdq_cl->chan->mbox->dev);
+@@ -299,7 +300,10 @@ static void ddp_cmdq_cb(struct mbox_client *cl, void *mssg)
+ 	state = to_mtk_crtc_state(mtk_crtc->base.state);
+ 
+ 	spin_lock_irqsave(&mtk_crtc->config_lock, flags);
+-	if (mtk_crtc->config_updating)
++	cfg_updating = mtk_crtc->config_updating;
++	spin_unlock_irqrestore(&mtk_crtc->config_lock, flags);
++
++	if (cfg_updating)
+ 		goto ddp_cmdq_cb_out;
+ 
+ 	state->pending_config = false;
+@@ -329,14 +333,11 @@ static void ddp_cmdq_cb(struct mbox_client *cl, void *mssg)
+ 	}
+ 
+ ddp_cmdq_cb_out:
+-
+ 	if (mtk_crtc->pending_needs_vblank) {
+ 		mtk_crtc_finish_page_flip(mtk_crtc);
+ 		mtk_crtc->pending_needs_vblank = false;
+ 	}
+ 
+-	spin_unlock_irqrestore(&mtk_crtc->config_lock, flags);
+-
+ 	mtk_crtc->cmdq_vblank_cnt = 0;
+ 	wake_up(&mtk_crtc->cb_blocking_queue);
+ }
+-- 
+2.56.0
+

@@ -1,0 +1,934 @@
+From fc1c10c07fa78d4110587c927a5d0ab714b77fd5 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] iommu: mediatek: support MT6897 normal and firmware banks
+
+Support MT6897 normal-bank mappings and firmware-owned contexts,
+shared page tables, hypervisor synchronization and larbless clients.
+Retain runtime-hold infrastructure; platform hold selection follows separately.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-16T18:55:48+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T03:57:58+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T04:46:11+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T05:10:21+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T05:41:44+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T06:02:11+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T07:05:07+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T08:40:58+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T08:41:54+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T08:45:06+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T13:01:02+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T17:47:53+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T14:39:23+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T16:20:08+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T20:25:46+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+(cherry picked from commit b4b9060cf0349730e0481692baa84bac702e308d)
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/include/dt-bindings/memory/mt6897-larb-port.h
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/iommu/mtk_iommu.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/misc/mediatek/iommu/iommu_port.h
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/clk/mediatek/clk-mt6897-vcodec.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/soc/mediatek/mtk-scpsys-mt6897.c
+---
+ drivers/iommu/mtk_iommu.c | 600 ++++++++++++++++++++++++++++++++++----
+ 1 file changed, 548 insertions(+), 52 deletions(-)
+
+diff --git a/drivers/iommu/mtk_iommu.c b/drivers/iommu/mtk_iommu.c
+index b52e16b067..5fbbbf8bdf 100644
+--- a/drivers/iommu/mtk_iommu.c
++++ b/drivers/iommu/mtk_iommu.c
+@@ -33,6 +33,8 @@
+ #include <asm/barrier.h>
+ #include <soc/mediatek/smi.h>
+ 
++#include "dma-iommu.h"
++
+ #include <dt-bindings/memory/mtk-memory-port.h>
+ 
+ #define REG_MMU_PT_BASE_ADDR			0x000
+@@ -149,6 +151,15 @@
+ #define INT_ID_PORT_WIDTH_6		BIT(19)
+ #define CFG_IFA_MASTER_IN_ATF		BIT(20)
+ #define DL_WITH_MULTI_LARB		BIT(21)
++/* The hypervisor may shadow the page table (MT6897 GenieZone type2). */
++#define HYP_PGTABLE_TYPE2		BIT(22)
++/*
++ * Keep the M4U runtime-active from probe (MT6897 workaround): the display
++ * masters fetch physical addresses, but their traffic still passes through
++ * the M4U, which therefore must not runtime-suspend even when no
++ * translated client holds it.
++ */
++#define PM_HOLD_FROM_PROBE		BIT(23)
+ 
+ #define MTK_IOMMU_HAS_FLAG_MASK(pdata, _x, mask)	\
+ 				((((pdata)->flags) & (mask)) == (_x))
+@@ -164,6 +175,7 @@
+ 
+ #define MTK_IOMMU_GROUP_MAX	8
+ #define MTK_IOMMU_BANK_MAX	5
++#define MT6897_FW_BANKS		4
+ 
+ enum mtk_iommu_plat {
+ 	M4U_MT2712,
+@@ -174,6 +186,7 @@ enum mtk_iommu_plat {
+ 	M4U_MT8183,
+ 	M4U_MT8186,
+ 	M4U_MT8188,
++	M4U_MT6897,
+ 	M4U_MT8189,
+ 	M4U_MT8192,
+ 	M4U_MT8195,
+@@ -241,6 +254,16 @@ struct mtk_iommu_plat_data {
+ 	};
+ 
+ 	unsigned char       larbid_remap[MTK_LARB_COM_MAX][MTK_LARB_SUBCOM_MAX];
++
++	/*
++	 * Larb IDs of MM masters that reach the IOMMU without an SMI larb
++	 * ("fake" larbs, e.g. the GCE): no larb device to link, no port
++	 * enable to program.
++	 */
++	u32		    larbless_msk;
++	/* Independent firmware-owned contexts, never Linux pgtable banks. */
++	bool		    firmware_banks;
++	u8		    firmware_id;
+ };
+ 
+ struct mtk_iommu_bank_data {
+@@ -253,6 +276,14 @@ struct mtk_iommu_bank_data {
+ 	struct mtk_iommu_domain		*m4u_dom; /* Each bank has a domain */
+ };
+ 
++struct mtk_iommu_fw_bank {
++	struct mtk_iommu_data *data;
++	int irq;
++	u8 bank;
++	bool requested, enabled, fault_disabled, failed;
++	char name[32];
++};
++
+ struct mtk_iommu_data {
+ 	struct device			*dev;
+ 	struct clk			*bclk;
+@@ -267,6 +298,9 @@ struct mtk_iommu_data {
+ 
+ 	struct mtk_iommu_bank_data	*bank;
+ 	struct mtk_iommu_domain		*share_dom;
++	struct mtk_iommu_fw_bank	fw_bank[MT6897_FW_BANKS];
++	bool				fw_init_attempted, fw_initialized, fw_backup_valid;
++	bool				fw_accessible;
+ 
+ 	struct regmap			*pericfg;
+ 	struct mutex			mutex; /* Protect m4u_group/m4u_dom above */
+@@ -279,6 +313,19 @@ struct mtk_iommu_data {
+ 	struct list_head		hw_list_head;
+ 	struct list_head		list;
+ 	struct mtk_smi_larb_iommu	larb_imu[MTK_LARB_NR_MAX];
++
++	/*
++	 * Hypervisor shadow of the page table owned by this data (frstdata
++	 * in the sharing pgtable case). Ranges changed before the first bank
++	 * publishes the table are collected and synchronised at publication.
++	 */
++	bool				pm_held;
++	bool				hyp_type2;
++	bool				hyp_published;
++	bool				hyp_pending;
++	unsigned long			hyp_pending_start;
++	unsigned long			hyp_pending_end;
++	spinlock_t			hyp_lock; /* Protect the hyp_* state */
+ };
+ 
+ struct mtk_iommu_domain {
+@@ -287,8 +334,6 @@ struct mtk_iommu_domain {
+ 
+ 	struct mtk_iommu_bank_data	*bank;
+ 	struct iommu_domain		domain;
+-
+-	struct mutex			mutex; /* Protect "data" in this structure */
+ };
+ 
+ static int mtk_iommu_bind(struct device *dev)
+@@ -467,6 +512,128 @@ static void mtk_iommu_tlb_flush_range_sync(unsigned long iova, size_t size,
+ 	}
+ }
+ 
++/*
++ * MT6897 GenieZone type2: the hypervisor keeps a shadow of the MM page table
++ * and the banks walk that shadow. The SMC ABI follows the vendor driver:
++ * query the mode once, and synchronise every changed IOVA range of table 0
++ * before the bank TLB invalidation.
++ */
++#define MTK_IOMMU_HYP_TYPE2_QUERY	0xbb00ffa4
++#define MTK_IOMMU_HYP_TYPE2_SYNC	0xbb00ffa7
++#define MTK_IOMMU_HYP_MM_TABLE		0
++
++static bool mtk_iommu_hyp_type2_query(struct mtk_iommu_data *data)
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(MTK_IOMMU_HYP_TYPE2_QUERY, 0, 0, 0, 0, 0, 0, 0, &res);
++	if (res.a0 > 1) {
++		/* Includes SMCCC_RET_NOT_SUPPORTED: no hypervisor shadow. */
++		dev_warn(data->dev, "Unexpected type2 query result %#lx, assume disabled\n",
++			 res.a0);
++		return false;
++	}
++	dev_info(data->dev, "Hypervisor type2 page table %s\n",
++		 str_enabled_disabled(res.a0));
++	return res.a0;
++}
++
++/* Synchronise [start, end] of the shadow table. Called with hyp_lock held. */
++static int mtk_iommu_hyp_sync_range(struct mtk_iommu_data *data,
++				    unsigned long start, unsigned long end)
++{
++	struct arm_smccc_res res;
++
++	/* The page table walk is coherent; complete the PTE writes first. */
++	dsb(sy);
++	arm_smccc_smc(MTK_IOMMU_HYP_TYPE2_SYNC, MTK_IOMMU_TLB_ADDR(start),
++		      MTK_IOMMU_TLB_ADDR(end), MTK_IOMMU_HYP_MM_TABLE,
++		      0, 0, 0, 0, &res);
++	/* Order the shadow updates before the bank TLB invalidation. */
++	dsb(sy);
++	if (res.a0) {
++		WARN_ONCE(1, "%s: type2 sync failed\n", dev_name(data->dev));
++		dev_err_ratelimited(data->dev, "type2 sync 0x%lx-0x%lx failed %#lx\n",
++				    start, end, res.a0);
++		return -EIO;
++	}
++	return 0;
++}
++
++static int mtk_iommu_hyp_sync(struct mtk_iommu_data *data,
++			      unsigned long iova, size_t size)
++{
++	unsigned long flags, end = iova + size - 1;
++	int ret = 0;
++
++	/* Also skips an empty gather. */
++	if (!data->hyp_type2 || !size || end < iova)
++		return 0;
++
++	spin_lock_irqsave(&data->hyp_lock, flags);
++	if (data->hyp_published) {
++		ret = mtk_iommu_hyp_sync_range(data, iova, end);
++	} else if (data->hyp_pending) {
++		data->hyp_pending_start = min(data->hyp_pending_start, iova);
++		data->hyp_pending_end = max(data->hyp_pending_end, end);
++	} else {
++		data->hyp_pending_start = iova;
++		data->hyp_pending_end = end;
++		data->hyp_pending = true;
++	}
++	spin_unlock_irqrestore(&data->hyp_lock, flags);
++	return ret;
++}
++
++static struct mtk_iommu_data *mtk_iommu_dom_pgtable_data(struct mtk_iommu_domain *dom)
++{
++	return mtk_iommu_get_frst_data(dom->bank->parent_data->hw_list);
++}
++
++/* A bank has started to walk the table: synchronise the earlier changes. */
++static void mtk_iommu_hyp_publish(struct mtk_iommu_domain *dom)
++{
++	struct mtk_iommu_data *data = mtk_iommu_dom_pgtable_data(dom);
++	unsigned long flags, start = 0, end = 0;
++	bool pending;
++
++	if (!data->hyp_type2)
++		return;
++
++	spin_lock_irqsave(&data->hyp_lock, flags);
++	pending = !data->hyp_published && data->hyp_pending;
++	if (pending) {
++		start = data->hyp_pending_start;
++		end = data->hyp_pending_end;
++		mtk_iommu_hyp_sync_range(data, start, end);
++	}
++	data->hyp_published = true;
++	data->hyp_pending = false;
++	spin_unlock_irqrestore(&data->hyp_lock, flags);
++
++	if (pending)
++		mtk_iommu_tlb_flush_range_sync(start, end - start + 1, dom->bank);
++}
++
++/*
++ * io-pgtable frees a retired lower-level table right after this callback,
++ * so the shadow and the TLBs must stop using it first. The cookie is the
++ * data owning the page table; invalidate bank 0 of every M4U sharing it.
++ */
++static void mtk_iommu_hyp_flush_walk(unsigned long iova, size_t size,
++				     size_t granule, void *cookie)
++{
++	struct mtk_iommu_data *data = cookie;
++
++	mtk_iommu_hyp_sync(data, iova, size);
++	mtk_iommu_tlb_flush_range_sync(iova, size, &data->bank[0]);
++}
++
++/* Leaf changes are gathered and synchronised once in iotlb_sync. */
++static const struct iommu_flush_ops mtk_iommu_hyp_flush_ops = {
++	.tlb_flush_walk	= mtk_iommu_hyp_flush_walk,
++};
++
+ static irqreturn_t mtk_iommu_isr(int irq, void *dev_id)
+ {
+ 	struct mtk_iommu_bank_data *bank = dev_id;
+@@ -617,7 +784,8 @@ static int mtk_iommu_config(struct mtk_iommu_data *data, struct device *dev,
+ 			larb_mmu->bank[portid] = upper_32_bits(region->iova_base);
+ 
+ 		dev_dbg(dev, "%s iommu for larb(%s) port 0x%lx region %d rgn-bank %d.\n",
+-			str_enable_disable(enable), dev_name(larb_mmu->dev),
++			str_enable_disable(enable),
++			larb_mmu->dev ? dev_name(larb_mmu->dev) : "none",
+ 			portid_msk, regionid, upper_32_bits(region->iova_base));
+ 
+ 		if (enable)
+@@ -678,6 +846,14 @@ static int mtk_iommu_domain_finalise(struct mtk_iommu_domain *dom,
+ 	if (MTK_IOMMU_HAS_FLAG(data->plat_data, PGTABLE_PA_35_EN))
+ 		dom->cfg.quirks |= IO_PGTABLE_QUIRK_ARM_MTK_TTBR_EXT;
+ 
++	if (MTK_IOMMU_HAS_FLAG(data->plat_data, HYP_PGTABLE_TYPE2))
++		data->hyp_type2 = mtk_iommu_hyp_type2_query(data);
++	if (data->hyp_type2) {
++		/* As in the vendor driver, type2 uses a coherent table walk. */
++		dom->cfg.coherent_walk = true;
++		dom->cfg.tlb = &mtk_iommu_hyp_flush_ops;
++	}
++
+ 	if (MTK_IOMMU_HAS_FLAG(data->plat_data, HAS_4GB_MODE))
+ 		dom->cfg.oas = data->enable_4GB ? 33 : 32;
+ 	else
+@@ -702,28 +878,57 @@ static int mtk_iommu_domain_finalise(struct mtk_iommu_domain *dom,
+ 
+ static struct iommu_domain *mtk_iommu_domain_alloc_paging(struct device *dev)
+ {
++	struct mtk_iommu_data *data = dev_iommu_priv_get(dev), *frstdata;
+ 	struct mtk_iommu_domain *dom;
++	int region_id, ret;
++
++	region_id = mtk_iommu_get_iova_region_id(dev, data->plat_data);
++	if (region_id < 0)
++		return ERR_PTR(region_id);
+ 
+ 	dom = kzalloc_obj(*dom);
+ 	if (!dom)
+-		return NULL;
+-	mutex_init(&dom->mutex);
++		return ERR_PTR(-ENOMEM);
+ 	dom->domain.pgsize_bitmap = SZ_4K | SZ_64K | SZ_1M | SZ_16M;
+ 
++	/*
++	 * Finalise the page table at allocation rather than at the first
++	 * attach: the core installs IOMMU_RESV_DIRECT mappings before it
++	 * attaches the device. Data is in the frstdata in sharing pgtable case.
++	 */
++	frstdata = mtk_iommu_get_frst_data(data->hw_list);
++	mutex_lock(&frstdata->mutex);
++	ret = mtk_iommu_domain_finalise(dom, frstdata, region_id);
++	mutex_unlock(&frstdata->mutex);
++	if (ret) {
++		kfree(dom);
++		return ERR_PTR(ret);
++	}
++	dom->bank = &data->bank[mtk_iommu_get_bank_id(dev, data->plat_data)];
++
+ 	return &dom->domain;
+ }
+ 
+ static void mtk_iommu_domain_free(struct iommu_domain *domain)
+ {
+-	kfree(to_mtk_domain(domain));
++	struct mtk_iommu_domain *dom = to_mtk_domain(domain);
++	struct mtk_iommu_data *frstdata;
++
++	/*
++	 * The page table is never freed and later domains take it from the
++	 * first finalised domain, so keep that one.
++	 */
++	frstdata = mtk_iommu_get_frst_data(dom->bank->parent_data->hw_list);
++	if (frstdata->share_dom == dom)
++		return;
++	kfree(dom);
+ }
+ 
+ static int mtk_iommu_attach_device(struct iommu_domain *domain,
+ 				   struct device *dev, struct iommu_domain *old)
+ {
+-	struct mtk_iommu_data *data = dev_iommu_priv_get(dev), *frstdata;
++	struct mtk_iommu_data *data = dev_iommu_priv_get(dev);
+ 	struct mtk_iommu_domain *dom = to_mtk_domain(domain);
+-	struct list_head *hw_list = data->hw_list;
+ 	struct device *m4udev = data->dev;
+ 	struct mtk_iommu_bank_data *bank;
+ 	unsigned int bankid;
+@@ -734,22 +939,6 @@ static int mtk_iommu_attach_device(struct iommu_domain *domain,
+ 		return region_id;
+ 
+ 	bankid = mtk_iommu_get_bank_id(dev, data->plat_data);
+-	mutex_lock(&dom->mutex);
+-	if (!dom->bank) {
+-		/* Data is in the frstdata in sharing pgtable case. */
+-		frstdata = mtk_iommu_get_frst_data(hw_list);
+-
+-		mutex_lock(&frstdata->mutex);
+-		ret = mtk_iommu_domain_finalise(dom, frstdata, region_id);
+-		mutex_unlock(&frstdata->mutex);
+-		if (ret) {
+-			mutex_unlock(&dom->mutex);
+-			return ret;
+-		}
+-		dom->bank = &data->bank[bankid];
+-	}
+-	mutex_unlock(&dom->mutex);
+-
+ 	mutex_lock(&data->mutex);
+ 	bank = &data->bank[bankid];
+ 	if (!bank->m4u_dom) { /* Initialize the M4U HW for each a BANK */
+@@ -766,6 +955,7 @@ static int mtk_iommu_attach_device(struct iommu_domain *domain,
+ 		}
+ 		bank->m4u_dom = dom;
+ 		writel(dom->cfg.arm_v7s_cfg.ttbr, bank->base + REG_MMU_PT_BASE_ADDR);
++		mtk_iommu_hyp_publish(dom);
+ 
+ 		pm_runtime_put(m4udev);
+ 	}
+@@ -835,6 +1025,16 @@ static size_t mtk_iommu_unmap(struct iommu_domain *domain,
+ static void mtk_iommu_flush_iotlb_all(struct iommu_domain *domain)
+ {
+ 	struct mtk_iommu_domain *dom = to_mtk_domain(domain);
++	struct mtk_iommu_data *data = mtk_iommu_dom_pgtable_data(dom);
++	unsigned long start = domain->geometry.aperture_start;
++	size_t size = domain->geometry.aperture_end - start + 1;
++
++	if (data->hyp_type2) {
++		/* This domain only changes the table within its aperture. */
++		mtk_iommu_hyp_sync(data, start, size);
++		mtk_iommu_tlb_flush_range_sync(start, size, dom->bank);
++		return;
++	}
+ 
+ 	if (dom->bank)
+ 		mtk_iommu_tlb_flush_all(dom->bank->parent_data);
+@@ -846,6 +1046,7 @@ static void mtk_iommu_iotlb_sync(struct iommu_domain *domain,
+ 	struct mtk_iommu_domain *dom = to_mtk_domain(domain);
+ 	size_t length = gather->end - gather->start + 1;
+ 
++	mtk_iommu_hyp_sync(mtk_iommu_dom_pgtable_data(dom), gather->start, length);
+ 	mtk_iommu_tlb_flush_range_sync(gather->start, length, dom->bank);
+ }
+ 
+@@ -853,9 +1054,11 @@ static int mtk_iommu_sync_map(struct iommu_domain *domain, unsigned long iova,
+ 			      size_t size)
+ {
+ 	struct mtk_iommu_domain *dom = to_mtk_domain(domain);
++	int ret;
+ 
++	ret = mtk_iommu_hyp_sync(mtk_iommu_dom_pgtable_data(dom), iova, size);
+ 	mtk_iommu_tlb_flush_range_sync(iova, size, dom->bank);
+-	return 0;
++	return ret;
+ }
+ 
+ static phys_addr_t mtk_iommu_iova_to_phys(struct iommu_domain *domain,
+@@ -909,6 +1112,8 @@ static struct iommu_device *mtk_iommu_probe_device(struct device *dev)
+ 		}
+ 	}
+ 
++	larbid_msk &= ~(unsigned long)data->plat_data->larbless_msk;
++
+ 	for_each_set_bit(larbid, &larbid_msk, 32) {
+ 		larbdev = data->larb_imu[larbid].dev;
+ 		if (!larbdev)
+@@ -950,6 +1155,8 @@ static void mtk_iommu_release_device(struct device *dev)
+ 		larbid_msk |= BIT(larbid);
+ 	}
+ 
++	larbid_msk &= ~(unsigned long)data->plat_data->larbless_msk;
++
+ 	for_each_set_bit(larbid, &larbid_msk, 32) {
+ 		larbdev = data->larb_imu[larbid].dev;
+ 		device_link_remove(dev, larbdev);
+@@ -1033,6 +1240,8 @@ static void mtk_iommu_get_resv_regions(struct device *dev,
+ 	struct iommu_resv_region *region;
+ 	int prot = IOMMU_WRITE | IOMMU_READ;
+ 
++	/* Include firmware-described direct mappings, e.g. live boot scanout. */
++	iommu_dma_get_resv_regions(dev, head);
+ 	if ((int)regionid < 0)
+ 		return;
+ 	curdom = data->plat_data->iova_region + regionid;
+@@ -1289,6 +1498,159 @@ static int mtk_iommu_mm_dts_parse(struct device *dev, struct component_match **m
+ 	return ret;
+ }
+ 
++/* MediaTek MT6897 firmware-bank contract, MiCode device modules 3c4ccd07
++ * mtk_iommu.c and the platform ATF. Linux owns bank0 only. SMC514 op0/2/3
++ * initializes/backs up/restores firmware bank registers; ATF owns their TTBRs
++ * and tables. Op5 synchronously reads fault data and ACKs INT_CONTROL BIT12.
++ */
++static int mtk_iommu_fw_command(struct mtk_iommu_data *data, unsigned int op,
++			      unsigned int arg)
++{
++	struct arm_smccc_res res;
++	u32 command = data->plat_data->firmware_id << 16 | 4 << 8 | op;
++
++	arm_smccc_smc(MTK_SIP_KERNEL_IOMMU_CONTROL, command, arg, 0, 0, 0, 0, 0, &res);
++	if (res.a0) {
++		dev_err(data->dev, "firmware bank operation %u failed: raw=%#lx/%#lx/%#lx/%#lx\n",
++			op, res.a0, res.a1, res.a2, res.a3);
++		return -EIO;
++	}
++	return 0;
++}
++
++static irqreturn_t mtk_iommu_fw_irq(int irq, void *priv)
++{
++	struct mtk_iommu_fw_bank *bank = priv;
++	struct mtk_iommu_data *data = bank->data;
++	struct arm_smccc_res res;
++	u32 command = data->plat_data->firmware_id << 16 | bank->bank << 8 | 5;
++	u32 va, fault_id, comm, sub, port, larb = MTK_INVALID_LARBID;
++	u64 iova, pa;
++
++	arm_smccc_smc(MTK_SIP_KERNEL_IOMMU_CONTROL, command, 0, 0, 0, 0, 0, 0, &res);
++	dev_err_ratelimited(data->dev,
++		"firmware bank%u fault raw=%#lx/%#lx/%#lx/%#lx\n",
++		bank->bank, res.a0, res.a1, res.a2, res.a3);
++	if (res.a0) {
++		/* A failed query may leave the level asserted. Keep this bank
++		 * masked until reboot; PM balances the extra disable exactly once. */
++		WRITE_ONCE(bank->failed, true);
++		WRITE_ONCE(bank->fault_disabled, true);
++		disable_irq_nosync(irq);
++		return IRQ_HANDLED;
++	}
++	if (!res.a1 && !res.a2 && !res.a3) {
++		dev_err_ratelimited(data->dev, "firmware bank%u returned an empty, ambiguous fault tuple\n",
++			bank->bank);
++		return IRQ_HANDLED;
++	}
++	/* Extract both high address fields and access flags before masking VA. */
++	va = lower_32_bits(res.a1);
++	fault_id = lower_32_bits(res.a3);
++	iova = (va & GENMASK(31, 12)) | (u64)((va >> 9) & 7) << 32;
++	pa = lower_32_bits(res.a2) | (u64)((va >> 6) & 7) << 32;
++	comm = (fault_id >> 10) & 7;
++	sub = (fault_id >> 7) & 7;
++	port = (fault_id >> 2) & 31;
++	if (comm < ARRAY_SIZE(data->plat_data->larbid_remap) &&
++	    sub < ARRAY_SIZE(data->plat_data->larbid_remap[0]))
++		larb = data->plat_data->larbid_remap[comm][sub];
++	dev_err_ratelimited(data->dev,
++		"firmware bank%u iova=%#llx pa=%#llx id=%#x comm=%u sub=%u larb=%u port=%u layer=%u %s\n",
++		bank->bank, iova, pa, fault_id, comm, sub, larb, port,
++		va & 1, str_write_read(va & 2));
++	return IRQ_HANDLED;
++}
++
++static void mtk_iommu_fw_irqs_disable(struct mtk_iommu_data *data)
++{
++	unsigned int i;
++
++	for (i = 0; i < MT6897_FW_BANKS; i++) {
++		struct mtk_iommu_fw_bank *bank = &data->fw_bank[i];
++
++		if (!bank->requested)
++			continue;
++		if (!bank->enabled) {
++			synchronize_irq(bank->irq);
++			continue;
++		}
++		disable_irq(bank->irq);
++		bank->enabled = false;
++		/* disable_irq synchronized the threaded query. Preserve the
++		 * lifecycle mask while balancing its failure mask once. */
++		if (bank->fault_disabled) {
++			bank->fault_disabled = false;
++			enable_irq(bank->irq);
++		}
++	}
++}
++
++static void mtk_iommu_fw_irqs_enable(struct mtk_iommu_data *data)
++{
++	unsigned int i;
++
++	for (i = 0; i < MT6897_FW_BANKS; i++) {
++		struct mtk_iommu_fw_bank *bank = &data->fw_bank[i];
++
++		if (bank->enabled || bank->failed)
++			continue;
++		bank->enabled = true;
++		enable_irq(bank->irq);
++	}
++}
++
++static int mtk_iommu_fw_irqs_prepare(struct platform_device *pdev,
++				    struct mtk_iommu_data *data)
++{
++	unsigned int i;
++	int ret;
++
++	if (!data->plat_data->firmware_banks)
++		return 0;
++	for (i = 0; i < MT6897_FW_BANKS; i++) {
++		struct mtk_iommu_fw_bank *bank = &data->fw_bank[i];
++
++		bank->data = data;
++		bank->bank = i + 1;
++		bank->irq = platform_get_irq(pdev, bank->bank);
++		if (bank->irq < 0)
++			return bank->irq;
++		snprintf(bank->name, sizeof(bank->name), "mt6897-%u-fw-bank%u",
++			 data->plat_data->firmware_id, bank->bank);
++		ret = devm_request_threaded_irq(data->dev, bank->irq, NULL,
++			mtk_iommu_fw_irq, IRQF_ONESHOT | IRQF_NO_AUTOEN, bank->name, bank);
++		if (ret)
++			return ret;
++		bank->requested = true;
++	}
++	return 0;
++}
++
++/* A powered partial init may already have enabled some firmware sources.
++ * Mask them once on probe unwind/remove, independently of Linux IRQ masking.
++ * Even a failed firmware mask is safe for free_irq after Linux synchronization;
++ * preserve the original provider unwind rather than binding an unusable device.
++ */
++static void mtk_iommu_fw_cleanup(struct mtk_iommu_data *data)
++{
++	int ret;
++
++	mtk_iommu_fw_irqs_disable(data);
++	if (!data->fw_init_attempted)
++		return;
++	if (data->fw_accessible) {
++		ret = mtk_iommu_fw_command(data, 1, 0);
++		if (ret)
++			dev_err(data->dev, "firmware IRQ cleanup mask failed; Linux IRQs remain disabled\n");
++	} else {
++		dev_warn(data->dev, "skipping firmware IRQ cleanup mask without access clock; Linux IRQs remain disabled\n");
++	}
++	data->fw_init_attempted = false;
++	data->fw_initialized = false;
++	data->fw_backup_valid = false;
++}
++
+ static int mtk_iommu_probe(struct platform_device *pdev)
+ {
+ 	struct mtk_iommu_data   *data;
+@@ -1396,6 +1758,10 @@ static int mtk_iommu_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++	ret = mtk_iommu_fw_irqs_prepare(pdev, data);
++	if (ret)
++		return ret;
++
+ 	pm_runtime_enable(dev);
+ 
+ 	if (MTK_IOMMU_IS_TYPE(data->plat_data, MTK_IOMMU_TYPE_MM)) {
+@@ -1416,6 +1782,7 @@ static int mtk_iommu_probe(struct platform_device *pdev)
+ 
+ 	platform_set_drvdata(pdev, data);
+ 	mutex_init(&data->mutex);
++	spin_lock_init(&data->hyp_lock);
+ 
+ 	if (MTK_IOMMU_HAS_FLAG(data->plat_data, SHARE_PGTABLE)) {
+ 		list_add_tail(&data->list, data->plat_data->hw_list);
+@@ -1426,6 +1793,30 @@ static int mtk_iommu_probe(struct platform_device *pdev)
+ 		data->hw_list = &data->hw_list_head;
+ 	}
+ 
++	/*
++	 * Before registration: registering attaches the existing clients and
++	 * publishes the page table, so bank 0 must not suspend from then on.
++	 */
++	if (MTK_IOMMU_HAS_FLAG(data->plat_data, PM_HOLD_FROM_PROBE)) {
++		ret = pm_runtime_resume_and_get(dev);
++		if (ret)
++			goto out_list_del;
++		data->pm_held = true;
++	}
++
++	if (data->plat_data->firmware_banks) {
++		/* The held PM vote precedes client registration and first normal
++		 * bank attachment. Initialize firmware contexts exactly once. */
++		data->fw_init_attempted = true;
++		ret = mtk_iommu_fw_command(data, 0, 0);
++		if (ret)
++			goto out_list_del;
++		data->fw_initialized = true;
++		mtk_iommu_fw_irqs_enable(data);
++		dev_info(dev, "firmware banks 1-4 initialized (id %u), Linux owns bank 0\n",
++			 data->plat_data->firmware_id);
++	}
++
+ 	ret = iommu_device_sysfs_add(&data->iommu, dev, NULL,
+ 				     "mtk-iommu.%pa", &ioaddr);
+ 	if (ret)
+@@ -1447,6 +1838,7 @@ static int mtk_iommu_probe(struct platform_device *pdev)
+ out_sysfs_remove:
+ 	iommu_device_sysfs_remove(&data->iommu);
+ out_list_del:
++	mtk_iommu_fw_cleanup(data);
+ 	list_del(&data->list);
+ 	if (MTK_IOMMU_IS_TYPE(data->plat_data, MTK_IOMMU_TYPE_MM)) {
+ 		device_link_remove(data->smicomm_dev, dev);
+@@ -1455,6 +1847,10 @@ static int mtk_iommu_probe(struct platform_device *pdev)
+ 			put_device(data->larb_imu[i].dev);
+ 	}
+ out_runtime_disable:
++	if (data->pm_held) {
++		pm_runtime_put_noidle(dev);
++		data->pm_held = false;
++	}
+ 	pm_runtime_disable(dev);
+ 	return ret;
+ }
+@@ -1465,6 +1861,7 @@ static void mtk_iommu_remove(struct platform_device *pdev)
+ 	struct mtk_iommu_bank_data *bank;
+ 	int i;
+ 
++	mtk_iommu_fw_cleanup(data);
+ 	iommu_device_sysfs_remove(&data->iommu);
+ 	iommu_device_unregister(&data->iommu);
+ 
+@@ -1477,6 +1874,8 @@ static void mtk_iommu_remove(struct platform_device *pdev)
+ 		for (i = 0; i < MTK_LARB_NR_MAX; i++)
+ 			put_device(data->larb_imu[i].dev);
+ 	}
++	if (data->pm_held)
++		pm_runtime_put_noidle(&pdev->dev);
+ 	pm_runtime_disable(&pdev->dev);
+ 	for (i = 0; i < data->plat_data->banks_num; i++) {
+ 		bank = &data->bank[i];
+@@ -1491,7 +1890,17 @@ static int __maybe_unused mtk_iommu_runtime_suspend(struct device *dev)
+ 	struct mtk_iommu_data *data = dev_get_drvdata(dev);
+ 	struct mtk_iommu_suspend_reg *reg = &data->reg;
+ 	void __iomem *base;
+-	int i = 0;
++	int i = 0, ret;
++
++	if (data->fw_initialized) {
++		mtk_iommu_fw_irqs_disable(data);
++		ret = mtk_iommu_fw_command(data, 2, 0);
++		if (ret) {
++			mtk_iommu_fw_irqs_enable(data);
++			return ret;
++		}
++		data->fw_backup_valid = true;
++	}
+ 
+ 	base = data->bank[i].base;
+ 	reg->wr_len_ctrl = readl_relaxed(base + REG_MMU_WR_LEN_CTRL);
+@@ -1507,6 +1916,7 @@ static int __maybe_unused mtk_iommu_runtime_suspend(struct device *dev)
+ 		reg->int_main_control[i] = readl_relaxed(base + REG_MMU_INT_MAIN_CONTROL);
+ 		reg->ivrp_paddr[i] = readl_relaxed(base + REG_MMU_IVRP_PADDR);
+ 	} while (++i < data->plat_data->banks_num);
++	data->fw_accessible = false;
+ 	clk_disable_unprepare(data->bclk);
+ 	return 0;
+ }
+@@ -1525,37 +1935,53 @@ static int __maybe_unused mtk_iommu_runtime_resume(struct device *dev)
+ 		return ret;
+ 	}
+ 
+-	/*
+-	 * Uppon first resume, only enable the clk and return, since the values of the
+-	 * registers are not yet set.
+-	 */
+-	if (!reg->wr_len_ctrl)
+-		return 0;
++	data->fw_accessible = true;
+ 
+-	base = data->bank[i].base;
+-	writel_relaxed(reg->wr_len_ctrl, base + REG_MMU_WR_LEN_CTRL);
+-	writel_relaxed(reg->misc_ctrl, base + REG_MMU_MISC_CTRL);
+-	writel_relaxed(reg->dcm_dis, base + REG_MMU_DCM_DIS);
+-	writel_relaxed(reg->ctrl_reg, base + REG_MMU_CTRL_REG);
+-	writel_relaxed(reg->vld_pa_rng, base + REG_MMU_VLD_PA_RNG);
+-	do {
+-		m4u_dom = data->bank[i].m4u_dom;
+-		if (!data->plat_data->banks_enable[i] || !m4u_dom)
+-			continue;
++	/* First normal-bank resume has no register snapshot, but a firmware
++	 * snapshot is independent and must still be restored when present. */
++	if (reg->wr_len_ctrl) {
+ 		base = data->bank[i].base;
+-		writel_relaxed(reg->int_control[i], base + REG_MMU_INT_CONTROL0);
+-		writel_relaxed(reg->int_main_control[i], base + REG_MMU_INT_MAIN_CONTROL);
+-		writel_relaxed(reg->ivrp_paddr[i], base + REG_MMU_IVRP_PADDR);
+-		writel(m4u_dom->cfg.arm_v7s_cfg.ttbr, base + REG_MMU_PT_BASE_ADDR);
+-	} while (++i < data->plat_data->banks_num);
++		writel_relaxed(reg->wr_len_ctrl, base + REG_MMU_WR_LEN_CTRL);
++		writel_relaxed(reg->misc_ctrl, base + REG_MMU_MISC_CTRL);
++		writel_relaxed(reg->dcm_dis, base + REG_MMU_DCM_DIS);
++		writel_relaxed(reg->ctrl_reg, base + REG_MMU_CTRL_REG);
++		writel_relaxed(reg->vld_pa_rng, base + REG_MMU_VLD_PA_RNG);
++		do {
++			m4u_dom = data->bank[i].m4u_dom;
++			if (!data->plat_data->banks_enable[i] || !m4u_dom)
++				continue;
++			base = data->bank[i].base;
++			writel_relaxed(reg->int_control[i], base + REG_MMU_INT_CONTROL0);
++			writel_relaxed(reg->int_main_control[i], base + REG_MMU_INT_MAIN_CONTROL);
++			writel_relaxed(reg->ivrp_paddr[i], base + REG_MMU_IVRP_PADDR);
++			writel(m4u_dom->cfg.arm_v7s_cfg.ttbr, base + REG_MMU_PT_BASE_ADDR);
++		} while (++i < data->plat_data->banks_num);
+ 
+-	/*
+-	 * Users may allocate dma buffer before they call pm_runtime_get,
+-	 * in which case it will lack the necessary tlb flush.
+-	 * Thus, make sure to update the tlb after each PM resume.
++	}
++	if (data->fw_initialized) {
++		if (!data->fw_backup_valid) {
++			ret = -EINVAL;
++			goto out_clk_disable;
++		}
++		ret = mtk_iommu_fw_command(data, 3, 0);
++		if (ret)
++			goto out_clk_disable;
++		data->fw_backup_valid = false;
++	}
++	/* Preserve the existing bank 0 invalidate after restoring both kinds of
++	 * register state. This is not a claim about protected-bank TLB scope.
++	 * No invalidate on the initial resume before any bank 0 domain exists.
+ 	 */
+-	mtk_iommu_tlb_flush_all(data);
++	if (reg->wr_len_ctrl || (data->fw_initialized && data->bank[0].m4u_dom))
++		mtk_iommu_tlb_flush_all(data);
++	if (data->fw_initialized)
++		mtk_iommu_fw_irqs_enable(data);
+ 	return 0;
++out_clk_disable:
++	/* A failed resume never exposes clients or unmasks firmware IRQs. */
++	data->fw_accessible = false;
++	clk_disable_unprepare(data->bclk);
++	return ret;
+ }
+ 
+ static const struct dev_pm_ops mtk_iommu_pm_ops = {
+@@ -1810,6 +2236,74 @@ static const struct mtk_iommu_plat_data mt8189_data_mm = {
+ 			   {13, 17}, {14, 16}},
+ };
+ 
++/*
++ * MT6897 MM IOMMUs (disp and mdp share one page table). The display
++ * larbs are described: compact larb IDs 0, 1, 20, 21, and 6/10 for
++ * larb32/33; plus the larb-less fake larb 43 (GCE) as 31 on mdp. larbid_remap[comm][sub] from the vendor fault-ID map
++ * (tf_larb = comm << 3 | sub). Larbs stay in bypass until a master
++ * attaches.
++ */
++/* Keep existing display/GCE clients below 4 GiB. The firmware code and
++ * protected VIDEO_UP0 apertures belong to secure firmware; reserving them
++ * does not install mappings. VIDEO_UP1 shares port 0 with the protected
++ * variant, while GCE uses ports 1/2 and must remain in the normal domain.
++ * Source: MediaTek mt6897_multi_dom_mm, MiCode device modules 3c4ccd07.
++ */
++static const struct mtk_iommu_iova_region mt6897_multi_dom[] = {
++	{ .iova_base = 0, .size = MTK_IOMMU_IOVA_SZ_4G },
++	{ .iova_base = 0x106000000ULL, .size = 0x02000000 }, /* LK code */
++	{ .iova_base = 0x110000000ULL, .size = 0x30000000 }, /* protected */
++	{ .iova_base = 0x140000000ULL, .size = 0x60000000 }, /* VIDEO_UP1 */
++};
++
++static const u32 mt6897_larb_region_msk[MT8192_MULTI_REGION_NR_MAX][MTK_LARB_NR_MAX] = {
++	[0] = {[0] = ~0, [1] = ~0, [4] = GENMASK(10, 0),
++	       [5] = GENMASK(8, 0), [6] = ~0,
++	       [7] = GENMASK(6, 0) | GENMASK(15, 10) | GENMASK(26, 19) | BIT(31),
++	       [8] = GENMASK(6, 0) | GENMASK(15, 10) | GENMASK(26, 19) | BIT(31),
++	       [10] = ~0, [20] = ~0,
++	       [21] = ~0, [31] = ~BIT(0)},
++	[3] = {[31] = BIT(0)},
++};
++
++static const struct mtk_iommu_plat_data mt6897_data_disp = {
++	.firmware_banks = true,
++	.firmware_id = 0,
++	.m4u_plat	= M4U_MT6897,
++	.flags		= HAS_BCLK | HAS_SUB_COMM_3BITS | OUT_ORDER_WR_EN |
++			  IOVA_34_EN | SHARE_PGTABLE | PGTABLE_PA_35_EN |
++			  DL_WITH_MULTI_LARB | HYP_PGTABLE_TYPE2 |
++			  MTK_IOMMU_TYPE_MM,
++	.hw_list	= &m4ulist,
++	.inv_sel_reg	= REG_MMU_INV_SEL_GEN2,
++	.banks_num	= 1,
++	.banks_enable	= {true},
++	.iova_region	= mt6897_multi_dom,
++	.iova_region_nr	= ARRAY_SIZE(mt6897_multi_dom),
++	.iova_region_larb_msk = mt6897_larb_region_msk,
++	.larbid_remap	= {{0}, {21, 10}, {}, {5}, {7}},
++};
++
++static const struct mtk_iommu_plat_data mt6897_data_mdp = {
++	.firmware_banks = true,
++	.firmware_id = 1,
++	.m4u_plat	= M4U_MT6897,
++	.flags		= HAS_BCLK | HAS_SUB_COMM_3BITS | OUT_ORDER_WR_EN |
++			  IOVA_34_EN | SHARE_PGTABLE | PGTABLE_PA_35_EN |
++			  DL_WITH_MULTI_LARB | HYP_PGTABLE_TYPE2 |
++			  MTK_IOMMU_TYPE_MM,
++	.hw_list	= &m4ulist,
++	.inv_sel_reg	= REG_MMU_INV_SEL_GEN2,
++	.banks_num	= 1,
++	.banks_enable	= {true},
++	.iova_region	= mt6897_multi_dom,
++	.iova_region_nr	= ARRAY_SIZE(mt6897_multi_dom),
++	.iova_region_larb_msk = mt6897_larb_region_msk,
++	/* Fake larb 43 (GCE, video uP) is compact ID 31, fault ID comm 1 sub 1 */
++	.larbid_remap	= {{1, 6}, {20, 31}, {}, {4}, {8}},
++	.larbless_msk	= BIT(31),
++};
++
+ static const struct mtk_iommu_plat_data mt8192_data = {
+ 	.m4u_plat       = M4U_MT8192,
+ 	.flags          = HAS_BCLK | HAS_SUB_COMM_2BITS | OUT_ORDER_WR_EN |
+@@ -1913,6 +2407,8 @@ static const struct of_device_id mtk_iommu_of_ids[] = {
+ 	{ .compatible = "mediatek,mt8188-iommu-vpp",   .data = &mt8188_data_vpp},
+ 	{ .compatible = "mediatek,mt8189-iommu-apu",   .data = &mt8189_data_apu},
+ 	{ .compatible = "mediatek,mt8189-iommu-infra", .data = &mt8189_data_infra},
++	{ .compatible = "mediatek,mt6897-iommu-disp",  .data = &mt6897_data_disp},
++	{ .compatible = "mediatek,mt6897-iommu-mdp",   .data = &mt6897_data_mdp},
+ 	{ .compatible = "mediatek,mt8189-iommu-mm",    .data = &mt8189_data_mm},
+ 	{ .compatible = "mediatek,mt8192-m4u", .data = &mt8192_data},
+ 	{ .compatible = "mediatek,mt8195-iommu-infra", .data = &mt8195_data_infra},
+-- 
+2.56.0
+

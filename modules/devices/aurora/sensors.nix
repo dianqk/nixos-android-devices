@@ -5,16 +5,10 @@ in
 {
   options.hardware.aurora.sensors.enable = lib.mkOption {
     type = lib.types.bool;
-    default = !config.androidDevices.recovery.enable && cfg.firmwareVariant == "android14";
-    description = "Aurora SSC sensors using the matching Android 14 DSP data.";
+    default = !config.androidDevices.recovery.enable;
+    description = "Aurora SSC sensors using the matching Android 16 DSP data.";
   };
   config = lib.mkIf cfg.sensors.enable {
-    assertions = [
-      {
-        assertion = cfg.firmwareVariant == "android14";
-        message = "Aurora SSC sensor data requires the OS1.0.3.0.UNACNXM Android 14 firmware baseline.";
-      }
-    ];
     androidDevices.sensors = {
       enable = true;
       rpcDomain = "adsp";

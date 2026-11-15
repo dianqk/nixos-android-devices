@@ -11,8 +11,52 @@ import sys
 import tempfile
 
 
-# Nixpkgs kernel postPatch salt verified for the rc5 and rc6 preparation contracts.
+# Nixpkgs kernel postPatch salt verified through the 7.3.4 preparation contract.
 RANDSTRUCT_SALT = "/1s3bzfisrvrdlla1qr3z074sphpb4cpz4rbacwp56cmp9237lv2y"
+
+
+# Verified Nixpkgs + kernel-compat 7.3.1/7.3.4 preparation; shebangs stay with Nix.
+# Refuse new preparation operations until their Git equivalent is reviewed.
+NIX_POST_PATCH_731 = r"""# Set randstruct seed to a deterministic but diversified value. Note:
+# we could have instead patched gen-random-seed.sh to take input from
+# the buildFlags, but that would require also patching the kernel's
+# toplevel Makefile to add a variable export. This would be likely to
+# cause future patch conflicts.
+for file in scripts/gen-randstruct-seed.sh scripts/gcc-plugins/gen-random-seed.sh; do
+  if [ -f "$file" ]; then
+    substituteInPlace "$file" \
+      --replace NIXOS_RANDSTRUCT_SEED \
+      $(echo @SOURCE@ /1s3bzfisrvrdlla1qr3z074sphpb4cpz4rbacwp56cmp9237lv2y | sha256sum | cut -d ' ' -f 1 | tr -d '\n')
+    break
+  fi
+done
+
+patchShebangs scripts
+
+# also patch arch-specific install scripts
+for i in $(find arch -name install.sh); do
+    patchShebangs "$i"
+done
+find . -type f \( -name Makefile -o -name Kbuild \) -print0 \
+  | xargs -0 sed -i -e 's/[[:space:]]-Werror\([[:space:]]\|$\)/ /g'
+"""
+
+
+def release_version(makefile):
+    fields = dict(re.findall(r'^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION) =[ \t]*(.*)$',
+                             makefile, re.MULTILINE))
+    version = fields['VERSION'] + '.' + fields['PATCHLEVEL']
+    if fields['SUBLEVEL'] != '0':
+        version += '.' + fields['SUBLEVEL']
+    return version + fields['EXTRAVERSION']
+
+
+def check_post_patch(version, source, post_patch):
+    if version in ['7.3.1', '7.3.4']:
+        if post_patch != NIX_POST_PATCH_731.replace('@SOURCE@', source):
+            raise ValueError('selected Nix source preparation contract changed; review postPatch')
+    elif f"echo {source} {RANDSTRUCT_SALT} | sha256sum" not in post_patch:
+        raise ValueError('selected Nix randstruct preparation contract changed; review postPatch')
 
 
 def run(*args, cwd=None, data=None):
@@ -34,21 +78,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['import', 'export', 'verify', 'prepare'])
     parser.add_argument('--repo', required=True, type=Path)
-    parser.add_argument('--device', required=True, choices=['aurora', 'polaris', 'sheng', 'asphalt', 'clover'])
-    parser.add_argument('--version', required=True, help='e.g. 7.3-rc5')
-    parser.add_argument('--base', required=True, help='verified upstream tag, e.g. v7.3-rc5')
+    parser.add_argument('--device', required=True, choices=['aurora', 'polaris', 'sheng', 'asphalt', 'clover', 'marble', 't880', 'dodge'])
+    parser.add_argument('--version', required=True, help='e.g. 7.3.1 or 7.3-rc5')
+    parser.add_argument('--base', required=True, help='verified upstream tag, e.g. v7.3.1')
     parser.add_argument('--flake', default=str(Path(__file__).resolve().parents[1]))
     parser.add_argument('--system', default='aarch64-linux')
-    parser.add_argument('--source-identity', help='exact rc source store path used by Nix randstruct seed')
+    parser.add_argument('--source-identity', help='exact source store path used by Nix randstruct seed')
     parser.add_argument('--output', type=Path, help='new directory for exported mail patches')
     args = parser.parse_args()
     repo = args.repo.resolve()
     branch = f'android/{args.version}/{args.device}'
     base = git(repo, 'rev-parse', f'{args.base}^{{commit}}')
     makefile = git(repo, 'show', f'{base}:Makefile')
-    fields = dict(re.findall(r'^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION) = (.*)$', makefile, re.MULTILINE))
-    version = fields['VERSION'] + '.' + fields['PATCHLEVEL'] + fields['EXTRAVERSION']
-    if fields['SUBLEVEL'] != '0' or version != args.version:
+    version = release_version(makefile)
+    if version != args.version:
         parser.error(f'base release {version} does not match --version {args.version}')
     if args.action in ['import', 'verify', 'prepare']:
         status = json.loads(run('nix', 'eval', '--json',
@@ -56,18 +99,20 @@ def main():
         if status['expectedVersion'] != args.version:
             parser.error(f'evaluated queue targets {status["expectedVersion"]}, not {args.version}')
     if args.action == 'prepare':
-        if args.version not in ['7.3-rc5', '7.3-rc6']:
-            parser.error('prepare implements only the verified 7.3-rc5 and 7.3-rc6 Nix postPatch contracts')
+        if args.version not in ['7.3-rc5', '7.3-rc6', '7.3', '7.3.1', '7.3.4']:
+            parser.error('prepare implements only the verified 7.3-rc5, 7.3-rc6, 7.3, 7.3.1 and 7.3.4 Nix postPatch contracts')
         if not args.source_identity:
             parser.error('prepare requires --source-identity for the selected release')
-        if args.version == '7.3-rc6':
+        if args.version != '7.3-rc5':
             contract = json.loads(run('nix', 'eval', '--json',
                 f'{args.flake}#legacyPackages.{args.system}.devices.{args.device}.kernel',
                 '--apply', 'k: { src = toString k.src; inherit (k) postPatch; }'))
             if args.source_identity != contract['src']:
-                parser.error('--source-identity differs from the selected rc6 Nix source')
-            if f"echo {args.source_identity} {RANDSTRUCT_SALT} | sha256sum" not in contract['postPatch']:
-                parser.error('selected Nix randstruct preparation contract changed; review postPatch')
+                parser.error(f'--source-identity differs from the selected {args.version} Nix source')
+            try:
+                check_post_patch(args.version, args.source_identity, contract['postPatch'])
+            except ValueError as error:
+                parser.error(str(error))
         if git(repo, 'status', '--porcelain'):
             parser.error('kernel worktree must be clean')
         prepared = f'android-prepared/{args.version}/{args.device}'
@@ -84,8 +129,11 @@ def main():
             git(repo, 'add', '-A')
             git(repo, 'commit', '--quiet', '-m',
                 f'build: apply Nixpkgs {patch.name}\n\nBuild-only patch; exclude from device queue export.\nImport-SHA256: {hashlib.sha256(patch.read_bytes()).hexdigest()}')
-        makefile = repo / 'Makefile'
-        makefile.write_text(makefile.read_text().replace('= /sbin/depmod', '= depmod'))
+        # Nixpkgs before the 7.3 kernel-build rewrite also pointed depmod at PATH.
+        resolve_depmod = args.version in ['7.3-rc5', '7.3-rc6']
+        if resolve_depmod:
+            makefile = repo / 'Makefile'
+            makefile.write_text(makefile.read_text().replace('= /sbin/depmod', '= depmod'))
         seed = hashlib.sha256((args.source_identity +
             ' ' + RANDSTRUCT_SALT + '\n').encode()).hexdigest()
         for name in ['scripts/gen-randstruct-seed.sh', 'scripts/gcc-plugins/gen-random-seed.sh']:
@@ -101,7 +149,9 @@ def main():
                     path.write_text(re.sub(r'[ \t]-Werror([ \t]|$)', ' ', path.read_text(), flags=re.MULTILINE))
         git(repo, 'add', '-A')
         git(repo, 'commit', '--quiet', '-m',
-            f'build: prepare Nix kernel source\n\nUse depmod from PATH, deterministic randstruct seed and remove standalone -Werror.\nShebang rewriting remains a Nix build-environment operation.\nRandstruct-Seed: {seed}\nSource-Identity: {args.source_identity}\nDevice-Queue: {branch}')
+            'build: prepare Nix kernel source\n\n' +
+            ('Use depmod from PATH, deterministic' if resolve_depmod else 'Use the deterministic') +
+            f' randstruct seed and remove standalone -Werror.\nShebang rewriting remains a Nix build-environment operation.\nRandstruct-Seed: {seed}\nSource-Identity: {args.source_identity}\nDevice-Queue: {branch}')
         preparation = {'branch': prepared, 'commit': git(repo, 'rev-parse', 'HEAD'),
                        'tree': git(repo, 'rev-parse', 'HEAD^{tree}'), 'seed': seed,
                        'sourceIdentity': args.source_identity,

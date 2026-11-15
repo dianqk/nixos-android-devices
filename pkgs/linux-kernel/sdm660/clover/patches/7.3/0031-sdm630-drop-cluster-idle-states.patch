@@ -1,0 +1,206 @@
+From dee150d243dcd36da60f1e9894c20f45d7207e14 Mon Sep 17 00:00:00 2001
+From: Fabricio Akio <fabricioakio@gmail.com>
+Date: Sun, 11 Oct 2026 23:18:07 -0300
+Subject: [PATCH] arm64: dts: qcom: sdm630: Drop the cluster idle states
+
+The cluster idle states use PSCI parameters 0x400000f2-0x400000f4. The
+vendor kernel encodes a cluster state differently: it puts the cluster
+mode in StateID bits 7:4 and sets an affinity-level field, bits 25:24,
+to 1, so cluster power collapse is 0x41000043, and only the last
+running CPU of a cluster requests one. A flat cpu-idle-states list
+cannot express that condition.
+
+cpuidle records no successful entry into any of these states, and every
+request for one fails. Because they are the deepest, an idle CPU keeps
+choosing one, each attempt returns at once, and the CPU spends its idle
+time retrying instead of sleeping. On a Motorola Moto X4 (SDM630) with
+the screen off, the CPUs made about 133,000 failed idle entries per
+second and spent about 10% of the time in an idle state, and the
+battery supplied 277 mA. Without these states they spend nearly all of
+it in one, and the battery supplies 115 mA.
+
+Fixes: b190fb010664 ("arm64: dts: qcom: sdm630: Add sdm630 dts file")
+Signed-off-by: Fabricio Akio <fabricioakio@gmail.com>
+Link: https://lore.kernel.org/all/20261011-sdm630-idle-states-v1-1-3181d488dc0f@gmail.com/
+Link: https://patchwork.kernel.org/project/linux-arm-msm/patch/20261011-sdm630-idle-states-v1-1-3181d488dc0f@gmail.com/
+Scope: SDM630/660 common
+Porting notes: Applied unchanged on v7.3 from the patchwork mbox (v1, not yet merged upstream); the maintainer accepted dropping the states as a temporary measure until PSCI OSI cluster domains exist.
+---
+ arch/arm64/boot/dts/qcom/sdm630.dtsi | 108 ++-------------------------
+ 1 file changed, 8 insertions(+), 100 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm630.dtsi b/arch/arm64/boot/dts/qcom/sdm630.dtsi
+index 9ea64cd2fe..d666a3ae94 100644
+--- a/arch/arm64/boot/dts/qcom/sdm630.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm630.dtsi
+@@ -63,11 +63,7 @@ cpu0: cpu@100 {
+ 			compatible = "arm,cortex-a53";
+ 			reg = <0x0 0x100>;
+ 			enable-method = "psci";
+-			cpu-idle-states = <&perf_cpu_sleep_0
+-						&perf_cpu_sleep_1
+-						&perf_cluster_sleep_0
+-						&perf_cluster_sleep_1
+-						&perf_cluster_sleep_2>;
++			cpu-idle-states = <&perf_cpu_sleep_0 &perf_cpu_sleep_1>;
+ 			capacity-dmips-mhz = <1126>;
+ 			#cooling-cells = <2>;
+ 			next-level-cache = <&l2_1>;
+@@ -83,11 +79,7 @@ cpu1: cpu@101 {
+ 			compatible = "arm,cortex-a53";
+ 			reg = <0x0 0x101>;
+ 			enable-method = "psci";
+-			cpu-idle-states = <&perf_cpu_sleep_0
+-						&perf_cpu_sleep_1
+-						&perf_cluster_sleep_0
+-						&perf_cluster_sleep_1
+-						&perf_cluster_sleep_2>;
++			cpu-idle-states = <&perf_cpu_sleep_0 &perf_cpu_sleep_1>;
+ 			capacity-dmips-mhz = <1126>;
+ 			#cooling-cells = <2>;
+ 			next-level-cache = <&l2_1>;
+@@ -98,11 +90,7 @@ cpu2: cpu@102 {
+ 			compatible = "arm,cortex-a53";
+ 			reg = <0x0 0x102>;
+ 			enable-method = "psci";
+-			cpu-idle-states = <&perf_cpu_sleep_0
+-						&perf_cpu_sleep_1
+-						&perf_cluster_sleep_0
+-						&perf_cluster_sleep_1
+-						&perf_cluster_sleep_2>;
++			cpu-idle-states = <&perf_cpu_sleep_0 &perf_cpu_sleep_1>;
+ 			capacity-dmips-mhz = <1126>;
+ 			#cooling-cells = <2>;
+ 			next-level-cache = <&l2_1>;
+@@ -113,11 +101,7 @@ cpu3: cpu@103 {
+ 			compatible = "arm,cortex-a53";
+ 			reg = <0x0 0x103>;
+ 			enable-method = "psci";
+-			cpu-idle-states = <&perf_cpu_sleep_0
+-						&perf_cpu_sleep_1
+-						&perf_cluster_sleep_0
+-						&perf_cluster_sleep_1
+-						&perf_cluster_sleep_2>;
++			cpu-idle-states = <&perf_cpu_sleep_0 &perf_cpu_sleep_1>;
+ 			capacity-dmips-mhz = <1126>;
+ 			#cooling-cells = <2>;
+ 			next-level-cache = <&l2_1>;
+@@ -128,11 +112,7 @@ cpu4: cpu@0 {
+ 			compatible = "arm,cortex-a53";
+ 			reg = <0x0 0x0>;
+ 			enable-method = "psci";
+-			cpu-idle-states = <&pwr_cpu_sleep_0
+-						&pwr_cpu_sleep_1
+-						&pwr_cluster_sleep_0
+-						&pwr_cluster_sleep_1
+-						&pwr_cluster_sleep_2>;
++			cpu-idle-states = <&pwr_cpu_sleep_0 &pwr_cpu_sleep_1>;
+ 			capacity-dmips-mhz = <1024>;
+ 			#cooling-cells = <2>;
+ 			next-level-cache = <&l2_0>;
+@@ -148,11 +128,7 @@ cpu5: cpu@1 {
+ 			compatible = "arm,cortex-a53";
+ 			reg = <0x0 0x1>;
+ 			enable-method = "psci";
+-			cpu-idle-states = <&pwr_cpu_sleep_0
+-						&pwr_cpu_sleep_1
+-						&pwr_cluster_sleep_0
+-						&pwr_cluster_sleep_1
+-						&pwr_cluster_sleep_2>;
++			cpu-idle-states = <&pwr_cpu_sleep_0 &pwr_cpu_sleep_1>;
+ 			capacity-dmips-mhz = <1024>;
+ 			#cooling-cells = <2>;
+ 			next-level-cache = <&l2_0>;
+@@ -163,11 +139,7 @@ cpu6: cpu@2 {
+ 			compatible = "arm,cortex-a53";
+ 			reg = <0x0 0x2>;
+ 			enable-method = "psci";
+-			cpu-idle-states = <&pwr_cpu_sleep_0
+-						&pwr_cpu_sleep_1
+-						&pwr_cluster_sleep_0
+-						&pwr_cluster_sleep_1
+-						&pwr_cluster_sleep_2>;
++			cpu-idle-states = <&pwr_cpu_sleep_0 &pwr_cpu_sleep_1>;
+ 			capacity-dmips-mhz = <1024>;
+ 			#cooling-cells = <2>;
+ 			next-level-cache = <&l2_0>;
+@@ -178,11 +150,7 @@ cpu7: cpu@3 {
+ 			compatible = "arm,cortex-a53";
+ 			reg = <0x0 0x3>;
+ 			enable-method = "psci";
+-			cpu-idle-states = <&pwr_cpu_sleep_0
+-						&pwr_cpu_sleep_1
+-						&pwr_cluster_sleep_0
+-						&pwr_cluster_sleep_1
+-						&pwr_cluster_sleep_2>;
++			cpu-idle-states = <&pwr_cpu_sleep_0 &pwr_cpu_sleep_1>;
+ 			capacity-dmips-mhz = <1024>;
+ 			#cooling-cells = <2>;
+ 			next-level-cache = <&l2_0>;
+@@ -266,66 +234,6 @@ perf_cpu_sleep_1: cpu-sleep-1-1 {
+ 				min-residency-us = <1000>;
+ 				local-timer-stop;
+ 			};
+-
+-			pwr_cluster_sleep_0: cluster-sleep-0-0 {
+-				compatible = "arm,idle-state";
+-				idle-state-name = "pwr-cluster-dynamic-retention";
+-				arm,psci-suspend-param = <0x400000f2>;
+-				entry-latency-us = <284>;
+-				exit-latency-us = <384>;
+-				min-residency-us = <9987>;
+-				local-timer-stop;
+-			};
+-
+-			pwr_cluster_sleep_1: cluster-sleep-0-1 {
+-				compatible = "arm,idle-state";
+-				idle-state-name = "pwr-cluster-retention";
+-				arm,psci-suspend-param = <0x400000f3>;
+-				entry-latency-us = <338>;
+-				exit-latency-us = <423>;
+-				min-residency-us = <9987>;
+-				local-timer-stop;
+-			};
+-
+-			pwr_cluster_sleep_2: cluster-sleep-0-2 {
+-				compatible = "arm,idle-state";
+-				idle-state-name = "pwr-cluster-retention";
+-				arm,psci-suspend-param = <0x400000f4>;
+-				entry-latency-us = <515>;
+-				exit-latency-us = <1821>;
+-				min-residency-us = <9987>;
+-				local-timer-stop;
+-			};
+-
+-			perf_cluster_sleep_0: cluster-sleep-1-0 {
+-				compatible = "arm,idle-state";
+-				idle-state-name = "perf-cluster-dynamic-retention";
+-				arm,psci-suspend-param = <0x400000f2>;
+-				entry-latency-us = <272>;
+-				exit-latency-us = <329>;
+-				min-residency-us = <9987>;
+-				local-timer-stop;
+-			};
+-
+-			perf_cluster_sleep_1: cluster-sleep-1-1 {
+-				compatible = "arm,idle-state";
+-				idle-state-name = "perf-cluster-retention";
+-				arm,psci-suspend-param = <0x400000f3>;
+-				entry-latency-us = <332>;
+-				exit-latency-us = <368>;
+-				min-residency-us = <9987>;
+-				local-timer-stop;
+-			};
+-
+-			perf_cluster_sleep_2: cluster-sleep-1-2 {
+-				compatible = "arm,idle-state";
+-				idle-state-name = "perf-cluster-retention";
+-				arm,psci-suspend-param = <0x400000f4>;
+-				entry-latency-us = <545>;
+-				exit-latency-us = <1609>;
+-				min-residency-us = <9987>;
+-				local-timer-stop;
+-			};
+ 		};
+ 	};
+ 

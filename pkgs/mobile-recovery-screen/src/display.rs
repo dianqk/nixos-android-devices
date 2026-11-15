@@ -304,6 +304,15 @@ impl Console {
         ioctl_value(&console.fb, FBIOBLANK, 0)?;
         Ok(console)
     }
+    pub fn blanked(&self) -> io::Result<bool> {
+        // TIOCL_BLANKEDSCREEN returns the blanked VT number in ioctl's result.
+        ioctl_ptr(&self.tty, libc::TIOCLINUX, &mut 15u8).map(|vt| vt != 0)
+    }
+    pub fn unblank(&mut self) -> io::Result<()> {
+        ioctl_ptr(&self.tty, libc::TIOCLINUX, &mut 4u8)?;
+        self.previous.fill(0);
+        Ok(())
+    }
     pub fn show(&mut self, canvas: &Canvas) -> io::Result<()> {
         canvas.write_changes(&mut self.previous, &mut self.tty)
     }

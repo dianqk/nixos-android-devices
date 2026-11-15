@@ -58,7 +58,11 @@ let
           # A running IWD can raise a hotplugged interface before udev applies
           # its .link MAC address (EBUSY). Prevent D-Bus reactivation until the
           # reloaded interface has completed udev initialization.
-          if systemctl is-active --quiet iwd.service; then
+          # Also stop an IWD that the previous resume is still starting
+          # (--no-block below): removing the driver while it initializes
+          # blocks forever in wiphy_unregister on back-to-back suspends.
+          iwd_state=$(systemctl is-active iwd.service || true)
+          if [ "$iwd_state" != inactive ] && [ "$iwd_state" != failed ]; then
             mkdir -p "$state_dir"
             touch "$state_dir/iwd-stopped"
             trap 'restore_iwd' ERR
@@ -104,8 +108,76 @@ in
 {
   options.hardware.sheng.suspendWorkarounds.enable =
     lib.mkEnableOption "Sheng wake-source filtering and ath12k cold cycling across suspend";
-  config =
-    lib.mkIf (!config.androidDevices.recovery.enable && config.hardware.sheng.suspendWorkarounds.enable)
+  options.hardware.sheng.suspend.memSleep = lib.mkOption {
+    type = lib.types.nullOr (
+      lib.types.enum [
+        "s2idle"
+        "deep"
+      ]
+    );
+    default = "deep";
+    description = ''
+      The only system suspend mode systemd uses (`MemorySleepMode`, with
+      `SuspendState=mem`). `deep` is verified on hardware; `s2idle` is not:
+      systemd's default fallback entered it once after a failed `deep`
+      attempt and the device reset. `null` keeps systemd's defaults,
+      including that fallback.
+    '';
+  };
+  config = lib.mkMerge [
+    # Named wakeup sources for the shared policy; data only until the consumer
+    # enables androidDevices.power.wakeup. Wake IRQs attributed with
+    # pm_debug_messages ("Triggering wakeup from IRQ") from deep suspend.
+    {
+      androidDevices.power.wakeup.sources =
+        let
+          spmi = "/devices/platform/soc@0/c400000.spmi/spmi-0/0-00";
+          glink = "/devices/platform/pmic-glink";
+        in
+        {
+          powerKey = {
+            description = "PMK8550 power key; wakes the device from deep suspend.";
+            devices = [ "${spmi}/c400000.spmi:pmic@0:pon@1300/c400000.spmi:pmic@0:pon@1300:pwrkey" ];
+          };
+          rtc = {
+            description = "PMK8550 RTC alarm (rtcwake, alarm timers); wakes the device from deep suspend.";
+            devices = [ "${spmi}/c400000.spmi:pmic@0:rtc@6100*" ];
+          };
+          cover = {
+            description = ''
+              gpio-keys: Hall lid switch (opening the cover wakes the device),
+              tablet-mode switch (closing the keyboard cover wakes it) and
+              volume up (wake untested).
+            '';
+            devices = [ "/devices/platform/gpio-keys" ];
+          };
+          usbPower = {
+            description = ''
+              USB power and Type-C (battery manager USB supply and UCSI source
+              supplies). Wakeup from plugging or unplugging is not yet
+              attributed.
+            '';
+            devices = [
+              "${glink}/pmic_glink.power-supply.0/power_supply/qcom-battmgr-usb"
+              "${glink}/pmic_glink.ucsi.0/power_supply/ucsi-source-psy-*"
+            ];
+          };
+          wirelessCharging = {
+            description = "Battery manager wireless supply; wake untested.";
+            devices = [ "${glink}/pmic_glink.power-supply.0/power_supply/qcom-battmgr-wls" ];
+          };
+        };
+    }
+    (lib.mkIf (!config.androidDevices.recovery.enable && config.hardware.sheng.suspend.memSleep != null)
+      {
+        systemd.sleep.settings.Sleep = {
+          SuspendState = "mem";
+          MemorySleepMode = config.hardware.sheng.suspend.memSleep;
+        };
+      }
+    )
+    (lib.mkIf
+      (!config.androidDevices.recovery.enable && config.hardware.sheng.suspendWorkarounds.enable)
       {
         systemd.services.sheng-wake-policy = {
           description = "Disable unused Sheng wake sources";
@@ -139,5 +211,7 @@ in
           };
         };
 
-      };
+      }
+    )
+  ];
 }

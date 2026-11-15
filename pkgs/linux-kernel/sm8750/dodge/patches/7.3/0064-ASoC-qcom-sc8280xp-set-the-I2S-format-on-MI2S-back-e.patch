@@ -1,0 +1,50 @@
+From 1b207c033113b9cef4819b29627aab8cd38b0d60 Mon Sep 17 00:00:00 2001
+From: Martin Lund <mrlund@hotmail.com>
+Date: Tue, 20 Oct 2026 11:56:34 +0200
+Subject: [PATCH 069/144] ASoC: qcom: sc8280xp: set the I2S format on MI2S back
+ ends
+
+MI2S codecs such as speaker amplifiers are clock consumers; set the
+runtime format to I2S with the codec as consumer so the q6 I2S DAI
+drives BCLK and WS.
+
+Assisted-by: Grok Bot
+Signed-off-by: Martin Lund <mrlund@hotmail.com>
+(cherry picked from commit 99639a276d0f3c01d31520244c4289021ca79cdf)
+Link: https://github.com/mrlund/linux-omarchy-mobile/commit/99639a276d0f3c01d31520244c4289021ca79cdf
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0090-ASoC-qcom-sc8280xp-set-the-I2S-format-on-MI2S-back-e.patch
+Import-SHA256: 74787c6c3f63f6b8dffe9d262d8e661e6f26244d854a013662d3ab1c148fec7a
+Import-Provenance: mail headers
+(cherry picked from commit 561c6cd0beb8b3a71c2ad174237936010716a287)
+---
+ sound/soc/qcom/sc8280xp.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/sound/soc/qcom/sc8280xp.c b/sound/soc/qcom/sc8280xp.c
+index 4d48e1012c..ceb67e09df 100644
+--- a/sound/soc/qcom/sc8280xp.c
++++ b/sound/soc/qcom/sc8280xp.c
+@@ -193,6 +193,12 @@ static int sc8280xp_snd_init(struct snd_soc_pcm_runtime *rtd)
+ 		snd_soc_limit_volume(card, "SpkrLeft PA Volume", 17);
+ 		snd_soc_limit_volume(card, "SpkrRight PA Volume", 17);
+ 		break;
++	case PRIMARY_MI2S_RX ... QUATERNARY_MI2S_TX:
++	case QUINARY_MI2S_RX ... QUINARY_MI2S_TX:
++		/* Format comes from .codec_dai_fmt on the board's priv_data.
++		 * No headset behind an MI2S amplifier link.
++		 */
++		return 0;
+ 	case DISPLAY_PORT_RX_0:
+ 		/* DISPLAY_PORT dai ids are not contiguous */
+ 		dp_pcm_id = 0;
+@@ -556,6 +562,9 @@ static const struct qcom_snd_soc_common sm8750_priv_data = {
+ 	.dapm_widgets = sc8280xp_dapm_widgets,
+ 	.num_dapm_widgets = ARRAY_SIZE(sc8280xp_dapm_widgets),
+ 	.wcd_jack = true,
++	.codec_dai_fmt = SND_SOC_DAIFMT_BC_FC |
++			 SND_SOC_DAIFMT_NB_NF |
++			 SND_SOC_DAIFMT_I2S,
+ };
+ 
+ static const struct of_device_id snd_sc8280xp_dt_match[] = {

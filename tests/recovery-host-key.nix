@@ -51,10 +51,11 @@ let
       disabled.boot.initrd.systemd.services.mobile-recovery-sshd.preStart;
     {
       polaris = check "polaris" "xiaomi,polaris" "1d84000.ufshc" "userdata";
-      clover = check "clover" "xiaomi,clover" "c0c4000.sdhci" "userdata";
+      clover = check "clover" "xiaomi,clover-lte" "c0c4000.mmc" "userdata";
       asphalt = check "asphalt" "lenovo,asphalt" "1d84000.ufshc" "linux";
       sheng = check "sheng" "xiaomi,sheng" "1d84000.ufshc" "linux";
       aurora = check "aurora" "xiaomi,aurora" "1d84000.ufshc" "linux";
+      marble = check "marble" "xiaomi,marble" "1d84000.ufshc" "linux";
       ramFallback = true;
     };
 in

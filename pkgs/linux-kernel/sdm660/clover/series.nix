@@ -27,4 +27,35 @@
   ./patches/7.3/0026-sdm630-audio-protection-domain.patch
   ./patches/7.3/0027-ath10k-persistent-split-amsdu.patch
   ./patches/7.3/0028-ath10k-split-amsdu-rfc-v3.patch
+  ./patches/7.3/0030-ath10k-disassoc-txbf.patch
+  ./patches/7.3/0031-sdm630-drop-cluster-idle-states.patch
+  ./patches/7.3/0032-sdm630-cpu-retention-psci-param.patch
+  ./patches/7.3/0033-sdm6xx-cpufreq-dt-blocklist.patch
+  ./patches/7.3/0034-cpr3-opp-level-vadj-binding.patch
+  ./patches/7.3/0035-cpr3-opp-level-shared-binding.patch
+  ./patches/7.3/0036-cpr3-binding.patch
+  ./patches/7.3/0037-cpr-common-split.patch
+  ./patches/7.3/0038-cpr-common-flat-fuse-adjust.patch
+  ./patches/7.3/0039-cpr-u64-frequency.patch
+  ./patches/7.3/0040-cpr-common-threads.patch
+  ./patches/7.3/0041-cpr3-driver.patch
+  ./patches/7.3/0042-cpr3-sdm630-gold-ro-factor.patch
+  ./patches/7.3/0043-cpr3-probe-error-loop.patch
+  ./patches/7.3/0044-cpr3-attach-cleanup.patch
+  ./patches/7.3/0045-cpr3-sdm660-open-loop.patch
+  ./patches/7.3/0046-opp-debugfs-double-init.patch
+  ./patches/7.3/0047-opp-debugfs-link-reference.patch
+  ./patches/7.3/0048-qcom-cpufreq-hw-kerneldoc.patch
+  ./patches/7.3/0049-qcom-cpufreq-hw-osm-programming.patch
+  ./patches/7.3/0050-qcom-cpufreq-hw-domain-count.patch
+  ./patches/7.3/0051-qcom-cpufreq-hw-no-osm-reprogram.patch
+  ./patches/7.3/0052-qcom-cpufreq-hw-sdm660-osm.patch
+  ./patches/7.3/0053-spm-sdm660-silver-avs-ctl.patch
+  ./patches/7.3/0054-spm-keep-saw-control.patch
+  ./patches/7.3/0055-sdm660-cpu-dvfs-nodes.patch
+  ./patches/7.3/0056-clover-cpu-frequency-scaling.patch
+  ./patches/7.3/0057-clover-full-cpu-frequency-table.patch
+  ./patches/7.3/0058-cpr3-sdm660-vendor-quotients.patch
+  ./patches/7.3/0059-cpr3-cprh-debugfs.patch
+  ./patches/7.3/0060-cpr3-sdm660-closed-loop.patch
 ]

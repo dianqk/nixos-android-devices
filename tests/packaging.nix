@@ -31,19 +31,58 @@ let
   nativeProbe = target.runCommand "uncached-native-arm-probe" { } ''
     uname -m > "$out"
   '';
+  wrapperSystem = env.nixosSystem {
+    modules = [
+      ({ pkgs, ... }: {
+        system.stateVersion = "26.11";
+        system.build.binaryWrapperProbe =
+          pkgs.runCommand "target-binary-wrapper-probe"
+            {
+              nativeBuildInputs = [ pkgs.makeBinaryWrapper ];
+              passthru.wrapperHook = pkgs.makeBinaryWrapper;
+            }
+            ''
+              mkdir -p $out/bin
+              makeWrapper ${target.hello}/bin/hello $out/bin/wrapped-hello --inherit-argv0
+            '';
+      })
+    ];
+  };
+  wrapper = wrapperSystem.config.system.build.binaryWrapperProbe;
+  expectedWrapperHook =
+    if buildSystem == "aarch64-linux" then
+      target.makeBinaryWrapper
+    else
+      host.makeBinaryWrapper.override { cc = env.compilationPkgs.stdenv.cc; };
 in
+assert target.androidDevicePackages.usb-signaller.stdenv.buildPlatform.system == buildSystem;
+assert target.androidDevicePackages.usb-signaller.stdenv.hostPlatform.system == "aarch64-linux";
+assert builtins.elem (target.lib.getDev target.systemd).outPath (
+  map (p: p.outPath) target.androidDevicePackages.usb-signaller.buildInputs
+);
 assert script.system == buildSystem;
 assert binary.system == buildSystem;
+assert wrapper.system == buildSystem;
+assert wrapper.wrapperHook.drvPath == expectedWrapperHook.drvPath;
 assert nativeProbe.system == "aarch64-linux";
 assert mobileDevice.system == buildSystem;
-host.runCommand "android-packaging-platforms" { nativeBuildInputs = [ host.patchelf ]; } ''
-  test "$(head -n1 ${mobileDevice}/bin/mobile-device)" = '#! ${host.runtimeShell} -e'
-  ${mobileDevice}/bin/mobile-device --help >/dev/null
-  test "$(head -n1 ${script}/bin/target-packaging-probe)" = '#!${target.runtimeShell}'
-  grep -F '${target.coreutils}/bin' ${script}/bin/target-packaging-probe
-  test "$(patchelf --print-interpreter ${binary}/bin/hello)" = '${target.stdenv.cc.bintools.dynamicLinker}'
-  ${target.lib.optionalString includeNativeProbe ''
-    test "$(cat ${nativeProbe})" = aarch64
-  ''}
-  touch "$out"
-''
+host.runCommand "android-packaging-platforms"
+  {
+    nativeBuildInputs = [
+      host.patchelf
+      env.compilationPkgs.pkgsBuildBuild.binutils
+    ];
+  }
+  ''
+    test "$(head -n1 ${mobileDevice}/bin/mobile-device)" = '#! ${host.runtimeShell} -e'
+    ${mobileDevice}/bin/mobile-device --help >/dev/null
+    test "$(head -n1 ${script}/bin/target-packaging-probe)" = '#!${target.runtimeShell}'
+    grep -F '${target.coreutils}/bin' ${script}/bin/target-packaging-probe
+    test "$(patchelf --print-interpreter ${binary}/bin/hello)" = '${target.stdenv.cc.bintools.dynamicLinker}'
+    readelf -h ${wrapper}/bin/wrapped-hello | grep -E 'Machine:.*AArch64'
+    test "$(patchelf --print-interpreter ${wrapper}/bin/wrapped-hello)" = '${env.compilationPkgs.stdenv.cc.bintools.dynamicLinker}'
+    ${target.lib.optionalString includeNativeProbe ''
+      test "$(cat ${nativeProbe})" = aarch64
+    ''}
+    touch "$out"
+  ''

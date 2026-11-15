@@ -1,0 +1,64 @@
+From 8a4fb141ef09f9d19cac9aa04f0c9d66b5fceb31 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 20 Oct 2026 14:22:52 +0800
+Subject: [PATCH] mtk-soc: enable the modem's own IMS (AT+EIMSCFG) for SMS on
+ 5G SA
+
+The stock RIL configures the modem's IMS stack on every boot with
+AT+EIMSCFG=1,0,0,0,1,1 (volte, vilte, vowifi, viwifi, sms, eims), sent as
+MIPC IMS_SET_CONFIG_REQ; observed on a build without any AP IMS service,
+where SMS on 5G SA goes out through the modem.  Without it the modem never
+registers to IMS and AT+CMGS on 5G SA fails with +CMS ERROR: 331; with it
+the modem registers (+CIREG: 2,1,5) and AT+CMGS succeeds on 5G SA.  Send
+it before the radio is powered up, as the stock RIL does.
+---
+ .../mtk-soc/mm-broadband-modem-mtk-soc.c      | 26 +++++++++++++++++--
+ 1 file changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/src/plugins/mtk-soc/mm-broadband-modem-mtk-soc.c b/src/plugins/mtk-soc/mm-broadband-modem-mtk-soc.c
+index 869d53e..4c6d40d 100644
+--- a/src/plugins/mtk-soc/mm-broadband-modem-mtk-soc.c
++++ b/src/plugins/mtk-soc/mm-broadband-modem-mtk-soc.c
+@@ -1661,6 +1661,28 @@ cfun_query_ready (MMBaseModem *self,
+                               (GAsyncReadyCallback) cfun_set_ready, ctx);
+ }
+ 
++/* IMS inside the modem.  The stock RIL configures the modem's own IMS stack
++ * on every boot with AT+EIMSCFG=<volte>,<vilte>,<vowifi>,<viwifi>,<sms>,<eims>
++ * = 1,0,0,0,1,1 (sent as MIPC IMS_SET_CONFIG_REQ; traced 2026-10-20 on a
++ * build without any AP IMS service).  Without it the modem never registers
++ * to IMS (+CIREG: 2,0) and, on 5G SA, AT+CMGS fails with +CMS ERROR: 331;
++ * with it the modem registers (+CIREG: 2,1,5) and sends SMS over IMS by
++ * itself.  The values are the stock ones; calls stay unsupported here. */
++static void
++eimscfg_ready (MMBaseModem *self,
++               GAsyncResult *res,
++               MtkSocInitializationStartedContext *ctx)
++{
++    g_autoptr(GError) error = NULL;
++
++    if (!mm_base_modem_at_command_finish (self, res, &error))
++        mm_obj_warn (self, "couldn't enable the modem IMS configuration: %s", error->message);
++    else
++        mm_obj_dbg (self, "(mtk-soc) modem IMS configuration set (AT+EIMSCFG=1,0,0,0,1,1)");
++    mm_base_modem_at_command (self, "+CFUN?", 3, FALSE,
++                              (GAsyncReadyCallback) cfun_query_ready, ctx);
++}
++
+ static void
+ initialization_started (MMBroadbandModem *self,
+                         GAsyncReadyCallback callback,
+@@ -1673,8 +1695,8 @@ initialization_started (MMBroadbandModem *self,
+     ctx = g_new0 (MtkSocInitializationStartedContext, 1);
+     ctx->callback = callback;
+     ctx->user_data = user_data;
+-    mm_base_modem_at_command (MM_BASE_MODEM (self), "+CFUN?", 3, FALSE,
+-                              (GAsyncReadyCallback) cfun_query_ready, ctx);
++    mm_base_modem_at_command (MM_BASE_MODEM (self), "+EIMSCFG=1,0,0,0,1,1", 5, FALSE,
++                              (GAsyncReadyCallback) eimscfg_ready, ctx);
+ }
+ 
+ static gpointer
+-- 
+2.55.0
+

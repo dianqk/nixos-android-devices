@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Thu, 15 Oct 2026 10:38:41 +0800
+Subject: [PATCH 30/31] board: mediatek-mobile: restart the watchdog right
+ before the OS jump
+
+The DRAM-wide cache flush before an OS boot takes about 8 s of the 15 s
+watchdog timeout. Restart the watchdog in the last C hook before the jump
+so the OS has the full timeout to reach its watchdog driver.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ board/mediatek/mediatek-mobile/mediatek-mobile.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/board/mediatek/mediatek-mobile/mediatek-mobile.c b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+index 498c8d73467..1b637e882c1 100644
+--- a/board/mediatek/mediatek-mobile/mediatek-mobile.c
++++ b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+@@ -594,6 +594,18 @@ void board_cleanup_before_linux(void)
+ 	gd->ram_size = end - start;
+ }
+ 
++/*
++ * Last C hook before the jump to the OS (after the cache flush above, which
++ * takes seconds): restart the running RGU watchdog so the OS gets its full
++ * timeout to reach its own watchdog driver.
++ */
++void update_os_arch_secondary_cores(uint8_t os_arch)
++{
++	if (CONFIG_MEDIATEK_MOBILE_ENTRY_WDT_RESTART)
++		writel(CONFIG_MEDIATEK_MOBILE_ENTRY_WDT_RESTART_KEY,
++		       (void *)CONFIG_MEDIATEK_MOBILE_ENTRY_WDT_RESTART);
++}
++
+ int dram_init(void)
+ {
+ 	if (mtk_select_window()) {
+-- 
+2.55.0
+

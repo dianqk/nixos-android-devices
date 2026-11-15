@@ -47,6 +47,17 @@ let
           && [ "$(read_node "$root" fastchg_mode 2>/dev/null || true)" = "1" ]
       }
 
+      # A USB host (PC) data port enumerates the gadget and reports a plain
+      # USB type; a charger never configures the gadget. Authentication cannot
+      # apply there.
+      usb_host_port() {
+        case "$(read_node "$root" real_type 2>/dev/null || true)" in
+          SDP | CDP) ;;
+          *) return 1 ;;
+        esac
+        grep -qx configured /sys/class/udc/*/state 2>/dev/null
+      }
+
       root="$(find_xiaomi_dir || true)"
       if [ -z "$root" ]; then
         echo "MiPPS auth skipped: request_vdm_cmd sysfs node not found"
@@ -55,11 +66,24 @@ let
 
       max_attempts=10
       sleep_seconds=1
+      # Start no attempt after this many seconds, so that the last attempt
+      # still finishes within TimeoutStartSec.
+      budget_seconds=30
+      start=$SECONDS
 
       for attempt in $(seq 1 "$max_attempts"); do
+        if usb_host_port; then
+          echo "MiPPS auth skipped: connected to a USB host data port"
+          exit 0
+        fi
+        if [ $((SECONDS - start)) -ge "$budget_seconds" ]; then
+          echo "MiPPS auth stopped: no attempt starts after ''${budget_seconds}s"
+          break
+        fi
+
         if is_complete "$root"; then
           echo "MiPPS auth already active before attempt $attempt"
-          xiaomi-mipps-auth --sysfs "$root" --timeout 3 || true
+          xiaomi-mipps-auth --sysfs "$root" --timeout 3 --no-data-role-swap || true
           exit 0
         fi
 
@@ -68,10 +92,12 @@ let
         pdo2="$(read_node "$root" pdo2 2>/dev/null || true)"
         echo "MiPPS auth attempt $attempt/$max_attempts: real_type=''${real_type:-unknown} adapter_svid=''${adapter_svid:-unknown} pdo2=''${pdo2:-unknown}"
 
-        # xiaomi-mipps-auth performs Type-C attach/role nudging before checking
-        # the Xiaomi SVID. Do not wait for adapter_svid here, because on sheng
-        # that can leave the charger stuck as SDP/generic PD forever.
-        xiaomi-mipps-auth --sysfs "$root" --timeout 3 || true
+        # Do not wait for adapter_svid here, because on sheng that can leave
+        # the charger stuck as SDP/generic PD forever. Keep the device data
+        # role: authentication completes without upstream's host-role request,
+        # which would take the port from usb-signaller on a host that accepts
+        # the swap.
+        xiaomi-mipps-auth --sysfs "$root" --timeout 3 --no-data-role-swap || true
 
         if is_complete "$root"; then
           echo "MiPPS auth active after attempt $attempt"
@@ -84,7 +110,7 @@ let
         sleep "$sleep_seconds"
       done
 
-      echo "MiPPS auth did not become active after $max_attempts attempts"
+      echo "MiPPS auth did not become active"
       echo "Final status:"
       for name in real_type adapter_svid pdo2 apdo_max power_max fastchg_mode pd_verifed request_vdm_cmd; do
         [ -e "$root/$name" ] || continue
@@ -113,7 +139,7 @@ in
       serviceConfig = {
         Type = "oneshot";
         ExecStart = "${pkgs.util-linux}/bin/flock -n -E 0 /run/xiaomi-mipps-auth.lock ${retryPackage}/bin/xiaomi-mipps-auth-retry";
-        TimeoutStartSec = 45;
+        TimeoutStartSec = 60;
       };
     };
 

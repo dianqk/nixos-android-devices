@@ -13,7 +13,10 @@
 | Bluetooth | BR/EDR and LE pairing, encrypted L2CAP data and GATT reads work; audio profiles, HID/PAN and Wi-Fi coexistence are not verified |
 | Cellular modem | Experimental; see [Cellular modem](#cellular-modem-experimental) |
 
-All results assume the required OEM base, OS1.0.3.0.UNACNXM (Android 14).
+The results were first measured on the former Android 14 base
+(OS1.0.3.0.UNACNXM). On the required OS3.0.308.0.WNACNXM (Android 16) base,
+ADSP battery/USB telemetry, Type-C, Wi-Fi, Bluetooth and cellular data were
+rechecked; other details have not been repeated.
 
 ## ADSP and Type-C
 
@@ -27,8 +30,22 @@ The connector graph uses OTG with a peripheral default. Fixed peripheral
 mode does not register a DWC3 role switch, so UCSI would exhaust its deferred
 probe retries. Device/sink role, ACM/NCM and battery reads work together;
 USB host mode is not supported yet. Battery reporting translates Aurora's OEM
-property IDs and current sign. The firmware's constant `power_now` value is
-unavailable rather than presented as measured power. A reported `Charging`
+property IDs and current sign. `usb_type` comes from the firmware's adapter
+type as in the OEM driver (Qualcomm HVDCP types read as DCP, a floating
+charger as Unknown), and `charge_counter` is scaled from mAh to µAh. The
+firmware's constant `power_now` value and its internal-resistance value (the
+battery ID resistor) are not exported. `charge_control_end_threshold` below 100
+enables the firmware's charge control first (as the OEM driver requires) and
+100 disables it; `constant_charge_current` is the firmware's charge current
+cap in µA, used by the optional
+[thermal charge current cap](../configuration.md#thermal-charge-current-cap).
+Both write charger settings and are not yet verified on hardware.
+The USB gadget requests 900 mA (the kernel caps it at 500 mA below
+SuperSpeed), and DWC3 reports that current to `qcom-battmgr-usb` as its
+input current limit, as the stock eUSB2 PHY does; otherwise a PC port stays
+at the firmware's unconfigured 100 mA limit. The ADSP charger log, including
+its current-limit votes, is available with
+`echo 'file qcom_battmgr.c +p' > /sys/kernel/debug/dynamic_debug/control`. A reported `Charging`
 status can coexist with net battery discharge under a limited USB input; check
 `current_now`, `charge_counter`, temperature and the negotiated input limit.
 Do not raise the input limit beyond the connected source's capability.
@@ -208,7 +225,7 @@ this public package; its firmware override supports a validated private NVM.
 ## Cellular modem (experimental)
 
 The board DT enables the MPSS remoteproc, IPA v5.5 and the static rmtfs shared
-memory. The stock Android 14 modem carve-outs match `sm8650.dtsi`. On hardware,
+memory. The stock modem carve-outs (Android 14 and 16) match `sm8650.dtsi`. On hardware,
 MPSS boots, the QRTR service set matches Android, ModemManager detects the SIM
 and registers on LTE/5G NR, IPv4 and IPv6 mobile data work, and SMS can be sent
 and received. This needs the license services below, including
@@ -217,7 +234,7 @@ periodic (~15 min) Smart Transmit license check. Voice calls are out of scope.
 The kernel carries [QRTR HELLO and announcement fixes](../../pkgs/linux-kernel/patches/qrtr-hello)
 so that the modem finds rmtfs and TFTP during startup.
 
-Enable it on the installed system (not RAM recovery) with the Android 14 base.
+Enable it on the installed system (not RAM recovery) with the required base.
 The shared options are described in [modem and QTEE services](../modem.md).
 `hardware.aurora.modem` supplies Aurora's remoteproc, NV partitions, firmware
 and license services to the shared `androidDevices.modem` module, which holds
@@ -240,7 +257,7 @@ choice.
 | Firmware | The firmware package's separate `modem` output: modem, modem DTB and IPA split MDTs plus the modem's read-only TFTP tree. It is installed only in the root file system, never in recovery. |
 | `modem-tqftpserv.service` | Serves `/readonly/firmware/image/` from the directory containing `modem.mdt`; writable requests go to `/var/lib/tqftpserv`. |
 | `modem-rmtfs.service` | `rmtfs -P -v [-r]`: serves `modemst1`, `modemst2`, `fsg` and `fsc` by partition label. It does not start or stop MPSS. |
-| `modem-mpss.service` | Waits up to `timeSyncTimeout` (120 s) for the system clock to be synchronised, then starts MPSS through remoteproc sysfs after the services above, and pulls in SIM provisioning and ModemManager. Stopping it, also at shutdown, writes `stop` only while MPSS is `running`; a crashed MPSS is left alone. |
+| `modem-mpss.service` | Waits up to `timeSyncTimeout` (120 s) for the system clock to be synchronised or restored from the RTC offset, then starts MPSS through remoteproc sysfs after the services above, and pulls in SIM provisioning and ModemManager. Stopping it, also at shutdown, writes `stop` only while MPSS is `running`; a crashed MPSS is left alone. |
 | `modem-sim-provision.service` | (`simProvisioning`, default on) If the modem has not activated the primary GW provisioning session 10 s after a USIM is detected, activates it for the first USIM with `qmicli`; then ModemManager starts. |
 | Smart Transmit license (`license.enable`, default on) | `qtee-supplicant.service` (minkipc) with write access limited to `/persist/data/pfm`, and `mink-modem-opener.service`, which publishes QRTR service 5013 for the modem's QTEE sessions. See [QTEE](#qtee-and-the-modem-license). |
 | QRTR name service and PD mapper | In-kernel (`net/qrtr/ns.c`, `QCOM_PD_MAPPER`); no userspace daemons. |
@@ -320,11 +337,14 @@ rmtfs, tqftpserv, supplicant or bridge units; reboot to apply their changes.
 Do not restart `qtee-supplicant` or `mink-modem-opener` by hand while MPSS is
 running; restarting the supplicant does not restart the bridge.
 
-Set the clock before MPSS starts. The RTC is not usable, so time comes from
-NTP; MPSS started with an unset clock stalls in initialisation (`DOG detects
-stalled initialization` about 40 s later). Without a network the start proceeds
-after the timeout, so set the clock first (`timedatectl set-time`) on an
-offline phone.
+Set the clock before MPSS starts. Linux cannot set the PMIC RTC, so time comes
+from NTP or, once one boot was synchronised, from the RTC plus the offset saved
+by [`androidDevices.clock.rtcOffset`](../configuration.md#system-clock-from-a-read-only-rtc)
+(enabled by default); `modem-mpss.service` accepts either. MPSS started with an
+unset clock stalls in initialisation (`DOG detects stalled initialization`
+about 40 s later). Without a network and without a saved offset the start
+proceeds after the timeout, so set the clock first (`timedatectl set-time`) on
+an offline phone.
 
 For diagnosis, `modemOpener.trace` logs every call between the modem and QTEE
 that passes through the bridge (method number, argument counts and sizes,

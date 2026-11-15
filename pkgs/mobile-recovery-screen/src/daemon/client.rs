@@ -46,13 +46,18 @@ pub fn upload(id: u64, token: String, mut input: impl Read) -> Result<()> {
     }
     Ok(())
 }
-pub fn wait(id: u64, mut snapshot: Snapshot) -> Result<Task> {
+pub fn wait(id: u64, snapshot: Snapshot) -> Result<Task> {
+    wait_with(id, snapshot, |_| {})
+}
+/// Wait for a task, calling `seen` with every snapshot of it.
+pub fn wait_with(id: u64, mut snapshot: Snapshot, mut seen: impl FnMut(&Task)) -> Result<Task> {
     loop {
         let task = snapshot
             .task
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("missing task"))?;
         ensure!(task.id == id, "task was replaced; requested task {id}");
+        seen(task);
         if !task.active {
             return Ok(task.clone());
         }
@@ -62,10 +67,18 @@ pub fn wait(id: u64, mut snapshot: Snapshot) -> Result<Task> {
         snapshot = request(Command::Task { id })?.snapshot;
     }
 }
+fn args_restart(s: &Snapshot) -> bool {
+    s.task.as_ref().is_some_and(|t| {
+        matches!(
+            t.operation.as_str(),
+            "reboot-system" | "reboot-recovery" | "reboot-bootloader" | "poweroff"
+        )
+    })
+}
 pub fn command(args: Vec<String>) -> Result<()> {
     match args.first().map(String::as_str).unwrap_or("help") {
         "help" => {
-            println!("Rust recovery client. All operations run in mobile-recovery-daemon.\nCommands: capabilities, status [--json], task TASK_ID, watch, cancel TASK_ID, shell\nprepare-install --check|--confirm-erase-userdata (A/B)\nformat-root --check|--confirm\nprepare-boot --check|--confirm (single slot)\nsafe-ufs\ninstall-initial MANIFEST REGISTRATION SYSTEM MIN_BYTES --check|--confirm|--resume-check|--resume-confirm\ndeploy-query MANIFEST SYSTEM\ndeploy-offline MANIFEST SYSTEM MISSING_COUNT --confirm\nmount-target [--ro|--rw], target-status, unmount-target\nrebuild boot [nixos-rebuild build options]\ngenerations, select-generation NUMBER --confirm\nupdate-firmware|update-recovery IMAGE --check|--confirm\ndeploy-check-boot\nclear-boot-request --check|--confirm\nrepair-backup-gpt --check|--confirm\nrepair-filesystems --check|--confirm\nreboot-system|reboot-recovery|reboot-bootloader|poweroff --confirm\nInput transfers are framed; CLI disconnection after complete input does not cancel installation.");
+            println!("Rust recovery client. All operations run in mobile-recovery-daemon.\nCommands: capabilities, status [--json], task TASK_ID, watch, cancel TASK_ID, shell\nprepare-install [--android-userdata SIZE] --check|--confirm-erase-userdata (A/B; Qualcomm A/B requires SIZE such as 64G to erase)\nformat-root --check|--confirm\nprepare-boot --check|--confirm (single slot)\nsafe-ufs\ninstall-initial-system MANIFEST REGISTRATION SYSTEM MIN_BYTES --check|--confirm|--resume-check|--resume-confirm\ndeploy-query MANIFEST SYSTEM\ndeploy-offline MANIFEST SYSTEM MISSING_COUNT --confirm\nmount-target [--ro|--rw], target-status, unmount-target\nrebuild boot [nixos-rebuild build options]\ngenerations, select-generation NUMBER --confirm\nupdate-firmware|update-recovery IMAGE --check|--confirm\ndeploy-check-boot\nclear-boot-request --check|--confirm\nmark-slot-successful --check|--confirm (MediaTek slot A)\nrepair-backup-gpt --check|--confirm\nrepair-filesystems --check|--confirm\nreboot-system|reboot-recovery|reboot-bootloader|poweroff --confirm\nInput transfers are framed; CLI disconnection after complete input does not cancel installation.");
             Ok(())
         }
         "capabilities" => {
@@ -97,7 +110,8 @@ pub fn command(args: Vec<String>) -> Result<()> {
             ensure!(args.len() > 1, "use submit OPERATION ...");
             let args = args[1..].to_vec();
             let input = args[0] == "deploy-offline"
-                || (args[0] == "install-initial" && args.last().is_some_and(|s| s == "--confirm"));
+                || (args[0] == "install-initial-system"
+                    && args.last().is_some_and(|s| s == "--confirm"));
             println!(
                 "{}",
                 serde_json::to_string(&request(Command::Submit { args, input })?)?
@@ -131,7 +145,7 @@ pub fn command(args: Vec<String>) -> Result<()> {
         "shell" => shell(),
         _ => {
             let input = args.first().is_some_and(|a| a == "deploy-offline")
-                || (args.first().is_some_and(|a| a == "install-initial")
+                || (args.first().is_some_and(|a| a == "install-initial-system")
                     && args.last().is_some_and(|a| a == "--confirm"));
             let r = request(Command::Submit { args, input })?;
             let id = r.snapshot.task.as_ref().unwrap().id;
@@ -141,7 +155,24 @@ pub fn command(args: Vec<String>) -> Result<()> {
                     eprintln!("Transfer failed: {e:#}; querying task {id}");
                 }
             }
-            let task = wait(id, r.snapshot)?;
+            // A restart drops this connection; print the acknowledgement
+            // (the systemctl wording host tools expect) once the daemon
+            // has passed every check and is about to restart.
+            let restart = args_restart(&r.snapshot);
+            let mut acknowledged = false;
+            let task = wait_with(id, r.snapshot, |t| {
+                if restart && !acknowledged && t.phase == RESTART_PHASE {
+                    acknowledged = true;
+                    eprintln!(
+                        "{}",
+                        if t.operation == "poweroff" {
+                            "Powering off."
+                        } else {
+                            "Rebooting."
+                        }
+                    );
+                }
+            })?;
             if let Some(e) = task.error {
                 bail!("task {id}: {e}")
             }

@@ -1,0 +1,23 @@
+Preserve externally managed USB data roles while preparing gadget modes.
+Upstream: https://codeberg.org/DylanVanAssche/usb-signaller/src/tag/v0.4.2
+
+--- a/src/dbus.rs
++++ b/src/dbus.rs
+@@ -46,8 +46,16 @@
+             ));
+         }
+ 
++        // TCPM-owned roles must survive startup and subsequent gadget changes.
++        let manage_role = std::env::var("USB_SIGNALLER_MANAGE_ROLE")
++            .map_or(true, |value| value != "0");
++        if !manage_role && mode == "host_mode" {
++            return Err(zbus::fdo::Error::NotSupported(
++                "USB data role is managed externally".into(),
++            ));
++        }
+         /* USB Role Switcher */
+-        for name in &discover_urss() {
++        for name in discover_urss().iter().filter(|_| manage_role) {
+             if URS::load(name).is_ok() {
+                 let role = match mode {
+                     "host_mode" => URSRole::Host,

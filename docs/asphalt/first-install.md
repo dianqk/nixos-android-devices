@@ -92,22 +92,25 @@ The recovery initrd contains no Python. Standard NixOS installation/update tools
 may use Python from the target system inside chroot.
 
 Starting from the original userdata layout, check and explicitly execute
-**destructive** preparation below. Android and Linux each receive approximately
-half of the original userdata allocation; the Linux half contains a separate FAT
-ESP (1 GiB by default) and ext4 root. Android userdata is destroyed and requires
-a separate factory reset. Already partitioned devices are refused by this
-operation. Never run it to repair an existing installation's boot path.
+**destructive** preparation below. Android keeps the userdata size you choose
+(32/64/128/256/512 GiB, offered while Linux keeps at least 64 GiB; see
+[recovery](../recovery.md#ab-devices-preparing-linux-storage)); Linux gets the
+rest as a separate FAT ESP (1 GiB by default) and ext4 root. Android userdata is
+destroyed and requires a separate factory reset. Already partitioned devices are
+refused by this operation. Never run it to repair an existing installation's
+boot path.
 
 ```sh
-ssh RECOVERY_HOST 'recovery prepare-install --check'
-ssh RECOVERY_HOST 'recovery prepare-install --confirm-erase-userdata'
+ssh RECOVERY_HOST 'recovery prepare-install --check'   # lists the offered sizes
+ssh RECOVERY_HOST 'recovery prepare-install --android-userdata 64G --check'
+ssh RECOVERY_HOST 'recovery prepare-install --android-userdata 64G --confirm-erase-userdata'
 ```
 
-Then follow [first installation](../initial-install.md) to import the matching
-system, install EFI and write U-Boot to `boot_b` last. That installer does not
-reboot and already writes the matching firmware: **do not repeat the manual
-`boot_b` flash from the restoration procedure**. After successful installation,
-return from NixOS recovery to OEM fastboot:
+If compatible U-Boot is missing, use the [checked firmware flash](#restore-an-existing-efi-installation)
+in OEM fastboot or [update the firmware separately from RAM recovery](../u-boot-install.md#build-and-flash-u-boot-independently).
+Then follow [first installation](../initial-install.md) to import the system and
+install its EFI generation. After successful installation, return from NixOS
+recovery to OEM fastboot for DTBO preparation if it has not been done:
 
 ```sh
 mobile-device recovery --target RECOVERY_HOST reboot bootloader

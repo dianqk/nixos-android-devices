@@ -1,0 +1,325 @@
+From ada390fb5dd66cfa633113b76389471400686fb6 Mon Sep 17 00:00:00 2001
+From: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Date: Tue, 14 Jul 2026 13:44:11 +0200
+Subject: [PATCH] drm/mediatek: Add Two-Dimension Sharpness Processor (TDSHP)
+ driver
+
+The MediaTek 2D Sharpness Processor (TDSHP) is responsible for
+performing image sharpness adjustments/enhancements in a display
+pipeline.
+
+Even though this hardware block supports adjusting the luma and
+contour 2D histograms, frequency weighting, luma-chroma gain and
+others, this only introduces a basic configuration which allows
+to bypass TDSHP processing in an effort to forward the data from
+this block to others.
+
+That is necessary because some components cannot be connected
+directly in specific pipelines; for example, in MT8196/MT6991
+pipelines, when Display Resizer (RSZ) and Color Correction (CCORR)
+components are required, it is necessary to pass through TDSHP as
+direct connection between RSZ and CCORR is not possible due to HW
+limitations.
+
+Signed-off-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Link: https://patchwork.kernel.org/project/linux-mediatek/list/?series=1127365
+[dianqk: from the Huge Restructuring v2 series, applied to v7.3-rc6; rc6 drift resolved]
+---
+ drivers/gpu/drm/mediatek/Makefile         |   1 +
+ drivers/gpu/drm/mediatek/mtk_ddp_comp.c   |  10 ++
+ drivers/gpu/drm/mediatek/mtk_disp_drv.h   |   8 ++
+ drivers/gpu/drm/mediatek/mtk_disp_tdshp.c | 167 ++++++++++++++++++++++
+ drivers/gpu/drm/mediatek/mtk_drm_drv.c    |   3 +
+ drivers/gpu/drm/mediatek/mtk_drm_drv.h    |   1 +
+ include/linux/soc/mediatek/mtk-mmsys.h    |   2 +
+ 7 files changed, 192 insertions(+)
+ create mode 100644 drivers/gpu/drm/mediatek/mtk_disp_tdshp.c
+
+diff --git a/drivers/gpu/drm/mediatek/Makefile b/drivers/gpu/drm/mediatek/Makefile
+index e9478fa1a2..47ba6bc17d 100644
+--- a/drivers/gpu/drm/mediatek/Makefile
++++ b/drivers/gpu/drm/mediatek/Makefile
+@@ -15,6 +15,7 @@ mediatek-drm-y := mtk_crtc.o \
+ 		  mtk_disp_ovl.o \
+ 		  mtk_disp_ovl_adaptor.o \
+ 		  mtk_disp_rdma.o \
++		  mtk_disp_tdshp.o \
+ 		  mtk_disp_wdma.o \
+ 		  mtk_drm_drv.o \
+ 		  mtk_drm_legacy.o \
+diff --git a/drivers/gpu/drm/mediatek/mtk_ddp_comp.c b/drivers/gpu/drm/mediatek/mtk_ddp_comp.c
+index 702b860ef6..e1873a20e6 100644
+--- a/drivers/gpu/drm/mediatek/mtk_ddp_comp.c
++++ b/drivers/gpu/drm/mediatek/mtk_ddp_comp.c
+@@ -414,6 +414,14 @@ static const struct mtk_ddp_comp_funcs ddp_rdma = {
+ 	.get_num_formats = mtk_rdma_get_num_formats,
+ };
+ 
++static const struct mtk_ddp_comp_funcs ddp_tdshp = {
++	.clk_enable = mtk_tdshp_clk_enable,
++	.clk_disable = mtk_tdshp_clk_disable,
++	.config = mtk_tdshp_config,
++	.start = mtk_tdshp_start,
++	.stop = mtk_tdshp_stop,
++};
++
+ static const struct mtk_ddp_comp_funcs ddp_wdma = {
+ 	.clk_enable = mtk_wdma_clk_enable,
+ 	.clk_disable = mtk_wdma_clk_disable,
+@@ -481,6 +489,7 @@ static const char * const mtk_ddp_comp_stem[MTK_DDP_COMP_TYPE_MAX] = {
+ 	[MTK_DISP_POSTMASK] = "postmask",
+ 	[MTK_DISP_PWM] = "pwm",
+ 	[MTK_DISP_RDMA] = "rdma",
++	[MTK_DISP_TDSHP] = "tdshp",
+ 	[MTK_DISP_UFOE] = "ufoe",
+ 	[MTK_DISP_WDMA] = "wdma",
+ 	[MTK_DISP_DP_INTF] = "dp-intf",
+@@ -508,6 +517,7 @@ static const struct mtk_ddp_comp_funcs *mtk_ddp_funcs[MTK_DDP_COMP_TYPE_MAX] = {
+ 	[MTK_DISP_POSTMASK]		= &ddp_postmask,
+ 	[MTK_DISP_PWM]			= NULL,
+ 	[MTK_DISP_RDMA]			= &ddp_rdma,
++	[MTK_DISP_TDSHP]		= &ddp_tdshp,
+ 	[MTK_DISP_UFOE]			= &ddp_ufoe,
+ 	[MTK_DISP_WDMA]			= &ddp_wdma,
+ 	[MTK_DISP_DPI]			= &ddp_dpi,
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_drv.h b/drivers/gpu/drm/mediatek/mtk_disp_drv.h
+index 3c5b9567d5..eaec83cda5 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_drv.h
++++ b/drivers/gpu/drm/mediatek/mtk_disp_drv.h
+@@ -242,6 +242,14 @@ void mtk_mdp_rdma_config(struct device *dev, struct mtk_mdp_rdma_cfg *cfg,
+ const u32 *mtk_mdp_rdma_get_formats(struct device *dev);
+ size_t mtk_mdp_rdma_get_num_formats(struct device *dev);
+ 
++int mtk_tdshp_clk_enable(struct mtk_ddp_comp *comp);
++void mtk_tdshp_clk_disable(struct mtk_ddp_comp *comp);
++void mtk_tdshp_config(struct mtk_ddp_comp *comp, unsigned int w,
++			   unsigned int h, unsigned int vrefresh,
++			   unsigned int bpc, struct cmdq_pkt *cmdq_pkt);
++void mtk_tdshp_start(struct device *dev);
++void mtk_tdshp_stop(struct device *dev);
++
+ int mtk_wdma_clk_enable(struct mtk_ddp_comp *comp);
+ void mtk_wdma_clk_disable(struct mtk_ddp_comp *comp);
+ void mtk_wdma_config(struct mtk_ddp_comp *comp, unsigned int width,
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_tdshp.c b/drivers/gpu/drm/mediatek/mtk_disp_tdshp.c
+new file mode 100644
+index 0000000000..31f57c5671
+--- /dev/null
++++ b/drivers/gpu/drm/mediatek/mtk_disp_tdshp.c
+@@ -0,0 +1,167 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek Two-Dimension Sharpness Processor (TDSHP)
++ *
++ * Copyright (c) 2025 MediaTek Inc.
++ * Copyright (c) 2026 Collabora Ltd.
++ *                    AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
++ */
++
++#include <linux/clk.h>
++#include <linux/component.h>
++#include <linux/module.h>
++#include <linux/of_device.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/soc/mediatek/mtk-cmdq.h>
++
++#include "mtk_disp_drv.h"
++#include "mtk_disp_ovl.h"
++#include "mtk_drm_drv.h"
++
++#define DISP_REG_TDSHP_EN			0x0000
++#  define DISP_TDSHP_TDS_EN			BIT(31)
++#define DISP_REG_TDSHP_CTRL			0x0100
++#  define DISP_TDSHP_CTRL_EN			BIT(0)
++#  define DISP_TDSHP_PWR_SCL_EN			BIT(2)
++#define DISP_REG_TDSHP_CFG			0x0110
++#  define DISP_TDSHP_RELAY_MODE			BIT(0)
++#define DISP_REG_TDSHP_INPUT_SIZE		0x0120
++#define DISP_REG_TDSHP_OUTPUT_OFFSET		0x0124
++#define DISP_REG_TDSHP_OUTPUT_SIZE		0x0128
++
++struct mtk_disp_tdshp {
++	void __iomem *regs;
++	struct clk *clk;
++	struct cmdq_client_reg cmdq_reg;
++};
++
++void mtk_tdshp_config(struct mtk_ddp_comp *comp, unsigned int w,
++		      unsigned int h, unsigned int vrefresh,
++		      unsigned int bpc, struct cmdq_pkt *cmdq_pkt)
++{
++	struct mtk_disp_tdshp *tdshp = dev_get_drvdata(comp->dev);
++	u32 val = bpc == 8 ? DISP_TDSHP_PWR_SCL_EN : 0;
++
++	/* Set basic parameters to at least pass the data on */
++	mtk_ddp_write(cmdq_pkt, val | DISP_TDSHP_CTRL_EN, &tdshp->cmdq_reg,
++		      tdshp->regs, DISP_REG_TDSHP_CTRL);
++
++	mtk_ddp_write(cmdq_pkt, w << 16 | h, &tdshp->cmdq_reg,
++		      tdshp->regs, DISP_REG_TDSHP_INPUT_SIZE);
++	mtk_ddp_write(cmdq_pkt, w << 16 | h, &tdshp->cmdq_reg,
++		      tdshp->regs, DISP_REG_TDSHP_OUTPUT_SIZE);
++	mtk_ddp_write(cmdq_pkt, 0x0, &tdshp->cmdq_reg,
++		      tdshp->regs, DISP_REG_TDSHP_OUTPUT_OFFSET);
++
++	/* Set RELAY mode to bypass 2D Sharpness processing */
++	mtk_ddp_write(cmdq_pkt, DISP_TDSHP_RELAY_MODE, &tdshp->cmdq_reg,
++		      tdshp->regs, DISP_REG_TDSHP_CFG);
++
++	mtk_ddp_write_mask(cmdq_pkt, DISP_TDSHP_TDS_EN, &tdshp->cmdq_reg,
++			   tdshp->regs, DISP_REG_TDSHP_EN, DISP_TDSHP_TDS_EN);
++}
++
++void mtk_tdshp_start(struct device *dev)
++{
++	struct mtk_disp_tdshp *tdshp = dev_get_drvdata(dev);
++
++	writel(DISP_TDSHP_CTRL_EN, tdshp->regs + DISP_REG_TDSHP_CTRL);
++}
++
++void mtk_tdshp_stop(struct device *dev)
++{
++	struct mtk_disp_tdshp *tdshp = dev_get_drvdata(dev);
++
++	writel(0, tdshp->regs + DISP_REG_TDSHP_CTRL);
++}
++
++int mtk_tdshp_clk_enable(struct mtk_ddp_comp *comp)
++{
++	struct mtk_disp_tdshp *tdshp = dev_get_drvdata(comp->dev);
++
++	return clk_prepare_enable(tdshp->clk);
++}
++
++void mtk_tdshp_clk_disable(struct mtk_ddp_comp *comp)
++{
++	struct mtk_disp_tdshp *tdshp = dev_get_drvdata(comp->dev);
++
++	clk_disable_unprepare(tdshp->clk);
++}
++
++static int mtk_tdshp_bind(struct device *dev, struct device *master, void *data)
++{
++	return 0;
++}
++
++static void mtk_tdshp_unbind(struct device *dev, struct device *master, void *data)
++{
++}
++
++static const struct component_ops mtk_disp_tdshp_component_ops = {
++	.bind	= mtk_tdshp_bind,
++	.unbind = mtk_tdshp_unbind,
++};
++
++static int mtk_disp_tdshp_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct mtk_disp_tdshp *tdshp;
++	int ret = 0;
++
++	tdshp = devm_kzalloc(dev, sizeof(*tdshp), GFP_KERNEL);
++	if (!tdshp)
++		return -ENOMEM;
++
++	tdshp->regs = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(tdshp->regs))
++		return dev_err_probe(dev, PTR_ERR(tdshp->regs), "Cannot get reg resource\n");
++
++	tdshp->clk = devm_clk_get(dev, NULL);
++	if (IS_ERR(tdshp->clk))
++		return dev_err_probe(dev, PTR_ERR(tdshp->clk), "Cannot get clocks\n");
++
++#if IS_REACHABLE(CONFIG_MTK_CMDQ)
++	ret = cmdq_dev_get_client_reg(dev, &tdshp->cmdq_reg, 0);
++	if (ret)
++		dev_dbg(dev, "No mediatek,gce-client-reg\n");
++#endif
++	platform_set_drvdata(pdev, tdshp);
++
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return ret;
++
++	ret = component_add(dev, &mtk_disp_tdshp_component_ops);
++	if (ret)
++		return dev_err_probe(dev, ret, "Failed to add component\n");
++
++	return 0;
++}
++
++static void mtk_disp_tdshp_remove(struct platform_device *pdev)
++{
++	component_del(&pdev->dev, &mtk_disp_tdshp_component_ops);
++}
++
++static const struct of_device_id mtk_disp_tdshp_driver_dt_match[] = {
++	{ .compatible = "mediatek,mt8196-disp-tdshp", },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, mtk_disp_tdshp_driver_dt_match);
++
++struct platform_driver mtk_disp_tdshp_driver = {
++	.probe = mtk_disp_tdshp_probe,
++	.remove = mtk_disp_tdshp_remove,
++	.driver = {
++		.name = "mediatek-disp-tdshp",
++		.owner = THIS_MODULE,
++		.of_match_table = mtk_disp_tdshp_driver_dt_match,
++	},
++};
++
++MODULE_AUTHOR("AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>");
++MODULE_DESCRIPTION("MediaTek Display Controller 2D Sharpness Processor Driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_drv.c b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+index 2fe5567960..babf60348c 100644
+--- a/drivers/gpu/drm/mediatek/mtk_drm_drv.c
++++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+@@ -716,6 +716,8 @@ static const struct of_device_id mtk_ddp_comp_dt_ids[] = {
+ 	  .data = (void *)MTK_DISP_RDMA },
+ 	{ .compatible = "mediatek,mt8195-disp-rdma",
+ 	  .data = (void *)MTK_DISP_RDMA },
++	{ .compatible = "mediatek,mt8196-disp-tdshp",
++	  .data = (void *)MTK_DISP_TDSHP },
+ 	{ .compatible = "mediatek,mt8173-disp-ufoe",
+ 	  .data = (void *)MTK_DISP_UFOE },
+ 	{ .compatible = "mediatek,mt6893-disp-wdma",
+@@ -1549,6 +1551,7 @@ static struct platform_driver * const mtk_drm_drivers[] = {
+ 	&mtk_disp_ovl_adaptor_driver,
+ 	&mtk_disp_ovl_driver,
+ 	&mtk_disp_rdma_driver,
++	&mtk_disp_tdshp_driver,
+ 	&mtk_disp_wdma_driver,
+ 	&mtk_dpi_driver,
+ 	&mtk_dvo_driver,
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_drv.h b/drivers/gpu/drm/mediatek/mtk_drm_drv.h
+index 5ebdb6f395..09aa0588ff 100644
+--- a/drivers/gpu/drm/mediatek/mtk_drm_drv.h
++++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.h
+@@ -88,6 +88,7 @@ extern struct platform_driver mtk_disp_outproc_driver;
+ extern struct platform_driver mtk_disp_ovl_adaptor_driver;
+ extern struct platform_driver mtk_disp_ovl_driver;
+ extern struct platform_driver mtk_disp_rdma_driver;
++extern struct platform_driver mtk_disp_tdshp_driver;
+ extern struct platform_driver mtk_disp_wdma_driver;
+ extern struct platform_driver mtk_dpi_driver;
+ extern struct platform_driver mtk_dsi_driver;
+diff --git a/include/linux/soc/mediatek/mtk-mmsys.h b/include/linux/soc/mediatek/mtk-mmsys.h
+index d6742ca39d..e33cb5b263 100644
+--- a/include/linux/soc/mediatek/mtk-mmsys.h
++++ b/include/linux/soc/mediatek/mtk-mmsys.h
+@@ -109,6 +109,8 @@ enum mtk_ddp_comp_type {
+ 	MTK_DISP_POSTMASK,
+ 	MTK_DISP_PWM,
+ 	MTK_DISP_RDMA,
++	MTK_DISP_RSZ,
++	MTK_DISP_TDSHP,
+ 	MTK_DISP_UFOE,
+ 	MTK_DISP_WDMA,
+ 
+-- 
+2.56.0
+

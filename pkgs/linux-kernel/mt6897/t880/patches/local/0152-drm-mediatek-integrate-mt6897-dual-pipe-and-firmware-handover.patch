@@ -1,0 +1,1814 @@
+From 601b2e31c794c4cdb4f5573023e7728e77b63bbd Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] drm/mediatek: integrate MT6897 dual-pipe and firmware
+ handover
+
+Integrate multi-controller dual-pipe display, OVL runtime ownership and
+firmware-gated translated handover. Abort a stuck CMDQ configuration on
+CRTC disable; preserve the CPU-updated DisplayPort path.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T05:50:42+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T08:10:27+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T14:13:46+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T14:13:47+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T04:46:11+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T07:05:07+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T07:23:43+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T07:43:54+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T08:40:58+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T15:16:56+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T03:00:38+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T03:36:03+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T03:36:03+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T20:47:44+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-05T13:24:15+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-05T14:20:23+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Link: https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/iommu/mtk_iommu.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/misc/mediatek/cmdq/mailbox/mtk-cmdq-mailbox-ext.c
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_drm_crtc.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/misc/mediatek/cmdq/mailbox/cmdq-util.c
+---
+ drivers/gpu/drm/mediatek/Kconfig       |   9 +
+ drivers/gpu/drm/mediatek/Makefile      |   2 +
+ drivers/gpu/drm/mediatek/mtk_crtc.c    | 375 ++++++++++++-
+ drivers/gpu/drm/mediatek/mtk_disp_va.c | 723 +++++++++++++++++++++++++
+ drivers/gpu/drm/mediatek/mtk_drm_drv.c | 268 ++++++---
+ 5 files changed, 1290 insertions(+), 87 deletions(-)
+ create mode 100644 drivers/gpu/drm/mediatek/mtk_disp_va.c
+
+diff --git a/drivers/gpu/drm/mediatek/Kconfig b/drivers/gpu/drm/mediatek/Kconfig
+index ad8c8b8236..26523950c4 100644
+--- a/drivers/gpu/drm/mediatek/Kconfig
++++ b/drivers/gpu/drm/mediatek/Kconfig
+@@ -24,6 +24,7 @@ config DRM_MEDIATEK
+ config DRM_MEDIATEK_DP
+ 	tristate "DRM DPTX Support for MediaTek SoCs"
+ 	depends on DRM_MEDIATEK
++	depends on TYPEC || !TYPEC
+ 	select DRM_DISPLAY_HELPER
+ 	select DRM_DISPLAY_DP_HELPER
+ 	select DRM_DISPLAY_DP_AUX_BUS
+@@ -57,3 +58,11 @@ config DRM_MEDIATEK_HDMI_V2
+ 	  This driver can also be built as a module. If so, the HDMIv2
+ 	  module will be called "mtk_hdmi_v2", and the DDCv2 module
+ 	  will be called "mtk_hdmi_ddc_v2".
++
++config DRM_MEDIATEK_MT6897_VA_BOOTSTRAP
++	bool "Experimental MT6897 boot display address translation handover"
++	depends on DRM_MEDIATEK=y && MTK_IOMMU=y && MTK_CMDQ=y
++	help
++	  Firmware address-mode handshakes before native DRM registration and
++	  CRTC enable. Successful transactions release their runtime resources;
++	  unknown completion retains quarantined mappings and power until reboot.
+diff --git a/drivers/gpu/drm/mediatek/Makefile b/drivers/gpu/drm/mediatek/Makefile
+index 47ba6bc17d..f1a75b4ffc 100644
+--- a/drivers/gpu/drm/mediatek/Makefile
++++ b/drivers/gpu/drm/mediatek/Makefile
+@@ -38,3 +38,5 @@ obj-$(CONFIG_DRM_MEDIATEK_HDMI_V2) += mtk_hdmi_v2.o
+ obj-$(CONFIG_DRM_MEDIATEK_HDMI_V2) += mtk_hdmi_ddc_v2.o
+ 
+ obj-$(CONFIG_DRM_MEDIATEK_DP) += mtk_dp.o
++
++obj-$(CONFIG_DRM_MEDIATEK_MT6897_VA_BOOTSTRAP) += mtk_disp_va.o
+diff --git a/drivers/gpu/drm/mediatek/mtk_crtc.c b/drivers/gpu/drm/mediatek/mtk_crtc.c
+index 0b45bccf84..1e8274571b 100644
+--- a/drivers/gpu/drm/mediatek/mtk_crtc.c
++++ b/drivers/gpu/drm/mediatek/mtk_crtc.c
+@@ -23,6 +23,7 @@
+ #include <drm/drm_probe_helper.h>
+ #include <drm/drm_vblank.h>
+ 
++#include "mtk_disp_va.h"
+ #include "mtk_crtc.h"
+ #include "mtk_ddp_comp.h"
+ #include "mtk_disp_drv.h"
+@@ -70,6 +71,13 @@ struct mtk_crtc_hw_layer {
+  * @hw_lock:         Display HW access mutex lock
+  * @config_updating: Tracks whether an asynchronous config update operation is in progress
+  * @config_lock:     Spinlock to protect config_updating variable
++ * @shadow_comp:     Dual pipe: the second pipe's components, as one or more shadow
++ *                   paths (segments) back to back. Layers and configuration go through
++ *                   the twins of the main path's components; the CRTC only links these
++ *                   paths (routes, MuteX triggers, clocks) and enables their MuteXes
++ *                   together with the main ones.
++ * @shadow_comp_nr:  Number of HW components in shadow_comp
++ * @shadow_seg_start: Bitmap of shadow_comp indices that start a shadow path
+  * @ddp_comp:        Array of HW components used in one Display Controller pipeline
+  */
+ struct mtk_crtc {
+@@ -107,6 +115,10 @@ struct mtk_crtc {
+ 	bool				config_updating;
+ 	spinlock_t			config_lock;
+ 
++	struct mtk_ddp_comp		**shadow_comp;
++	unsigned int			shadow_comp_nr;
++	unsigned long			shadow_seg_start;
++
+ 	struct mtk_ddp_comp		*ddp_comp[];
+ };
+ 
+@@ -264,7 +276,7 @@ static int mtk_crtc_ddp_clk_enable(struct mtk_crtc *mtk_crtc)
+ {
+ 	struct drm_device *dev = mtk_crtc->base.dev;
+ 	int ret;
+-	int i;
++	int i, j;
+ 
+ 	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++) {
+ 		ret = mtk_ddp_comp_clk_enable(mtk_crtc->ddp_comp[i]);
+@@ -274,7 +286,18 @@ static int mtk_crtc_ddp_clk_enable(struct mtk_crtc *mtk_crtc)
+ 		}
+ 	}
+ 
++	for (j = 0; j < mtk_crtc->shadow_comp_nr; j++) {
++		ret = mtk_ddp_comp_clk_enable(mtk_crtc->shadow_comp[j]);
++		if (ret) {
++			drm_err(dev, "Failed to enable shadow clock %d: %d\n", j, ret);
++			goto err_shadow;
++		}
++	}
++
+ 	return 0;
++err_shadow:
++	while (--j >= 0)
++		mtk_ddp_comp_clk_disable(mtk_crtc->shadow_comp[j]);
+ err:
+ 	while (--i >= 0)
+ 		mtk_ddp_comp_clk_disable(mtk_crtc->ddp_comp[i]);
+@@ -285,6 +308,9 @@ static void mtk_crtc_ddp_clk_disable(struct mtk_crtc *mtk_crtc)
+ {
+ 	int i;
+ 
++	for (i = 0; i < mtk_crtc->shadow_comp_nr; i++)
++		mtk_ddp_comp_clk_disable(mtk_crtc->shadow_comp[i]);
++
+ 	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++)
+ 		mtk_ddp_comp_clk_disable(mtk_crtc->ddp_comp[i]);
+ }
+@@ -426,6 +452,129 @@ static unsigned int mtk_crtc_get_controller_map_idx(struct mtk_crtc *mtk_crtc,
+ 	return 0;
+ }
+ 
++/*
++ * A blender that follows another blender takes its background from it
++ * (OVL chains such as MT6897's OVL0_2L -> OVL1_2L -> OVL2_2L).
++ */
++static bool mtk_crtc_bg_chained(struct mtk_crtc *mtk_crtc, unsigned int i)
++{
++	struct mtk_ddp_comp *prev;
++
++	if (i == 0)
++		return false;
++
++	prev = mtk_crtc->ddp_comp[i - 1];
++	return i == 1 || (prev->funcs && prev->funcs->bgclr_in_on);
++}
++
++static struct mtk_mutex *mtk_crtc_comp_mutex(struct mtk_crtc *mtk_crtc,
++					     struct mtk_ddp_comp *comp)
++{
++	struct mtk_drm_private *priv = mtk_crtc_get_comp_priv(mtk_crtc, comp);
++
++	return mtk_crtc->mutex[mtk_crtc_get_controller_map_idx(mtk_crtc,
++							       priv->data->mmsys_id)];
++}
++
++/* Link (or unlink) the dual-pipe shadow path: routes and MuteX triggers */
++static void mtk_crtc_shadow_link(struct mtk_crtc *mtk_crtc, bool link)
++{
++	unsigned int i, n = mtk_crtc->shadow_comp_nr;
++
++	for (i = 0; i < n; i++) {
++		struct mtk_ddp_comp *comp = mtk_crtc->shadow_comp[i];
++		struct mtk_drm_private *priv = mtk_crtc_get_comp_priv(mtk_crtc, comp);
++		struct mtk_mutex *mutex = mtk_crtc_comp_mutex(mtk_crtc, comp);
++
++		/* Shadow paths are linked within themselves only */
++		if (i + 1 < n && !(mtk_crtc->shadow_seg_start & BIT(i + 1))) {
++			struct mtk_ddp_comp *next = mtk_crtc->shadow_comp[i + 1];
++
++			if (link && !mtk_ddp_comp_connect(comp, priv->mmsys_dev, next))
++				mtk_mmsys_hw_connect(priv->mmsys_dev, comp->type, comp->inst_id,
++						     next->type, next->inst_id);
++			else if (!link && !mtk_ddp_comp_disconnect(comp, priv->mmsys_dev, next))
++				mtk_mmsys_hw_disconnect(priv->mmsys_dev, comp->type, comp->inst_id,
++							next->type, next->inst_id);
++		}
++
++		if (link && !mtk_ddp_comp_add(comp, mutex))
++			mtk_mutex_add_trigger(mutex, comp->type, comp->inst_id, comp->mtx_trig_id);
++		else if (!link && !mtk_ddp_comp_remove(comp, mutex))
++			mtk_mutex_remove_trigger(mutex, comp->type, comp->inst_id,
++						 comp->mtx_trig_id);
++	}
++}
++
++static bool mtk_crtc_comp_is_output(const struct mtk_ddp_comp *comp)
++{
++	switch (comp->type) {
++	case MTK_DISP_DP_INTF:
++	case MTK_DISP_DPI:
++	case MTK_DISP_DSI:
++	case MTK_DISP_DVO:
++		return true;
++	default:
++		return false;
++	}
++}
++
++/*
++ * A controller without an output component of its own (e.g. an OVLSYS)
++ * must start its frames on the output of the pipe it feeds; controllers
++ * that own an output got their SOF when that component was added.
++ */
++static void mtk_crtc_path_follower_sof(struct mtk_crtc *mtk_crtc,
++				       struct mtk_ddp_comp **comps, unsigned int n,
++				       unsigned long *done, bool set)
++{
++	struct mtk_ddp_comp *out = NULL;
++	unsigned int i;
++
++	/* The pipe's output: the main path ends with it, a shadow set holds one */
++	for (i = 0; i < n; i++)
++		if (mtk_crtc_comp_is_output(comps[i]))
++			out = comps[i];
++	if (!out)
++		return;
++
++	for (i = 0; i < n; i++) {
++		u8 cid = comps[i]->controller_id;
++		struct mtk_mutex *mutex;
++
++		if (*done & BIT(cid))
++			continue;
++		*done |= BIT(cid);
++
++		mutex = mtk_crtc_comp_mutex(mtk_crtc, comps[i]);
++		if (set)
++			mtk_mutex_add_trigger(mutex, out->type, out->inst_id, out->mtx_trig_id);
++		else
++			mtk_mutex_remove_trigger(mutex, out->type, out->inst_id,
++						 out->mtx_trig_id);
++	}
++}
++
++static void mtk_crtc_follower_sof(struct mtk_crtc *mtk_crtc, bool set)
++{
++	unsigned long done = 0;
++	unsigned int i;
++
++	/* Controllers with their own output are already done */
++	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++)
++		if (mtk_crtc_comp_is_output(mtk_crtc->ddp_comp[i]))
++			done |= BIT(mtk_crtc->ddp_comp[i]->controller_id);
++	for (i = 0; i < mtk_crtc->shadow_comp_nr; i++)
++		if (mtk_crtc_comp_is_output(mtk_crtc->shadow_comp[i]))
++			done |= BIT(mtk_crtc->shadow_comp[i]->controller_id);
++
++	/* The main path first: a controller shared by both pipes follows it */
++	mtk_crtc_path_follower_sof(mtk_crtc, mtk_crtc->ddp_comp, mtk_crtc->ddp_comp_nr,
++				   &done, set);
++	mtk_crtc_path_follower_sof(mtk_crtc, mtk_crtc->shadow_comp,
++				   mtk_crtc->shadow_comp_nr, &done, set);
++}
++
+ static int mtk_crtc_ddp_hw_init(struct mtk_crtc *mtk_crtc)
+ {
+ 	struct drm_crtc *crtc = &mtk_crtc->base;
+@@ -484,6 +633,10 @@ static int mtk_crtc_ddp_hw_init(struct mtk_crtc *mtk_crtc)
+ 		goto err_mutex_unprepare;
+ 	}
+ 
++	ret = mtk_disp_va_runtime_gate(crtc->dev->dev);
++	if (ret)
++		goto err_clk_disable;
++
+ 	for (i = 0; i < mtk_crtc->ddp_comp_nr - 1; i++) {
+ 		struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[i];
+ 		struct mtk_ddp_comp *next = mtk_crtc->ddp_comp[i + 1];
+@@ -516,6 +669,10 @@ static int mtk_crtc_ddp_hw_init(struct mtk_crtc *mtk_crtc)
+ 				      mtk_crtc->ddp_comp[i]->inst_id,
+ 				      mtk_crtc->ddp_comp[i]->mtx_trig_id);
+ 
++	mtk_crtc_shadow_link(mtk_crtc, true);
++	mtk_crtc_follower_sof(mtk_crtc, true);
++
++	/* Both pipes' MuteXes are enabled together, before the output starts */
+ 	for (i = 0; i < mtk_crtc->num_controllers; i++)
+ 		mtk_mutex_enable(mtk_crtc->mutex[i]);
+ 
+@@ -529,7 +686,7 @@ static int mtk_crtc_ddp_hw_init(struct mtk_crtc *mtk_crtc)
+ 		if (comp->type == MTK_DISP_DSC && !comp_dsc)
+ 			comp_dsc = comp;
+ 
+-		if (i == 1)
++		if (mtk_crtc_bg_chained(mtk_crtc, i))
+ 			mtk_ddp_comp_bgclr_in_on(comp);
+ 
+ 		mtk_ddp_comp_config(comp, width, height, vrefresh, bpc, NULL);
+@@ -558,6 +715,8 @@ static int mtk_crtc_ddp_hw_init(struct mtk_crtc *mtk_crtc)
+ 
+ 	return 0;
+ 
++err_clk_disable:
++	mtk_crtc_ddp_clk_disable(mtk_crtc);
+ err_mutex_unprepare:
+ 	for (i = 0; i < mtk_crtc->num_controllers; i++)
+ 		mtk_mutex_unprepare(mtk_crtc->mutex[i]);
+@@ -579,13 +738,16 @@ static void mtk_crtc_ddp_hw_fini(struct mtk_crtc *mtk_crtc)
+ 
+ 	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++) {
+ 		mtk_ddp_comp_stop(mtk_crtc->ddp_comp[i]);
+-		if (i == 1)
++		if (mtk_crtc_bg_chained(mtk_crtc, i))
+ 			mtk_ddp_comp_bgclr_in_off(mtk_crtc->ddp_comp[i]);
+ 	}
+ 
+ 	for (i = 0; i < mtk_crtc->num_controllers; i++)
+ 		mtk_mutex_disable(mtk_crtc->mutex[i]);
+ 
++	mtk_crtc_follower_sof(mtk_crtc, false);
++	mtk_crtc_shadow_link(mtk_crtc, false);
++
+ 	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++) {
+ 		struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[i];
+ 
+@@ -1000,13 +1162,39 @@ static void mtk_crtc_atomic_disable(struct drm_crtc *crtc,
+ 	mtk_crtc_update_config(mtk_crtc, false);
+ #if IS_REACHABLE(CONFIG_MTK_CMDQ)
+ 	/* Wait for planes to be disabled by cmdq */
+-	if (mtk_crtc->cmdq_client.chan)
+-		wait_event_timeout(mtk_crtc->cb_blocking_queue,
+-				   mtk_crtc->cmdq_vblank_cnt == 0,
+-				   msecs_to_jiffies(500));
++	if (mtk_crtc->cmdq_client.chan &&
++	    !wait_event_timeout(mtk_crtc->cb_blocking_queue,
++				mtk_crtc->cmdq_vblank_cnt == 0,
++				msecs_to_jiffies(500))) {
++		/*
++		 * The GCE thread still waits for an event of a pipe that does
++		 * not run. Abort it before the path is torn down and powered
++		 * off, so that it cannot write to the engines later, and
++		 * complete the page flip it was carrying.
++		 */
++		drm_warn(dev, "[CRTC:%d] CMDQ configuration did not complete, aborting\n",
++			 crtc->base.id);
++		mbox_flush(mtk_crtc->cmdq_client.chan, 2000);
++		mtk_crtc->cmdq_vblank_cnt = 0;
++		if (mtk_crtc->pending_needs_vblank) {
++			mtk_crtc_finish_page_flip(mtk_crtc);
++			mtk_crtc->pending_needs_vblank = false;
++		}
++	}
+ #endif
+-	/* Wait for planes to be disabled */
+-	drm_crtc_wait_one_vblank(crtc);
++	/*
++	 * Wait for planes to be disabled. The bridges are post-disabled
++	 * before the CRTC, and a DSI panel's off commands stop video there,
++	 * so no vblank may come: wait without warning.
++	 */
++	if (!drm_crtc_vblank_get(crtc)) {
++		u64 count = drm_crtc_vblank_count(crtc);
++
++		wait_event_timeout(*drm_crtc_vblank_waitqueue(crtc),
++				   drm_crtc_vblank_count(crtc) != count,
++				   msecs_to_jiffies(100));
++		drm_crtc_vblank_put(crtc);
++	}
+ 
+ 	drm_crtc_vblank_off(crtc);
+ 	mtk_crtc_ddp_hw_fini(mtk_crtc);
+@@ -1287,22 +1475,38 @@ static int mtk_crtc_find_suitable_dma_dev(struct mtk_crtc *mtk_crtc)
+ 		mtk_crtc->dma_dev = mtk_ddp_comp_dma_dev_get(dma_comp_mmu);
+ 	else if (dma_comp)
+ 		mtk_crtc->dma_dev = mtk_ddp_comp_dma_dev_get(dma_comp);
++	else if (mtk_crtc->config_comp_idx >= 0)
++		/*
++		 * No IOMMU and no "#dma-cells": the layer configuration component
++		 * (an OVL/RDMA/exDMA) still reads the planes, with physical
++		 * addresses within its DMA mask.
++		 */
++		mtk_crtc->dma_dev = mtk_ddp_comp_dma_dev_get(mtk_crtc->ddp_comp[mtk_crtc->config_comp_idx]);
+ 	else
+ 		return -EINVAL;
+ 
+ 	return 0;
+ }
+ 
++/* Main path components first, then the dual-pipe shadow path */
++static struct mtk_ddp_comp *mtk_crtc_any_comp(struct mtk_crtc *mtk_crtc, unsigned int i)
++{
++	if (i < mtk_crtc->ddp_comp_nr)
++		return mtk_crtc->ddp_comp[i];
++
++	return mtk_crtc->shadow_comp[i - mtk_crtc->ddp_comp_nr];
++}
++
+ static int mtk_crtc_init_multi_controller_properties(struct device *dev,
+ 						     struct mtk_crtc *mtk_crtc)
+ {
+ 	struct drm_crtc *crtc = &mtk_crtc->base;
+ 	unsigned long controllers_mask = 0;
+ 	struct mtk_drm_private *priv;
+-	unsigned int i, j, k, z;
++	unsigned int i, j, k, z = 0;
+ 
+-	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++) {
+-		u8 controller_id = mtk_crtc->ddp_comp[i]->controller_id;
++	for (i = 0; i < mtk_crtc->ddp_comp_nr + mtk_crtc->shadow_comp_nr; i++) {
++		u8 controller_id = mtk_crtc_any_comp(mtk_crtc, i)->controller_id;
+ 
+ 		if (controller_id > MTK_DISP_CONTROLLER_MAX_CONTROLLERS_NUM) {
+ 			dev_err(mtk_crtc->mmsys_dev, "Bad controller ID %u\n",
+@@ -1335,24 +1539,24 @@ static int mtk_crtc_init_multi_controller_properties(struct device *dev,
+ 	priv = crtc->dev->dev_private;
+ 
+ 	for_each_set_bit(i, &controllers_mask, MTK_DISP_CONTROLLER_MAX_CONTROLLERS_NUM) {
+-		for (j = 0; j < mtk_crtc->ddp_comp_nr; j++) {
++		for (j = 0; j < mtk_crtc->ddp_comp_nr + mtk_crtc->shadow_comp_nr; j++) {
+ 			struct mtk_drm_private *controller_priv;
++			struct mtk_ddp_comp *comp = mtk_crtc_any_comp(mtk_crtc, j);
+ 
+-			if (mtk_crtc->ddp_comp[j]->controller_id != i)
++			if (comp->controller_id != i)
+ 				continue;
+ 
+ 			/* Find the matching Controller ID's mmsys device */
+ 			for (k = 0; k < priv->data->mmsys_dev_num; k++) {
+ 				controller_priv = priv->all_drm_private[k];
+ 
+-				if (controller_priv->data->mmsys_id ==
+-				    mtk_crtc->ddp_comp[j]->controller_id)
++				if (controller_priv->data->mmsys_id == comp->controller_id)
+ 					break;
+ 			}
+ 			if (k == priv->data->mmsys_dev_num)
+ 				continue;
+ 
+-			mtk_crtc->controller_idmap[z] = mtk_crtc->ddp_comp[j]->controller_id;
++			mtk_crtc->controller_idmap[z] = comp->controller_id;
+ 			z++;
+ 
+ 			/*
+@@ -1404,6 +1608,133 @@ static int mtk_crtc_init_mutex(struct device *dev, struct mtk_crtc *mtk_crtc)
+ 	return 0;
+ }
+ 
++/* Collect a CRTC path's components across all controllers, in order */
++static int mtk_crtc_gather_path(struct mtk_drm_private *priv, unsigned int path_sel,
++				struct mtk_ddp_comp **comps)
++{
++	int j, k, i, n = 0;
++
++	for (j = 0; j < priv->data->mmsys_dev_num; j++) {
++		for (k = 0; k < priv->data->mmsys_dev_num; k++) {
++			struct mtk_drm_private *subsys_priv = priv->all_drm_private[k];
++			const struct mtk_drm_path_definition *ctrlr_path;
++
++			if (!subsys_priv)
++				continue;
++
++			ctrlr_path = &subsys_priv->data->output_paths[path_sel];
++			if (!ctrlr_path->len || ctrlr_path->order != j)
++				continue;
++
++			for (i = 0; i < ctrlr_path->len; i++) {
++				struct mtk_ddp_comp *comp;
++
++				comp = mtk_ddp_comp_find_by_id(&subsys_priv->hlist,
++							       ctrlr_path->comp[i].type,
++							       ctrlr_path->comp[i].inst_id);
++				if (!comp || !comp->dev)
++					return -ENODEV;
++				if (comps)
++					comps[n] = comp;
++				n++;
++			}
++		}
++	}
++
++	return n;
++}
++
++/*
++ * Dual pipe: the second pipe is described as ordinary output paths that are
++ * this CRTC's shadow paths rather than CRTCs of their own:
++ * - the path that starts with the twin of the first component (the other
++ *   pipe's OVL), and
++ * - a path that ends with the slave of this CRTC's DSI. A controller can
++ *   hold only one segment of a path, and the MT6897 second pipe re-enters
++ *   DISPSYS1 for DSI1, so that last stretch is a path of its own.
++ * Shadow paths must come after this path in the devicetree.
++ */
++static int mtk_crtc_init_shadow_path(struct device *dev, struct mtk_crtc *mtk_crtc,
++				     struct mtk_drm_private *priv, unsigned int path_sel)
++{
++	struct mtk_ddp_comp *first = mtk_crtc->ddp_comp[0];
++	struct mtk_ddp_comp *last = mtk_crtc->ddp_comp[mtk_crtc->ddp_comp_nr - 1];
++	struct mtk_ddp_comp **comps, **all;
++	struct device *twin, *slave = NULL;
++	unsigned int p, total = 0;
++	bool found_twin = false;
++	int n;
++
++	if (first->type != MTK_DISP_OVL && first->type != MTK_DISP_OVL_2L)
++		return 0;
++
++	twin = mtk_ovl_get_twin(first->dev);
++	if (!twin)
++		return 0;
++
++	if (last->type == MTK_DISP_DSI)
++		slave = mtk_dsi_get_slave_dev(last->dev);
++
++	all = devm_kcalloc(dev, MTK_DISP_CONTROLLER_MAX_COMP_PER_PATH * MAX_CRTC,
++			   sizeof(*all), GFP_KERNEL);
++	if (!all)
++		return -ENOMEM;
++
++	for (p = 0; p < MAX_CRTC; p++) {
++		bool is_twin, is_slave;
++
++		if (p == path_sel)
++			continue;
++
++		n = mtk_crtc_gather_path(priv, p, NULL);
++		if (n <= 0)
++			continue;
++
++		comps = devm_kcalloc(dev, n, sizeof(*comps), GFP_KERNEL);
++		if (!comps)
++			return -ENOMEM;
++		mtk_crtc_gather_path(priv, p, comps);
++
++		is_twin = comps[0]->dev == twin;
++		is_slave = slave && comps[n - 1]->dev == slave;
++		if (!is_twin && !is_slave) {
++			devm_kfree(dev, comps);
++			continue;
++		}
++
++		if (p < path_sel) {
++			dev_err(dev, "Dual-pipe shadow path %u precedes its CRTC path %u\n",
++				p, path_sel);
++			devm_kfree(dev, comps);
++			return -EINVAL;
++		}
++
++		if (total + n > BITS_PER_LONG) {
++			devm_kfree(dev, comps);
++			return -E2BIG;
++		}
++
++		found_twin |= is_twin;
++		comps[0]->shadow_head = true;
++		mtk_crtc->shadow_seg_start |= BIT(total);
++		memcpy(&all[total], comps, n * sizeof(*comps));
++		total += n;
++		devm_kfree(dev, comps);
++		dev_info(dev, "Dual pipe: path %u (%d components) is a shadow of path %u\n",
++			 p, n, path_sel);
++	}
++
++	if (!found_twin) {
++		dev_err(dev, "Dual-pipe twin %s is not the head of any output path\n",
++			dev_name(twin));
++		return -ENODEV;
++	}
++
++	mtk_crtc->shadow_comp = all;
++	mtk_crtc->shadow_comp_nr = total;
++	return 0;
++}
++
+ int mtk_crtc_create(struct drm_device *drm_dev,
+ 		    enum mtk_crtc_path path_sel, int priv_data_index,
+ 		    const struct mtk_drm_route *conn_routes,
+@@ -1495,6 +1826,16 @@ int mtk_crtc_create(struct drm_device *drm_dev,
+ 		}
+ 	}
+ 
++	/* A dual-pipe shadow path belongs to another CRTC */
++	if (mtk_crtc->ddp_comp[0]->shadow_head) {
++		devm_kfree(dev, mtk_crtc);
++		return 0;
++	}
++
++	ret = mtk_crtc_init_shadow_path(dev, mtk_crtc, priv, path_sel);
++	if (ret)
++		goto err_free_crtc;
++
+ 	/* Component 0 would be valid so initialize vblank and config idx to -EINVAL */
+ 	mtk_crtc->vblank_comp_idx = -EINVAL;
+ 	mtk_crtc->config_comp_idx = -EINVAL;
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_va.c b/drivers/gpu/drm/mediatek/mtk_disp_va.c
+new file mode 100644
+index 0000000000..5e222dbbb3
+--- /dev/null
++++ b/drivers/gpu/drm/mediatek/mtk_disp_va.c
+@@ -0,0 +1,723 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* MT6897 display VA handover. Successful transactions release their runtime
++ * resources; unknown firmware/packet completion is quarantined until reboot.
++ * Register/SMC ABI reference: MiCode MTK_kernel_device_modules
++ * 3c4ccd07d5624879555ec710c11bb8818e5cb5c6, mediatek_v2/mtk_disp_ovl.c,
++ * mtk_disp_postmask.c, cmdq-util.c and mtk-cmdq-mailbox-ext.c.
++ * https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6
++ */
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/mailbox_controller.h>
++#include <linux/device.h>
++#include <linux/iommu.h>
++#include <linux/mutex.h>
++#include <linux/module.h>
++#include <linux/sizes.h>
++#include <linux/of_address.h>
++#include <linux/of_platform.h>
++#include <linux/overflow.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/completion.h>
++#include <linux/dma-mapping.h>
++#include <linux/mm.h>
++#include <linux/soc/mediatek/mtk-cmdq.h>
++
++#include "mtk_disp_va.h"
++#include <linux/io.h>
++
++#define MTK_DISP_VA_START 692
++#define MTK_DISP_VA_END 693
++
++enum mtk_disp_va_state {
++	MTK_DISP_VA_IDLE,
++	MTK_DISP_VA_PREPARED,
++	MTK_DISP_VA_ATTEMPTED,
++	MTK_DISP_VA_TRANSLATED,
++};
++
++/* Checked linear fetch validation, independent of the hardware decoder. */
++static int mtk_disp_va_check_linear(u64 address, u32 width, u32 height,
++				    u32 pitch, u32 bytes_per_pixel,
++				    u64 reserved_start, u64 reserved_size,
++				    u64 *last)
++{
++	u64 row_bytes, tail, end, reserved_end;
++
++	if (!width || !height || !bytes_per_pixel || !reserved_size ||
++	    check_mul_overflow((u64)width, (u64)bytes_per_pixel, &row_bytes) ||
++	    row_bytes > pitch ||
++	    check_mul_overflow((u64)(height - 1), (u64)pitch, &tail) ||
++	    check_add_overflow(tail, row_bytes - 1, &tail) ||
++	    check_add_overflow(address, tail, &end) ||
++	    check_add_overflow(reserved_start, reserved_size - 1, &reserved_end) ||
++	    address < reserved_start || end > reserved_end)
++		return -EINVAL;
++	*last = end;
++	return 0;
++}
++
++static int mtk_disp_va_check_identity(struct iommu_domain *domain,
++				      u64 first, u64 last)
++{
++	u64 page = first & PAGE_MASK;
++
++	if (!domain || !iommu_is_dma_domain(domain) || first > last)
++		return -EINVAL;
++	for (;;) {
++		if (iommu_iova_to_phys(domain, page) != page)
++			return -EINVAL;
++		if (last - page < PAGE_SIZE)
++			break;
++		if (check_add_overflow(page, (u64)PAGE_SIZE, &page))
++			return -EINVAL;
++	}
++	return 0;
++}
++
++/* MT6897 2-layer OVL snapshot decoder. Registers are read only after all
++ * explicit display power/clock holds; snapshot must be rechecked before SMC.
++ */
++struct mtk_disp_va_layer {
++	u64 first;
++	u64 last;
++};
++
++static int mtk_disp_va_decode_ovl(void __iomem *base, u64 start, u64 length,
++				struct mtk_disp_va_layer layers[2], u32 *active)
++{
++	u32 en = readl(base + 0xc), src = readl(base + 0x2c);
++	u32 datapath = readl(base + 0x24), ext = readl(base + 0x324);
++	unsigned int i;
++
++	*active = 0;
++	if (!(en & BIT(0)))
++		return 0;
++	if (!(en & (BIT(20) | BIT(22))))
++		return -EINVAL;
++	if ((src & ~GENMASK(1, 0)) || (ext & GENMASK(2, 0)) ||
++	    (datapath & GENMASK(23, 16)))
++		return -EINVAL;
++	for (i = 0; i < 2; i++) {
++		u32 con, size, pitch, pitch_msb, high, fmt, bpp;
++		u64 address;
++		int ret;
++
++		if (!(src & BIT(i))) {
++			if (readl(base + 0xc0 + 0x20 * i) & BIT(0))
++				return -EINVAL;
++			continue;
++		}
++		con = readl(base + 0x30 + 0x20 * i);
++		/* Memory source, linear, uncompressed, no flips/3D/landscape. */
++		if ((datapath & BIT(i + 4)) ||
++		    (readl(base + 0x2d0) & (3 << (4 * i))) ||
++		    (readl(base + 0xc0 + 0x20 * i) & BIT(4)) ||
++		    readl(base + 0x880 + 0x10 * i) ||
++		    (con & (GENMASK(29, 28) | GENMASK(22, 20) | BIT(10) | BIT(9))))
++			return -EINVAL;
++		fmt = (con >> 12) & 0xf;
++		switch (fmt) {
++		case 0: bpp = 2; break;
++		case 1: bpp = 3; break;
++		case 2:
++		case 3: bpp = 4; break;
++		default: return -EINVAL;
++		}
++		address = readl(base + 0xf40 + 0x20 * i);
++		high = readl(base + 0xf4c + 0x20 * i);
++		if (high & ~0xf)
++			return -EINVAL;
++		address |= (u64)high << 32;
++		pitch = readl(base + 0x44 + 0x20 * i) & 0xffff;
++		pitch_msb = readl(base + 0x40 + 0x20 * i);
++		if (pitch_msb & BIT(16))
++			return -EINVAL;
++		/* RGB YUV_TRANS bit20 is harmless; do not reject it. */
++		pitch |= (pitch_msb & 0xf) << 16;
++		size = readl(base + 0x38 + 0x20 * i);
++		if (size & ~0x0fff0fff)
++			return -EINVAL;
++		ret = mtk_disp_va_check_linear(address, size & 0xfff,
++					     (size >> 16) & 0xfff, pitch, bpp,
++					     start, length, &layers[i].last);
++		if (ret)
++			return ret;
++		layers[i].first = address;
++		*active |= BIT(i);
++	}
++	return 0;
++}
++
++static int mtk_disp_va_check_postmask(void __iomem *base)
++{
++	u32 en = readl(base), cfg = readl(base + 0x20);
++
++	if ((en & BIT(0)) && !(readl(base + 0x24) & (BIT(1) | BIT(2))))
++		return -EINVAL;
++	/* Only proven non-fetching POSTMASK is supported by this initial implementation. */
++	if ((en & BIT(0)) && !(cfg & BIT(0)) && (cfg & BIT(1)))
++		return -EINVAL;
++	return 0;
++}
++
++
++#define MTK_VA_SUPPLIERS 12
++#define MTK_VA_OVLS 8
++#define MTK_VA_POSTMASKS 2
++
++struct mtk_va_raw_snapshot {
++	u32 ovl[MTK_VA_OVLS][21];
++	u32 postmask[MTK_VA_POSTMASKS][3];
++};
++
++struct mtk_disp_va_bootstrap {
++	struct device *dev;
++	struct mutex lock;
++	enum mtk_disp_va_state state;
++	struct cmdq_client client;
++	struct cmdq_pkt packet;
++	struct completion done;
++	int packet_status;
++	bool packet_mapped;
++	bool gce_held;
++	bool initial_done;
++	struct iommu_group *groups[7];
++	struct clk_bulk_data *clocks;
++	int num_clocks;
++	struct device *suppliers[MTK_VA_SUPPLIERS];
++	unsigned int num_suppliers, held, held_ovls;
++	struct device *dma_dev;
++	struct device *ovl_devs[6];
++	struct iommu_domain *domain;
++	void __iomem *ovl[MTK_VA_OVLS];
++	void __iomem *postmask[MTK_VA_POSTMASKS];
++	struct resource identity;
++	struct mtk_va_raw_snapshot snapshots[2];
++	bool clocks_held;
++};
++
++
++
++static int mtk_va_snapshot(struct mtk_disp_va_bootstrap *b,
++			   struct mtk_disp_va_layer layers[MTK_VA_OVLS][2],
++			   u32 active[MTK_VA_OVLS], struct mtk_va_raw_snapshot *raw)
++{
++	static const unsigned int common[] = { 0xc, 0x2c, 0x24, 0x324, 0x2d0 };
++	static const unsigned int per_layer[] = { 0x30, 0x38, 0x44, 0x40,
++		0xf40, 0xf4c, 0xc0 };
++	unsigned int i, j, n, cursor;
++	int ret;
++
++	memset(raw, 0, sizeof(*raw));
++	memset(layers, 0, sizeof(*layers) * MTK_VA_OVLS);
++	for (i = 0; i < MTK_VA_OVLS; i++) {
++		cursor = 0;
++		for (j = 0; j < ARRAY_SIZE(common); j++)
++			raw->ovl[i][cursor++] = readl(b->ovl[i] + common[j]);
++		for (n = 0; n < 2; n++) {
++			for (j = 0; j < ARRAY_SIZE(per_layer); j++)
++				raw->ovl[i][cursor++] = readl(b->ovl[i] + per_layer[j] + 0x20 * n) &
++					(j == 6 ? (BIT(0) | BIT(4)) : ~0U);
++			raw->ovl[i][cursor++] = readl(b->ovl[i] + 0x880 + 0x10 * n);
++		}
++		ret = mtk_disp_va_decode_ovl(b->ovl[i], b->identity.start,
++				resource_size(&b->identity), layers[i], &active[i]);
++		if (ret) {
++			dev_err(b->dev, "OVL%u unsupported fetch config EN=%08x SRC=%08x (%d)\n",
++				i, raw->ovl[i][0], raw->ovl[i][1], ret);
++			return ret;
++		}
++		/* OVL3/7 have no port attachment in this candidate. */
++		if ((i == 3 || i == 7) && active[i]) {
++			dev_err(b->dev, "OVL%u active without a port attachment\n", i);
++			return -EINVAL;
++		}
++	}
++	for (i = 0; i < MTK_VA_POSTMASKS; i++) {
++		raw->postmask[i][0] = readl(b->postmask[i]);
++		raw->postmask[i][1] = readl(b->postmask[i] + 0x20);
++		raw->postmask[i][2] = readl(b->postmask[i] + 0x24) & (BIT(1) | BIT(2));
++		ret = mtk_disp_va_check_postmask(b->postmask[i]);
++		if (ret) {
++			dev_err(b->dev, "POSTMASK%u unsupported fetch EN=%08x CFG=%08x SHADOW=%08x\n",
++				i, raw->postmask[i][0], raw->postmask[i][1], raw->postmask[i][2]);
++			return ret;
++		}
++	}
++	return 0;
++}
++
++static void mtk_va_release_prepared(void *ctx)
++{
++	struct mtk_disp_va_bootstrap *b = ctx;
++	unsigned int i;
++
++	if (b->packet_mapped) {
++		cmdq_pkt_destroy(&b->client, &b->packet);
++		b->packet_mapped = false;
++	}
++	for (i = 0; i < ARRAY_SIZE(b->groups); i++) {
++		if (b->groups[i])
++			iommu_group_put(b->groups[i]);
++		b->groups[i] = NULL;
++	}
++
++	if (b->clocks_held) {
++		clk_bulk_disable_unprepare(b->num_clocks, b->clocks);
++		b->clocks_held = false;
++	}
++	while (b->held_ovls)
++		pm_runtime_put(b->ovl_devs[--b->held_ovls]);
++	while (b->held)
++		pm_runtime_put(b->suppliers[--b->held]);
++	pm_runtime_put(b->dev);
++}
++
++static int mtk_va_acquire(void *ctx)
++{
++	struct mtk_disp_va_bootstrap *b = ctx;
++	int ret;
++
++	ret = pm_runtime_resume_and_get(b->dev);
++	if (ret < 0)
++		return ret;
++	for (; b->held < b->num_suppliers; b->held++) {
++		ret = pm_runtime_resume_and_get(b->suppliers[b->held]);
++		if (ret < 0) {
++			dev_err(b->dev, "supplier %s PM failed: %d\n",
++				dev_name(b->suppliers[b->held]), ret);
++			goto fail;
++		}
++	}
++	/* The last OVL can be inside component_add() here, before its probe
++	 * returns. All components have bound and PM was enabled first; do not
++	 * require device_is_bound or managed supplier links for these OVLs.
++	 */
++	for (; b->held_ovls < ARRAY_SIZE(b->ovl_devs); b->held_ovls++) {
++		ret = pm_runtime_resume_and_get(b->ovl_devs[b->held_ovls]);
++		if (ret < 0) {
++			dev_err(b->dev, "OVL %s PM failed: %d\n",
++				dev_name(b->ovl_devs[b->held_ovls]), ret);
++			goto fail;
++		}
++	}
++	ret = clk_bulk_prepare_enable(b->num_clocks, b->clocks);
++	if (ret)
++		goto fail;
++	b->clocks_held = true;
++	return 0;
++fail:
++	mtk_va_release_prepared(b);
++	return ret;
++}
++
++static int mtk_va_preflight(void *ctx)
++{
++	struct mtk_disp_va_bootstrap *b = ctx;
++	struct mtk_disp_va_layer layers[MTK_VA_OVLS][2], again[MTK_VA_OVLS][2];
++	u32 active[MTK_VA_OVLS], again_active[MTK_VA_OVLS];
++	struct mtk_va_raw_snapshot *raw = &b->snapshots[0];
++	struct mtk_va_raw_snapshot *again_raw = &b->snapshots[1];
++	unsigned int i, j;
++	int ret;
++
++	b->domain = iommu_get_domain_for_dev(b->dma_dev);
++	if (!b->domain || !iommu_is_dma_domain(b->domain)) {
++		dev_err(b->dev, "OVL0 has no translated DMA domain\n");
++		return -EINVAL;
++	}
++	for (i = 0; i < ARRAY_SIZE(b->ovl_devs); i++)
++		if (!of_property_present(b->ovl_devs[i]->of_node, "iommus") ||
++		    iommu_get_domain_for_dev(b->ovl_devs[i]) != b->domain) {
++			dev_err(b->dev, "%s missing/shared domain mismatch\n",
++				dev_name(b->ovl_devs[i]));
++			return -EINVAL;
++		}
++	ret = mtk_va_snapshot(b, layers, active, raw);
++	if (ret)
++		return ret;
++	ret = mtk_disp_va_check_identity(b->domain, b->identity.start, b->identity.end);
++	if (ret) {
++		dev_err(b->dev, "LK identity reservation %#llx-%#llx not fully mapped\n",
++			(u64)b->identity.start, (u64)b->identity.end);
++		return ret;
++	}
++	for (i = 0; i < MTK_VA_OVLS; i++)
++		for (j = 0; j < 2; j++) {
++			if (!(active[i] & BIT(j)))
++				continue;
++			ret = mtk_disp_va_check_identity(b->domain,
++					layers[i][j].first, layers[i][j].last);
++			if (ret) {
++				dev_err(b->dev, "OVL%u layer%u identity %#llx-%#llx failed\n",
++					i, j, layers[i][j].first, layers[i][j].last);
++				return ret;
++			}
++		}
++	ret = mtk_va_snapshot(b, again, again_active, again_raw);
++	if (ret)
++		return ret;
++	if (memcmp(layers, again, sizeof(layers)) ||
++	    memcmp(active, again_active, sizeof(active)) ||
++	    memcmp(raw, again_raw, sizeof(*raw))) {
++		dev_err(b->dev, "fetch config changed during identity validation\n");
++		return -EAGAIN;
++	}
++	dev_info(b->dev, "identity %#llx-%#llx OVL masks %x/%x/%x/%x/%x/%x/%x/%x\n",
++		(u64)b->identity.start, (u64)b->identity.end, active[0], active[1],
++		active[2], active[3], active[4], active[5], active[6], active[7]);
++	return 0;
++}
++
++static void mtk_va_done(struct mbox_client *client, void *message)
++{
++	struct cmdq_client *cmdq_client = container_of(client, struct cmdq_client, client);
++	struct mtk_disp_va_bootstrap *b = container_of(cmdq_client, struct mtk_disp_va_bootstrap, client);
++	struct cmdq_cb_data *data = message;
++
++	WRITE_ONCE(b->packet_status,
++		   data && data->pkt == &b->packet ? data->sta : -EPROTO);
++	complete(&b->done);
++}
++
++static int mtk_va_prepare_packet(struct mtk_disp_va_bootstrap *b)
++{
++	struct device *gce = b->client.chan->mbox->dev;
++	struct iommu_domain *domain = iommu_get_domain_for_dev(gce);
++	phys_addr_t physical;
++	unsigned int i;
++	int ret;
++
++	if (!domain || domain != b->domain)
++		return -EINVAL;
++	if (b->packet_mapped)
++		return -EBUSY;
++	for (i = 0; i < ARRAY_SIZE(b->ovl_devs); i++) {
++		b->groups[i] = iommu_group_get(b->ovl_devs[i]);
++		if (!b->groups[i])
++			return -EINVAL;
++	}
++	b->groups[6] = iommu_group_get(gce);
++	if (!b->groups[6])
++		return -EINVAL;
++	memset(&b->packet, 0, sizeof(b->packet));
++	ret = cmdq_pkt_create(&b->client, &b->packet, PAGE_SIZE);
++	if (ret)
++		return ret;
++	b->packet_mapped = true;
++	physical = virt_to_phys(b->packet.va_base);
++	for (i = 0; i < b->packet.buf_size; i += PAGE_SIZE)
++		if (iommu_iova_to_phys(domain, b->packet.pa_base + i) != physical + i)
++			return -EFAULT;
++	if (physical < 0x33ff00000ULL && physical + b->packet.buf_size > 0x33fe00000ULL)
++		return -EINVAL;
++	ret = cmdq_pkt_set_event(&b->packet, MTK_DISP_VA_START);
++	if (!ret)
++		ret = cmdq_pkt_wfe(&b->packet, MTK_DISP_VA_END, true);
++	if (!ret)
++		ret = cmdq_pkt_eoc(&b->packet);
++	if (ret)
++		return ret;
++	dma_sync_single_for_device(gce, b->packet.pa_base,
++				   b->packet.cmd_buf_size, DMA_TO_DEVICE);
++	dev_dbg(b->dev, "VA packet IOVA=%pad PA=%pa bytes=%zu\n",
++		 &b->packet.pa_base, &physical, b->packet.cmd_buf_size);
++	return 0;
++}
++
++/* The independent provider keeps callback/packet storage alive if DRM bind
++ * fails after an unknown completion. Normal success retains no runtime holds.
++ */
++static int mtk_disp_va_bootstrap_run(struct mtk_disp_va_bootstrap *b, bool initial)
++{
++	unsigned long deadline;
++	long remaining;
++	unsigned int i;
++	int ret;
++
++	mutex_lock(&b->lock);
++	if (b->state == MTK_DISP_VA_ATTEMPTED) {
++		ret = -EIO;
++		goto unlock;
++	}
++	if (initial && b->initial_done) {
++		ret = iommu_get_domain_for_dev(b->dma_dev) == b->domain ? 0 : -EINVAL;
++		goto unlock;
++	}
++	ret = mtk_va_acquire(b);
++	if (ret)
++		goto unlock;
++	b->state = MTK_DISP_VA_PREPARED;
++	if (initial) {
++		ret = mtk_va_preflight(b);
++	} else {
++		ret = b->initial_done ? 0 : -EINVAL;
++		for (i = 0; !ret && i < ARRAY_SIZE(b->ovl_devs); i++)
++			if (iommu_get_domain_for_dev(b->ovl_devs[i]) != b->domain)
++				ret = -EINVAL;
++	}
++	if (!ret)
++		ret = mtk_va_prepare_packet(b);
++	if (ret) {
++		mtk_va_release_prepared(b);
++		b->state = b->initial_done ? MTK_DISP_VA_TRANSLATED : MTK_DISP_VA_IDLE;
++		goto unlock;
++	}
++	init_completion(&b->done);
++	b->packet_status = -EINPROGRESS;
++	deadline = jiffies + msecs_to_jiffies(100);
++	/* Runtime resume may start prebuilt firmware, so all mapping/boot
++	 * checks must precede this get and any subsequent error is retained.
++	 */
++	b->state = MTK_DISP_VA_ATTEMPTED;
++	ret = pm_runtime_resume_and_get(b->client.chan->mbox->dev);
++	if (ret < 0)
++		goto retained;
++	b->gce_held = true;
++	if (time_after_eq(jiffies, deadline)) {
++		ret = -ETIMEDOUT;
++		goto retained;
++	}
++	ret = cmdq_mbox_disp_va_enable(b->client.chan);
++	if (ret)
++		goto retained;
++	if (time_after_eq(jiffies, deadline)) {
++		ret = -ETIMEDOUT;
++		goto retained;
++	}
++	ret = mbox_send_message(b->client.chan, &b->packet);
++	if (ret < 0)
++		goto retained;
++	mbox_client_txdone(b->client.chan, 0);
++	remaining = (long)(deadline - jiffies);
++	if (remaining <= 0 || !wait_for_completion_timeout(&b->done, remaining)) {
++		ret = -ETIMEDOUT;
++		goto retained;
++	}
++	ret = READ_ONCE(b->packet_status);
++	if (ret)
++		goto retained;
++	/* IRQ callback completion precedes unlink/free/disable. Acquire its
++	 * channel lock through the read-only idle helper before freeing DMA.
++	 */
++	while (!cmdq_mbox_channel_idle(b->client.chan)) {
++		if (time_after_eq(jiffies, deadline)) {
++			ret = -ETIMEDOUT;
++			goto retained;
++		}
++		usleep_range(50, 100);
++	}
++	ret = pm_runtime_put_sync_suspend(b->client.chan->mbox->dev);
++	b->gce_held = false; /* The put consumes the reference even on failure. */
++	if (ret < 0)
++		goto retained;
++	mtk_va_release_prepared(b);
++	b->initial_done = true;
++	b->state = MTK_DISP_VA_TRANSLATED;
++	ret = 0;
++	dev_dbg(b->dev, "VA transaction initial=%u retired; runtime resources released\n", initial);
++	goto unlock;
++retained:
++	dev_err(b->dev, "VA transaction result=%d; unknown completion quarantined until reboot\n", ret);
++unlock:
++	mutex_unlock(&b->lock);
++	return ret;
++}
++
++static void mtk_va_put_device(void *dev)
++{
++	put_device(dev);
++}
++
++static int mtk_va_add_supplier(struct mtk_disp_va_bootstrap *b,
++			       struct device_node *np)
++{
++	struct platform_device *pdev = of_find_device_by_node(np);
++	struct device *supplier;
++	int ret;
++
++	if (!pdev)
++		return -EPROBE_DEFER;
++	supplier = &pdev->dev;
++	if (!device_is_bound(supplier)) {
++		put_device(supplier);
++		return -EPROBE_DEFER;
++	}
++	ret = devm_add_action_or_reset(b->dev, mtk_va_put_device, supplier);
++	if (ret)
++		return ret;
++	if (!device_link_add(b->dev, supplier,
++			     DL_FLAG_PM_RUNTIME | DL_FLAG_AUTOREMOVE_SUPPLIER))
++		return -ENOMEM;
++	b->suppliers[b->num_suppliers++] = supplier;
++	return 0;
++}
++
++static int mtk_va_map_ovl(struct mtk_disp_va_bootstrap *b, unsigned int index,
++			 struct device_node *np)
++{
++	struct resource res;
++	int ret;
++
++	ret = of_address_to_resource(np, 0, &res);
++	if (ret || resource_size(&res) < 0x1000)
++		return -EINVAL;
++	b->ovl[index] = devm_ioremap(b->dev, res.start, 0x1000);
++	return b->ovl[index] ? 0 : -ENOMEM;
++}
++
++static int mtk_va_probe(struct platform_device *pdev)
++{
++	static const unsigned int represented[] = { 0, 1, 2, 4, 5, 6 };
++	static const char * const extra_ovls[] = { "ovl3", "ovl7" };
++	static const char * const postmasks[] = { "postmask0", "postmask1" };
++	struct device *dev = &pdev->dev;
++	struct device_node *np = dev->of_node, *supplier;
++	struct mtk_disp_va_bootstrap *b;
++	struct resource res;
++	unsigned int i;
++	int ret, count;
++
++	b = devm_kzalloc(dev, sizeof(*b), GFP_KERNEL);
++	if (!b)
++		return -ENOMEM;
++	b->dev = dev;
++	mutex_init(&b->lock);
++	b->num_clocks = devm_clk_bulk_get_all(dev, &b->clocks);
++	if (b->num_clocks < 0)
++		return b->num_clocks;
++	/* Eight OVL gates, both POSTMASK gates, GCE_D and GCE 26 MHz. */
++	if (b->num_clocks != 12)
++		return -EINVAL;
++	count = of_count_phandle_with_args(np, "mediatek,suppliers", NULL);
++	if (count != MTK_VA_SUPPLIERS)
++		return -EINVAL;
++	for (i = 0; i < count; i++) {
++		supplier = of_parse_phandle(np, "mediatek,suppliers", i);
++		ret = mtk_va_add_supplier(b, supplier);
++		of_node_put(supplier);
++		if (ret)
++			return dev_err_probe(dev, ret, "bootstrap supplier %u\n", i);
++	}
++	for (i = 0; i < ARRAY_SIZE(represented); i++) {
++		supplier = of_parse_phandle(np, "mediatek,ovls", i);
++		if (!supplier)
++			return -EINVAL;
++		ret = mtk_va_map_ovl(b, represented[i], supplier);
++		if (ret) {
++			of_node_put(supplier);
++			return ret;
++		}
++		{
++			struct platform_device *ovl = of_find_device_by_node(supplier);
++
++			if (!ovl)
++				ret = -EPROBE_DEFER;
++			else {
++				b->ovl_devs[i] = &ovl->dev;
++				if (!i)
++					b->dma_dev = &ovl->dev;
++				ret = devm_add_action_or_reset(dev, mtk_va_put_device,
++						      &ovl->dev);
++			}
++		}
++		of_node_put(supplier);
++		if (ret)
++			return ret;
++	}
++	for (i = 0; i < 2; i++) {
++		struct resource *r;
++
++		r = platform_get_resource_byname(pdev, IORESOURCE_MEM, extra_ovls[i]);
++		if (!r || resource_size(r) < 0x1000)
++			return -EINVAL;
++		b->ovl[3 + 4 * i] = devm_ioremap(dev, r->start, 0x1000);
++		r = platform_get_resource_byname(pdev, IORESOURCE_MEM, postmasks[i]);
++		if (!r || resource_size(r) < 0x1000)
++			return -EINVAL;
++		b->postmask[i] = devm_ioremap(dev, r->start, 0x1000);
++		if (!b->ovl[3 + 4 * i] || !b->postmask[i])
++			return -ENOMEM;
++	}
++	supplier = of_parse_phandle(np, "memory-region", 0);
++	ret = supplier ? of_address_to_resource(supplier, 0, &b->identity) : -EINVAL;
++	if (supplier && !of_property_present(supplier, "no-map"))
++		ret = -EINVAL;
++	of_node_put(supplier);
++	if (ret)
++		return ret;
++	supplier = of_parse_phandle(np, "memory-region", 1);
++	ret = supplier ? of_address_to_resource(supplier, 0, &res) : -EINVAL;
++	if (supplier && !of_property_present(supplier, "no-map"))
++		ret = -EINVAL;
++	of_node_put(supplier);
++	if (ret || res.start != 0x33fe00000ULL || resource_size(&res) != SZ_1M)
++		return -EINVAL;
++	platform_set_drvdata(pdev, b);
++	b->client.client.dev = dev;
++	b->client.client.knows_txdone = true;
++	b->client.client.rx_callback = mtk_va_done;
++	b->client.chan = mbox_request_channel(&b->client.client, 0);
++	if (IS_ERR(b->client.chan))
++		return PTR_ERR(b->client.chan);
++	pm_runtime_enable(dev);
++	return 0;
++}
++
++static int mtk_disp_va_gate(struct device *consumer, bool initial)
++{
++	struct device_node *np;
++	struct platform_device *pdev;
++	struct mtk_disp_va_bootstrap *b;
++	int ret;
++
++	np = of_parse_phandle(consumer->parent->of_node, "mediatek,display-va-bootstrap", 0);
++	if (!np)
++		return 0;
++	pdev = of_find_device_by_node(np);
++	of_node_put(np);
++	if (!pdev)
++		return -EPROBE_DEFER;
++	if (!device_is_bound(&pdev->dev)) {
++		ret = -EPROBE_DEFER;
++		goto put;
++	}
++	/* The dedicated built-in provider has an independent boot lifetime.
++	 * Keep the get_device reference across this synchronous gate. Manual
++	 * provider/supplier removal is unsupported; no master lifetime link
++	 * is needed or used during component-framework probe/bind ordering.
++	 */
++	b = platform_get_drvdata(pdev);
++	ret = b ? mtk_disp_va_bootstrap_run(b, initial) : -EPROBE_DEFER;
++put:
++	put_device(&pdev->dev);
++	return ret;
++}
++
++int mtk_disp_va_bootstrap_gate(struct device *consumer)
++{
++	return mtk_disp_va_gate(consumer, true);
++}
++
++int mtk_disp_va_runtime_gate(struct device *consumer)
++{
++	return mtk_disp_va_gate(consumer, false);
++}
++
++static const struct of_device_id mtk_va_of_match[] = {
++	{ .compatible = "mediatek,mt6897-display-va-bootstrap" },
++	{ }
++};
++
++static struct platform_driver mtk_va_driver = {
++	.probe = mtk_va_probe,
++	.driver = {
++		.name = "mt6897-display-va-bootstrap",
++		.of_match_table = mtk_va_of_match,
++		.suppress_bind_attrs = true,
++	},
++};
++/* Independent lifetime protects quarantined callbacks on DRM bind failure. */
++builtin_platform_driver(mtk_va_driver);
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_drv.c b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+index 5f4b2ba504..f5afb1abc2 100644
+--- a/drivers/gpu/drm/mediatek/mtk_drm_drv.c
++++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+@@ -35,6 +35,7 @@
+ #include "mtk_ddp_comp.h"
+ #include "mtk_disp_drv.h"
+ #include "mtk_drm_drv.h"
++#include "mtk_disp_va.h"
+ #include "mtk_drm_legacy.h"
+ 
+ #define DRIVER_NAME "mediatek"
+@@ -121,6 +122,42 @@ static const struct mtk_mmsys_driver_data mt8192_mmsys_driver_data = {
+ 	.mmsys_dev_num = 1,
+ };
+ 
++/*
++ * MT6897: two OVLSYS and two DISPSYS controllers; the paths come from the
++ * devicetree graph.
++ */
++static const struct mtk_mmsys_driver_data mt6897_dispsys0_driver_data = {
++	.mmsys_id = 0,
++	.mmsys_dev_num = 4,
++	.max_width = 4096,
++	.min_width = 1,
++	.min_height = 1,
++};
++
++static const struct mtk_mmsys_driver_data mt6897_dispsys1_driver_data = {
++	.mmsys_id = 1,
++	.mmsys_dev_num = 4,
++	.max_width = 4096,
++	.min_width = 1,
++	.min_height = 1,
++};
++
++static const struct mtk_mmsys_driver_data mt6897_ovlsys0_driver_data = {
++	.mmsys_id = 2,
++	.mmsys_dev_num = 4,
++	.max_width = 4096,
++	.min_width = 1,
++	.min_height = 1,
++};
++
++static const struct mtk_mmsys_driver_data mt6897_ovlsys1_driver_data = {
++	.mmsys_id = 3,
++	.mmsys_dev_num = 4,
++	.max_width = 4096,
++	.min_width = 1,
++	.min_height = 1,
++};
++
+ static const struct mtk_mmsys_driver_data mt8195_vdosys0_driver_data = {
+ 	.output_paths = mt8195_vdo0_legacy_paths,
+ 	.mmsys_dev_num = 2,
+@@ -149,6 +186,14 @@ static const struct of_device_id mtk_drm_of_ids[] = {
+ 	  .data = &mt7623_mmsys_driver_data},
+ 	{ .compatible = "mediatek,mt2712-mmsys",
+ 	  .data = &mt2712_mmsys_driver_data},
++	{ .compatible = "mediatek,mt6897-dispsys0",
++	  .data = &mt6897_dispsys0_driver_data},
++	{ .compatible = "mediatek,mt6897-dispsys1",
++	  .data = &mt6897_dispsys1_driver_data},
++	{ .compatible = "mediatek,mt6897-ovlsys0",
++	  .data = &mt6897_ovlsys0_driver_data},
++	{ .compatible = "mediatek,mt6897-ovlsys1",
++	  .data = &mt6897_ovlsys1_driver_data},
+ 	{ .compatible = "mediatek,mt8167-mmsys",
+ 	  .data = &mt8167_mmsys_driver_data},
+ 	{ .compatible = "mediatek,mt8173-mmsys",
+@@ -175,84 +220,86 @@ static const struct of_device_id mtk_drm_of_ids[] = {
+ };
+ MODULE_DEVICE_TABLE(of, mtk_drm_of_ids);
+ 
+-static int mtk_drm_match(struct device *dev, const void *data)
++/*
++ * Serialises the bound flags of all controllers of a multi-mmsys display and
++ * the choice of the controller that initialises the DRM device, so that the
++ * controller completing the set does it once, whatever the bind order.
++ */
++static DEFINE_MUTEX(mtk_drm_bind_lock);
++
++struct mtk_drm_ctrl_scan {
++	struct mtk_drm_private **privs;
++	unsigned int num;
++	unsigned long found;
++	unsigned long bound;
++	bool has_master;
++};
++
++static int mtk_drm_ctrl_scan_one(struct device *dev, void *data)
+ {
+-	if (!strncmp(dev_name(dev), "mediatek-drm", sizeof("mediatek-drm") - 1))
+-		return true;
+-	return false;
++	struct mtk_drm_ctrl_scan *scan = data;
++	struct mtk_drm_private *priv = dev_get_drvdata(dev);
++
++	if (!priv || priv->data->mmsys_dev_num != scan->num ||
++	    priv->data->mmsys_id >= scan->num)
++		return 0;
++
++	scan->privs[priv->data->mmsys_id] = priv;
++	scan->found |= BIT(priv->data->mmsys_id);
++	if (priv->mtk_drm_bound)
++		scan->bound |= BIT(priv->data->mmsys_id);
++	if (priv->drm_master)
++		scan->has_master = true;
++
++	return 0;
+ }
+ 
++/*
++ * Called with mtk_drm_bind_lock held. Look at every bound mediatek-drm
++ * controller device; when all controllers of this display are bound and none
++ * has created the DRM device yet, link their private data and return true:
++ * the caller then initialises the DRM device.
++ */
+ static bool mtk_drm_get_all_drm_priv(struct device *dev)
+ {
+ 	struct mtk_drm_private *drm_priv = dev_get_drvdata(dev);
+-	struct mtk_drm_private **all_drm_priv;
+-	struct mtk_drm_private *temp_drm_priv;
+-	struct device_node *phandle = dev->parent->of_node;
+-	const struct of_device_id *of_id;
+-	struct device_node *node;
+-	struct device *drm_dev;
+-	unsigned int cnt = 0;
+-	bool all_privs_found;
++	unsigned int num = drm_priv->data->mmsys_dev_num;
++	struct mtk_drm_ctrl_scan scan = { .num = num };
++	unsigned long all = GENMASK(num - 1, 0);
++	bool init;
+ 	int i, j;
+ 
+-	dev_vdbg(dev, "Populating private data for all controllers on ID%u\n",
+-		 drm_priv->data->mmsys_id);
+-
+-	/* Avoid variable length arrays and allocate an array of pointers to privs */
+-	all_drm_priv = kmalloc_array(drm_priv->data->mmsys_dev_num,
+-				     sizeof(struct mtk_drm_private *), GFP_KERNEL);
+-	if (!all_drm_priv)
+-		return -ENOMEM;
+-
+-	for_each_child_of_node(phandle->parent, node) {
+-		struct platform_device *pdev;
+-
+-		of_id = of_match_node(mtk_drm_of_ids, node);
+-		if (!of_id)
+-			continue;
+-
+-		pdev = of_find_device_by_node(node);
+-		if (!pdev)
+-			continue;
+-
+-		drm_dev = device_find_child(&pdev->dev, NULL, mtk_drm_match);
+-		put_device(&pdev->dev);
+-		if (!drm_dev)
+-			continue;
+-
+-		temp_drm_priv = dev_get_drvdata(drm_dev);
+-		put_device(drm_dev);
+-		if (!temp_drm_priv)
+-			continue;
+-
+-		/* Assign each probed controller's priv pointer to the array */
+-		all_drm_priv[temp_drm_priv->data->mmsys_id] = temp_drm_priv;
++	lockdep_assert_held(&mtk_drm_bind_lock);
+ 
+-		if (temp_drm_priv->mtk_drm_bound)
+-			cnt++;
+-
+-		if (cnt == drm_priv->data->mmsys_dev_num) {
+-			of_node_put(node);
+-			break;
+-		}
+-	}
++	scan.privs = kcalloc(num, sizeof(*scan.privs), GFP_KERNEL);
++	if (!scan.privs)
++		return false;
+ 
+ 	/*
+-	 * If all controller priv pointers were found, initialize them all so
+-	 * that every controller has pointers to the mtk_drm_private of all
+-	 * the others.
++	 * This controller may still be inside its own probe (component master
++	 * added at the end of probe), where it is not yet on the driver's
++	 * device list: count it explicitly.
+ 	 */
+-	all_privs_found = drm_priv->data->mmsys_dev_num == cnt;
+-	if (all_privs_found) {
+-		for (i = 0; i < cnt; i++)
+-			for (j = 0; j < cnt; j++)
+-				all_drm_priv[j]->all_drm_private[i] = all_drm_priv[i];
++	mtk_drm_ctrl_scan_one(dev, &scan);
++	if (driver_for_each_device(dev->driver, NULL, &scan, mtk_drm_ctrl_scan_one))
++		dev_dbg(dev, "controller scan stopped early\n");
++
++	init = scan.bound == all && !scan.has_master;
++	dev_dbg(dev, "controller %u bound: found %#lx bound %#lx of %#lx, %s\n",
++		drm_priv->data->mmsys_id, scan.found, scan.bound, all,
++		init ? "initialising the DRM device" :
++		scan.has_master ? "DRM device already initialised" :
++		"waiting for the other controllers");
++
++	if (init) {
++		for (i = 0; i < num; i++)
++			for (j = 0; j < num; j++)
++				scan.privs[j]->all_drm_private[i] = scan.privs[i];
+ 	}
+ 
+-	/* Done using the temporary array of pointers: free it now. */
+-	kfree(all_drm_priv);
++	kfree(scan.privs);
+ 
+-	return all_privs_found;
++	return init;
+ }
+ 
+ static bool mtk_drm_find_mmsys_comp(struct mtk_drm_private *private,
+@@ -393,6 +440,8 @@ static int mtk_drm_kms_init(struct drm_device *drm)
+ 	struct mtk_drm_private *private = drm->dev_private;
+ 	struct mtk_drm_private *priv_n;
+ 	struct device *dma_dev = NULL;
++	struct drm_encoder *encoder;
++	s8 path_crtc[MAX_CRTC];
+ 	struct drm_crtc *crtc;
+ 	int num_failed = 0;
+ 	int num_paths = 0;
+@@ -447,6 +496,10 @@ static int mtk_drm_kms_init(struct drm_device *drm)
+ 	 *    third path.
+ 	 */
+ 	for (i = 0; i < MAX_CRTC; i++) {
++		unsigned int num_crtc = drm->mode_config.num_crtc;
++
++		path_crtc[i] = -1;
++
+ 		for (j = 0; j < private->data->mmsys_dev_num; j++) {
+ 			priv_n = private->all_drm_private[j];
+ 
+@@ -477,6 +530,25 @@ static int mtk_drm_kms_init(struct drm_device *drm)
+ 
+ 			num_failed++;
+ 		}
++
++		/* A shadow path of another CRTC creates none */
++		if (drm->mode_config.num_crtc > num_crtc)
++			path_crtc[i] = num_crtc;
++	}
++
++	/*
++	 * The encoders name their paths in possible_crtcs, but CRTC indices
++	 * are dense: shadow paths do not take one. Map paths to CRTCs.
++	 */
++	drm_for_each_encoder(encoder, drm) {
++		u32 possible_crtcs = 0;
++
++		for (i = 0; i < MAX_CRTC; i++)
++			if ((encoder->possible_crtcs & BIT(i)) && path_crtc[i] >= 0)
++				possible_crtcs |= BIT(path_crtc[i]);
++
++		if (possible_crtcs)
++			encoder->possible_crtcs = possible_crtcs;
+ 	}
+ 
+ 	if (num_failed == num_paths) {
+@@ -485,6 +557,10 @@ static int mtk_drm_kms_init(struct drm_device *drm)
+ 		goto err_component_unbind;
+ 	}
+ 
++	ret = mtk_disp_va_bootstrap_gate(private->dev);
++	if (ret)
++		goto err_component_unbind;
++
+ 	/* IGT will check if the cursor size is configured */
+ 	drm->mode_config.cursor_width = 512;
+ 	drm->mode_config.cursor_height = 512;
+@@ -563,13 +639,18 @@ static int mtk_drm_bind(struct device *dev)
+ 	}
+ 
+ 	private->mutex_dev = &pdev->dev;
+-	private->mtk_drm_bound = true;
+ 	private->dev = dev;
+ 
++	mutex_lock(&mtk_drm_bind_lock);
++	private->mtk_drm_bound = true;
+ 	if (!mtk_drm_get_all_drm_priv(dev)) {
++		mutex_unlock(&mtk_drm_bind_lock);
+ 		put_device(private->mutex_dev);
+ 		return 0;
+ 	}
++	/* Claimed under the lock: no other controller initialises it as well */
++	private->drm_master = true;
++	mutex_unlock(&mtk_drm_bind_lock);
+ 
+ 	drm = drm_dev_alloc(&mtk_drm_driver, dev);
+ 	if (IS_ERR(drm)) {
+@@ -577,7 +658,6 @@ static int mtk_drm_bind(struct device *dev)
+ 		goto err_put_dev;
+ 	}
+ 
+-	private->drm_master = true;
+ 	drm->dev_private = private;
+ 	for (i = 0; i < private->data->mmsys_dev_num; i++)
+ 		private->all_drm_private[i]->drm = drm;
+@@ -606,6 +686,9 @@ static int mtk_drm_bind(struct device *dev)
+ 	for (i = 0; i < private->data->mmsys_dev_num; i++)
+ 		private->all_drm_private[i]->drm = NULL;
+ err_put_dev:
++	mutex_lock(&mtk_drm_bind_lock);
++	private->drm_master = false;
++	mutex_unlock(&mtk_drm_bind_lock);
+ 	put_device(private->mutex_dev);
+ 	return ret;
+ }
+@@ -621,8 +704,10 @@ static void mtk_drm_unbind(struct device *dev)
+ 		drm_dev_put(private->drm);
+ 		put_device(private->mutex_dev);
+ 	}
++	mutex_lock(&mtk_drm_bind_lock);
+ 	private->mtk_drm_bound = false;
+ 	private->drm_master = false;
++	mutex_unlock(&mtk_drm_bind_lock);
+ 	private->drm = NULL;
+ }
+ 
+@@ -654,12 +739,36 @@ static const struct of_device_id mtk_ddp_comp_dt_ids[] = {
+ 	  .data = (void *)MTK_DISP_COLOR },
+ 	{ .compatible = "mediatek,mt8173-disp-color",
+ 	  .data = (void *)MTK_DISP_COLOR },
++	{ .compatible = "mediatek,mt6897-disp-direct-link",
++	  .data = (void *)MTK_DISP_DIRECT_LINK },
+ 	{ .compatible = "mediatek,mt8196-disp-direct-link",
+ 	  .data = (void *)MTK_DISP_DIRECT_LINK },
+ 	{ .compatible = "mediatek,mt8167-disp-dither",
+ 	  .data = (void *)MTK_DISP_DITHER },
+ 	{ .compatible = "mediatek,mt8183-disp-dither",
+ 	  .data = (void *)MTK_DISP_DITHER },
++	{ .compatible = "mediatek,mt6897-disp-aal",
++	  .data = (void *)MTK_DISP_PQ_RELAY },
++	{ .compatible = "mediatek,mt6897-disp-ccorr",
++	  .data = (void *)MTK_DISP_PQ_RELAY },
++	{ .compatible = "mediatek,mt6897-disp-dither",
++	  .data = (void *)MTK_DISP_PQ_RELAY },
++	{ .compatible = "mediatek,mt6897-disp-gamma",
++	  .data = (void *)MTK_DISP_PQ_RELAY },
++	{ .compatible = "mediatek,mt6897-disp-c3d",
++	  .data = (void *)MTK_DISP_PQ_RELAY },
++	{ .compatible = "mediatek,mt6897-disp-chist",
++	  .data = (void *)MTK_DISP_PQ_RELAY },
++	{ .compatible = "mediatek,mt6897-disp-mdp-aal",
++	  .data = (void *)MTK_DISP_PQ_RELAY },
++	{ .compatible = "mediatek,mt6897-disp-oddmr",
++	  .data = (void *)MTK_DISP_PQ_RELAY },
++	{ .compatible = "mediatek,mt6897-disp-postalign",
++	  .data = (void *)MTK_DISP_PQ_RELAY },
++	{ .compatible = "mediatek,mt6897-disp-spr",
++	  .data = (void *)MTK_DISP_PQ_RELAY },
++	{ .compatible = "mediatek,mt6897-disp-dsc",
++	  .data = (void *)MTK_DISP_DSC },
+ 	{ .compatible = "mediatek,mt8195-disp-dsc",
+ 	  .data = (void *)MTK_DISP_DSC },
+ 	{ .compatible = "mediatek,mt8196-disp-exdma",
+@@ -680,6 +789,12 @@ static const struct of_device_id mtk_ddp_comp_dt_ids[] = {
+ 	  .data = (void *)MTK_DISP_MUTEX },
+ 	{ .compatible = "mediatek,mt8167-disp-mutex",
+ 	  .data = (void *)MTK_DISP_MUTEX },
++	{ .compatible = "mediatek,mt6897-dispsys0-mutex",
++	  .data = (void *)MTK_DISP_MUTEX },
++	{ .compatible = "mediatek,mt6897-dispsys1-mutex",
++	  .data = (void *)MTK_DISP_MUTEX },
++	{ .compatible = "mediatek,mt6897-ovlsys-mutex",
++	  .data = (void *)MTK_DISP_MUTEX },
+ 	{ .compatible = "mediatek,mt8173-disp-mutex",
+ 	  .data = (void *)MTK_DISP_MUTEX },
+ 	{ .compatible = "mediatek,mt8183-disp-mutex",
+@@ -712,6 +827,8 @@ static const struct of_device_id mtk_ddp_comp_dt_ids[] = {
+ 	  .data = (void *)MTK_DISP_OVL },
+ 	{ .compatible = "mediatek,mt8183-disp-ovl-2l",
+ 	  .data = (void *)MTK_DISP_OVL_2L },
++	{ .compatible = "mediatek,mt6897-disp-ovl-2l",
++	  .data = (void *)MTK_DISP_OVL_2L },
+ 	{ .compatible = "mediatek,mt8192-disp-ovl-2l",
+ 	  .data = (void *)MTK_DISP_OVL_2L },
+ 	{ .compatible = "mediatek,mt8192-disp-postmask",
+@@ -742,6 +859,8 @@ static const struct of_device_id mtk_ddp_comp_dt_ids[] = {
+ 	  .data = (void *)MTK_DISP_WDMA },
+ 	{ .compatible = "mediatek,mt8173-disp-wdma",
+ 	  .data = (void *)MTK_DISP_WDMA },
++	{ .compatible = "mediatek,mt6897-ovl-direct-link",
++	  .data = (void *)MTK_DISP_DIRECT_LINK },
+ 	{ .compatible = "mediatek,mt8196-ovl-direct-link",
+ 	  .data = (void *)MTK_DISP_DIRECT_LINK },
+ 	{ .compatible = "mediatek,mt2701-dpi",
+@@ -754,6 +873,8 @@ static const struct of_device_id mtk_ddp_comp_dt_ids[] = {
+ 	  .data = (void *)MTK_DISP_DPI },
+ 	{ .compatible = "mediatek,mt8186-dpi",
+ 	  .data = (void *)MTK_DISP_DPI },
++	{ .compatible = "mediatek,mt6897-dp-intf",
++	  .data = (void *)MTK_DISP_DP_INTF },
+ 	{ .compatible = "mediatek,mt8188-dp-intf",
+ 	  .data = (void *)MTK_DISP_DP_INTF },
+ 	{ .compatible = "mediatek,mt8192-dpi",
+@@ -764,6 +885,8 @@ static const struct of_device_id mtk_ddp_comp_dt_ids[] = {
+ 	  .data = (void *)MTK_DISP_DPI },
+ 	{ .compatible = "mediatek,mt2701-dsi",
+ 	  .data = (void *)MTK_DISP_DSI },
++	{ .compatible = "mediatek,mt6897-dsi",
++	  .data = (void *)MTK_DISP_DSI },
+ 	{ .compatible = "mediatek,mt8173-dsi",
+ 	  .data = (void *)MTK_DISP_DSI },
+ 	{ .compatible = "mediatek,mt8183-dsi",
+@@ -860,12 +983,14 @@ static int mtk_drm_of_get_first_input(struct device *dev, struct device_node *no
+ 			return -ENOENT;
+ 		of_node_put(remote_port);
+ 
+-		/* All even ports describe inputs, all odd ports describe outputs */
+-		comp_type = (crtc_endpoint + 1) % 2 ?
+-			    MTK_DISP_DIRECT_LINK_IN : MTK_DISP_DIRECT_LINK_OUT;
++		/*
++		 * The first input is read from port 0, which is always an input:
++		 * the parity rule is about port numbers, not about the path
++		 * (endpoint) number.
++		 */
++		comp_type = MTK_DISP_DIRECT_LINK_IN;
+ 
+-		dev_dbg(dev, "Found First DirectLink %s with port %pOF and ID %u\n",
+-			comp_type == MTK_DISP_DIRECT_LINK_OUT ? "OUT" : "IN",
++		dev_dbg(dev, "Found First DirectLink IN with port %pOF and ID %u\n",
+ 			ep_in, crtc_endpoint);
+ 	}
+ 
+@@ -1342,6 +1467,9 @@ static int mtk_drm_register_sibling(struct device *dev, struct mtk_drm_private *
+ 			if (port_id % 2)
+ 				comp_type = MTK_DISP_DIRECT_LINK_OUT;
+ 
++			/* A port without endpoints must not return a stale value */
++			ret = 0;
++
+ 			for_each_of_graph_port_endpoint(port, ep) {
+ 				struct of_endpoint of_ep;
+ 
+-- 
+2.56.0
+

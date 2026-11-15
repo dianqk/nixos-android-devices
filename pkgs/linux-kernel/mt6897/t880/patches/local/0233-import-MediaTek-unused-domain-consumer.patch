@@ -1,0 +1,105 @@
+From 211e184e650c6486e71852387aaa9981d2ebce49 Mon Sep 17 00:00:00 2001
+From: pswbuild <pswbuild@oppo.com>
+Date: Fri, 20 Mar 2026 03:11:53 +0000
+Subject: [PATCH] Synchronize code for OnePlus OPD2407_16.0.2.400(CN01) Based
+ on MTK release TAG:
+ alps/kernel/build/bazel_mgk_rules:t-alps-release-u0.mp1.rc-V10.29
+ alps/vendor/mediatek/kernel_modules/connectivity/bt/linux_v2_mt6653:t-alps-release-u0.mp1.rc-V10.29
+ alps/vendor/mediatek/kernel_modules/connectivity/bt/mt66xx:t-alps-release-u0.mp1.rc-V10.29
+ alps/vendor/mediatek/kernel_modules/connectivity/bt/mt76xx/sdio:t-alps-release-u0.mp1.rc-V10.29
+ alps/vendor/mediatek/kernel_modules/connectivity/common:t-alps-release-u0.mp1.rc-V10.29
+ alps/vendor/mediatek/kernel_modules/connectivity/connfem:t-alps-release-u0.mp1.rc-V10.29
+ alps/vendor/mediatek/kernel_modules/connectivity/conninfra:t-alps-release-u0.mp1.rc-V10.29
+ alps/vendor/mediatek/kernel_modules/connectivity/conninfra_mt6653:t-alps-release-u0.mp1.rc-V10.29
+ alps/vendor/mediatek/kernel_modules/connectivity/fmradio:t-alps-release-u0.mp1.rc-V10.29
+ alps/vendor/mediatek/kernel_modules/connectivity/gps:t-alps-release-u0.mp1.rc-V10.29
+ alps/vendor/mediatek/kernel_modules/connectivity/wlan/adaptor:t-alps-release-u0.mp1.rc-V10.29
+ alps/vendor/mediatek/kernel_modules/connectivity/wlan/adaptor_mt6653:t-alps-release-u0.mp1.rc-V10.29
+ alps/vendor/mediatek/kernel_modules/connectivity/wlan/core/gen2:t-alps-release-u0.mp1.rc-V10.29
+ alps/vendor/mediatek/kernel_modules/connectivity/wlan/core/gen3:t-alps-release-u0.mp1.rc-V10.29
+ alps/vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4-mt7663:t-alps-release-u0.mp1.rc-V10.29
+ alps/vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4-mt7668:t-alps-release-u0.mp1.rc-V10.29
+ alps/vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4-mt79xx:t-alps-release-u0.mp1.rc-V10.29
+ alps/vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m_mt6653:t-alps-release-u0.mp1.rc-V10.29
+ alps/vendor/mediatek/kernel_modules/gpu:t-alps-release-u0.mp1.rc-V10.29
+ alps/vendor/mediatek/kernel_modules/hbt_driver:t-alps-release-v0.mp1.rc-V14.10
+ alps/vendor/mediatek/kernel_modules/hbt_driver_cus:t-alps-release-v0.mp1.rc-V14.10
+ alps/vendor/mediatek/kernel_modules/met_drv_v2:t-alps-release-u0.mp1.rc-V10.29
+ alps/vendor/mediatek/kernel_modules/met_drv_v3:t-alps-release-u0.mp1.rc-V10.29
+ alps/vendor/mediatek/kernel_modules/sched_cus:t-alps-release-u0.mp1.rc-V10.29
+ alps/vendor/mediatek/kernel_modules/udc:t-alps-release-u0.mp1.rc-V10.29
+ kernel/build:t-alps-release-u0.mp1.rc-V10.29
+ neptune/bt_driver/linux_v2:t-alps-release-u0.mp1.rc-V10.29
+ neptune/wlan_driver/gen4m:t-alps-release-u0.mp1.rc-V10.29
+ quark/kernel_device_modules-6.1:t-alps-release-u0.mp1.rc-V10.29
+ quark/mtkcam-kernel_device_modules:t-alps-release-u0.mp1.rc-V10.29
+
+Partial source-file import: retain only
+kernel/kernel_device_modules-6.1/drivers/soc/mediatek/mtk-pm-domain-disable-unused.c.
+The release-sync commit contains unrelated vendor trees; those are omitted.
+Integration and lifecycle changes follow separately.
+
+Link: https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_mt6897/commit/581b111f07d4368776397388737bc84312d921b7
+Link: https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_mt6897/blob/76792af3e1fefabd34be6dd684bfc9facc4d5b17/kernel/kernel_device_modules-6.1/drivers/soc/mediatek/mtk-pm-domain-disable-unused.c
+Signed-off-by: Dian QK <dianqk@dianqk.net>
+---
+ .../mediatek/mtk-pm-domain-disable-unused.c   | 47 +++++++++++++++++++
+ 1 file changed, 47 insertions(+)
+ create mode 100644 drivers/soc/mediatek/mtk-pm-domain-disable-unused.c
+
+diff --git a/drivers/soc/mediatek/mtk-pm-domain-disable-unused.c b/drivers/soc/mediatek/mtk-pm-domain-disable-unused.c
+new file mode 100644
+index 0000000000..b7576878c2
+--- /dev/null
++++ b/drivers/soc/mediatek/mtk-pm-domain-disable-unused.c
+@@ -0,0 +1,47 @@
++// SPDX-License-Identifier: GPL-2.0
++//
++// Copyright (c) 2021 MediaTek Inc.
++// Author: Owen Chen <owen.chen@mediatek.com>
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/pm_runtime.h>
++
++static const struct of_device_id scpsys_disable_unused_id_table[] = {
++	{ .compatible = "mediatek,scpsys-disable-unused",},
++	{ },
++};
++
++MODULE_DEVICE_TABLE(of, scpsys_disable_unused_id_table);
++
++static int scpsys_disable_unused_probe(struct platform_device *pdev)
++{
++	pm_runtime_enable(&pdev->dev);
++
++	return 0;
++}
++
++static struct platform_driver scpsys_disable_unused = {
++	.probe		= scpsys_disable_unused_probe,
++	.driver		= {
++		.name	= "scpsys_disable_unused",
++		.owner	= THIS_MODULE,
++		.of_match_table = scpsys_disable_unused_id_table,
++	},
++};
++
++static int __init scpsys_disable_unused_init(void)
++{
++	return platform_driver_register(&scpsys_disable_unused);
++}
++
++static void __exit scpsys_disable_unused_exit(void)
++{
++	platform_driver_unregister(&scpsys_disable_unused);
++}
++
++late_initcall_sync(scpsys_disable_unused_init);
++module_exit(scpsys_disable_unused_exit);
++MODULE_LICENSE("GPL");
+-- 
+2.56.0
+

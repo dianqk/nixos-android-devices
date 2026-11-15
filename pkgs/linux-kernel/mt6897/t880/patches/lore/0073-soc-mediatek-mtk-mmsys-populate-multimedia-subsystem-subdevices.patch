@@ -1,0 +1,51 @@
+From 2bbdc6a3d9e83400c79e4b8c7db8c5dcf3343e2f Mon Sep 17 00:00:00 2001
+From: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Date: Tue, 14 Jul 2026 13:44:09 +0200
+Subject: [PATCH] soc: mediatek: mtk-mmsys: Populate multimedia subsystem
+ subdevices
+
+The multimedia hardware subsystem contains all of the multimedia
+related sub-devices, and that really is by hardware design, not
+anything software related.
+
+In order to allow specifying a correct description of the hardware
+in devicetrees, add support for probing subdevices of multimedia
+controllers, specified as subnodes.
+
+Acked-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Signed-off-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Link: https://patchwork.kernel.org/project/linux-mediatek/list/?series=1127365
+[dianqk: from the Huge Restructuring v2 series, applied to v7.3-rc6; rc6 drift resolved]
+---
+ drivers/soc/mediatek/mtk-mmsys.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/drivers/soc/mediatek/mtk-mmsys.c b/drivers/soc/mediatek/mtk-mmsys.c
+index f501a29a76..6c02b89874 100644
+--- a/drivers/soc/mediatek/mtk-mmsys.c
++++ b/drivers/soc/mediatek/mtk-mmsys.c
+@@ -12,6 +12,7 @@
+ #include <linux/io.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/reset-controller.h>
+ #include <linux/soc/mediatek/mtk-mmsys.h>
+@@ -489,6 +490,13 @@ static int mtk_mmsys_probe(struct platform_device *pdev)
+ 		return PTR_ERR(clks);
+ 	mmsys->clks_pdev = clks;
+ 
++	ret = devm_of_platform_populate(dev);
++	if (ret) {
++		dev_err(dev, "Failed to populate child devices: %d\n", ret);
++		platform_device_unregister(clks);
++		return ret;
++	}
++
+ 	if (mmsys->data->is_vppsys)
+ 		goto out_probe_done;
+ 
+-- 
+2.56.0
+

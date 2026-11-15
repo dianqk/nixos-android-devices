@@ -24,6 +24,8 @@ static unsigned int boot_lun, enabled_mask, resets, lun_writes, reason_reads, re
 static unsigned char boot_ids[AB_MAX_LUNS];
 static unsigned int android_non_gpt_mask;
 #define CONFIG_EFI_MOBILE_QCOM_AB_ANDROID_NON_GPT_LUN_MASK android_non_gpt_mask
+static const char *non_slot_names;
+#define CONFIG_EFI_MOBILE_QCOM_AB_NON_SLOT_NAMES non_slot_names
 static unsigned char reason;
 static unsigned int fail_lun_write, fail_reason_read, fail_reason_write;
 static int reset_result, restore_failure;
@@ -98,6 +100,7 @@ static void prepare_adapter(void)
 	fixture(); active = true; boot_lun = 2; enabled_mask = 3; reason = 0x85;
 	memset(boot_ids, 0, sizeof(boot_ids)); boot_ids[0] = 1; boot_ids[1] = 2;
 	android_non_gpt_mask = 0;
+	non_slot_names = "";
 	resets = lun_writes = reason_reads = reason_writes = 0;
 	fail_lun_write = fail_reason_read = fail_reason_write = restore_failure = reset_result = 0;
 	fail_block_restoration = 0;
@@ -125,8 +128,13 @@ int main(void)
 	unsigned int count = 0;
 	/* Errors after metadata, boot-LUN and reason writes must restore all
 	 * three before returning, including PSCI success/error returns. */
+	for (unsigned int variant = 0; variant < 2; variant++)
 	for (unsigned int fault = 0; fault < 10; fault++) {
 		prepare_adapter(); memset(&result, 0, sizeof(result));
+		if (variant) {
+			unrelated_oem_metadata(3);
+			non_slot_names = oem_non_slot_names;
+		}
 		if (fault == 1) fail_write = 3;
 		if (fault == 2) fail_lun_write = 1;
 		if (fault == 3) fail_reason_write = 1;
@@ -148,6 +156,22 @@ int main(void)
 	assert(ab_execute_android(&result) < 0 && result.restore_status && !active);
 	assert(reason == 0x85 && !memcmp(media, original, sizeof(media)));
 	count++;
+	/* Policy cannot hide real target ambiguity, slot flags or snapshot state. */
+	for (unsigned int fault = 0; fault < 4; fault++) {
+		prepare_adapter(); unrelated_oem_metadata(3);
+		non_slot_names = fault ? oem_non_slot_names : "";
+		if (fault == 1) ab_put(slot_entry(1, 0, 8) + 48, AB_ACTIVE, 8);
+		if (fault == 2) entry(1, 10, "boot_a", 94);
+		if (fault == 3) media[0][26 * AB_BLOCK + 5] = 3;
+		for (unsigned int d = 0; d < 2; d++) {
+			memcpy(slot_entry(d, 1, 0), slot_entry(d, 0, 0), 12 * 128);
+			headers(d);
+		}
+		memcpy(original, media, sizeof(media));
+		assert(ab_execute_android(&result) < 0);
+		assert(!writes && !lun_writes && !reason_writes && !resets);
+		assert(!memcmp(media, original, sizeof(media))); count++;
+	}
 	/* Recovery gate is read only, even with a storage/backend fault. */
 	for (unsigned int fault = 0; fault < 5; fault++) {
 		struct ab_state state;

@@ -5,9 +5,48 @@
     feature = "device-asphalt",
     feature = "device-clover",
     feature = "device-sheng",
-    feature = "device-aurora"
+    feature = "device-aurora",
+    feature = "device-marble",
+    feature = "device-t880",
+    feature = "device-dodge"
 )))]
 compile_error!("select one supported device feature");
+#[cfg(all(
+    feature = "device-dodge",
+    any(
+        feature = "device-polaris",
+        feature = "device-asphalt",
+        feature = "device-clover",
+        feature = "device-sheng",
+        feature = "device-aurora",
+        feature = "device-marble",
+        feature = "device-t880"
+    )
+))]
+compile_error!("select only one device feature");
+#[cfg(all(feature = "device-dodge", not(feature = "ab-partitions")))]
+compile_error!("Dodge requires the ab-partitions capability");
+#[cfg(feature = "device-dodge")]
+mod dodge;
+#[cfg(feature = "device-dodge")]
+use dodge as selected;
+#[cfg(all(
+    feature = "device-t880",
+    any(
+        feature = "device-polaris",
+        feature = "device-asphalt",
+        feature = "device-clover",
+        feature = "device-sheng",
+        feature = "device-aurora"
+    )
+))]
+compile_error!("select only one device feature");
+#[cfg(all(feature = "device-t880", feature = "ab-partitions"))]
+compile_error!("T880 reads its slot from misc, not from a boot argument");
+#[cfg(feature = "device-t880")]
+mod t880;
+#[cfg(feature = "device-t880")]
+use t880 as selected;
 #[cfg(any(
     all(
         feature = "device-polaris",
@@ -34,6 +73,24 @@ compile_error!("select only one device feature");
     )
 ))]
 compile_error!("select only one device feature");
+#[cfg(all(
+    feature = "device-marble",
+    any(
+        feature = "device-polaris",
+        feature = "device-clover",
+        feature = "device-asphalt",
+        feature = "device-sheng",
+        feature = "device-aurora",
+        feature = "device-t880"
+    )
+))]
+compile_error!("select only one device feature");
+#[cfg(all(feature = "device-marble", not(feature = "ab-partitions")))]
+compile_error!("Marble requires the ab-partitions capability");
+#[cfg(feature = "device-marble")]
+mod marble;
+#[cfg(feature = "device-marble")]
+use marble as selected;
 #[cfg(all(feature = "device-aurora", not(feature = "ab-partitions")))]
 compile_error!("Aurora requires the ab-partitions capability");
 #[cfg(feature = "device-aurora")]
@@ -85,6 +142,9 @@ pub(crate) struct Item {
     pub action: Option<&'static str>,
 }
 
+/// Item whose action first asks how much Android userdata to keep.
+pub(crate) const PREPARE_INSTALL: &str = "prepare-install";
+
 pub(crate) const RECOVERY_ITEMS: &[Item] = &[
     Item {
         label: "Show recovery log",
@@ -101,6 +161,15 @@ pub(crate) const RECOVERY_ITEMS: &[Item] = &[
     Item {
         label: "Enter fastboot",
         action: Some("reboot-bootloader"),
+    },
+    // A/B storage: split userdata into the chosen Android size and Linux.
+    #[cfg(all(
+        any(feature = "ab-partitions", feature = "device-t880"),
+        feature = "recovery-daemon"
+    ))]
+    Item {
+        label: "Prepare Linux storage",
+        action: Some(PREPARE_INSTALL),
     },
     Item {
         label: "Power off",

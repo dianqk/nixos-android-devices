@@ -1,0 +1,46 @@
+From 688a58a1cd9f7a59fce7c464e7440e0b26e258b4 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Mon, 26 Oct 2026 12:00:00 +0800
+Subject: [PATCH 94/95] arm64: dts: qcom: sm8475-xiaomi-marble: disable
+ unsupported QCE
+
+Linux 7.3 marks CRYPTO_DEV_QCE as BROKEN: the driver cannot arbitrate
+access with the secure world and is slower than the CPU. No driver binds
+the SoC crypto node, yet it defaults to enabled and is an interconnect
+consumer, so fw_devlink keeps the qnoc-sm8450 interconnect providers
+(1700000.interconnect, interconnect-1) sync_state() pending for the
+whole boot. Until sync_state() the providers keep their boot-time
+bandwidth floors, so DDR never reaches its low-power state in suspend
+(qcom_stats ddr count stayed 0). Disable this Linux consumer on the
+board; leave the remote-controlled BAM and secure-world ownership
+untouched. CPU crypto remains available. Do not override BROKEN.
+
+This mirrors the Lenovo Asphalt (SM8475) and Xiaomi Aurora (SM8650)
+board changes.
+
+Reference: https://github.com/torvalds/linux/blob/v7.3/drivers/crypto/Kconfig
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ arch/arm64/boot/dts/qcom/sm8475-xiaomi-marble.dts | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-marble.dts b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-marble.dts
+index faa8e2b92e0a..7576ded31886 100644
+--- a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-marble.dts
++++ b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-marble.dts
+@@ -436,6 +436,14 @@ pm8450_l4: ldo4 {
+ 	};
+ };
+ 
++&crypto {
++	/*
++	 * CRYPTO_DEV_QCE is BROKEN in 7.3: no driver binds this node, which would
++	 * keep the interconnect providers' sync_state() pending.
++	 */
++	status = "disabled";
++};
++
+ &gpi_dma0 {
+ 	/*
+ 	 * iommus kept from sm8450.dtsi (SID 0x5b6, matches live stock): with

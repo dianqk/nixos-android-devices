@@ -1,0 +1,249 @@
+From 87fc6b3f088ae680a76e7cee6034cc22085be27d Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] mfd: mediatek: support MT6897 SPMI PMICs and IRQ lifecycle
+
+Support MT6363, MT6368 and MT6685 child devices. Correct IRQ allocation,
+masking, reset and status acknowledgement for the SPMI controller.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-15T19:08:54+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-15T19:41:12+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-15T19:09:26+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-16T03:48:52+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-16T07:44:41+08:00
+Link: https://lore.kernel.org/all/20260511101355.122478-6-angelogioacchino.delregno@collabora.com/
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/mfd/mtk-spmi-pmic.c | 103 +++++++++++++++++++++++++++++-------
+ 1 file changed, 83 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/mfd/mtk-spmi-pmic.c b/drivers/mfd/mtk-spmi-pmic.c
+index d1fc8156e6..17e1dd309d 100644
+--- a/drivers/mfd/mtk-spmi-pmic.c
++++ b/drivers/mfd/mtk-spmi-pmic.c
+@@ -12,6 +12,7 @@
+ #include <linux/device.h>
+ #include <linux/errno.h>
+ #include <linux/gfp.h>
++#include <linux/interrupt.h>
+ #include <linux/irq.h>
+ #include <linux/irqchip/chained_irq.h>
+ #include <linux/irqdomain.h>
+@@ -88,21 +89,27 @@ static void mtk_spmi_pmic_irq_set_unmasking(struct irq_data *d, bool unmask)
+ 	const struct mtk_spmi_pmic_variant *variant = pmic->variant;
+ 	struct regmap *regmap = pmic->regmap;
+ 	irq_hw_number_t hwirq = irqd_to_hwirq(d);
+-	unsigned short i;
++	int i;
+ 
+-	for (i = 0; i < variant->num_groups; i++) {
++	/* Groups are sorted by hwirq_base: find the last one starting below hwirq */
++	for (i = variant->num_groups - 1; i >= 0; i--) {
+ 		const struct mtk_spmi_pmic_irq_grp *irq_grp = &variant->pmic_irq[i];
++		unsigned int offset;
+ 		u32 con_reg;
+-		u8 irq_en_bit;
+ 
+ 		if (hwirq < irq_grp->hwirq_base)
+ 			continue;
+ 
+-		con_reg = irq_grp->con_reg + (variant->con_reg_len * i);
+-		irq_en_bit = hwirq - irq_grp->hwirq_base;
+-		regmap_assign_bits(regmap, con_reg, BIT(irq_en_bit), unmask);
++		offset = hwirq - irq_grp->hwirq_base;
++		if (offset >= irq_grp->num_int_regs * MTK_SPMI_PMIC_VAL_BITS)
++			return;
+ 
+-		break;
++		/* Each 8-bit control register is followed by its SET and CLR */
++		con_reg = irq_grp->con_reg +
++			  variant->con_reg_len * (offset / MTK_SPMI_PMIC_VAL_BITS);
++		regmap_assign_bits(regmap, con_reg,
++				   BIT(offset % MTK_SPMI_PMIC_VAL_BITS), unmask);
++		return;
+ 	}
+ }
+ 
+@@ -116,11 +123,19 @@ static void mtk_spmi_pmic_irq_unmask(struct irq_data *d)
+ 	mtk_spmi_pmic_irq_set_unmasking(d, true);
+ }
+ 
++static int mtk_spmi_pmic_irq_set_wake(struct irq_data *d, unsigned int on)
++{
++	struct mtk_spmi_pmic *pmic = irq_data_get_irq_chip_data(d);
++
++	/* All PMIC interrupts arrive through the parent (RCS) interrupt */
++	return irq_set_irq_wake(pmic->irq, on);
++}
++
+ static struct irq_chip mtk_spmi_pmic_irq_chip = {
+ 	.name = "mtk-spmi-pmic",
+ 	.irq_mask = mtk_spmi_pmic_irq_mask,
+ 	.irq_unmask = mtk_spmi_pmic_irq_unmask,
+-	.flags = IRQCHIP_SKIP_SET_WAKE,
++	.irq_set_wake = mtk_spmi_pmic_irq_set_wake,
+ };
+ 
+ static struct lock_class_key mtk_spmi_pmic_irq_lock_class, mtk_spmi_pmic_irq_request_class;
+@@ -186,9 +201,9 @@ static int mtk_spmi_pmic_irq_alloc(struct irq_domain *d, unsigned int virq,
+ 		return ret;
+ 
+ 	for (i = 0; i < nr_irqs; i++) {
+-		irq_set_lockdep_class(virq, &mtk_spmi_pmic_irq_lock_class,
++		irq_set_lockdep_class(virq + i, &mtk_spmi_pmic_irq_lock_class,
+ 				      &mtk_spmi_pmic_irq_request_class);
+-		irq_domain_set_info(d, virq, hwirq, &mtk_spmi_pmic_irq_chip,
++		irq_domain_set_info(d, virq + i, hwirq + i, &mtk_spmi_pmic_irq_chip,
+ 				    pmic, handle_level_irq, NULL, NULL);
+ 	}
+ 
+@@ -221,7 +236,13 @@ static int mtk_spmi_pmic_handle_group_irq(struct mtk_spmi_pmic *pmic, int group)
+ 		if (status == 0)
+ 			continue;
+ 
++		/*
++		 * Clear the latched status before dispatching, so that an
++		 * interrupt raised again while it is being handled is not lost.
++		 */
+ 		saved_status = status;
++		regmap_write(regmap, irq_grp->sta_reg + i, saved_status);
++
+ 		do {
+ 			irq_hw_number_t hwirq;
+ 			u8 bit = __ffs(status);
+@@ -239,9 +260,6 @@ static int mtk_spmi_pmic_handle_group_irq(struct mtk_spmi_pmic *pmic, int group)
+ 
+ 			generic_handle_domain_irq_safe(pmic->dom, hwirq);
+ 		} while (status);
+-
+-		/* Clear the interrupts by writing the previous status */
+-		regmap_write(regmap, irq_grp->sta_reg + i, saved_status);
+ 	}
+ 
+ 	return 0;
+@@ -263,10 +281,11 @@ static void mtk_spmi_pmic_handle_chained_irq(struct irq_desc *desc)
+ 	if (variant->irq_grp_reg > 0) {
+ 		ret = regmap_read(regmap, variant->irq_grp_reg, &val);
+ 		if (ret)
+-			handle_bad_irq(desc);
++			val = 0;
+ 
+ 		/* This is very unlikely to happen */
+ 		if (val == 0) {
++			regmap_write(regmap, MTK_SPMI_PMIC_RCS_IRQ_DONE, 1);
+ 			chained_irq_exit(chip, desc);
+ 			return;
+ 		}
+@@ -276,7 +295,7 @@ static void mtk_spmi_pmic_handle_chained_irq(struct irq_desc *desc)
+ 
+ 	for (i = 0; i < variant->num_groups; i++) {
+ 		const struct mtk_spmi_pmic_irq_grp *irq_grp = &variant->pmic_irq[i];
+-		u8 group_bit = BIT(irq_grp[i].group_num);
++		u8 group_bit = BIT(irq_grp->group_num);
+ 
+ 		if (val & group_bit) {
+ 			ret = mtk_spmi_pmic_handle_group_irq(pmic, i);
+@@ -296,11 +315,49 @@ static void mtk_spmi_pmic_handle_chained_irq(struct irq_desc *desc)
+ 	chained_irq_exit(chip, desc);
+ }
+ 
++/*
++ * Start from a known state, as the vendor driver does: the bootloader may
++ * leave interrupts enabled or pending, and the PMIC sends no new RCS
++ * request until the previous one is acknowledged.
++ */
++static int mtk_spmi_pmic_irq_reset(struct mtk_spmi_pmic *pmic)
++{
++	const struct mtk_spmi_pmic_variant *variant = pmic->variant;
++	struct regmap *regmap = pmic->regmap;
++	int i, j, ret;
++
++	for (i = 0; i < variant->num_groups; i++) {
++		const struct mtk_spmi_pmic_irq_grp *irq_grp = &variant->pmic_irq[i];
++
++		for (j = 0; j < irq_grp->num_int_regs; j++) {
++			ret = regmap_write(regmap, irq_grp->con_reg +
++					   variant->con_reg_len * j, 0);
++			if (ret)
++				return ret;
++
++			ret = regmap_write(regmap, irq_grp->sta_reg + j, 0xff);
++			if (ret)
++				return ret;
++		}
++	}
++
++	return regmap_write(regmap, MTK_SPMI_PMIC_RCS_IRQ_DONE, 1);
++}
++
+ static void mtk_spmi_pmic_irq_remove(void *data)
+ {
+ 	struct mtk_spmi_pmic *pmic = (struct mtk_spmi_pmic *)data;
++	const struct mtk_spmi_pmic_variant *variant = pmic->variant;
++	const struct mtk_spmi_pmic_irq_grp *last = &variant->pmic_irq[variant->num_groups - 1];
++	irq_hw_number_t hwirq, max_hwirq;
+ 
+ 	irq_set_chained_handler_and_data(pmic->irq, NULL, NULL);
++
++	/* The sub-devices are gone, but their mappings are still there */
++	max_hwirq = last->hwirq_base + last->num_int_regs * MTK_SPMI_PMIC_VAL_BITS;
++	for (hwirq = 0; hwirq < max_hwirq; hwirq++)
++		irq_dispose_mapping(irq_find_mapping(pmic->dom, hwirq));
++
+ 	irq_domain_remove(pmic->dom);
+ }
+ 
+@@ -316,22 +373,25 @@ static int mtk_spmi_pmic_irq_init(struct device *dev, struct regmap *regmap,
+ 		return -ENOMEM;
+ 
+ 	pmic->irq = of_irq_get(dev->of_node, 0);
+-	if (pmic->irq < 0)
+-		return dev_err_probe(dev, pmic->irq, "Cannot get IRQ\n");
++	if (pmic->irq <= 0)
++		return dev_err_probe(dev, pmic->irq ?: -ENXIO, "Cannot get IRQ\n");
+ 
+ 	pmic->dev = dev;
+ 	pmic->regmap = regmap;
+ 	pmic->variant = variant;
+ 
++	ret = mtk_spmi_pmic_irq_reset(pmic);
++	if (ret)
++		return dev_err_probe(dev, ret, "Cannot reset the interrupt controller\n");
++
+ 	pmic->dom = irq_domain_create_tree(fwnode, &mtk_spmi_pmic_irq_domain_ops, pmic);
+ 	if (!pmic->dom)
+ 		return dev_err_probe(dev, -ENOMEM, "Cannot create IRQ domain\n");
+ 
++	/* On failure this runs mtk_spmi_pmic_irq_remove() already */
+ 	ret = devm_add_action_or_reset(dev, mtk_spmi_pmic_irq_remove, pmic);
+-	if (ret) {
+-		irq_domain_remove(pmic->dom);
++	if (ret)
+ 		return ret;
+-	}
+ 
+ 	irq_set_chained_handler_and_data(pmic->irq, mtk_spmi_pmic_handle_chained_irq, pmic);
+ 
+@@ -409,6 +469,9 @@ static int mtk_spmi_pmic_probe(struct spmi_device *sdev)
+ static const struct of_device_id mtk_pmic_spmi_id_table[] = {
+ 	{ .compatible = "mediatek,mt6363", .data = &mt6363_variant },
+ 	{ .compatible = "mediatek,mt6373", .data = &mt6373_variant },
++	/* No interrupt controller support yet: only populate the sub-devices */
++	{ .compatible = "mediatek,mt6368" },
++	{ .compatible = "mediatek,mt6685" },
+ 	{ /* sentinel */ }
+ };
+ MODULE_DEVICE_TABLE(of, mtk_pmic_spmi_id_table);
+-- 
+2.56.0
+

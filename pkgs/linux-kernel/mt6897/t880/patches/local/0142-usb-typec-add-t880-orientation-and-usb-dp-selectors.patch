@@ -1,0 +1,458 @@
+From 33783a54bbc73c6a3371a1cb95d3e867d1caf363 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] usb: typec: add T880 orientation and USB-DP selectors
+
+Drive the WHS3844 orientation switch and the MediaTek USB/DP selector,
+including four-lane DP ownership of the shared high-speed path.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T19:13:13+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-19T23:19:18+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-19T23:19:18+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/usb/typec/mux/Kconfig               |  15 ++
+ drivers/usb/typec/mux/Makefile              |   2 +
+ drivers/usb/typec/mux/mtk-usb-dp-selector.c | 145 ++++++++++++
+ drivers/usb/typec/mux/whs3844.c             | 233 ++++++++++++++++++++
+ 4 files changed, 395 insertions(+)
+ create mode 100644 drivers/usb/typec/mux/mtk-usb-dp-selector.c
+ create mode 100644 drivers/usb/typec/mux/whs3844.c
+
+diff --git a/drivers/usb/typec/mux/Kconfig b/drivers/usb/typec/mux/Kconfig
+index 6dd8f961b5..3ee826cfea 100644
+--- a/drivers/usb/typec/mux/Kconfig
++++ b/drivers/usb/typec/mux/Kconfig
+@@ -76,6 +76,21 @@ config TYPEC_MUX_PTN36502
+ 	  Say Y or M if your system has a NXP PTN36502 Type-C redriver chip
+ 	  found on some devices with a Type-C port.
+ 
++config TYPEC_MUX_WHS3844
++	tristate "Willsemi WHS3844 USB3/DP lane switch driver"
++	depends on I2C
++	help
++	  Orientation switch driver for the Willsemi (Chamsion) WHS3844
++	  USB3/DisplayPort lane switch.
++
++config TYPEC_MUX_MTK_USB_DP_SELECTOR
++	tristate "MediaTek USB/DP lane selector driver"
++	depends on ARCH_MEDIATEK || COMPILE_TEST
++	depends on HAS_IOMEM
++	help
++	  Orientation switch driver for the USB/DP lane selector register
++	  of MediaTek MT6897 SoCs.
++
+ config TYPEC_MUX_TUSB1046
+ 	tristate "TI TUSB1046 Type-C crosspoint switch driver"
+ 	depends on I2C
+diff --git a/drivers/usb/typec/mux/Makefile b/drivers/usb/typec/mux/Makefile
+index b4f599eb50..470c5d77a1 100644
+--- a/drivers/usb/typec/mux/Makefile
++++ b/drivers/usb/typec/mux/Makefile
+@@ -9,4 +9,6 @@ obj-$(CONFIG_TYPEC_MUX_NB7VPQ904M)	+= nb7vpq904m.o
+ obj-$(CONFIG_TYPEC_MUX_PS883X)		+= ps883x.o
+ obj-$(CONFIG_TYPEC_MUX_PTN36502)	+= ptn36502.o
+ obj-$(CONFIG_TYPEC_MUX_TUSB1046)	+= tusb1046.o
++obj-$(CONFIG_TYPEC_MUX_WHS3844)		+= whs3844.o
++obj-$(CONFIG_TYPEC_MUX_MTK_USB_DP_SELECTOR) += mtk-usb-dp-selector.o
+ obj-$(CONFIG_TYPEC_MUX_WCD939X_USBSS)	+= wcd939x-usbss.o
+diff --git a/drivers/usb/typec/mux/mtk-usb-dp-selector.c b/drivers/usb/typec/mux/mtk-usb-dp-selector.c
+new file mode 100644
+index 0000000000..f781ddf09c
+--- /dev/null
++++ b/drivers/usb/typec/mux/mtk-usb-dp-selector.c
+@@ -0,0 +1,145 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek USB/DP lane selector (MT6897): one SoC register whose bit 18
++ * flips the USB3 TX lanes for reverse plugs and whose bit 19 selects the
++ * 4-lane DP mode (DisplayPort pin assignments C and E; cleared for D, USB
++ * and on detach, as the vendor usb_dp_selector driver does). The register
++ * lies inside the pin controller's range, so it is mapped without
++ * requesting the region and changed by read-modify-write.
++ */
++
++#include <linux/bits.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/usb/typec_dp.h>
++#include <linux/usb/typec_mux.h>
++
++#define MTK_UDS_USB_FLIP	BIT(18)
++#define MTK_UDS_DP_4LANE	BIT(19)
++
++struct mtk_uds {
++	void __iomem *reg;
++	struct typec_switch_dev *sw;
++	struct typec_mux_dev *mux;
++	struct mutex lock;
++};
++
++static void mtk_uds_update(struct mtk_uds *uds, u32 mask, u32 set)
++{
++	u32 val;
++
++	mutex_lock(&uds->lock);
++	val = readl(uds->reg);
++	val = (val & ~mask) | set;
++	writel(val, uds->reg);
++	mutex_unlock(&uds->lock);
++}
++
++static int mtk_uds_switch_set(struct typec_switch_dev *sw,
++			      enum typec_orientation orientation)
++{
++	struct mtk_uds *uds = typec_switch_get_drvdata(sw);
++	u32 set = 0, mask = MTK_UDS_USB_FLIP;
++
++	if (orientation == TYPEC_ORIENTATION_REVERSE)
++		set |= MTK_UDS_USB_FLIP;
++	/* The 4-lane DP mode cannot work with USB3: clear it on detach */
++	if (orientation == TYPEC_ORIENTATION_NONE)
++		mask |= MTK_UDS_DP_4LANE;
++	mtk_uds_update(uds, mask, set);
++
++	return 0;
++}
++
++static int mtk_uds_mux_set(struct typec_mux_dev *mux,
++			   struct typec_mux_state *state)
++{
++	struct mtk_uds *uds = typec_mux_get_drvdata(mux);
++	bool dp_4lane = false;
++
++	if (state->alt && state->alt->svid == USB_TYPEC_DP_SID)
++		dp_4lane = state->mode == TYPEC_DP_STATE_C ||
++			   state->mode == TYPEC_DP_STATE_E;
++	mtk_uds_update(uds, MTK_UDS_DP_4LANE, dp_4lane ? MTK_UDS_DP_4LANE : 0);
++
++	return 0;
++}
++
++static int mtk_uds_probe(struct platform_device *pdev)
++{
++	struct typec_switch_desc sw_desc = { };
++	struct typec_mux_desc mux_desc = { };
++	struct device *dev = &pdev->dev;
++	struct resource *res;
++	struct mtk_uds *uds;
++	int ret;
++
++	uds = devm_kzalloc(dev, sizeof(*uds), GFP_KERNEL);
++	if (!uds)
++		return -ENOMEM;
++
++	ret = devm_mutex_init(dev, &uds->lock);
++	if (ret)
++		return ret;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res || resource_size(res) < 4)
++		return -EINVAL;
++	/* Shared with the pin controller: no region request */
++	uds->reg = devm_ioremap(dev, res->start, 4);
++	if (!uds->reg)
++		return -ENOMEM;
++
++	sw_desc.drvdata = uds;
++	sw_desc.fwnode = dev_fwnode(dev);
++	sw_desc.set = mtk_uds_switch_set;
++
++	uds->sw = typec_switch_register(dev, &sw_desc);
++	if (IS_ERR(uds->sw))
++		return dev_err_probe(dev, PTR_ERR(uds->sw),
++				     "cannot register the switch\n");
++
++	mux_desc.drvdata = uds;
++	mux_desc.fwnode = dev_fwnode(dev);
++	mux_desc.set = mtk_uds_mux_set;
++
++	uds->mux = typec_mux_register(dev, &mux_desc);
++	if (IS_ERR(uds->mux)) {
++		typec_switch_unregister(uds->sw);
++		return dev_err_probe(dev, PTR_ERR(uds->mux),
++				     "cannot register the mux\n");
++	}
++
++	platform_set_drvdata(pdev, uds);
++	return 0;
++}
++
++static void mtk_uds_remove(struct platform_device *pdev)
++{
++	struct mtk_uds *uds = platform_get_drvdata(pdev);
++
++	typec_mux_unregister(uds->mux);
++	typec_switch_unregister(uds->sw);
++}
++
++static const struct of_device_id mtk_uds_of_match[] = {
++	{ .compatible = "mediatek,mt6897-usb-dp-selector" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mtk_uds_of_match);
++
++static struct platform_driver mtk_uds_driver = {
++	.driver = {
++		.name = "mtk-usb-dp-selector",
++		.of_match_table = mtk_uds_of_match,
++	},
++	.probe = mtk_uds_probe,
++	.remove = mtk_uds_remove,
++};
++module_platform_driver(mtk_uds_driver);
++
++MODULE_DESCRIPTION("MediaTek USB/DP lane selector");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/usb/typec/mux/whs3844.c b/drivers/usb/typec/mux/whs3844.c
+new file mode 100644
+index 0000000000..478d63cfcb
+--- /dev/null
++++ b/drivers/usb/typec/mux/whs3844.c
+@@ -0,0 +1,233 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Willsemi (Chamsion) WHS3844 USB3/DP lane switch: orientation and mode.
++ *
++ * Register values follow the MediaTek/Alldocube vendor driver: the chip
++ * has no public datasheet. 0x0a selects the path (bit 2: flip; 0x1b/0x1f:
++ * USB3 + 2-lane DP normal/flip, also used for plain USB3; 0x1a/0x1e:
++ * 4-lane DP normal/flip; 0x10: open), 0x0c/0x10/0x11/0x13/0x20/0x21 are
++ * lane settings written with it. The vendor picks the 4-lane DP setting
++ * for DisplayPort pin assignments C and E and the USB3 setting for D.
++ */
++
++#include <linux/bits.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/regulator/consumer.h>
++#include <linux/usb/typec_dp.h>
++#include <linux/usb/typec_mux.h>
++
++#define WHS3844_REG_ID		0x01
++#define WHS3844_ID		0x40
++#define WHS3844_REG_CONFIG	0x0a
++#define WHS3844_CONFIG_OPEN	0x10
++#define WHS3844_CONFIG_USB3	0x1b
++#define WHS3844_CONFIG_USB3_FLIP 0x1f
++#define WHS3844_CONFIG_DP	0x1a
++#define WHS3844_CONFIG_DP_FLIP	0x1e
++
++struct whs3844 {
++	struct i2c_client *client;
++	struct typec_switch_dev *sw;
++	struct typec_mux_dev *mux;
++	struct mutex lock;
++	enum typec_orientation orientation;
++	bool dp_4lane;
++};
++
++struct whs3844_write {
++	u8 reg;
++	u8 val;
++};
++
++static const struct whs3844_write whs3844_usb3_normal[] = {
++	{ WHS3844_REG_CONFIG, WHS3844_CONFIG_USB3 },
++	{ 0x0c, 0x50 }, { 0x10, 0x33 }, { 0x11, 0x33 }, { 0x21, 0x22 },
++	{ 0x13, 0x00 },
++};
++
++static const struct whs3844_write whs3844_usb3_flip[] = {
++	{ WHS3844_REG_CONFIG, WHS3844_CONFIG_USB3_FLIP },
++	{ 0x0c, 0x50 }, { 0x10, 0x33 }, { 0x11, 0x33 }, { 0x20, 0x22 },
++	{ 0x13, 0x00 },
++};
++
++/* 4-lane DP; AUX snooping off (0x13 bit 7) while the lanes are set */
++static const struct whs3844_write whs3844_dp_normal[] = {
++	{ WHS3844_REG_CONFIG, WHS3844_CONFIG_DP },
++	{ 0x0c, 0x50 }, { 0x13, 0x80 }, { 0x10, 0xaa }, { 0x11, 0xaa },
++	{ 0x13, 0x00 },
++};
++
++static const struct whs3844_write whs3844_dp_flip[] = {
++	{ WHS3844_REG_CONFIG, WHS3844_CONFIG_DP_FLIP },
++	{ 0x0c, 0x50 }, { 0x13, 0x80 }, { 0x10, 0xaa }, { 0x11, 0xaa },
++	{ 0x13, 0x00 },
++};
++
++static const struct whs3844_write whs3844_open[] = {
++	{ WHS3844_REG_CONFIG, WHS3844_CONFIG_OPEN },
++};
++
++static int whs3844_write_seq(struct whs3844 *whs,
++			     const struct whs3844_write *seq, size_t n)
++{
++	int ret;
++
++	for (size_t i = 0; i < n; i++) {
++		ret = i2c_smbus_write_byte_data(whs->client, seq[i].reg,
++						seq[i].val);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++/* Called with the lock held */
++static int whs3844_apply(struct whs3844 *whs)
++{
++	const struct whs3844_write *seq;
++	size_t n;
++	int ret;
++
++	switch (whs->orientation) {
++	case TYPEC_ORIENTATION_NORMAL:
++		seq = whs->dp_4lane ? whs3844_dp_normal : whs3844_usb3_normal;
++		n = whs->dp_4lane ? ARRAY_SIZE(whs3844_dp_normal) :
++				    ARRAY_SIZE(whs3844_usb3_normal);
++		break;
++	case TYPEC_ORIENTATION_REVERSE:
++		seq = whs->dp_4lane ? whs3844_dp_flip : whs3844_usb3_flip;
++		n = whs->dp_4lane ? ARRAY_SIZE(whs3844_dp_flip) :
++				    ARRAY_SIZE(whs3844_usb3_flip);
++		break;
++	case TYPEC_ORIENTATION_NONE:
++	default:
++		seq = whs3844_open;
++		n = ARRAY_SIZE(whs3844_open);
++		break;
++	}
++
++	ret = whs3844_write_seq(whs, seq, n);
++	if (ret)
++		dev_err(&whs->client->dev, "orientation %d, 4-lane DP %d: %d\n",
++			whs->orientation, whs->dp_4lane, ret);
++	return ret;
++}
++
++static int whs3844_switch_set(struct typec_switch_dev *sw,
++			      enum typec_orientation orientation)
++{
++	struct whs3844 *whs = typec_switch_get_drvdata(sw);
++	int ret;
++
++	mutex_lock(&whs->lock);
++	whs->orientation = orientation;
++	if (orientation == TYPEC_ORIENTATION_NONE)
++		whs->dp_4lane = false;
++	ret = whs3844_apply(whs);
++	mutex_unlock(&whs->lock);
++
++	return ret;
++}
++
++static int whs3844_mux_set(struct typec_mux_dev *mux,
++			   struct typec_mux_state *state)
++{
++	struct whs3844 *whs = typec_mux_get_drvdata(mux);
++	bool dp_4lane = false;
++	int ret = 0;
++
++	if (state->alt && state->alt->svid == USB_TYPEC_DP_SID)
++		dp_4lane = state->mode == TYPEC_DP_STATE_C ||
++			   state->mode == TYPEC_DP_STATE_E;
++
++	mutex_lock(&whs->lock);
++	if (dp_4lane != whs->dp_4lane) {
++		whs->dp_4lane = dp_4lane;
++		if (whs->orientation != TYPEC_ORIENTATION_NONE)
++			ret = whs3844_apply(whs);
++	}
++	mutex_unlock(&whs->lock);
++
++	return ret;
++}
++
++static int whs3844_probe(struct i2c_client *client)
++{
++	struct typec_switch_desc sw_desc = { };
++	struct typec_mux_desc mux_desc = { };
++	struct device *dev = &client->dev;
++	struct whs3844 *whs;
++	int ret;
++
++	whs = devm_kzalloc(dev, sizeof(*whs), GFP_KERNEL);
++	if (!whs)
++		return -ENOMEM;
++	whs->client = client;
++
++	ret = devm_mutex_init(dev, &whs->lock);
++	if (ret)
++		return ret;
++
++	ret = devm_regulator_get_enable(dev, "vcc");
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot enable vcc\n");
++
++	ret = i2c_smbus_read_byte_data(client, WHS3844_REG_ID);
++	if (ret < 0)
++		return dev_err_probe(dev, ret, "cannot read the ID\n");
++	if (ret != WHS3844_ID)
++		return dev_err_probe(dev, -ENODEV, "unexpected ID 0x%02x\n", ret);
++
++	sw_desc.drvdata = whs;
++	sw_desc.fwnode = dev_fwnode(dev);
++	sw_desc.set = whs3844_switch_set;
++
++	whs->sw = typec_switch_register(dev, &sw_desc);
++	if (IS_ERR(whs->sw))
++		return dev_err_probe(dev, PTR_ERR(whs->sw),
++				     "cannot register the switch\n");
++
++	mux_desc.drvdata = whs;
++	mux_desc.fwnode = dev_fwnode(dev);
++	mux_desc.set = whs3844_mux_set;
++
++	whs->mux = typec_mux_register(dev, &mux_desc);
++	if (IS_ERR(whs->mux)) {
++		typec_switch_unregister(whs->sw);
++		return dev_err_probe(dev, PTR_ERR(whs->mux),
++				     "cannot register the mux\n");
++	}
++
++	i2c_set_clientdata(client, whs);
++	return 0;
++}
++
++static void whs3844_remove(struct i2c_client *client)
++{
++	struct whs3844 *whs = i2c_get_clientdata(client);
++
++	typec_mux_unregister(whs->mux);
++	typec_switch_unregister(whs->sw);
++}
++
++static const struct of_device_id whs3844_of_match[] = {
++	{ .compatible = "willsemi,whs3844" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, whs3844_of_match);
++
++static struct i2c_driver whs3844_driver = {
++	.driver = {
++		.name = "whs3844",
++		.of_match_table = whs3844_of_match,
++	},
++	.probe = whs3844_probe,
++	.remove = whs3844_remove,
++};
++module_i2c_driver(whs3844_driver);
++
++MODULE_DESCRIPTION("Willsemi WHS3844 USB3/DP lane switch driver");
++MODULE_LICENSE("GPL");
+-- 
+2.56.0
+

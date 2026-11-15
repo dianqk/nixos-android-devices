@@ -1,0 +1,156 @@
+From 18aba9d126ef13de875dc79beda2f4cff409ae18 Mon Sep 17 00:00:00 2001
+From: Tatsuki Tanaka <tatsuki@tanakatatsuki.dev>
+Date: Fri, 9 Oct 2026 18:32:18 +0800
+Subject: [PATCH] pinctrl: qcom: sm8450: add TLMM driver for SM8450/SM8475
+
+Add support for the Top-Level Mode Multiplexer (TLMM) on Qualcomm
+SM8450 and SM8475 SoCs, including special pin functions for UFS reset
+and SDC2 lines.
+
+Signed-off-by: Tatsuki Tanaka <tatsuki@tanakatatsuki.dev>
+(cherry picked from commit d4abb95bfdc01d78896a42e5d145bbe3b01accb9)
+---
+ drivers/pinctrl/qcom/Kconfig          |   8 ++
+ drivers/pinctrl/qcom/Makefile         |   1 +
+ drivers/pinctrl/qcom/pinctrl-sm8450.c | 101 ++++++++++++++++++++++++++
+ 3 files changed, 110 insertions(+)
+ create mode 100644 drivers/pinctrl/qcom/pinctrl-sm8450.c
+
+diff --git a/drivers/pinctrl/qcom/Kconfig b/drivers/pinctrl/qcom/Kconfig
+index 0bea461fc..baf91aa38 100644
+--- a/drivers/pinctrl/qcom/Kconfig
++++ b/drivers/pinctrl/qcom/Kconfig
+@@ -172,6 +172,14 @@ config PINCTRL_QCOM_SM8250
+ 	  Say Y here to enable support for pinctrl on the Snapdragon SM8250 SoC,
+ 	  as well as the associated GPIO driver.
+ 
++config PINCTRL_QCOM_SM8450
++	bool "Qualcomm SM8450 / SM8475 Pinctrl"
++	default y if PINCTRL_QCOM_GENERIC
++	select PINCTRL_QCOM
++	help
++	  Say Y here to enable support for pinctrl on the Snapdragon SM8450/SM8475 SoC,
++	  as well as the associated GPIO driver.
++
+ config PINCTRL_QCOM_SM8550
+ 	bool "Qualcomm SM8550 Pinctrl"
+ 	default y if PINCTRL_QCOM_GENERIC
+diff --git a/drivers/pinctrl/qcom/Makefile b/drivers/pinctrl/qcom/Makefile
+index 87cb128c4..77e06b160 100644
+--- a/drivers/pinctrl/qcom/Makefile
++++ b/drivers/pinctrl/qcom/Makefile
+@@ -23,6 +23,7 @@ obj-$(CONFIG_PINCTRL_QCOM_SM6350) += pinctrl-sm6350.o
+ obj-$(CONFIG_PINCTRL_QCOM_SM7150) += pinctrl-sm7150.o
+ obj-$(CONFIG_PINCTRL_QCOM_SM8150) += pinctrl-sm8150.o
+ obj-$(CONFIG_PINCTRL_QCOM_SM8250) += pinctrl-sm8250.o
++obj-$(CONFIG_PINCTRL_QCOM_SM8450) += pinctrl-sm8450.o
+ obj-$(CONFIG_PINCTRL_QCOM_SM8550) += pinctrl-sm8550.o
+ obj-$(CONFIG_PINCTRL_QCOM_SM8650) += pinctrl-sm8650.o
+ obj-$(CONFIG_PINCTRL_QCOM_X1E80100) += pinctrl-x1e80100.o
+diff --git a/drivers/pinctrl/qcom/pinctrl-sm8450.c b/drivers/pinctrl/qcom/pinctrl-sm8450.c
+new file mode 100644
+index 000000000..0bbf4d6e2
+--- /dev/null
++++ b/drivers/pinctrl/qcom/pinctrl-sm8450.c
+@@ -0,0 +1,101 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Qualcomm sm8450/sm8475 pinctrl
++ *
++ * (C) Copyright 2026 Tatsuki Tanaka <tatsuki@tanakatatsuki.dev>
++ *
++ */
++
++#include <dm.h>
++
++#include "pinctrl-qcom.h"
++
++#define MAX_PIN_NAME_LEN 32
++static char pin_name[MAX_PIN_NAME_LEN] __section(".data");
++
++static const struct pinctrl_function msm_pinctrl_functions[] = {
++	{"qup14", 1},
++	{"gpio", 0},
++	{"pcie1_clk_req_n", 1},
++};
++
++#define SDC_QDSD_PINGROUP(pg_name, ctl, pull, drv)	\
++	{					        \
++		.name = pg_name,			\
++		.ctl_reg = ctl,				\
++		.io_reg = 0,				\
++		.pull_bit = pull,			\
++		.drv_bit = drv,				\
++		.oe_bit = -1,				\
++		.in_bit = -1,				\
++		.out_bit = -1,				\
++	}
++
++#define UFS_RESET(pg_name, ctl, io)			\
++	{					        \
++		.name = pg_name,			\
++		.ctl_reg = ctl,				\
++		.io_reg = io,				\
++		.pull_bit = 3,				\
++		.drv_bit = 0,				\
++		.oe_bit = -1,				\
++		.in_bit = -1,				\
++		.out_bit = 0,				\
++	}
++
++static const struct msm_special_pin_data msm_special_pins_data[] = {
++	[0] = UFS_RESET("ufs_reset", 0xde000, 0xde004),
++	[1] = SDC_QDSD_PINGROUP("sdc2_clk", 0xd6000, 14, 6),
++	[2] = SDC_QDSD_PINGROUP("sdc2_cmd", 0xd6000, 11, 3),
++	[3] = SDC_QDSD_PINGROUP("sdc2_data", 0xd6000, 9, 0),
++};
++
++static const char *sm8450_get_function_name(struct udevice *dev,
++					    unsigned int selector)
++{
++	return msm_pinctrl_functions[selector].name;
++}
++
++static const char *sm8450_get_pin_name(struct udevice *dev,
++				       unsigned int selector)
++{
++	if (selector >= 210 && selector <= 213)
++		snprintf(pin_name, MAX_PIN_NAME_LEN,
++			 msm_special_pins_data[selector - 210].name);
++	else
++		snprintf(pin_name, MAX_PIN_NAME_LEN, "gpio%u", selector);
++
++	return pin_name;
++}
++
++static int sm8450_get_function_mux(__maybe_unused unsigned int pin,
++				   unsigned int selector)
++{
++	return msm_pinctrl_functions[selector].val;
++}
++
++static struct msm_pinctrl_data sm8450_data = {
++	.pin_data = {
++		.pin_count = 214,
++		.special_pins_start = 210,
++		.special_pins_data = msm_special_pins_data,
++	},
++	.functions_count = ARRAY_SIZE(msm_pinctrl_functions),
++	.get_function_name = sm8450_get_function_name,
++	.get_function_mux = sm8450_get_function_mux,
++	.get_pin_name = sm8450_get_pin_name,
++};
++
++static const struct udevice_id msm_pinctrl_ids[] = {
++	{ .compatible = "qcom,sm8450-tlmm", .data = (ulong)&sm8450_data },
++	{ .compatible = "qcom,sm8475-tlmm", .data = (ulong)&sm8450_data },
++	{ /* Sentinel */ }
++};
++
++U_BOOT_DRIVER(pinctrl_sm8450) = {
++	.name		= "pinctrl_sm8450",
++	.id		= UCLASS_NOP,
++	.of_match	= msm_pinctrl_ids,
++	.ops		= &msm_pinctrl_ops,
++	.bind		= msm_pinctrl_bind,
++};

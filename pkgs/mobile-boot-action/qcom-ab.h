@@ -15,6 +15,10 @@
 #define AB_RETRY (7ULL << 51)
 #define AB_SUCCESS (1ULL << 54)
 #define AB_UNBOOTABLE (1ULL << 55)
+/* Bits a stale backup entry may differ in: the slot byte (48-55) and bit 60,
+ * which Qualcomm/Xiaomi firmware also flips on slot entries. Same scope as the
+ * recovery's repair-backup-gpt. */
+#define AB_SLOT_ATTRIBUTES ((0xffULL << 48) | (1ULL << 60))
 
 struct ab_disk {
 	void *context;
@@ -24,6 +28,7 @@ struct ab_disk {
 	unsigned char *header[2], *entries[2];
 	unsigned char *new_header[2], *new_entries[2];
 	int touched[2];
+	int stale_backup; /* backup array differs only in slot metadata */
 };
 struct ab_ops {
 	int (*read)(void *, unsigned long long, unsigned int, void *);
@@ -37,6 +42,11 @@ struct ab_state {
 	struct ab_disk disk[AB_MAX_LUNS];
 	unsigned int disks;
 	unsigned char *scratch;
+	/* Slot confirmation only: accept a backup array that differs from a valid
+	 * primary only in slot metadata (see ab_backup_scope). */
+	int tolerate_stale_backup;
+	/* Explicit space-separated OEM names that are not slot-selection entries. */
+	const char *non_slot_names;
 };
 static unsigned long long ab_get(const unsigned char *p, unsigned int n)
 {
@@ -99,6 +109,54 @@ static int ab_header(struct ab_state *s, struct ab_disk *d, unsigned int side)
 	d->array_lba[side] = arr;
 	return 0;
 }
+static int ab_name(const unsigned char *e, char *name);
+/* Some ABLs (Xiaomi Marble) update only the primary GPT on every boot: retry
+ * decrements and, on set_active, type swaps to a placeholder scheme. The
+ * backup array then differs from the primary (its CRC may also be stale).
+ * Accept exactly that: the backup header is valid with the primary's geometry
+ * (ab_header), and each differing entry is a used <base>_a/<base>_b entry
+ * whose partner exists in this GPT, differing only in its type GUID (not to
+ * zero) and in AB_SLOT_ATTRIBUTES. Unique GUIDs, LBAs, other attributes,
+ * names and unused entries must be identical. */
+static int ab_backup_scope(const struct ab_disk *d)
+{
+	unsigned int i, j, n;
+	char name[36], peer[36], other[36];
+	for (i = 0; i < d->count; i++) {
+		const unsigned char *p = d->entries[0] + 128 * i, *b = d->entries[1] + 128 * i;
+		if (!memcmp(p, b, 128))
+			continue;
+		if (ab_zero(p, 16) || ab_zero(b, 16) || ab_name(p, name)) {
+			printf("Mobile boot action: backup GPT entry %u differs outside a used entry\n", i + 1);
+			return -EINVAL;
+		}
+		n = strlen(name);
+		if (n < 3 || name[n - 2] != '_' || (name[n - 1] != 'a' && name[n - 1] != 'b')) {
+			printf("Mobile boot action: backup GPT differs outside an A/B entry (%s)\n", name);
+			return -EINVAL;
+		}
+		strcpy(peer, name);
+		peer[n - 1] = name[n - 1] == 'a' ? 'b' : 'a';
+		for (j = 0; j < d->count; j++) {
+			const unsigned char *e = d->entries[0] + 128 * j;
+			if (!ab_zero(e, 16) && !ab_name(e, other) && !strcmp(other, peer))
+				break;
+		}
+		if (j == d->count) {
+			printf("Mobile boot action: backup GPT differs in %s without an A/B partner\n", name);
+			return -EINVAL;
+		}
+		if (memcmp(p + 16, b + 16, 32) || memcmp(p + 56, b + 56, 72)) {
+			printf("Mobile boot action: backup GPT identity, LBAs or name differ (%s)\n", name);
+			return -EINVAL;
+		}
+		if ((ab_get(p + 48, 8) ^ ab_get(b + 48, 8)) & ~AB_SLOT_ATTRIBUTES) {
+			printf("Mobile boot action: backup GPT differs in non-slot attributes (%s)\n", name);
+			return -EINVAL;
+		}
+	}
+	return 0;
+}
 static int ab_load(struct ab_state *s, struct ab_disk *d)
 {
 	unsigned int side, i, j;
@@ -111,8 +169,14 @@ static int ab_load(struct ab_state *s, struct ab_disk *d)
 		if (!d->header[side] || !d->new_header[side])
 			return -ENOMEM;
 		ret = s->ops->read(d->context, side ? d->blocks - 1 : 1, 1, d->header[side]);
-		if (ret || (ret = ab_header(s, d, side)))
+		if (ret)
 			return ret;
+		ret = ab_header(s, d, side);
+		if (ret) {
+			printf("Mobile boot action: %s GPT header invalid or geometry differs\n",
+			       side ? "backup" : "primary");
+			return ret;
+		}
 		d->entries[side] = s->ops->alloc(d->array_blocks * AB_BLOCK);
 		d->new_entries[side] = s->ops->alloc(d->array_blocks * AB_BLOCK);
 		if (!d->entries[side] || !d->new_entries[side])
@@ -121,8 +185,17 @@ static int ab_load(struct ab_state *s, struct ab_disk *d)
 		if (ret)
 			return ret;
 		if (s->ops->crc(d->entries[side], d->bytes) != ab_get(d->header[side] + 88, 4) ||
-		    (side && memcmp(d->entries[0], d->entries[1], d->bytes)))
-			return -EINVAL;
+		    (side && memcmp(d->entries[0], d->entries[1], d->bytes))) {
+			if (!side) {
+				printf("Mobile boot action: primary GPT entries CRC mismatch\n");
+				return -EINVAL;
+			}
+			if (!s->tolerate_stale_backup) {
+				printf("Mobile boot action: backup GPT entries CRC mismatch or differ from the primary\n");
+				return -EINVAL;
+			}
+			d->stale_backup = 1; /* checked against the primary below */
+		}
 		memcpy(d->new_header[side], d->header[side], AB_BLOCK);
 		memcpy(d->new_entries[side], d->entries[side], d->array_blocks * AB_BLOCK);
 	}
@@ -141,7 +214,7 @@ static int ab_load(struct ab_state *s, struct ab_disk *d)
 				return -EINVAL;
 		}
 	}
-	return 0;
+	return d->stale_backup ? ab_backup_scope(d) : 0;
 }
 static void ab_free(struct ab_state *s)
 {
@@ -193,6 +266,35 @@ static int ab_bootable(const unsigned char *e)
 	unsigned long long a = ab_get(e + 48, 8);
 	return !(a & AB_UNBOOTABLE) && (a & AB_PRIORITY) && (a & (AB_SUCCESS | AB_RETRY));
 }
+/* A configured exception may never hide Qualcomm slot metadata. Bit 60 is
+ * an independent OEM/UEFI attribute and is preserved with the whole entry. */
+static int ab_non_slot(struct ab_state *s, const unsigned char *e, const char *name)
+{
+	const char *p = s->non_slot_names;
+	unsigned int n = strlen(name);
+	if (!p)
+		return 0;
+	while (*p) {
+		const char *start;
+		while (*p == ' ')
+			p++;
+		start = p;
+		while (*p && *p != ' ')
+			p++;
+		if ((unsigned int)(p - start) == n && !memcmp(start, name, n)) {
+			/* These names locate mandatory transaction state, never exceptions. */
+			if (!strcmp(name, "boot_a") || !strcmp(name, "boot_b") ||
+			    !strcmp(name, "abl_a") || !strcmp(name, "abl_b") ||
+			    !strcmp(name, "xbl_a") || !strcmp(name, "xbl_b") ||
+			    !strcmp(name, "misc") || !strcmp(name, "linux-boot") ||
+			    !strcmp(name, "recovery_a") || !strcmp(name, "recovery_b") ||
+			    (ab_get(e + 48, 8) & (0xffULL << 48)))
+				return -EINVAL;
+			return 1;
+		}
+	}
+	return 0;
+}
 /* AOSP Android 13 misc_virtual_ab_message, packed v2 at misc + 32 KiB:
  * https://android.googlesource.com/platform/bootable/recovery/+/refs/tags/android-13.0.0_r1/bootloader_message/include/bootloader_message/bootloader_message.h
  * Only a known NONE state is accepted. Never cancel/clear snapshot metadata. */
@@ -227,15 +329,27 @@ static int ab_validate(struct ab_state *s, unsigned int boot_lun, enum ab_purpos
 	    (purpose != AB_CONFIRM && !misc) ||
 	    (purpose == AB_RECOVERY && !ab_find(s, "recovery_b")))
 		return -EINVAL;
+	/* Confirmation changes only boot_b's success bit. Unrelated OEM names
+	 * and non-slot partition suffixes do not describe a slot switch. */
+	if (purpose == AB_CONFIRM)
+		return 0;
 	/* Require all pairs and their active bits to agree before any switch.
 	 * XBL selection is through bBootLunEn, not a GUID exchange. */
 	for (i = 0; i < s->disks; i++)
 		for (j = 0; j < s->disk[i].count; j++) {
 			unsigned char *e = s->disk[i].entries[0] + 128 * j, *other;
 			unsigned int n;
+			int non_slot;
 			if (ab_zero(e, 16))
 				continue;
-			if (ab_name(e, name) || ab_find(s, name) != e)
+			if (ab_name(e, name))
+				return -EINVAL;
+			non_slot = ab_non_slot(s, e, name);
+			if (non_slot < 0)
+				return non_slot;
+			if (non_slot)
+				continue;
+			if (ab_find(s, name) != e)
 				return -EINVAL;
 			n = strlen(name);
 			if (n < 3 || name[n - 2] != '_' || (name[n - 1] != 'a' && name[n - 1] != 'b'))
@@ -243,7 +357,7 @@ static int ab_validate(struct ab_state *s, unsigned int boot_lun, enum ab_purpos
 			strcpy(peer, name);
 			peer[n - 1] = name[n - 1] == 'a' ? 'b' : 'a';
 			other = ab_find(s, peer);
-			if (!other)
+			if (!other || ab_non_slot(s, other, peer))
 				return -EINVAL;
 			if (!strcmp(name, "xbl_a") || !strcmp(name, "xbl_b")) {
 				if (memcmp(e, other, 16))
@@ -276,6 +390,11 @@ static int ab_validate(struct ab_state *s, unsigned int boot_lun, enum ab_purpos
 	}
 	return 0;
 }
+/* The primary is authoritative: set boot_b's successful bit there and rebuild
+ * the backup array from it (keeping the backup's block padding and header
+ * geometry). With identical copies this is the same per-copy bit change; with
+ * a tolerated stale backup (only on boot_b's LU, which is the only one written)
+ * it also resynchronises the backup. Other LUs are never written. */
 static inline void ab_plan_confirm(struct ab_state *s)
 {
 	unsigned char *b = ab_find(s, "boot_b");
@@ -283,12 +402,13 @@ static inline void ab_plan_confirm(struct ab_state *s)
 	for (i = 0; i < s->disks; i++) {
 		struct ab_disk *d = &s->disk[i];
 		for (j = 0; j < d->count; j++) {
+			unsigned char *e = d->new_entries[0] + j * 128;
 			if (d->entries[0] + j * 128 != b)
 				continue;
+			ab_put(e + 48, ab_get(e + 48, 8) | AB_SUCCESS, 8);
+			memcpy(d->new_entries[1], d->new_entries[0], d->bytes);
 			for (side = 0; side < 2; side++) {
-				unsigned char *e = d->new_entries[side] + j * 128;
 				unsigned char *h = d->new_header[side];
-				ab_put(e + 48, ab_get(e + 48, 8) | AB_SUCCESS, 8);
 				ab_put(h + 88, s->ops->crc(d->new_entries[side], d->bytes), 4);
 				memset(h + 16, 0, 4);
 				ab_put(h + 16, s->ops->crc(h, 92), 4);
@@ -307,6 +427,8 @@ static void ab_plan_android(struct ab_state *s)
 			if (ab_zero(e, 16))
 				continue;
 			ab_name(e, name); /* validated */
+			if (ab_non_slot(s, e, name))
+				continue;
 			n = strlen(name);
 			if (n < 3 || name[n - 2] != '_' || (name[n - 1] != 'a' && name[n - 1] != 'b'))
 				continue;
@@ -352,7 +474,12 @@ static int ab_store(struct ab_state *s, int restore)
 	int ret, first_error = 0;
 	for (i = 0; i < s->disks; i++) {
 		struct ab_disk *d = &s->disk[i];
-		/* Complete/read back backup before writing the primary copy. */
+		/* Complete/read back backup before writing the primary copy. For a
+		 * confirmation over a stale backup this means: power loss after the
+		 * backup leaves the old valid primary plus a backup that differs
+		 * only in slot metadata (tolerated; the next boot confirms again);
+		 * a torn primary write leaves a current backup, never one that
+		 * predates ABL's slot changes. */
 		for (round = 0; round < 2; round++) {
 			unsigned int side = 1 - round;
 			unsigned char *entries = restore ? d->entries[side] : d->new_entries[side];

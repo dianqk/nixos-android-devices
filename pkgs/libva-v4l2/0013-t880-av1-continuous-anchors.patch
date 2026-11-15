@@ -1,0 +1,84 @@
+From: dianqk <dianqk@dianqk.net>
+Subject: [PATCH] t880: keep AV1 capture active across independent keys
+
+AV1 DISPLAY completion does not require future input. Before accepting an
+independent key, wait for prior compressed ownership and CLIENT outputs,
+verify every old wire entry completed, and retire only the completed history.
+Preserve CAPTURE storage, firmware reference ownership and monotonic tokens.
+Avoid a needless STOP and stream restart at each key picture.
+
+Keep complete anchor framing, the original deadline, sticky failure handling,
+and the existing restart for a stream that was explicitly drained. Other
+codec completion policies are unchanged.
+
+--- a/src/t880-decoder.cpp
++++ b/src/t880-decoder.cpp
+@@ -398,9 +398,21 @@
+     try {
+         pump(0);
+         if (!anchor.empty() && !history_.empty()) {
+-            // Retire an old anchor only after every accepted CLIENT has a
+-            // stable completed output. Reset also releases old DPB references.
+-            drain();
++            // AV1 can complete every old CLIENT without future input. Keep
++            // the active CAPTURE/DPB pool across independent keys; firmware
++            // retires its own references while decoding the new key AU.
++            if (display_without_lookahead_ && !drained_) {
++                wait_inputs();
++                while (!pending_.empty()) pump(10);
++                for (const auto &[id, job] : wire_)
++                    check(job.returned && job.displayed,
++                          "T880 incomplete old-anchor wire ownership");
++                wire_.clear();
++            } else {
++                // Other codecs retain demand-drain, and an already drained
++                // stream still needs the normal CAPTURE restart below.
++                drain();
++            }
+             history_.clear(); history_bytes_ = 0;
+         }
+         if (drained_) rebuild();
+--- a/tests/t880/replay.cpp
++++ b/tests/t880/replay.cpp
+@@ -297,6 +297,41 @@
+     f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
+     {
+         T880Decoder d("fake", 160, 128, VAProfileAV1Profile0, VA_RT_FORMAT_YUV420, -1);
++        auto a = surface(), b = surface(), c = surface();
++        d.submit({1}, a, {1});
++        f.display_after_polls = f.polls + 3;
++        d.submit({2}, b, {2}); // Wait for the old CLIENT before retiring history.
++        assert(!a->pending && a->memory->map()[0] == 1);
++        assert(f.accepted == 2 && f.stops == 0 && f.resets == 0);
++        f.display_after_polls = f.polls + 2; d.sync(b);
++        d.submit({3}, c, {3}); f.display_after_polls = f.polls + 2; d.sync(c);
++        assert(c->memory->map()[0] == 3 && f.accepted == 3);
++        assert(f.stops == 0 && f.resets == 0);
++        assert((f.submitted == std::vector<uint64_t>{1,2,3}));
++        d.finish(); assert(f.stops == 1);
++        // An explicit drain is not an active stream, even for a fresh key.
++        auto e = surface(); d.submit({4}, e, {4});
++        assert(f.resets == 1); f.display_after_polls = f.polls + 2; d.sync(e);
++        assert(e->memory->map()[0] == 4 && f.submitted.back() == 4);
++    }
++    f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
++    {
++        T880Decoder d("fake", 160, 128, VAProfileAV1Profile0, VA_RT_FORMAT_YUV420, -1);
++        auto a = surface(), b = surface(); d.submit({1}, a, {1});
++        unsigned accepted = f.accepted, before = f.polls; f.expire = true;
++        bool timed_out = false;
++        try { d.submit({2}, b, {2}); } catch (const Error &e) { timed_out = e.status == VA_STATUS_ERROR_TIMEDOUT; }
++        assert(timed_out && f.polls - before <= 4 && f.accepted == accepted);
++        assert(!a->pending && a->status == VA_STATUS_ERROR_TIMEDOUT && !b->pending);
++        // Fatal timeout closes CAPTURE once; it does not drain/restart or accept the key.
++        assert(f.stops == 0 && f.resets == 1);
++        f.expire = false; f.display_after_polls = f.polls + 1;
++        rejects([&] { d.sync(a); }); // Late completion cannot revive the failed stream.
++        rejects([&] { d.submit({3}, surface(), {3}); });
++    }
++    f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
++    {
++        T880Decoder d("fake", 160, 128, VAProfileAV1Profile0, VA_RT_FORMAT_YUV420, -1);
+         auto a = surface(); d.submit({1}, a, {1}); unsigned before = f.polls; f.expire = true;
+         bool timed_out = false;
+         try { d.sync(a); } catch (const Error &e) { timed_out = e.status == VA_STATUS_ERROR_TIMEDOUT; }

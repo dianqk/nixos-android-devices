@@ -37,6 +37,9 @@ let
     echo 'Charging diagnostics' > "$g/strings/0x409/product"
     printf '%s' ${lib.escapeShellArg cfg.usbSerial} > "$g/strings/0x409/serialnumber"
     echo diagnostics > "$g/configs/c.1/strings/0x409/configuration"
+    # Request 900 mA (500 mA below SuperSpeed) rather than the 2 mA default;
+    # boards that report the gadget current to their charger use it as input limit.
+    echo 900 > "$g/configs/c.1/MaxPower"
     ln -s "$g/functions/acm.log" "$g/configs/c.1/acm"
     for attempt in $(seq 1 200); do
       test ! -e /sys/class/udc/${cfg.usbController} || break

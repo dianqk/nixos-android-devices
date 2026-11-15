@@ -1,0 +1,149 @@
+From 46f215593e980c94c5e9125696fa58b24f213aa2 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 8 Nov 2026 02:54:10 +0800
+Subject: [PATCH 218/218] soc: mediatek: prepare DRAM worker cleanup before
+ DVFSRC START
+
+Register the managed delayed work before installing protective requests and starting DVFSRC. Registration can fail; doing it after START lets probe unwind release the request resources while DVFSRC is already following them. Keep the existing voltage, HRT, initial peak, START and scheduling sequence.
+
+Exercise the production probe transaction with ordered success and injected setup/request/start failures.
+---
+ drivers/soc/mediatek/mtk-dram-bw.c            |  8 +-
+ tools/testing/selftests/mtk_clk/Makefile      |  2 +-
+ .../selftests/mtk_clk/test_dram_bootstrap.py  | 91 +++++++++++++++++++
+ 3 files changed, 97 insertions(+), 4 deletions(-)
+ create mode 100755 tools/testing/selftests/mtk_clk/test_dram_bootstrap.py
+
+diff --git a/drivers/soc/mediatek/mtk-dram-bw.c b/drivers/soc/mediatek/mtk-dram-bw.c
+index 8a9dfed00c..e861ea10de 100644
+--- a/drivers/soc/mediatek/mtk-dram-bw.c
++++ b/drivers/soc/mediatek/mtk-dram-bw.c
+@@ -283,6 +283,11 @@ static int mtk_dram_bw_probe(struct platform_device *pdev)
+ 	if (IS_ERR(db->vcore))
+ 		return dev_err_probe(dev, PTR_ERR(db->vcore), "dvfsrc-vcore\n");
+ 
++	/* Prepare cleanup before START: probe unwind must not drop live floors. */
++	ret = devm_delayed_work_autocancel(dev, &db->work, mtk_dram_bw_work);
++	if (ret)
++		return ret;
++
+ 	/* Floors first, then the boot vote at the top step, then START. */
+ 	if (floor_uv) {
+ 		ret = regulator_set_voltage(db->vcore, floor_uv, INT_MAX);
+@@ -305,9 +310,6 @@ static int mtk_dram_bw_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "DVFSRC start\n");
+ 
+-	ret = devm_delayed_work_autocancel(dev, &db->work, mtk_dram_bw_work);
+-	if (ret)
+-		return ret;
+ 	queue_delayed_work(system_freezable_power_efficient_wq, &db->work,
+ 			   msecs_to_jiffies(db->period_ms));
+ 
+diff --git a/tools/testing/selftests/mtk_clk/Makefile b/tools/testing/selftests/mtk_clk/Makefile
+index 10441376a8..405d35b988 100644
+--- a/tools/testing/selftests/mtk_clk/Makefile
++++ b/tools/testing/selftests/mtk_clk/Makefile
+@@ -1,4 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-TEST_PROGS := test_mt6897.py test_domains.py test_boot_owner.py test_directlink.py test_display_pm.py test_dpintf_pm.py test_cmdq_stop.py test_crtc_stop.py test_dsi_routing.py
++TEST_PROGS := test_dram_bootstrap.py test_mt6897.py test_domains.py test_boot_owner.py test_directlink.py test_display_pm.py test_dpintf_pm.py test_cmdq_stop.py test_crtc_stop.py test_dsi_routing.py
+ TEST_FILES := mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c ven_cases.c boot_stubs.h boot_cases.c directlink_cases.c display_pm_cases.c mmsys_pm_cases.c dpintf_pm_cases.c cmdq_stop_cases.c crtc_stop_cases.c dsi_routing_cases.c dsi_mmsys_cases.c
+ include ../lib.mk
+diff --git a/tools/testing/selftests/mtk_clk/test_dram_bootstrap.py b/tools/testing/selftests/mtk_clk/test_dram_bootstrap.py
+new file mode 100755
+index 0000000000..01b106ced4
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/test_dram_bootstrap.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Execute the production DRAM probe transaction with ordered failure mocks."""
++from pathlib import Path
++import os
++import subprocess
++import tempfile
++
++assets = Path(__file__).resolve().parent
++repo = Path(os.environ.get('KERNEL_SRC', str(assets.parents[3])))
++source = (repo / 'drivers/soc/mediatek/mtk-dram-bw.c').read_text()
++probe = source.split('static int mtk_dram_bw_probe(', 1)[1].split('\nstatic void mtk_dram_bw_remove', 1)[0]
++start = probe.index('\t/* Prepare cleanup before START:')
++# All fallible resource acquisition precedes the tested production transaction.
++assert probe.rindex('devm_regulator_get(') < start
++assert probe.count('devm_delayed_work_autocancel(') == 1
++transaction = probe[start:probe.index('\n\tdev_info(', start)]
++with tempfile.TemporaryDirectory(prefix='mtk-dram-bootstrap-') as tmp:
++    tmp = Path(tmp)
++    test = tmp / 'test.c'
++    test.write_text(r'''
++#include <assert.h>
++#include <limits.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <string.h>
++struct device { int unused; };
++struct platform_device { struct device dev; };
++struct step { unsigned int kbps; };
++struct dram { int work; void *vcore, *hrt_path, *cpu_path;
++    struct step steps[1]; unsigned int cur_kbps, period_ms; };
++static char calls[16];
++static unsigned int count, fail_at;
++static bool started;
++static int system_freezable_power_efficient_wq;
++static void mtk_dram_bw_work(void) {}
++static int call(char op) {
++    assert(!started); calls[count++] = op;
++    return count == fail_at ? -5 : 0;
++}
++static int devm_delayed_work_autocancel(struct device *d, int *w, void (*fn)(void)) {
++    assert(fn == mtk_dram_bw_work); return call('D');
++}
++static int regulator_set_voltage(void *r, unsigned int uv, int max) {
++    assert(uv == 750000 && max == INT_MAX); return call('V');
++}
++static int icc_set_bw(void *path, unsigned int avg, unsigned int peak) {
++    if (avg) { assert(avg == 4800000 && peak == 0); return call('H'); }
++    assert(peak == 40800000); return call('M');
++}
++static void platform_set_drvdata(struct platform_device *d, struct dram *db) {}
++static int mtk_dvfsrc_start(struct device *d) {
++    int ret = call('S'); if (!ret) started = true; return ret;
++}
++#define dev_err_probe(dev, ret, ...) (ret)
++#define msecs_to_jiffies(ms) (ms)
++static void queue_delayed_work(int queue, int *work, unsigned int delay) {
++    assert(started && delay == 50); calls[count++] = 'Q';
++}
++static int production(unsigned int floor_uv, unsigned int hrt_kbps) {
++    struct dram storage = {.steps = {{40800000}}, .period_ms = 50};
++    struct dram *db = &storage;
++    struct platform_device platform = {0}, controller = {0};
++    struct platform_device *pdev = &platform, *dvfsrc = &controller;
++    struct device *dev = &platform.dev;
++    int ret;
++''' + transaction + r'''
++    return 0;
++}
++int main(void) {
++    const char *expected = "DVHMSQ";
++    for (unsigned int failure = 0; failure <= 5; failure++) {
++        memset(calls, 0, sizeof(calls)); count = 0; started = false;
++        fail_at = failure;
++        int ret = production(750000, 4800000);
++        assert(ret == (failure ? -5 : 0));
++        assert(count == (failure ? failure : 6));
++        assert(!memcmp(calls, expected, count));
++        assert(started == !failure);
++    }
++    /* Optional zero floors preserve existing behavior; MCU still precedes START. */
++    memset(calls, 0, sizeof(calls)); count = 0; started = false; fail_at = 0;
++    assert(production(0, 0) == 0 && !strcmp(calls, "DMSQ"));
++    puts("DRAM bootstrap: ordered success, all five failures, zero floors passed");
++}
++''')
++    binary = tmp / 'test'
++    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
++                    '-Wno-unused-parameter', '-Werror', '-fsanitize=address,undefined',
++                    str(test), '-o', str(binary)], check=True)
++    subprocess.run([str(binary)], check=True)

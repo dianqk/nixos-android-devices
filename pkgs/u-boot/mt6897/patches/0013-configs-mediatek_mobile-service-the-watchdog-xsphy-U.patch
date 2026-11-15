@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 14 Oct 2026 20:54:46 +0800
+Subject: [PATCH 13/13] configs: mediatek_mobile: service the watchdog, xsphy
+ USB, steady fastboot
+
+- Start and service the watchdog: the preloader leaves the RGU running
+  and the stock LK hands over with it enabled; mtk_wdt stops it at probe,
+  so restart it with a 15 s timeout (the driver's maximum is ~16 s) and
+  let the cyclic framework feed it during waits.
+- Use the xsphy USB PHY driver found on MT6897 devices instead of t-phy.
+- Do not abort fastboot on key events: a misread key must not end the
+  USB session.
+- Export the version string as ${ver} for on-screen banners.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ configs/mediatek_mobile_defconfig | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/configs/mediatek_mobile_defconfig b/configs/mediatek_mobile_defconfig
+index fea22cc0c40..dee8a514327 100644
+--- a/configs/mediatek_mobile_defconfig
++++ b/configs/mediatek_mobile_defconfig
+@@ -24,6 +24,7 @@ CONFIG_LOG_MAX_LEVEL=7
+ CONFIG_LOG_DEFAULT_LEVEL=6
+ # CONFIG_DISPLAY_CPUINFO is not set
+ CONFIG_HUSH_PARSER=y
++CONFIG_VERSION_VARIABLE=y
+ CONFIG_CMD_BOOTI=y
+ CONFIG_CMD_BOOTMENU=y
+ CONFIG_CMD_BOOTEFI=y
+@@ -35,7 +36,6 @@ CONFIG_CMD_UFS=y
+ CONFIG_CMD_USB=y
+ CONFIG_CMD_USB_MASS_STORAGE=y
+ CONFIG_CMD_UMS_ABORT_KEYED=y
+-CONFIG_CMD_FASTBOOT_ABORT_KEYED=y
+ CONFIG_CMD_PAUSE=y
+ CONFIG_CMD_FAT=y
+ CONFIG_CMD_EXT4=y
+@@ -64,7 +64,7 @@ CONFIG_FASTBOOT_BUF_SIZE=0x8000000
+ # CONFIG_FASTBOOT_FLASH is not set
+ CONFIG_FASTBOOT_CMD_OEM_CONSOLE=y
+ CONFIG_PHY=y
+-CONFIG_PHY_MTK_TPHY=y
++CONFIG_PHY_MTK_XSPHY=y
+ CONFIG_PINCTRL=y
+ CONFIG_RESET_TI_SYSCON=y
+ CONFIG_SCSI=y
+@@ -88,7 +88,7 @@ CONFIG_VIDEO_SIMPLE=y
+ CONFIG_NO_FB_CLEAR=y
+ CONFIG_SYS_WHITE_ON_BLACK=y
+ CONFIG_WDT=y
+-# CONFIG_WATCHDOG_AUTOSTART is not set
++CONFIG_WATCHDOG_TIMEOUT_MSECS=15000
+ CONFIG_WDT_MTK=y
+ # CONFIG_PANIC_HANG is not set
+ # CONFIG_OF_UPSTREAM is not set

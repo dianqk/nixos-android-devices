@@ -1,0 +1,114 @@
+From d7c8c66f872951e85bcfc39b0c7cc4898fa31b1b Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] drm/mediatek: support MT6897 four-pixel DP interface
+
+Use the MT6897 four-pixel DP_INTF configuration, clock parent selection
+and buffer layout for the supported DisplayPort timings.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T03:12:46+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T03:36:03+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/mediatek/mtk_dpi.c        | 32 +++++++++++++++++++++++
+ drivers/gpu/drm/mediatek/mtk_dpi_common.c | 13 +++++++--
+ 2 files changed, 43 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_dpi.c b/drivers/gpu/drm/mediatek/mtk_dpi.c
+index 8fda46dbd1..d38cf5d7e9 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dpi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dpi.c
+@@ -358,6 +358,16 @@ static void mtk_dpi_config_hw(struct mtk_dpi *dpi,
+ 		mtk_dpi_mask(dpi, DPI_CON, dpi->conf->input_2p_en_bit,
+ 			     dpi->conf->input_2p_en_bit);
+ 
++	if (dpi->conf->buf_ctrl) {
++		/* The output buffer reads 4 pixels at a time */
++		writel(DIV_ROUND_UP(vm->hactive, 4) * vactive,
++		       dpi->regs + DPINTF_BUF_RW_TIMES);
++		mtk_dpi_mask(dpi, DPINTF_BUF_CON0,
++			     DPINTF_BUF_EN | DPINTF_BUF_UNDERFLOW_DONT_BLOCK,
++			     DPINTF_BUF_EN | DPINTF_BUF_UNDERFLOW_DONT_BLOCK);
++		writel(0, dpi->regs + DPINTF_SW_NP_SEL);
++	}
++
+ 	mtk_dpi_sw_reset(dpi, false);
+ 	return;
+ }
+@@ -698,6 +708,27 @@ static const struct mtk_dpi_conf mt8195_dpintf_conf = {
+ 	.input_2p_en_bit = DPINTF_INPUT_2P_EN,
+ };
+ 
++/*
++ * As the MT8195 DP_INTF, without the 2-pixel input and with the output
++ * buffer set up as the MediaTek vendor driver (mtk_dp_intf.c,
++ * mt6897_dp_intf_driver_data: np_sel 0).
++ */
++static const struct mtk_dpi_conf mt6897_dpintf_conf = {
++	.dpi_factor = dpi_factor_mt8195_dp_intf,
++	.num_dpi_factor = ARRAY_SIZE(dpi_factor_mt8195_dp_intf),
++	.max_clock_khz = 600000,
++	.output_fmts = mt8195_dp_intf_output_fmts,
++	.num_output_fmts = ARRAY_SIZE(mt8195_dp_intf_output_fmts),
++	.pixels_per_iter = 4,
++	.dimension_mask = DPINTF_HPW_MASK,
++	.hvsize_mask = DPINTF_HSIZE_MASK,
++	.channel_swap_shift = DPINTF_CH_SWAP,
++	.yuv422_en_bit = DPINTF_YUV422_EN,
++	.csc_enable_bit = DPINTF_CSC_ENABLE,
++	.buf_ctrl = true,
++	.output_optional = true,
++};
++
+ static int mtk_dpi_probe(struct platform_device *pdev)
+ {
+ 	struct mtk_dpi *dpi;
+@@ -721,6 +752,7 @@ static void mtk_dpi_remove(struct platform_device *pdev)
+ 
+ static const struct of_device_id mtk_dpi_of_ids[] = {
+ 	{ .compatible = "mediatek,mt2701-dpi", .data = &mt2701_conf },
++	{ .compatible = "mediatek,mt6897-dp-intf", .data = &mt6897_dpintf_conf },
+ 	{ .compatible = "mediatek,mt8173-dpi", .data = &mt8173_conf },
+ 	{ .compatible = "mediatek,mt8183-dpi", .data = &mt8183_conf },
+ 	{ .compatible = "mediatek,mt8186-dpi", .data = &mt8186_conf },
+diff --git a/drivers/gpu/drm/mediatek/mtk_dpi_common.c b/drivers/gpu/drm/mediatek/mtk_dpi_common.c
+index 5f6a8ec902..cd56cc61ad 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dpi_common.c
++++ b/drivers/gpu/drm/mediatek/mtk_dpi_common.c
+@@ -304,17 +304,26 @@ int mtk_dpi_common_bind(struct device *dev, struct device *master, void *data)
+ 	ret = drm_bridge_attach(&dpi->encoder, &dpi->bridge, NULL,
+ 				DRM_BRIDGE_ATTACH_NO_CONNECTOR);
+ 	if (ret)
+-		goto err_cleanup;
++		goto err_output;
+ 
+ 	dpi->connector = drm_bridge_connector_init(drm_dev, &dpi->encoder);
+ 	if (IS_ERR(dpi->connector)) {
+ 		dev_err(dev, "Unable to create bridge connector\n");
+ 		ret = PTR_ERR(dpi->connector);
+-		goto err_cleanup;
++		goto err_output;
+ 	}
+ 
+ 	return 0;
+ 
++err_output:
++	/*
++	 * Keep the bare encoder: encoders are not renumbered on cleanup and
++	 * the other outputs of the device must still come up.
++	 */
++	if (dpi->conf->output_optional) {
++		dev_warn(dev, "output unavailable: %d\n", ret);
++		return 0;
++	}
+ err_cleanup:
+ 	drm_encoder_cleanup(&dpi->encoder);
+ 	return ret;
+-- 
+2.56.0
+

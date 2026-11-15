@@ -4,7 +4,6 @@
     ../desktop.nix
     ../usb-network.nix
   ];
-  androidDevices.usbSerial = "aurora-example";
   # Conservative setting: preserve ABL votes; rail ownership is not verified.
   boot.kernelParams = [
     "clk_ignore_unused"

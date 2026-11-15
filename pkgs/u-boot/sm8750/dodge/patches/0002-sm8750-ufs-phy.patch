@@ -1,0 +1,493 @@
+From: Nitin Rawat <quic_nitirawa@quicinc.com>
+Date: Mon, 10 Mar 2025 14:12:30 -0700
+Subject: [PATCH] phy: qcom-qmp-ufs: Add PHY Configuration support for sm8750
+
+Add SM8750 specific register layout and table configs. The serdes
+TX RX register offset has changed for SM8750 and hence keep UFS
+specific serdes offsets in a dedicated header file.
+
+Reviewed-by: Neil Armstrong <neil.armstrong@linaro.org>
+Co-developed-by: Manish Pandey <quic_mapa@quicinc.com>
+Signed-off-by: Manish Pandey <quic_mapa@quicinc.com>
+Signed-off-by: Nitin Rawat <quic_nitirawa@quicinc.com>
+Link: https://lore.kernel.org/r/20250310-sm8750_ufs_master-v2-2-0dfdd6823161@quicinc.com
+Signed-off-by: Vinod Koul <vkoul@kernel.org>
+(cherry picked from commit b02cc9a176793b207e959701af1ec26222093b05)
+
+
+Local U-Boot adaptation: use driver-model APIs and existing generic helpers.
+SM8750 PHY sequences configure every block, including PCS gear and HS-B
+overlays; other PHYs retain their current sequence. SM8750 wraps calibration
+in its host PHY reset, following Linux 05441d697f7f:
+https://github.com/torvalds/linux/blob/05441d697f7f9a927264f4058cbbc6a03dfcac9d/drivers/phy/qualcomm/phy-qcom-qmp-ufs.c
+TLMM is GPIO-only with
+the source-defined special UFS reset line. ABL retains regulator votes.
+---
+diff --git a/drivers/phy/qcom/phy-qcom-qmp-qserdes-com-v6.h b/drivers/phy/qcom/phy-qcom-qmp-qserdes-com-v6.h
+index 328c6c0b..258f3d30 100644
+--- a/drivers/phy/qcom/phy-qcom-qmp-qserdes-com-v6.h
++++ b/drivers/phy/qcom/phy-qcom-qmp-qserdes-com-v6.h
+@@ -86,4 +86,11 @@
+ #define QSERDES_V6_COM_CMN_STATUS				0x1d0
+ #define QSERDES_V6_COM_C_READY_STATUS				0x1f8
+ 
++#define QSERDES_V6_COM_ADAPTIVE_ANALOG_CONFIG			0x268
++#define QSERDES_V6_COM_CP_CTRL_ADAPTIVE_MODE0			0x26c
++#define QSERDES_V6_COM_PLL_RCCTRL_ADAPTIVE_MODE0		0x270
++#define QSERDES_V6_COM_PLL_CCTRL_ADAPTIVE_MODE0			0x274
++#define QSERDES_V6_COM_CP_CTRL_ADAPTIVE_MODE1			0x278
++#define QSERDES_V6_COM_PLL_RCCTRL_ADAPTIVE_MODE1		0x27c
++#define QSERDES_V6_COM_PLL_CCTRL_ADAPTIVE_MODE1			0x280
+ #endif
+diff --git a/drivers/phy/qcom/phy-qcom-qmp-qserdes-txrx-ufs-v7.h b/drivers/phy/qcom/phy-qcom-qmp-qserdes-txrx-ufs-v7.h
+new file mode 100644
+index 00000000..3f052249
+--- /dev/null
++++ b/drivers/phy/qcom/phy-qcom-qmp-qserdes-txrx-ufs-v7.h
+@@ -0,0 +1,67 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (c) 2024, Linaro Limited
++ */
++
++#ifndef QCOM_PHY_QMP_QSERDES_TXRX_UFS_V7_H_
++#define QCOM_PHY_QMP_QSERDES_TXRX_UFS_V7_H_
++
++#define QSERDES_UFS_V7_TX_RES_CODE_LANE_TX				0x28
++#define QSERDES_UFS_V7_TX_RES_CODE_LANE_RX				0x2c
++#define QSERDES_UFS_V7_TX_RES_CODE_LANE_OFFSET_TX			0x30
++#define QSERDES_UFS_V7_TX_RES_CODE_LANE_OFFSET_RX			0x34
++#define QSERDES_UFS_V7_TX_LANE_MODE_1					0x7c
++#define QSERDES_UFS_V7_TX_FR_DCC_CTRL					0x108
++
++#define QSERDES_UFS_V7_RX_UCDR_FASTLOCK_FO_GAIN_RATE4                   0x10
++#define QSERDES_UFS_V7_RX_UCDR_FASTLOCK_SO_GAIN_RATE4                   0x24
++#define QSERDES_UFS_V7_RX_UCDR_SO_SATURATION				0x28
++#define QSERDES_UFS_V7_RX_UCDR_FASTLOCK_COUNT_HIGH_RATE4                0x54
++#define QSERDES_UFS_V7_RX_UCDR_PI_CTRL1					0x58
++#define QSERDES_UFS_V7_RX_TERM_BW_CTRL0					0xc4
++#define QSERDES_UFS_V7_RX_UCDR_FO_GAIN_RATE2                            0xd4
++#define QSERDES_UFS_V7_RX_UCDR_FO_GAIN_RATE4                            0xdc
++#define QSERDES_UFS_V7_RX_UCDR_SO_GAIN_RATE4                            0xf0
++#define QSERDES_UFS_V7_RX_UCDR_PI_CONTROLS                              0xf4
++#define QSERDES_UFS_V7_RX_VGA_CAL_MAN_VAL                               0x178
++#define QSERDES_UFS_V7_RX_EQU_ADAPTOR_CNTRL4                            0x1b4
++#define QSERDES_UFS_V7_RX_EQ_OFFSET_ADAPTOR_CNTRL1                      0x1cc
++#define QSERDES_UFS_V7_RX_OFFSET_ADAPTOR_CNTRL3                         0x1d4
++#define QSERDES_UFS_V7_RX_INTERFACE_MODE                                0x1f0
++#define QSERDES_UFS_V7_RX_MODE_RATE_0_1_B0				0x218
++#define QSERDES_UFS_V7_RX_MODE_RATE_0_1_B1				0x21C
++#define QSERDES_UFS_V7_RX_MODE_RATE_0_1_B2				0x220
++#define QSERDES_UFS_V7_RX_MODE_RATE_0_1_B3				0x224
++#define QSERDES_UFS_V7_RX_MODE_RATE_0_1_B4				0x228
++#define QSERDES_UFS_V7_RX_MODE_RATE_0_1_B6				0x230
++#define QSERDES_UFS_V7_RX_MODE_RATE_0_1_B7				0x234
++#define QSERDES_UFS_V7_RX_MODE_RATE2_B3					0x248
++#define QSERDES_UFS_V7_RX_MODE_RATE2_B6					0x254
++#define QSERDES_UFS_V7_RX_MODE_RATE2_B7					0x258
++#define QSERDES_UFS_V7_RX_MODE_RATE3_B0					0x260
++#define QSERDES_UFS_V7_RX_MODE_RATE3_B1					0x264
++#define QSERDES_UFS_V7_RX_MODE_RATE3_B2					0x268
++#define QSERDES_UFS_V7_RX_MODE_RATE3_B3					0x26c
++#define QSERDES_UFS_V7_RX_MODE_RATE3_B4					0x270
++#define QSERDES_UFS_V7_RX_MODE_RATE3_B5					0x274
++#define QSERDES_UFS_V7_RX_MODE_RATE3_B7					0x27c
++#define QSERDES_UFS_V7_RX_MODE_RATE3_B8					0x280
++#define QSERDES_UFS_V7_RX_MODE_RATE4_SA_B0				0x284
++#define QSERDES_UFS_V7_RX_MODE_RATE4_SA_B1				0x288
++#define QSERDES_UFS_V7_RX_MODE_RATE4_SA_B2				0x28c
++#define QSERDES_UFS_V7_RX_MODE_RATE4_SA_B3				0x290
++#define QSERDES_UFS_V7_RX_MODE_RATE4_SA_B4				0x294
++#define QSERDES_UFS_V7_RX_MODE_RATE4_SA_B5				0x298
++#define QSERDES_UFS_V7_RX_MODE_RATE4_SA_B6				0x29c
++#define QSERDES_UFS_V7_RX_MODE_RATE4_SA_B7				0x2a0
++#define QSERDES_UFS_V7_RX_MODE_RATE4_SB_B0				0x2a8
++#define QSERDES_UFS_V7_RX_MODE_RATE4_SB_B1				0x2ac
++#define QSERDES_UFS_V7_RX_MODE_RATE4_SB_B2				0x2b0
++#define QSERDES_UFS_V7_RX_MODE_RATE4_SB_B3				0x2b4
++#define QSERDES_UFS_V7_RX_MODE_RATE4_SB_B4				0x2b8
++#define QSERDES_UFS_V7_RX_MODE_RATE4_SB_B5				0x2bc
++#define QSERDES_UFS_V7_RX_MODE_RATE4_SB_B6				0x2c0
++#define QSERDES_UFS_V7_RX_MODE_RATE4_SB_B7				0x2c4
++#define QSERDES_UFS_V7_RX_DLL0_FTUNE_CTRL				0x348
++#define QSERDES_UFS_V7_RX_SIGDET_CAL_TRIM				0x380
++#endif
+diff --git a/drivers/phy/qcom/phy-qcom-qmp-ufs.c b/drivers/phy/qcom/phy-qcom-qmp-ufs.c
+index 3df88189..025e77a4 100644
+--- a/drivers/phy/qcom/phy-qcom-qmp-ufs.c
++++ b/drivers/phy/qcom/phy-qcom-qmp-ufs.c
+@@ -38,6 +38,7 @@
+ #include "phy-qcom-qmp-qserdes-txrx-v4.h"
+ #include "phy-qcom-qmp-qserdes-txrx-v5.h"
+ #include "phy-qcom-qmp-qserdes-txrx-ufs-v6.h"
++#include "phy-qcom-qmp-qserdes-txrx-ufs-v7.h"
+ 
+ /* QPHY_SW_RESET bit */
+ #define SW_RESET				BIT(0)
+@@ -905,6 +906,133 @@ static const struct qmp_ufs_init_tbl sm6115_ufsphy_pcs[] = {
+ 	QMP_PHY_INIT_CFG(QPHY_V2_PCS_UFS_RX_MIN_HIBERN8_TIME, 0x9a), /* 8 us */
+ };
+ 
++static const struct qmp_ufs_init_tbl sm8750_ufsphy_serdes[] = {
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_SYSCLK_EN_SEL, 0xd9),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_CMN_CONFIG_1, 0x16),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_HSCLK_SEL_1, 0x11),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_HSCLK_HS_SWITCH_SEL_1, 0x00),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_LOCK_CMP_EN, 0x01),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_LOCK_CMP_CFG, 0x60),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_PLL_IVCO, 0x1f),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_PLL_IVCO_MODE1, 0x1f),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_CMN_IETRIM, 0x07),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_CMN_IPTRIM, 0x20),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_VCO_TUNE_MAP, 0x04),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_VCO_TUNE_CTRL, 0x40),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_ADAPTIVE_ANALOG_CONFIG, 0x06),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_DEC_START_MODE0, 0x41),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_CP_CTRL_MODE0, 0x06),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_PLL_RCTRL_MODE0, 0x18),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_PLL_CCTRL_MODE0, 0x14),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_CP_CTRL_ADAPTIVE_MODE0, 0x06),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_PLL_RCCTRL_ADAPTIVE_MODE0, 0x18),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_PLL_CCTRL_ADAPTIVE_MODE0, 0x14),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_LOCK_CMP1_MODE0, 0x7f),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_LOCK_CMP2_MODE0, 0x06),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_BIN_VCOCAL_CMP_CODE1_MODE0, 0x92),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_BIN_VCOCAL_CMP_CODE2_MODE0, 0x1e),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_DEC_START_MODE1, 0x4c),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_CP_CTRL_MODE1, 0x06),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_PLL_RCTRL_MODE1, 0x18),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_PLL_CCTRL_MODE1, 0x14),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_CP_CTRL_ADAPTIVE_MODE1, 0x06),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_PLL_RCCTRL_ADAPTIVE_MODE1, 0x18),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_PLL_CCTRL_ADAPTIVE_MODE1, 0x14),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_LOCK_CMP1_MODE1, 0x99),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_LOCK_CMP2_MODE1, 0x07),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_BIN_VCOCAL_CMP_CODE1_MODE1, 0xbe),
++	QMP_PHY_INIT_CFG(QSERDES_V6_COM_BIN_VCOCAL_CMP_CODE2_MODE1, 0x23),
++};
++
++static const struct qmp_ufs_init_tbl sm8750_ufsphy_tx[] = {
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_TX_LANE_MODE_1, 0x00),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_TX_RES_CODE_LANE_OFFSET_TX, 0x07),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_TX_RES_CODE_LANE_OFFSET_RX, 0x17),
++};
++
++static const struct qmp_ufs_init_tbl sm8750_ufsphy_rx[] = {
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_UCDR_FO_GAIN_RATE2, 0x0c),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_UCDR_FO_GAIN_RATE4, 0x0c),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_UCDR_SO_GAIN_RATE4, 0x04),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_EQ_OFFSET_ADAPTOR_CNTRL1, 0x14),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_UCDR_PI_CONTROLS, 0x07),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_OFFSET_ADAPTOR_CNTRL3, 0x0e),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_UCDR_FASTLOCK_COUNT_HIGH_RATE4,
++			 0x02),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_UCDR_FASTLOCK_FO_GAIN_RATE4, 0x1c),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_UCDR_FASTLOCK_SO_GAIN_RATE4, 0x06),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_VGA_CAL_MAN_VAL, 0x8e),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_EQU_ADAPTOR_CNTRL4, 0x0f),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE_0_1_B0, 0xce),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE_0_1_B1, 0xce),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE_0_1_B2, 0x18),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE_0_1_B3, 0x1a),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE_0_1_B4, 0x0f),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE_0_1_B6, 0x60),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE_0_1_B7, 0x62),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE2_B3, 0x9a),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE2_B6, 0xe2),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE2_B7, 0x06),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE3_B0, 0x1b),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE3_B1, 0x1b),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE3_B2, 0x98),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE3_B3, 0x9b),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE3_B4, 0x2a),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE3_B5, 0x12),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE3_B7, 0x06),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE3_B8, 0x01),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE4_SA_B0, 0x93),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE4_SA_B1, 0x93),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE4_SA_B2, 0x60),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE4_SA_B3, 0x99),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE4_SA_B4, 0x5f),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE4_SA_B5, 0x92),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE4_SA_B6, 0xe3),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE4_SA_B7, 0x06),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE4_SB_B0, 0x9b),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE4_SB_B1, 0x9b),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE4_SB_B2, 0x60),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE4_SB_B3, 0x99),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE4_SB_B4, 0x5f),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE4_SB_B5, 0x92),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE4_SB_B6, 0xfb),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_MODE_RATE4_SB_B7, 0x06),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_UCDR_SO_SATURATION, 0x1f),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_UCDR_PI_CTRL1, 0x94),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_TERM_BW_CTRL0, 0xfa),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_DLL0_FTUNE_CTRL, 0x30),
++	QMP_PHY_INIT_CFG(QSERDES_UFS_V7_RX_SIGDET_CAL_TRIM, 0x77),
++};
++
++static const struct qmp_ufs_init_tbl sm8750_ufsphy_pcs[] = {
++	QMP_PHY_INIT_CFG(QPHY_V6_PCS_UFS_MULTI_LANE_CTRL1, 0x02),
++	QMP_PHY_INIT_CFG(QPHY_V6_PCS_UFS_TX_MID_TERM_CTRL1, 0x43),
++	QMP_PHY_INIT_CFG(QPHY_V6_PCS_UFS_PCS_CTRL1, 0x40),
++	QMP_PHY_INIT_CFG(QPHY_V6_PCS_UFS_TX_LARGE_AMP_DRV_LVL, 0x0f),
++	QMP_PHY_INIT_CFG(QPHY_V6_PCS_UFS_RX_SIGDET_CTRL2, 0x68),
++	QMP_PHY_INIT_CFG(QPHY_V6_PCS_UFS_TX_POST_EMP_LVL_S4, 0x0e),
++	QMP_PHY_INIT_CFG(QPHY_V6_PCS_UFS_TX_POST_EMP_LVL_S5, 0x12),
++	QMP_PHY_INIT_CFG(QPHY_V6_PCS_UFS_TX_POST_EMP_LVL_S6, 0x15),
++	QMP_PHY_INIT_CFG(QPHY_V6_PCS_UFS_TX_POST_EMP_LVL_S7, 0x19),
++};
++
++static const struct qmp_ufs_init_tbl sm8750_ufsphy_g4_pcs[] = {
++	QMP_PHY_INIT_CFG(QPHY_V6_PCS_UFS_TX_HSGEAR_CAPABILITY, 0x04),
++	QMP_PHY_INIT_CFG(QPHY_V6_PCS_UFS_RX_HSGEAR_CAPABILITY, 0x04),
++};
++
++static const struct qmp_ufs_init_tbl sm8750_ufsphy_hs_b_pcs[] = {
++	QMP_PHY_INIT_CFG(QPHY_V6_PCS_UFS_PCS_CTRL1, 0x41),
++};
++
++static const struct qmp_ufs_init_tbl sm8650_ufsphy_g5_pcs[] = {
++	QMP_PHY_INIT_CFG(QPHY_V6_PCS_UFS_PLL_CNTL, 0x33),
++	QMP_PHY_INIT_CFG(QPHY_V6_PCS_UFS_TX_HSGEAR_CAPABILITY, 0x05),
++	QMP_PHY_INIT_CFG(QPHY_V6_PCS_UFS_RX_HSGEAR_CAPABILITY, 0x05),
++	QMP_PHY_INIT_CFG(QPHY_V6_PCS_UFS_RX_HS_G5_SYNC_LENGTH_CAPABILITY, 0x4d),
++	QMP_PHY_INIT_CFG(QPHY_V6_PCS_UFS_RX_HSG5_SYNC_WAIT_TIME, 0x9e),
++};
++
+ struct qmp_ufs_offsets {
+ 	u16 serdes;
+ 	u16 pcs;
+@@ -939,6 +1067,8 @@ struct qmp_ufs_cfg {
+ 	const struct qmp_ufs_cfg_tbls tbls_hs_b;
+ 	/* Additional sequence for HS G4 */
+ 	const struct qmp_ufs_cfg_tbls tbls_hs_g4;
++	const struct qmp_ufs_cfg_tbls tbls_hs_g5;
++	unsigned int max_supported_gear;
+ 
+ 	/* clock ids to be requested */
+ 	const char * const *clk_list;
+@@ -955,6 +1085,7 @@ struct qmp_ufs_cfg {
+ 
+ 	/* true, if PCS block has no separate SW_RESET register */
+ 	bool no_pcs_sw_reset;
++	bool host_phy_reset;
+ };
+ 
+ struct qmp_ufs_priv {
+@@ -971,6 +1102,7 @@ struct qmp_ufs_priv {
+ 	struct clk *clks;
+ 	unsigned int clk_count;
+ 
++	struct reset_ctl host_reset;
+ 	struct reset_ctl *resets;
+ 	unsigned int reset_count;
+ 
+@@ -1352,6 +1484,38 @@ static const struct qmp_ufs_cfg sm6115_ufsphy_cfg = {
+ 	.no_pcs_sw_reset	= true,
+ };
+ 
++static const struct qmp_ufs_cfg sm8750_ufsphy_cfg = {
++	.host_phy_reset = true,
++	.lanes = 2,
++	.offsets = &qmp_ufs_offsets_v6,
++	.max_supported_gear = 5,
++	.tbls = {
++		.serdes = sm8750_ufsphy_serdes,
++		.serdes_num = ARRAY_SIZE(sm8750_ufsphy_serdes),
++		.tx = sm8750_ufsphy_tx,
++		.tx_num = ARRAY_SIZE(sm8750_ufsphy_tx),
++		.rx = sm8750_ufsphy_rx,
++		.rx_num = ARRAY_SIZE(sm8750_ufsphy_rx),
++		.pcs = sm8750_ufsphy_pcs,
++		.pcs_num = ARRAY_SIZE(sm8750_ufsphy_pcs),
++	},
++	.tbls_hs_b = {
++		.pcs = sm8750_ufsphy_hs_b_pcs,
++		.pcs_num = ARRAY_SIZE(sm8750_ufsphy_hs_b_pcs),
++	},
++	.tbls_hs_g4 = {
++		.pcs = sm8750_ufsphy_g4_pcs,
++		.pcs_num = ARRAY_SIZE(sm8750_ufsphy_g4_pcs),
++	},
++	.tbls_hs_g5 = {
++		.pcs = sm8650_ufsphy_g5_pcs,
++		.pcs_num = ARRAY_SIZE(sm8650_ufsphy_g5_pcs),
++	},
++	.clk_list = sm8450_ufs_phy_clk_l,
++	.num_clks = ARRAY_SIZE(sm8450_ufs_phy_clk_l),
++	.regs = ufsphy_v6_regs_layout,
++};
++
+ static void qmp_ufs_configure_lane(void __iomem *base,
+ 					const struct qmp_ufs_init_tbl tbl[],
+ 					int num,
+@@ -1407,9 +1571,29 @@ static void qmp_ufs_pcs_init(struct qmp_ufs_priv *qmp, const struct qmp_ufs_cfg_
+ 	qmp_ufs_configure(pcs, tbls->pcs, tbls->pcs_num);
+ }
+ 
++static void qmp_ufs_init_all(struct qmp_ufs_priv *qmp,
++			     const struct qmp_ufs_cfg_tbls *tbls)
++{
++	qmp_ufs_serdes_init(qmp, tbls);
++	qmp_ufs_lanes_init(qmp, tbls);
++	qmp_ufs_pcs_init(qmp, tbls);
++}
++
+ static void qmp_ufs_init_registers(struct qmp_ufs_priv *qmp, const struct qmp_ufs_cfg *cfg)
+ {
+-	/* We support 'PHY_MODE_UFS_HS_B' mode & 'UFS_HS_G3' submode for now. */
++	if (cfg->max_supported_gear) {
++		/*
++		 * Complete base, gear overlay, then HS series overlay, as in Linux.
++		 * SM8750's series-B override is in PCS, not SERDES.
++		 */
++		qmp_ufs_init_all(qmp, &cfg->tbls);
++		qmp_ufs_init_all(qmp, qmp->submode == 5 ? &cfg->tbls_hs_g5 :
++							  &cfg->tbls_hs_g4);
++		if (qmp->mode == PHY_MODE_UFS_HS_B)
++			qmp_ufs_init_all(qmp, &cfg->tbls_hs_b);
++		return;
++	}
++	/* Retain the existing configuration sequence for other supported PHYs. */
+ 	qmp_ufs_serdes_init(qmp, &cfg->tbls);
+ 	qmp_ufs_serdes_init(qmp, &cfg->tbls_hs_b);
+ 	qmp_ufs_serdes_init(qmp, &cfg->tbls_hs_g4);
+@@ -1417,6 +1601,19 @@ static void qmp_ufs_init_registers(struct qmp_ufs_priv *qmp, const struct qmp_uf
+ 	qmp_ufs_pcs_init(qmp, &cfg->tbls);
+ }
+ 
++static int qmp_ufs_set_mode(struct phy *phy, enum phy_mode mode, int submode)
++{
++	struct qmp_ufs_priv *qmp = dev_get_priv(phy->dev);
++	if (!qmp->cfg->max_supported_gear)
++		return 0;
++	if ((mode != PHY_MODE_UFS_HS_A && mode != PHY_MODE_UFS_HS_B) ||
++	    submode < 1 || submode > qmp->cfg->max_supported_gear)
++		return -EINVAL;
++	qmp->mode = mode;
++	qmp->submode = submode;
++	return 0;
++}
++
+ static int qmp_ufs_do_reset(struct qmp_ufs_priv *qmp)
+ {
+ 	int i, ret;
+@@ -1452,7 +1649,23 @@ static int qmp_ufs_power_on(struct phy *phy)
+ 	/* Power down PHY */
+ 	qphy_setbits(pcs, cfg->regs[QPHY_PCS_POWER_DOWN_CONTROL], SW_PWRDN);
+ 
++	/* SM8750 calibration requires the host reset around register programming. */
++	if (cfg->host_phy_reset) {
++		ret = reset_assert(&qmp->host_reset);
++		if (ret)
++			return ret;
++	}
++
+ 	qmp_ufs_init_registers(qmp, cfg);
++	if (cfg->host_phy_reset)
++		dev_info(phy->dev, "PHY gear=%u PLL_CNTL after tables=%#x\n",
++			 qmp->submode, readl(pcs + QPHY_V6_PCS_UFS_PLL_CNTL));
++
++	if (cfg->host_phy_reset) {
++		ret = reset_deassert(&qmp->host_reset);
++		if (ret)
++			return ret;
++	}
+ 
+ 	if (cfg->no_pcs_sw_reset) {
+ 		ret = qmp_ufs_do_reset(qmp);
+@@ -1476,6 +1689,9 @@ static int qmp_ufs_power_on(struct phy *phy)
+ 		return ret;
+ 	}
+ 
++	if (cfg->host_phy_reset)
++		dev_info(phy->dev, "PHY ready gear=%u PLL_CNTL=%#x\n",
++			 qmp->submode, readl(pcs + QPHY_V6_PCS_UFS_PLL_CNTL));
+ 	return 0;
+ }
+ 
+@@ -1687,6 +1903,12 @@ static int qmp_ufs_probe(struct udevice *dev)
+ 		return ret;
+ 	}
+ 
++	if (qmp->cfg->host_phy_reset) {
++		ret = reset_get_by_name(dev, "ufsphy", &qmp->host_reset);
++		if (ret)
++			return ret;
++	}
++
+ 	if (qmp->cfg->no_pcs_sw_reset) {
+ 		ret = qmp_ufs_reset_init(dev, qmp);
+ 		if (ret) {
+@@ -1733,26 +1955,55 @@ static int qmp_ufs_probe(struct udevice *dev)
+ }
+ 
+ static struct phy_ops qmp_ufs_ops = {
++	.set_mode = qmp_ufs_set_mode,
+ 	.power_on = qmp_ufs_power_on,
+ 	.power_off = qmp_ufs_power_off,
+ };
+ 
+ static const struct udevice_id qmp_ufs_ids[] = {
+-	{ .compatible = "qcom,milos-qmp-ufs-phy", .data = (ulong)&milos_ufsphy_cfg, },
+-	{ .compatible = "qcom,sa8775p-qmp-ufs-phy", .data = (ulong)&sa8775p_ufsphy_cfg, },
+-	{ .compatible = "qcom,sdm845-qmp-ufs-phy", .data = (ulong)&sdm845_ufsphy_cfg },
+-	{ .compatible = "qcom,sm6115-qmp-ufs-phy", .data = (ulong)&sm6115_ufsphy_cfg, },
+-	{ .compatible = "qcom,sm6125-qmp-ufs-phy", .data = (ulong)&sm6115_ufsphy_cfg, },
+-	{ .compatible = "qcom,sm6350-qmp-ufs-phy", .data = (ulong)&sdm845_ufsphy_cfg },
+-	{ .compatible = "qcom,sm7150-qmp-ufs-phy", .data = (ulong)&sm7150_ufsphy_cfg },
+-	{ .compatible = "qcom,sm8150-qmp-ufs-phy", .data = (ulong)&sm8150_ufsphy_cfg },
+-	{ .compatible = "qcom,sm8250-qmp-ufs-phy", .data = (ulong)&sm8250_ufsphy_cfg },
+-	{ .compatible = "qcom,qcs8300-qmp-ufs-phy", .data = (ulong)&sa8775p_ufsphy_cfg },
+-	{ .compatible = "qcom,sm8550-qmp-ufs-phy", .data = (ulong)&sm8550_ufsphy_cfg },
+-	{ .compatible = "qcom,sm8650-qmp-ufs-phy", .data = (ulong)&sm8650_ufsphy_cfg },
+-	{ .compatible = "qcom,sc7280-qmp-ufs-phy", .data = (ulong)&sc7280_ufsphy_cfg, },
+-	{ .compatible = "qcom,qcs615-qmp-ufs-phy", .data = (ulong)&sm6115_ufsphy_cfg, },
+-	{ }
++	{
++		.compatible = "qcom,milos-qmp-ufs-phy",
++		.data = (ulong)&milos_ufsphy_cfg,
++	},
++	{
++		.compatible = "qcom,sa8775p-qmp-ufs-phy",
++		.data = (ulong)&sa8775p_ufsphy_cfg,
++	},
++	{ .compatible = "qcom,sdm845-qmp-ufs-phy",
++	  .data = (ulong)&sdm845_ufsphy_cfg },
++	{
++		.compatible = "qcom,sm6115-qmp-ufs-phy",
++		.data = (ulong)&sm6115_ufsphy_cfg,
++	},
++	{
++		.compatible = "qcom,sm6125-qmp-ufs-phy",
++		.data = (ulong)&sm6115_ufsphy_cfg,
++	},
++	{ .compatible = "qcom,sm6350-qmp-ufs-phy",
++	  .data = (ulong)&sdm845_ufsphy_cfg },
++	{ .compatible = "qcom,sm7150-qmp-ufs-phy",
++	  .data = (ulong)&sm7150_ufsphy_cfg },
++	{ .compatible = "qcom,sm8150-qmp-ufs-phy",
++	  .data = (ulong)&sm8150_ufsphy_cfg },
++	{ .compatible = "qcom,sm8250-qmp-ufs-phy",
++	  .data = (ulong)&sm8250_ufsphy_cfg },
++	{ .compatible = "qcom,qcs8300-qmp-ufs-phy",
++	  .data = (ulong)&sa8775p_ufsphy_cfg },
++	{ .compatible = "qcom,sm8550-qmp-ufs-phy",
++	  .data = (ulong)&sm8550_ufsphy_cfg },
++	{ .compatible = "qcom,sm8750-qmp-ufs-phy",
++	  .data = (ulong)&sm8750_ufsphy_cfg },
++	{ .compatible = "qcom,sm8650-qmp-ufs-phy",
++	  .data = (ulong)&sm8650_ufsphy_cfg },
++	{
++		.compatible = "qcom,sc7280-qmp-ufs-phy",
++		.data = (ulong)&sc7280_ufsphy_cfg,
++	},
++	{
++		.compatible = "qcom,qcs615-qmp-ufs-phy",
++		.data = (ulong)&sm6115_ufsphy_cfg,
++	},
++	{}
+ };
+ 
+ U_BOOT_DRIVER(qcom_qmp_ufs) = {

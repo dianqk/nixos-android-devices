@@ -1,0 +1,196 @@
+From 823a95253478b4295b449710d02b6a20bf627c86 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 20 Oct 2026 13:52:57 +0800
+Subject: [PATCH] mtk-soc: radio power-down and a bounded SMS PDU mode retry
+
+ModemManager powers the radio down around SetInitialEpsBearerSettings;
+without modem_power_down that request failed.  Use AT+CFUN=4 (power up
+stays the generic AT+CFUN=1).
+
+Shortly after READY the modem answers AT+CMGF=0 with +CMS ERROR: 500 until
+its SMS service is up, and ModemManager then falls back to text mode, in
+which this modem refuses AT+CMGS.  Retry PDU mode every 3 s up to 20 times
+before using the generic setup.
+---
+ .../mtk-soc/mm-broadband-modem-mtk-soc.c      | 137 +++++++++++++++++-
+ 1 file changed, 136 insertions(+), 1 deletion(-)
+
+diff --git a/src/plugins/mtk-soc/mm-broadband-modem-mtk-soc.c b/src/plugins/mtk-soc/mm-broadband-modem-mtk-soc.c
+index e0c94d5..12b3432 100644
+--- a/src/plugins/mtk-soc/mm-broadband-modem-mtk-soc.c
++++ b/src/plugins/mtk-soc/mm-broadband-modem-mtk-soc.c
+@@ -16,6 +16,7 @@
+ #include "mm-broadband-modem-mtk-soc.h"
+ #include "mm-iface-modem.h"
+ #include "mm-iface-modem-3gpp.h"
++#include "mm-iface-modem-messaging.h"
+ #include "mm-log-object.h"
+ #include "mm-modem-helpers.h"
+ #include "mm-mtk-mipc.h"
+@@ -24,6 +25,7 @@
+ 
+ static void iface_modem_init (MMIfaceModemInterface *iface);
+ static void iface_modem_3gpp_init (MMIfaceModem3gppInterface *iface);
++static void iface_modem_messaging_init (MMIfaceModemMessagingInterface *iface);
+ static void load_signal_quality (MMIfaceModem *self, GAsyncReadyCallback callback, gpointer user_data);
+ static guint load_signal_quality_finish (MMIfaceModem *self, GAsyncResult *res, GError **error);
+ 
+@@ -32,7 +34,8 @@ G_DEFINE_TYPE_EXTENDED (MMBroadbandModemMtkSoc,
+                         MM_TYPE_BROADBAND_MODEM,
+                         0,
+                         G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM, iface_modem_init)
+-                        G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_3GPP, iface_modem_3gpp_init))
++                        G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_3GPP, iface_modem_3gpp_init)
++                        G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_MESSAGING, iface_modem_messaging_init))
+ 
+ typedef struct {
+     GPtrArray *sim_slots;
+@@ -969,6 +972,136 @@ load_initial_eps_bearer_settings (MMIfaceModem3gpp    *self,
+                               g_task_new (self, NULL, callback, user_data));
+ }
+ 
++/*****************************************************************************/
++/* Radio power down (AT+CFUN=4), used by ModemManager around initial EPS      */
++/* bearer updates; power up stays the parent's AT+CFUN=1.                     */
++
++static gboolean
++modem_power_down_finish (MMIfaceModem  *self,
++                         GAsyncResult  *res,
++                         GError       **error)
++{
++    return !!mm_base_modem_at_command_finish (MM_BASE_MODEM (self), res, error);
++}
++
++static void
++modem_power_down (MMIfaceModem        *self,
++                  GAsyncReadyCallback  callback,
++                  gpointer             user_data)
++{
++    mm_base_modem_at_command (MM_BASE_MODEM (self), "+CFUN=4", 10, FALSE,
++                              callback, user_data);
++}
++
++/*****************************************************************************/
++/* SMS format.  Shortly after READY the modem answers AT+CMGF=0 with          */
++/* +CMS ERROR: 500 until its SMS service is up; ModemManager would then fall  */
++/* back to text mode, in which this modem refuses AT+CMGS.  Retry PDU mode    */
++/* for a bounded time first; only then use the parent's fallback.             */
++
++#define CMGF_RETRY_ATTEMPTS    20
++#define CMGF_RETRY_INTERVAL_S  3
++
++static MMIfaceModemMessagingInterface *iface_modem_messaging_parent;
++
++typedef struct {
++    guint attempts_left;
++} CmgfContext;
++
++static void cmgf_pdu_attempt (GTask *task);
++
++static gboolean
++setup_sms_format_finish (MMIfaceModemMessaging  *self,
++                         GAsyncResult           *res,
++                         GError                **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++static void
++parent_setup_sms_format_ready (MMIfaceModemMessaging *self,
++                               GAsyncResult          *res,
++                               GTask                 *task)
++{
++    GError *error = NULL;
++
++    if (!iface_modem_messaging_parent->setup_sms_format_finish (self, res, &error))
++        g_task_return_error (task, error);
++    else
++        g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++static gboolean
++cmgf_retry_idle (GTask *task)
++{
++    cmgf_pdu_attempt (task);
++    return G_SOURCE_REMOVE;
++}
++
++static void
++cmgf_pdu_ready (MMBaseModem  *self,
++                GAsyncResult *res,
++                GTask        *task)
++{
++    CmgfContext       *ctx = g_task_get_task_data (task);
++    g_autoptr(GError)  error = NULL;
++
++    if (mm_base_modem_at_command_finish (self, res, &error)) {
++        mm_obj_dbg (self, "(mtk-soc) SMS PDU mode set");
++        g_object_set (self, MM_IFACE_MODEM_MESSAGING_SMS_PDU_MODE, TRUE, NULL);
++        g_task_return_boolean (task, TRUE);
++        g_object_unref (task);
++        return;
++    }
++    if (ctx->attempts_left > 0 &&
++        g_error_matches (error, MM_MESSAGE_ERROR, MM_MESSAGE_ERROR_UNKNOWN)) {
++        mm_obj_dbg (self, "(mtk-soc) SMS service not ready (%s), retrying PDU mode "
++                    "(%u attempts left)", error->message, ctx->attempts_left);
++        g_timeout_add_seconds (CMGF_RETRY_INTERVAL_S, (GSourceFunc) cmgf_retry_idle, task);
++        return;
++    }
++    mm_obj_dbg (self, "(mtk-soc) couldn't set SMS PDU mode: %s; using the generic setup",
++                error->message);
++    iface_modem_messaging_parent->setup_sms_format (MM_IFACE_MODEM_MESSAGING (self),
++                                                    (GAsyncReadyCallback) parent_setup_sms_format_ready,
++                                                    task);
++}
++
++static void
++cmgf_pdu_attempt (GTask *task)
++{
++    CmgfContext *ctx = g_task_get_task_data (task);
++
++    ctx->attempts_left--;
++    mm_base_modem_at_command (MM_BASE_MODEM (g_task_get_source_object (task)),
++                              "+CMGF=0", 3, FALSE,
++                              (GAsyncReadyCallback) cmgf_pdu_ready, task);
++}
++
++static void
++setup_sms_format (MMIfaceModemMessaging *self,
++                  GAsyncReadyCallback    callback,
++                  gpointer               user_data)
++{
++    GTask       *task;
++    CmgfContext *ctx;
++
++    task = g_task_new (self, NULL, callback, user_data);
++    ctx = g_new0 (CmgfContext, 1);
++    ctx->attempts_left = CMGF_RETRY_ATTEMPTS;
++    g_task_set_task_data (task, ctx, g_free);
++    cmgf_pdu_attempt (task);
++}
++
++static void
++iface_modem_messaging_init (MMIfaceModemMessagingInterface *iface)
++{
++    iface_modem_messaging_parent = g_type_interface_peek_parent (iface);
++    iface->setup_sms_format = setup_sms_format;
++    iface->setup_sms_format_finish = setup_sms_format_finish;
++}
++
+ static void
+ iface_modem_3gpp_init (MMIfaceModem3gppInterface *iface)
+ {
+@@ -992,6 +1125,8 @@ iface_modem_init (MMIfaceModemInterface *iface)
+     iface->load_current_modes_finish = load_current_modes_finish;
+     iface->set_current_modes = set_current_modes;
+     iface->set_current_modes_finish = set_current_modes_finish;
++    iface->modem_power_down = modem_power_down;
++    iface->modem_power_down_finish = modem_power_down_finish;
+     iface->load_access_technologies = load_access_technologies;
+     iface->load_access_technologies_finish = load_access_technologies_finish;
+     iface->load_sim_slots = load_sim_slots;
+-- 
+2.55.0
+

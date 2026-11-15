@@ -1,0 +1,40 @@
+From 298f2f97ff81038bf3769d14472c9c4376dcd746 Mon Sep 17 00:00:00 2001
+From: Tatsuki Tanaka <tatsuki@tanakatatsuki.dev>
+Date: Fri, 9 Oct 2026 18:32:53 +0800
+Subject: [PATCH] usb: gadget: f_acm: add option not to wait for host
+ connection
+
+Introduce CONFIG_USB_FUNCTION_ACM_NOWAIT to return immediately during
+stdio init, buffering output until a host connects and enumeration
+completes. Enables early USB serial console on phones without hanging
+when disconnected.
+
+Signed-off-by: Tatsuki Tanaka <tatsuki@tanakatatsuki.dev>
+(cherry picked from commit 212c5288fdc4cd4667bd171e24f3e314a7c4f4e7)
+[Conflict: the shared queue's 0002 already starts the ACM console without
+ waiting for a host, so the wait loop is gone; kept that body. The new
+ Kconfig option remains and has no further effect.]
+---
+ drivers/usb/gadget/Kconfig | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/drivers/usb/gadget/Kconfig b/drivers/usb/gadget/Kconfig
+index e42d5a436..f60ea3e8e 100644
+--- a/drivers/usb/gadget/Kconfig
++++ b/drivers/usb/gadget/Kconfig
+@@ -229,6 +229,15 @@ config USB_FUNCTION_ACM
+ 	  interoperate with MS-Windows hosts or with the Linux-USB "cdc-acm"
+ 	  driver.
+ 
++config USB_FUNCTION_ACM_NOWAIT
++	bool "Don't wait for the host when starting the ACM console"
++	depends on USB_FUNCTION_ACM
++	help
++	  Return from the usbacm stdio start immediately instead of blocking
++	  until a host opens the port. Console output is buffered until the
++	  host connects. This allows enabling the USB serial console
++	  unconditionally at boot without hanging when no cable is attached.
++
+ endif # USB_GADGET_DOWNLOAD
+ 
+ config USB_ETHER

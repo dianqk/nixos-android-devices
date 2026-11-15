@@ -1,0 +1,29 @@
+From: Dian QK <dianqk@dianqk.net>
+Date: Wed, 11 Nov 2026 18:00:00 +0800
+Subject: [PATCH] bt: restore the controller address after every physical open
+
+The MT6897 firmware is reloaded on physical power-on and loses the public
+address programmed from nvdata. Running setup only once leaves the kernel
+with the firmware default address after a management power cycle, while
+BlueZ retains the original adapter identity.
+
+Use the core non-persistent setup quirk to program the address before HCI
+initialization reads it on every open, as the upstream MediaTek UART and
+SDIO transports do. The BTIF power-on hook already returns success without
+reloading firmware when the controller is on.
+
+Link: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/bluetooth/btmtkuart.c?h=v7.3.1
+Signed-off-by: Dian QK <dianqk@dianqk.net>
+---
+--- a/connectivity/bt/mt66xx/btmtk_main.c
++++ b/connectivity/bt/mt66xx/btmtk_main.c
+@@ -3825,6 +3825,9 @@
+ 	hdev->send	   = bt_send_frame;
+ 	hdev->setup    = bt_setup;
+ 	hdev->set_bdaddr = btmtk_t880_set_bdaddr;
++	/* Firmware reload on each physical open loses the nvdata address. */
++	hci_set_quirk(hdev, HCI_QUIRK_NON_PERSISTENT_SETUP);
++
+ 	/* The firmware rejects HCI_OP_READ_SYNC_TRAIN_PARAMS (0x0c77). */
+ 	hci_set_quirk(hdev, HCI_QUIRK_BROKEN_READ_SYNC_TRAIN_PARAMS);
+ 	/* Unconfigured unless the bdaddr parameter provides the address. */

@@ -1,0 +1,118 @@
+From 2c6b29f341836a705f0434c840bce25352e56b3d Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 20 Oct 2026 09:25:34 +0800
+Subject: [PATCH] Add a t880 board profile and per-drive root overrides
+
+Alldocube iPlay 80 mini Ultra (T880, MT6897) profile for the launcher:
+the same read-only NV partitions as qqcandy, with the modem OTA store
+mounted at /mnt/vendor/mdota (as Android on this tablet) from mcf_ota_a,
+the slot whose LK loads the modem image under Linux.
+
+MTK_CCCI_DRIVE_ROOTS lets a board integration replace the candidate roots
+of individual FS drives without changing the qqcandy defaults, e.g.
+"T=/mnt/vendor/mdota:/vendor/etc/mdota". Invalid entries are refused.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ README.md                             |  3 ++-
+ src/mtk_ccci_userspace/mdinit.py      | 18 ++++++++++++++++++
+ src/mtk_ccci_userspace/start_owner.py | 26 +++++++++++++++++++-------
+ 3 files changed, 39 insertions(+), 8 deletions(-)
+
+diff --git a/README.md b/README.md
+index 8c3bb4a..6e648f6 100644
+--- a/README.md
++++ b/README.md
+@@ -48,7 +48,8 @@ The owner uses environment variables instead of hard-coded private paths:
+ - `MTK_CCCI_VENDOR_ETC_ROOT`
+ - `MTK_CCCI_PRIVATE_ROOT`
+ - `MTK_CCCI_PROPERTY_TABLE`
+-- `MTK_CCCI_BOARD` (currently only `qqcandy`)
++- `MTK_CCCI_BOARD` (`qqcandy` or `t880`)
++- `MTK_CCCI_DRIVE_ROOTS` (optional per-drive root overrides)
+ - `MTK_CCCI_EXPECTED_KERNEL`
+ - `MTK_CCCI_EXPECTED_NOTES_SHA256`
+ - `MTK_CCCI_ENABLE_MDLOG` (disabled by default)
+diff --git a/src/mtk_ccci_userspace/mdinit.py b/src/mtk_ccci_userspace/mdinit.py
+index db49d5c..94f72b1 100644
+--- a/src/mtk_ccci_userspace/mdinit.py
++++ b/src/mtk_ccci_userspace/mdinit.py
+@@ -174,6 +174,24 @@ DRIVE_ROOTS = {
+ # private-data drive observed directly in run9, not a protected partition.
+ DRIVE_ORDER = ("Z", "X", "Y", "W", "V", "U", "T", "S", "R", "Q")
+ 
++# Board integrations may replace the candidate roots of individual drives:
++# MTK_CCCI_DRIVE_ROOTS="T=/mnt/vendor/mdota:/vendor/etc/mdota;S=/mnt/vendor/nvcfg"
++# (letters from DRIVE_ORDER, absolute paths, tried in order as above).
++def _drive_root_overrides(spec):
++    roots = {}
++    for item in filter(None, (part.strip() for part in spec.split(";"))):
++        letter, _, paths = item.partition("=")
++        letter = letter.strip().upper()
++        candidates = [p for p in paths.split(":") if p]
++        if (letter not in DRIVE_ORDER or not candidates or
++                not all(os.path.isabs(p) for p in candidates)):
++            raise ValueError("invalid MTK_CCCI_DRIVE_ROOTS entry %r" % item)
++        roots[letter] = candidates
++    return roots
++
++
++DRIVE_ROOTS.update(_drive_root_overrides(os.environ.get("MTK_CCCI_DRIVE_ROOTS", "")))
++
+ 
+ def resolve_drive_dirs(roots=None):
+     """Bind each official drive letter to the first EXISTING candidate root.
+diff --git a/src/mtk_ccci_userspace/start_owner.py b/src/mtk_ccci_userspace/start_owner.py
+index 1babdc1..946b54c 100644
+--- a/src/mtk_ccci_userspace/start_owner.py
++++ b/src/mtk_ccci_userspace/start_owner.py
+@@ -10,9 +10,19 @@ import runpy
+ import subprocess
+ import sys
+ 
+-PROTECTED = {
+-    "nvdata": "nvdata", "nvcfg": "nvcfg", "protect_f": "protect1",
+-    "protect_s": "protect2", "mcf_ota": "mcf_ota_a",
++# Read-only modem partitions per board: mount point under the vendor root ->
++# GPT partition label.
++BOARDS = {
++    "qqcandy": {
++        "nvdata": "nvdata", "nvcfg": "nvcfg", "protect_f": "protect1",
++        "protect_s": "protect2", "mcf_ota": "mcf_ota_a",
++    },
++    # Alldocube iPlay 80 mini Ultra (MT6897): Android mounts the modem OTA
++    # store at /mnt/vendor/mdota; Linux boots slot A, whose LK loads md1img_a.
++    "t880": {
++        "nvdata": "nvdata", "nvcfg": "nvcfg", "protect_f": "protect1",
++        "protect_s": "protect2", "mdota": "mcf_ota_a",
++    },
+ }
+ 
+ 
+@@ -42,8 +52,10 @@ def validate_write_root(path, protected):
+ def preflight():
+     if os.geteuid() != 0:
+         raise RuntimeError("modem owner requires root")
+-    if os.environ.get("MTK_CCCI_BOARD") != "qqcandy":
+-        raise RuntimeError("only the explicitly selected qqcandy profile is supported")
++    board = os.environ.get("MTK_CCCI_BOARD")
++    if board not in BOARDS:
++        raise RuntimeError("only an explicitly selected known board profile is supported")
++    protected_mounts = BOARDS[board]
+     expected_release = os.environ.get("MTK_CCCI_EXPECTED_KERNEL", "")
+     expected_notes = os.environ.get("MTK_CCCI_EXPECTED_NOTES_SHA256", "")
+     if not expected_release or len(expected_notes) != 64:
+@@ -60,8 +72,8 @@ def preflight():
+             raise RuntimeError(f"missing device node: {name}")
+ 
+     vendor = Path(os.environ.get("MTK_CCCI_VENDOR_ROOT", "/mnt/vendor"))
+-    protected = [vendor / name for name in PROTECTED]
+-    for name, label in PROTECTED.items():
++    protected = [vendor / name for name in protected_mounts]
++    for name, label in protected_mounts.items():
+         target = vendor / name
+         result = subprocess.run(
+             ["findmnt", "--json", "--output", "TARGET,SOURCE,OPTIONS", "--mountpoint", str(target)],
+-- 
+2.55.0
+

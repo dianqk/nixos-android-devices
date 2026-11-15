@@ -1,0 +1,756 @@
+From 6dfa9e4c2286452454fca656bbb5b2775e1f0e5c Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 16 Oct 2026 12:20:49 +0800
+Subject: [PATCH] gen4m: build and run the MT6897 Wi-Fi driver on Linux 7.x
+
+- Kbuild: CONN_SRC for the conninfra/connfem headers, the compat header
+  and no -Werror.
+- cfg80211: adapters from the 7.x cfg80211_ops prototypes to the
+  existing handlers (wireless_dev based key and station operations,
+  link_id/radio_idx arguments, cfg80211_ap_update). Remain-on-channel
+  and mgmt-tx keep the cookie that cfg80211 now allocates. Header
+  prototypes follow the same version checks as their definitions.
+- netdev: GRO lists moved under napi->gro, alloc_netdev_dummy(), void
+  platform remove, the new ch_switch, new_sta and del_sta signatures,
+  removed cfg80211_ap_settings fields, string MODULE_IMPORT_NS(),
+  strscpy().
+- Wireless-extension events become no-ops when the kernel has no WEXT;
+  nl80211 carries them.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ connectivity/wlan/core/gen4m/Kbuild.main      |  50 ++---
+ .../wlan/core/gen4m/os/linux/gl_cfg80211.c    |   6 +-
+ .../wlan/core/gen4m/os/linux/gl_coredump.c    |   2 +-
+ .../wlan/core/gen4m/os/linux/gl_fw_dev.c      |   2 +-
+ .../wlan/core/gen4m/os/linux/gl_fw_log.c      |   2 +-
+ .../wlan/core/gen4m/os/linux/gl_ics.c         |   2 +-
+ .../wlan/core/gen4m/os/linux/gl_init.c        | 197 ++++++++++++++++--
+ .../wlan/core/gen4m/os/linux/gl_kal.c         |  33 +--
+ .../core/gen4m/os/linux/gl_p2p_cfg80211.c     |  14 +-
+ .../wlan/core/gen4m/os/linux/gl_p2p_kal.c     |  10 +-
+ .../wlan/core/gen4m/os/linux/gl_sa_log.c      |   2 +-
+ .../wlan/core/gen4m/os/linux/hif/axi/axi.c    |   9 +-
+ .../core/gen4m/os/linux/include/gl_cfg80211.h |   4 +-
+ .../wlan/core/gen4m/os/linux/include/gl_os.h  |   8 +-
+ 14 files changed, 262 insertions(+), 79 deletions(-)
+
+diff --git a/connectivity/wlan/core/gen4m/Kbuild.main b/connectivity/wlan/core/gen4m/Kbuild.main
+index 0ca332e..84c89fa 100644
+--- a/connectivity/wlan/core/gen4m/Kbuild.main
++++ b/connectivity/wlan/core/gen4m/Kbuild.main
+@@ -8,6 +8,8 @@ endif
+ KO_PATH := $(if $(filter /%,$(src)),,$(srctree)/)$(src)
+ 
+ ccflags-y :=
++CONN_SRC ?= $(TOP)/vendor/mediatek/kernel_modules/connectivity
++ccflags-y += -include $(CONN_SRC)/../compat/t880_compat.h -I$(CONN_SRC)/../compat/include -Wno-error -Wno-missing-prototypes -Wno-missing-declarations
+ CFG_DIR ?= $(KO_CODE_PATH)/configs
+ 
+ ifeq ($(CONFIG_MTK_PLATFORM),)
+@@ -139,7 +141,7 @@ ccflags-y += -DCFG_SUPPORT_PASSPOINT=1
+ ccflags-y += -DCFG_HS20_DEBUG=1
+ endif
+ 
+-ccflags-y += -Werror $(call cc-disable-warning, unused-but-set-variable)
++ccflags-y += $(call cc-disable-warning, unused-but-set-variable)
+ ccflags-y += $(call cc-disable-warning, attribute-warning)
+ #ccflags-y:=$(filter-out -U$(WLAN_CHIP_ID),$(ccflags-y))
+ #ccflags-y += -DLINUX -D$(WLAN_CHIP_ID)
+@@ -1297,7 +1299,7 @@ ifeq ($(CONFIG_MTK_WIFI_CONNV3_SUPPORT), y)
+         CONFIG_MTK_WIFI_CONNV3_PATH ?= $(KO_CODE_PATH)/../conninfra
+         KBUILD_EXTRA_SYMBOLS += $(CONFIG_MTK_WIFI_CONNV3_PATH)/Module.symvers
+     else
+-        CONFIG_MTK_WIFI_CONNV3_PATH ?= $(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra
++        CONFIG_MTK_WIFI_CONNV3_PATH ?= $(CONN_SRC)/conninfra
+     endif
+     $(info $$CONFIG_MTK_WIFI_CONNV3_PATH is [${CONFIG_MTK_WIFI_CONNV3_PATH}])
+     ccflags-y += -I$(CONFIG_MTK_WIFI_CONNV3_PATH)/include
+@@ -1306,43 +1308,43 @@ ifeq ($(CONFIG_MTK_WIFI_CONNV3_SUPPORT), y)
+     ccflags-y += -I$(CONFIG_MTK_WIFI_CONNV3_PATH)/conn_drv/connv3/debug_utility/include
+     ccflags-y += -I$(CONFIG_MTK_WIFI_CONNV3_PATH)/conn_drv/connv3/debug_utility/connsyslog
+ 
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/include
++    ccflags-y += -I$(CONN_SRC)/conninfra/include
+ else ifeq ($(CONFIG_MTK_WIFI_CONNINFRA_SUPPORT), y)
+     CONFIG_WIFI_COREDUMP_SUPPORT=y
+     ccflags-y += -DCFG_SUPPORT_CONNINFRA=1
+     ccflags-y += -DCFG_ANDORID_CONNINFRA_SUPPORT=1
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/include
++    ccflags-y += -I$(CONN_SRC)/conninfra/include
+     ccflags-y += -DCFG_ANDORID_CONNINFRA_COREDUMP_SUPPORT=1
+     ccflags-y += -DCFG_MTK_CONNSYS_DEDICATED_LOG_PATH
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/include
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/platform/include
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/base/include
++    ccflags-y += -I$(CONN_SRC)/conninfra/include
++    ccflags-y += -I$(CONN_SRC)/conninfra/platform/include
++    ccflags-y += -I$(CONN_SRC)/conninfra/base/include
+ 
+     # conninfra path
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/debug_utility
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/debug_utility/include
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/debug_utility/connsyslog
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/debug_utility/coredump
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/debug_utility/coredump/platform/include
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/debug_utility/metlog
++    ccflags-y += -I$(CONN_SRC)/conninfra/debug_utility
++    ccflags-y += -I$(CONN_SRC)/conninfra/debug_utility/include
++    ccflags-y += -I$(CONN_SRC)/conninfra/debug_utility/connsyslog
++    ccflags-y += -I$(CONN_SRC)/conninfra/debug_utility/coredump
++    ccflags-y += -I$(CONN_SRC)/conninfra/debug_utility/coredump/platform/include
++    ccflags-y += -I$(CONN_SRC)/conninfra/debug_utility/metlog
+ 
+     # connv2 path
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2/debug_utility
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2/debug_utility/include
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2/debug_utility/connsyslog
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2/debug_utility/coredump
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2/debug_utility/coredump/platform/include
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2/debug_utility/metlog
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/wlan/adaptor
++    ccflags-y += -I$(CONN_SRC)/conninfra/conn_drv/connv2/debug_utility
++    ccflags-y += -I$(CONN_SRC)/conninfra/conn_drv/connv2/debug_utility/include
++    ccflags-y += -I$(CONN_SRC)/conninfra/conn_drv/connv2/debug_utility/connsyslog
++    ccflags-y += -I$(CONN_SRC)/conninfra/conn_drv/connv2/debug_utility/coredump
++    ccflags-y += -I$(CONN_SRC)/conninfra/conn_drv/connv2/debug_utility/coredump/platform/include
++    ccflags-y += -I$(CONN_SRC)/conninfra/conn_drv/connv2/debug_utility/metlog
++    ccflags-y += -I$(CONN_SRC)/wlan/adaptor
+ else
+     CONFIG_WIFI_COREDUMP_SUPPORT=n
+     ccflags-y += -DCFG_SUPPORT_CONNINFRA=0
+     ccflags-y += -DCFG_ANDORID_CONNINFRA_SUPPORT=0
+     ccflags-y += -DCFG_ANDORID_CONNINFRA_COREDUMP_SUPPORT=0
+     ifeq ($(WMT_SUPPORT), y)
+-        ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/common/common_main/include
+-        ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/common/common_main/linux/include
+-        ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/common/debug_utility
++        ccflags-y += -I$(CONN_SRC)/common/common_main/include
++        ccflags-y += -I$(CONN_SRC)/common/common_main/linux/include
++        ccflags-y += -I$(CONN_SRC)/common/debug_utility
+         ifeq ($(CONFIG_MTK_CONN_LTE_IDC_SUPPORT),y)
+             ccflags-y += -DWMT_IDC_SUPPORT=1
+         else
+@@ -1798,7 +1800,7 @@ ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/connectivity/common
+ ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/gpu/drm/mediatek/mediatek_v2/
+ ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/devfreq/
+ ccflags-y += -I$(srctree)/net
+-ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/connfem/include/
++ccflags-y += -I$(CONN_SRC)/connfem/include/
+ 
+ ifeq ($(CONFIG_MTK_WIFI_CCCI_SUPPORT), y)
+ CONFIG_MTK_ECCCI_DRIVER := y
+diff --git a/connectivity/wlan/core/gen4m/os/linux/gl_cfg80211.c b/connectivity/wlan/core/gen4m/os/linux/gl_cfg80211.c
+index 2586229..f64b25e 100644
+--- a/connectivity/wlan/core/gen4m/os/linux/gl_cfg80211.c
++++ b/connectivity/wlan/core/gen4m/os/linux/gl_cfg80211.c
+@@ -2645,7 +2645,8 @@ int mtk_cfg80211_remain_on_channel(struct wiphy *wiphy,
+ 		if (!IS_BSS_INDEX_VALID(ucBssIndex))
+ 			return -EINVAL;
+ 
+-		*cookie = prGlueInfo->u8Cookie++;
++		/* T880: keep the cookie cfg80211 allocated (7.x) */
++		*cookie = *cookie ? *cookie : prGlueInfo->u8Cookie++;
+ 
+ 		prMsgChnlReq = cnmMemAlloc(prGlueInfo->prAdapter,
+ 			   RAM_TYPE_MSG, sizeof(struct MSG_REMAIN_ON_CHANNEL));
+@@ -2812,7 +2813,8 @@ int _mtk_cfg80211_mgmt_tx(struct wiphy *wiphy,
+ 		WIPHY_PRIV(wiphy, prGlueInfo);
+ 		ASSERT(prGlueInfo);
+ 
+-		*cookie = prGlueInfo->u8Cookie++;
++		/* T880: keep the cookie cfg80211 allocated (7.x) */
++		*cookie = *cookie ? *cookie : prGlueInfo->u8Cookie++;
+ #if CFG_SUPPORT_TX_MGMT_USE_DATAQ
+ 		u2MgmtTxMaxLen = prGlueInfo->prAdapter
+ 				->chip_info->cmd_max_pkt_size
+diff --git a/connectivity/wlan/core/gen4m/os/linux/gl_coredump.c b/connectivity/wlan/core/gen4m/os/linux/gl_coredump.c
+index 0dc064b..da41833 100644
+--- a/connectivity/wlan/core/gen4m/os/linux/gl_coredump.c
++++ b/connectivity/wlan/core/gen4m/os/linux/gl_coredump.c
+@@ -200,7 +200,7 @@ static int coredump_add_cdev(struct coredump_ctx *ctx)
+ 		goto unregister_chrdev_region;
+ 	}
+ 
+-	ctx->driver_class = class_create(THIS_MODULE,
++	ctx->driver_class = class_create(
+ 		COREDUMP_WIFI_INF_NAME);
+ 	if (IS_ERR(ctx->driver_class)) {
+ 		DBGLOG(INIT, ERROR,
+diff --git a/connectivity/wlan/core/gen4m/os/linux/gl_fw_dev.c b/connectivity/wlan/core/gen4m/os/linux/gl_fw_dev.c
+index 94201cd..c05d20c 100644
+--- a/connectivity/wlan/core/gen4m/os/linux/gl_fw_dev.c
++++ b/connectivity/wlan/core/gen4m/os/linux/gl_fw_dev.c
+@@ -239,7 +239,7 @@ int FwLogDevInit(void)
+ 	if (result < 0)
+ 		goto free_dev;
+ 
+-	gIndexDev->driver_class = class_create(THIS_MODULE,
++	gIndexDev->driver_class = class_create(
+ 		FW_INDEX_LOG_DRIVER_NAME);
+ 
+ 	if (KAL_IS_ERR(gIndexDev->driver_class)) {
+diff --git a/connectivity/wlan/core/gen4m/os/linux/gl_fw_log.c b/connectivity/wlan/core/gen4m/os/linux/gl_fw_log.c
+index f8064a7..63a0917 100644
+--- a/connectivity/wlan/core/gen4m/os/linux/gl_fw_log.c
++++ b/connectivity/wlan/core/gen4m/os/linux/gl_fw_log.c
+@@ -263,7 +263,7 @@ int fw_log_wifi_inf_init(void)
+ 		goto unregister_chrdev_region;
+ 	}
+ 
+-	prInf->driver_class = class_create(THIS_MODULE,
++	prInf->driver_class = class_create(
+ 					   FW_LOG_WIFI_INF_NAME);
+ 	if (IS_ERR(prInf->driver_class)) {
+ 		DBGLOG(INIT, ERROR,
+diff --git a/connectivity/wlan/core/gen4m/os/linux/gl_ics.c b/connectivity/wlan/core/gen4m/os/linux/gl_ics.c
+index ea4c586..20dec9b 100644
+--- a/connectivity/wlan/core/gen4m/os/linux/gl_ics.c
++++ b/connectivity/wlan/core/gen4m/os/linux/gl_ics.c
+@@ -345,7 +345,7 @@ int IcsInit(void)
+ 	if (result < 0)
+ 		goto free_dev;
+ 
+-	gIcsDev->driver_class = class_create(THIS_MODULE,
++	gIcsDev->driver_class = class_create(
+ 		FW_LOG_ICS_DRIVER_NAME);
+ 
+ 	if (KAL_IS_ERR(gIcsDev->driver_class)) {
+diff --git a/connectivity/wlan/core/gen4m/os/linux/gl_init.c b/connectivity/wlan/core/gen4m/os/linux/gl_init.c
+index ee54bea..0239683 100644
+--- a/connectivity/wlan/core/gen4m/os/linux/gl_init.c
++++ b/connectivity/wlan/core/gen4m/os/linux/gl_init.c
+@@ -1176,35 +1176,194 @@ const uint32_t mtk_cipher_suites[] = {
+ 	WLAN_CIPHER_SUITE_NO_GROUP_ADDR
+ };
+ 
++#if KERNEL_VERSION(6, 17, 0) <= CFG80211_VERSION_CODE
++/*
++ * T880 port: adapters from the 7.x cfg80211_ops prototypes (wireless_dev,
++ * link_id/radio_idx, caller-provided cookies) to the gen4m handlers.
++ */
++static int t880_cfg_add_key(struct wiphy *wiphy, struct wireless_dev *wdev,
++	int link_id, u8 key_index, bool pairwise, const u8 *mac_addr,
++	struct key_params *params)
++{
++	return mtk_cfg_add_key(wiphy, wdev->netdev, link_id, key_index,
++			       pairwise, mac_addr, params);
++}
++
++static int t880_cfg_get_key(struct wiphy *wiphy, struct wireless_dev *wdev,
++	int link_id, u8 key_index, bool pairwise, const u8 *mac_addr,
++	void *cookie, void (*callback)(void *cookie, struct key_params *))
++{
++	return mtk_cfg_get_key(wiphy, wdev->netdev, link_id, key_index,
++			       pairwise, mac_addr, cookie, callback);
++}
++
++static int t880_cfg_del_key(struct wiphy *wiphy, struct wireless_dev *wdev,
++	int link_id, u8 key_index, bool pairwise, const u8 *mac_addr)
++{
++	return mtk_cfg_del_key(wiphy, wdev->netdev, link_id, key_index,
++			       pairwise, mac_addr);
++}
++
++static int t880_cfg_set_default_mgmt_key(struct wiphy *wiphy,
++	struct wireless_dev *wdev, int link_id, u8 key_index)
++{
++	return mtk_cfg_set_default_mgmt_key(wiphy, wdev->netdev, link_id,
++					    key_index);
++}
++
++#if (CFG_SUPPORT_BCN_PROT == 1)
++static int t880_cfg_set_default_beacon_key(struct wiphy *wiphy,
++	struct wireless_dev *wdev, int link_id, u8 key_index)
++{
++	return mtk_cfg_set_default_beacon_key(wiphy, wdev->netdev, link_id,
++					      key_index);
++}
++#endif
++
++static int t880_cfg_get_station(struct wiphy *wiphy, struct wireless_dev *wdev,
++	const u8 *mac, struct station_info *sinfo)
++{
++	return mtk_cfg_get_station(wiphy, wdev->netdev, mac, sinfo);
++}
++
++#if CFG_SUPPORT_TDLS
++static int t880_cfg_change_station(struct wiphy *wiphy,
++	struct wireless_dev *wdev, const u8 *mac,
++	struct station_parameters *params)
++{
++	return mtk_cfg_change_station(wiphy, wdev->netdev, mac, params);
++}
++
++static int t880_cfg_add_station(struct wiphy *wiphy, struct wireless_dev *wdev,
++	const u8 *mac, struct station_parameters *params)
++{
++	return mtk_cfg_add_station(wiphy, wdev->netdev, mac, params);
++}
++
++static int t880_cfg_tdls_mgmt(struct wiphy *wiphy, struct net_device *dev,
++	const u8 *peer, int link_id, u8 action_code, u8 dialog_token,
++	u16 status_code, u32 peer_capability, bool initiator,
++	const u8 *buf, size_t len)
++{
++	return mtk_cfg_tdls_mgmt(wiphy, dev, peer, action_code, dialog_token,
++				 status_code, peer_capability, initiator,
++				 buf, len);
++}
++#endif
++
++static int t880_cfg_del_station(struct wiphy *wiphy, struct wireless_dev *wdev,
++	struct station_del_parameters *params)
++{
++	return mtk_cfg_del_station(wiphy, wdev->netdev, params);
++}
++
++/* cfg80211 now allocates the cookie; gen4m keeps a non-zero preset. */
++static int t880_cfg_remain_on_channel(struct wiphy *wiphy,
++	struct wireless_dev *wdev, struct ieee80211_channel *chan,
++	unsigned int duration, u64 cookie, const u8 *rx_addr)
++{
++	u64 c = cookie;
++
++	return mtk_cfg_remain_on_channel(wiphy, wdev, chan, duration, &c);
++}
++
++static int t880_cfg_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
++	struct cfg80211_mgmt_tx_params *params, u64 cookie)
++{
++	u64 c = cookie;
++
++	return mtk_cfg_mgmt_tx(wiphy, wdev, params, &c);
++}
++
++#if (CFG_SUPPORT_DFS_MASTER == 1)
++static int t880_cfg_start_radar_detection(struct wiphy *wiphy,
++	struct net_device *dev, struct cfg80211_chan_def *chandef,
++	u32 cac_time_ms, int link_id)
++{
++	return mtk_cfg_start_radar_detection(wiphy, dev, chandef, cac_time_ms);
++}
++#endif
++
++#if (CFG_ENABLE_WIFI_DIRECT_CFG_80211 != 0)
++static int t880_cfg_change_beacon(struct wiphy *wiphy, struct net_device *dev,
++	struct cfg80211_ap_update *info)
++{
++	return mtk_cfg_change_beacon(wiphy, dev, &info->beacon);
++}
++
++static int t880_cfg_stop_ap(struct wiphy *wiphy, struct net_device *dev,
++	unsigned int link_id)
++{
++#if (CFG_ADVANCED_80211_MLO == 1)
++	return mtk_cfg_stop_ap(wiphy, dev, link_id);
++#else
++	return mtk_cfg_stop_ap(wiphy, dev);
++#endif
++}
++
++static int t880_cfg_set_wiphy_params(struct wiphy *wiphy, int radio_idx,
++	u32 changed)
++{
++	return mtk_cfg_set_wiphy_params(wiphy, changed);
++}
++
++static int t880_cfg_set_bitrate_mask(struct wiphy *wiphy,
++	struct net_device *dev, unsigned int link_id, const u8 *peer,
++	const struct cfg80211_bitrate_mask *mask)
++{
++#if (CFG_ADVANCED_80211_MLO == 1)
++	return mtk_cfg_set_bitrate_mask(wiphy, dev, link_id, peer, mask);
++#else
++	return mtk_cfg_set_bitrate_mask(wiphy, dev, peer, mask);
++#endif
++}
++
++static int t880_cfg_set_txpower(struct wiphy *wiphy, struct wireless_dev *wdev,
++	int radio_idx, enum nl80211_tx_power_setting type, int mbm)
++{
++	return mtk_cfg_set_txpower(wiphy, wdev, type, mbm);
++}
++
++static int t880_cfg_get_txpower(struct wiphy *wiphy, struct wireless_dev *wdev,
++	int radio_idx, unsigned int link_id, int *dbm)
++{
++	return mtk_cfg_get_txpower(wiphy, wdev, dbm);
++}
++#endif
++#define T880_CFG(x) t880_cfg_##x
++#else
++#define T880_CFG(x) mtk_cfg_##x
++#endif
++
+ static struct cfg80211_ops mtk_cfg_ops = {
+ 	.add_virtual_intf = mtk_cfg_add_iface,
+ 	.del_virtual_intf = mtk_cfg_del_iface,
+ 	.change_virtual_intf = mtk_cfg_change_iface,
+-	.add_key = mtk_cfg_add_key,
+-	.get_key = mtk_cfg_get_key,
+-	.del_key = mtk_cfg_del_key,
+-	.set_default_mgmt_key = mtk_cfg_set_default_mgmt_key,
++	.add_key = T880_CFG(add_key),
++	.get_key = T880_CFG(get_key),
++	.del_key = T880_CFG(del_key),
++	.set_default_mgmt_key = T880_CFG(set_default_mgmt_key),
+ #if (CFG_SUPPORT_BCN_PROT == 1) && \
+ 	(KERNEL_VERSION(5, 7, 0) <= CFG80211_VERSION_CODE)
+-	.set_default_beacon_key = mtk_cfg_set_default_beacon_key,
++	.set_default_beacon_key = T880_CFG(set_default_beacon_key),
+ #endif
+ 	.set_default_key = mtk_cfg_set_default_key,
+-	.get_station = mtk_cfg_get_station,
++	.get_station = T880_CFG(get_station),
+ #if (CFG_ADVANCED_80211_MLO == 1) || \
+ 	(KERNEL_VERSION(6, 1, 0) <= CFG80211_VERSION_CODE)
+ 	.get_channel = mtk_cfg_get_channel,
+ #endif
+ #if CFG_SUPPORT_TDLS
+-	.change_station = mtk_cfg_change_station,
+-	.add_station = mtk_cfg_add_station,
++	.change_station = T880_CFG(change_station),
++	.add_station = T880_CFG(add_station),
+ 	.tdls_oper = mtk_cfg_tdls_oper,
+-	.tdls_mgmt = mtk_cfg_tdls_mgmt,
++	.tdls_mgmt = T880_CFG(tdls_mgmt),
+ #if CFG_SUPPORT_TDLS_OFFCHANNEL
+ 	.tdls_channel_switch = mtk_tdls_channel_switch,
+ 	.tdls_cancel_channel_switch = mtk_tdls_cancel_channel_switch,
+ #endif
+ #endif
+-	.del_station = mtk_cfg_del_station,	/* AP/P2P use this function */
++	.del_station = T880_CFG(del_station),	/* AP/P2P use this function */
+ 	.scan = mtk_cfg_scan,
+ #if KERNEL_VERSION(4, 5, 0) <= CFG80211_VERSION_CODE
+ 	.abort_scan = mtk_cfg_abort_scan,
+@@ -1234,9 +1393,9 @@ static struct cfg80211_ops mtk_cfg_ops = {
+ 	.assoc = mtk_cfg_assoc,
+ 
+ 	/* Action Frame TX/RX */
+-	.remain_on_channel = mtk_cfg_remain_on_channel,
++	.remain_on_channel = T880_CFG(remain_on_channel),
+ 	.cancel_remain_on_channel = mtk_cfg_cancel_remain_on_channel,
+-	.mgmt_tx = mtk_cfg_mgmt_tx,
++	.mgmt_tx = T880_CFG(mgmt_tx),
+ 	/* .mgmt_tx_cancel_wait        = mtk_cfg80211_mgmt_tx_cancel_wait, */
+ #if KERNEL_VERSION(5, 8, 0) > CFG80211_VERSION_CODE
+ 	.mgmt_frame_register = mtk_cfg_mgmt_frame_register,
+@@ -1250,7 +1409,7 @@ static struct cfg80211_ops mtk_cfg_ops = {
+ #endif
+ 
+ #if (CFG_SUPPORT_DFS_MASTER == 1)
+-	.start_radar_detection = mtk_cfg_start_radar_detection,
++	.start_radar_detection = T880_CFG(start_radar_detection),
+ #if KERNEL_VERSION(3, 13, 0) <= CFG80211_VERSION_CODE
+ 	.channel_switch = mtk_cfg_channel_switch,
+ #endif
+@@ -1262,12 +1421,12 @@ static struct cfg80211_ops mtk_cfg_ops = {
+ 	.deauth = mtk_cfg_deauth,
+ 	.disassoc = mtk_cfg_disassoc,
+ 	.start_ap = mtk_cfg_start_ap,
+-	.change_beacon = mtk_cfg_change_beacon,
+-	.stop_ap = mtk_cfg_stop_ap,
+-	.set_wiphy_params = mtk_cfg_set_wiphy_params,
+-	.set_bitrate_mask = mtk_cfg_set_bitrate_mask,
+-	.set_tx_power = mtk_cfg_set_txpower,
+-	.get_tx_power = mtk_cfg_get_txpower,
++	.change_beacon = T880_CFG(change_beacon),
++	.stop_ap = T880_CFG(stop_ap),
++	.set_wiphy_params = T880_CFG(set_wiphy_params),
++	.set_bitrate_mask = T880_CFG(set_bitrate_mask),
++	.set_tx_power = T880_CFG(set_txpower),
++	.get_tx_power = T880_CFG(get_txpower),
+ #endif
+ 	.update_ft_ies = mtk_cfg80211_update_ft_ies,
+ #ifdef CFG_SUPPORT_SNIFFER_RADIOTAP
+diff --git a/connectivity/wlan/core/gen4m/os/linux/gl_kal.c b/connectivity/wlan/core/gen4m/os/linux/gl_kal.c
+index 9bbab2c..846c9f4 100644
+--- a/connectivity/wlan/core/gen4m/os/linux/gl_kal.c
++++ b/connectivity/wlan/core/gen4m/os/linux/gl_kal.c
+@@ -25,6 +25,7 @@
+ #include "gl_kal.h"
+ #include "gl_wext.h"
+ #include "precomp.h"
++#include <net/gro.h>
+ #if KERNEL_VERSION(5, 16, 0) > LINUX_VERSION_CODE
+ #include <stdarg.h>
+ #endif
+@@ -1856,12 +1857,12 @@ uint32_t kal_is_skb_gro(struct ADAPTER *prAdapter, uint8_t ucBssIdx)
+ 
+ static inline void napi_gro_flush_list(struct napi_struct *napi)
+ {
+-	napi_gro_flush(napi, false);
++	gro_flush(&napi->gro, false); /* T880 */
+ #if KERNEL_VERSION(5, 4, 0) <= CFG80211_VERSION_CODE
+-	if (napi->rx_count) {
+-		netif_receive_skb_list(&napi->rx_list);
+-		INIT_LIST_HEAD(&napi->rx_list);
+-		napi->rx_count = 0;
++	if (napi->gro.rx_count) {
++		netif_receive_skb_list(&napi->gro.rx_list);
++		INIT_LIST_HEAD(&napi->gro.rx_list);
++		napi->gro.rx_count = 0;
+ 	}
+ #endif
+ }
+@@ -1898,11 +1899,11 @@ void kal_gro_flush(struct ADAPTER *prAdapter)
+ 	if (CHECK_FOR_TIMEOUT(kalGetTimeTick(),
+ 		prGlueInfo->tmGROFlushTimeout,
+ 		prWifiVar->ucGROFlushTimeout)) {
+-		napi_gro_flush(&prGlueInfo->napi, false);
++		gro_flush(&prGlueInfo->napi.gro, false); /* T880 */
+ 		DBGLOG_LIMITED(INIT, TRACE, "napi_gro_flush.\n");
+ #if KERNEL_VERSION(5, 4, 0) <= CFG80211_VERSION_CODE
+ 		prGlueInfo->u4PendingFlushNum =
+-			prGlueInfo->napi.rx_count;
++			prGlueInfo->napi.gro.rx_count;
+ #else
+ 		prGlueInfo->u4PendingFlushNum = 0;
+ #endif
+@@ -8331,7 +8332,7 @@ u_int8_t kalSendUevent(const char *src)
+ 	envp[1] = NULL;
+ 
+ 	/*send uevent*/
+-	strlcpy(event_string, src, sizeof(event_string));
++	strscpy(event_string, src, sizeof(event_string));
+ 	if (event_string[0] == '\0') { /*string is null*/
+ 		return FALSE;
+ 	}
+@@ -11455,7 +11456,7 @@ void kalIndicateChannelSwitch(struct GLUE_INFO *prGlueInfo,
+ 		linkIdx, 0);
+ #endif
+ #else
+-	cfg80211_ch_switch_notify(prDevHandler, &chandef);
++	cfg80211_ch_switch_notify(prDevHandler, &chandef, 0); /* T880: 6.3+ link_id */
+ #endif
+ 	/* Check SAP channel */
+ 	p2pFuncSwitchSapChannel(prGlueInfo->prAdapter);
+@@ -13035,7 +13036,7 @@ void kalSetThreadSchPolicyPriority(struct GLUE_INFO *prGlueInfo)
+ }
+ 
+ #if KERNEL_VERSION(5, 4, 0) <= CFG80211_VERSION_CODE
+-MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
++MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
+ #endif
+ 
+ #if CFG_SUPPORT_RX_GRO
+@@ -13085,7 +13086,7 @@ uint8_t kalRxGroInit(struct net_device *prDev)
+ void kalNapiThreadedInit(struct GLUE_INFO *prGlueInfo)
+ {
+ #if KERNEL_VERSION(5, 15, 0) <= CFG80211_VERSION_CODE
+-	if (dev_set_threaded(&prGlueInfo->dummy_dev, TRUE) != 0) {
++	if (dev_set_threaded(prGlueInfo->dummy_dev, TRUE) != 0) {
+ 		prGlueInfo->napi_thread = NULL;
+ 		DBGLOG(INIT, ERROR, "Napi Threaded Init Fail\n");
+ 	} else {
+@@ -13109,12 +13110,14 @@ uint8_t kalNapiInit(struct GLUE_INFO *prGlueInfo)
+ 	spin_lock_init(&prGlueInfo->napi_spinlock);
+ 	skb_queue_head_init(&prGlueInfo->rRxNapiSkbQ);
+ 	/* use dummy device to register napi */
+-	init_dummy_netdev(&prGlueInfo->dummy_dev);
++	prGlueInfo->dummy_dev = alloc_netdev_dummy(0);
++	if (!prGlueInfo->dummy_dev)
++		return 1;
+ #if (KERNEL_VERSION(6, 1, 0) <= LINUX_VERSION_CODE)
+-	netif_napi_add(&prGlueInfo->dummy_dev, &prGlueInfo->napi,
++	netif_napi_add(prGlueInfo->dummy_dev, &prGlueInfo->napi,
+ 			kalNapiPoll);
+ #else
+-	netif_napi_add(&prGlueInfo->dummy_dev, &prGlueInfo->napi,
++	netif_napi_add(prGlueInfo->dummy_dev, &prGlueInfo->napi,
+ 			kalNapiPoll, NAPI_POLL_WEIGHT);
+ #endif
+ #if CFG_SUPPORT_RX_NAPI_THREADED
+@@ -13130,6 +13133,8 @@ uint8_t kalNapiUninit(struct GLUE_INFO *prGlueInfo)
+ #if CFG_SUPPORT_RX_NAPI_THREADED
+ 	kalNapiThreadedUninit(prGlueInfo);
+ #endif /* CFG_SUPPORT_RX_NAPI_THREADED */
++	free_netdev(prGlueInfo->dummy_dev);
++	prGlueInfo->dummy_dev = NULL;
+ 	DBGLOG(INIT, TRACE, "Napi Uninit Done\n");
+ 	return 0;
+ }
+diff --git a/connectivity/wlan/core/gen4m/os/linux/gl_p2p_cfg80211.c b/connectivity/wlan/core/gen4m/os/linux/gl_p2p_cfg80211.c
+index fa48f88..999d5cd 100644
+--- a/connectivity/wlan/core/gen4m/os/linux/gl_p2p_cfg80211.c
++++ b/connectivity/wlan/core/gen4m/os/linux/gl_p2p_cfg80211.c
+@@ -1694,19 +1694,19 @@ int mtk_p2p_cfg80211_start_ap(struct wiphy *wiphy,
+ 					 settings->inactivity_timeout,
+ 					 settings->beacon_interval,
+ 					 settings->dtim_period,
+-					 settings->ht_required,
+-					 settings->vht_required);
++					 0 /* T880: ht_required removed */,
++					 0 /* T880: vht_required removed */);
+ #if KERNEL_VERSION(5, 8, 0) <= CFG80211_VERSION_CODE
+ 		i4Written += kalSnprintf(aucLogBuf + i4Written,
+ 					 LOG_BUFFER_SIZE - i4Written,
+ 					 " he[%d]",
+-					 settings->he_required);
++					 0 /* T880: he_required removed */);
+ #endif
+ #if KERNEL_VERSION(5, 11, 0) <= CFG80211_VERSION_CODE
+ 		i4Written += kalSnprintf(aucLogBuf + i4Written,
+ 					 LOG_BUFFER_SIZE - i4Written,
+ 					 " sae_h2e[%d]",
+-					 settings->sae_h2e_required);
++					 0 /* T880: sae_h2e_required removed */);
+ #endif
+ 
+ 		if (chandef) {
+@@ -2607,7 +2607,8 @@ int mtk_p2p_cfg80211_remain_on_channel(struct wiphy *wiphy,
+ 
+ 		prGlueP2pDevInfo = prGlueInfo->prP2PDevInfo;
+ 
+-		*cookie = prGlueP2pDevInfo->u8Cookie++;
++		/* T880: keep the cookie cfg80211 allocated (7.x) */
++		*cookie = *cookie ? *cookie : prGlueP2pDevInfo->u8Cookie++;
+ 
+ 		prMsgChnlReq = cnmMemAlloc(prGlueInfo->prAdapter,
+ 			RAM_TYPE_MSG, sizeof(struct MSG_P2P_CHNL_REQUEST));
+@@ -2743,7 +2744,8 @@ int _mtk_p2p_cfg80211_mgmt_tx(struct wiphy *wiphy,
+ 			}
+ 		}
+ 
+-		*cookie = prGlueInfo->prP2PDevInfo->u8Cookie++;
++		/* T880: keep the cookie cfg80211 allocated (7.x) */
++		*cookie = *cookie ? *cookie : prGlueInfo->prP2PDevInfo->u8Cookie++;
+ 
+ 		prMsgTxReq = cnmMemAlloc(prGlueInfo->prAdapter,
+ 				RAM_TYPE_MSG,
+diff --git a/connectivity/wlan/core/gen4m/os/linux/gl_p2p_kal.c b/connectivity/wlan/core/gen4m/os/linux/gl_p2p_kal.c
+index 2291b5f..4fafba4 100644
+--- a/connectivity/wlan/core/gen4m/os/linux/gl_p2p_kal.c
++++ b/connectivity/wlan/core/gen4m/os/linux/gl_p2p_kal.c
+@@ -1706,7 +1706,7 @@ kalP2PGOStationUpdate(struct GLUE_INFO *prGlueInfo,
+ 			rStationInfo.assoc_req_ies_len =
+ 				prCliStaRec->u2AssocReqIeLen;
+ 
+-			cfg80211_new_sta(prP2pGlueInfo->aprRoleHandler,
++			cfg80211_new_sta(prP2pGlueInfo->aprRoleHandler->ieee80211_ptr, /* T880: 7.x wdev */
+ 				/* struct net_device * dev, */
+ 				aucBssid,
+ 				&rStationInfo, GFP_KERNEL);
+@@ -1736,7 +1736,7 @@ kalP2PGOStationUpdate(struct GLUE_INFO *prGlueInfo,
+ 						RSN_AKM_SUITE_OWE)
+ 					break;
+ 				prCliStaRec->fgIsConnected = FALSE;
+-				cfg80211_del_sta(prP2pGlueInfo->aprRoleHandler,
++				cfg80211_del_sta(prP2pGlueInfo->aprRoleHandler->ieee80211_ptr, /* T880: 7.x wdev */
+ 					/* struct net_device * dev, */
+ 					aucBssid, GFP_KERNEL);
+ 			}
+@@ -2698,11 +2698,11 @@ void kalP2pIndicateChnlSwitchStarted(struct ADAPTER *prAdapter,
+ 
+ #if (KERNEL_VERSION(6, 3, 0) <= CFG80211_VERSION_CODE)
+ 	cfg80211_ch_switch_started_notify(prNetdevice, &chandef,
+-				  ucLinkIdx, ucCsaCount, fgQuiet, 0);
++				  ucLinkIdx, ucCsaCount, fgQuiet);
+ #elif (KERNEL_VERSION(6, 1, 0) <= CFG80211_VERSION_CODE) && \
+ 	(CFG_ADVANCED_80211_MLO == 1)
+ 	cfg80211_ch_switch_started_notify(prNetdevice, &chandef,
+-				  ucLinkIdx, ucCsaCount, fgQuiet, 0);
++				  ucLinkIdx, ucCsaCount, fgQuiet);
+ #elif (KERNEL_VERSION(6, 1, 0) <= CFG80211_VERSION_CODE) || \
+ 	(CFG_ADVANCED_80211_MLO == 1)
+ 	cfg80211_ch_switch_started_notify(prNetdevice, &chandef,
+@@ -2870,7 +2870,7 @@ void kalP2pIndicateChnlSwitch(struct ADAPTER *prAdapter,
+ 		linkIdx, 0);
+ #endif
+ #else
+-	cfg80211_ch_switch_notify(prNetdevice, &chandef);
++	cfg80211_ch_switch_notify(prNetdevice, &chandef, 0); /* T880 */
+ #endif
+ 	netif_carrier_on(prNetdevice);
+ 	netif_tx_start_all_queues(prNetdevice);
+diff --git a/connectivity/wlan/core/gen4m/os/linux/gl_sa_log.c b/connectivity/wlan/core/gen4m/os/linux/gl_sa_log.c
+index 8165a3f..7ceff4c 100644
+--- a/connectivity/wlan/core/gen4m/os/linux/gl_sa_log.c
++++ b/connectivity/wlan/core/gen4m/os/linux/gl_sa_log.c
+@@ -382,7 +382,7 @@ int SalogInit(void)
+ 	if (result < 0)
+ 		goto free_dev;
+ 
+-	gSaDev->driver_class = class_create(THIS_MODULE,
++	gSaDev->driver_class = class_create(
+ 		SA_DRIVER_NAME);
+ 
+ 	if (KAL_IS_ERR(gSaDev->driver_class)) {
+diff --git a/connectivity/wlan/core/gen4m/os/linux/hif/axi/axi.c b/connectivity/wlan/core/gen4m/os/linux/hif/axi/axi.c
+index c361acc..645b398 100644
+--- a/connectivity/wlan/core/gen4m/os/linux/hif/axi/axi.c
++++ b/connectivity/wlan/core/gen4m/os/linux/hif/axi/axi.c
+@@ -434,6 +434,13 @@ exit:
+ 	return ret;
+ }
+ 
++static int mtk_axi_remove(struct platform_device *pdev);
++/* T880: platform_driver.remove returns void since 6.11 */
++static void mtk_axi_remove_void(struct platform_device *pdev)
++{
++	mtk_axi_remove(pdev);
++}
++
+ static int mtk_axi_remove(struct platform_device *pdev)
+ {
+ 	struct mt66xx_hif_driver_data *prDriverData =
+@@ -479,7 +486,7 @@ uint32_t glRegisterBus(probe_card pfProbe, remove_card pfRemove)
+ 	pfWlanRemove = pfRemove;
+ 
+ 	mtk_axi_driver.probe = mtk_axi_probe;
+-	mtk_axi_driver.remove = mtk_axi_remove;
++	mtk_axi_driver.remove = mtk_axi_remove_void;
+ 
+ 	mtk_axi_driver.suspend = mtk_axi_suspend;
+ 	mtk_axi_driver.resume = mtk_axi_resume;
+diff --git a/connectivity/wlan/core/gen4m/os/linux/include/gl_cfg80211.h b/connectivity/wlan/core/gen4m/os/linux/include/gl_cfg80211.h
+index 34c27b3..f126286 100644
+--- a/connectivity/wlan/core/gen4m/os/linux/include/gl_cfg80211.h
++++ b/connectivity/wlan/core/gen4m/os/linux/include/gl_cfg80211.h
+@@ -466,7 +466,7 @@ int mtk_cfg_change_iface(struct wiphy *wiphy,
+ 			 enum nl80211_iftype type, u32 *flags,
+ 			 struct vif_params *params);
+ #endif
+-#if (CFG_ADVANCED_80211_MLO == 1)
++#if (CFG_ADVANCED_80211_MLO == 1) || (KERNEL_VERSION(6, 1, 0) <= CFG80211_VERSION_CODE)
+ int mtk_cfg_add_key(struct wiphy *wiphy,
+ 		    struct net_device *ndev, int link_id, u8 key_index,
+ 		    bool pairwise, const u8 *mac_addr,
+@@ -502,7 +502,7 @@ int mtk_cfg_set_default_mgmt_key(struct wiphy *wiphy,
+ 		struct net_device *ndev, u8 key_index);
+ #endif
+ 
+-#if (CFG_ADVANCED_80211_MLO == 1)
++#if (CFG_ADVANCED_80211_MLO == 1) || (KERNEL_VERSION(6, 1, 0) <= CFG80211_VERSION_CODE)
+ int mtk_cfg_set_default_beacon_key(struct wiphy *wiphy,
+ 		struct net_device *ndev, int link_id, u8 key_index);
+ #else
+diff --git a/connectivity/wlan/core/gen4m/os/linux/include/gl_os.h b/connectivity/wlan/core/gen4m/os/linux/include/gl_os.h
+index bae524b..54601cb 100644
+--- a/connectivity/wlan/core/gen4m/os/linux/include/gl_os.h
++++ b/connectivity/wlan/core/gen4m/os/linux/include/gl_os.h
+@@ -870,7 +870,7 @@ struct GLUE_INFO {
+ #endif /* CFG_SUPPORT_TASKLET_FREE_MSDU */
+ 
+ #if CFG_SUPPORT_RX_GRO
+-	struct net_device dummy_dev;
++	struct net_device *dummy_dev; /* T880: alloc_netdev_dummy() (6.10+) */
+ 	struct napi_struct napi;
+ 	OS_SYSTIME tmGROFlushTimeout;
+ 	spinlock_t napi_spinlock;
+@@ -1725,4 +1725,10 @@ void wlanFuncOffImpl(void);
+ int wlanFuncOn(void);
+ int wlanFuncOff(void);
+ 
++/* T880: the kernel has no wireless extensions; nl80211 carries the events. */
++#if !IS_ENABLED(CONFIG_WEXT_CORE)
++#define wireless_send_event(dev, cmd, wrqu, extra) \
++	do { (void)(dev); (void)(wrqu); (void)(extra); } while (0)
++#endif
++
+ #endif /* _GL_OS_H */
+-- 
+2.55.0
+

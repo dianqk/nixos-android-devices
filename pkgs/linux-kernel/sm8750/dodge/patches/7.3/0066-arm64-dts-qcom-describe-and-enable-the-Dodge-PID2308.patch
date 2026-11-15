@@ -1,0 +1,132 @@
+From 41dcadc43605c5d352e6ca91543bbb2e1420e7e8 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 8 Nov 2026 20:07:48 +0800
+Subject: [PATCH 071/144] arm64: dts: qcom: describe and enable the Dodge
+ PID2308 speakers
+
+Keep the PID2308 description and its I2C parent hub enablement together.
+
+Consolidated from local follow-ups:
+  900915be3c316827963381d9e12446c037d39a34 arm64: dts: qcom: describe Dodge PID2308 speaker amplifiers
+  55bcbcba6c109084958105f14a6c50e2b0d66e94 arm64: dts: qcom: enable the Dodge speaker I2C parent hub
+---
+ .../qcom/sm8750-oneplus-dodge-recovery.dts    | 12 +++
+ .../boot/dts/qcom/sm8750-oneplus-dodge.dts    | 74 +++++++++++++++++++
+ 2 files changed, 86 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge-recovery.dts b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge-recovery.dts
+index ce2fc0b9f1..cdc5d74ba7 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge-recovery.dts
++++ b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge-recovery.dts
+@@ -80,3 +80,15 @@ &swr1 {
+ &swr2 {
+ 	status = "disabled";
+ };
++
++&speaker_left {
++	status = "disabled";
++};
++
++&speaker_right {
++	status = "disabled";
++};
++
++&i2c_master_hub_0 {
++	status = "disabled";
++};
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+index 19772527bd..95f37b98fa 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
++++ b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+@@ -22,6 +22,8 @@ / {
+ 	sound: sound {
+ 		compatible = "qcom,sm8750-sndcard", "qcom,sm8450-sndcard";
+ 		model = "OnePlus-dodge";
++		pinctrl-0 = <&i2s1_active>;
++		pinctrl-names = "default";
+ 
+ 		/* Mic bias wiring as on stock; AMIC2 is the USB-C headset mic. */
+ 		audio-routing = "AMIC1", "MIC BIAS1",
+@@ -36,6 +38,22 @@ sound: sound {
+ 				"TX SWR_INPUT2", "ADC3_OUTPUT",
+ 				"TX SWR_INPUT3", "ADC4_OUTPUT";
+ 
++		speaker-dai-link {
++			link-name = "Speaker Playback";
++
++			cpu {
++				sound-dai = <&q6apmbedai SECONDARY_MI2S_RX>;
++			};
++
++			codec {
++				sound-dai = <&speaker_left>, <&speaker_right>;
++			};
++
++			platform {
++				sound-dai = <&q6apm>;
++			};
++		};
++
+ 		wcd-playback-dai-link {
+ 			link-name = "WCD Playback";
+ 
+@@ -1003,3 +1021,59 @@ wcd_tx: codec@0,3 {
+ 		qcom,tx-port-mapping = <2 2 3 4>;
+ 	};
+ };
++
++&tlmm {
++	i2s1_active: i2s1-active-state {
++		sck-pins {
++			pins = "gpio121";
++			function = "i2s1_sck";
++			drive-strength = <4>;
++			bias-disable;
++		};
++
++		data0-pins {
++			pins = "gpio122";
++			function = "i2s1_data0";
++			drive-strength = <4>;
++			bias-disable;
++		};
++
++		ws-pins {
++			pins = "gpio123";
++			function = "i2s1_ws";
++			drive-strength = <4>;
++			bias-disable;
++		};
++
++		data1-pins {
++			pins = "gpio124";
++			function = "i2s1_data1";
++			drive-strength = <4>;
++			bias-disable;
++		};
++	};
++};
++
++&i2c_hub_4 {
++	status = "okay";
++
++	speaker_left: audio-codec@34 {
++		compatible = "awinic,aw882308";
++		reg = <0x34>;
++		reset-gpios = <&tlmm 2 GPIO_ACTIVE_LOW>;
++		#sound-dai-cells = <0>;
++		sound-name-prefix = "Left";
++	};
++
++	speaker_right: audio-codec@35 {
++		compatible = "awinic,aw882308";
++		reg = <0x35>;
++		reset-gpios = <&tlmm 164 GPIO_ACTIVE_LOW>;
++		#sound-dai-cells = <0>;
++		sound-name-prefix = "Right";
++	};
++};
++
++&i2c_master_hub_0 {
++	status = "okay";
++};

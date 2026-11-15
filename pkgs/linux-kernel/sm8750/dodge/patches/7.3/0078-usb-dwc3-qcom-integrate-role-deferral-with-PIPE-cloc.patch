@@ -1,0 +1,85 @@
+From f2a7ff07007cee53e1863ffe9c6c72a8b7ac5a54 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Mon, 9 Nov 2026 05:09:39 +0800
+Subject: [PATCH 083/144] usb: dwc3: qcom: integrate role deferral with PIPE
+ clock locking
+
+Keep role_lock outside pipe_clk_lock and runtime PM barriers. Protect notifier register access with the PIPE lock, leave pending updates intact after failed core resume, and require system resume callbacks for role deferral even without a Type-C mux.
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0106-usb-dwc3-qcom-integrate-role-deferral-with-PIPE-cloc.patch
+Import-SHA256: 9943c0967cb403d9a2cc04dbc0c7ba7f1eb1d54e1c6437c3e7aedd5fbd24d12a
+Import-Provenance: mail headers
+(cherry picked from commit 5ccb6c215ee3801866d07512b76f83b05e4b83ab)
+---
+ drivers/usb/dwc3/dwc3-qcom.c | 29 ++++++++++++++---------------
+ 1 file changed, 14 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/usb/dwc3/dwc3-qcom.c b/drivers/usb/dwc3/dwc3-qcom.c
+index dc5992a61a..a2e6a6b298 100644
+--- a/drivers/usb/dwc3/dwc3-qcom.c
++++ b/drivers/usb/dwc3/dwc3-qcom.c
+@@ -89,7 +89,7 @@ struct dwc3_qcom {
+ 	bool			dp_active;
+ 	bool			dp_only;
+ 	bool			utmi_pipe_clk;
+-	/* protects dp_active, dp_only, utmi_pipe_clk and pm_suspended */
++	/* Inner to role_lock; protects mux/PIPE state and pm_suspended. */
+ 	struct mutex		pipe_clk_lock;
+ 	struct typec_mux_dev	*mux;
+ 	struct icc_path		*icc_path_ddr;
+@@ -679,8 +679,10 @@ static void dwc3_qcom_set_role_notifier(struct dwc3 *dwc, enum usb_role next_rol
+ 		return;
+ 	}
+ 
+-	qcom->vbus_override_pending = false;
+-	dwc3_qcom_vbus_override_enable(qcom, enable);
++	scoped_guard(mutex, &qcom->pipe_clk_lock) {
++		qcom->vbus_override_pending = false;
++		dwc3_qcom_vbus_override_enable(qcom, enable);
++	}
+ 
+ 	pm_runtime_mark_last_busy(qcom->dev);
+ 	pm_runtime_put_sync(qcom->dev);
+@@ -867,10 +869,7 @@ static int dwc3_qcom_pm_suspend(struct device *dev)
+ 	bool wakeup = device_may_wakeup(dev);
+ 	int ret;
+ 
+-	/*
+-	 * A role switch that comes in now waits until the glue is suspended
+-	 * and is then deferred, see dwc3_qcom_set_role_notifier().
+-	 */
++	/* Serialize role changes before draining callbacks taking pipe_clk_lock. */
+ 	guard(mutex)(&qcom->role_lock);
+ 
+ 	/* Drain runtime callbacks before taking the lock they also acquire. */
+@@ -909,13 +908,13 @@ static int dwc3_qcom_pm_resume(struct device *dev)
+ 
+ 	dwc3_qcom_update_pipe_clk(qcom);
+ 	ret = dwc3_pm_resume(&qcom->dwc);
+-	if (!ret)
++	if (!ret) {
+ 		qcom->pm_suspended = false;
+-
+-	/* Apply the newer role override after the core's gadget resume. */
+-	if (qcom->vbus_override_pending) {
+-		dwc3_qcom_vbus_override_enable(qcom, qcom->vbus_override);
+-		qcom->vbus_override_pending = false;
++		/* Core resume may enable VBUS; the deferred role is newer. */
++		if (qcom->vbus_override_pending) {
++			dwc3_qcom_vbus_override_enable(qcom, qcom->vbus_override);
++			qcom->vbus_override_pending = false;
++		}
+ 	}
+ out:
+ 	mutex_unlock(&qcom->pipe_clk_lock);
+@@ -938,8 +937,8 @@ static int dwc3_qcom_prepare(struct device *dev)
+ 	int ret;
+ 
+ 	ret = dwc3_pm_prepare(dwc);
+-	/* A mux update during sleep needs the serialized resume callback. */
+-	return ret > 0 && qcom->mux ? 0 : ret;
++	/* Mux and role changes during sleep need the resume callback. */
++	return ret > 0 ? 0 : ret;
+ }
+ 
+ static int dwc3_qcom_runtime_suspend(struct device *dev)

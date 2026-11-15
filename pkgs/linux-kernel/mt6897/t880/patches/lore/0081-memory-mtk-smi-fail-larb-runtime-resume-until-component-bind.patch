@@ -1,0 +1,181 @@
+From 2f4f50cb8efc603b903c0fb373c6d87018d83d5f Mon Sep 17 00:00:00 2001
+From: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+Date: Sat, 26 Sep 2026 21:24:17 +0200
+Subject: [PATCH] memory: mtk-smi: fail larb runtime resume until component
+ bind
+
+With the mtk-smi and mtk-iommu drivers built as modules, a consumer
+device probe (e.g. mediatek-drm on MT8183) can race the iommu's
+component master bind.  The consumer's probe path runtime-resumes its
+smi-larb suppliers, and the larb's runtime resume then runs
+mtk_smi_larb_config_port_gen2_general(), which dereferences
+larb->mmu and larb->bank.  Those pointers are only populated by
+mtk_smi_larb_bind() when the component master completes, so a larb
+resumed inside the window dereferences NULL and oopses in the module
+loader's initcall context.  The module loader is then stuck and the
+rest of the boot dies.  On MT8183 (krane), mediatek-drm module init
+hits this:
+
+  Internal error: Oops: 0000000096000004 [#1] SMP
+  CPU: 4 UID: 0 PID: 270 Comm: (udev-worker) Tainted: G W
+  pc : mtk_smi_larb_config_port_gen2_general+0xe0/0x660 [mtk_smi]
+  lr : mtk_smi_larb_resume+0xb8/0x1b8 [mtk_smi]
+  Call trace:
+   mtk_smi_larb_config_port_gen2_general+0xe0/0x660 [mtk_smi] (P)
+   mtk_smi_larb_resume+0xb8/0x1b8 [mtk_smi]
+   pm_generic_runtime_resume+0x38/0x80
+   genpd_runtime_resume+0x118/0x320
+   rpm_callback+0x8c/0xc8
+   rpm_resume+0x558/0x758
+   __pm_runtime_resume+0x64/0xd8
+   pm_runtime_get_suppliers+0x6c/0xb8
+   __driver_probe_device+0x68/0x230
+   driver_probe_device+0xdc/0x1b0
+   __driver_attach+0x10c/0x2c8
+   bus_add_driver+0x17c/0x2e0
+   __platform_register_drivers+0x7c/0x1c0
+   mtk_drm_init+0x38/0xfd0 [mediatek_drm]
+   do_one_initcall+0x60/0x4e0
+   do_init_module+0xa0/0x308
+   init_module_from_file+0x10c/0x180
+   idempotent_init_module+0x1f8/0x2f0
+   __arm64_sys_finit_module+0x74/0x120
+
+The oopsing udev worker exits holding the module loader's locks, so
+every later module load soft-locks and the boot dies in the initrd.
+The same oops was reported on MT8188 (Genio 700 EVK) from mtk_mdp3
+module init.
+
+Publish the bind state with smp_store_release() and check it with
+smp_load_acquire() in mtk_smi_larb_resume(); that answers how the
+check synchronizes between CPUs.  Fail the resume with -EAGAIN: the
+larb stays RPM_SUSPENDED and retryable, the error is dropped by
+pm_runtime_get_suppliers() on the driver-core probe path, and the
+consumer's first runtime resume after the bind (at display enable,
+mtk_crtc_atomic_enable()) re-runs the callback, which configures the
+larb ports then.  Failing rather than skipping keeps the larb
+suspended instead of marking it active with unconfigured MMU ports,
+which would only turn the crash into silent iommu faults.
+
+A failed supplier resume does not break the consumer's probe.
+pm_runtime_get_suppliers() is void and drops the error, so a probe
+inside the window just proceeds.  The display components do not touch
+the larb in probe: mtk_disp_ovl_probe() and its siblings only call
+pm_runtime_enable(), and mdp3 only enables runtime PM for its
+DMA-capable components (mtk-mdp3-comp.c).  The first real runtime
+resume happens later, at display enable: mtk_crtc_atomic_enable()
+does pm_runtime_resume_and_get() and the device links resume the
+larb first.  By then the component master bind has completed, so the
+larb configures its ports and the resume succeeds.  There is no
+deadlock either: the bind only records the larb pointers, it does not
+resume the larb, so the window closes when the bind completes
+regardless of what consumers do.  -ENODEV is not an alternative;
+like -EPROBE_DEFER it is recorded in dev->power.runtime_error
+instead of being exempted.
+
+The bind state is a separate flag rather than a NULL test on
+larb->mmu so that the publication explicitly covers both larb->mmu
+and larb->bank.  mtk_smi_larb_unbind() clears it again with
+WRITE_ONCE(), which is all the clear side needs since it publishes
+nothing, so an iommu removal or module unload can not leave a stale
+bound state pointing at the freed iommu data.  A resume in flight
+while the iommu goes away is a pre-existing teardown hazard (the
+data it reads belongs to the iommu device, whose removal breaks
+bound consumers anyway); clearing the flag makes every resume that
+starts after the clear fail safely instead.
+
+Tested on MT8183 (krane) with the full MTK stack built as modules:
+with this change applied the machine boots reliably, the iommu
+probes and binds all larbs, and the display stack comes up fully
+functional.
+
+The Fixes: tag points at 4f0a1a1ae351, which moved the port
+configuration into the runtime resume.  The device links that open
+the race window are added on the mtk-iommu side, but the dereference
+guarded here is the one that commit introduced.
+
+Fixes: 4f0a1a1ae351 ("memory: mtk-smi: Invoke pm runtime_callback to enable clocks")
+Reported-by: Jian Hui Lee <jianhui.lee@canonical.com>
+Closes: https://lore.kernel.org/linux-arm-kernel/20251111124853.2916889-1-jianhui.lee@canonical.com/
+Cc: stable@vger.kernel.org
+Cc: Krzysztof Kozlowski <krzk@kernel.org>
+Cc: Yong Wu <yong.wu@mediatek.com>
+Cc: Jian Hui Lee <jianhui.lee@canonical.com>
+Cc: Matthias Brugger <matthias.bgg@gmail.com>
+Cc: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Cc: Rafael J. Wysocki <rafael@kernel.org>
+Cc: Ulf Hansson <ulf.hansson@linaro.org>
+Cc: linux-mediatek@lists.infradead.org
+Cc: linux-arm-kernel@lists.infradead.org
+Cc: linux-pm@vger.kernel.org
+Cc: linux-kernel@vger.kernel.org
+Signed-off-by: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+Reviewed-by: Yong Wu <yong.wu@mediatek.com>
+Link: https://lore.kernel.org/all/20260926192417.1448813-1-valentin.haudiquet@canonical.com/
+Link: https://lore.kernel.org/all/adb82cfed14bb682fe3250d22bee806bf35b4a78.camel@mediatek.com/
+---
+ drivers/memory/mtk-smi.c | 27 ++++++++++++++++++++++++++-
+ 1 file changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/memory/mtk-smi.c b/drivers/memory/mtk-smi.c
+index aaeba8ab21..dfc65b2089 100644
+--- a/drivers/memory/mtk-smi.c
++++ b/drivers/memory/mtk-smi.c
+@@ -157,6 +157,7 @@ struct mtk_smi_larb { /* larb: local arbiter */
+ 	int				larbid;
+ 	u32				*mmu;
+ 	unsigned char			*bank;
++	bool				bound; /* set once the iommu binds us */
+ };
+ 
+ static int
+@@ -171,6 +172,11 @@ mtk_smi_larb_bind(struct device *dev, struct device *master, void *data)
+ 			larb->larbid = i;
+ 			larb->mmu = &larb_mmu[i].mmu;
+ 			larb->bank = larb_mmu[i].bank;
++			/*
++			 * Publish larb->mmu and larb->bank; pairs with
++			 * smp_load_acquire() in mtk_smi_larb_resume().
++			 */
++			smp_store_release(&larb->bound, true);
+ 			return 0;
+ 		}
+ 	}
+@@ -180,7 +186,13 @@ mtk_smi_larb_bind(struct device *dev, struct device *master, void *data)
+ static void
+ mtk_smi_larb_unbind(struct device *dev, struct device *master, void *data)
+ {
+-	/* Do nothing as the iommu is always enabled. */
++	struct mtk_smi_larb *larb = dev_get_drvdata(dev);
++
++	/*
++	 * The iommu data recorded at bind time is going away; make the
++	 * next runtime resume wait for a fresh bind.
++	 */
++	WRITE_ONCE(larb->bound, false);
+ }
+ 
+ static const struct component_ops mtk_smi_larb_component_ops = {
+@@ -697,6 +709,19 @@ static int __maybe_unused mtk_smi_larb_resume(struct device *dev)
+ 	const struct mtk_smi_larb_gen *larb_gen = larb->larb_gen;
+ 	int ret;
+ 
++	/*
++	 * With modular builds a consumer device probe can runtime-resume
++	 * the larb (pm_runtime_get_suppliers()) before the iommu's
++	 * component master bind has populated larb->mmu and larb->bank.
++	 * Fail the resume with -EAGAIN: the larb stays RPM_SUSPENDED and
++	 * retryable, and the next resume after the bind configures the
++	 * larb ports.
++	 */
++	if (!smp_load_acquire(&larb->bound)) {
++		dev_dbg(dev, "not yet bound to an iommu, skipping port configuration\n");
++		return -EAGAIN;
++	}
++
+ 	ret = clk_bulk_prepare_enable(larb->smi.clk_num, larb->smi.clks);
+ 	if (ret)
+ 		return ret;
+-- 
+2.56.0
+

@@ -1,0 +1,193 @@
+From 0b72a7532aafc4fea134059156be3e250527fbe3 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 25 Oct 2026 19:12:29 +0800
+Subject: [PATCH] ASoC: qcom: route three channels to the Marble speaker TDM
+ backend
+
+Drive the top amplifier's ultrasound input in TDM slot 2 with the final FL/FR/FC channel layout.
+
+Source changes (original messages and trailers follow).
+
+Source-commit: 5ef79b849c66255ac0faa5adf16d157eaaf580d0
+Source-author: dianqk <dianqk@dianqk.net>
+Source-date: 2026-10-25T19:12:29+08:00
+Imported-from: pkgs/linux-kernel/sm7475/marble/patches/local/0075-ASoC-qcom-audioreach-add-a-default-map-for-three-cha.patch
+
+ASoC: qcom: audioreach: add a default map for three channels
+
+audioreach_set_default_channel_mapping() fills maps for one, two and
+four channels only. A three-channel backend keeps an empty map, and the
+MFC output media format then carries no channel types.
+
+Map three channels to front left, front right and front centre, the map
+the Android audio HAL (PAL) uses for three-channel devices.
+
+Re-applied after the LPASS DCODEC vote fix: the earlier attempt (reverted
+by 81b63654fb5a/321f3d13156f/06be2e6db9f9) was tested while 7.3 sent no
+audio to the amplifiers at all, so it could not show whether driving slot 2
+removes the noise of the top amplifier (0x34), whose ACF takes TDM
+ultrasound input (SYSCTRL ULS_MODE) and otherwise mixes an undriven slot.
+Stock fills slot 2 from its ultrasound backend (TDM-LPAIF-RX-TERTIARY-VIRT-1,
+silent when no ultrasound session runs); here the device MFC produces it as
+the front-centre channel of its 2 -> 3 channel conversion, so the slot
+carries a defined signal instead of an idle line.
+
+(cherry picked from commit 3d6b32a6d7cf3ad1c4c1b92acf77d32d0a89e421)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Source-commit: 0738860f3b7a39d613b40a70f6cf5b84245e4fb3
+Source-author: dianqk <dianqk@dianqk.net>
+Source-date: 2026-10-25T19:12:29+08:00
+Imported-from: pkgs/linux-kernel/sm7475/marble/patches/local/0076-ASoC-qcom-sc8280xp-run-the-Marble-speaker-TDM-backen.patch
+
+ASoC: qcom: sc8280xp: run the Marble speaker TDM backend with three channels
+
+Stock Android configures the Marble speaker group device with three
+32-bit channels and slot mask 0x7 at 96 kHz (resourcemanager
+group_device_cfg: devicepp MFC 48 kHz stereo, group_dev 96 kHz,
+channels 3, slot_mask 7). The amplifier ACF agrees: the top AW88263S
+reads slot 0, the bottom one slot 1, and the top amplifier runs its
+ultrasound input in TDM mode (SYSCTRL ULS_MODE = 1), which stock feeds
+through slot 2.
+
+The backend ran with two channels in slots 0 and 1, so slot 2 was never
+driven (the TDM block shares the data line, inactive slots are not
+driven). The first playback trial gave noise from the top speaker.
+
+Add a board TDM channel count to the backend fixup and use three
+channels for Marble; the device MFC then converts the stereo stream to
+front left, front right and front centre as stock PAL does.
+
+Re-applied after the LPASS DCODEC vote fix: the earlier attempt (reverted
+by 81b63654fb5a/321f3d13156f/06be2e6db9f9) was tested while 7.3 sent no
+audio to the amplifiers at all, so it could not show whether driving slot 2
+removes the noise of the top amplifier (0x34), whose ACF takes TDM
+ultrasound input (SYSCTRL ULS_MODE) and otherwise mixes an undriven slot.
+Stock fills slot 2 from its ultrasound backend (TDM-LPAIF-RX-TERTIARY-VIRT-1,
+silent when no ultrasound session runs); here the device MFC produces it as
+the front-centre channel of its 2 -> 3 channel conversion, so the slot
+carries a defined signal instead of an idle line.
+
+(cherry picked from commit 50ce36546a22d309429b200496b6795629bd7929)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Source-commit: 8d5f089283a1ea468fbadb79c6a8899d004e45c0
+Source-author: dianqk <dianqk@dianqk.net>
+Source-date: 2026-10-25T19:12:30+08:00
+Imported-from: pkgs/linux-kernel/sm7475/marble/patches/local/0077-arm64-dts-qcom-sm8475-xiaomi-marble-activate-speaker.patch
+
+arm64: dts: qcom: sm8475-xiaomi-marble: activate speaker TDM slot 2
+
+Use slots 0-2 of the four 32-bit speaker TDM slots, as the stock group
+device (slot_mask 7): slot 0 feeds the top amplifier, slot 1 the bottom
+one, and slot 2 the top amplifier's TDM ultrasound input.
+
+Re-applied after the LPASS DCODEC vote fix: the earlier attempt (reverted
+by 81b63654fb5a/321f3d13156f/06be2e6db9f9) was tested while 7.3 sent no
+audio to the amplifiers at all, so it could not show whether driving slot 2
+removes the noise of the top amplifier (0x34), whose ACF takes TDM
+ultrasound input (SYSCTRL ULS_MODE) and otherwise mixes an undriven slot.
+Stock fills slot 2 from its ultrasound backend (TDM-LPAIF-RX-TERTIARY-VIRT-1,
+silent when no ultrasound session runs); here the device MFC produces it as
+the front-centre channel of its 2 -> 3 channel conversion, so the slot
+carries a defined signal instead of an idle line.
+
+(cherry picked from commit abcaa2121839aef60d9f485d185d33a1effc9beb)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm64/boot/dts/qcom/sm8475-xiaomi-marble.dts |  7 ++++---
+ sound/soc/qcom/qdsp6/audioreach.c                 |  4 ++++
+ sound/soc/qcom/sc8280xp.c                         | 14 +++++++++++---
+ 3 files changed, 19 insertions(+), 6 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-marble.dts b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-marble.dts
+index 8f85d9767a..767c4a313f 100644
+--- a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-marble.dts
++++ b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-marble.dts
+@@ -1104,8 +1104,9 @@ tx-pins {
+ /*
+  * Speakers: 2x Awinic AW88263S (register compatible with AW88261) on i2c15,
+  * fed by the tertiary TDM interface like stock ("TDM-LPAIF-RX-TERTIARY"):
+- * 96 kHz, 32-bit samples, 4 x 32-bit slots (slots 0/1 carry the two amps),
+- * short frame sync; the amps' interface registers come from their ACF.
++ * 96 kHz, 32-bit samples, 4 x 32-bit slots, slots 0-2 active (slot 0 top,
++ * slot 1 bottom, slot 2 the top amp's TDM ultrasound input), short frame
++ * sync; the amps' interface registers come from their ACF.
+  * 0x34 = top (also the earpiece, see gpio52), 0x35 = bottom. Pins and gpios
+  * from the stock device tree.
+  */
+@@ -1236,7 +1237,7 @@ cpu {
+ 			sound-dai = <&q6apmbedai TERTIARY_TDM_RX_0>;
+ 			dai-tdm-slot-num = <4>;
+ 			dai-tdm-slot-width = <32>;
+-			dai-tdm-slot-rx-mask = <1 1 0 0>;
++			dai-tdm-slot-rx-mask = <1 1 1 0>;
+ 		};
+ 
+ 		codec {
+diff --git a/sound/soc/qcom/qdsp6/audioreach.c b/sound/soc/qcom/qdsp6/audioreach.c
+index 85645ec2e6..1bea8ddafb 100644
+--- a/sound/soc/qcom/qdsp6/audioreach.c
++++ b/sound/soc/qcom/qdsp6/audioreach.c
+@@ -358,6 +358,10 @@ void audioreach_set_default_channel_mapping(u8 *ch_map, int num_channels)
+ 	} else if (num_channels == 2) {
+ 		ch_map[0] =  PCM_CHANNEL_FL;
+ 		ch_map[1] =  PCM_CHANNEL_FR;
++	} else if (num_channels == 3) {
++		ch_map[0] =  PCM_CHANNEL_FL;
++		ch_map[1] =  PCM_CHANNEL_FR;
++		ch_map[2] =  PCM_CHANNEL_FC;
+ 	} else if (num_channels == 4) {
+ 		ch_map[0] =  PCM_CHANNEL_FL;
+ 		ch_map[1] =  PCM_CHANNEL_FR;
+diff --git a/sound/soc/qcom/sc8280xp.c b/sound/soc/qcom/sc8280xp.c
+index 1f4d0eee30..318032bddf 100644
+--- a/sound/soc/qcom/sc8280xp.c
++++ b/sound/soc/qcom/sc8280xp.c
+@@ -73,9 +73,10 @@ struct qcom_snd_soc_common {
+ 	bool mi2s_mclk_enable;
+ 	bool mi2s_bclk_enable;
+ 	bool wcd_jack;
+-	/* TDM backend rate and sample format; 0 keeps 48 kHz S16_LE */
++	/* TDM backend rate, sample format and channels; 0 keeps 48 kHz S16_LE stereo */
+ 	unsigned int tdm_rate;
+ 	snd_pcm_format_t tdm_format;
++	unsigned int tdm_channels;
+ 	/* TDM backends need an LPASS core vote ("tdm-vote" clock) */
+ 	bool tdm_hw_vote;
+ 	int (*snd_prepare)(struct snd_pcm_substream *substream);
+@@ -254,6 +255,8 @@ static int sc8280xp_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
+ 			snd_mask_none(fmt);
+ 			snd_mask_set_format(fmt, data->priv->tdm_format);
+ 		}
++		if (data->priv->tdm_channels)
++			channels->min = channels->max = data->priv->tdm_channels;
+ 		break;
+ 	default:
+ 		break;
+@@ -657,8 +660,12 @@ static const struct qcom_snd_soc_common sm8450_priv_data = {
+  * Xiaomi Poco F5 / Redmi Note 12 Turbo (marble): two AW88263S speaker
+  * amplifiers on the tertiary TDM interface, run like stock at 96 kHz with
+  * 32-bit samples in four 32-bit slots; the interface needs the LPASS core
+- * vote of stock "qcom,mi2s-tdm-is-hw-vote-needed". The SM8450 card name
+- * keeps the qcom/sm8450 topology and UCM directories.
++ * vote of stock "qcom,mi2s-tdm-is-hw-vote-needed". As the stock group
++ * device ("channels 3, slot_mask 7"), the backend carries three channels:
++ * slot 0 top, slot 1 bottom, and slot 2, which the top amplifier's ACF
++ * uses as TDM ultrasound input (SYSCTRL ULS_MODE = TDM), is driven rather
++ * than left idle. The SM8450 card name keeps the qcom/sm8450 topology and
++ * UCM directories.
+  */
+ static const struct qcom_snd_soc_common marble_priv_data = {
+ 	.driver_name = "sm8450",
+@@ -672,6 +679,7 @@ static const struct qcom_snd_soc_common marble_priv_data = {
+ 			 SND_SOC_DAIFMT_I2S,
+ 	.tdm_rate = 96000,
+ 	.tdm_format = SNDRV_PCM_FORMAT_S32_LE,
++	.tdm_channels = 3,
+ 	.tdm_hw_vote = true,
+ };
+ 

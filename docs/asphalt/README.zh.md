@@ -1,8 +1,8 @@
 # 联想 Y700 2023（TB320FC）（asphalt）
 
-[English](README.md) · [全部设备](../README.zh.md) · [硬件支持](hardware.zh.md)
+[English](README.md) · [全部设备](../README.zh.md) · [支持状态](status.zh.md) · [硬件支持](hardware.zh.md)
 
-支持等级：Tier 2。具体含义见[支持范围](../README.zh.md#支持等级)。
+状态：见[硬件页](hardware.zh.md)和[支持状态](status.zh.md)。
 
 ## 配置与安装
 
@@ -21,8 +21,6 @@
 
 ```nix
 {
-  androidDevices.usbSerial = "my-asphalt-01";
-  androidDevices.persistentImage.rootfs.label = "NIXOS";
   # Optional factory identity files:
   # hardware.asphalt.radio.wifiAddressFile = ./wifi-address;
   # hardware.asphalt.radio.bluetoothAddressFile = ./bluetooth-address;
@@ -58,13 +56,17 @@ Android/LineageOS 可能恢复不兼容的 overlay。使用[显式检查的 DTBO
 
 ## 固件来源
 
-设备专用固件从固定的上游提交获取，本仓库不保存其二进制副本。
+设备专用固件按哈希从一个发布归档获取，本仓库不保存其二进制副本。
 
-- 来源：[dianqk/firmware-lenovo-asphalt 的 `207d466` 提交](https://github.com/dianqk/firmware-lenovo-asphalt/tree/207d4668183032c1d9f196f195e9ecef98949d06)。
+- 归档：[`asphalt-firmware-ZUI-17.0.339-20261115.tar.zst`](https://github.com/dianqk/nixos-android-devices/releases/download/firmware/asphalt-firmware-ZUI-17.0.339-20261115.tar.zst)（原厂 ZUI 17.0.339 vendor）。
+- 布局：`lenovo/tb320fc/{firmware,audio,wifi}` 与
+  `oneplus/negroni/WCN6855/hw2.1`，另有顶层 `SHA256SUMS` 与 README。
 - 用途：触摸、GPU、音频、视频、WCN6855 板级数据及 OnePlus Wi-Fi 固件。
 
-上游仓库记录了 Lenovo Android 镜像来源、OnePlus Wi-Fi 来源与 41 个文件的
-SHA256 校验值。可通过 `hardware.asphalt.wifiBoardFile` 覆盖默认 Wi-Fi
+归档 README 记录了 Lenovo Android 镜像来源与 OnePlus Wi-Fi 来源；构建时会按
+`SHA256SUMS` 校验 41 个文件。如需使用自己的副本，将
+`hardware.asphalt.firmwareSource` 设为 `androidPackages.mkFirmwareArchive { name; url; hash; }`
+或布局相同的目录。可通过 `hardware.asphalt.wifiBoardFile` 覆盖默认 Wi-Fi
 板级数据；设备地址由用户另行提供。
 
 通用固件来源及许可证说明见[文档索引](../README.zh.md#固件来源与许可证)。

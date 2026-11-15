@@ -1,0 +1,872 @@
+From 78e85ec001b05c28b54a03bdd50b91ce26f9c0a4 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 20 Oct 2026 13:32:12 +0800
+Subject: [PATCH] mtk-soc: allowed modes and the initial attach APN through
+ MIPC
+
+The modem does not register on LTE without an initial attach (initial EPS
+bearer) APN, which the stock RIL sets with MIPC APN_SET_IA_REQ at boot;
+ModemManager had no way to set it and no allowed-mode support.
+
+Implement set_initial_eps_bearer_settings with APN_SET_IA_REQ and
+set_current_modes with NW_SET_RAT_REQ, both in the stock RIL's wire format
+(traced 2026-10-20) and sent on their own MIPC control channel
+(/dev/ttyCMIPC2) so they do not interfere with the data bearer's channel.
+Current values are read back with AT+ERAT? and AT+CGDCONT? (context 0).
+Only the observed values are supported: LTE only or the modem default
+(NR/LTE/3G/2G); IPv4v6 without credentials for the attach APN.
+---
+ src/plugins/meson.build                       |   1 +
+ .../mtk-soc/mm-broadband-modem-mtk-soc.c      | 320 +++++++++++++++++-
+ src/plugins/mtk-soc/mm-mtk-mipc-client.c      | 245 ++++++++++++++
+ src/plugins/mtk-soc/mm-mtk-mipc-client.h      |  36 ++
+ src/plugins/mtk-soc/mm-mtk-mipc.c             |  50 +++
+ src/plugins/mtk-soc/mm-mtk-mipc.h             |  30 ++
+ src/plugins/mtk-soc/test-mtk-mipc.c           |  49 +++
+ 7 files changed, 730 insertions(+), 1 deletion(-)
+ create mode 100644 src/plugins/mtk-soc/mm-mtk-mipc-client.c
+ create mode 100644 src/plugins/mtk-soc/mm-mtk-mipc-client.h
+
+diff --git a/src/plugins/meson.build b/src/plugins/meson.build
+index 8688d96..523c9aa 100644
+--- a/src/plugins/meson.build
++++ b/src/plugins/meson.build
+@@ -743,6 +743,7 @@ if plugins_options['mtk-soc']
+                        'mtk-soc/mm-broadband-modem-mtk-soc.c',
+                        'mtk-soc/mm-broadband-bearer-mtk-soc.c',
+                        'mtk-soc/mm-mtk-mipc.c',
++                       'mtk-soc/mm-mtk-mipc-client.c',
+                        'mtk-soc/mm-mtk-ipsec.c'),
+       'include_directories': plugins_incs,
+       'c_args': '-DMM_MODULE_NAME="mtk-soc"',
+diff --git a/src/plugins/mtk-soc/mm-broadband-modem-mtk-soc.c b/src/plugins/mtk-soc/mm-broadband-modem-mtk-soc.c
+index 6520a3d..e0c94d5 100644
+--- a/src/plugins/mtk-soc/mm-broadband-modem-mtk-soc.c
++++ b/src/plugins/mtk-soc/mm-broadband-modem-mtk-soc.c
+@@ -5,6 +5,7 @@
+ 
+ #include <config.h>
+ 
++#include <stdio.h>
+ #include <string.h>
+ 
+ #include "ModemManager.h"
+@@ -14,11 +15,15 @@
+ #include "mm-broadband-modem.h"
+ #include "mm-broadband-modem-mtk-soc.h"
+ #include "mm-iface-modem.h"
++#include "mm-iface-modem-3gpp.h"
+ #include "mm-log-object.h"
+ #include "mm-modem-helpers.h"
++#include "mm-mtk-mipc.h"
++#include "mm-mtk-mipc-client.h"
+ #include "mm-port-serial-at.h"
+ 
+ static void iface_modem_init (MMIfaceModemInterface *iface);
++static void iface_modem_3gpp_init (MMIfaceModem3gppInterface *iface);
+ static void load_signal_quality (MMIfaceModem *self, GAsyncReadyCallback callback, gpointer user_data);
+ static guint load_signal_quality_finish (MMIfaceModem *self, GAsyncResult *res, GError **error);
+ 
+@@ -26,7 +31,8 @@ G_DEFINE_TYPE_EXTENDED (MMBroadbandModemMtkSoc,
+                         mm_broadband_modem_mtk_soc,
+                         MM_TYPE_BROADBAND_MODEM,
+                         0,
+-                        G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM, iface_modem_init))
++                        G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM, iface_modem_init)
++                        G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_3GPP, iface_modem_3gpp_init))
+ 
+ typedef struct {
+     GPtrArray *sim_slots;
+@@ -671,9 +677,321 @@ load_access_technologies (MMIfaceModem        *self,
+                               (GAsyncReadyCallback) cops_access_tech_ready, task);
+ }
+ 
++/*****************************************************************************/
++/* Allowed modes and the initial EPS bearer (initial attach APN).             */
++/*                                                                            */
++/* Both go to the modem as the MIPC requests the stock RIL sends              */
++/* (NW_SET_RAT_REQ, APN_SET_IA_REQ, traced 2026-10-20) on the control         */
++/* channel; the current values are read back with AT+ERAT? and AT+CGDCONT?    */
++/* (the modem reports the initial attach APN as PDP context 0).  Only the     */
++/* observed values are supported: LTE only (mode 3) and the modem default     */
++/* (mode 21, NR/LTE/3G/2G); IPv4v6 without credentials for the attach APN.    */
++/* Without an attach APN the modem does not register on LTE at all.           */
++
++#define MTK_SOC_MIPC_TIMEOUT_MS 5000
++#define MTK_SOC_TXID_SET_RAT    0x0e10
++#define MTK_SOC_TXID_SET_IA     0x0e11
++#define MTK_SOC_ALL_MODES       (MM_MODEM_MODE_2G | MM_MODEM_MODE_3G | \
++                                 MM_MODEM_MODE_4G | MM_MODEM_MODE_5G)
++
++static guint8
++mtk_soc_mipc_ps (gpointer self)
++{
++    guint slot;
++
++    slot = GPOINTER_TO_UINT (g_object_get_data (G_OBJECT (self), MM_MTK_SOC_PRIMARY_SLOT_DATA));
++    return (slot >= 1 && slot <= 2) ? (guint8) slot : 1;
++}
++
++static void
++mipc_transact_ready (GObject      *self,
++                     GAsyncResult *res,
++                     GTask        *task)
++{
++    GError *error = NULL;
++
++    if (!mm_mtk_mipc_client_transact_finish (self, res, &error))
++        g_task_return_error (task, error);
++    else
++        g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++static GArray *
++load_supported_modes_finish (MMIfaceModem  *self,
++                             GAsyncResult  *res,
++                             GError       **error)
++{
++    return g_task_propagate_pointer (G_TASK (res), error);
++}
++
++static void
++load_supported_modes (MMIfaceModem        *self,
++                      GAsyncReadyCallback  callback,
++                      gpointer             user_data)
++{
++    GTask                  *task;
++    GArray                 *combinations;
++    MMModemModeCombination  mode;
++
++    combinations = g_array_sized_new (FALSE, FALSE, sizeof (MMModemModeCombination), 2);
++    mode.allowed = MTK_SOC_ALL_MODES;
++    mode.preferred = MM_MODEM_MODE_NONE;
++    g_array_append_val (combinations, mode);
++    mode.allowed = MM_MODEM_MODE_4G;
++    mode.preferred = MM_MODEM_MODE_NONE;
++    g_array_append_val (combinations, mode);
++
++    task = g_task_new (self, NULL, callback, user_data);
++    g_task_return_pointer (task, combinations, (GDestroyNotify) g_array_unref);
++    g_object_unref (task);
++}
++
++static gboolean
++load_current_modes_finish (MMIfaceModem  *self,
++                           GAsyncResult  *res,
++                           MMModemMode   *allowed,
++                           MMModemMode   *preferred,
++                           GError       **error)
++{
++    GError *inner_error = NULL;
++    gssize  value;
++
++    value = g_task_propagate_int (G_TASK (res), &inner_error);
++    if (inner_error) {
++        g_propagate_error (error, inner_error);
++        return FALSE;
++    }
++    *allowed = (MMModemMode) value;
++    *preferred = MM_MODEM_MODE_NONE;
++    return TRUE;
++}
++
++static void
++erat_query_ready (MMBaseModem  *self,
++                  GAsyncResult *res,
++                  GTask        *task)
++{
++    const gchar *response;
++    GError      *error = NULL;
++    guint        current = 0, gprs = 0, mode = 0;
++
++    response = mm_base_modem_at_command_finish (self, res, &error);
++    if (!response) {
++        g_task_return_error (task, error);
++    } else if (sscanf (mm_strip_tag (response, "+ERAT:"), "%u,%u,%u", &current, &gprs, &mode) != 3) {
++        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                                 "Couldn't parse +ERAT response: %s", response);
++    } else if (mode == MM_MTK_MIPC_RAT_MODE_LTE) {
++        g_task_return_int (task, MM_MODEM_MODE_4G);
++    } else if (mode == MM_MTK_MIPC_RAT_MODE_DEFAULT) {
++        g_task_return_int (task, MTK_SOC_ALL_MODES);
++    } else {
++        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
++                                 "Unknown +ERAT RAT mode %u", mode);
++    }
++    g_object_unref (task);
++}
++
++static void
++load_current_modes (MMIfaceModem        *self,
++                    GAsyncReadyCallback  callback,
++                    gpointer             user_data)
++{
++    mm_base_modem_at_command (MM_BASE_MODEM (self), "+ERAT?", 5, FALSE,
++                              (GAsyncReadyCallback) erat_query_ready,
++                              g_task_new (self, NULL, callback, user_data));
++}
++
++static gboolean
++set_current_modes_finish (MMIfaceModem  *self,
++                          GAsyncResult  *res,
++                          GError       **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++static void
++set_current_modes (MMIfaceModem        *self,
++                   MMModemMode          allowed,
++                   MMModemMode          preferred,
++                   GAsyncReadyCallback  callback,
++                   gpointer             user_data)
++{
++    g_autoptr(GBytes) request = NULL;
++    GTask            *task;
++    guint8            mode;
++    guint8            preference;
++
++    task = g_task_new (self, NULL, callback, user_data);
++    if (preferred != MM_MODEM_MODE_NONE) {
++        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
++                                 "Preferred modes are not supported");
++        g_object_unref (task);
++        return;
++    }
++    if (allowed == MM_MODEM_MODE_4G) {
++        mode = MM_MTK_MIPC_RAT_MODE_LTE;
++        preference = MM_MTK_MIPC_RAT_PREFER_NONE;
++    } else if (allowed == MM_MODEM_MODE_ANY || allowed == MTK_SOC_ALL_MODES) {
++        mode = MM_MTK_MIPC_RAT_MODE_DEFAULT;
++        preference = MM_MTK_MIPC_RAT_PREFER_DEFAULT;
++    } else {
++        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
++                                 "Only 4G alone or all modes can be allowed");
++        g_object_unref (task);
++        return;
++    }
++
++    mm_obj_dbg (self, "setting RAT mode %u, preference %u (MIPC NW_SET_RAT_REQ)",
++                mode, preference);
++    request = mm_mtk_mipc_nw_set_rat_request (mtk_soc_mipc_ps (self), MTK_SOC_TXID_SET_RAT,
++                                              mode, preference);
++    mm_mtk_mipc_client_transact (self, request, MM_MTK_MIPC_NW_SET_RAT_CNF,
++                                 mtk_soc_mipc_ps (self), MTK_SOC_TXID_SET_RAT,
++                                 MTK_SOC_MIPC_TIMEOUT_MS,
++                                 (GAsyncReadyCallback) mipc_transact_ready, task);
++}
++
++static gboolean
++set_initial_eps_bearer_settings_finish (MMIfaceModem3gpp  *self,
++                                        GAsyncResult      *res,
++                                        GError           **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++static void
++set_initial_eps_bearer_settings (MMIfaceModem3gpp    *self,
++                                 MMBearerProperties  *config,
++                                 GAsyncReadyCallback  callback,
++                                 gpointer             user_data)
++{
++    g_autoptr(GBytes) request = NULL;
++    GError           *error = NULL;
++    GTask            *task;
++    const gchar      *apn;
++    const gchar      *user;
++    const gchar      *password;
++    MMBearerIpFamily  ip_type;
++
++    task = g_task_new (self, NULL, callback, user_data);
++    apn = mm_bearer_properties_get_apn (config);
++    user = mm_bearer_properties_get_user (config);
++    password = mm_bearer_properties_get_password (config);
++    ip_type = mm_bearer_properties_get_ip_type (config);
++
++    if (!apn || !apn[0]) {
++        error = g_error_new (MM_CORE_ERROR, MM_CORE_ERROR_INVALID_ARGS,
++                             "An initial attach APN is required");
++    } else if ((user && user[0]) || (password && password[0])) {
++        error = g_error_new (MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
++                             "Initial attach APN credentials are not supported");
++    } else if (ip_type != MM_BEARER_IP_FAMILY_NONE &&
++               ip_type != MM_BEARER_IP_FAMILY_ANY &&
++               ip_type != MM_BEARER_IP_FAMILY_IPV4V6) {
++        error = g_error_new (MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
++                             "Only the IPv4v6 initial attach PDP type is supported");
++    } else {
++        request = mm_mtk_mipc_apn_set_ia_request (mtk_soc_mipc_ps (self), MTK_SOC_TXID_SET_IA,
++                                                  apn, &error);
++    }
++    if (!request) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++
++    mm_obj_dbg (self, "setting the initial attach APN (MIPC APN_SET_IA_REQ, IPv4v6)");
++    mm_mtk_mipc_client_transact (self, request, MM_MTK_MIPC_APN_SET_IA_CNF,
++                                 mtk_soc_mipc_ps (self), MTK_SOC_TXID_SET_IA,
++                                 MTK_SOC_MIPC_TIMEOUT_MS,
++                                 (GAsyncReadyCallback) mipc_transact_ready, task);
++}
++
++static MMBearerProperties *
++load_initial_eps_bearer_settings_finish (MMIfaceModem3gpp  *self,
++                                         GAsyncResult      *res,
++                                         GError           **error)
++{
++    return g_task_propagate_pointer (G_TASK (res), error);
++}
++
++static void
++cgdcont_initial_ready (MMBaseModem  *self,
++                       GAsyncResult *res,
++                       GTask        *task)
++{
++    const gchar        *response;
++    GError             *error = NULL;
++    GList              *contexts;
++    GList              *l;
++    MMBearerProperties *properties = NULL;
++
++    response = mm_base_modem_at_command_finish (self, res, &error);
++    if (!response) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++    contexts = mm_3gpp_parse_cgdcont_read_response (response, &error);
++    for (l = contexts; l; l = g_list_next (l)) {
++        MM3gppPdpContext *pdp = l->data;
++
++        if (pdp->cid != 0)
++            continue;
++        properties = mm_bearer_properties_new ();
++        mm_bearer_properties_set_apn (properties, pdp->apn);
++        mm_bearer_properties_set_ip_type (properties, pdp->pdp_type);
++        break;
++    }
++    mm_3gpp_pdp_context_list_free (contexts);
++
++    if (properties) {
++        g_clear_error (&error);
++        g_task_return_pointer (task, properties, g_object_unref);
++    } else if (error) {
++        g_task_return_error (task, error);
++    } else {
++        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_NOT_FOUND,
++                                 "No initial attach APN (PDP context 0) is set");
++    }
++    g_object_unref (task);
++}
++
++static void
++load_initial_eps_bearer_settings (MMIfaceModem3gpp    *self,
++                                  GAsyncReadyCallback  callback,
++                                  gpointer             user_data)
++{
++    mm_base_modem_at_command (MM_BASE_MODEM (self), "+CGDCONT?", 5, FALSE,
++                              (GAsyncReadyCallback) cgdcont_initial_ready,
++                              g_task_new (self, NULL, callback, user_data));
++}
++
++static void
++iface_modem_3gpp_init (MMIfaceModem3gppInterface *iface)
++{
++    iface->set_initial_eps_bearer_settings = set_initial_eps_bearer_settings;
++    iface->set_initial_eps_bearer_settings_finish = set_initial_eps_bearer_settings_finish;
++    iface->load_initial_eps_bearer_settings = load_initial_eps_bearer_settings;
++    iface->load_initial_eps_bearer_settings_finish = load_initial_eps_bearer_settings_finish;
++    /* The parent's implementation relies on its own settings loader having
++     * probed the initial EPS bearer context id first (it asserts otherwise),
++     * which the loader above replaces; the attach status is not reported. */
++    iface->load_initial_eps_bearer = NULL;
++    iface->load_initial_eps_bearer_finish = NULL;
++}
++
+ static void
+ iface_modem_init (MMIfaceModemInterface *iface)
+ {
++    iface->load_supported_modes = load_supported_modes;
++    iface->load_supported_modes_finish = load_supported_modes_finish;
++    iface->load_current_modes = load_current_modes;
++    iface->load_current_modes_finish = load_current_modes_finish;
++    iface->set_current_modes = set_current_modes;
++    iface->set_current_modes_finish = set_current_modes_finish;
+     iface->load_access_technologies = load_access_technologies;
+     iface->load_access_technologies_finish = load_access_technologies_finish;
+     iface->load_sim_slots = load_sim_slots;
+diff --git a/src/plugins/mtk-soc/mm-mtk-mipc-client.c b/src/plugins/mtk-soc/mm-mtk-mipc-client.c
+new file mode 100644
+index 0000000..ab25137
+--- /dev/null
++++ b/src/plugins/mtk-soc/mm-mtk-mipc-client.c
+@@ -0,0 +1,245 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#include <config.h>
++
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <unistd.h>
++
++#include "mm-mtk-mipc.h"
++#include "mm-mtk-mipc-client.h"
++
++#define CLIENT_TXID_TEST   0x0e00
++#define CLIENT_TXID_OPEN   0x0e01
++#define CLIENT_TXID_CLOSE  0x0e02
++#define CLIENT_SETUP_TIMEOUT_MS 3000
++
++typedef struct {
++    GBytes  *request;
++    guint16  cnf_message_id;
++    guint8   ps;
++    guint16  transaction_id;
++    guint    timeout_ms;
++} TransactContext;
++
++static void
++transact_context_free (TransactContext *ctx)
++{
++    g_bytes_unref (ctx->request);
++    g_free (ctx);
++}
++
++static gboolean
++write_all (gint fd, GBytes *bytes, GError **error)
++{
++    const guint8 *data;
++    gsize         size;
++    gsize         offset = 0;
++
++    data = g_bytes_get_data (bytes, &size);
++    while (offset < size) {
++        ssize_t written;
++
++        written = write (fd, data + offset, size - offset);
++        if (written < 0 && errno == EINTR)
++            continue;
++        if (written < 0 && errno == EAGAIN) {
++            struct pollfd pfd = { .fd = fd, .events = POLLOUT };
++
++            if (poll (&pfd, 1, 1000) > 0)
++                continue;
++            g_set_error (error, MM_MTK_MIPC_ERROR, MM_MTK_MIPC_ERROR_TRUNCATED,
++                         "Timed out writing to %s", MM_MTK_MIPC_CONTROL_PORT);
++            return FALSE;
++        }
++        if (written <= 0) {
++            g_set_error (error, MM_MTK_MIPC_ERROR, MM_MTK_MIPC_ERROR_INVALID,
++                         "Couldn't write to %s: %s", MM_MTK_MIPC_CONTROL_PORT,
++                         written < 0 ? g_strerror (errno) : "short write");
++            return FALSE;
++        }
++        offset += (gsize) written;
++    }
++    return TRUE;
++}
++
++/* Waits for one frame; other frames (unsolicited messages) are dropped. */
++static gboolean
++wait_frame (gint            fd,
++            GByteArray     *buffer,
++            guint16         message_id,
++            guint8          ps,
++            guint16         transaction_id,
++            guint           timeout_ms,
++            MMMtkMipcFrame *frame,
++            GError        **error)
++{
++    gint64 deadline;
++
++    deadline = g_get_monotonic_time () + ((gint64) timeout_ms) * 1000;
++    while (TRUE) {
++        struct pollfd pfd = { .fd = fd, .events = POLLIN };
++        guint8        chunk[4096];
++        gint64        now;
++        ssize_t       n;
++
++        while (mm_mtk_mipc_stream_pop (buffer, frame)) {
++            if (frame->message_id == message_id && frame->ps == ps &&
++                frame->transaction_id == transaction_id)
++                return TRUE;
++            mm_mtk_mipc_frame_clear (frame);
++        }
++        now = g_get_monotonic_time ();
++        if (now >= deadline) {
++            g_set_error (error, MM_MTK_MIPC_ERROR, MM_MTK_MIPC_ERROR_TRUNCATED,
++                         "Timeout waiting for MIPC message 0x%04x (ps %u, txid 0x%04x)",
++                         message_id, ps, transaction_id);
++            return FALSE;
++        }
++        if (poll (&pfd, 1, (gint) MIN ((deadline - now) / 1000 + 1, (gint64) G_MAXINT)) < 0) {
++            if (errno == EINTR)
++                continue;
++            g_set_error (error, MM_MTK_MIPC_ERROR, MM_MTK_MIPC_ERROR_INVALID,
++                         "poll() on %s failed: %s", MM_MTK_MIPC_CONTROL_PORT, g_strerror (errno));
++            return FALSE;
++        }
++        if (pfd.revents & (POLLERR | POLLNVAL | POLLHUP)) {
++            g_set_error (error, MM_MTK_MIPC_ERROR, MM_MTK_MIPC_ERROR_INVALID,
++                         "MIPC port %s reported an error", MM_MTK_MIPC_CONTROL_PORT);
++            return FALSE;
++        }
++        if (!(pfd.revents & POLLIN))
++            continue;
++        n = read (fd, chunk, sizeof (chunk));
++        if (n < 0 && (errno == EINTR || errno == EAGAIN))
++            continue;
++        if (n <= 0) {
++            g_set_error (error, MM_MTK_MIPC_ERROR, MM_MTK_MIPC_ERROR_INVALID,
++                         "Couldn't read from %s: %s", MM_MTK_MIPC_CONTROL_PORT,
++                         n < 0 ? g_strerror (errno) : "closed");
++            return FALSE;
++        }
++        g_byte_array_append (buffer, chunk, (guint) n);
++    }
++}
++
++static gboolean
++exchange_result (gint         fd,
++                 GByteArray  *buffer,
++                 GBytes      *request,
++                 guint16      cnf_message_id,
++                 guint8       ps,
++                 guint16      transaction_id,
++                 guint        timeout_ms,
++                 GError     **error)
++{
++    MMMtkMipcFrame frame = { 0 };
++    guint32        result = 0;
++    gboolean       ok;
++
++    if (!write_all (fd, request, error) ||
++        !wait_frame (fd, buffer, cnf_message_id, ps, transaction_id, timeout_ms, &frame, error))
++        return FALSE;
++    ok = mm_mtk_mipc_find_u32_tlv (frame.payload, MM_MTK_MIPC_TLV_RESULT, &result, error);
++    mm_mtk_mipc_frame_clear (&frame);
++    if (ok && result != 0) {
++        g_set_error (error, MM_MTK_MIPC_ERROR, MM_MTK_MIPC_ERROR_INVALID,
++                     "MIPC message 0x%04x refused with result %u", cnf_message_id, result);
++        ok = FALSE;
++    }
++    return ok;
++}
++
++static void
++transact_thread (GTask        *task,
++                 gpointer      source_object,
++                 gpointer      task_data,
++                 GCancellable *cancellable)
++{
++    TransactContext       *ctx = task_data;
++    g_autoptr(GByteArray)  buffer = g_byte_array_new ();
++    g_autoptr(GBytes)      test = NULL;
++    g_autoptr(GBytes)      open_request = NULL;
++    g_autoptr(GBytes)      close_request = NULL;
++    GError                *error = NULL;
++    gboolean               opened = FALSE;
++    gint                   fd;
++
++    fd = open (MM_MTK_MIPC_CONTROL_PORT, O_RDWR | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
++    if (fd < 0) {
++        g_task_return_new_error (task, MM_MTK_MIPC_ERROR, MM_MTK_MIPC_ERROR_INVALID,
++                                 "Couldn't open %s: %s", MM_MTK_MIPC_CONTROL_PORT,
++                                 g_strerror (errno));
++        return;
++    }
++
++    /* TEST: liveness only, the result code is informational. */
++    test = mm_mtk_mipc_test_request (0xff, CLIENT_TXID_TEST);
++    if (write_all (fd, test, &error)) {
++        MMMtkMipcFrame frame = { 0 };
++
++        if (wait_frame (fd, buffer, MM_MTK_MIPC_TEST_CNF, 0xff, CLIENT_TXID_TEST,
++                        CLIENT_SETUP_TIMEOUT_MS, &frame, &error))
++            mm_mtk_mipc_frame_clear (&frame);
++    }
++    if (!error) {
++        open_request = mm_mtk_mipc_open_request (0xff, CLIENT_TXID_OPEN,
++                                                 MM_MTK_MIPC_CONTROL_PORT, &error);
++        if (open_request)
++            opened = exchange_result (fd, buffer, open_request, MM_MTK_MIPC_OPEN_CNF, 0xff,
++                                      CLIENT_TXID_OPEN, CLIENT_SETUP_TIMEOUT_MS, &error);
++    }
++    if (opened)
++        exchange_result (fd, buffer, ctx->request, ctx->cnf_message_id, ctx->ps,
++                         ctx->transaction_id, ctx->timeout_ms, &error);
++    if (opened) {
++        g_autoptr(GError) close_error = NULL;
++
++        /* CLOSE only removes this client; no confirmation is needed. */
++        close_request = mm_mtk_mipc_frame_build (MM_MTK_MIPC_CLOSE_REQ, 0xff,
++                                                CLIENT_TXID_CLOSE, NULL, 0);
++        if (!write_all (fd, close_request, &close_error))
++            g_debug ("mtk-soc: MIPC control client close failed: %s", close_error->message);
++    }
++    close (fd);
++
++    if (error)
++        g_task_return_error (task, error);
++    else
++        g_task_return_boolean (task, TRUE);
++}
++
++void
++mm_mtk_mipc_client_transact (gpointer             source_object,
++                             GBytes              *request,
++                             guint16              cnf_message_id,
++                             guint8               ps,
++                             guint16              transaction_id,
++                             guint                timeout_ms,
++                             GAsyncReadyCallback  callback,
++                             gpointer             user_data)
++{
++    TransactContext *ctx;
++    GTask           *task;
++
++    ctx = g_new0 (TransactContext, 1);
++    ctx->request = g_bytes_ref (request);
++    ctx->cnf_message_id = cnf_message_id;
++    ctx->ps = ps;
++    ctx->transaction_id = transaction_id;
++    ctx->timeout_ms = timeout_ms;
++
++    task = g_task_new (source_object, NULL, callback, user_data);
++    g_task_set_task_data (task, ctx, (GDestroyNotify) transact_context_free);
++    g_task_run_in_thread (task, transact_thread);
++    g_object_unref (task);
++}
++
++gboolean
++mm_mtk_mipc_client_transact_finish (gpointer       source_object,
++                                    GAsyncResult  *res,
++                                    GError       **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
+diff --git a/src/plugins/mtk-soc/mm-mtk-mipc-client.h b/src/plugins/mtk-soc/mm-mtk-mipc-client.h
+new file mode 100644
+index 0000000..dd4e5c1
+--- /dev/null
++++ b/src/plugins/mtk-soc/mm-mtk-mipc-client.h
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#ifndef MM_MTK_MIPC_CLIENT_H
++#define MM_MTK_MIPC_CLIENT_H
++
++#include <gio/gio.h>
++
++G_BEGIN_DECLS
++
++/* One-shot MIPC control transactions for the modem object.
++ *
++ * The data bearer keeps /dev/ttyCMIPC1 open while a call is up, so control
++ * requests use their own CCCI MIPC channel (/dev/ttyCMIPC2): open, TEST and
++ * OPEN handshake, one request, wait for its confirmation, CLOSE, close.  The
++ * blocking I/O runs in a GTask worker thread with poll() deadlines.  The
++ * result is the confirmation's result TLV (0x0000); a non-zero result is
++ * returned as an error. */
++
++#define MM_MTK_MIPC_CONTROL_PORT "/dev/ttyCMIPC2"
++
++/* Takes ownership of nothing: `request` is referenced for the operation. */
++void     mm_mtk_mipc_client_transact        (gpointer             source_object,
++                                             GBytes              *request,
++                                             guint16              cnf_message_id,
++                                             guint8               ps,
++                                             guint16              transaction_id,
++                                             guint                timeout_ms,
++                                             GAsyncReadyCallback  callback,
++                                             gpointer             user_data);
++gboolean mm_mtk_mipc_client_transact_finish (gpointer             source_object,
++                                             GAsyncResult        *res,
++                                             GError             **error);
++
++G_END_DECLS
++
++#endif
+diff --git a/src/plugins/mtk-soc/mm-mtk-mipc.c b/src/plugins/mtk-soc/mm-mtk-mipc.c
+index a571454..d196ad8 100644
+--- a/src/plugins/mtk-soc/mm-mtk-mipc.c
++++ b/src/plugins/mtk-soc/mm-mtk-mipc.c
+@@ -407,6 +407,56 @@ mm_mtk_mipc_data_act_request (guint8        ps,
+                                     payload->data, payload->len);
+ }
+ 
++GBytes *
++mm_mtk_mipc_apn_set_ia_request (guint8        ps,
++                                guint16       transaction_id,
++                                const gchar  *apn,
++                                GError      **error)
++{
++    g_autoptr(GByteArray) payload = NULL;
++    g_autofree guint8 *apn_value = NULL;
++    guint16 apn_len = 0;
++    const guint8 wildcard = '*';
++    guint8 byte;
++
++    g_return_val_if_fail (error == NULL || *error == NULL, NULL);
++    if (!apn) {
++        g_set_error_literal (error, MM_MTK_MIPC_ERROR, MM_MTK_MIPC_ERROR_INVALID,
++                             "MIPC APN must be given");
++        return NULL;
++    }
++    apn_value = c_string_value (apn, MM_MTK_MIPC_MAX_APN_LEN, "APN", &apn_len, error);
++    if (!apn_value)
++        return NULL;
++
++    payload = g_byte_array_new ();
++    /* Stock wire order; empty credentials are sent as "*" without a NUL. */
++    append_tlv (payload, 0x8106, &wildcard, 1);
++    append_tlv (payload, 0x0101, apn_value, apn_len);
++    byte = 3;
++    append_tlv (payload, 0x0102, &byte, 1);
++    append_tlv (payload, 0x0103, &byte, 1);
++    byte = 0;
++    append_tlv (payload, 0x0104, &byte, 1);
++    append_tlv (payload, 0x8105, &wildcard, 1);
++    return mm_mtk_mipc_frame_build (MM_MTK_MIPC_APN_SET_IA_REQ, ps, transaction_id,
++                                    payload->data, payload->len);
++}
++
++GBytes *
++mm_mtk_mipc_nw_set_rat_request (guint8  ps,
++                                guint16 transaction_id,
++                                guint8  mode,
++                                guint8  preference)
++{
++    g_autoptr(GByteArray) payload = g_byte_array_new ();
++
++    append_tlv (payload, 0x0100, &mode, 1);
++    append_tlv (payload, 0x0101, &preference, 1);
++    return mm_mtk_mipc_frame_build (MM_MTK_MIPC_NW_SET_RAT_REQ, ps, transaction_id,
++                                    payload->data, payload->len);
++}
++
+ GBytes *
+ mm_mtk_mipc_data_deact_request (guint8    ps,
+                                 guint16   transaction_id,
+diff --git a/src/plugins/mtk-soc/mm-mtk-mipc.h b/src/plugins/mtk-soc/mm-mtk-mipc.h
+index f819e40..65a9a52 100644
+--- a/src/plugins/mtk-soc/mm-mtk-mipc.h
++++ b/src/plugins/mtk-soc/mm-mtk-mipc.h
+@@ -21,6 +21,19 @@ G_BEGIN_DECLS
+ #define MM_MTK_MIPC_DATA_DEACT_CNF 0x0204
+ #define MM_MTK_MIPC_DATA_GET_CALL_LIST_REQ 0x020f
+ #define MM_MTK_MIPC_DATA_GET_CALL_LIST_CNF 0x0210
++/* Control messages observed from the stock RIL (2026-10-20 trace). */
++#define MM_MTK_MIPC_APN_SET_IA_REQ 0x0101
++#define MM_MTK_MIPC_APN_SET_IA_CNF 0x0102
++#define MM_MTK_MIPC_NW_SET_RAT_REQ 0x0427
++#define MM_MTK_MIPC_NW_SET_RAT_CNF 0x0428
++
++/* NW_SET_RAT_REQ values seen from the stock RIL and the modem (AT+ERAT):
++ * mode 3 / preference 0 is LTE only; mode 21 / preference 128 is the modem's
++ * own default (NR, LTE, 3G, 2G), with which it registers on NR SA. */
++#define MM_MTK_MIPC_RAT_MODE_LTE        3
++#define MM_MTK_MIPC_RAT_MODE_DEFAULT    21
++#define MM_MTK_MIPC_RAT_PREFER_NONE     0
++#define MM_MTK_MIPC_RAT_PREFER_DEFAULT  128
+ /* qqcandy: MIPC clients must explicitly subscribe to the INDs they want.  Without
+  * this the modem delivers no unsolicited message at all, so everything the
+  * firmware reports on its own (IMS state/VoPS/registration, network registration,
+@@ -161,6 +174,23 @@ GBytes *mm_mtk_mipc_data_act_request (guint8        ps,
+  * Does not carry a new APN profile or default-data credentials. */
+ GBytes *mm_mtk_mipc_data_ims_reuse_request (guint8 ps, guint16 transaction_id);
+ 
++/* Builds the APN_SET_IA_REQ (0x101) that sets the initial attach (initial
++ * EPS bearer) APN, in the stock RIL's wire order: tlv(0x8106 "*"),
++ * tlv(0x0101 APN), tlv(0x0102 PDP type), tlv(0x0103 roaming PDP type),
++ * tlv(0x0104 auth type 0), tlv(0x8105 "*").  Only what was observed is
++ * supported: IPv4v6 (PDP type 3) and no credentials. */
++GBytes *mm_mtk_mipc_apn_set_ia_request (guint8        ps,
++                                        guint16       transaction_id,
++                                        const gchar  *apn,
++                                        GError      **error);
++
++/* Builds the NW_SET_RAT_REQ (0x427): tlv(0x0100, u8 mode) and
++ * tlv(0x0101, u8 preference). */
++GBytes *mm_mtk_mipc_nw_set_rat_request (guint8  ps,
++                                        guint16 transaction_id,
++                                        guint8  mode,
++                                        guint8  preference);
++
+ /* Builds the DATA_DEACT_CALL_REQ (0x203): tlv(0x0101, u8 call_id) plus
+  * tlv(0x0102, u8 deact_reason). Both TLVs are 8-byte aligned by construction,
+  * which the modem's parser requires. */
+diff --git a/src/plugins/mtk-soc/test-mtk-mipc.c b/src/plugins/mtk-soc/test-mtk-mipc.c
+index f6b086e..b2142d9 100644
+--- a/src/plugins/mtk-soc/test-mtk-mipc.c
++++ b/src/plugins/mtk-soc/test-mtk-mipc.c
+@@ -592,6 +592,53 @@ test_empty_type0_filler (void)
+     g_assert_cmpuint (length, ==, 4);
+ }
+ 
++/* Frames as sent by the stock RIL (radio log of 2026-10-20). */
++static void
++assert_bytes_hex (GBytes *bytes, const gchar *hex)
++{
++    g_autofree gchar *actual = NULL;
++    const guint8 *data;
++    gsize size;
++    gsize i;
++
++    data = g_bytes_get_data (bytes, &size);
++    actual = g_malloc0 (size * 2 + 1);
++    for (i = 0; i < size; i++)
++        g_snprintf (actual + i * 2, 3, "%02X", data[i]);
++    g_assert_cmpstr (actual, ==, hex);
++}
++
++static void
++test_apn_set_ia_frame (void)
++{
++    g_autoptr(GBytes) frame = NULL;
++    g_autoptr(GError) error = NULL;
++
++    frame = mm_mtk_mipc_apn_set_ia_request (1, 0x0236, "3gnet", &error);
++    g_assert_no_error (error);
++    assert_bytes_hex (frame,
++                      "84195424000000000100010136023800"
++                      "068101002A000000"
++                      "0101060033676E657400000000000000"
++                      "0201010003000000"
++                      "0301010003000000"
++                      "0401010000000000"
++                      "058101002A000000");
++}
++
++static void
++test_nw_set_rat_frame (void)
++{
++    g_autoptr(GBytes) lte = NULL;
++    g_autoptr(GBytes) stock = NULL;
++
++    lte = mm_mtk_mipc_nw_set_rat_request (1, 0x0282, MM_MTK_MIPC_RAT_MODE_LTE,
++                                          MM_MTK_MIPC_RAT_PREFER_NONE);
++    assert_bytes_hex (lte, "8419542400000000010027048202100000010100030000000101010000000000");
++    stock = mm_mtk_mipc_nw_set_rat_request (1, 0x0242, 0x16, 0x80);
++    assert_bytes_hex (stock, "8419542400000000010027044202100000010100160000000101010080000000");
++}
++
+ int
+ main (int argc, char **argv)
+ {
+@@ -615,5 +662,7 @@ main (int argc, char **argv)
+     g_test_add_func ("/mipc/spi-free", test_spi_free);
+     g_test_add_func ("/mipc/spi-alloc-ipv6", test_spi_alloc_ipv6);
+     g_test_add_func ("/mipc/spi-invalid", test_spi_invalid);
++    g_test_add_func ("/MM/mtk-soc/mipc/apn-set-ia-frame", test_apn_set_ia_frame);
++    g_test_add_func ("/MM/mtk-soc/mipc/nw-set-rat-frame", test_nw_set_rat_frame);
+     return g_test_run ();
+ }
+-- 
+2.55.0
+

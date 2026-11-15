@@ -1,0 +1,1189 @@
+From e4e0e66e9d60166d530b2080f968d3999d3bab8f Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 16:21:30 +0800
+Subject: [PATCH] drm/mediatek: transfer inherited MT6897 DMA power ownership
+
+An IOMMU probe reference keeps the M4U powered but does not own the larbs
+or OVL clocks. The translated handover can release its temporary OVL/larb
+references before the first CRTC takes persistent references, leaving live
+bootloader scanout without a complete owner.
+
+Add a built-in independent boot owner that acquires both physical larb
+paths and the clock of every represented OVL before component registration.
+Require the GCE managed resume and synchronous suspend qualification before
+acknowledging either fabric guard. A failed STOP restores its consumed PM
+reference and retains the quarantine; another normal GCE user keeps its own
+reference. Require built-in GCE and runtime PM for this contract.
+
+Validate the complete engine set and the source-defined non-fetching state
+of OVL7 and POSTMASKs before acknowledging both initial IOMMU guards.
+Acquisition failure retains only resources actually acquired; a failure
+before any acquisition remains retryable. Component probe/bind errors do
+not destroy inherited leases.
+
+Transfer each active engine lease only after successful full CRTC setup
+or the normal stop sequence while ordinary PM/clock references are held.
+The existing last-user larb sleep acknowledgment remains the DMA drain
+boundary and preserves upstream references on failure. Keep the helper
+built in, with manual unbind disabled, so quarantined state survives DRM
+component failure and cannot disappear with a removable DRM module.
+
+Give firmware-bank initialization its own balanced PM reference and expose
+an idempotent, provider-locked boot-guard acknowledgment API. Add address-mode
+independent OVL supplier links, preserving existing translated attachments.
+
+The register predicates and OVL3 larb1/larb0 mapping follow the pinned
+MediaTek mtk_disp_ovl.c, mtk_disp_postmask.c and mt6897.dts sources.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/gpu/drm/mediatek/Kconfig              |  11 +
+ drivers/gpu/drm/mediatek/Makefile             |   2 +
+ drivers/gpu/drm/mediatek/mtk_crtc.c           |   8 +
+ drivers/gpu/drm/mediatek/mtk_ddp_comp.c       |   1 +
+ drivers/gpu/drm/mediatek/mtk_ddp_comp.h       |   7 +
+ drivers/gpu/drm/mediatek/mtk_disp_boot.c      | 411 ++++++++++++++++++
+ drivers/gpu/drm/mediatek/mtk_disp_boot.h      |  20 +
+ drivers/gpu/drm/mediatek/mtk_disp_drv.h       |   1 +
+ drivers/gpu/drm/mediatek/mtk_disp_ovl.c       |  28 ++
+ drivers/iommu/mtk_iommu.c                     |  60 ++-
+ drivers/memory/mtk-smi.c                      |   9 +
+ include/soc/mediatek/mtk_iommu.h              |  14 +
+ include/soc/mediatek/smi.h                    |  10 +
+ tools/testing/selftests/mtk_display/Makefile  |   3 +
+ .../mtk_display/test_boot_ownership.py        | 190 ++++++++
+ .../selftests/mtk_display/test_iommu_guard.py |  74 ++++
+ .../selftests/mtk_vcp/test_smi_suppliers.py   |   5 +-
+ 17 files changed, 841 insertions(+), 13 deletions(-)
+ create mode 100644 drivers/gpu/drm/mediatek/mtk_disp_boot.c
+ create mode 100644 drivers/gpu/drm/mediatek/mtk_disp_boot.h
+ create mode 100644 include/soc/mediatek/mtk_iommu.h
+ create mode 100644 tools/testing/selftests/mtk_display/Makefile
+ create mode 100755 tools/testing/selftests/mtk_display/test_boot_ownership.py
+ create mode 100755 tools/testing/selftests/mtk_display/test_iommu_guard.py
+
+diff --git a/drivers/gpu/drm/mediatek/Kconfig b/drivers/gpu/drm/mediatek/Kconfig
+index 26523950c4..f83f5e9cd5 100644
+--- a/drivers/gpu/drm/mediatek/Kconfig
++++ b/drivers/gpu/drm/mediatek/Kconfig
+@@ -21,6 +21,17 @@ config DRM_MEDIATEK
+ 	  This driver provides kernel mode setting and
+ 	  buffer management to userspace.
+ 
++config DRM_MEDIATEK_MT6897_BOOT_HANDOVER
++	bool "MT6897 inherited display DMA ownership"
++	depends on PM && DRM_MEDIATEK=y && MTK_IOMMU=y && MTK_SMI=y
++	depends on MTK_CMDQ_MBOX=y
++	default y if ARCH_MEDIATEK
++	help
++	  Keep inherited display DMA owned independently of component binding.
++	  The static platform provider is built in so a quarantined boot lease
++	  cannot disappear with a removable DRM module. Device-tree consumers
++	  must describe both physical SMI paths and all inherited engines.
++
+ config DRM_MEDIATEK_DP
+ 	tristate "DRM DPTX Support for MediaTek SoCs"
+ 	depends on DRM_MEDIATEK
+diff --git a/drivers/gpu/drm/mediatek/Makefile b/drivers/gpu/drm/mediatek/Makefile
+index f1a75b4ffc..0d4f30f080 100644
+--- a/drivers/gpu/drm/mediatek/Makefile
++++ b/drivers/gpu/drm/mediatek/Makefile
+@@ -40,3 +40,5 @@ obj-$(CONFIG_DRM_MEDIATEK_HDMI_V2) += mtk_hdmi_ddc_v2.o
+ obj-$(CONFIG_DRM_MEDIATEK_DP) += mtk_dp.o
+ 
+ obj-$(CONFIG_DRM_MEDIATEK_MT6897_VA_BOOTSTRAP) += mtk_disp_va.o
++
++obj-$(CONFIG_DRM_MEDIATEK_MT6897_BOOT_HANDOVER) += mtk_disp_boot.o
+diff --git a/drivers/gpu/drm/mediatek/mtk_crtc.c b/drivers/gpu/drm/mediatek/mtk_crtc.c
+index 1e8274571b..c831f76516 100644
+--- a/drivers/gpu/drm/mediatek/mtk_crtc.c
++++ b/drivers/gpu/drm/mediatek/mtk_crtc.c
+@@ -713,6 +713,14 @@ static int mtk_crtc_ddp_hw_init(struct mtk_crtc *mtk_crtc)
+ 		mtk_crtc_config_layer(mtk_crtc, plane_state, i, NULL);
+ 	}
+ 
++	/* All failure exits precede this point. The complete CRTC owns its
++	 * component clocks/PM, so inherited leases can transfer without a gap.
++	 */
++	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++)
++		mtk_ddp_comp_boot_handover(mtk_crtc->ddp_comp[i]);
++	for (i = 0; i < mtk_crtc->shadow_comp_nr; i++)
++		mtk_ddp_comp_boot_handover(mtk_crtc->shadow_comp[i]);
++
+ 	return 0;
+ 
+ err_clk_disable:
+diff --git a/drivers/gpu/drm/mediatek/mtk_ddp_comp.c b/drivers/gpu/drm/mediatek/mtk_ddp_comp.c
+index fe37902cfd..cebdd93520 100644
+--- a/drivers/gpu/drm/mediatek/mtk_ddp_comp.c
++++ b/drivers/gpu/drm/mediatek/mtk_ddp_comp.c
+@@ -554,6 +554,7 @@ static const struct mtk_ddp_comp_funcs ddp_ovl = {
+ 	.config = mtk_ovl_config,
+ 	.start = mtk_ovl_start,
+ 	.stop = mtk_ovl_stop,
++	.boot_handover = mtk_ovl_boot_handover,
+ 	.register_vblank_cb = mtk_ovl_register_vblank_cb,
+ 	.unregister_vblank_cb = mtk_ovl_unregister_vblank_cb,
+ 	.enable_vblank = mtk_ovl_enable_vblank,
+diff --git a/drivers/gpu/drm/mediatek/mtk_ddp_comp.h b/drivers/gpu/drm/mediatek/mtk_ddp_comp.h
+index db853e001f..8ad776dee1 100644
+--- a/drivers/gpu/drm/mediatek/mtk_ddp_comp.h
++++ b/drivers/gpu/drm/mediatek/mtk_ddp_comp.h
+@@ -45,6 +45,7 @@ struct mtk_ddp_comp_funcs {
+ 	void (*dsc_setup)(struct device *dev, struct drm_dsc_config *dsc);
+ 	void (*start)(struct device *dev);
+ 	void (*stop)(struct device *dev);
++	void (*boot_handover)(struct device *dev);
+ 	void (*register_vblank_cb)(struct device *dev,
+ 				   void (*vblank_cb)(void *),
+ 				   void *vblank_cb_data);
+@@ -166,6 +167,12 @@ static inline void mtk_ddp_comp_stop(struct mtk_ddp_comp *comp)
+ 		comp->funcs->stop(comp->dev);
+ }
+ 
++static inline void mtk_ddp_comp_boot_handover(struct mtk_ddp_comp *comp)
++{
++	if (comp->funcs && comp->funcs->boot_handover)
++		comp->funcs->boot_handover(comp->dev);
++}
++
+ static inline void mtk_ddp_comp_register_vblank_cb(struct mtk_ddp_comp *comp,
+ 						   void (*vblank_cb)(void *),
+ 						   void *vblank_cb_data)
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_boot.c b/drivers/gpu/drm/mediatek/mtk_disp_boot.c
+new file mode 100644
+index 0000000000..9a2cbd7bb8
+--- /dev/null
++++ b/drivers/gpu/drm/mediatek/mtk_disp_boot.c
+@@ -0,0 +1,411 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Independent owner of inherited MT6897 display DMA. Registers/port mapping:
++ * https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6
++ * mediatek_v2/mtk_disp_ovl.c, mtk_disp_postmask.c and mt6897.dts.
++ * This driver is built in, never part of the removable DRM module. A failed
++ * acquisition or unsupported live engine retains its acquired resources.
++ */
++#include <linux/clk.h>
++#include <linux/io.h>
++#include <linux/mutex.h>
++#include <linux/of_address.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <soc/mediatek/mtk_iommu.h>
++
++#include "mtk_disp_boot.h"
++
++#define MTK_BOOT_ENGINES 8
++#define MTK_BOOT_PATHS 2
++
++struct mtk_boot_engine {
++	struct device_node *node;
++	void __iomem *regs;
++	struct clk *clk;
++	struct device *paths[MTK_BOOT_PATHS];
++	unsigned int held_paths;
++	bool clock_held, active;
++};
++
++struct mtk_disp_boot {
++	struct device *dev;
++	struct mutex lock; /* Serialize acquisition and per-engine transfer. */
++	struct mtk_boot_engine engines[MTK_BOOT_ENGINES];
++	unsigned int num_engines;
++	struct device *iommus[MTK_BOOT_PATHS];
++	struct device *gce;
++	bool gce_held;
++	void __iomem *unowned_ovl, *postmasks[2];
++	struct clk_bulk_data *clocks;
++	int num_clocks;
++	bool power_held, clocks_held, attempted, ready;
++	int error;
++};
++
++static void mtk_boot_put_device(void *dev)
++{
++	put_device(dev);
++}
++
++static void mtk_boot_put_node(void *node)
++{
++	of_node_put(node);
++}
++
++static void mtk_boot_put_clock(void *clock)
++{
++	clk_put(clock);
++}
++
++static int mtk_boot_resolve(struct device *dev, struct device_node *node,
++			    struct device **result)
++{
++	struct platform_device *pdev;
++	int ret;
++
++	if (!node)
++		return -EINVAL;
++	pdev = of_find_device_by_node(node);
++	if (!pdev)
++		return -EPROBE_DEFER;
++	if (!device_is_bound(&pdev->dev)) {
++		put_device(&pdev->dev);
++		return -EPROBE_DEFER;
++	}
++	*result = &pdev->dev;
++	ret = devm_add_action_or_reset(dev, mtk_boot_put_device, *result);
++	return ret;
++}
++
++static void mtk_boot_engine_release(struct mtk_boot_engine *engine)
++{
++	if (engine->clock_held) {
++		clk_disable_unprepare(engine->clk);
++		engine->clock_held = false;
++	}
++	/* Last-user larb suspend drains through SLP_PROT_RDY. A failed drain
++	 * keeps its clocks and upstream supplier references in the PM core.
++	 * Clearing OVL EN alone is not a DMA-drain assertion.
++	 */
++	while (engine->held_paths)
++		pm_runtime_put(engine->paths[--engine->held_paths]);
++}
++
++/* Same non-fetching POSTMASK predicates as the VA preflight. These are not a
++ * generic outstanding-DMA counter; unknown enabled state must retain power.
++ */
++static int mtk_boot_check_postmask(void __iomem *base)
++{
++	u32 en = readl(base), cfg = readl(base + 0x20);
++
++	if ((en & BIT(0)) && !(readl(base + 0x24) & (BIT(1) | BIT(2))))
++		return -EINVAL;
++	if ((en & BIT(0)) && !(cfg & BIT(0)) && (cfg & BIT(1)))
++		return -EINVAL;
++	return 0;
++}
++
++static int mtk_boot_acquire(struct mtk_disp_boot *boot)
++{
++	unsigned int i, j;
++	int ret;
++
++	if (boot->attempted)
++		return boot->error;
++	ret = pm_runtime_resume_and_get(boot->dev);
++	if (ret < 0)
++		return ret; /* No acquired lease: ordinary probe deferral may retry. */
++	boot->attempted = true;
++	boot->power_held = true;
++	for (i = 0; i < boot->num_engines; i++) {
++		struct mtk_boot_engine *engine = &boot->engines[i];
++
++		for (j = 0; j < MTK_BOOT_PATHS; j++) {
++			ret = pm_runtime_resume_and_get(engine->paths[j]);
++			if (ret < 0)
++				goto quarantine;
++			engine->held_paths++;
++		}
++		ret = clk_prepare_enable(engine->clk);
++		if (ret)
++			goto quarantine;
++		engine->clock_held = true;
++		engine->active = readl(engine->regs + 0xc) & BIT(0);
++	}
++	/* Both OVL and DIS domains are now owned through the larb chains. */
++	ret = clk_bulk_prepare_enable(boot->num_clocks, boot->clocks);
++	if (ret)
++		goto quarantine;
++	boot->clocks_held = true;
++	/* Probe/RPM_SUSPENDED does not establish that inherited GCE threads
++	 * stopped. Managed resume first validates/takes firmware ownership.
++	 */
++	ret = pm_runtime_resume_and_get(boot->gce);
++	if (ret < 0)
++		goto quarantine;
++	boot->gce_held = true;
++	/* OVL7 has no normal component owner. Its disabled EN predicate and
++	 * the POSTMASK checks are inherited from the source-verified preflight.
++	 */
++	if (readl(boot->unowned_ovl + 0xc) & BIT(0)) {
++		ret = -EBUSY;
++		goto quarantine;
++	}
++	for (i = 0; i < ARRAY_SIZE(boot->postmasks); i++) {
++		ret = mtk_boot_check_postmask(boot->postmasks[i]);
++		if (ret)
++			goto quarantine;
++	}
++	/* Force the existing verified STOP path when this is the last user.
++	 * Another normal runtime user may instead retain GCE ownership.
++	 * The put consumes our usage reference even if suspend fails.
++	 */
++	ret = pm_runtime_put_sync_suspend(boot->gce);
++	if (ret < 0) {
++		pm_runtime_get_noresume(boot->gce);
++		goto quarantine;
++	}
++	boot->gce_held = false;
++	/* Every possible fetch now has an independent owner. The references
++	 * resolved at probe keep both providers alive across a partial ack.
++	 * Failed/partial acknowledgment retains all engine/fabric leases.
++	 */
++	for (i = 0; i < MTK_BOOT_PATHS; i++) {
++		ret = mtk_iommu_release_boot_guard(boot->iommus[i]);
++		if (ret)
++			goto quarantine;
++	}
++	boot->ready = true;
++	/* Disable borrowed read clocks while all OVL/DIS supplier domains are
++	 * still owned. Only then may an inactive engine drop its last path.
++	 */
++	clk_bulk_disable_unprepare(boot->num_clocks, boot->clocks);
++	boot->clocks_held = false;
++	pm_runtime_put(boot->dev);
++	boot->power_held = false;
++	for (i = 0; i < boot->num_engines; i++)
++		if (!boot->engines[i].active)
++			mtk_boot_engine_release(&boot->engines[i]);
++	dev_info(boot->dev, "inherited DMA covered; initial IOMMU guards retired\n");
++	return 0;
++quarantine:
++	boot->error = ret;
++	dev_err(boot->dev, "boot DMA ownership failed (%d); acquired resources retained\n", ret);
++	return ret;
++}
++
++static struct platform_device *mtk_boot_find(struct device *consumer)
++{
++	struct device_node *node;
++	struct platform_device *pdev;
++
++	if (!of_property_present(consumer->of_node, "mediatek,boot-handover"))
++		return NULL;
++	node = of_parse_phandle(consumer->of_node, "mediatek,boot-handover", 0);
++	if (!node)
++		return ERR_PTR(-EINVAL);
++	if (!of_device_is_compatible(node, "mediatek,mt6897-display-boot-state")) {
++		of_node_put(node);
++		return ERR_PTR(-EINVAL);
++	}
++	pdev = of_find_device_by_node(node);
++	of_node_put(node);
++	return pdev ?: ERR_PTR(-EPROBE_DEFER);
++}
++
++int mtk_disp_boot_ready(struct device *consumer)
++{
++	struct platform_device *pdev = mtk_boot_find(consumer);
++	struct mtk_disp_boot *boot;
++	int ret;
++
++	if (IS_ERR_OR_NULL(pdev))
++		return PTR_ERR_OR_ZERO(pdev);
++	/* This independent provider is built in with manual unbind disabled.
++	 * Probe completes before it publishes ownership to OVL components.
++	 */
++	if (!device_is_bound(&pdev->dev)) {
++		ret = -EPROBE_DEFER;
++		goto put;
++	}
++	boot = platform_get_drvdata(pdev);
++	mutex_lock(&boot->lock);
++	ret = mtk_boot_acquire(boot);
++	mutex_unlock(&boot->lock);
++put:
++	put_device(&pdev->dev);
++	return ret;
++}
++
++static void mtk_boot_transfer_engine(struct mtk_disp_boot *boot,
++				     struct device_node *node)
++{
++	unsigned int i;
++
++	if (!boot->ready)
++		return;
++	for (i = 0; i < boot->num_engines; i++) {
++		if (boot->engines[i].node != node)
++			continue;
++		mtk_boot_engine_release(&boot->engines[i]);
++		boot->engines[i].active = false;
++		break;
++	}
++}
++
++/* Called only with normal OVL runtime/clock ownership already established,
++ * after successful full CRTC setup or its stop sequence, including its twin.
++ */
++void mtk_disp_boot_transfer(struct device *consumer)
++{
++	struct platform_device *pdev = mtk_boot_find(consumer);
++	struct mtk_disp_boot *boot;
++
++	if (IS_ERR_OR_NULL(pdev))
++		return;
++	boot = platform_get_drvdata(pdev);
++	if (!boot)
++		goto put;
++	mutex_lock(&boot->lock);
++	mtk_boot_transfer_engine(boot, consumer->of_node);
++	mutex_unlock(&boot->lock);
++put:
++	put_device(&pdev->dev);
++}
++
++static int mtk_disp_boot_probe(struct platform_device *pdev)
++{
++	/* Register windows from the pinned MT6897 vendor DT, not port guesses. */
++	static const resource_size_t engine_windows[] = {
++		0x14402000, 0x14403000, 0x14404000, 0x14405000,
++		0x14602000, 0x14603000, 0x14604000,
++	};
++	static const resource_size_t check_windows[] = {
++		0x14605000, 0x14015000, 0x14215000,
++	};
++	static const char *const registers[] = { "unowned-ovl", "postmask0", "postmask1" };
++	struct device *dev = &pdev->dev;
++	struct mtk_disp_boot *boot;
++	struct device_node *node, *supplier;
++	void __iomem *maps[3];
++	struct resource resource;
++	int count, ret, i, j;
++
++	boot = devm_kzalloc(dev, sizeof(*boot), GFP_KERNEL);
++	if (!boot)
++		return -ENOMEM;
++	boot->dev = dev;
++	mutex_init(&boot->lock);
++	boot->num_clocks = devm_clk_bulk_get_all(dev, &boot->clocks);
++	if (boot->num_clocks != 3)
++		return boot->num_clocks < 0 ? boot->num_clocks : -EINVAL;
++	for (i = 0; i < ARRAY_SIZE(maps); i++) {
++		struct resource *res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
++								registers[i]);
++		if (!res || res->start != check_windows[i] || resource_size(res) < 0x1000)
++			return -EINVAL;
++		/* VA preflight also borrows read-only mappings of these windows. */
++		maps[i] = devm_ioremap(dev, res->start, 0x1000);
++		if (!maps[i])
++			return -ENOMEM;
++	}
++	boot->unowned_ovl = maps[0];
++	boot->postmasks[0] = maps[1];
++	boot->postmasks[1] = maps[2];
++	count = of_count_phandle_with_args(dev->of_node, "mediatek,iommus", NULL);
++	if (count != MTK_BOOT_PATHS)
++		return -EINVAL;
++	for (i = 0; i < count; i++) {
++		node = of_parse_phandle(dev->of_node, "mediatek,iommus", i);
++		ret = mtk_boot_resolve(dev, node, &boot->iommus[i]);
++		of_node_put(node);
++		if (ret)
++			return ret;
++	}
++	node = of_parse_phandle(dev->of_node, "mediatek,gce", 0);
++	if (!node)
++		return -EINVAL;
++	if (!of_device_is_compatible(node, "mediatek,mt6897-gce") ||
++	    of_address_to_resource(node, 0, &resource) ||
++	    resource.start != 0x1e980000) {
++		of_node_put(node);
++		return -EINVAL;
++	}
++	ret = mtk_boot_resolve(dev, node, &boot->gce);
++	of_node_put(node);
++	if (ret)
++		return ret;
++	count = of_count_phandle_with_args(dev->of_node, "mediatek,engines", NULL);
++	if (count != ARRAY_SIZE(engine_windows))
++		return -EINVAL;
++	boot->num_engines = count;
++	for (i = 0; i < count; i++) {
++		struct mtk_boot_engine *engine = &boot->engines[i];
++
++		node = of_parse_phandle(dev->of_node, "mediatek,engines", i);
++		if (!node)
++			return -EINVAL;
++		if (of_address_to_resource(node, 0, &resource) ||
++		    resource.start != engine_windows[i] ||
++		    resource_size(&resource) < 0x1000) {
++			of_node_put(node);
++			return -EINVAL;
++		}
++		engine->node = node;
++		ret = devm_add_action_or_reset(dev, mtk_boot_put_node, node);
++		if (ret)
++			return ret;
++		engine->regs = devm_ioremap(dev, resource.start, 0x1000);
++		if (!engine->regs)
++			return -ENOMEM;
++		engine->clk = of_clk_get(node, 0);
++		if (IS_ERR(engine->clk))
++			return PTR_ERR(engine->clk);
++		ret = devm_add_action_or_reset(dev, mtk_boot_put_clock, engine->clk);
++		if (ret)
++			return ret;
++		if (of_count_phandle_with_args(node, "mediatek,smi", NULL) != MTK_BOOT_PATHS)
++			return -EINVAL;
++		for (j = 0; j < MTK_BOOT_PATHS; j++) {
++			resource_size_t first = i < 4 ? 0x1440c000 : 0x1460c000;
++			struct resource path_resource;
++
++			supplier = of_parse_phandle(node, "mediatek,smi", j);
++			if (!supplier ||
++			    !of_device_is_compatible(supplier, "mediatek,mt6897-smi-larb") ||
++			    of_address_to_resource(supplier, 0, &path_resource) ||
++			    (path_resource.start != first &&
++			     path_resource.start != first + 0x1000)) {
++				of_node_put(supplier);
++				return -EINVAL;
++			}
++			ret = mtk_boot_resolve(dev, supplier, &engine->paths[j]);
++			of_node_put(supplier);
++			if (ret)
++				return ret;
++		}
++		if (engine->paths[0] == engine->paths[1])
++			return -EINVAL;
++	}
++	if (boot->iommus[0] == boot->iommus[1])
++		return -EINVAL;
++	platform_set_drvdata(pdev, boot);
++	pm_runtime_enable(dev);
++	return 0;
++}
++
++static const struct of_device_id mtk_boot_of_match[] = {
++	{ .compatible = "mediatek,mt6897-display-boot-state" },
++	{ }
++};
++
++static struct platform_driver mtk_disp_boot_driver = {
++	.probe = mtk_disp_boot_probe,
++	.driver = {
++		.name = "mt6897-display-boot-state",
++		.of_match_table = mtk_boot_of_match,
++		.suppress_bind_attrs = true,
++	},
++};
++builtin_platform_driver(mtk_disp_boot_driver);
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_boot.h b/drivers/gpu/drm/mediatek/mtk_disp_boot.h
+new file mode 100644
+index 0000000000..559f56612d
+--- /dev/null
++++ b/drivers/gpu/drm/mediatek/mtk_disp_boot.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __MTK_DISP_BOOT_H
++#define __MTK_DISP_BOOT_H
++#include <linux/device.h>
++#include <linux/errno.h>
++#include <linux/of.h>
++/* The inherited owner is independent of DRM component/module teardown. */
++#if IS_BUILTIN(CONFIG_DRM_MEDIATEK_MT6897_BOOT_HANDOVER)
++int mtk_disp_boot_ready(struct device *consumer);
++void mtk_disp_boot_transfer(struct device *consumer);
++#else
++static inline int mtk_disp_boot_ready(struct device *consumer)
++{
++	return of_property_present(consumer->of_node, "mediatek,boot-handover") ?
++		-ENODEV : 0;
++}
++
++static inline void mtk_disp_boot_transfer(struct device *consumer) { }
++#endif
++#endif
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_drv.h b/drivers/gpu/drm/mediatek/mtk_disp_drv.h
+index 39b0cc13f5..384b4b0754 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_drv.h
++++ b/drivers/gpu/drm/mediatek/mtk_disp_drv.h
+@@ -167,6 +167,7 @@ void mtk_ovl_layer_off(struct device *dev, unsigned int idx,
+ 		       struct cmdq_pkt *cmdq_pkt);
+ void mtk_ovl_start(struct device *dev);
+ struct device *mtk_ovl_get_twin(struct device *dev);
++void mtk_ovl_boot_handover(struct device *dev);
+ void mtk_ovl_stop(struct device *dev);
+ unsigned int mtk_ovl_supported_rotations(struct device *dev);
+ void mtk_ovl_register_vblank_cb(struct device *dev,
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_ovl.c b/drivers/gpu/drm/mediatek/mtk_disp_ovl.c
+index 18cca834ac..5c224114fa 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_ovl.c
++++ b/drivers/gpu/drm/mediatek/mtk_disp_ovl.c
+@@ -20,6 +20,8 @@
+ #include "mtk_ddp_comp.h"
+ #include "mtk_disp_drv.h"
+ #include "mtk_disp_ovl.h"
++#include "mtk_disp_boot.h"
++#include <soc/mediatek/smi.h>
+ #include "mtk_drm_drv.h"
+ 
+ #define DISP_REG_OVL_INTEN			0x0004
+@@ -386,6 +388,7 @@ void mtk_ovl_stop(struct device *dev)
+ 	if (twin)
+ 		mtk_ovl_stop_one(twin);
+ 	mtk_ovl_stop_one(ovl);
++	mtk_ovl_boot_handover(dev);
+ }
+ 
+ static void mtk_ovl_start_one(struct mtk_disp_ovl *ovl)
+@@ -413,6 +416,8 @@ static void mtk_ovl_stop_one(struct mtk_disp_ovl *ovl)
+ 			       ovl->regs + DISP_REG_OVL_EN);
+ 	else
+ 		writel_relaxed(0x0, ovl->regs + DISP_REG_OVL_EN);
++	/* Flush stop before clocks/PM may be released; this is not an idle poll. */
++	readl(ovl->regs + DISP_REG_OVL_EN);
+ 	if (ovl->data->smi_id_en) {
+ 		unsigned int reg;
+ 
+@@ -898,6 +903,16 @@ static const struct component_ops mtk_disp_ovl_component_ops = {
+ 	.unbind = mtk_disp_ovl_unbind,
+ };
+ 
++void mtk_ovl_boot_handover(struct device *dev)
++{
++	struct mtk_disp_ovl *ovl = dev_get_drvdata(dev);
++	struct mtk_disp_ovl *twin = mtk_ovl_twin(ovl);
++
++	mtk_disp_boot_transfer(dev);
++	if (twin)
++		mtk_disp_boot_transfer(ovl->twin);
++}
++
+ static int mtk_disp_ovl_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -905,6 +920,19 @@ static int mtk_disp_ovl_probe(struct platform_device *pdev)
+ 	int irq;
+ 	int ret;
+ 
++	/* Resolve/acquire the independent inherited owner before component_add
++	 * can synchronously bind DRM and fail this probe. No boot lease is
++	 * stored in this component's devm resources.
++	 */
++	ret = mtk_disp_boot_ready(dev);
++	if (ret)
++		return dev_err_probe(dev, ret, "display boot owner unavailable\n");
++	if (of_property_present(dev->of_node, "mediatek,smi")) {
++		ret = mtk_smi_link_suppliers(dev);
++		if (ret)
++			return dev_err_probe(dev, ret, "physical DMA suppliers unavailable\n");
++	}
++
+ 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+ 	if (!priv)
+ 		return -ENOMEM;
+diff --git a/drivers/iommu/mtk_iommu.c b/drivers/iommu/mtk_iommu.c
+index b804720410..bda799e51d 100644
+--- a/drivers/iommu/mtk_iommu.c
++++ b/drivers/iommu/mtk_iommu.c
+@@ -32,6 +32,7 @@
+ #include <linux/string_choices.h>
+ #include <asm/barrier.h>
+ #include <soc/mediatek/smi.h>
++#include <soc/mediatek/mtk_iommu.h>
+ 
+ #include "dma-iommu.h"
+ 
+@@ -153,13 +154,10 @@
+ #define DL_WITH_MULTI_LARB		BIT(21)
+ /* The hypervisor may shadow the page table (MT6897 GenieZone type2). */
+ #define HYP_PGTABLE_TYPE2		BIT(22)
+-/*
+- * Keep the M4U runtime-active from probe (MT6897 workaround): the display
+- * masters fetch physical addresses, but their traffic still passes through
+- * the M4U, which therefore must not runtime-suspend even when no
+- * translated client holds it.
++/* Protect inherited DMA until an independent display boot owner explicitly
++ * acknowledges its complete supplier coverage. Normal consumers then own PM.
+  */
+-#define PM_HOLD_FROM_PROBE		BIT(23)
++#define BOOT_DMA_GUARD		BIT(23)
+ 
+ #define MTK_IOMMU_HAS_FLAG_MASK(pdata, _x, mask)	\
+ 				((((pdata)->flags) & (mask)) == (_x))
+@@ -320,6 +318,7 @@ struct mtk_iommu_data {
+ 	 * publishes the table are collected and synchronised at publication.
+ 	 */
+ 	bool				pm_held;
++	struct mutex			boot_guard_lock; /* Boot-reference transfer. */
+ 	bool				hyp_type2;
+ 	bool				hyp_published;
+ 	bool				hyp_pending;
+@@ -1782,6 +1781,7 @@ static int mtk_iommu_probe(struct platform_device *pdev)
+ 
+ 	platform_set_drvdata(pdev, data);
+ 	mutex_init(&data->mutex);
++	mutex_init(&data->boot_guard_lock);
+ 	spin_lock_init(&data->hyp_lock);
+ 
+ 	if (MTK_IOMMU_HAS_FLAG(data->plat_data, SHARE_PGTABLE)) {
+@@ -1797,7 +1797,7 @@ static int mtk_iommu_probe(struct platform_device *pdev)
+ 	 * Before registration: registering attaches the existing clients and
+ 	 * publishes the page table, so bank 0 must not suspend from then on.
+ 	 */
+-	if (MTK_IOMMU_HAS_FLAG(data->plat_data, PM_HOLD_FROM_PROBE)) {
++	if (MTK_IOMMU_HAS_FLAG(data->plat_data, BOOT_DMA_GUARD)) {
+ 		ret = pm_runtime_resume_and_get(dev);
+ 		if (ret)
+ 			goto out_list_del;
+@@ -1805,10 +1805,15 @@ static int mtk_iommu_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	if (data->plat_data->firmware_banks) {
+-		/* The held PM vote precedes client registration and first normal
+-		 * bank attachment. Initialize firmware contexts exactly once. */
++		/* Firmware initialization owns a separate reference. The boot DMA
++		 * guard must not be its implicit power-management prerequisite.
++		 */
++		ret = pm_runtime_resume_and_get(dev);
++		if (ret)
++			goto out_list_del;
+ 		data->fw_init_attempted = true;
+ 		ret = mtk_iommu_fw_command(data, 0, 0);
++		pm_runtime_put_noidle(dev);
+ 		if (ret)
+ 			goto out_list_del;
+ 		data->fw_initialized = true;
+@@ -1885,6 +1890,39 @@ static void mtk_iommu_remove(struct platform_device *pdev)
+ 	}
+ }
+ 
++/* The caller must already own the inherited DMA fabric. Device locking keeps
++ * the provider's drvdata alive across this synchronous, idempotent transfer.
++ */
++int mtk_iommu_release_boot_guard(struct device *dev)
++{
++	struct mtk_iommu_data *data;
++	int ret = 0;
++
++	device_lock(dev);
++	if (!device_is_bound(dev) || strcmp(dev->driver->name, "mtk-iommu")) {
++		ret = -EPROBE_DEFER;
++		goto unlock;
++	}
++	data = dev_get_drvdata(dev);
++	if (!data || !MTK_IOMMU_HAS_FLAG(data->plat_data, BOOT_DMA_GUARD)) {
++		ret = -EINVAL;
++		goto unlock;
++	}
++	mutex_lock(&data->boot_guard_lock);
++	if (data->plat_data->firmware_banks && !data->fw_initialized) {
++		ret = -EAGAIN;
++	} else if (data->pm_held) {
++		data->pm_held = false;
++		pm_runtime_put(dev);
++		dev_info(dev, "inherited DMA guard transferred to display owners\n");
++	}
++	mutex_unlock(&data->boot_guard_lock);
++unlock:
++	device_unlock(dev);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mtk_iommu_release_boot_guard);
++
+ static int __maybe_unused mtk_iommu_runtime_suspend(struct device *dev)
+ {
+ 	struct mtk_iommu_data *data = dev_get_drvdata(dev);
+@@ -2273,7 +2311,7 @@ static const struct mtk_iommu_plat_data mt6897_data_disp = {
+ 	.flags		= HAS_BCLK | HAS_SUB_COMM_3BITS | OUT_ORDER_WR_EN |
+ 			  IOVA_34_EN | SHARE_PGTABLE | PGTABLE_PA_35_EN |
+ 			  DL_WITH_MULTI_LARB | HYP_PGTABLE_TYPE2 |
+-			  PM_HOLD_FROM_PROBE | MTK_IOMMU_TYPE_MM,
++			  BOOT_DMA_GUARD | MTK_IOMMU_TYPE_MM,
+ 	.hw_list	= &m4ulist,
+ 	.inv_sel_reg	= REG_MMU_INV_SEL_GEN2,
+ 	.banks_num	= 1,
+@@ -2291,7 +2329,7 @@ static const struct mtk_iommu_plat_data mt6897_data_mdp = {
+ 	.flags		= HAS_BCLK | HAS_SUB_COMM_3BITS | OUT_ORDER_WR_EN |
+ 			  IOVA_34_EN | SHARE_PGTABLE | PGTABLE_PA_35_EN |
+ 			  DL_WITH_MULTI_LARB | HYP_PGTABLE_TYPE2 |
+-			  PM_HOLD_FROM_PROBE | MTK_IOMMU_TYPE_MM,
++			  BOOT_DMA_GUARD | MTK_IOMMU_TYPE_MM,
+ 	.hw_list	= &m4ulist,
+ 	.inv_sel_reg	= REG_MMU_INV_SEL_GEN2,
+ 	.banks_num	= 1,
+diff --git a/drivers/memory/mtk-smi.c b/drivers/memory/mtk-smi.c
+index df4964008a..f7da6abe98 100644
+--- a/drivers/memory/mtk-smi.c
++++ b/drivers/memory/mtk-smi.c
+@@ -775,6 +775,15 @@ static int mtk_smi_device_link_common(struct device *dev, struct device **com_de
+ 	return ret;
+ }
+ 
++/* Address-mode-independent runtime dependencies for physical DMA masters. */
++int mtk_smi_link_suppliers(struct device *dev)
++{
++	struct device *unused;
++
++	return mtk_smi_device_link_common(dev, &unused, 2);
++}
++EXPORT_SYMBOL_GPL(mtk_smi_link_suppliers);
++
+ static int mtk_smi_dts_clk_init(struct device *dev, struct mtk_smi *smi,
+ 				const char * const clks[],
+ 				unsigned int clk_nr_required,
+diff --git a/include/soc/mediatek/mtk_iommu.h b/include/soc/mediatek/mtk_iommu.h
+new file mode 100644
+index 0000000000..cc64240014
+--- /dev/null
++++ b/include/soc/mediatek/mtk_iommu.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __SOC_MEDIATEK_MTK_IOMMU_H
++#define __SOC_MEDIATEK_MTK_IOMMU_H
++#include <linux/device.h>
++#include <linux/errno.h>
++#if IS_REACHABLE(CONFIG_MTK_IOMMU)
++int mtk_iommu_release_boot_guard(struct device *dev);
++#else
++static inline int mtk_iommu_release_boot_guard(struct device *dev)
++{
++	return -ENODEV;
++}
++#endif
++#endif
+diff --git a/include/soc/mediatek/smi.h b/include/soc/mediatek/smi.h
+index 000eb1cf68..073c34fc89 100644
+--- a/include/soc/mediatek/smi.h
++++ b/include/soc/mediatek/smi.h
+@@ -8,6 +8,7 @@
+ 
+ #include <linux/bitops.h>
+ #include <linux/device.h>
++#include <linux/errno.h>
+ 
+ #if IS_ENABLED(CONFIG_MTK_SMI)
+ 
+@@ -27,4 +28,13 @@ struct mtk_smi_larb_iommu {
+ 
+ #endif
+ 
++#if IS_REACHABLE(CONFIG_MTK_SMI)
++int mtk_smi_link_suppliers(struct device *dev);
++#else
++static inline int mtk_smi_link_suppliers(struct device *dev)
++{
++	return -ENODEV;
++}
++#endif
++
+ #endif
+diff --git a/tools/testing/selftests/mtk_display/Makefile b/tools/testing/selftests/mtk_display/Makefile
+new file mode 100644
+index 0000000000..1cfcb36859
+--- /dev/null
++++ b/tools/testing/selftests/mtk_display/Makefile
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0-only
++TEST_PROGS := test_boot_ownership.py test_iommu_guard.py
++include ../lib.mk
+diff --git a/tools/testing/selftests/mtk_display/test_boot_ownership.py b/tools/testing/selftests/mtk_display/test_boot_ownership.py
+new file mode 100755
+index 0000000000..e82683dcdf
+--- /dev/null
++++ b/tools/testing/selftests/mtk_display/test_boot_ownership.py
+@@ -0,0 +1,190 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Exercise production boot ownership with PM, clock and firmware fault injection."""
++from pathlib import Path
++import hashlib
++import os
++import subprocess
++import tempfile
++work=tempfile.TemporaryDirectory(prefix='mtk-display-boot-')
++out=Path(work.name)
++repo=Path(__file__).resolve().parents[4]
++src=(repo/'drivers/gpu/drm/mediatek/mtk_disp_boot.c').read_text()
++names=['mtk_boot_engine_release','mtk_boot_check_postmask','mtk_boot_acquire','mtk_boot_transfer_engine']
++def fn(n):
++ start=src.rfind('\nstatic ',0,src.index(n+'('))+1
++ brace=src.index('{',src.index(n+'('));depth=1;i=brace+1
++ while depth:
++  depth+=(src[i]=='{')-(src[i]=='}');i+=1
++ return src[start:i]
++structs=src[src.index('struct mtk_boot_engine {'):src.index('static void mtk_boot_put_device')]
++preamble=r'''
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include <errno.h>
++#define __iomem
++#define MTK_BOOT_ENGINES 8
++#define MTK_BOOT_PATHS 2
++#define BIT(n) (1U<<(n))
++#define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
++typedef uint32_t u32;
++struct device_node { int id; };
++struct device { int id, refs; };
++struct clk { int id, refs; };
++struct mutex { int unused; };
++struct clk_bulk_data { int unused; };
++'''
++stubs=r'''
++static struct mtk_disp_boot boot;
++static struct device own,paths[4],providers[2],gce;
++static struct clk clocks[7];
++static struct device_node nodes[8];
++static uint32_t registers[7][1024],extra[1024],post[2][1024];
++static int stage,fail_stage,bulk,acks[2],releases,tests,gce_puts,gce_restores,gce_stops,other_gce_owner;
++static int fail(void) { return ++stage==fail_stage; }
++static int pm_runtime_resume_and_get(struct device*d) {
++ if(fail()) return -EIO;
++ d->refs++;return 0;
++}
++static int pm_runtime_put_sync_suspend(struct device*d) {
++ assert(d==&gce&&d->refs>0&&bulk);d->refs--;gce_puts++;
++ if(fail())return -EIO;
++ if(!d->refs)gce_stops++;
++ return 0;
++}
++static void pm_runtime_get_noresume(struct device*d) {
++ assert(d==&gce);d->refs++;gce_restores++;
++}
++static void pm_runtime_put(struct device*d) {
++ assert(!bulk);assert(d->refs>0);d->refs--;releases++;
++}
++static int clk_prepare_enable(struct clk*c) {
++ int side=c->id<4?0:2;
++ assert(paths[side].refs>0 && paths[side+1].refs>0);
++ if(fail()) return -EIO;
++ c->refs++;return 0;
++}
++static void clk_disable_unprepare(struct clk*c) {
++ int side=c->id<4?0:2;
++ assert(!bulk);assert(paths[side].refs>0&&paths[side+1].refs>0);
++ assert(c->refs>0);c->refs--;releases++;
++}
++static int clk_bulk_prepare_enable(int n,struct clk_bulk_data*c) {
++ (void)c;assert(n==3);for(int i=0;i<4;i++)assert(paths[i].refs>0);
++ if(fail())return -EIO;
++ bulk=1;return 0;
++}
++static void clk_bulk_disable_unprepare(int n,struct clk_bulk_data*c) {
++ (void)c;assert(n==3&&bulk);for(int i=0;i<4;i++)assert(paths[i].refs>0);
++ bulk=0;releases++;
++}
++static int mtk_iommu_release_boot_guard(struct device*d) {
++ assert(bulk&&!boot.gce_held&&gce.refs==other_gce_owner);assert(gce_puts==1&&!gce_restores);for(int i=0;i<7;i++)assert(clocks[i].refs==1);
++ if(fail()) return -EIO;
++ acks[d->id]++;assert(acks[d->id]==1);return 0;
++}
++static u32 readl(const void*p) {
++ for(int i=0;i<7;i++)if((uintptr_t)p>=(uintptr_t)registers[i] && (uintptr_t)p<(uintptr_t)(registers[i]+1024))assert(clocks[i].refs);
++ if((uintptr_t)p>=(uintptr_t)extra && (uintptr_t)p<(uintptr_t)(extra+1024))assert(bulk);
++ if((uintptr_t)p>=(uintptr_t)post && (uintptr_t)p<(uintptr_t)(post+2))assert(bulk);
++ return *(const uint32_t*)p;
++}
++#define dev_info(...) ((void)0)
++#define dev_err(...) ((void)0)
++'''
++tests=r'''
++static void reset(unsigned mask,int failure) {
++ memset(&boot,0,sizeof boot);memset(&own,0,sizeof own);memset(paths,0,sizeof paths);
++ memset(providers,0,sizeof providers);memset(clocks,0,sizeof clocks);memset(registers,0,sizeof registers);
++ memset(extra,0,sizeof extra);memset(post,0,sizeof post);memset(acks,0,sizeof acks);
++ stage=bulk=releases=gce_puts=gce_restores=gce_stops=other_gce_owner=0;memset(&gce,0,sizeof gce);fail_stage=failure;boot.gce=&gce;boot.dev=&own;boot.num_engines=7;boot.num_clocks=3;
++ boot.unowned_ovl=extra;boot.postmasks[0]=post[0];boot.postmasks[1]=post[1];
++ for(int i=0;i<2;i++){providers[i].id=i;boot.iommus[i]=&providers[i];}
++ for(int i=0;i<7;i++) {
++  int s=i<4?0:2;clocks[i].id=i;nodes[i].id=i;
++  boot.engines[i]=(struct mtk_boot_engine){.node=&nodes[i],.regs=registers[i],.clk=&clocks[i],.paths={&paths[s],&paths[s+1]}};
++  registers[i][3]=!!(mask&BIT(i));
++ }
++}
++static void balanced(void) {
++ assert(!own.refs&&!bulk&&gce.refs==other_gce_owner);for(int i=0;i<4;i++)assert(!paths[i].refs);
++ for(int i=0;i<7;i++)assert(!clocks[i].refs);
++}
++static void frozen_retry(int expected) {
++ struct mtk_disp_boot old=boot;int s=stage,r=releases;
++ assert(mtk_boot_acquire(&boot)==expected);assert(stage==s&&releases==r);
++ assert(!memcmp(&old,&boot,sizeof boot));
++ for(int i=0;i<7;i++)mtk_boot_transfer_engine(&boot,&nodes[i]);
++ assert(stage==s&&releases==r);assert(!memcmp(&old,&boot,sizeof boot));
++}
++int main(void) {
++ /* Every inherited-active subset, including all inactive/all active. */
++ for(unsigned mask=0;mask<128;mask++) {
++  reset(mask,0);assert(mtk_boot_acquire(&boot)==0);assert(stage==27&&boot.ready);
++  assert(acks[0]==1&&acks[1]==1&&!bulk&&!own.refs);
++  for(int i=0;i<7;i++)assert(clocks[i].refs==!!(mask&BIT(i)));
++  int s=stage,r=releases;assert(mtk_boot_acquire(&boot)==0);assert(stage==s&&releases==r);
++  mtk_boot_transfer_engine(&boot,&nodes[7]);assert(releases==r);
++  for(int i=6;i>=0;i--) {mtk_boot_transfer_engine(&boot,&nodes[i]);r=releases;mtk_boot_transfer_engine(&boot,&nodes[i]);assert(releases==r);}
++  balanced();assert(mtk_boot_acquire(&boot)==0);balanced();tests++;
++ }
++ /* Transfer must preserve already acquired normal owner references. */
++ reset(127,0);assert(mtk_boot_acquire(&boot)==0);
++ for(int i=0;i<7;i++){int s=i<4?0:2;paths[s].refs++;paths[s+1].refs++;clocks[i].refs++;}
++ for(int i=0;i<7;i++)mtk_boot_transfer_engine(&boot,&nodes[i]);
++ for(int i=0;i<7;i++)assert(clocks[i].refs==1);
++ assert(paths[0].refs==4&&paths[1].refs==4&&paths[2].refs==3&&paths[3].refs==3);
++ for(int i=0;i<7;i++){int s=i<4?0:2;clk_disable_unprepare(&clocks[i]);pm_runtime_put(&paths[s+1]);pm_runtime_put(&paths[s]);}
++ balanced();tests++;
++ /* All 27 boundaries: 1 own PM,14 path PM,7 clock,bulk,GCE get,GCE put,2 ack. */
++ for(int f=1;f<=27;f++) {
++  reset(127,f);assert(mtk_boot_acquire(&boot)==-EIO);assert(stage==f&&!boot.ready);
++  assert(!releases);assert(acks[0]==(f==27));assert(acks[1]==0);
++  int expected_paths[4]={0};
++  for(int i=0;i<7;i++) {
++   int side=i<4?0:2,held=0;
++   for(int j=0;j<2;j++)if(2+3*i+j<f){expected_paths[side+j]++;held++;}
++   assert(boot.engines[i].held_paths==(unsigned)held);
++   assert(clocks[i].refs==(4+3*i<f));
++   assert(boot.engines[i].clock_held==(4+3*i<f));
++  }
++  for(int i=0;i<4;i++)assert(paths[i].refs==expected_paths[i]);
++  assert(bulk==(f>23));
++  assert(gce.refs==(f==25));assert(boot.gce_held==(f==25));
++  assert(gce_restores==(f==25));assert(gce_puts==(f>=25));
++  assert(gce_stops==(f>25));
++  if(f==1) {assert(!boot.attempted);balanced();fail_stage=0;assert(mtk_boot_acquire(&boot)==0);for(int i=0;i<7;i++)mtk_boot_transfer_engine(&boot,&nodes[i]);balanced();}
++  else {assert(boot.attempted&&own.refs==1);frozen_retry(-EIO);}
++  tests++;
++ }
++ /* Unsupported unmodeled DMA never acknowledges providers or frees power. */
++ for(int variant=0;variant<5;variant++) {
++  reset(127,0);
++  if(!variant)extra[3]=1;
++  else {int p=(variant-1)/2;post[p][0]=1;if(variant%2==0){post[p][8]=2;post[p][9]=2;}}
++  int err=variant?-EINVAL:-EBUSY;assert(mtk_boot_acquire(&boot)==err);
++  assert(stage==24&&!acks[0]&&!acks[1]&&bulk&&!releases);frozen_retry(err);tests++;
++ }
++ /* An existing normal GCE owner bypasses STOP but retains ownership. */
++ reset(0,0);other_gce_owner=1;gce.refs=1;
++ assert(mtk_boot_acquire(&boot)==0);assert(!gce_stops&&gce_puts==1&&!gce_restores&&!boot.gce_held);
++ balanced();tests++;
++ /* Supported enabled relay POSTMASK does not cause false quarantine. */
++ reset(0,0);post[0][0]=post[1][0]=1;post[0][8]=post[1][8]=3;post[0][9]=2;post[1][9]=4;
++ assert(mtk_boot_acquire(&boot)==0);balanced();tests++;
++ printf("PASS %d scenarios: production acquire/release/transfer, every active subset,27 fault boundaries,quarantine/idempotence/order; no hardware drain claim\n",tests);
++}
++'''
++(out/'lease-tests.c').write_text(preamble+structs+stubs+'\n'.join(fn(n) for n in names)+tests)
++(out/'source.sha256').write_text(hashlib.sha256(src.encode()).hexdigest()+'  mtk_disp_boot.c\n')
++(out/'production-functions.c').write_text('\n\n'.join(fn(n) for n in names))
++print((out/'source.sha256').read_text())
++
++subprocess.run([os.environ.get('CC','cc'),'-std=gnu11','-Wall','-Wextra','-Werror',
++ '-Wno-unused-parameter','-Wno-sign-compare','-fsanitize=address,undefined','-O1',
++ str(out/'lease-tests.c'),'-o',str(out/'lease-tests')],check=True)
++subprocess.run([str(out/'lease-tests')],check=True)
++work.cleanup()
+diff --git a/tools/testing/selftests/mtk_display/test_iommu_guard.py b/tools/testing/selftests/mtk_display/test_iommu_guard.py
+new file mode 100755
+index 0000000000..2881598851
+--- /dev/null
++++ b/tools/testing/selftests/mtk_display/test_iommu_guard.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Check production IOMMU guard validation, serialization and PM reference transfer."""
++from pathlib import Path
++import re,subprocess,tempfile,os
++work=tempfile.TemporaryDirectory(prefix='mtk-iommu-boot-');w=Path(work.name);repo=Path(__file__).resolve().parents[4];s=(repo/'drivers/iommu/mtk_iommu.c').read_text()
++def fn(name):
++ m=re.search(r'(?:static )?int (?:__maybe_unused )?'+name+r'\([^;]*?\)\n\{',s);i=m.end();d=1
++ while d:d+=(s[i]=='{')-(s[i]=='}');i+=1
++ return s[m.start():i]
++pre=r'''
++#include <assert.h>
++#include <stdbool.h>
++#include <string.h>
++#include <errno.h>
++#include <stdio.h>
++#define EPROBE_DEFER 517
++#define BOOT_DMA_GUARD 1
++#define MTK_IOMMU_HAS_FLAG(p,f) ((p)->flags&(f))
++#define dev_info(...) ((void)0)
++struct mutex{bool locked;};struct pdata{bool firmware_banks;int flags;};
++struct mtk_iommu_data{struct pdata*plat_data;bool fw_initialized,pm_held;struct mutex boot_guard_lock;};
++struct driver{char*name;};struct device{bool bound,locked;struct driver*driver;struct mtk_iommu_data*data;int usage,puts;};
++static void device_lock(struct device*d){assert(!d->locked);d->locked=true;}
++static void device_unlock(struct device*d){assert(d->locked);d->locked=false;}
++static bool device_is_bound(struct device*d){return d->bound;}
++static void*dev_get_drvdata(struct device*d){assert(d->locked);return d->data;}
++static void mutex_lock(struct mutex*m){assert(!m->locked);m->locked=true;}
++static void mutex_unlock(struct mutex*m){assert(m->locked);m->locked=false;}
++static void pm_runtime_put(struct device*d){assert(d->locked&&d->data->boot_guard_lock.locked&&d->usage>0);d->usage--;d->puts++;}
++'''
++tests=r'''
++int main(void){struct pdata p={true,BOOT_DMA_GUARD};struct driver driver={"mtk-iommu"};struct mtk_iommu_data data={&p,true,true,{false}};struct device d={true,false,&driver,&data,1,0};
++ assert(!mtk_iommu_release_boot_guard(&d)&&!data.pm_held&&!d.usage&&d.puts==1&&!d.locked);assert(!mtk_iommu_release_boot_guard(&d)&&d.puts==1);
++ d.bound=false;assert(mtk_iommu_release_boot_guard(&d)==-EPROBE_DEFER&&!d.locked);d.bound=true;driver.name="wrong";assert(mtk_iommu_release_boot_guard(&d)==-EPROBE_DEFER);driver.name="mtk-iommu";
++ d.data=0;assert(mtk_iommu_release_boot_guard(&d)==-EINVAL);d.data=&data;p.flags=0;assert(mtk_iommu_release_boot_guard(&d)==-EINVAL);p.flags=BOOT_DMA_GUARD;
++ data.pm_held=true;data.fw_initialized=false;d.usage=1;assert(mtk_iommu_release_boot_guard(&d)==-EAGAIN&&data.pm_held&&d.usage==1&&d.puts==1);data.fw_initialized=true;assert(!mtk_iommu_release_boot_guard(&d)&&d.puts==2&&!d.usage);puts("PASS actual IOMMU boot-guard API: provider validation, device/guard locks, firmware gate, reference balance and duplicate ack");}
++'''
++p=w/'iommu-guard.c';p.write_text(pre+fn('mtk_iommu_release_boot_guard')+tests);subprocess.run([os.environ.get('CC','cc'),'-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-O1',str(p),'-o',str(w/'iommu-guard')],check=True);subprocess.run([str(w/'iommu-guard')],check=True)
++# Verify the firmware command is enclosed by its own acquired reference.
++a=s.index('if (data->plat_data->firmware_banks) {',s.index('static int mtk_iommu_probe'))
++b=s.index('\n\tret = iommu_device_sysfs_add',a);f=s[a:b]
++assert f.index('pm_runtime_resume_and_get(dev)')<f.index('mtk_iommu_fw_command(data, 0, 0)')<f.index('pm_runtime_put_noidle(dev)')<f.index('if (ret)',f.index('mtk_iommu_fw_command(data, 0, 0)'))
++print('Firmware initialization has a separate balanced PM command reference; error path is not described as a hardware DMA-drain proof.')
++
++larb_source=(repo/'drivers/memory/mtk-smi.c').read_text()
++pattern=re.search(r'static int __maybe_unused mtk_smi_larb_suspend\([^;]*?\)\n\{',larb_source)
++i=pattern.end();depth=1
++while depth:
++ depth+=(larb_source[i]=='{')-(larb_source[i]=='}');i+=1
++larb_function=larb_source[pattern.start():i]
++larb_mock=r'''#include <assert.h>
++#include <errno.h>
++#define __maybe_unused
++#define MTK_SMI_FLAG_SLEEP_CTL 1
++#define MTK_SMI_CAPS(f,c) ((f)&(c))
++struct gen{int flags_general;};struct smi{int clk_num;void*clks;};
++struct mtk_smi_larb{struct gen*larb_gen;struct smi smi;};
++struct device{struct mtk_smi_larb*data;};
++static int drain_error,clock_disables;
++static void*dev_get_drvdata(struct device*d){return d->data;}
++static int mtk_smi_larb_sleep_ctrl_enable(struct mtk_smi_larb*l){return drain_error;}
++static void clk_bulk_disable_unprepare(int n,void*c){clock_disables++;}
++'''
++larb_tests=r'''int main(void){struct gen gen={MTK_SMI_FLAG_SLEEP_CTL};struct mtk_smi_larb larb={&gen,{2,0}};struct device dev={&larb};
++drain_error=-ETIMEDOUT;assert(mtk_smi_larb_suspend(&dev)==-ETIMEDOUT&&!clock_disables);
++drain_error=0;assert(!mtk_smi_larb_suspend(&dev)&&clock_disables==1);
++}
++'''
++p=w/'larb-drain.c';p.write_text(larb_mock+larb_function+larb_tests)
++subprocess.run([os.environ.get('CC','cc'),'-Wall','-Wextra','-Werror','-Wno-unused-parameter','-fsanitize=address,undefined','-O1',str(p),'-o',str(w/'larb-drain')],check=True)
++subprocess.run([str(w/'larb-drain')],check=True)
++print('PASS actual larb suspend: failed sleep acknowledgment retains clocks; successful drain permits clock release (no hardware drain claim).')
++work.cleanup()
+diff --git a/tools/testing/selftests/mtk_vcp/test_smi_suppliers.py b/tools/testing/selftests/mtk_vcp/test_smi_suppliers.py
+index 571613bc53..c74fa80a1d 100644
+--- a/tools/testing/selftests/mtk_vcp/test_smi_suppliers.py
++++ b/tools/testing/selftests/mtk_vcp/test_smi_suppliers.py
+@@ -18,6 +18,7 @@ mock=r'''
+ #include <string.h>
+ #define ARRAY_SIZE(x) (sizeof(x)/sizeof((x)[0]))
+ #define GFP_KERNEL 0
++#define EXPORT_SYMBOL_GPL(x)
+ #define EPROBE_DEFER 517
+ #define DL_FLAG_PM_RUNTIME 1
+ #define DL_FLAG_STATELESS 2
+@@ -37,7 +38,7 @@ static void *platform_get_drvdata(struct platform_device *p){return p->dev.of_no
+ static void put_device(struct device *d){assert(d->refs>0);d->refs--;puts++;}
+ static void *devres_open_group(struct device *d,void *id,int flags){return (void*)1;}
+ static void *devm_kzalloc(struct device *d,size_t n,int flags){void *p=calloc(1,n);allocations[allocated++]=p;return p;}
+-static struct device_link *device_link_add(struct device *a,struct device *b,unsigned f){int i=link_calls++;if(i==fail_link)return NULL;link[i].alive=true;links++;return &link[i];}
++static struct device_link *device_link_add(struct device *a,struct device *b,unsigned f){assert(f==(DL_FLAG_PM_RUNTIME|DL_FLAG_STATELESS));int i=link_calls++;if(i==fail_link)return NULL;link[i].alive=true;links++;return &link[i];}
+ static void device_link_del(struct device_link *l){assert(l->alive);l->alive=false;links--;}
+ static int devm_add_action_or_reset(struct device *d,void (*fn)(void*),void *arg){int i=action_calls++;if(i==fail_action){fn(arg);return -ENOMEM;}action[actions++]=(typeof(action[0])){fn,arg};return 0;}
+ static void devres_release_group(struct device *d,void *g){while(actions){actions--;action[actions].fn(action[actions].arg);}}
+@@ -47,7 +48,7 @@ static void devres_remove_group(struct device *d,void *g){}
+ test=r'''
+ static void reset(void){assert(!links);for(unsigned i=0;i<allocated;i++)free(allocations[i]);allocated=0;duplicate=false;count=1;missing=unbound=fail_link=fail_action=-1;link_calls=action_calls=puts=actions=0;memset(pdev,0,sizeof(pdev));for(int i=0;i<3;i++)nodes[i].id=i;for(int i=0;i<2;i++)pdev[i].dev.of_node=&nodes[i];consumer.of_node=&nodes[2];}
+ static void balanced(void){assert(!links&&!pdev[0].dev.refs&&!pdev[1].dev.refs);}
+-int main(void){struct device *primary=NULL;reset();assert(!mtk_smi_device_link_common(&consumer,&primary,1));assert(primary==&pdev[0].dev&&links==1);devres_release_group(&consumer,(void*)1);balanced();assert(puts==1);
++int main(void){struct device *primary=NULL;reset();assert(!mtk_smi_link_suppliers(&consumer));assert(links==1);devres_release_group(&consumer,(void*)1);balanced();assert(puts==1);
+  reset();count=2;assert(!mtk_smi_device_link_common(&consumer,&primary,2));assert(primary==&pdev[0].dev&&links==2);devres_release_group(&consumer,(void*)1);balanced();assert(puts==2);
+  reset();count=2;missing=1;assert(mtk_smi_device_link_common(&consumer,&primary,2)==-EPROBE_DEFER);assert(!primary);balanced();assert(puts==1);
+  reset();count=2;unbound=1;assert(mtk_smi_device_link_common(&consumer,&primary,2)==-EPROBE_DEFER);balanced();assert(puts==2);
+-- 
+2.56.0
+

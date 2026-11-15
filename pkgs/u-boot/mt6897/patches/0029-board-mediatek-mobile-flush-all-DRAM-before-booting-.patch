@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Thu, 15 Oct 2026 10:24:56 +0800
+Subject: [PATCH 29/29] board: mediatek-mobile: flush all DRAM before booting
+ an OS
+
+gd->ram_base/ram_size describe only the relocation window, and the by-VA
+flush before an OS boot (CMO_BY_VA_ONLY) is clamped to it. bootm had moved
+the kernel to 0xc0200000 and placed the initrd and FDT near 0x5e9ee000,
+outside the window: after the MMU went off the kernel entry read stale
+memory and faulted. Widen the range to the DRAM banks in
+board_cleanup_before_linux(); unmapped no-map holes are skipped.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../mediatek-mobile/mediatek-mobile.c         | 20 +++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/board/mediatek/mediatek-mobile/mediatek-mobile.c b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+index 2f83d51f91d..498c8d73467 100644
+--- a/board/mediatek/mediatek-mobile/mediatek-mobile.c
++++ b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+@@ -574,6 +574,26 @@ static void mtk_build_mem_map(void)
+ 	/* Zero size and attributes terminate the map. */
+ }
+ 
++/*
++ * gd->ram_base/ram_size describe only U-Boot's relocation window, and the
++ * by-VA cache flush before booting an OS (CMO_BY_VA_ONLY) is clamped to
++ * it. Kernels, initrds and FDTs placed elsewhere would stay dirty in the
++ * cache when the MMU goes off. Widen the range to all DRAM banks; the
++ * no-map holes are not mapped, so the walk skips them.
++ */
++void board_cleanup_before_linux(void)
++{
++	u64 start, end;
++
++	if (!mtk_bank_count)
++		return;
++	start = mtk_banks[0].start;
++	end = mtk_banks[mtk_bank_count - 1].start +
++	      mtk_banks[mtk_bank_count - 1].size;
++	gd->ram_base = start;
++	gd->ram_size = end - start;
++}
++
+ int dram_init(void)
+ {
+ 	if (mtk_select_window()) {
+-- 
+2.55.0
+

@@ -1,0 +1,2662 @@
+From 2665e54e4a6d94ed64a61a1ff49acb86ad49e91a Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] media: mediatek: adapt the VCP decoder backend to MT6897
+
+Adapt the imported decoder to MT6897 firmware layouts, bounded DMA
+apertures, ring ownership and retained bitstream inputs. Support the
+negotiated formats and reject unsupported compressed capture layouts.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T13:17:01+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T14:39:23+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T15:50:44+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T17:25:12+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T17:27:31+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T17:35:56+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T17:49:07+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T18:09:33+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T18:09:33+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T18:15:46+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T18:30:46+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T18:31:58+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T19:33:11+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-04T04:13:23+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-04T23:12:20+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-05T08:48:08+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-05T09:37:14+08:00
+Link: https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6
+Link: https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec
+Link: https://github.com/MT6895-Mainline/linux/tree/f1c0c8245d163fece46699612b8322d11e26348d
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec/mtk_vcodec_dec.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec/vdec/vdec_vcp_if.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec/mtk_vcodec_dec_pm.c
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ .../mediatek/vcodec/vcp/mtk_vcp_vdec.c        | 610 ++++++++++++++----
+ .../mediatek/vcodec/vcp/mtk_vcp_vdec.h        |   5 +-
+ .../mediatek/vcodec/vcp/mtk_vcp_vdec_abi.h    | 247 ++-----
+ .../vcodec/vcp/mtk_vcp_vdec_bitstream.h       |   7 +-
+ .../mediatek/vcodec/vcp/mtk_vcp_vdec_hw.c     | 492 +++++++-------
+ .../mediatek/vcodec/vcp/mtk_vcp_vdec_hw.h     |  27 +-
+ .../mediatek/vcodec/vcp/mtk_vcp_vdec_input.h  |  63 ++
+ .../vcodec/vcp/mtk_vcp_vdec_mt6897_abi.h      | 299 +++++++++
+ .../mediatek/vcodec/vcp/mtk_vcp_vdec_pixels.h |  46 ++
+ 9 files changed, 1182 insertions(+), 614 deletions(-)
+ create mode 100644 drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_input.h
+ create mode 100644 drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_mt6897_abi.h
+ create mode 100644 drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_pixels.h
+
+diff --git a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec.c b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec.c
+index 8b727a9a9d..fb156a556f 100644
+--- a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec.c
++++ b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+-/* MT6895 firmware protocol for the stateful decoder frontend. */
++/* MT6897 firmware protocol for the stateful decoder frontend. */
++#include <linux/remoteproc/mtk_vcp_memory.h>
+ #include <linux/atomic.h>
+ #include <linux/completion.h>
+ #include <linux/dma-mapping.h>
+@@ -10,8 +11,10 @@
+ #include <linux/sizes.h>
+ #include <linux/unaligned.h>
+ 
++#include "mtk_vcp_vdec_pixels.h"
+ #include "mtk_vcp_vdec.h"
+ #include "mtk_vcp_vdec_bitstream.h"
++#include "mtk_vcp_vdec_input.h"
+ 
+ #define DEC_EVENTS 192
+ #define DEC_ALLOCATIONS 128
+@@ -51,16 +54,21 @@ struct mtk_vcp_vdec {
+ 	struct completion reply;
+ 	struct vcp_vdec_vsi *vsi;
+ 	u64 cookie, next_memory;
+-	u32 address, expected, codec_id;
+-	int error;
++	u64 address;
++	u32 expected, codec_id;
++	int error, hw_error;
+ 	bool initialized, broken, firmware_live, picture_known;
++	bool ring_fault_reported;
++	bool flushing; /* rx_lock: remains set until the next accepted START */
+ 	unsigned long cores;
++	u32 ao_count;
+ 	u8 response[64] __aligned(8);
+ 	size_t response_size, work_bytes;
+ 	unsigned int allocation_count;
+ 	struct list_head allocations;
+ 	struct dec_surface surfaces[64];
+ 	u64 bitstreams[64];
++	struct vcp_vdec_input input;
+ 	struct vcp_vdec_event events[DEC_EVENTS];
+ 	u32 event_read, event_count;
+ };
+@@ -84,7 +92,20 @@ static void dec_fail(struct mtk_vcp_vdec *d, int error)
+ 	d->ops->notify(d->priv);
+ }
+ 
+-static void *dec_shared(struct mtk_vcp_vdec *d, u32 address, size_t size)
++static void dec_hardware_fail(struct mtk_vcp_vdec *d, u32 id, int error)
++{
++	if (d->hw_error)
++		return;
++	/* Do not complete the RPC: consume its bounded ACK before cleanup
++	 * changes expected, even when firmware acknowledges START with 0.
++	 */
++	d->hw_error = error;
++	dev_err(d->dev, "hardware callback %#x failed: %d; session poisoned\n",
++		id, error);
++	d->ops->notify(d->priv);
++}
++
++static void *dec_shared(struct mtk_vcp_vdec *d, u64 address, size_t size)
+ {
+ 	struct mtk_vcp_mem mem;
+ 	u32 start, offset;
+@@ -92,6 +113,11 @@ static void *dec_shared(struct mtk_vcp_vdec *d, u32 address, size_t size)
+ 	if (mtk_vcp_get_mem(d->vcp, MTK_VCP_MEM_VDEC, &mem))
+ 		return ERR_PTR(-EHOSTDOWN);
+ 	start = mem.dma & 0xfffffff;
++	/* Firmware instances may use a packed 32-bit or full IOVA address.
++	 * Validate the representation before selecting its low-28 SHM window. */
++	if (address > U32_MAX &&
++	    (address < mem.dma || address - mem.dma >= mem.size))
++		return ERR_PTR(-ERANGE);
+ 	address &= 0xfffffff;
+ 	if (address < start)
+ 		return ERR_PTR(-ERANGE);
+@@ -104,17 +130,27 @@ static void *dec_shared(struct mtk_vcp_vdec *d, u32 address, size_t size)
+ static int dec_memory(struct mtk_vcp_vdec *d, struct vcp_vdec_mem_op *m)
+ {
+ 	struct dec_memory *a;
+-	u32 type = le32_to_cpu(m->mem_type), size = le32_to_cpu(m->mem_len);
++	u32 type = le32_to_cpu(m->type), size = le32_to_cpu(m->size);
+ 	int ret;
+ 
+-	if (le32_to_cpu(m->msg_id) == VCP_VDEC_MEM_FREE) {
++	if (le32_to_cpu(m->id) == VCP_VDEC_MEM_FREE) {
+ 		list_for_each_entry(a, &d->allocations, list) {
+-			if (a->cookie != le64_to_cpu(m->mem_va))
++			if (a->cookie != le64_to_cpu(m->va))
+ 				continue;
+ 			if (a->type != type || a->mem.size != size ||
+-			    a->mem.dma != le64_to_cpu(m->mem_iova) ||
+-			    a->mem.dma != le64_to_cpu(m->mem_pa))
++			    a->mem.dma != le64_to_cpu(m->iova) ||
++			    a->mem.dma != le64_to_cpu(m->pa))
+ 				return -EINVAL;
++			if (d->hw_error) {
++				/* DEINIT is not proof that a timed-out engine is idle.
++				 * Keep mappings/bookkeeping until confirmed offline
++				 * hardware cleanup permits destroy. Identical repeats
++				 * remain validated and idempotent.
++				 */
++				return 0;
++			}
++			VCPDBG("mem: free type=%u requested=%u dma=%pad cookie=%#llx\n",
++			       type, size, &a->mem.dma, a->cookie);
+ 			d->ops->free(d->priv, type, &a->mem);
+ 			d->work_bytes -= size;
+ 			d->allocation_count--;
+@@ -135,11 +171,10 @@ static int dec_memory(struct mtk_vcp_vdec *d, struct vcp_vdec_mem_op *m)
+ 		goto fail;
+ 	if (!a->mem.cpu || a->mem.size != size || !a->mem.dma ||
+ 	    a->mem.dma + size < a->mem.dma ||
+-	    (type == 0 && (a->mem.dma < 0x150000000ULL ||
+-			 a->mem.dma + size > 0x160000000ULL)) ||
+-	    (type == 1 && a->mem.dma + size > 0x400000000ULL) ||
+-	    (type == 2 && (a->mem.dma < 0x20000000ULL ||
+-			 a->mem.dma + size > 0x32c00000ULL))) {
++	    (type == 0 && (a->mem.dma < 0x140000000ULL ||
++			 a->mem.dma + size > 0x1a0000000ULL)) ||
++	    (type == 1 && a->mem.dma + size > 0x100000000ULL) ||
++	    (type == 2 && a->mem.dma + size > 0x100000000ULL)) {
+ 		ret = -ERANGE;
+ 		d->ops->free(d->priv, type, &a->mem);
+ 		goto fail;
+@@ -150,9 +185,11 @@ static int dec_memory(struct mtk_vcp_vdec *d, struct vcp_vdec_mem_op *m)
+ 	list_add_tail(&a->list, &d->allocations);
+ 	d->work_bytes += size;
+ 	d->allocation_count++;
+-	m->mem_iova = cpu_to_le64(a->mem.dma);
+-	m->mem_pa = m->mem_iova;
+-	m->mem_va = cpu_to_le64(a->cookie);
++	m->iova = cpu_to_le64(a->mem.dma);
++	m->pa = m->iova;
++	m->va = cpu_to_le64(a->cookie);
++	VCPDBG("mem: alloc type=%u requested=%u dma=%pad cookie=%#llx\n",
++	       type, size, &a->mem.dma, a->cookie);
+ 	return 0;
+ fail:
+ 	kfree(a);
+@@ -170,20 +207,85 @@ static int dec_push_event(struct mtk_vcp_vdec *d, enum vcp_vdec_event_type type,
+ 	e->type = type;
+ 	e->cookie = cookie;
+ 	e->timestamp = timestamp;
++	e->no_generated = false;
+ 	return 0;
+ }
+ 
++/* Failure-only metadata: take the first snapshot while VSI is live and the
++ * caller owns rx_lock. Keep every rejection and ownership transition intact.
++ */
++static bool dec_first_ring_fault(struct mtk_vcp_vdec *d)
++{
++	lockdep_assert_held(&d->rx_lock);
++	if (d->ring_fault_reported)
++		return false;
++	d->ring_fault_reported = true;
++	return true;
++}
++
++struct dec_ring_snapshot {
++	u32 read, write, count;
++};
++
++/* Firmware publishes a tuple through separate stores. Accept two consecutive
++ * matching coherent samples, with bounded retry under rx_lock; a range error
++ * or persistently inconsistent tuple remains a protocol failure. This does
++ * not establish atomic shared-count ownership during nonempty consumption.
++ */
++static int dec_ring_snapshot(const __le32 *wire_read, const __le32 *wire_write,
++			     const __le32 *wire_count, struct dec_ring_snapshot *out)
++{
++	struct dec_ring_snapshot previous = {};
++	bool have_previous = false;
++	unsigned int attempt;
++
++	for (attempt = 0; attempt < 32; attempt++) {
++		dma_rmb();
++		out->read = le32_to_cpu(READ_ONCE(*wire_read));
++		out->write = le32_to_cpu(READ_ONCE(*wire_write));
++		out->count = le32_to_cpu(READ_ONCE(*wire_count));
++		if (out->read >= 64 || out->write >= 64 || out->count > 64)
++			return -EPROTO;
++		if ((out->read + out->count) % 64 == out->write) {
++			if (have_previous && previous.read == out->read &&
++			    previous.write == out->write && previous.count == out->count) {
++				dma_rmb();
++				return 0;
++			}
++			previous = *out;
++			have_previous = true;
++		} else {
++			have_previous = false;
++		}
++		cpu_relax();
++	}
++	return -EPROTO;
++}
++
+ /* Consume at PUT_FRAME_BUFFER, or after START/RESET for synchronous codecs. */
+ static int dec_frames(struct mtk_vcp_vdec *d, struct vcp_vdec_fb_ring *r, bool display)
+ {
+-	u32 read = le32_to_cpu(READ_ONCE(r->read));
+-	u32 write = le32_to_cpu(READ_ONCE(r->write));
+-	u32 count = le32_to_cpu(READ_ONCE(r->count));
++	struct dec_ring_snapshot snapshot;
++	u32 read, write, count;
+ 	unsigned int i;
+ 	int ret;
+ 
+-	if (read >= 64 || write >= 64 || count > 64 || (read + count) % 64 != write)
++	ret = dec_ring_snapshot(&r->read, &r->write, &r->count, &snapshot);
++	read = snapshot.read;
++	write = snapshot.write;
++	count = snapshot.count;
++	if (ret) {
++		if (dec_first_ring_fault(d))
++			VCPDBG("ring-fault: %s tuple r=%u w=%u n=%u now=%u/%u/%u expected=%#x events=%u\n",
++			       display ? "display" : "free-fb", read, write, count,
++			       le32_to_cpu(READ_ONCE(r->read)),
++			       le32_to_cpu(READ_ONCE(r->write)),
++			       le32_to_cpu(READ_ONCE(r->count)), d->expected, d->event_count);
+ 		return -EPROTO;
++	}
++	/* An empty poll must not clear a newly arriving firmware publication. */
++	if (!count)
++		return 0;
+ 	while (count--) {
+ 		struct vcp_vdec_fb *f = &r->frame[read];
+ 		u64 cookie = le64_to_cpu(f->cookie);
+@@ -194,22 +296,35 @@ static int dec_frames(struct mtk_vcp_vdec *d, struct vcp_vdec_fb_ring *r, bool d
+ 				s = &d->surfaces[i];
+ 				break;
+ 			}
+-		/* xaga firmware returns cookies/timestamps but zeroes the DMA
+-		 * fields in display/free entries. Never interpret a cookie as
+-		 * a pointer; any supplied address must match our submitted record.
+-		 */
+-		if (!s || s->pending || (f->y && s->y != le64_to_cpu(f->y)) ||
+-		    (f->c && s->c != le64_to_cpu(f->c)) ||
+-		    (display && s->displayed))
++		/* MT6897 rings contain cookies/timestamps, never AP pointers. */
++		if (!s || s->pending || (display && s->displayed)) {
++			if (dec_first_ring_fault(d))
++				VCPDBG("ring-fault: %s frame r=%u w=%u remaining=%u cookie=%#llx ts=%llu slot=%u pending=%d displayed=%d expected=%#x events=%u\n",
++				       display ? "display" : "free-fb", read, write, count,
++				       cookie, le64_to_cpu(f->timestamp), s ? i : 64,
++				       s ? s->pending : 0, s ? s->displayed : 0,
++				       d->expected, d->event_count);
+ 			return -EPROTO;
++		}
++		/* Vendor INPUT_DRIVEN_PUT_FRM keeps an early FREE advisory when
++		 * the frame has not been displayed. It is not a DMA release: a
++		 * later DISPLAY and final FREE still name this same cookie.
++		 */
++		if (!display && d->vsi->input_driven == 2 && !d->flushing &&
++		    !s->displayed && !le32_to_cpu(f->reserved))
++			goto next_frame;
+ 		ret = dec_push_event(d, display ? VCP_VDEC_DISPLAY : VCP_VDEC_FREE_FRAME,
+ 				     cookie, le64_to_cpu(f->timestamp));
+ 		if (ret)
+ 			return ret;
+-		if (display)
++		if (display) {
++			d->events[(d->event_read + d->event_count - 1) % DEC_EVENTS].no_generated =
++				!!le32_to_cpu(f->reserved);
+ 			s->displayed = true;
+-		else
++		} else {
+ 			memset(s, 0, sizeof(*s));
++		}
++next_frame:
+ 		read = (read + 1) % 64;
+ 	}
+ 	WRITE_ONCE(r->read, cpu_to_le32(read));
+@@ -217,43 +332,101 @@ static int dec_frames(struct mtk_vcp_vdec *d, struct vcp_vdec_fb_ring *r, bool d
+ 	return 0;
+ }
+ 
++/* Async frame rings belong to PUT_FRAME_BUFFER: firmware waits for our reply
++ * before publishing again. Polling them from a worker is outside that ownership
++ * window. FREE_BS remains worker-owned, including same-input continuations.
++ */
++static int dec_collect_frames(struct mtk_vcp_vdec *d)
++{
++	int ret;
++
++	dma_rmb();
++	ret = dec_frames(d, &d->vsi->display, true);
++	if (!ret)
++		ret = dec_frames(d, &d->vsi->free_fb, false);
++	/* Publish consumed frame entries before the callback ACK. */
++	dma_wmb();
++	return ret;
++}
++
++static int dec_collect_callback(struct mtk_vcp_vdec *d, bool no_need_put)
++{
++	if (d->hw_error)
++		return d->hw_error;
++	if (no_need_put)
++		return 0;
++	if (!d->vsi)
++		return -EPROTO;
++	/* Synchronous output is deferred to the decoder worker. */
++	if (!READ_ONCE(d->vsi->output_async))
++		return 0;
++	return dec_collect_frames(d);
++}
++
+ static int dec_collect(struct mtk_vcp_vdec *d)
+ {
+ 	struct vcp_vdec_bs_ring *r;
++	struct dec_ring_snapshot snapshot;
+ 	u32 read, write, count;
+ 	unsigned int i;
+ 	int ret;
+ 
++	if (d->hw_error)
++		return d->hw_error;
+ 	if (!d->vsi)
+ 		return -EPROTO;
++	if (!READ_ONCE(d->vsi->output_async)) {
++		ret = dec_collect_frames(d);
++		if (ret)
++			return ret;
++	}
+ 	dma_rmb();
+-	ret = dec_frames(d, &d->vsi->display, true);
+-	if (!ret)
+-		ret = dec_frames(d, &d->vsi->free_fb, false);
+-	if (ret)
+-		return ret;
+ 	r = &d->vsi->free_bs;
+-	read = le32_to_cpu(READ_ONCE(r->read));
+-	write = le32_to_cpu(READ_ONCE(r->write));
+-	count = le32_to_cpu(READ_ONCE(r->count));
+-	if (read >= 64 || write >= 64 || count > 64 || (read + count) % 64 != write)
++	ret = dec_ring_snapshot(&r->read, &r->write, &r->count, &snapshot);
++	read = snapshot.read;
++	write = snapshot.write;
++	count = snapshot.count;
++	if (ret) {
++		if (dec_first_ring_fault(d))
++			VCPDBG("ring-fault: free-bs tuple r=%u w=%u n=%u now=%u/%u/%u expected=%#x events=%u\n",
++			       read, write, count, le32_to_cpu(READ_ONCE(r->read)),
++			       le32_to_cpu(READ_ONCE(r->write)),
++			       le32_to_cpu(READ_ONCE(r->count)), d->expected, d->event_count);
+ 		return -EPROTO;
++	}
++	if (!count)
++		goto publish;
+ 	while (count--) {
+ 		u64 cookie = le64_to_cpu(r->cookie[read]);
+ 
+ 		for (i = 0; i < 64; i++)
+ 			if (cookie && d->bitstreams[i] == cookie)
+ 				break;
+-		if (i == 64)
++		if (i == 64) {
++			if (dec_first_ring_fault(d))
++				VCPDBG("ring-fault: free-bs cookie r=%u w=%u remaining=%u cookie=%#llx expected=%#x events=%u\n",
++				       read, write, count, cookie, d->expected, d->event_count);
+ 			return -EPROTO;
++		}
++		if (d->input.cookie == cookie) {
++			ret = vcp_vdec_input_release(&d->input, cookie);
++			if (ret < 0)
++				return ret;
++			if (!ret)
++				goto next_bs;
++		}
+ 		ret = dec_push_event(d, VCP_VDEC_FREE_BITSTREAM, cookie, 0);
+ 		if (ret)
+ 			return ret;
+ 		d->bitstreams[i] = 0;
++		if (d->input.cookie == cookie)
++			memset(&d->input, 0, sizeof(d->input));
++next_bs:
+ 		read = (read + 1) % 64;
+ 	}
+ 	WRITE_ONCE(r->read, cpu_to_le32(read));
+ 	WRITE_ONCE(r->count, 0);
++publish:
+ 	dma_wmb();
+ 	return 0;
+ }
+@@ -261,23 +434,24 @@ static int dec_collect(struct mtk_vcp_vdec *d)
+ static void dec_receive_session(struct mtk_vcp_vdec *d, const void *data,
+ 				size_t size)
+ {
+-	u8 buf[64] __aligned(8);
++	u8 buf[64] __aligned(8) = {};
+ 	struct vcp_vdec_ack *a = (void *)buf;
+ 	u32 id, reply_id;
+-	int ret = 0;
++	int ret = 0, callback_error;
++	bool hardware_callback = false;
+ 
+ 	VCPDBG("rx: %zu bytes\n", size);
+-	if (size < sizeof(*a) || size > sizeof(buf)) {
++	if (size < offsetof(struct vcp_vdec_ack, codec_id) || size > sizeof(buf)) {
+ 		VCPDBG("rx: unexpected size %zu (ack is %zu)\n", size, sizeof(*a));
+ 		return;
+ 	}
+ 	memcpy(buf, data, size);
+-	if (le64_to_cpu(a->ap_inst_addr) != d->cookie) {
++	if (le64_to_cpu(a->cookie) != d->cookie) {
+ 		VCPDBG("rx: foreign context %#llx (mine %#llx)\n",
+-		       (u64)le64_to_cpu(a->ap_inst_addr), d->cookie);
++		       (u64)le64_to_cpu(a->cookie), d->cookie);
+ 		return;
+ 	}
+-	id = le32_to_cpu(a->msg_id);
++	id = le32_to_cpu(a->id);
+ 	VCPDBG("rx: id=%#x expected=%#x status=%d\n", id, d->expected,
+ 	       (s32)le32_to_cpu(a->status));
+ 	mutex_lock(&d->rx_lock);
+@@ -287,7 +461,12 @@ static void dec_receive_session(struct mtk_vcp_vdec *d, const void *data,
+ 		 * Keep whatever the receive buffer can hold and let the caller
+ 		 * validate the size it expects.
+ 		 */
+-		if (size < sizeof(*a)) {
++		size_t required = id == VCP_VDEC_INIT_DONE ?
++			sizeof(struct vcp_vdec_init_ack) :
++			id == VCP_VDEC_QUERY_CAP_DONE ? sizeof(struct vcp_vdec_query_ack) :
++			sizeof(*a);
++
++		if (size != required) {
+ 			dec_fail(d, -EPROTO);
+ 			goto out;
+ 		}
+@@ -302,9 +481,17 @@ static void dec_receive_session(struct mtk_vcp_vdec *d, const void *data,
+ 		dec_fail(d, -EPROTO);
+ 		goto out;
+ 	}
++	if (size != ((id == VCP_VDEC_MEM_ALLOC || id == VCP_VDEC_MEM_FREE) ?
++		     sizeof(struct vcp_vdec_mem_op) : sizeof(*a))) {
++		dec_fail(d, -EPROTO);
++		goto out;
++	}
+ 	reply_id = id + 0x1000;
+ 	switch (id) {
+ 	case VCP_VDEC_CHECK_CODEC_ID:
++		VCPDBG("codec check: requested=%u secure=%u expected=%u\n",
++		       le32_to_cpu(a->codec_id), le32_to_cpu(a->status),
++		       READ_ONCE(d->codec_id));
+ 		reply_id = VCP_VDEC_CHECK_ID_DONE;
+ 		ret = le32_to_cpu(a->codec_id) == READ_ONCE(d->codec_id) &&
+ 		      !a->status ? 0 : -EINVAL;
+@@ -315,17 +502,19 @@ static void dec_receive_session(struct mtk_vcp_vdec *d, const void *data,
+ 			dec_fail(d, -EPROTO);
+ 			goto out;
+ 		}
+-		ret = dec_memory(d, (void *)buf);
++		ret = d->hw_error && id == VCP_VDEC_MEM_ALLOC ?
++			d->hw_error : dec_memory(d, (void *)buf);
+ 		if (ret && id == VCP_VDEC_MEM_ALLOC) {
+ 			struct vcp_vdec_mem_op *m = (void *)buf;
+ 
+-			m->mem_iova = 0;
+-			m->mem_pa = 0;
+-			m->mem_va = 0;
++			m->iova = 0;
++			m->pa = 0;
++			m->va = 0;
+ 		}
+ 		break;
+ 	case VCP_VDEC_PUT_FRAME_BUFFER:
+-		ret = dec_collect(d);
++		/* Vendor callback may request notification without draining rings. */
++		ret = dec_collect_callback(d, !!le32_to_cpu(a->no_need_put));
+ 		if (!ret)
+ 			d->ops->notify(d->priv);
+ 		break;
+@@ -333,6 +522,21 @@ static void dec_receive_session(struct mtk_vcp_vdec *d, const void *data,
+ 	case VCP_VDEC_LOCK_LAT: {
+ 		unsigned int core = id == VCP_VDEC_LOCK_LAT;
+ 
++		hardware_callback = true;
++		if (d->hw_error) {
++			ret = d->hw_error;
++			break;
++		}
++
++		/* Only CORE payload requests the vendor AO power reference. LAT
++		 * always uses the regular engine path, regardless of payload. */
++		if (!core && a->payload) {
++			ret = d->ao_count == 64 ? -EOVERFLOW :
++				d->ops->power_ao(d->priv, true);
++			if (!ret)
++				d->ao_count++;
++			break;
++		}
+ 		if (test_bit(core, &d->cores))
+ 			ret = -EBUSY;
+ 		else
+@@ -345,6 +549,15 @@ static void dec_receive_session(struct mtk_vcp_vdec *d, const void *data,
+ 	case VCP_VDEC_UNLOCK_LAT: {
+ 		unsigned int core = id == VCP_VDEC_UNLOCK_LAT;
+ 
++		hardware_callback = true;
++
++		if (!core && a->payload) {
++			ret = !d->ao_count ? -EINVAL :
++				d->ops->power_ao(d->priv, false);
++			if (!ret)
++				d->ao_count--;
++			break;
++		}
+ 		if (!test_bit(core, &d->cores))
+ 			ret = -EINVAL;
+ 		else
+@@ -356,15 +569,19 @@ static void dec_receive_session(struct mtk_vcp_vdec *d, const void *data,
+ 	case VCP_VDEC_WAITISR: {
+ 		u32 core = le32_to_cpu(a->status);
+ 
+-		ret = core < 2 && test_bit(core, &d->cores) ?
+-			d->ops->wait_irq(d->priv, core) : -EINVAL;
++		hardware_callback = true;
++		ret = d->hw_error ?: (core < 2 && test_bit(core, &d->cores) ?
++			d->ops->wait_irq(d->priv, core) : -EINVAL);
+ 		break;
+ 	}
+ 	default:
+ 		ret = -EOPNOTSUPP;
+ 	}
+-	a->msg_id = cpu_to_le32(reply_id);
+-	a->ctx_id = cpu_to_le32(lower_32_bits(d->cookie));
++	callback_error = ret;
++	if (hardware_callback && callback_error)
++		dec_hardware_fail(d, id, callback_error);
++	a->id = cpu_to_le32(reply_id);
++	a->ctx = cpu_to_le32(lower_32_bits(d->cookie));
+ 	a->status = cpu_to_le32(ret);
+ 	dma_wmb();
+ 	ret = mtk_vcp_ipi_send(d->vcp, MTK_VCP_DECODER, buf, size);
+@@ -388,10 +605,11 @@ static void dec_receive(void *priv, const void *data, size_t size)
+ 	struct mtk_vcp_vdec *d;
+ 	u64 inst;
+ 
+-	if (size < sizeof(ack))
++	if (size < offsetof(struct vcp_vdec_ack, codec_id))
+ 		return;
+-	memcpy(&ack, data, sizeof(ack));
+-	inst = le64_to_cpu(ack.ap_inst_addr);
++	memset(&ack, 0, sizeof(ack));
++	memcpy(&ack, data, min(size, sizeof(ack)));
++	inst = le64_to_cpu(ack.cookie);
+ 	if (!inst)
+ 		return;
+ 	mutex_lock(&eng->lock);
+@@ -405,15 +623,21 @@ static void dec_receive(void *priv, const void *data, size_t size)
+ }
+ 
+ /* api_lock held, rx_lock must remain available while waiting for replies. */
+-static int dec_command(struct mtk_vcp_vdec *d, const void *msg, size_t size, u32 ack)
++static int dec_command_deadline(struct mtk_vcp_vdec *d, const void *msg,
++				size_t size, u32 ack, bool cleanup,
++				unsigned long deadline)
+ {
+-	unsigned long started = jiffies;
++	unsigned long started = jiffies, now, remaining;
+ 	u32 id = get_unaligned_le32(msg);
+ 	int ret;
+ 
+ 	mutex_lock(&d->rx_lock);
+-	if (d->broken) {
+-		ret = d->error ?: -EIO;
++	if (time_after_eq(jiffies, deadline)) {
++		mutex_unlock(&d->rx_lock);
++		return -ETIMEDOUT;
++	}
++	if (d->broken || (d->hw_error && !cleanup)) {
++		ret = d->broken ? (d->error ?: -EIO) : d->hw_error;
+ 		mutex_unlock(&d->rx_lock);
+ 		VCPDBG("cmd: id=%#x ack=%#x refused, session broken (%d)\n", id,
+ 		       ack, ret);
+@@ -430,13 +654,16 @@ static int dec_command(struct mtk_vcp_vdec *d, const void *msg, size_t size, u32
+ 		mtk_vcp_ipi_send(d->vcp, MTK_VCP_DECODER, msg, size);
+ 	VCPDBG("cmd: id=%#x ack=%#x size=%zu sent (ret=%d), waiting %u ms\n",
+ 	       id, ack, size, ret, DEC_RPC_TIMEOUT);
+-	if (!ret && !wait_for_completion_timeout(&d->reply, msecs_to_jiffies(DEC_RPC_TIMEOUT)))
++	now = jiffies;
++	remaining = time_before(now, deadline) ? deadline - now : 0;
++	if (!ret && (!remaining ||
++	    !wait_for_completion_timeout(&d->reply, remaining)))
+ 		ret = -ETIMEDOUT;
+ 	mutex_lock(&d->rx_lock);
+ 	if (ret)
+ 		dec_fail(d, ret);
+ 	else
+-		ret = d->error;
++		ret = d->error ?: (cleanup ? 0 : d->hw_error);
+ 	d->expected = 0;
+ 	mutex_unlock(&d->rx_lock);
+ 	dma_rmb();
+@@ -445,6 +672,18 @@ static int dec_command(struct mtk_vcp_vdec *d, const void *msg, size_t size, u32
+ 	return ret;
+ }
+ 
++static int dec_command_internal(struct mtk_vcp_vdec *d, const void *msg,
++				size_t size, u32 ack, bool cleanup)
++{
++	return dec_command_deadline(d, msg, size, ack, cleanup,
++				    jiffies + msecs_to_jiffies(DEC_RPC_TIMEOUT));
++}
++
++static int dec_command(struct mtk_vcp_vdec *d, const void *msg, size_t size, u32 ack)
++{
++	return dec_command_internal(d, msg, size, ack, false);
++}
++
+ struct mtk_vcp_vdec_engine *mtk_vcp_vdec_engine_create(struct device *dev,
+ 						       struct mtk_vcp *vcp)
+ {
+@@ -487,7 +726,7 @@ struct mtk_vcp_vdec *mtk_vcp_vdec_create(struct mtk_vcp_vdec_engine *engine,
+ {
+ 	struct mtk_vcp_vdec *d;
+ 
+-	if (!engine || !ops || !ops->power || !ops->wait_irq || !ops->alloc ||
++	if (!engine || !ops || !ops->power || !ops->power_ao || !ops->wait_irq || !ops->alloc ||
+ 	    !ops->free || !ops->notify)
+ 		return ERR_PTR(-EINVAL);
+ 	d = kzalloc_obj(*d);
+@@ -512,12 +751,14 @@ EXPORT_SYMBOL_GPL(mtk_vcp_vdec_create);
+ 
+ int mtk_vcp_vdec_init(struct mtk_vcp_vdec *d)
+ {
+-	static const char layout[] = "vendor.mtk.vdec.frame.layout.mode 0";
++	static const char layout[] =
++		"vendor.mtk.vdec.frame.layout.mode 0 "
++		"vendor.mtk.vdec.frame.layout.debug 1";
+ 	struct mtk_vcp_mem properties;
+ 	struct vcp_vdec_init msg = {
+-		.msg_id = cpu_to_le32(VCP_VDEC_AP_INIT),
+-		.ctx_id = cpu_to_le32(lower_32_bits(d->cookie)),
+-		.ap_inst_addr = cpu_to_le64(d->cookie),
++		.id = cpu_to_le32(VCP_VDEC_AP_INIT),
++		.ctx = cpu_to_le32(lower_32_bits(d->cookie)),
++		.cookie = cpu_to_le64(d->cookie),
+ 	};
+ 	int ret;
+ 
+@@ -527,7 +768,7 @@ int mtk_vcp_vdec_init(struct mtk_vcp_vdec *d)
+ 		goto out;
+ 	}
+ 	/* Firmware reads this property table when the decoder service starts.
+-	 * Request uncompressed MM21 for the CPU conversion to standard NV12M.
++	 * Enable the layout override and request uncompressed MM21 for NV12M.
+ 	 */
+ 	ret = mtk_vcp_get_mem(d->vcp, MTK_VCP_MEM_VDEC_PROP, &properties);
+ 	if (ret)
+@@ -537,6 +778,7 @@ int mtk_vcp_vdec_init(struct mtk_vcp_vdec *d)
+ 		goto out;
+ 	}
+ 	memcpy(properties.cpu, layout, sizeof(layout));
++	VCPDBG("property bootstrap bytes=%*phN\n", (int)sizeof(layout), properties.cpu);
+ 	dma_wmb();
+ 	/* Even a lost INIT reply can leave firmware allocations live. */
+ 	d->firmware_live = true;
+@@ -547,8 +789,8 @@ int mtk_vcp_vdec_init(struct mtk_vcp_vdec *d)
+ 		ret = -EPROTO;
+ 		goto out;
+ 	}
+-	d->address = get_unaligned_le32(d->response + 24);
+-	d->vsi = dec_shared(d, d->address, sizeof(*d->vsi));
++	d->address = get_unaligned_le64(d->response + 24);
++	d->vsi = dec_shared(d, d->address, MT6897_VDEC_VSI_EXTENT);
+ 	if (IS_ERR(d->vsi)) {
+ 		ret = PTR_ERR(d->vsi);
+ 		d->vsi = NULL;
+@@ -559,6 +801,10 @@ int mtk_vcp_vdec_init(struct mtk_vcp_vdec *d)
+ 	d->vsi->ipi_blocked = 0;
+ 	d->vsi->general_dma = cpu_to_le64(~0ULL);
+ 	d->vsi->general_fd = cpu_to_le32(-1);
++	d->vsi->general_size = 0;
++	dev_info(d->dev, "VDEC INIT modes: input=%u async=%u low_power=%u instance=%#llx\n",
++		d->vsi->input_driven, d->vsi->output_async,
++		d->vsi->low_pw_mode, d->address);
+ 	dma_wmb();
+ out:
+ 	mutex_unlock(&d->api_lock);
+@@ -588,10 +834,10 @@ EXPORT_SYMBOL_GPL(mtk_vcp_vdec_set_codec);
+ int mtk_vcp_vdec_query_cap(struct mtk_vcp_vdec *d, u32 id, void *out, size_t size)
+ {
+ 	struct vcp_vdec_query_cap msg = {
+-		.msg_id = cpu_to_le32(VCP_VDEC_AP_QUERY_CAP),
+-		.ctx_id = cpu_to_le32(lower_32_bits(d->cookie)),
+-		.id = cpu_to_le32(id),
+-		.ap_inst_addr = cpu_to_le64(d->cookie),
++		.id = cpu_to_le32(VCP_VDEC_AP_QUERY_CAP),
++		.ctx = cpu_to_le32(lower_32_bits(d->cookie)),
++		.query = cpu_to_le32(id),
++		.cookie = cpu_to_le64(d->cookie),
+ 	};
+ 	struct vcp_vdec_query_ack *ack = (void *)d->response;
+ 	void *shared;
+@@ -600,14 +846,15 @@ int mtk_vcp_vdec_query_cap(struct mtk_vcp_vdec *d, u32 id, void *out, size_t siz
+ 	if (!out || !size)
+ 		return -EINVAL;
+ 	mutex_lock(&d->api_lock);
+-	if (!d->initialized || d->broken) {
++	if (!d->initialized || d->broken || READ_ONCE(d->hw_error)) {
+ 		ret = -EIO;
+ 		goto out;
+ 	}
+ 	ret = dec_command(d, &msg, sizeof(msg), VCP_VDEC_QUERY_CAP_DONE);
+ 	if (ret)
+ 		goto out;
+-	if (d->response_size != sizeof(*ack)) {
++	if (d->response_size != sizeof(*ack) ||
++	    le32_to_cpu(ack->query) != id || ack->data_cookie) {
+ 		dev_info(d->dev,
+ 			 "VDEC query %u: reply size %zu, want %zu, head=%*phN\n", id,
+ 			 d->response_size, sizeof(*ack),
+@@ -615,7 +862,7 @@ int mtk_vcp_vdec_query_cap(struct mtk_vcp_vdec *d, u32 id, void *out, size_t siz
+ 		ret = -EPROTO;
+ 		goto out;
+ 	}
+-	shared = dec_shared(d, get_unaligned_le32(d->response + 40), size);
++	shared = dec_shared(d, le64_to_cpu(ack->address), size);
+ 	if (IS_ERR(shared)) {
+ 		ret = PTR_ERR(shared);
+ 		goto out;
+@@ -628,9 +875,10 @@ int mtk_vcp_vdec_query_cap(struct mtk_vcp_vdec *d, u32 id, void *out, size_t siz
+ }
+ EXPORT_SYMBOL_GPL(mtk_vcp_vdec_query_cap);
+ 
+-/* The firmware only delivers 8-bit MM21 and 10-bit MT2T pictures; anything
+- * else (other bit depths, 4:2:2/4:4:4, compressed layouts) has no frontend
+- * conversion path.
++/* This frontend accepts 8-bit MM21 and 10-bit MT2T pictures; anything
++ * else (other bit depths, 4:2:2/4:4:4, other formats/layouts) has no frontend
++ * conversion path. The CPU detiler accepts only layout 0; other firmware
++ * layouts require their own conversion contract.
+  */
+ static bool vcp_vdec_layout_ok(struct vcp_vdec_vsi *v, struct vcp_vdec_picture *p)
+ {
+@@ -646,8 +894,8 @@ static bool vcp_vdec_layout_ok(struct vcp_vdec_vsi *v, struct vcp_vdec_picture *
+ 	}
+ 	if (depth == 8)
+ 		return p->fourcc == V4L2_PIX_FMT_MM21 &&
+-		       p->size[0] == (u64)p->stride * p->buffer_height &&
+-		       p->size[1] == p->size[0] / 2;
++		       mtk_vcp_mm21_valid(p->stride, p->buffer_height,
++					p->size[0], p->size[1], le32_to_cpu(v->pic.layout));
+ 	return false;
+ }
+ 
+@@ -658,7 +906,7 @@ int mtk_vcp_vdec_picture(struct mtk_vcp_vdec *d, struct vcp_vdec_picture *p)
+ 
+ 	mutex_lock(&d->api_lock);
+ 	v = d->vsi;
+-	if (!v || d->broken) {
++	if (!v || d->broken || READ_ONCE(d->hw_error)) {
+ 		ret = -EIO;
+ 		goto out;
+ 	}
+@@ -676,6 +924,15 @@ int mtk_vcp_vdec_picture(struct mtk_vcp_vdec *d, struct vcp_vdec_picture *p)
+ 	p->crop_top = le32_to_cpu(v->crop_top);
+ 	p->crop_width = le32_to_cpu(v->crop_width);
+ 	p->crop_height = le32_to_cpu(v->crop_height);
++	VCPDBG("picture: %ux%u buffer=%ux%u sizes=%u/%u crop=%u,%u %ux%u depth=%u layout=%u fourcc=%#x field=%u dpb=%u planes=%u modes=%u/%u/%u changed=%#x error=%#x general=%#llx/%#x/%u\n",
++		p->width, p->height, p->stride, p->buffer_height, p->size[0], p->size[1],
++		p->crop_left, p->crop_top, p->crop_width, p->crop_height,
++		le32_to_cpu(v->pic.bitdepth), le32_to_cpu(v->pic.layout), p->fourcc,
++		le32_to_cpu(v->pic.field), p->dpb, le32_to_cpu(v->dec.planes),
++		v->input_driven, v->output_async, v->low_pw_mode,
++		le32_to_cpu(v->dec.changed), le32_to_cpu(v->dec.error_map),
++		le64_to_cpu(v->general_dma), le32_to_cpu(v->general_fd),
++		le32_to_cpu(v->general_size));
+ 	/* 10-bit pictures arrive in the MT2T tile layout at 10 bits per sample:
+ 	 * five bytes per four samples. Chroma tiles need an even tile column
+ 	 * count, hence the 32-aligned stride.
+@@ -685,6 +942,8 @@ int mtk_vcp_vdec_picture(struct mtk_vcp_vdec *d, struct vcp_vdec_picture *p)
+ 	    p->buffer_height < p->height || p->buffer_height > 2176 ||
+ 	    (p->buffer_height & 31) || !p->dpb || p->dpb > 32 ||
+ 	    (p->input_driven != 0 && p->input_driven != 2) ||
++	    !mtk_vcp_crop_valid(p->width, p->height, p->crop_left, p->crop_top,
++				p->crop_width, p->crop_height) ||
+ 	    !vcp_vdec_layout_ok(v, p)) {
+ 		dev_err(d->dev,
+ 			"unsupported picture %ux%u buffer %ux%u size %u/%u dpb %u format %#x depth %u layout %u input %u\n",
+@@ -706,23 +965,23 @@ int mtk_vcp_vdec_frame(struct mtk_vcp_vdec *d, u64 cookie, unsigned int index,
+ 		       dma_addr_t y, dma_addr_t c)
+ {
+ 	struct vcp_vdec_set_param msg = {
+-		.msg_id = cpu_to_le32(VCP_VDEC_AP_FRAME_BUFFER),
+-		.ctx_id = cpu_to_le32(lower_32_bits(d->cookie)),
+-		.vcp_inst_addr = cpu_to_le32(d->address),
++		.id = cpu_to_le32(VCP_VDEC_AP_FRAME_BUFFER),
++		.ctx = cpu_to_le32(lower_32_bits(d->cookie)),
++		.instance = cpu_to_le64(d->address),
+ 	};
+-	struct vcp_vdec_fb f = {
++	struct vcp_vdec_fb_ipi f = {
+ 		.cookie = cpu_to_le64(cookie), .y = cpu_to_le64(y), .c = cpu_to_le64(c),
+ 		.general = cpu_to_le64(~0ULL), .reserved = cpu_to_le32(index),
+ 	};
+ 	unsigned int i, slot = 64;
+ 	int ret;
+ 
+-	if (!cookie || index >= 64 || !y || !c || y >= 0x400000000ULL || c >= 0x400000000ULL)
++	if (!cookie || index >= 64 || !y || !c || y >= 0x100000000ULL || c >= 0x100000000ULL)
+ 		return -EINVAL;
+ 	mutex_lock(&d->api_lock);
+ 	mutex_lock(&d->rx_lock);
+ 	ret = -EINVAL;
+-	if (!d->initialized || d->broken)
++	if (!d->initialized || d->broken || READ_ONCE(d->hw_error))
+ 		goto unlock;
+ 	for (i = 0; i < 64; i++) {
+ 		if (d->surfaces[i].cookie == cookie)
+@@ -754,14 +1013,38 @@ int mtk_vcp_vdec_frame(struct mtk_vcp_vdec *d, u64 cookie, unsigned int index,
+ }
+ EXPORT_SYMBOL_GPL(mtk_vcp_vdec_frame);
+ 
++/* Shipping header setup: SET_PARAM_FRAME_SIZE updates the shared fields,
++ * then SET_PARAM_DEC_PARAMS (22) sends a zero-data 64-byte notification.
++ * This frontend has no optional container-size control: use vendor 0/0.
++ */
++int mtk_vcp_vdec_prepare_header(struct mtk_vcp_vdec *d)
++{
++	struct vcp_vdec_set_param msg = {
++		.id = cpu_to_le32(VCP_VDEC_AP_SET_PARAM),
++		.ctx = cpu_to_le32(lower_32_bits(d->cookie)),
++		.instance = cpu_to_le64(d->address),
++		.param = cpu_to_le32(22),
++	};
++	int ret = -EINVAL;
++
++	mutex_lock(&d->api_lock);
++	if (d->initialized && !d->broken) {
++		mt6897_vdec_header_params(&d->vsi->params);
++		ret = dec_command(d, &msg, sizeof(msg), VCP_VDEC_SET_PARAM_DONE);
++	}
++	mutex_unlock(&d->api_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mtk_vcp_vdec_prepare_header);
++
+ int mtk_vcp_vdec_start(struct mtk_vcp_vdec *d, u64 cookie, dma_addr_t dma,
+ 		       u32 bytes, u32 capacity, u64 timestamp, u32 *changed,
+-		       u64 *fb_cookie)
++		       u64 *fb_cookie, unsigned long deadline)
+ {
+ 	struct vcp_vdec_start msg = {
+-		.msg_id = cpu_to_le32(VCP_VDEC_AP_START),
+-		.ctx_id = cpu_to_le32(lower_32_bits(d->cookie)),
+-		.vcp_inst_addr = cpu_to_le32(d->address),
++		.id = cpu_to_le32(VCP_VDEC_AP_START),
++		.ctx = cpu_to_le32(lower_32_bits(d->cookie)),
++		.instance = cpu_to_le64(d->address),
+ 		.data = { cpu_to_le32(bytes), cpu_to_le32(capacity), 0 },
+ 	};
+ 	unsigned int i, slot = 64, frames = 0, frame_slot = 64;
+@@ -771,17 +1054,25 @@ int mtk_vcp_vdec_start(struct mtk_vcp_vdec *d, u64 cookie, dma_addr_t dma,
+ 	if (fb_cookie)
+ 		*fb_cookie = 0;
+ 	if (!cookie || !bytes || bytes > capacity || capacity > SZ_16M ||
+-	    dma < 0x110000000ULL || dma >= 0x130000000ULL ||
+-	    capacity > 0x130000000ULL - dma || !changed)
++	    !mtk_vcp_sw_dma_valid(dma, capacity) || !changed)
+ 		return -EINVAL;
+ 	mutex_lock(&d->api_lock);
+ 	mutex_lock(&d->rx_lock);
+-	if (!d->initialized || d->broken)
++	if (!d->initialized || d->broken || READ_ONCE(d->hw_error))
+ 		goto unlock;
+-	for (i = 0; i < 64; i++) {
+-		if (d->bitstreams[i] == cookie)
++	if (d->input.more) {
++		ret = dec_collect(d);
++		if (ret)
+ 			goto unlock;
+-		if (!d->bitstreams[i])
++	}
++	ret = -EINVAL;
++	for (i = 0; i < 64; i++) {
++		if (d->bitstreams[i] == cookie) {
++			if (!d->input.more || d->input.cookie != cookie)
++				goto unlock;
++			slot = i;
++		}
++		if (!d->bitstreams[i] && !d->input.cookie)
+ 			slot = i;
+ 		if (d->surfaces[i].cookie)
+ 			frames++;
+@@ -794,6 +1085,10 @@ int mtk_vcp_vdec_start(struct mtk_vcp_vdec *d, u64 cookie, dma_addr_t dma,
+ 	parsing_header = !d->picture_known;
+ 	if (!parsing_header && !d->vsi->input_driven && frame_slot == 64)
+ 		goto unlock;
++	ret = vcp_vdec_input_begin(&d->input, cookie, dma, bytes, capacity, timestamp, deadline);
++	if (ret)
++		goto unlock;
++	d->flushing = false;
+ 	d->bitstreams[slot] = cookie;
+ 	d->vsi->dec.bs_dma = cpu_to_le64(dma);
+ 	d->vsi->dec.bs_cookie = cpu_to_le64(cookie);
+@@ -814,27 +1109,30 @@ int mtk_vcp_vdec_start(struct mtk_vcp_vdec *d, u64 cookie, dma_addr_t dma,
+ 	d->vsi->dec.timestamp = cpu_to_le64(timestamp);
+ 	d->vsi->dec.queued_frames = cpu_to_le32(frames);
+ 	mutex_unlock(&d->rx_lock);
+-	ret = dec_command(d, &msg, sizeof(msg), VCP_VDEC_START_DONE);
++	ret = dec_command_deadline(d, &msg, sizeof(msg), VCP_VDEC_START_DONE, false, deadline);
+ 	*changed = le32_to_cpu(d->vsi->dec.changed);
+-	if (!ret && !d->vsi->input_driven) {
++	if (ret < 0)
++		dev_info(d->dev, "START failed: status=%d changed=%#x error_map=%#x bs=%pad bytes=%u capacity=%u\n",
++			 ret, *changed, le32_to_cpu(d->vsi->dec.error_map),
++			 &dma, bytes, capacity);
++	if (!ret) {
+ 		mutex_lock(&d->rx_lock);
+ 		ret = dec_collect(d);
+-		/* START_DONE releases the synchronous input even if this firmware
+-		 * omits it from free_bs. A callback may already have returned it.
+-		 */
+-		if (!ret && d->bitstreams[slot]) {
+-			d->bitstreams[slot] = 0;
+-			ret = dec_push_event(d, VCP_VDEC_FREE_BITSTREAM, cookie, 0);
+-		}
+-		mutex_unlock(&d->rx_lock);
+-	} else if (!ret && parsing_header && (*changed & BIT(0))) {
+-		/* The initial resolution notification requires resubmitting this
+-		 * access unit. Firmware has not queued the bitstream for decoding.
+-		 */
+-		mutex_lock(&d->rx_lock);
+-		if (d->bitstreams[slot]) {
+-			d->bitstreams[slot] = 0;
+-			ret = dec_push_event(d, VCP_VDEC_FREE_BITSTREAM, cookie, 0);
++		if (!ret) {
++			int complete = vcp_vdec_input_ack(&d->input,
++					*changed & BIT(4));
++
++			if (complete < 0) {
++				ret = complete;
++			} else if (!(*changed & BIT(4)) &&
++				   (complete || !d->vsi->input_driven ||
++				    (parsing_header && (*changed & BIT(0))))) {
++				ret = dec_push_event(d, VCP_VDEC_FREE_BITSTREAM, cookie, 0);
++				if (!ret) {
++					d->bitstreams[slot] = 0;
++					memset(&d->input, 0, sizeof(d->input));
++				}
++			}
+ 		}
+ 		mutex_unlock(&d->rx_lock);
+ 	}
+@@ -850,36 +1148,45 @@ EXPORT_SYMBOL_GPL(mtk_vcp_vdec_start);
+ static int dec_simple_command(struct mtk_vcp_vdec *d, u32 command, u32 ack, u32 flags)
+ {
+ 	struct vcp_vdec_cmd msg = {
+-		.msg_id = cpu_to_le32(command),
+-		.ctx_id = cpu_to_le32(lower_32_bits(d->cookie)),
+-		.vcp_inst_addr = cpu_to_le32(d->address),
+-		.reserved = cpu_to_le32(flags),
++		.id = cpu_to_le32(command),
++		.ctx = cpu_to_le32(lower_32_bits(d->cookie)),
++		.instance = cpu_to_le64(d->address),
++		.drain_type = cpu_to_le32(flags),
+ 	};
+ 
+-	return dec_command(d, &msg, sizeof(msg), ack);
++	return dec_command_internal(d, &msg, sizeof(msg), ack,
++		!flags && (command == VCP_VDEC_AP_RESET || command == VCP_VDEC_AP_DEINIT));
+ }
+ 
+ int mtk_vcp_vdec_reset(struct mtk_vcp_vdec *d, bool drain)
+ {
+ 	struct vcp_vdec_set_param flush = {
+-		.msg_id = cpu_to_le32(VCP_VDEC_AP_FRAME_BUFFER),
+-		.ctx_id = cpu_to_le32(lower_32_bits(d->cookie)),
+-		.vcp_inst_addr = cpu_to_le32(d->address),
++		.id = cpu_to_le32(VCP_VDEC_AP_FRAME_BUFFER),
++		.ctx = cpu_to_le32(lower_32_bits(d->cookie)),
++		.instance = cpu_to_le64(d->address),
+ 	};
+ 	int ret;
+ 
++	VCPDBG("flush begin: initialized=%d\n", d->initialized);
+ 	mutex_lock(&d->api_lock);
+ 	ret = -EINVAL;
+ 	if (!d->initialized)
+ 		goto out;
++	mutex_lock(&d->rx_lock);
++	d->flushing = true;
++	mutex_unlock(&d->rx_lock);
++	if (drain && READ_ONCE(d->hw_error)) {
++		ret = READ_ONCE(d->hw_error);
++		goto out;
++	}
+ 	/* Drain returns decoded references but leaves unused resources queued.
+ 	 * A null FRAME_BUFFER plus RESET flush returns those resources as well.
+ 	 */
+ 	ret = drain || !d->vsi->input_driven ? 0 :
+-		dec_command(d, &flush, sizeof(flush), VCP_VDEC_DONE);
++		dec_command_internal(d, &flush, sizeof(flush), VCP_VDEC_DONE, true);
+ 	if (!ret)
+ 		ret = dec_simple_command(d, VCP_VDEC_AP_RESET, VCP_VDEC_RESET_DONE, drain);
+-	if (!ret && !d->vsi->input_driven) {
++	if (!ret && !d->vsi->input_driven && !READ_ONCE(d->hw_error)) {
+ 		unsigned int i;
+ 
+ 		mutex_lock(&d->rx_lock);
+@@ -895,6 +1202,24 @@ int mtk_vcp_vdec_reset(struct mtk_vcp_vdec *d, bool drain)
+ 		}
+ 		mutex_unlock(&d->rx_lock);
+ 	}
++	if (!ret && !READ_ONCE(d->hw_error)) {
++		unsigned int i;
++
++		mutex_lock(&d->rx_lock);
++		ret = dec_collect(d);
++		if (!ret && d->input.cookie) {
++			if (vcp_vdec_input_reset_ack(&d->input)) {
++				ret = dec_push_event(d, VCP_VDEC_FREE_BITSTREAM,
++						     d->input.cookie, 0);
++				for (i = 0; !ret && i < 64; i++)
++					if (d->bitstreams[i] == d->input.cookie)
++						d->bitstreams[i] = 0;
++				if (!ret)
++					memset(&d->input, 0, sizeof(d->input));
++			}
++		}
++		mutex_unlock(&d->rx_lock);
++	}
+ 	if (!ret && !drain)
+ 		d->picture_known = false;
+ out:
+@@ -905,9 +1230,8 @@ int mtk_vcp_vdec_reset(struct mtk_vcp_vdec *d, bool drain)
+ }
+ EXPORT_SYMBOL_GPL(mtk_vcp_vdec_reset);
+ 
+-/* Drain the firmware-owned free/display rings. In input-driven mode the
+- * firmware reports finished pictures through those rings instead of an IPI, so
+- * the client has to poll them while it is decoding.
++/* Collect worker-owned input releases and synchronous output. Async frame
++ * events have already been collected before PUT_FRAME_BUFFER is acknowledged.
+  */
+ int mtk_vcp_vdec_collect(struct mtk_vcp_vdec *d)
+ {
+@@ -927,7 +1251,9 @@ int mtk_vcp_vdec_event(struct mtk_vcp_vdec *d, struct vcp_vdec_event *e)
+ 	int ret = -EAGAIN;
+ 
+ 	mutex_lock(&d->rx_lock);
+-	if (d->event_count) {
++	if (d->hw_error) {
++		ret = d->hw_error;
++	} else if (d->event_count) {
+ 		*e = d->events[d->event_read];
+ 		d->event_read = (d->event_read + 1) % DEC_EVENTS;
+ 		d->event_count--;
+@@ -944,19 +1270,23 @@ EXPORT_SYMBOL_GPL(mtk_vcp_vdec_event);
+ int mtk_vcp_vdec_deinit(struct mtk_vcp_vdec *d)
+ {
+ 	struct vcp_vdec_set_param flush = {
+-		.msg_id = cpu_to_le32(VCP_VDEC_AP_FRAME_BUFFER),
+-		.ctx_id = cpu_to_le32(lower_32_bits(d->cookie)),
+-		.vcp_inst_addr = cpu_to_le32(d->address),
++		.id = cpu_to_le32(VCP_VDEC_AP_FRAME_BUFFER),
++		.ctx = cpu_to_le32(lower_32_bits(d->cookie)),
++		.instance = cpu_to_le64(d->address),
+ 	};
+ 	int ret;
+ 
++	VCPDBG("flush begin: initialized=%d\n", d->initialized);
+ 	mutex_lock(&d->api_lock);
+ 	ret = -EINVAL;
+ 	if (!d->initialized)
+ 		goto out;
++	mutex_lock(&d->rx_lock);
++	d->flushing = true;
++	mutex_unlock(&d->rx_lock);
+ 	/* Deinitializing with unused frames in service2 crashes xaga firmware. */
+ 	ret = !d->vsi->input_driven ? 0 :
+-		dec_command(d, &flush, sizeof(flush), VCP_VDEC_DONE);
++		dec_command_internal(d, &flush, sizeof(flush), VCP_VDEC_DONE, true);
+ 	if (!ret)
+ 		ret = dec_simple_command(d, VCP_VDEC_AP_RESET, VCP_VDEC_RESET_DONE, 0);
+ 	if (!ret)
+@@ -982,7 +1312,7 @@ int mtk_vcp_vdec_destroy(struct mtk_vcp_vdec *d, bool after_reset)
+ 	if (!d)
+ 		return 0;
+ 	if (after_reset ? !mtk_vcp_is_offline(d->vcp) :
+-	    (d->firmware_live || d->broken || d->cores)) {
++	    (d->firmware_live || d->broken || READ_ONCE(d->hw_error) || d->cores)) {
+ 		VCPDBG("destroy: busy, after_reset=%d live=%d broken=%d cores=%#lx offline=%d\n",
+ 		       after_reset, d->firmware_live, d->broken, d->cores,
+ 		       mtk_vcp_is_offline(d->vcp));
+@@ -1003,4 +1333,4 @@ int mtk_vcp_vdec_destroy(struct mtk_vcp_vdec *d, bool after_reset)
+ EXPORT_SYMBOL_GPL(mtk_vcp_vdec_destroy);
+ 
+ MODULE_LICENSE("GPL");
+-MODULE_DESCRIPTION("MediaTek MT6895 VCP decoder protocol");
++MODULE_DESCRIPTION("MediaTek MT6897 VCP decoder protocol");
+diff --git a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec.h b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec.h
+index 2a2de3019b..1db5f29ab1 100644
+--- a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec.h
++++ b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec.h
+@@ -12,6 +12,7 @@ struct mtk_vcp_vdec;
+  */
+ struct mtk_vcp_vdec_ops {
+ 	int (*power)(void *priv, unsigned int core, bool on);
++	int (*power_ao)(void *priv, bool on);
+ 	int (*wait_irq)(void *priv, unsigned int core);
+ 	int (*alloc)(void *priv, u32 type, size_t size, struct mtk_vcp_mem *mem);
+ 	void (*free)(void *priv, u32 type, struct mtk_vcp_mem *mem);
+@@ -27,6 +28,7 @@ enum vcp_vdec_event_type {
+ struct vcp_vdec_event {
+ 	enum vcp_vdec_event_type type;
+ 	u64 cookie, timestamp;
++	bool no_generated; /* DISPLAY reserved: no picture bytes were produced */
+ };
+ 
+ struct vcp_vdec_picture {
+@@ -51,6 +53,7 @@ void mtk_vcp_vdec_engine_destroy(struct mtk_vcp_vdec_engine *engine);
+ struct mtk_vcp_vdec *mtk_vcp_vdec_create(struct mtk_vcp_vdec_engine *engine,
+ 					 const struct mtk_vcp_vdec_ops *ops, void *priv);
+ int mtk_vcp_vdec_init(struct mtk_vcp_vdec *dec);
++int mtk_vcp_vdec_prepare_header(struct mtk_vcp_vdec *dec);
+ int mtk_vcp_vdec_set_codec(struct mtk_vcp_vdec *dec, u32 codec_id);
+ int mtk_vcp_vdec_query_cap(struct mtk_vcp_vdec *dec, u32 id, void *out, size_t size);
+ int mtk_vcp_vdec_picture(struct mtk_vcp_vdec *dec, struct vcp_vdec_picture *pic);
+@@ -58,7 +61,7 @@ int mtk_vcp_vdec_frame(struct mtk_vcp_vdec *dec, u64 cookie, unsigned int index,
+ 		       dma_addr_t y, dma_addr_t c);
+ int mtk_vcp_vdec_start(struct mtk_vcp_vdec *dec, u64 cookie, dma_addr_t dma,
+ 		       u32 bytes, u32 capacity, u64 timestamp, u32 *changed,
+-		       u64 *fb_cookie);
++		       u64 *fb_cookie, unsigned long deadline);
+ int mtk_vcp_vdec_reset(struct mtk_vcp_vdec *dec, bool drain);
+ int mtk_vcp_vdec_collect(struct mtk_vcp_vdec *dec);
+ int mtk_vcp_vdec_event(struct mtk_vcp_vdec *dec, struct vcp_vdec_event *event);
+diff --git a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_abi.h b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_abi.h
+index 40a087f5bd..ef37db01f3 100644
+--- a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_abi.h
++++ b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_abi.h
+@@ -1,123 +1,58 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+ #ifndef __MTK_VCP_VDEC_ABI_H
+ #define __MTK_VCP_VDEC_ABI_H
+-
+-#include <linux/build_bug.h>
+-#include <linux/types.h>
+ #include <linux/videodev2.h>
++#include "mtk_vcp_vdec_mt6897_abi.h"
+ 
+-/* MT6895 RISC-V VCP vendor ABI, verified against xaga vendor headers. */
+-#define VCP_VDEC_AP_SEND_BASE       0xa000
+-#define VCP_VDEC_ACK_BASE           0xb000
+-#define VCP_VDEC_VCP_SEND_BASE      0xc000
+-#define VCP_VDEC_AP_ACK_BASE        0xd000
+-
+-enum vcp_vdec_msg_id {
+-	VCP_VDEC_AP_INIT = VCP_VDEC_AP_SEND_BASE,
+-	VCP_VDEC_AP_START,
+-	VCP_VDEC_AP_END,
+-	VCP_VDEC_AP_DEINIT,
+-	VCP_VDEC_AP_RESET,
+-	VCP_VDEC_AP_SET_PARAM,
+-	VCP_VDEC_AP_QUERY_CAP,
+-	VCP_VDEC_AP_FRAME_BUFFER,
+-	VCP_VDEC_AP_BACKUP,
+-	VCP_VDEC_INIT_DONE = VCP_VDEC_ACK_BASE,
+-	VCP_VDEC_START_DONE,
+-	VCP_VDEC_DONE,
+-	VCP_VDEC_DEINIT_DONE,
+-	VCP_VDEC_RESET_DONE,
+-	VCP_VDEC_SET_PARAM_DONE,
+-	VCP_VDEC_QUERY_CAP_DONE,
+-	VCP_VDEC_PUT_FRAME_BUFFER = VCP_VDEC_VCP_SEND_BASE,
+-	VCP_VDEC_LOCK_CORE,
+-	VCP_VDEC_UNLOCK_CORE,
+-	VCP_VDEC_LOCK_LAT,
+-	VCP_VDEC_UNLOCK_LAT,
+-	VCP_VDEC_MEM_ALLOC,
+-	VCP_VDEC_MEM_FREE,
+-	VCP_VDEC_WAITISR,
+-	VCP_VDEC_GET_FRAME_BUFFER,
+-	VCP_VDEC_CHECK_CODEC_ID,
+-};
+-
+-struct vcp_vdec_cmd {
+-	__le32 msg_id, ctx_id, vcp_inst_addr, reserved;
+-};
+-
+-struct vcp_vdec_init {
+-	__le32 msg_id, ctx_id, reserved;
+-	__le64 ap_inst_addr;
+-};
+-
+-struct vcp_vdec_start {
+-	__le32 msg_id, ctx_id, vcp_inst_addr;
+-	__le32 data[3], reserved;
+-};
+-
+-struct vcp_vdec_set_param {
+-	__le32 msg_id, ctx_id, vcp_inst_addr, id;
+-	__le32 data[12];
+-};
+-
+-struct vcp_vdec_query_cap {
+-	__le32 msg_id, ctx_id, id;
+-	__le64 ap_inst_addr, ap_data_addr;
+-};
+-
+-/* The query id field of VCP_VDEC_AP_QUERY_CAP. The reply is an array of
+- * VCP_VDEC_CAPS entries of the matching structure, written by the firmware
+- * and copied out by the AP.
+- */
+-enum vcp_vdec_cap_id {
+-	VCP_VDEC_CAP_SUPPORTED_FORMATS = 8,
+-	VCP_VDEC_CAP_FRAME_SIZES = 9,
+-};
+-
+-struct vcp_vdec_cap_format {
+-	__le32 fourcc;
+-	__le32 type;
+-	__le32 num_planes;
+-};
+-
+-struct vcp_vdec_cap_framesize {
+-	__le32 fourcc;
+-	__le32 profile;
+-	__le32 level;
+-	struct v4l2_frmsize_stepwise stepwise;
+-};
+-
+-struct vcp_vdec_ack {
+-	__le32 msg_id, ctx_id, status;
+-	__le64 ap_inst_addr;
+-	__le32 codec_id, reserved;
+-};
+-
+-struct vcp_vdec_init_ack {
+-	__le32 msg_id, ctx_id, status;
+-	__le64 ap_inst_addr;
+-	__le32 vcp_inst_addr;
+-};
+-
+-struct vcp_vdec_mem_op {
+-	__le32 msg_id, ctx_id, status;
+-	__le64 ap_inst_addr;
+-	__le32 mem_type, mem_len;
+-	__le64 mem_iova, mem_pa, mem_va;
+-	__le32 reserved[2];
+-};
+-
+-/* Vendor frame/plane limits are independent of the AP vb2 limits. */
+-#define VCP_VDEC_BUFFERS 64
+-#define VCP_VDEC_PLANES 8
+-#define VCP_VDEC_CAPS 128
++/* This frontend only implements the MT6897 shipping firmware family. */
++#define VCP_VDEC_VCP_SEND_BASE 0xc000
++#define VCP_VDEC_BUFFERS MT6897_VDEC_BUFFERS
++#define VCP_VDEC_PLANES MT6897_VDEC_PLANES
++#define VCP_VDEC_CAPS MT6897_VDEC_CAPS
+ #define VCP_VDEC_CHECK_ID_DONE 0xd008
++#define VCP_VDEC_CAP_SUPPORTED_FORMATS 8
++#define VCP_VDEC_CAP_FRAME_SIZES 9
++#define VCP_VDEC_AP_INIT MT6897_VDEC_INIT
++#define VCP_VDEC_AP_START MT6897_VDEC_START
++#define VCP_VDEC_AP_DEINIT MT6897_VDEC_DEINIT
++#define VCP_VDEC_AP_RESET MT6897_VDEC_RESET
++#define VCP_VDEC_AP_SET_PARAM MT6897_VDEC_SET_PARAM
++#define VCP_VDEC_AP_QUERY_CAP MT6897_VDEC_QUERY_CAP
++#define VCP_VDEC_AP_FRAME_BUFFER MT6897_VDEC_FRAME_BUFFER
++#define VCP_VDEC_INIT_DONE MT6897_VDEC_INIT_DONE
++#define VCP_VDEC_START_DONE MT6897_VDEC_START_DONE
++#define VCP_VDEC_DEINIT_DONE MT6897_VDEC_DEINIT_DONE
++#define VCP_VDEC_RESET_DONE MT6897_VDEC_RESET_DONE
++#define VCP_VDEC_SET_PARAM_DONE MT6897_VDEC_SET_PARAM_DONE
++#define VCP_VDEC_QUERY_CAP_DONE MT6897_VDEC_QUERY_CAP_DONE
++#define VCP_VDEC_DONE MT6897_VDEC_DONE
++#define VCP_VDEC_PUT_FRAME_BUFFER MT6897_VDEC_PUT_FRAME_BUFFER
++#define VCP_VDEC_LOCK_CORE MT6897_VDEC_LOCK_CORE
++#define VCP_VDEC_UNLOCK_CORE MT6897_VDEC_UNLOCK_CORE
++#define VCP_VDEC_LOCK_LAT MT6897_VDEC_LOCK_LAT
++#define VCP_VDEC_UNLOCK_LAT MT6897_VDEC_UNLOCK_LAT
++#define VCP_VDEC_MEM_ALLOC MT6897_VDEC_MEM_ALLOC
++#define VCP_VDEC_MEM_FREE MT6897_VDEC_MEM_FREE
++#define VCP_VDEC_WAITISR MT6897_VDEC_WAITISR
++#define VCP_VDEC_GET_FRAME_BUFFER MT6897_VDEC_GET_FRAME_BUFFER
++#define VCP_VDEC_CHECK_CODEC_ID MT6897_VDEC_CHECK_CODEC_ID
++#define vcp_vdec_cmd mt6897_vdec_cmd
++#define vcp_vdec_init mt6897_vdec_init
++#define vcp_vdec_start mt6897_vdec_start
++#define vcp_vdec_set_param mt6897_vdec_set_param
++#define vcp_vdec_query_cap mt6897_vdec_query
++#define vcp_vdec_cap_format mt6897_vdec_format
++#define vcp_vdec_cap_framesize mt6897_vdec_frame_size
++#define vcp_vdec_ack mt6897_vdec_ack
++#define vcp_vdec_init_ack mt6897_vdec_init_ack
++#define vcp_vdec_mem_op mt6897_vdec_mem_op
++#define vcp_vdec_query_ack mt6897_vdec_query_ack
++#define vcp_vdec_fb mt6897_vdec_fb
++#define vcp_vdec_fb_ipi mt6897_vdec_fb_ipi
++#define vcp_vdec_bs_ring mt6897_vdec_bs_ring
++#define vcp_vdec_fb_ring mt6897_vdec_fb_ring
++#define vcp_vdec_vsi mt6897_vdec_vsi
+ 
+-/* Codec ids carried in the VCP_VDEC_CHECK_CODEC_ID handshake. They are the
+- * vendor enum mtk_codec_type, shared with the encoder ABI, and have nothing
+- * to do with the V4L2 fourcc. During INIT the firmware probes the codecs it
+- * knows, one at a time, until the AP confirms the one the session uses.
+- */
+ enum vcp_vdec_codec {
+ 	VCP_VDEC_UNKNOWN = 0,
+ 	VCP_VDEC_H264,
+@@ -134,91 +69,5 @@ enum vcp_vdec_codec {
+ 	VCP_VDEC_AV1,
+ };
+ 
+-struct vcp_vdec_query_ack {
+-	__le32 id, ctx, status;
+-	__le64 cookie;
+-	__le32 query;
+-	__le64 data_cookie;
+-	__le32 address;
+-};
+-
+-struct vcp_vdec_fb {
+-	__le64 cookie, y, c, general, timestamp;
+-	__le32 general_size, reserved;
+-};
+-
+-struct vcp_vdec_bs_ring {
+-	__le64 cookie[VCP_VDEC_BUFFERS];
+-	__le32 read, write, count, reserved;
+-};
+-
+-struct vcp_vdec_fb_ring {
+-	struct vcp_vdec_fb frame[VCP_VDEC_BUFFERS];
+-	__le32 read, write, count, reserved;
+-};
+-
+-struct vcp_vdec_info {
+-	__le32 dpb_size, changed;
+-	__le64 bs_dma, bs_fd;
+-	__le64 fb_dma[VCP_VDEC_PLANES], fb_fd[VCP_VDEC_PLANES];
+-	__le64 bs_cookie, fb_cookie;
+-	__le32 planes, index, wait_keyframe, error_map;
+-	__le64 timestamp;
+-	__le32 queued_frames;
+-};
+-
+-struct vcp_vdec_pic {
+-	__le32 width, height, buffer_width, buffer_height;
+-	__le32 plane_size[VCP_VDEC_PLANES];
+-	__le32 bitdepth, layout, fourcc;
+-};
+-
+-struct vcp_vdec_format {
+-	__le32 fourcc, type, planes;
+-};
+-
+-struct vcp_vdec_frame_size {
+-	__le32 fourcc, profile, level;
+-	__le32 min_width, max_width, step_width;
+-	__le32 min_height, max_height, step_height;
+-};
+-
+-struct vcp_vdec_vsi {
+-	struct vcp_vdec_bs_ring free_bs;
+-	struct vcp_vdec_fb_ring free_fb, display;
+-	struct vcp_vdec_info dec;
+-	struct vcp_vdec_pic pic;
+-	__le32 color_desc[17];
+-	__le32 crop_left, crop_top, crop_width, crop_height;
+-	struct vcp_vdec_format formats[VCP_VDEC_CAPS];
+-	struct vcp_vdec_frame_size frame_sizes[VCP_VDEC_CAPS];
+-	__le32 aspect_ratio, fixed_buffers, fixed_buffers_svp, interlacing, codec_type;
+-	u8 crc_path[256], golden_path[256];
+-	u8 input_driven, ipi_blocked;
+-	__le32 general_fd;
+-	__le64 general_dma;
+-	__le32 general_size;
+-};
+-
+-static_assert(sizeof(struct vcp_vdec_vsi) == 13752);
+-static_assert(sizeof(struct vcp_vdec_info) == 200);
+-static_assert(sizeof(struct vcp_vdec_pic) == 60);
+-static_assert(sizeof(struct vcp_vdec_bs_ring) == 528);
+-static_assert(sizeof(struct vcp_vdec_fb_ring) == 3088);
+-static_assert(sizeof(struct vcp_vdec_fb) == 48);
+-static_assert(sizeof(struct vcp_vdec_query_ack) == 48);
+-static_assert(offsetof(struct vcp_vdec_vsi, dec) == 6704);
+-static_assert(offsetof(struct vcp_vdec_vsi, pic) == 6904);
+-static_assert(offsetof(struct vcp_vdec_vsi, input_driven) == 13724);
+-static_assert(offsetof(struct vcp_vdec_vsi, general_dma) == 13736);
+-
+-static_assert(sizeof(struct vcp_vdec_cmd) == 16);
+-static_assert(sizeof(struct vcp_vdec_init) == 24);
+-static_assert(sizeof(struct vcp_vdec_start) == 28);
+-static_assert(sizeof(struct vcp_vdec_set_param) == 64);
+-static_assert(sizeof(struct vcp_vdec_query_cap) == 32);
+-static_assert(sizeof(struct vcp_vdec_ack) == 32);
+-static_assert(sizeof(struct vcp_vdec_init_ack) == 32);
+-static_assert(sizeof(struct vcp_vdec_mem_op) == 64);
+ 
+ #endif
+diff --git a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_bitstream.h b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_bitstream.h
+index 4102eb42b8..3a227205eb 100644
+--- a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_bitstream.h
++++ b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_bitstream.h
+@@ -772,10 +772,9 @@ static inline int vcp_h263_guard(const u8 *data, size_t size)
+ 
+ /* AV1 temporal unit: a chain of OBUs. Lengths are validated so a claimed
+  * size can never run past the submitted buffer; tile and frame contents
+- * stay firmware-owned. Temporal units carrying more than three frame OBUs
+- * (hidden alt-ref packing from deep encoder lag) stall the firmware
+- * without answering, so they are refused: single, dual and triple frame
+- * units decode exactly up to 1280x720.
++ * stay firmware-owned. Retain the MT6895 reference restriction against
++ * temporal units carrying more than three frame OBUs (hidden alt-ref packing
++ * from deep encoder lag), where that firmware could stall without answering.
+  */
+ static inline int vcp_av1_guard(const u8 *data, size_t size)
+ {
+diff --git a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_hw.c b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_hw.c
+index 06c95077c2..daab5c71de 100644
+--- a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_hw.c
++++ b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_hw.c
+@@ -1,5 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ #include <linux/clk.h>
++#include <linux/mfd/syscon.h>
++#include <linux/regmap.h>
+ #include <linux/completion.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/interrupt.h>
+@@ -11,9 +13,7 @@
+ #include <linux/overflow.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_domain.h>
+-#include <linux/pm_opp.h>
+ #include <linux/pm_runtime.h>
+-#include <linux/regulator/consumer.h>
+ #include "mtk_vcp_vdec_hw.h"
+ 
+ #define VDEC_CORES 2
+@@ -25,18 +25,21 @@
+ #define VDEC_UFO_STATUS 0x8c
+ #define VDEC_UFO_IDLE 0x11000
+ 
+-/* Highest operating point of the vendor OPP table: 660 MHz at 750 mV. */
++/* Maximum frequency in the MT6897 vendor decoder table. */
+ #define VDEC_MAX_RATE 660000000UL
+ 
+ /* Hardware tracing is opt-in through dynamic debug. */
+ #define VCPDBG(fmt, ...) pr_debug("VCPDBG:%s: " fmt, __func__, ##__VA_ARGS__)
+ 
+ struct vdec_core {
++	struct mtk_vcp_vdec_hw *hw;
++	unsigned int index;
+ 	void __iomem *misc, *vld;
+ 	struct device *domain, *larb;
+ 	struct completion irq_done;
+-	int irq;
+-	bool owned;
++	int irq, irq_error;
++	u32 irq_entries, irq_base_guard, irq_status_guard, irq_crc_guard, irq_completions;
++	bool owned, irq_fault_disabled;
+ };
+ struct mtk_vcp_vdec_hw {
+ 	struct device *dev, *ube;
+@@ -44,133 +47,75 @@ struct mtk_vcp_vdec_hw {
+ 	void __iomem *ufo;
+ 	struct clk_bulk_data clocks[3];
+ 	struct vdec_core core[2];
+-	struct regulator *vcore;
+-	/*
+-	 * The step the current stream needs, and what the rail is asked for right
+-	 * now. The request follows desired_uv across power cycles: firmware powers
+-	 * the cores down between frames, so a power-down must not cost the session
+-	 * the step it was granted.
+-	 */
+-	unsigned long desired_uv;
+-	int active_uv;
+-	/* Highest step of the declared table, used as the request until a stream
+-	 * names the step it actually needs.
+-	 */
+-	unsigned long max_uv;
++	void __iomem *base, *racing;
++	struct regmap *soc;
++	struct dev_pm_domain_list *domains;
++	u32 racing_info[128];
++	struct mutex racing_lock;
+ 	/* PM references are acquired domains first, then LARBs. A failed put
+ 	 * consumes its reference, so pending suspend retries must not put again.
+-	 * Keep the module and rail until all acquired resources are released.
++	 * Keep the module until all acquired resources are released.
+ 	 */
+ 	unsigned long pm_held, pm_pending;
+ 	bool pm_ref;
++	u32 ao_count;
++	unsigned long ao_held, ao_pending;
++	bool ao_ref;
+ 	bool retained;
+-	struct mutex perf_lock;
++	/* First integration keeps normal gates/PM until confirmed session stop.
++	 * CORE/LAT activity and AO references remain independently balanced. */
+ 	bool powered, uncertain;
+ };
+ 
+ static irqreturn_t vdec_irq(int irq, void *priv)
+ {
+ 	struct vdec_core *c = priv;
+-	u32 status = readl(c->misc + 0xa4);
+-
+-	if (!(status & BIT(16)))
+-		return IRQ_NONE;
+-	VCPDBG("irq: irq=%d status=%#x\n", c->irq, status);
+-	writel(status | 0x11, c->misc + 0xa4);
+-	writel(readl(c->misc + 0xa4) & ~0x10, c->misc + 0xa4);
+-	complete(&c->irq_done);
+-	return IRQ_HANDLED;
+-}
+-
+-/*
+- * Ask the shared rail for the step the current stream needs. Called with
+- * perf_lock held and before the gates are enabled, so the cores never come up
+- * below the step this session was granted.
+- *
+- * The rail serves the highest request among its clients, so raising this
+- * codec's floor cannot lower anyone else's and re-asking for the same step is
+- * a no-op.
+- */
+-static int vdec_vote_apply(struct mtk_vcp_vdec_hw *hw)
+-{
++	u32 status;
+ 	int ret;
+ 
+-	if (!hw->vcore || !hw->desired_uv || hw->active_uv == (int)hw->desired_uv)
+-		return 0;
+-	ret = regulator_set_voltage(hw->vcore, hw->desired_uv, INT_MAX);
+-	if (ret) {
+-		dev_err(hw->dev, "VDEC %lu uV VCORE request failed: %d\n",
+-			hw->desired_uv, ret);
+-		return ret;
++	c->irq_entries++;
++	if (readl(c->hw->base) & BIT(4)) {
++		c->irq_base_guard++;
++		return IRQ_HANDLED;
+ 	}
+-	hw->active_uv = hw->desired_uv;
+-	dev_dbg(hw->dev, "VDEC VCORE request: %lu uV\n", hw->desired_uv);
+-	return 0;
+-}
+-
+-/*
+- * Highest step of the declared table. Firmware powers the cores up on its own
+- * schedule, including during INIT before any stream geometry is known, so the
+- * request starts here and is only narrowed once a stream names its step.
+- * Without this the rail would be asked for nothing at all in that window.
+- */
+-static int vdec_bootstrap_voltage(struct mtk_vcp_vdec_hw *hw)
+-{
+-	struct dev_pm_opp *opp;
+-	unsigned long hz = ULONG_MAX, volt;
+-
+-	opp = dev_pm_opp_find_freq_floor(hw->dev, &hz);
+-	if (IS_ERR(opp))
+-		return PTR_ERR(opp);
+-	volt = dev_pm_opp_get_voltage(opp);
+-	dev_pm_opp_put(opp);
+-	if (!volt || volt > INT_MAX)
+-		return -EINVAL;
+-	hw->max_uv = volt;
+-	hw->desired_uv = volt;
+-	return 0;
+-}
++	status = readl(c->misc + 0xa4);
+ 
+-/*
+- * Highest frequency the declared OPP table offers, 0 when it declares none.
+- * set_perf() matches the request against that table, so a caller that wants to
+- * clamp a hint to what the rail actually has needs this.
+- */
+-unsigned long mtk_vcp_vdec_hw_top_hz(struct mtk_vcp_vdec_hw *hw)
+-{
+-	struct dev_pm_opp *opp;
+-	unsigned long hz = ULONG_MAX, freq = 0;
+-
+-	opp = dev_pm_opp_find_freq_floor(hw->dev, &hz);
+-	if (!IS_ERR(opp)) {
+-		freq = dev_pm_opp_get_freq(opp);
+-		dev_pm_opp_put(opp);
++	if (!(status & BIT(16))) {
++		c->irq_status_guard++;
++		return IRQ_NONE;
+ 	}
+-	return freq;
+-}
+-
+-/* perf_lock held. Only safe once both cores are idle. */
+-static void vdec_vote_idle(struct mtk_vcp_vdec_hw *hw)
+-{
+-	int ret;
+-
+-	if (!hw->vcore || !hw->active_uv)
+-		return;
+-	if (hw->retained) {
+-		dev_warn(hw->dev, "VDEC keeping the %d uV VCORE request: hardware was not confirmed idle\n",
+-			 hw->active_uv);
+-		return;
++	VCPDBG("irq: irq=%d status=%#x\n", c->irq, status);
++	/* Vendor RDMA CRC notifications are not decode completion. */
++	if (!c->index && (readl(c->misc + 0x19c) & BIT(4))) {
++		c->irq_crc_guard++;
++		return IRQ_HANDLED;
+ 	}
+-	ret = regulator_set_voltage(hw->vcore, 0, INT_MAX);
+-	if (ret) {
+-		dev_warn(hw->dev, "VDEC VCORE request release failed: %d (keeping %d uV)\n",
+-			 ret, hw->active_uv);
+-		return;
++	if (!c->index && (readl(c->hw->base + 0x60) & BIT(0))) {
++		ret = regmap_write_bits(c->hw->soc, 0x24, BIT(16), BIT(16));
++		if (!ret)
++			ret = regmap_write_bits(c->hw->soc, 0x24, BIT(16), 0);
++		if (ret) {
++			WRITE_ONCE(c->irq_error, ret);
++			if (!c->irq_fault_disabled) {
++				c->irq_fault_disabled = true;
++				disable_irq_nosync(c->irq);
++			}
++			complete(&c->irq_done);
++			dev_err_ratelimited(c->hw->dev, "VDEC IRQ clear failed: %d\n", ret);
++			return IRQ_HANDLED;
++		}
++	} else {
++		writel(status | 0x11, c->misc + 0xa4);
++		writel(readl(c->misc + 0xa4) & ~0x10, c->misc + 0xa4);
+ 	}
+-	dev_dbg(hw->dev, "VDEC VCORE request idle (was %d uV)\n", hw->active_uv);
+-	hw->active_uv = 0;
++	c->irq_completions++;
++	complete(&c->irq_done);
++	return IRQ_HANDLED;
+ }
+ 
++/* MT6897 uses the existing shared DRAM-provider AP 750 mV floor. The
++ * inherited VDEC mux rate is retained; no Xaga OPP or firmware DVFS policy.
++ */
+ /* Engines must be idle, or this must be rollback before their clocks were
+  * enabled. Stop at the first failure: parent domains must remain referenced
+  * while a LARB's shutdown is unconfirmed. PM serializes each device's retry
+@@ -209,6 +154,80 @@ static int vdec_pm_release(struct mtk_vcp_vdec_hw *hw)
+ 	return 0;
+ }
+ 
++/* CORE AO requests own PM references independently of engine clocks. */
++static int vdec_ao_release(struct mtk_vcp_vdec_hw *hw)
++{
++	int i, ret;
++
++	for (i = 2 * VDEC_CORES - 1; i >= 0; i--) {
++		struct device *dev = i < VDEC_CORES ? hw->core[i].domain :
++				hw->core[i - VDEC_CORES].larb;
++
++		if (hw->ao_held & BIT(i)) {
++			ret = pm_runtime_put_sync(dev);
++			hw->ao_held &= ~BIT(i);
++		} else if (hw->ao_pending & BIT(i)) {
++			ret = pm_runtime_suspend(dev);
++		} else {
++			continue;
++		}
++		if (ret < 0) {
++			hw->ao_pending |= BIT(i);
++			hw->retained = true;
++			return ret;
++		}
++		hw->ao_pending &= ~BIT(i);
++	}
++	if (hw->ao_ref) {
++		hw->ao_ref = false;
++		module_put(THIS_MODULE);
++	}
++	return 0;
++}
++
++int mtk_vcp_vdec_hw_power_ao(struct mtk_vcp_vdec_hw *hw, bool on)
++{
++	int i, ret;
++
++	if (hw->retained || hw->uncertain)
++		return -EIO;
++	if (!on) {
++		if (!hw->ao_count)
++			return -EINVAL;
++		if (hw->ao_count > 1) {
++			hw->ao_count--;
++			return 0;
++		}
++		ret = vdec_ao_release(hw);
++		if (!ret)
++			hw->ao_count = 0;
++		return ret;
++	}
++	if (hw->ao_count == 64)
++		return -EOVERFLOW;
++	if (hw->ao_count) {
++		hw->ao_count++;
++		return 0;
++	}
++	__module_get(THIS_MODULE);
++	hw->ao_ref = true;
++	for (i = 0; i < 2 * VDEC_CORES; i++) {
++		struct device *dev = i < VDEC_CORES ? hw->core[i].domain :
++				hw->core[i - VDEC_CORES].larb;
++
++		ret = pm_runtime_resume_and_get(dev);
++		if (ret < 0) {
++			vdec_ao_release(hw);
++			return ret;
++		}
++		hw->ao_held |= BIT(i);
++	}
++	hw->ao_count = 1;
++	return 0;
++}
++
++static int vdec_break_core(struct mtk_vcp_vdec_hw *hw, unsigned int index);
++
+ static int vdec_power_on(struct mtk_vcp_vdec_hw *hw)
+ {
+ 	int domains = 0, larbs = 0, i, ret;
+@@ -223,15 +242,6 @@ static int vdec_power_on(struct mtk_vcp_vdec_hw *hw)
+ 		if (!rate || rate > VDEC_MAX_RATE)
+ 			return -ERANGE;
+ 	}
+-	/* Raise the rail before the gates. Firmware powers the cores down
+-	 * between frames, so the step is restored on every power-up rather than
+-	 * only when the stream was parsed.
+-	 */
+-	mutex_lock(&hw->perf_lock);
+-	ret = vdec_vote_apply(hw);
+-	mutex_unlock(&hw->perf_lock);
+-	if (ret)
+-		return ret;
+ 	__module_get(THIS_MODULE);
+ 	hw->pm_ref = true;
+ 	for (; domains < 2; domains++) {
+@@ -259,6 +269,8 @@ static int vdec_power_on(struct mtk_vcp_vdec_hw *hw)
+ 	return ret;
+ }
+ 
++/* The exclusive session serializes all firmware callbacks under its RX
++ * mutex. Teardown synchronizes the IRQ handler before touching this state. */
+ int mtk_vcp_vdec_hw_power(struct mtk_vcp_vdec_hw *hw, unsigned int core, bool on)
+ {
+ 	int ret;
+@@ -291,14 +303,57 @@ int mtk_vcp_vdec_hw_power(struct mtk_vcp_vdec_hw *hw, unsigned int core, bool on
+ 		VCPDBG("power: core%u was not owned\n", core);
+ 		return -EINVAL;
+ 	}
+-	/* Firmware owns the interrupt except for explicit WAITISR requests.
+-	 * Keep the rails until the complete session has been deinitialized.
++	/* Shared racing state follows the vendor first-active/last-active
++	 * transitions, independently of AO domain references. */
++	mutex_lock(&hw->racing_lock);
++	if (on && !hw->core[0].owned && !hw->core[1].owned) {
++		unsigned int i;
++
++		for (i = 0; i < ARRAY_SIZE(hw->racing_info); i++)
++			writel(hw->racing_info[i], hw->racing + 0x100 + i * 4);
++	}
++	if (!on && !hw->core[!core].owned) {
++		unsigned int i;
++
++		for (i = 0; i < ARRAY_SIZE(hw->racing_info); i++)
++			hw->racing_info[i] = readl(hw->racing + 0x100 + i * 4);
++	}
++	/* A normal VCP UNLOCK hands engine ownership back to the AP. Shipping
++	 * clock_off saves racing state without an AP break/reset. Uncertain or
++	 * still-owned engines instead require offline recovery below.
+ 	 */
+ 	hw->core[core].owned = on;
++	mutex_unlock(&hw->racing_lock);
+ 	VCPDBG("power: core%u now %s\n", core, on ? "running" : "stopped");
+ 	return 0;
+ }
+ 
++/* Read only registers used by the vendor interrupt and break paths. The
++ * caller holds engine clocks/PM and has disabled/synchronized its IRQ.
++ * LAT has no source-defined RDMA CRC guard, so read +0x19c only for CORE.
++ */
++static void vdec_timeout_snapshot(struct mtk_vcp_vdec_hw *hw, unsigned int core)
++{
++	unsigned int soc = 0;
++	int i, ret;
++
++	if (!hw->powered)
++		return;
++	ret = regmap_read(hw->soc, 0x24, &soc);
++	dev_warn(hw->dev, "VDEC wait core%u: base0=%#x base60=%#x soc24=%#x soc_error=%d\n",
++		 core, readl(hw->base), readl(hw->base + 0x60), soc, ret);
++	for (i = 0; i < VDEC_CORES; i++) {
++		struct vdec_core *c = &hw->core[i];
++
++		dev_warn(hw->dev, "VDEC core%d: misc_a4=%#x break104=%#x IRQ entries=%u base_guard=%u status_guard=%u crc_guard=%u completions=%u\n",
++			 i, readl(c->misc + 0xa4), readl(c->misc + VDEC_BREAK_STATUS),
++			 c->irq_entries, c->irq_base_guard, c->irq_status_guard,
++			 c->irq_crc_guard, c->irq_completions);
++	}
++	dev_warn(hw->dev, "VDEC CORE RDMA CRC19c=%#x\n",
++		 readl(hw->core[0].misc + 0x19c));
++}
++
+ int mtk_vcp_vdec_hw_wait(struct mtk_vcp_vdec_hw *hw, unsigned int core)
+ {
+ 	struct vdec_core *c;
+@@ -308,12 +363,23 @@ int mtk_vcp_vdec_hw_wait(struct mtk_vcp_vdec_hw *hw, unsigned int core)
+ 		return -EINVAL;
+ 	c = &hw->core[core];
+ 	reinit_completion(&c->irq_done);
++	WRITE_ONCE(c->irq_error, 0);
+ 	enable_irq(c->irq);
+ 	ret = wait_for_completion_timeout(&c->irq_done, msecs_to_jiffies(1000)) ?
+ 		0 : -ETIMEDOUT;
+ 	disable_irq(c->irq);
++	/* disable_irq synchronized the handler. Balance its failure mask once
++	 * while preserving the normal wait-side mask for the next request. */
++	if (c->irq_fault_disabled) {
++		c->irq_fault_disabled = false;
++		enable_irq(c->irq);
++	}
++	if (!ret)
++		ret = READ_ONCE(c->irq_error);
+ 	VCPDBG("wait: core%u -> %d\n", core, ret);
+ 	if (ret) {
++		if (!hw->uncertain)
++			vdec_timeout_snapshot(hw, core);
+ 		VCPDBG("wait: core%u interrupt timed out, state now uncertain\n",
+ 		       core);
+ 		hw->uncertain = true;
+@@ -321,93 +387,19 @@ int mtk_vcp_vdec_hw_wait(struct mtk_vcp_vdec_hw *hw, unsigned int core)
+ 	return ret;
+ }
+ 
+-/*
+- * Ask the shared DVFSRC rail for the operating point this stream needs.
+- *
+- * The frame geometry and the stream's frame rate give a pixel rate, and the OPP
+- * table maps that to the VCORE step the DVFSRC needs, so the smallest step at
+- * or above it is the one that is asked for. That mapping is a property of the
+- * table: no pixel-per-clock ratio is assumed here, and a stream above the top
+- * step is reported as -ERANGE rather than decoded at a point nobody asked for.
+- *
+- * Only the voltage is requested: the mux parents belong to the DVFSRC
+- * provider, which coordinates them with the other multimedia clients, so this
+- * driver never calls clk_set_rate() or clk_set_parent(). Its clocks are kept
+- * for gate control and for the rate check in vdec_power_on().
+- *
+- * The step is held until the session stops existing, not just until the next
+- * power-down, because firmware powers the cores down between frames.
+- */
+ int mtk_vcp_vdec_hw_set_perf(struct mtk_vcp_vdec_hw *hw, u32 width, u32 height,
+-				     u32 fps)
++			      u32 fps)
+ {
+-	struct dev_pm_opp *opp;
+-	unsigned long hz, volt, previous;
+-	u64 pixels;
+-	int ret;
+-
+-	VCPDBG("perf: requested %ux%u at %u fps\n", width, height, fps);
+-	if (!width || !height || !fps) {
+-		VCPDBG("perf: incomplete geometry\n");
+-		return -EINVAL;
+-	}
+-	if (check_mul_overflow((u64)width, (u64)height, &pixels) ||
+-	    check_mul_overflow(pixels, (u64)fps, &pixels))
+-		return -ERANGE;
+-	if (pixels > ULONG_MAX)
+-		return -ERANGE;
+-	/* No OPP table means this device has no way to name the step it needs. */
+-	if (!hw->vcore)
+-		return -EOPNOTSUPP;
+-
+-	hz = (unsigned long)pixels;
+-	opp = dev_pm_opp_find_freq_ceil(hw->dev, &hz);
+-	if (IS_ERR(opp)) {
+-		ret = PTR_ERR(opp);
+-		dev_err(hw->dev, "VDEC %ux%u@%u: no operating point at or above a %llu pixel/s rate: %d\n",
+-			width, height, fps, pixels, ret);
+-		return ret;
+-	}
+-	volt = dev_pm_opp_get_voltage(opp);
+-	dev_pm_opp_put(opp);
+-	if (!volt || volt > INT_MAX)
++	if (hw->retained || hw->uncertain)
++		return -EIO;
++	if (!width || width > 4096 || !height || height > 2176 || !fps)
+ 		return -EINVAL;
+-
+-	mutex_lock(&hw->perf_lock);
+-	/* Hardware state is uncertain after a failed shutdown, so no step can be
+-	 * guaranteed from here on.
+-	 */
+-	if (hw->retained) {
+-		ret = -EIO;
+-		goto out;
+-	}
+-	if (hw->desired_uv == volt && hw->active_uv == (int)volt) {
+-		ret = 0;
+-		goto out;
+-	}
+-	/* Every step that is not already in force is written through, including
+-	 * a lower one: the rail serves the highest request among all of its
+-	 * clients, so lowering this codec's own floor cannot pull anyone else
+-	 * down.
+-	 */
+-	previous = hw->desired_uv;
+-	hw->desired_uv = volt;
+-	ret = regulator_set_voltage(hw->vcore, volt, INT_MAX);
+-	if (ret) {
+-		hw->desired_uv = previous;
+-		goto out;
+-	}
+-	hw->active_uv = volt;
+-out:
+-	mutex_unlock(&hw->perf_lock);
+-
+-	if (ret)
+-		dev_warn(hw->dev, "VDEC perf failed: %ux%u@%u -> %lu uV: %d\n",
+-			 width, height, fps, volt, ret);
+-	else
+-		dev_dbg(hw->dev, "VDEC perf: %ux%u@%u -> %llu pixel/s, %lu uV\n",
+-			 width, height, fps, pixels, volt);
+-	return ret;
++	/* Rate is a client hint. Preserve the inherited clocks and shared AP
++	 * floor; runtime throughput is measured rather than inferred from a
++	 * guessed pixels-per-clock relationship. */
++	dev_dbg(hw->dev, "stream hint %ux%u@%u, inherited VDEC clock %lu Hz\n",
++		width, height, fps, clk_get_rate(hw->clocks[0].clk));
++	return 0;
+ }
+ 
+ int mtk_vcp_vdec_hw_alloc(struct mtk_vcp_vdec_hw *hw, u32 type, size_t size,
+@@ -433,10 +425,11 @@ void mtk_vcp_vdec_hw_free(struct mtk_vcp_vdec_hw *hw, u32 type, struct mtk_vcp_m
+ 	mem->cpu = NULL;
+ }
+ 
+-/* MT6895 xaga vendor mtk_vcodec_dec_hw_break(): request MISC break,
++/* MT6897 vendor mtk_vdec_hw_break(): request MISC break,
+  * wait for both idle bits (and UFO when enabled), then pulse VLD reset.
+  * Unlike the vendor timeout path, never reset or release DMA on timeout.
+- * Firmware must be offline so no callback can restart an engine mid-reset.
++ * This path is reserved for recovery of owned or uncertain engines after
++ * confirmed firmware shutdown; normal VCP unlock does not request a break.
+  */
+ static int vdec_break_core(struct mtk_vcp_vdec_hw *hw, unsigned int index)
+ {
+@@ -452,14 +445,19 @@ static int vdec_break_core(struct mtk_vcp_vdec_hw *hw, unsigned int index)
+ 	ret = readl_poll_timeout(core->misc + VDEC_BREAK_STATUS, value,
+ 				(value & VDEC_BREAK_IDLE) == VDEC_BREAK_IDLE,
+ 				10, 1000000);
+-	if (ret)
++	if (ret) {
++		dev_warn(hw->dev, "VDEC core%u break timeout: request=%#x status=%#x\n",
++			 index, readl(core->misc + VDEC_BREAK), value);
+ 		return ret;
++	}
+ 	if (ufo) {
+ 		ret = readl_poll_timeout(hw->ufo + VDEC_UFO_STATUS, value,
+ 					(value & VDEC_UFO_IDLE) == VDEC_UFO_IDLE,
+ 					10, 1000000);
+-		if (ret)
++		if (ret) {
++			dev_warn(hw->dev, "VDEC core%u UFO timeout: status=%#x\n", index, value);
+ 			return ret;
++		}
+ 		writel(readl(hw->ufo + VDEC_UFO_CONTROL) | BIT(1),
+ 		       hw->ufo + VDEC_UFO_CONTROL);
+ 	}
+@@ -502,6 +500,12 @@ int mtk_vcp_vdec_hw_stop(struct mtk_vcp_vdec_hw *hw)
+ 	VCPDBG("stop: powered=%d owned=%d/%d retained=%d uncertain=%d\n",
+ 	       hw->powered, hw->core[0].owned, hw->core[1].owned, hw->retained,
+ 	       hw->uncertain);
++	if (hw->ao_count && !mtk_vcp_is_offline(hw->vcp))
++		return -EBUSY;
++	ret = vdec_ao_release(hw);
++	if (ret)
++		return ret;
++	hw->ao_count = 0;
+ 	ret = vdec_recover_engines(hw);
+ 	if (ret)
+ 		return ret;
+@@ -512,16 +516,12 @@ int mtk_vcp_vdec_hw_stop(struct mtk_vcp_vdec_hw *hw)
+ 	ret = vdec_pm_release(hw);
+ 	if (ret)
+ 		return ret;
+-	mutex_lock(&hw->perf_lock);
+-	vdec_vote_idle(hw);
+-	hw->desired_uv = hw->max_uv;
+-	mutex_unlock(&hw->perf_lock);
+ 	return 0;
+ }
+ 
+ static void vdec_detach(void *data)
+ {
+-	dev_pm_domain_detach(data, true);
++	dev_pm_domain_detach_list(data);
+ }
+ static void vdec_put(void *data)
+ {
+@@ -532,13 +532,17 @@ struct mtk_vcp_vdec_hw *mtk_vcp_vdec_hw_create(struct platform_device *pdev,
+ 					    struct mtk_vcp *vcp, struct device *ube)
+ {
+ 	struct device *dev = &pdev->dev;
++	static const char * const pd_names[] = { "core", "lat" };
++	const struct dev_pm_domain_attach_data pd_data = {
++		.pd_names = pd_names, .num_pd_names = ARRAY_SIZE(pd_names),
++		.pd_flags = PD_FLAG_NO_DEV_LINK,
++	};
+ 	struct mtk_vcp_vdec_hw *hw;
+-	bool table;
+ 	int i, ret;
+ 
+ 	if (!iommu_get_domain_for_dev(dev))
+ 		return ERR_PTR(-ENODEV);
+-	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(34));
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+ 	if (ret)
+ 		return ERR_PTR(ret);
+ 	hw = devm_kzalloc(dev, sizeof(*hw), GFP_KERNEL);
+@@ -553,37 +557,28 @@ struct mtk_vcp_vdec_hw *mtk_vcp_vdec_hw_create(struct platform_device *pdev,
+ 	ret = devm_clk_bulk_get(dev, 3, hw->clocks);
+ 	if (ret)
+ 		return ERR_PTR(ret);
+-	/* Managed table: the OPPs live exactly as long as this device does. */
+-	ret = devm_pm_opp_of_add_table(dev);
+-	if (ret && ret != -ENODEV)
+-		return ERR_PTR(ret);
+-	table = !ret;
+-	mutex_init(&hw->perf_lock);
+-	hw->vcore = devm_regulator_get_optional(dev, "dvfsrc-vcore");
+-	if (IS_ERR(hw->vcore))
+-		return ERR_CAST(hw->vcore);
+-	/* A table and the rail it names are only useful together: the table is
+-	 * what maps a stream to a step, and the rail is what the step is asked
+-	 * of. A device that declares one without the other is misdescribed, and
+-	 * set_perf() reports the same mismatch to its callers.
+-	 */
+-	if (table != !!hw->vcore) {
+-		dev_err(dev, "VDEC needs both an OPP table and its supply\n");
+-		return ERR_PTR(-EINVAL);
+-	}
+-	if (table) {
+-		/* Start from the top of the table so a power-up that happens
+-		 * before any stream geometry is known is still covered by a
+-		 * request.
+-		 */
+-		ret = vdec_bootstrap_voltage(hw);
+-		if (ret)
+-			return ERR_PTR(ret);
+-	}
++	mutex_init(&hw->racing_lock);
+ 	hw->ufo = devm_platform_ioremap_resource_byname(pdev, "base");
+ 	if (IS_ERR(hw->ufo))
+ 		return ERR_CAST(hw->ufo);
++	hw->base = hw->ufo;
+ 	hw->ufo += 0x800;
++	hw->soc = syscon_regmap_lookup_by_phandle(dev->of_node, "mediatek,soc-gcon");
++	if (IS_ERR(hw->soc))
++		return ERR_CAST(hw->soc);
++	hw->racing = devm_platform_ioremap_resource_byname(pdev, "racing");
++	if (IS_ERR(hw->racing))
++		return ERR_CAST(hw->racing);
++	ret = dev_pm_domain_attach_list(dev, &pd_data, &hw->domains);
++	if (ret < 0)
++		return ERR_PTR(ret);
++	if (!hw->domains || hw->domains->num_pds != VDEC_CORES) {
++		dev_pm_domain_detach_list(hw->domains);
++		return ERR_PTR(-ENODEV);
++	}
++	ret = devm_add_action_or_reset(dev, vdec_detach, hw->domains);
++	if (ret)
++		return ERR_PTR(ret);
+ 	for (i = 0; i < 2; i++) {
+ 		struct vdec_core *c = &hw->core[i];
+ 		struct device_node *node;
+@@ -595,12 +590,9 @@ struct mtk_vcp_vdec_hw *mtk_vcp_vdec_hw_create(struct platform_device *pdev,
+ 		c->vld = devm_platform_ioremap_resource_byname(pdev, i ? "lat-vld" : "vld");
+ 		if (IS_ERR(c->vld))
+ 			return ERR_CAST(c->vld);
+-		c->domain = dev_pm_domain_attach_by_id(dev, i);
+-		if (IS_ERR_OR_NULL(c->domain))
+-			return ERR_PTR(c->domain ? PTR_ERR(c->domain) : -ENODEV);
+-		ret = devm_add_action_or_reset(dev, vdec_detach, c->domain);
+-		if (ret)
+-			return ERR_PTR(ret);
++		c->hw = hw;
++		c->index = i;
++		c->domain = hw->domains->pd_devs[i];
+ 		node = of_parse_phandle(dev->of_node, "mediatek,larbs", i);
+ 		if (!node)
+ 			return ERR_PTR(-EINVAL);
+diff --git a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_hw.h b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_hw.h
+index 965cf3250b..34eeb686a7 100644
+--- a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_hw.h
++++ b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_hw.h
+@@ -6,33 +6,20 @@ struct platform_device;
+ struct mtk_vcp_vdec_hw;
+ struct mtk_vcp_vdec_hw *mtk_vcp_vdec_hw_create(struct platform_device *pdev,
+ 					    struct mtk_vcp *vcp, struct device *ube);
++int mtk_vcp_vdec_hw_power_ao(struct mtk_vcp_vdec_hw *hw, bool on);
+ int mtk_vcp_vdec_hw_power(struct mtk_vcp_vdec_hw *hw, unsigned int core, bool on);
+-/* Ask the shared DVFSRC rail for the VCORE step this stream's throughput needs.
+- * Only the voltage is requested; clock rates and mux parents stay with the
+- * DVFSRC provider. The step is held for the session, not for one power cycle,
+- * and is restored before every power-up.
+- *
+- * Returns -EOPNOTSUPP without an OPP table, -ERANGE for a stream above the top
+- * step and -EIO once hardware state is uncertain, so callers must propagate the
+- * failure instead of decoding at a step nobody was granted.
+- */
++/* Validate/log a stream hint; inherited clocks and shared AP floor stay owned
++ * by the platform. This does not promise any measured decode throughput. */
+ int mtk_vcp_vdec_hw_set_perf(struct mtk_vcp_vdec_hw *hw, u32 width, u32 height,
+ 			      u32 fps);
+-/* Highest frequency the OPP table declares, 0 when there is no table. */
+-unsigned long mtk_vcp_vdec_hw_top_hz(struct mtk_vcp_vdec_hw *hw);
+ int mtk_vcp_vdec_hw_wait(struct mtk_vcp_vdec_hw *hw, unsigned int core);
+ int mtk_vcp_vdec_hw_alloc(struct mtk_vcp_vdec_hw *hw, u32 type, size_t size,
+ 			struct mtk_vcp_mem *mem);
+ void mtk_vcp_vdec_hw_free(struct mtk_vcp_vdec_hw *hw, u32 type, struct mtk_vcp_mem *mem);
+-/* Call after successful DEINIT, or confirmed firmware shutdown.
+- * Uncertain/owned engines require VCP offline and successful hardware break
+- * and reset before PM references or DMA can be released.
+- * A nonzero return means shutdown was not confirmed: the caller must keep
+- * the session and the voltage request it holds. PM retries do not drop usage
+- * references twice; IRQ recovery failure retains clocks, references and DMA.
+- * A successful stop ends the
+- * session and gives up the stream's step, leaving the request at the top of the
+- * OPP table for a session that powers up before its geometry is known.
++/* Call after successful DEINIT or confirmed firmware shutdown. Uncertain
++ * engines require confirmed firmware stop and bounded hardware recovery.
++ * Failure retains clocks, PM references and DMA; consumed PM references are
++ * never put twice during cleanup retries.
+  */
+ int mtk_vcp_vdec_hw_stop(struct mtk_vcp_vdec_hw *hw);
+ #endif
+diff --git a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_input.h b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_input.h
+new file mode 100644
+index 0000000000..13140521a9
+--- /dev/null
++++ b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_input.h
+@@ -0,0 +1,63 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef MTK_VCP_VDEC_INPUT_H
++#define MTK_VCP_VDEC_INPUT_H
++
++/* One logical AU keeps its DMA lease across vendor NEED_MORE_OUTPUT replies.
++ * The vendor AP contract reuses the same BS identity after draining its FREE
++ * record; these are continuations, not independent bitstream generations.
++ */
++struct vcp_vdec_input {
++	u64 cookie, dma, timestamp, deadline;
++	u32 bytes, capacity, attempts;
++	bool flight, more, released;
++};
++
++static inline int vcp_vdec_input_begin(struct vcp_vdec_input *s, u64 cookie,
++		 u64 dma, u32 bytes, u32 capacity, u64 timestamp, u64 deadline)
++{
++	if (s->cookie && (s->cookie != cookie || s->dma != dma ||
++	    s->bytes != bytes || s->capacity != capacity ||
++	    s->timestamp != timestamp || s->deadline != deadline || !s->more || s->flight))
++		return -EINVAL;
++	if (s->attempts >= 32)
++		return -ELOOP;
++	s->cookie = cookie;
++	s->dma = dma;
++	s->bytes = bytes;
++	s->capacity = capacity;
++	s->timestamp = timestamp;
++	s->deadline = deadline;
++	s->attempts++;
++	s->flight = true;
++	s->more = false;
++	s->released = false;
++	return 0;
++}
++
++/* 1 permits one final completion; 0 retains the logical AU's DMA lease. */
++static inline int vcp_vdec_input_release(struct vcp_vdec_input *s, u64 cookie)
++{
++	if (!s->cookie || s->cookie != cookie || s->released)
++		return -EPROTO;
++	s->released = true;
++	return !s->flight && !s->more;
++}
++
++static inline int vcp_vdec_input_ack(struct vcp_vdec_input *s, bool more)
++{
++	if (!s->cookie || !s->flight)
++		return -EPROTO;
++	s->flight = false;
++	s->more = more;
++	return !more && s->released;
++}
++/* Only a successful firmware reset can terminate continuation eligibility.
++ * It does not fabricate a release: the DMA owner still waits for FREE.
++ */
++static inline bool vcp_vdec_input_reset_ack(struct vcp_vdec_input *s)
++{
++	s->flight = false;
++	s->more = false;
++	return s->cookie && s->released;
++}
++#endif
+diff --git a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_mt6897_abi.h b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_mt6897_abi.h
+new file mode 100644
+index 0000000000..eb9617a1e7
+--- /dev/null
++++ b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_mt6897_abi.h
+@@ -0,0 +1,299 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * MT6897 VCP wire ABI. Derived from MediaTek vdec_ipi_msg.h/vcodec_ipi_msg.h
++ * Copyright (c) 2016 MediaTek Inc.
++ * Authors: PC Chen <pc.chen@mediatek.com>, Tiffany Lin <tiffany.lin@mediatek.com>
++ * Source: https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec
++ *
++ * Local adaptation: explicit little-endian wire types, no AP pointers, and
++ * assertions against the shipping MT6897 decoder's serialized offsets.
++ * This is deliberately separate from the incompatible MT6895 firmware ABI.
++ */
++#ifndef __MTK_VCP_VDEC_MT6897_ABI_H
++#define __MTK_VCP_VDEC_MT6897_ABI_H
++
++#include <linux/build_bug.h>
++#include <linux/stddef.h>
++#include <linux/types.h>
++#include <linux/byteorder/generic.h>
++#include <linux/string.h>
++
++#define MT6897_VDEC_BUFFERS 64
++#define MT6897_VDEC_PLANES 8
++#define MT6897_VDEC_CAPS 128
++
++enum mt6897_vdec_msg_id {
++	MT6897_VDEC_INIT = 0xa000,
++	MT6897_VDEC_START,
++	MT6897_VDEC_DEINIT,
++	MT6897_VDEC_RESET,
++	MT6897_VDEC_SET_PARAM,
++	MT6897_VDEC_QUERY_CAP,
++	MT6897_VDEC_FRAME_BUFFER,
++	MT6897_VDEC_BACKUP,
++	MT6897_VDEC_RESUME,
++	MT6897_VDEC_INIT_DONE = 0xb000,
++	MT6897_VDEC_START_DONE,
++	MT6897_VDEC_DEINIT_DONE,
++	MT6897_VDEC_RESET_DONE,
++	MT6897_VDEC_SET_PARAM_DONE,
++	MT6897_VDEC_QUERY_CAP_DONE,
++	MT6897_VDEC_DONE,
++	MT6897_VDEC_BACKUP_DONE,
++	MT6897_VDEC_RESUME_DONE,
++	MT6897_VDEC_PUT_FRAME_BUFFER = 0xc000,
++	MT6897_VDEC_LOCK_CORE,
++	MT6897_VDEC_UNLOCK_CORE,
++	MT6897_VDEC_LOCK_LAT,
++	MT6897_VDEC_UNLOCK_LAT,
++	MT6897_VDEC_MEM_ALLOC,
++	MT6897_VDEC_MEM_FREE,
++	MT6897_VDEC_WAITISR,
++	MT6897_VDEC_GET_FRAME_BUFFER,
++	MT6897_VDEC_CHECK_CODEC_ID,
++	MT6897_VDEC_SLICE_DONE_ISR,
++};
++
++struct mt6897_vdec_cmd {
++	__le32 id, ctx;
++	__le64 instance;
++	__le32 drain_type, reserved;
++};
++struct mt6897_vdec_init {
++	__le32 id, ctx;
++	__le64 instance, cookie;
++};
++struct mt6897_vdec_start {
++	__le32 id, ctx;
++	__le64 instance;
++	__le32 data[6];
++};
++struct mt6897_vdec_set_param {
++	__le32 id, ctx;
++	__le64 instance;
++	__le32 param, reserved, data[10];
++};
++struct mt6897_vdec_ack {
++	__le32 id, ctx, status, reserved;
++	__le64 cookie;
++	__le32 codec_id, no_need_put;
++	__le64 payload;
++};
++struct mt6897_vdec_init_ack {
++	__le32 id, ctx, status, reserved;
++	__le64 cookie, instance;
++};
++struct mt6897_vdec_query {
++	__le32 id, ctx, status, reserved;
++	__le64 cookie, data_cookie;
++	__le32 query;
++};
++struct mt6897_vdec_query_ack {
++	__le32 id, ctx, status, reserved;
++	__le64 cookie, data_cookie, address;
++	__le32 query;
++};
++struct mt6897_vdec_mem_op {
++	__le32 id, ctx, status, reserved;
++	__le64 cookie;
++	__le32 type, size;
++	__le64 iova, pa, va;
++	__le32 vcp_addr[2];
++};
++struct mt6897_vdec_fb {
++	__le64 cookie, timestamp;
++	__le16 field, frame_type;
++	__le32 reserved;
++};
++/* Vendor header names the final word reserved, but the same pinned source
++ * vdec_vcp_set_frame_buffer() fills it with pfb->index. Preserve that index.
++ */
++struct mt6897_vdec_fb_ipi {
++	__le64 cookie, y, c, general;
++	__le32 general_size, reserved;
++};
++struct mt6897_vdec_bs_ring {
++	__le64 cookie[MT6897_VDEC_BUFFERS];
++	__le32 read, write, count, reserved;
++};
++struct mt6897_vdec_fb_ring {
++	struct mt6897_vdec_fb frame[MT6897_VDEC_BUFFERS];
++	__le32 read, write, count, reserved;
++};
++struct mt6897_vdec_params {
++	__le32 changed, mode, width, height, max_width, max_height, fixed_buffers;
++	__le64 crc_path, golden_path;
++	__le32 wait_keyframe, nal_size_length, svp_mode, operating_rate;
++	__le32 error_mode, queued_frames, priority, slice_count, vpeek;
++};
++struct mt6897_vdec_info {
++	__le32 dpb_size, changed;
++	__le64 bs_dma, bs_fd;
++	__le64 fb_dma[MT6897_VDEC_PLANES], fb_fd[MT6897_VDEC_PLANES];
++	__le64 bs_cookie, fb_cookie;
++	__le32 planes, index, error_map;
++	__le64 timestamp;
++	__le32 queued_frames;
++};
++struct mt6897_vdec_pic {
++	__le32 width, height, buffer_width, buffer_height;
++	__le32 plane_size[MT6897_VDEC_PLANES];
++	__le32 bitdepth, layout, fourcc, field;
++};
++struct mt6897_vdec_format {
++	__le32 fourcc, type, planes, reserved;
++};
++struct mt6897_vdec_frame_size {
++	__le32 fourcc, profile, level, reserved;
++	__le32 min_width, max_width, step_width, min_height, max_height, step_height;
++};
++/* Validated prefix only. Firmware owns additional metadata after this
++ * prefix; never clear or copy sizeof(this) over the entire firmware VSI.
++ */
++struct mt6897_vdec_vsi {
++	struct mt6897_vdec_bs_ring free_bs;
++	struct mt6897_vdec_fb_ring free_fb, display;
++	struct mt6897_vdec_params params;
++	struct mt6897_vdec_info dec;
++	struct mt6897_vdec_pic pic;
++	__le32 color_desc[18];
++	__le32 crop_left, crop_top, crop_width, crop_height;
++	__le32 time_numerator, time_denominator;
++	struct mt6897_vdec_format formats[MT6897_VDEC_CAPS];
++	struct mt6897_vdec_frame_size frame_sizes[MT6897_VDEC_CAPS];
++	__le32 aspect_ratio, fixed_buffers, fixed_buffers_svp, interlacing, codec_type;
++	u8 input_driven, output_async, low_pw_mode, in_group, cpu_hint;
++	u8 crc_path[256], golden_path[256];
++	__le64 general_dma;
++	__le32 general_fd, general_size;
++	__le64 meta_dma;
++	__le32 meta_fd, meta_size, ipi_blocked;
++};
++
++static_assert(sizeof(struct mt6897_vdec_cmd) == 24);
++static_assert(sizeof(struct mt6897_vdec_init) == 24);
++static_assert(sizeof(struct mt6897_vdec_start) == 40);
++static_assert(sizeof(struct mt6897_vdec_set_param) == 64);
++static_assert(sizeof(struct mt6897_vdec_ack) == 40);
++static_assert(sizeof(struct mt6897_vdec_init_ack) == 32);
++static_assert(sizeof(struct mt6897_vdec_query) == 40);
++static_assert(sizeof(struct mt6897_vdec_query_ack) == 48);
++static_assert(sizeof(struct mt6897_vdec_mem_op) == 64);
++static_assert(sizeof(struct mt6897_vdec_fb) == 24);
++static_assert(sizeof(struct mt6897_vdec_fb_ipi) == 40);
++static_assert(sizeof(struct mt6897_vdec_bs_ring) == 528);
++static_assert(sizeof(struct mt6897_vdec_fb_ring) == 1552);
++static_assert(sizeof(struct mt6897_vdec_params) == 88);
++static_assert(sizeof(struct mt6897_vdec_info) == 200);
++static_assert(sizeof(struct mt6897_vdec_pic) == 64);
++static_assert(offsetof(struct mt6897_vdec_cmd, instance) == 8);
++static_assert(offsetof(struct mt6897_vdec_init, cookie) == 16);
++static_assert(offsetof(struct mt6897_vdec_query, query) == 32);
++static_assert(offsetof(struct mt6897_vdec_ack, cookie) == 16);
++static_assert(offsetof(struct mt6897_vdec_vsi, free_fb) == 528);
++static_assert(offsetof(struct mt6897_vdec_vsi, display) == 2080);
++static_assert(offsetof(struct mt6897_vdec_vsi, dec) == 3720);
++static_assert(offsetof(struct mt6897_vdec_vsi, pic) == 3920);
++static_assert(offsetof(struct mt6897_vdec_vsi, crop_left) == 4056);
++static_assert(offsetof(struct mt6897_vdec_vsi, formats) == 4080);
++
++static_assert(offsetof(struct mt6897_vdec_vsi, input_driven) == 11268);
++static_assert(offsetof(struct mt6897_vdec_vsi, output_async) == 11269);
++static_assert(offsetof(struct mt6897_vdec_vsi, low_pw_mode) == 11270);
++static_assert(offsetof(struct mt6897_vdec_vsi, general_dma) == 11792);
++static_assert(offsetof(struct mt6897_vdec_vsi, general_fd) == 11800);
++static_assert(offsetof(struct mt6897_vdec_vsi, general_size) == 11804);
++static_assert(offsetof(struct mt6897_vdec_vsi, ipi_blocked) == 11824);
++#define MT6897_VDEC_VSI_EXTENT (offsetof(struct mt6897_vdec_vsi, ipi_blocked) + 4)
++static_assert(MT6897_VDEC_VSI_EXTENT == 11828);
++
++/* Firmware may request this shared-memory bootstrap even without an encoder
++ * frontend. Its prefix differs from decoder messages: cookie precedes status.
++ * MediaTek venc_ipi_msg.h at the same pinned source revision above.
++ */
++struct mt6897_venc_boot_mem {
++	__le32 id, ctx;
++	__le64 cookie;
++	__le32 status, reserved, type, size;
++	__le64 iova, pa, va;
++	__le32 property, log;
++};
++static_assert(sizeof(struct mt6897_venc_boot_mem) == 64);
++static_assert(offsetof(struct mt6897_venc_boot_mem, cookie) == 8);
++static_assert(offsetof(struct mt6897_venc_boot_mem, status) == 16);
++static_assert(offsetof(struct mt6897_venc_boot_mem, type) == 24);
++static_assert(offsetof(struct mt6897_venc_boot_mem, property) == 56);
++
++/* Preserve the firmware context and cookie; replace all reply-owned fields. */
++static inline void mt6897_venc_shm_reply(struct mt6897_venc_boot_mem *msg,
++				       u32 size, u64 dma, u64 va,
++				       u32 property, u32 log)
++{
++	msg->id = cpu_to_le32(0x4003);
++	msg->status = msg->reserved = 0;
++	msg->type = cpu_to_le32(6);
++	msg->size = cpu_to_le32(size);
++	msg->iova = msg->pa = cpu_to_le64(dma);
++	msg->va = cpu_to_le64(va);
++	msg->property = cpu_to_le32(property);
++	msg->log = cpu_to_le32(log);
++}
++
++/* Zero the complete wire object, including alignment and tail padding. */
++static inline void mt6897_vdec_make_init(struct mt6897_vdec_init *msg,
++				       u32 context, u64 cookie)
++{
++	memset(msg, 0, sizeof(*msg));
++	msg->id = cpu_to_le32(MT6897_VDEC_INIT);
++	msg->ctx = cpu_to_le32(context);
++	msg->cookie = cpu_to_le64(cookie);
++}
++
++static inline void mt6897_vdec_make_query(struct mt6897_vdec_query *msg,
++					u32 context, u64 cookie, u64 data_cookie,
++					u32 query)
++{
++	memset(msg, 0, sizeof(*msg));
++	msg->id = cpu_to_le32(MT6897_VDEC_QUERY_CAP);
++	msg->ctx = cpu_to_le32(context);
++	msg->cookie = cpu_to_le64(cookie);
++	msg->data_cookie = cpu_to_le64(data_cookie);
++	msg->query = cpu_to_le32(query);
++}
++
++static inline void mt6897_vdec_make_start(struct mt6897_vdec_start *msg,
++					u32 context, u64 instance, const u32 data[6])
++{
++	unsigned int i;
++
++	memset(msg, 0, sizeof(*msg));
++	msg->id = cpu_to_le32(MT6897_VDEC_START);
++	msg->ctx = cpu_to_le32(context);
++	msg->instance = cpu_to_le64(instance);
++	for (i = 0; i < 6; i++)
++		msg->data[i] = cpu_to_le32(data[i]);
++}
++/* Vendor's optional container-size control defaults to zero. The first
++ * header pass still publishes those defaults and the FRAME_SIZE change bit.
++ * Preserve every other firmware-owned parameter byte.
++ */
++static inline void mt6897_vdec_header_params(struct mt6897_vdec_params *params)
++{
++	params->width = 0;
++	params->height = 0;
++	params->changed = cpu_to_le32(le32_to_cpu(params->changed) | (1U << 1));
++}
++static_assert(offsetof(struct mt6897_vdec_vsi, params.changed) == 3632);
++static_assert(offsetof(struct mt6897_vdec_vsi, params.width) == 3640);
++static_assert(offsetof(struct mt6897_vdec_vsi, params.height) == 3644);
++
++/* Firmware normal decoder buffers are 32-bit; the shared domain may keep
++ * an unmapped gap below that address limit. No full-4-GiB extent is needed.
++ */
++static inline bool mt6897_vdec_normal_aperture_valid(u64 start, u64 end,
++						  bool forced)
++{
++	return forced && !start && end > start && end <= 0xffffffffULL;
++}
++
++#endif
+diff --git a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_pixels.h b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_pixels.h
+new file mode 100644
+index 0000000000..0f19bca831
+--- /dev/null
++++ b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_pixels.h
+@@ -0,0 +1,46 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __MTK_VCP_VDEC_PIXELS_H
++#define __MTK_VCP_VDEC_PIXELS_H
++#include <linux/types.h>
++#include <linux/string.h>
++
++/* MM21 identifies the tile format. Layout 8 is admitted only for the
++ * eight-bit MM21 format, not interpreted as a compression flag.
++ * Firmware allocation tails are opaque and never read by the CPU detiler.
++ */
++static inline bool mtk_vcp_mm21_valid(u32 stride, u32 height, u32 y_size,
++				    u32 c_size, u32 layout)
++{
++	u64 luma = (u64)stride * height;
++
++	return stride && stride <= 4096 && !(stride & 15) &&
++		height && height <= 2176 && !(height & 31) &&
++		!layout && y_size >= luma &&
++		c_size >= luma / 2 && (u64)y_size + c_size <= 16ULL * 1024 * 1024;
++}
++
++static inline bool mtk_vcp_crop_valid(u32 width, u32 height, u32 left,
++				     u32 top, u32 crop_width, u32 crop_height)
++{
++	return crop_width && crop_height && left < width && top < height &&
++		crop_width <= width - left && crop_height <= height - top;
++}
++
++/* Caller validates the tiled source footprint and linear destination size.
++ * Luma uses 16x32 tiles, interleaved chroma uses 16x16 tiles.
++ */
++static inline void mtk_vcp_mm21_detile(void *destination, const void *source,
++				     u32 stride, u32 height, u32 tile_h)
++{
++	u8 *dst = destination;
++	const u8 *src = source;
++	u32 x, y;
++
++	for (y = 0; y < height; y++)
++		for (x = 0; x < stride; x += 16) {
++			u32 offset = (y / tile_h * (stride / 16) + x / 16) * tile_h * 16;
++
++			memcpy(dst + y * stride + x, src + offset + y % tile_h * 16, 16);
++		}
++}
++#endif
+-- 
+2.56.0
+

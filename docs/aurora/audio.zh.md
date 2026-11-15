@@ -2,7 +2,9 @@
 
 [English](audio.md)
 
-使用 OS1.0.3.0.UNACNXM Android 14 固件底包。启用 `hardware.aurora.audio.enable`
+使用要求的 OS3.0.308.0.WNACNXM（Android 16）底包。下文结果在此前的 Android 14
+底包（OS1.0.3.0.UNACNXM）上测得；Android 16 版本中打包的音频文件未变，但 ADSP
+固件不同，扬声器播放尚未在其上重新验证。启用 `hardware.aurora.audio.enable`
 （已安装系统的默认值）时，Aurora 模块会安装 AudioReach 拓扑、UCM 以及原厂双
 CS35L43 保护固件。RAM recovery 不包含音频固件和用户态路由。
 
@@ -24,7 +26,6 @@ Linux 而重新运行校准。
   hardware.aurora.firmwarePackage =
     inputs.androidDevices.legacyPackages.${pkgs.stdenv.buildPlatform.system}
       .devices.aurora.firmware.override {
-        firmwareVariant = "android14";
         bluetoothNvm = ./hmtnv20.b2e;
         speakerCalibration = builtins.fromJSON
           (builtins.readFile ./aurora-speaker-calibration.json);

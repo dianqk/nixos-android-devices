@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 14 Oct 2026 15:45:35 +0800
+Subject: [PATCH 11/11] ufs: ufs-mediatek: make the bootloader reset SMC
+ optional
+
+The MTK_SIP_BL_UFS_CONTROL reset added for U-Boot running as the first
+non-secure stage is not appropriate when the stock LK chainloads U-Boot
+as a boot-image kernel. Put it behind UFS_MEDIATEK_BL_RESET, default off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/ufs/Kconfig        | 10 ++++++++++
+ drivers/ufs/ufs-mediatek.c |  3 ++-
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/ufs/Kconfig b/drivers/ufs/Kconfig
+index 6dffdc00b3..b66ab015bd 100644
+--- a/drivers/ufs/Kconfig
++++ b/drivers/ufs/Kconfig
+@@ -37,6 +37,16 @@ config UFS_MEDIATEK
+ 
+ 	  If unsure, say N.
+ 
++config UFS_MEDIATEK_BL_RESET
++	bool "Reset the UFS controller through the bootloader SMC"
++	depends on UFS_MEDIATEK
++	help
++	  Issue the bootloader-stage MTK_SIP_BL_UFS_CONTROL reset before link
++	  startup. This is needed when U-Boot replaces the vendor LK as the
++	  first non-secure stage. Leave it disabled when the vendor LK
++	  chainloads U-Boot as a boot-image kernel: LK has already owned the
++	  controller, and the kernel-stage device reset path is used instead.
++
+ config UFS_PCI
+ 	bool "PCI bus based UFS Controller support"
+ 	depends on PCI && UFS
+diff --git a/drivers/ufs/ufs-mediatek.c b/drivers/ufs/ufs-mediatek.c
+index db60166bfd..b383a05ce7 100644
+--- a/drivers/ufs/ufs-mediatek.c
++++ b/drivers/ufs/ufs-mediatek.c
+@@ -107,7 +107,8 @@ static int ufs_mtk_pre_link(struct ufs_hba *hba)
+ 	 * to run in non-secure world, we need to reset the UFS
+ 	 * controller via the SMC to acknowledge the switch.
+ 	 */
+-	mtk_ufs_bootloader_smc_reset();
++	if (IS_ENABLED(CONFIG_UFS_MEDIATEK_BL_RESET))
++		mtk_ufs_bootloader_smc_reset();
+ 
+ 	ret = ufs_mtk_unipro_set_lpm(hba, false);
+ 	if (ret)

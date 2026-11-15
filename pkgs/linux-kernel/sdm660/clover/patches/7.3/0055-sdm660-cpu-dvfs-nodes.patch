@@ -1,0 +1,456 @@
+From 404c6389b8fd933841ec1b1e9b8937318e8b2113 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 31 Oct 2026 19:50:55 +0800
+Subject: [PATCH] arm64: dts: qcom: sdm660: Describe the CPU CPRh, OSM and L2
+ SAWs
+
+Describe the CPU voltage and frequency hardware of SDM660, disabled by
+default:
+
+- The CPR fuse cells of both clusters in the QFPROM (speed bin, CPR
+  fusing revision, and per fuse corner open-loop voltage, target
+  quotient, ring oscillator and quotient offset), at the locations of
+  the vendor CPRh driver.
+- The silver and gold L2 SAWs.
+- The two CPRh controllers (silver at 0x179c8000, gold at 0x179c4000) as
+  one CPR3 power domain provider, with the RBCPR clock at 19.2 MHz. It
+  keeps VDD_MX (active only) at nominal or above while it is bound, as
+  the memory arrays run from MX below the APM threshold.
+- The OSM frequency domains, sequencer regions and OSM clock RCG, with
+  the GPLL0 based alternate clock and the L2 SAWs it waits for.
+
+Also add the CPUs as cooling devices of the passive trips of the CPU
+thermal zones: the four gold CPU sensors throttle the gold cluster and
+the power cluster sensor throttles the silver cluster.
+
+Board files add the corner plan (OPP tables) and enable the nodes.
+
+Scope: SDM630/660 common
+Porting notes: Local device tree addition (not upstream). Fuse locations from the vendor crDroid 4.19 drivers/regulator/cprh-kbss-regulator.c, register blocks from the vendor sdm660.dtsi, sdm660-regulator.dtsi and sdm660-pm.dtsi.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm64/boot/dts/qcom/sdm660.dtsi | 396 +++++++++++++++++++++++++++
+ 1 file changed, 396 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm660.dtsi b/arch/arm64/boot/dts/qcom/sdm660.dtsi
+index 70505591f2..8b277313c3 100644
+--- a/arch/arm64/boot/dts/qcom/sdm660.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm660.dtsi
+@@ -38,6 +38,68 @@ cdsp_region: cdsp@94a00000 {
+ 			no-map;
+ 		};
+ 	};
++
++	thermal-zones {
++		cpu0-thermal {
++			cooling-maps {
++				map0 {
++					trip = <&cpu0_alert0>;
++					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++				};
++			};
++		};
++
++		cpu1-thermal {
++			cooling-maps {
++				map0 {
++					trip = <&cpu1_alert0>;
++					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++				};
++			};
++		};
++
++		cpu2-thermal {
++			cooling-maps {
++				map0 {
++					trip = <&cpu2_alert0>;
++					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++				};
++			};
++		};
++
++		cpu3-thermal {
++			cooling-maps {
++				map0 {
++					trip = <&cpu3_alert0>;
++					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++				};
++			};
++		};
++
++		pwr-cluster-thermal {
++			cooling-maps {
++				map0 {
++					trip = <&pwr_cluster_alert0>;
++					cooling-device = <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++				};
++			};
++		};
++	};
+ };
+ 
+ &adreno_gpu {
+@@ -307,6 +369,208 @@ &mmcc {
+ 			<0>;
+ };
+ 
++&qfprom {
++	cpr_speed_bin: cpr-speed-bin@4133 {
++		reg = <0x4133 0x1>;
++		bits = <5 3>;
++	};
++
++	cpr_ro_sel3_pwrcl: cpr-ro-sel3-pwrcl@420f {
++		reg = <0x420f 0x1>;
++		bits = <0 4>;
++	};
++
++	cpr_ro_sel5_perfcl: cpr-ro-sel5-perfcl@4211 {
++		reg = <0x4211 0x2>;
++		bits = <6 4>;
++	};
++
++	cpr_ro_sel4_pwrcl: cpr-ro-sel4-pwrcl@4218 {
++		reg = <0x4218 0x1>;
++		bits = <4 4>;
++	};
++
++	cpr_ro_sel5_pwrcl: cpr-ro-sel5-pwrcl@4218 {
++		reg = <0x4218 0x1>;
++		bits = <0 4>;
++	};
++
++	cpr_ro_sel1_pwrcl: cpr-ro-sel1-pwrcl@4219 {
++		reg = <0x4219 0x1>;
++		bits = <4 4>;
++	};
++
++	cpr_ro_sel2_pwrcl: cpr-ro-sel2-pwrcl@4219 {
++		reg = <0x4219 0x1>;
++		bits = <0 4>;
++	};
++
++	cpr_init_voltage4_pwrcl: cpr-init-voltage4-pwrcl@421a {
++		reg = <0x421a 0x2>;
++		bits = <6 6>;
++	};
++
++	cpr_init_voltage5_pwrcl: cpr-init-voltage5-pwrcl@421a {
++		reg = <0x421a 0x1>;
++		bits = <0 6>;
++	};
++
++	cpr_init_voltage2_pwrcl: cpr-init-voltage2-pwrcl@421b {
++		reg = <0x421b 0x2>;
++		bits = <4 6>;
++	};
++
++	cpr_init_voltage1_pwrcl: cpr-init-voltage1-pwrcl@421c {
++		reg = <0x421c 0x1>;
++		bits = <2 6>;
++	};
++
++	cpr_quot5_pwrcl: cpr-quot5-pwrcl@421d {
++		reg = <0x421d 0x2>;
++		bits = <0 12>;
++	};
++
++	cpr_quot4_pwrcl: cpr-quot4-pwrcl@421e {
++		reg = <0x421e 0x2>;
++		bits = <4 12>;
++	};
++
++	cpr_quot2_pwrcl: cpr-quot2-pwrcl@4220 {
++		reg = <0x4220 0x2>;
++		bits = <0 12>;
++	};
++
++	cpr_quot1_pwrcl: cpr-quot1-pwrcl@4221 {
++		reg = <0x4221 0x2>;
++		bits = <4 12>;
++	};
++
++	cpr_quot_offset4_pwrcl: cpr-quot-offset4-pwrcl@4223 {
++		reg = <0x4223 0x2>;
++		bits = <7 7>;
++	};
++
++	cpr_quot_offset5_pwrcl: cpr-quot-offset5-pwrcl@4223 {
++		reg = <0x4223 0x1>;
++		bits = <0 7>;
++	};
++
++	cpr_quot_offset2_pwrcl: cpr-quot-offset2-pwrcl@4224 {
++		reg = <0x4224 0x2>;
++		bits = <6 7>;
++	};
++
++	cpr_ro_sel4_perfcl: cpr-ro-sel4-perfcl@4226 {
++		reg = <0x4226 0x2>;
++		bits = <5 4>;
++	};
++
++	cpr_ro_sel1_perfcl: cpr-ro-sel1-perfcl@4227 {
++		reg = <0x4227 0x2>;
++		bits = <5 4>;
++	};
++
++	cpr_ro_sel3_perfcl: cpr-ro-sel3-perfcl@4227 {
++		reg = <0x4227 0x1>;
++		bits = <1 4>;
++	};
++
++	cpr_init_voltage4_perfcl: cpr-init-voltage4-perfcl@4228 {
++		reg = <0x4228 0x2>;
++		bits = <5 6>;
++	};
++
++	cpr_ro_sel2_perfcl: cpr-ro-sel2-perfcl@4228 {
++		reg = <0x4228 0x1>;
++		bits = <1 4>;
++	};
++
++	cpr_init_voltage3_perfcl: cpr-init-voltage3-perfcl@4229 {
++		reg = <0x4229 0x2>;
++		bits = <3 6>;
++	};
++
++	cpr_init_voltage1_perfcl: cpr-init-voltage1-perfcl@422a {
++		reg = <0x422a 0x1>;
++		bits = <1 6>;
++	};
++
++	cpr_init_voltage2_perfcl: cpr-init-voltage2-perfcl@422a {
++		reg = <0x422a 0x2>;
++		bits = <7 6>;
++	};
++
++	cpr_quot4_perfcl: cpr-quot4-perfcl@422b {
++		reg = <0x422b 0x3>;
++		bits = <5 12>;
++	};
++
++	cpr_quot3_perfcl: cpr-quot3-perfcl@422d {
++		reg = <0x422d 0x2>;
++		bits = <1 12>;
++	};
++
++	cpr_quot1_perfcl: cpr-quot1-perfcl@422e {
++		reg = <0x422e 0x3>;
++		bits = <5 12>;
++	};
++
++	cpr_quot2_perfcl: cpr-quot2-perfcl@4230 {
++		reg = <0x4230 0x2>;
++		bits = <1 12>;
++	};
++
++	cpr_quot_offset4_perfcl: cpr-quot-offset4-perfcl@4231 {
++		reg = <0x4231 0x2>;
++		bits = <5 7>;
++	};
++
++	cpr_quot_offset3_perfcl: cpr-quot-offset3-perfcl@4232 {
++		reg = <0x4232 0x2>;
++		bits = <4 7>;
++	};
++
++	cpr_quot_offset2_perfcl: cpr-quot-offset2-perfcl@4233 {
++		reg = <0x4233 0x2>;
++		bits = <3 7>;
++	};
++
++	cpr_init_voltage5_perfcl: cpr-init-voltage5-perfcl@4235 {
++		reg = <0x4235 0x1>;
++		bits = <2 6>;
++	};
++
++	cpr_quot5_perfcl: cpr-quot5-perfcl@4236 {
++		reg = <0x4236 0x2>;
++		bits = <0 12>;
++	};
++
++	cpr_quot_offset5_perfcl: cpr-quot-offset5-perfcl@4237 {
++		reg = <0x4237 0x2>;
++		bits = <4 7>;
++	};
++
++	cpr_init_voltage3_pwrcl: cpr-init-voltage3-pwrcl@4238 {
++		reg = <0x4238 0x2>;
++		bits = <3 6>;
++	};
++
++	cpr_quot3_pwrcl: cpr-quot3-pwrcl@4239 {
++		reg = <0x4239 0x2>;
++		bits = <1 12>;
++	};
++
++	cpr_quot_offset3_pwrcl: cpr-quot-offset3-pwrcl@423a {
++		reg = <0x423a 0x2>;
++		bits = <5 7>;
++	};
++
++	cpr_fuse_revision: cpr-fuse-revision@423b {
++		reg = <0x423b 0x1>;
++		bits = <4 3>;
++	};
++};
++
+ &soc {
+ 	cdsp_smmu: iommu@5180000 {
+ 		compatible = "qcom,sdm630-smmu-v2", "qcom,smmu-v2";
+@@ -435,6 +699,138 @@ compute-cb@11 {
+ 			};
+ 		};
+ 	};
++
++	saw_gold_l2: power-manager@17812000 {
++		compatible = "qcom,sdm660-gold-saw2-v4.1-l2", "qcom,saw2";
++		reg = <0x17812000 0x1000>;
++		status = "disabled";
++	};
++
++	saw_silver_l2: power-manager@17912000 {
++		compatible = "qcom,sdm660-silver-saw2-v4.1-l2", "qcom,saw2";
++		reg = <0x17912000 0x1000>;
++		status = "disabled";
++	};
++
++	cpufreq_hw: cpufreq@179c1000 {
++		compatible = "qcom,sdm660-cpufreq-hw";
++		reg = <0x179c1000 0x1000>, <0x179c3000 0x1000>,
++		      <0x179c0000 0x1000>, <0x179c2000 0x1000>,
++		      <0x179d112c 0x8>;
++		reg-names = "freq-domain0", "freq-domain1",
++			    "osm-domain0", "osm-domain1",
++			    "osm-clk";
++
++		clocks = <&rpmcc RPM_SMD_XO_A_CLK_SRC>,
++			 <&gcc HMSS_GPLL0_CLK_SRC>;
++		clock-names = "xo", "alternate";
++
++		/* Silver and gold L2 SAWs, in frequency domain order */
++		qcom,saw = <&saw_silver_l2>, <&saw_gold_l2>;
++
++		#freq-domain-cells = <1>;
++		#clock-cells = <1>;
++
++		status = "disabled";
++	};
++
++	apc_cprh: power-controller@179c8000 {
++		compatible = "qcom,sdm660-cprh", "qcom,cprh";
++		reg = <0x179c8000 0x4000>,
++		      <0x179c4000 0x4000>;
++
++		clocks = <&gcc GCC_HMSS_RBCPR_CLK>;
++		assigned-clocks = <&gcc GCC_HMSS_RBCPR_CLK>;
++		assigned-clock-rates = <19200000>;
++
++		/* Keep MX at nominal while the APM can run the arrays from it */
++		power-domains = <&rpmpd RPMPD_VDDMX_AO>;
++		required-opps = <&rpmpd_opp_nom>;
++		#power-domain-cells = <1>;
++
++		nvmem-cells = <&cpr_speed_bin>,
++			      <&cpr_fuse_revision>,
++			      <&cpr_quot1_pwrcl>,
++			      <&cpr_quot2_pwrcl>,
++			      <&cpr_quot3_pwrcl>,
++			      <&cpr_quot4_pwrcl>,
++			      <&cpr_quot5_pwrcl>,
++			      <&cpr_quot_offset2_pwrcl>,
++			      <&cpr_quot_offset3_pwrcl>,
++			      <&cpr_quot_offset4_pwrcl>,
++			      <&cpr_quot_offset5_pwrcl>,
++			      <&cpr_init_voltage1_pwrcl>,
++			      <&cpr_init_voltage2_pwrcl>,
++			      <&cpr_init_voltage3_pwrcl>,
++			      <&cpr_init_voltage4_pwrcl>,
++			      <&cpr_init_voltage5_pwrcl>,
++			      <&cpr_ro_sel1_pwrcl>,
++			      <&cpr_ro_sel2_pwrcl>,
++			      <&cpr_ro_sel3_pwrcl>,
++			      <&cpr_ro_sel4_pwrcl>,
++			      <&cpr_ro_sel5_pwrcl>,
++			      <&cpr_quot1_perfcl>,
++			      <&cpr_quot2_perfcl>,
++			      <&cpr_quot3_perfcl>,
++			      <&cpr_quot4_perfcl>,
++			      <&cpr_quot5_perfcl>,
++			      <&cpr_quot_offset2_perfcl>,
++			      <&cpr_quot_offset3_perfcl>,
++			      <&cpr_quot_offset4_perfcl>,
++			      <&cpr_quot_offset5_perfcl>,
++			      <&cpr_init_voltage1_perfcl>,
++			      <&cpr_init_voltage2_perfcl>,
++			      <&cpr_init_voltage3_perfcl>,
++			      <&cpr_init_voltage4_perfcl>,
++			      <&cpr_init_voltage5_perfcl>,
++			      <&cpr_ro_sel1_perfcl>,
++			      <&cpr_ro_sel2_perfcl>,
++			      <&cpr_ro_sel3_perfcl>,
++			      <&cpr_ro_sel4_perfcl>,
++			      <&cpr_ro_sel5_perfcl>;
++		nvmem-cell-names = "cpr_speed_bin",
++				   "cpr_fuse_revision",
++				   "cpr0_quotient1",
++				   "cpr0_quotient2",
++				   "cpr0_quotient3",
++				   "cpr0_quotient4",
++				   "cpr0_quotient5",
++				   "cpr0_quotient_offset2",
++				   "cpr0_quotient_offset3",
++				   "cpr0_quotient_offset4",
++				   "cpr0_quotient_offset5",
++				   "cpr0_init_voltage1",
++				   "cpr0_init_voltage2",
++				   "cpr0_init_voltage3",
++				   "cpr0_init_voltage4",
++				   "cpr0_init_voltage5",
++				   "cpr0_ring_osc1",
++				   "cpr0_ring_osc2",
++				   "cpr0_ring_osc3",
++				   "cpr0_ring_osc4",
++				   "cpr0_ring_osc5",
++				   "cpr1_quotient1",
++				   "cpr1_quotient2",
++				   "cpr1_quotient3",
++				   "cpr1_quotient4",
++				   "cpr1_quotient5",
++				   "cpr1_quotient_offset2",
++				   "cpr1_quotient_offset3",
++				   "cpr1_quotient_offset4",
++				   "cpr1_quotient_offset5",
++				   "cpr1_init_voltage1",
++				   "cpr1_init_voltage2",
++				   "cpr1_init_voltage3",
++				   "cpr1_init_voltage4",
++				   "cpr1_init_voltage5",
++				   "cpr1_ring_osc1",
++				   "cpr1_ring_osc2",
++				   "cpr1_ring_osc3",
++				   "cpr1_ring_osc4",
++				   "cpr1_ring_osc5";
++
++		status = "disabled";
++	};
+ };
+ 
+ &tlmm {

@@ -1,0 +1,331 @@
+From 8fac53d89ab768d1f0d77611b52b71e0b4cc545d Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 21 Oct 2026 07:28:43 +0800
+Subject: [PATCH] power: supply: qcom_battmgr: Aurora charge control and charge
+ current cap
+
+Follow the OEM qti_battery_charger.c (MiCode Xiaomi_Kernel_OpenSource
+c7841217725a) for the Xiaomi Aurora firmware's battery write paths:
+
+- Charge thresholds: the firmware applies BATTMGR_CHG_CTRL_LIMIT_EN (0x48)
+  only after BATT_CHG_CTRL_EN (wire ID 25) is set; the OEM driver sends
+  0x48 only while its charge_control_en is set. An end threshold below 100
+  now sets BATT_CHG_CTRL_EN before 0x48 (and clears it again if 0x48 fails
+  on a disabled controller); an end threshold of 100, as written by UPower
+  to disable its threshold, clears it. A start threshold is remembered
+  while disabled and sent while enabled. Firmware errors and timeouts are
+  returned to the writer instead of 0.
+- CONSTANT_CHARGE_CURRENT: readable and writable in uA through wire ID 12
+  (BATT_CONSTANT_CURRENT), a negative value removing the cap as in the OEM
+  driver. Stock mi_thermald limits charging through this property. The read
+  value is the firmware's effective cap.
+- BATTMGR_BAT_PROPERTY_SET responses report a nonzero firmware result as
+  -EIO.
+
+Aurora gets its own battery descriptor with the charge current property,
+without the POWER_NOW placeholder and INTERNAL_RESISTANCE (the battery ID
+resistor). CHARGE_CONTROL_LIMIT is not exposed: the OEM driver writes
+either a thermal level or a current in uA to the same firmware property,
+and the firmware level table is unknown. Other boards keep their
+descriptors and threshold behaviour.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/power/supply/qcom_battmgr.c | 210 +++++++++++++++++++++++++++-
+ 1 file changed, 209 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index d648bc7d7e9e..1711340ef057 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -101,6 +101,8 @@ enum qcom_battmgr_variant {
+ #define WLS_BOOST_EN			6
+ 
+ #define BATTMGR_CHG_CTRL_LIMIT_EN	0x48
++/* Xiaomi battery wire ID inserted before BATT_TEMP (see the property quirk). */
++#define XIAOMI_BATT_CONSTANT_CURRENT	12
+ #define CHARGE_CTRL_START_THR_MIN	50
+ #define CHARGE_CTRL_START_THR_MAX	95
+ #define CHARGE_CTRL_END_THR_MIN		55
+@@ -316,6 +318,10 @@ struct qcom_battmgr {
+ 
+ 	enum qcom_battmgr_variant variant;
+ 	bool xiaomi_battery_property_ids;
++	/* Xiaomi firmware applies 0x48 thresholds only with BATT_CHG_CTRL_EN. */
++	bool xiaomi_chg_ctrl_en;
++	unsigned int xiaomi_chg_ctrl_start;
++	unsigned int xiaomi_constant_current;
+ 
+ 	struct power_supply *ac_psy;
+ 	struct power_supply *bat_psy;
+@@ -477,6 +483,40 @@ static int qcom_battmgr_bat_sm8350_update(struct qcom_battmgr *battmgr,
+ 	return ret;
+ }
+ 
++/* Xiaomi wire ID of a mainline SM8350 battery property ID. */
++static unsigned int qcom_battmgr_xiaomi_bat_wire(unsigned int prop)
++{
++	if (prop >= BATT_TEMP && prop <= BATT_CHG_CTRL_END_THR)
++		prop++;
++
++	return prop;
++}
++
++/* Called with battmgr->lock held. */
++static int qcom_battmgr_xiaomi_bat_set(struct qcom_battmgr *battmgr,
++				       unsigned int wire, u32 value)
++{
++	return qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
++					     wire, value);
++}
++
++static int qcom_battmgr_xiaomi_get_constant_current(struct qcom_battmgr *battmgr,
++						    union power_supply_propval *val)
++{
++	int ret;
++
++	mutex_lock(&battmgr->lock);
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
++					    XIAOMI_BATT_CONSTANT_CURRENT, 0);
++	mutex_unlock(&battmgr->lock);
++	if (ret)
++		return ret;
++
++	val->intval = min_t(unsigned int, battmgr->xiaomi_constant_current, INT_MAX);
++
++	return 0;
++}
++
+ static int qcom_battmgr_bat_sc8280xp_update(struct qcom_battmgr *battmgr,
+ 					    enum power_supply_property psp)
+ {
+@@ -539,6 +579,10 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
+ 	if (!battmgr->service_up)
+ 		return -EAGAIN;
+ 
++	if (battmgr->xiaomi_battery_property_ids &&
++	    psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT)
++		return qcom_battmgr_xiaomi_get_constant_current(battmgr, val);
++
+ 	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
+ 	    battmgr->variant == QCOM_BATTMGR_X1E80100)
+ 		ret = qcom_battmgr_bat_sc8280xp_update(battmgr, psp);
+@@ -702,6 +746,93 @@ static int qcom_battmgr_set_charge_control(struct qcom_battmgr *battmgr,
+ 	return qcom_battmgr_request(battmgr, &request, sizeof(request));
+ }
+ 
++/* Called with battmgr->lock held. */
++static int qcom_battmgr_xiaomi_set_chg_ctrl_en(struct qcom_battmgr *battmgr, bool enable)
++{
++	int ret;
++
++	ret = qcom_battmgr_xiaomi_bat_set(battmgr,
++					  qcom_battmgr_xiaomi_bat_wire(BATT_CHG_CTRL_EN),
++					  enable);
++	if (!ret)
++		battmgr->xiaomi_chg_ctrl_en = enable;
++
++	return ret;
++}
++
++/*
++ * As the OEM driver, send thresholds only while BATT_CHG_CTRL_EN is set. An end
++ * threshold below 100 enables charge control first, 100 disables it again, and
++ * firmware errors are returned to the writer.
++ */
++static int qcom_battmgr_xiaomi_set_charge_start_threshold(struct qcom_battmgr *battmgr,
++							  int start_soc)
++{
++	u32 end_soc = battmgr->info.charge_ctrl_end;
++	int ret = 0;
++
++	start_soc = clamp(start_soc, CHARGE_CTRL_START_THR_MIN, CHARGE_CTRL_START_THR_MAX);
++
++	mutex_lock(&battmgr->lock);
++	if (battmgr->xiaomi_chg_ctrl_en) {
++		if (start_soc >= end_soc)
++			end_soc = min_t(u32, start_soc + CHARGE_CTRL_DELTA_SOC,
++					CHARGE_CTRL_END_THR_MAX);
++		ret = qcom_battmgr_set_charge_control(battmgr, end_soc, end_soc - start_soc);
++	}
++	if (!ret)
++		battmgr->xiaomi_chg_ctrl_start = start_soc;
++	mutex_unlock(&battmgr->lock);
++
++	return ret;
++}
++
++static int qcom_battmgr_xiaomi_set_charge_end_threshold(struct qcom_battmgr *battmgr,
++							int end_soc)
++{
++	u32 delta_soc = CHARGE_CTRL_DELTA_SOC;
++	bool was_enabled;
++	int ret;
++
++	end_soc = clamp(end_soc, CHARGE_CTRL_END_THR_MIN, CHARGE_CTRL_END_THR_MAX);
++
++	mutex_lock(&battmgr->lock);
++	if (end_soc == CHARGE_CTRL_END_THR_MAX) {
++		ret = qcom_battmgr_xiaomi_set_chg_ctrl_en(battmgr, false);
++		goto out_unlock;
++	}
++
++	if (battmgr->xiaomi_chg_ctrl_start && end_soc > battmgr->xiaomi_chg_ctrl_start)
++		delta_soc = end_soc - battmgr->xiaomi_chg_ctrl_start;
++
++	was_enabled = battmgr->xiaomi_chg_ctrl_en;
++	ret = qcom_battmgr_xiaomi_set_chg_ctrl_en(battmgr, true);
++	if (ret)
++		goto out_unlock;
++
++	ret = qcom_battmgr_set_charge_control(battmgr, end_soc, delta_soc);
++	if (ret && !was_enabled)
++		qcom_battmgr_xiaomi_set_chg_ctrl_en(battmgr, false);
++
++out_unlock:
++	mutex_unlock(&battmgr->lock);
++
++	return ret;
++}
++
++static int qcom_battmgr_xiaomi_set_constant_current(struct qcom_battmgr *battmgr, int ua)
++{
++	int ret;
++
++	/* As the OEM driver: a negative request removes the cap. */
++	mutex_lock(&battmgr->lock);
++	ret = qcom_battmgr_xiaomi_bat_set(battmgr, XIAOMI_BATT_CONSTANT_CURRENT,
++					  ua < 0 ? UINT_MAX : ua);
++	mutex_unlock(&battmgr->lock);
++
++	return ret;
++}
++
+ static int qcom_battmgr_set_charge_start_threshold(struct qcom_battmgr *battmgr, int start_soc)
+ {
+ 	u32 target_soc, delta_soc;
+@@ -788,10 +919,14 @@ static int qcom_battmgr_charge_control_thresholds_init(struct qcom_battmgr *batt
+ static int qcom_battmgr_bat_is_writeable(struct power_supply *psy,
+ 					 enum power_supply_property psp)
+ {
++	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
++
+ 	switch (psp) {
+ 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
+ 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+ 		return 1;
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
++		return battmgr->xiaomi_battery_property_ids;
+ 	default:
+ 		return 0;
+ 	}
+@@ -808,6 +943,21 @@ static int qcom_battmgr_bat_set_property(struct power_supply *psy,
+ 	if (!battmgr->service_up)
+ 		return -EAGAIN;
+ 
++	if (battmgr->xiaomi_battery_property_ids) {
++		switch (psp) {
++		case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
++			return qcom_battmgr_xiaomi_set_charge_start_threshold(battmgr,
++									      pval->intval);
++		case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
++			return qcom_battmgr_xiaomi_set_charge_end_threshold(battmgr,
++									    pval->intval);
++		case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
++			return qcom_battmgr_xiaomi_set_constant_current(battmgr, pval->intval);
++		default:
++			return -EINVAL;
++		}
++	}
++
+ 	switch (psp) {
+ 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
+ 		return qcom_battmgr_set_charge_start_threshold(battmgr, pval->intval);
+@@ -959,6 +1109,45 @@ static const struct power_supply_desc sm8550_bat_psy_desc = {
+ 	.property_is_writeable = qcom_battmgr_bat_is_writeable,
+ };
+ 
++/*
++ * Xiaomi Aurora: no POWER_NOW placeholder or INTERNAL_RESISTANCE (the battery
++ * ID resistor); a writable charge current cap (uA) as in the OEM driver.
++ */
++static const enum power_supply_property sm8550_xiaomi_bat_props[] = {
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_HEALTH,
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_CHARGE_TYPE,
++	POWER_SUPPLY_PROP_CAPACITY,
++	POWER_SUPPLY_PROP_VOLTAGE_OCV,
++	POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_VOLTAGE_MAX,
++	POWER_SUPPLY_PROP_CURRENT_NOW,
++	POWER_SUPPLY_PROP_TEMP,
++	POWER_SUPPLY_PROP_TECHNOLOGY,
++	POWER_SUPPLY_PROP_CHARGE_COUNTER,
++	POWER_SUPPLY_PROP_CYCLE_COUNT,
++	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
++	POWER_SUPPLY_PROP_CHARGE_FULL,
++	POWER_SUPPLY_PROP_MODEL_NAME,
++	POWER_SUPPLY_PROP_TIME_TO_FULL_AVG,
++	POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG,
++	POWER_SUPPLY_PROP_STATE_OF_HEALTH,
++	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT,
++	POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD,
++	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
++};
++
++static const struct power_supply_desc sm8550_xiaomi_bat_psy_desc = {
++	.name = "qcom-battmgr-bat",
++	.type = POWER_SUPPLY_TYPE_BATTERY,
++	.properties = sm8550_xiaomi_bat_props,
++	.num_properties = ARRAY_SIZE(sm8550_xiaomi_bat_props),
++	.get_property = qcom_battmgr_bat_get_property,
++	.set_property = qcom_battmgr_bat_set_property,
++	.property_is_writeable = qcom_battmgr_bat_is_writeable,
++};
++
+ static int qcom_battmgr_ac_get_property(struct power_supply *psy,
+ 					enum power_supply_property psp,
+ 					union power_supply_propval *val)
+@@ -1438,6 +1627,17 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
+ 	switch (opcode) {
+ 	case BATTMGR_BAT_PROPERTY_GET:
+ 		property = le32_to_cpu(resp->intval.property);
++		if (battmgr->xiaomi_battery_property_ids &&
++		    property == XIAOMI_BATT_CONSTANT_CURRENT) {
++			if (payload_len != sizeof(resp->intval)) {
++				battmgr->error = -ENODATA;
++				goto out_complete;
++			}
++			battmgr->error = le32_to_cpu(resp->intval.result) ? -EIO : 0;
++			if (!battmgr->error)
++				battmgr->xiaomi_constant_current = le32_to_cpu(resp->intval.value);
++			goto out_complete;
++		}
+ 		if (battmgr->xiaomi_battery_property_ids &&
+ 		    property > BATT_CHG_CTRL_LIM_MAX) {
+ 			/* Skip OEM-only IDs; normalize before payload decoding. */
+@@ -1626,6 +1826,11 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
+ 			break;
+ 		}
+ 		break;
++	case BATTMGR_BAT_PROPERTY_SET:
++		if (payload_len != sizeof(resp->intval) ||
++		    le32_to_cpu(resp->intval.result))
++			battmgr->error = -EIO;
++		break;
+ 	case BATTMGR_REQUEST_NOTIFICATION:
+ 	case BATTMGR_CHG_CTRL_LIMIT_EN:
+ 		battmgr->error = 0;
+@@ -1783,7 +1988,10 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 			return dev_err_probe(dev, PTR_ERR(battmgr->wls_psy),
+ 					     "failed to register wireless charing power supply\n");
+ 	} else {
+-		if (battmgr->variant == QCOM_BATTMGR_SM8550)
++		if (battmgr->variant == QCOM_BATTMGR_SM8550 &&
++		    battmgr->xiaomi_battery_property_ids)
++			psy_desc = &sm8550_xiaomi_bat_psy_desc;
++		else if (battmgr->variant == QCOM_BATTMGR_SM8550)
+ 			psy_desc = &sm8550_bat_psy_desc;
+ 		else
+ 			psy_desc = &sm8350_bat_psy_desc;

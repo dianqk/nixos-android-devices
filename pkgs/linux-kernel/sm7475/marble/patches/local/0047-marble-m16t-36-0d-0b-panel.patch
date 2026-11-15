@@ -1,0 +1,621 @@
+From c86fa4bbf6c95712b4ce235d4c1fb6c98defd88c Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 24 Oct 2026 10:36:59 +0800
+Subject: [PATCH] drm/panel: add the Xiaomi Marble M16T 36 0d 0b panel
+
+Integrate the driver, cached backlight updates and bootloader power handoff.
+
+Source changes (original messages and trailers follow).
+
+Source-commit: 6b0581eb2527adf46e0fb020d30f7cbd7d771302
+Source-author: dianqk <dianqk@dianqk.net>
+Source-date: 2026-10-24T10:36:59+08:00
+Imported-from: pkgs/linux-kernel/sm7475/marble/patches/local/0047-drm-panel-add-the-Xiaomi-marble-M16T-36-0d-0b-panel.patch
+
+drm/panel: add the Xiaomi marble M16T 36 0d 0b panel
+
+Marble ships with at least two M16T DSC video-mode panels. ABL names
+the fitted one in msm_drm.dsi_display0; the existing driver
+(xiaomi,marble-m16t-36-02-0a) covers "36 02 0a", while this phone has
+qcom,mdss_dsi_m16t_36_0d_0b_dsc_vid ("xiaomi 36 0d 0b video mode dsc
+dsi panel", mi,panel-id <0x4d313654 0x360201>), which stays black with
+the 02 0a sequence.
+
+The 0d 0b panel uses a different controller command set: a different
+on/off sequence, reset sequence, vertical porches (fp 16, pw 4,
+bp 12), supply order (vddio, vci, vddd) and a vddd of 1.25 V instead
+of 1.2 V. Add a separate driver rather than a variant
+table in the 02 0a driver, which is built around a Novatek register
+set and DSC RC table that do not apply here.
+
+The driver was generated with linux-mdss-dsi-panel-driver-generator
+(https://github.com/msm8916-mainline/linux-mdss-dsi-panel-driver-generator,
+28c4df2, --dumb-dcs) from the device tree of the stock Android
+running on the phone, then adapted:
+
+- reset: a full high-low-high pulse (high 11 ms, low 1 ms, high
+  11 ms; the stock 36 02 0a qcom,mdss-dsi-reset-sequence <1 11>,
+  <0 1>, <1 11>) instead of this panel's stock <0 1>, <1 20>. The
+  downstream pairs are raw GPIO levels; with the active-low
+  reset-gpios the generated code mapped them correctly (assert 1 ms,
+  release 20 ms). Since the reset is already asserted at that point,
+  that sequence is a single release, and on hardware the panel then
+  ignores all DCS reads (power mode read fails with -ENODATA, black
+  screen). With the high-low-high pulse it reports power mode 0x9c
+  and ID c2 b6 32 and displays;
+- compatible "xiaomi,marble-m16t-36-0d-0b", explicit stock supply
+  order and delays, MIPI_DSI_MODE_DSC_ALL_SLICES_IN_PKT for
+  qcom,mdss-dsc-slice-per-pkt = <2> and RGB888 as in the 02 0a driver;
+- stock qcom,mdss-dsc-config-by-manufacture-cmd: the decoder PPS is
+  sent as manufacturer command 0x70 in the on sequence. It describes
+  DSC 1.1, 10 bpc, 8 bpp, 540x12 slices (stock DT says slice height
+  20, but the PPS fields are derived from 12). The DSC config uses
+  these values and explicit RC parameters, so drm/msm keeps them and
+  drm_dsc_compute_rc_parameters() reproduces the 0x70 bytes; the
+  standard PPS is sent as well with identical contents.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Source-commit: 85e13f37392e07feedb83ef35a0e7f91b9d8a47e
+Source-author: dianqk <dianqk@dianqk.net>
+Source-date: 2026-10-24T17:15:32+08:00
+Imported-from: pkgs/linux-kernel/sm7475/marble/patches/local/0048-drm-panel-xiaomi-m16t-36-0d-0b-skip-backlight-update.patch
+
+drm/panel: xiaomi-m16t-36-0d-0b: skip backlight updates while unprepared
+
+drm/msm's DSI host rejects every transfer while its link is off
+(dsi_host_transfer() returns -EINVAL without power_on), so a sysfs
+brightness write while the panel is blanked fails with EINVAL. On an
+installed system, systemd-backlight restores the level at boot and
+failed five times in a row ("Failed to write system 'brightness'
+attribute: Invalid argument") while fb0 was blanked.
+
+Do as upstream commit 3367c5a129f7 ("drm/panel: sofef00: Fix DSI
+transfer errors on backlight update") does: return early while the
+panel is not prepared. The backlight core keeps the level in
+bl->props.brightness, and drm_panel_enable() sends it through
+backlight_enable() at the next power-on. Also restore the LPM mode
+flag when the DCS write fails, so a failed update does not leave
+later commands in high-speed mode.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Source-commit: cdf94e9270dbd36b6adc51576db4b848417f3eba
+Source-author: dianqk <dianqk@dianqk.net>
+Source-date: 2026-10-24T20:54:21+08:00
+Imported-from: pkgs/linux-kernel/sm7475/marble/patches/local/0050-drm-panel-xiaomi-m16t-36-0d-0b-power-the-panel-down-.patch
+
+drm/panel: xiaomi-m16t-36-0d-0b: power the panel down at probe
+
+On Marble the first bring-up after boot leaves the panel black: the on
+sequence, PPS and compression mode commands all succeed, but every DCS
+read fails (power mode read returns -ENODATA, ID reads zeros). After a
+DPMS cycle the same prepare works (power mode 0x9c, ID c2 b6 32).
+
+Keeping the display PLL that ABL left running (previous commit) removes
+the "disp_cc_mdss_mdp_clk_src: rcg didn't update its configuration"
+warning, but on its own the panel still stays black at boot. The
+power-down alone, without the PLL fix, did not help either. With both, a
+build that additionally traced DCS readbacks in prepare and enable lit
+the panel from boot.
+
+ABL leaves the panel powered (continuous splash). The supplies are RPMh
+LDOs; the first regulator_enable() only adds the APPS vote to rails that
+are already on. In the working DPMS cycle the supplies really turn off
+(unprepare releases the last reference, the RPMh disable from the APPS
+DRV replaces ABL's vote) and the DSI host and PHY are powered down right
+after, so the panel sits unpowered for about 300 ms with idle lanes.
+
+A power-down at the start of the first prepare (100 ms, later 500 ms
+with the rails verified off) did not help: by then the DSI host has
+already powered the PHY and drives LP-11 into the unpowered panel.
+
+Power the panel down in probe, before attaching to the DSI host: with
+reset asserted, take each supply and release it in the stock off order,
+then keep it off for 500 ms. The DSI host is brought up only after the
+panel has attached, so the lanes are idle during that time. Prepare is
+unchanged. This delays the first display bring-up by half a second.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/panel/Kconfig                 |  12 +
+ drivers/gpu/drm/panel/Makefile                |   1 +
+ .../drm/panel/panel-xiaomi-m16t-36-0d-0b.c    | 456 ++++++++++++++++++
+ 3 files changed, 469 insertions(+)
+ create mode 100644 drivers/gpu/drm/panel/panel-xiaomi-m16t-36-0d-0b.c
+
+diff --git a/drivers/gpu/drm/panel/Kconfig b/drivers/gpu/drm/panel/Kconfig
+index edc2a587b0..5a609caf34 100644
+--- a/drivers/gpu/drm/panel/Kconfig
++++ b/drivers/gpu/drm/panel/Kconfig
+@@ -1417,6 +1417,18 @@ config DRM_PANEL_XIAOMI_M16T_36_02_0A
+ 	  Say Y here to enable support for the 1080x2400 120Hz DSC panel
+ 	  used in the Xiaomi Poco F5 / Redmi Note 12 Turbo (marble).
+ 
++config DRM_PANEL_XIAOMI_M16T_36_0D_0B
++	tristate "Xiaomi marble M16T 36 0d 0b DSC video mode panel"
++	depends on OF
++	depends on DRM_MIPI_DSI
++	depends on BACKLIGHT_CLASS_DEVICE
++	select DRM_DISPLAY_DSC_HELPER
++	select DRM_DISPLAY_HELPER
++	help
++	  Say Y here to enable support for the "36 0d 0b" variant of the
++	  1080x2400 120Hz DSC panel used in the Xiaomi Poco F5 / Redmi Note 12
++	  Turbo (marble).
++
+ config DRM_PANEL_XINPENG_XPP055C272
+ 	tristate "Xinpeng XPP055C272 panel driver"
+ 	depends on OF
+diff --git a/drivers/gpu/drm/panel/Makefile b/drivers/gpu/drm/panel/Makefile
+index cecc5bd577..45a1cf5ba1 100644
+--- a/drivers/gpu/drm/panel/Makefile
++++ b/drivers/gpu/drm/panel/Makefile
+@@ -137,4 +137,5 @@ obj-$(CONFIG_DRM_PANEL_VISIONOX_VTDR6130) += panel-visionox-vtdr6130.o
+ obj-$(CONFIG_DRM_PANEL_VISIONOX_R66451) += panel-visionox-r66451.o
+ obj-$(CONFIG_DRM_PANEL_WIDECHIPS_WS2401) += panel-widechips-ws2401.o
+ obj-$(CONFIG_DRM_PANEL_XIAOMI_M16T_36_02_0A) += panel-xiaomi-m16t-36-02-0a.o
++obj-$(CONFIG_DRM_PANEL_XIAOMI_M16T_36_0D_0B) += panel-xiaomi-m16t-36-0d-0b.o
+ obj-$(CONFIG_DRM_PANEL_XINPENG_XPP055C272) += panel-xinpeng-xpp055c272.o
+diff --git a/drivers/gpu/drm/panel/panel-xiaomi-m16t-36-0d-0b.c b/drivers/gpu/drm/panel/panel-xiaomi-m16t-36-0d-0b.c
+new file mode 100644
+index 0000000000..e0574f06f4
+--- /dev/null
++++ b/drivers/gpu/drm/panel/panel-xiaomi-m16t-36-0d-0b.c
+@@ -0,0 +1,456 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Generated with linux-mdss-dsi-panel-driver-generator from vendor device tree:
++//   Copyright (c) 2013, The Linux Foundation. All rights reserved.
++// Xiaomi Poco F5 / Redmi Note 12 Turbo (marble) M16T panel "36 0d 0b"
++// (stock qcom,mdss_dsi_m16t_36_0d_0b_dsc_vid)
++
++#include <linux/backlight.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/regulator/consumer.h>
++
++#include <drm/display/drm_dsc.h>
++#include <drm/display/drm_dsc_helper.h>
++#include <drm/drm_mipi_dsi.h>
++#include <drm/drm_modes.h>
++#include <drm/drm_panel.h>
++#include <drm/drm_probe_helper.h>
++
++struct xiaomi_m16t_0d0b {
++	struct drm_panel panel;
++	struct mipi_dsi_device *dsi;
++	struct drm_dsc_config dsc;
++	struct gpio_desc *reset_gpio;
++	struct regulator_bulk_data supplies[3];
++};
++
++/* Stock power-on order: vddio (+10 ms), vci (+10 ms), vddd. */
++enum { SUPPLY_VDDIO, SUPPLY_VCI, SUPPLY_VDDD };
++
++static inline
++struct xiaomi_m16t_0d0b *to_xiaomi_m16t_0d0b(struct drm_panel *panel)
++{
++	return container_of_const(panel, struct xiaomi_m16t_0d0b, panel);
++}
++
++static void xiaomi_m16t_0d0b_reset(struct xiaomi_m16t_0d0b *ctx)
++{
++	/*
++	 * reset-gpios is active low, so logical 1 drives the line low.
++	 * The stock sequence for this panel, <0 1>, <1 20> (low 1 ms, high
++	 * 20 ms), only releases a reset that is already asserted here and
++	 * the panel does not answer afterwards. A full high-low-high pulse,
++	 * the stock 36 02 0a sequence <1 11>, <0 1>, <1 11>, brings it up.
++	 */
++	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
++	usleep_range(11000, 12000);
++	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
++	usleep_range(1000, 2000);
++	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
++	usleep_range(11000, 12000);
++}
++
++static int xiaomi_m16t_0d0b_on(struct xiaomi_m16t_0d0b *ctx)
++{
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
++
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xaa, 0x10);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xd0,
++				     0x84, 0x35, 0x90, 0x14, 0xc0, 0x00, 0x29,
++				     0x2c, 0x0b, 0x00, 0x32, 0x00, 0x2d, 0x1e,
++				     0x00, 0x32, 0x00, 0x00, 0x05, 0x05, 0x0b,
++				     0x0b);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x03, 0x01);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x35, 0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x53, 0x20);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x51, 0x00, 0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x59, 0x09);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x6f, 0x01);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x6c, 0x02);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x6d, 0x00);
++	/*
++	 * Stock qcom,mdss-dsc-config-by-manufacture-cmd: the decoder PPS is
++	 * written with this manufacturer command instead of DCS type 0x0a.
++	 * It describes DSC 1.1, 10 bpc, 8 bpp, 540x12 slices; the DSC config
++	 * set up in probe reproduces these bytes.
++	 */
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x70,
++				     0x11, 0x00, 0x00, 0xab, 0x30, 0x80, 0x09,
++				     0x60, 0x04, 0x38, 0x00, 0x0c, 0x02, 0x1c,
++				     0x02, 0x1c, 0x02, 0x00, 0x02, 0x0e, 0x00,
++				     0x20, 0x01, 0x1f, 0x00, 0x07, 0x00, 0x0c,
++				     0x08, 0xbb, 0x08, 0x7a, 0x18, 0x00, 0x10,
++				     0xf0, 0x07, 0x10, 0x20, 0x00, 0x06, 0x0f,
++				     0x0f, 0x33, 0x0e, 0x1c, 0x2a, 0x38, 0x46,
++				     0x54, 0x62, 0x69, 0x70, 0x77, 0x79, 0x7b,
++				     0x7d, 0x7e, 0x02, 0x02, 0x22, 0x00, 0x2a,
++				     0x40, 0x2a, 0xbe, 0x3a, 0xfc, 0x3a, 0xfa,
++				     0x3a, 0xf8, 0x3b, 0x38, 0x3b, 0x78, 0x3b,
++				     0xb6, 0x4b, 0xb6, 0x4b, 0xf4, 0x4b, 0xf4,
++				     0x6c, 0x34, 0x84, 0x74, 0x00, 0x00, 0x00,
++				     0x00, 0x00, 0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0x5a, 0x81);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x65, 0x03);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf4, 0x03);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0x5a, 0x80);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x65, 0x0a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf9, 0xa8);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x65, 0x0e);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf9, 0xb9);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0x5a, 0x81);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x65, 0x08);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf6, 0x51, 0x44);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xaa, 0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xff, 0x5a, 0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x11, 0x00);
++	mipi_dsi_msleep(&dsi_ctx, 120);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x29, 0x00);
++
++	return dsi_ctx.accum_err;
++}
++
++static int xiaomi_m16t_0d0b_off(struct xiaomi_m16t_0d0b *ctx)
++{
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
++
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x28, 0x00);
++	mipi_dsi_msleep(&dsi_ctx, 20);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x10, 0x00);
++	mipi_dsi_msleep(&dsi_ctx, 120);
++
++	return dsi_ctx.accum_err;
++}
++
++static void xiaomi_m16t_0d0b_power_off(struct xiaomi_m16t_0d0b *ctx)
++{
++	/* reverse order, stock qcom,supply-post-off-sleep = <2> */
++	regulator_disable(ctx->supplies[SUPPLY_VDDD].consumer);
++	usleep_range(2000, 3000);
++	regulator_disable(ctx->supplies[SUPPLY_VCI].consumer);
++	usleep_range(2000, 3000);
++	regulator_disable(ctx->supplies[SUPPLY_VDDIO].consumer);
++	usleep_range(2000, 3000);
++}
++
++/*
++ * Time the panel stays powered down at probe, after the bootloader
++ * handover and before the DSI link is first brought up.
++ */
++#define XIAOMI_M16T_0D0B_HANDOVER_OFF_MS	500
++
++/*
++ * ABL leaves the panel powered (continuous splash). The supplies are RPMh
++ * LDOs whose state Linux cannot read back, so the first regulator_enable()
++ * in prepare would only add the APPS vote to rails that are already on.
++ * After the handover the panel does not answer at the first bring-up (DCS
++ * reads return -ENODATA, the screen stays black), while after a DPMS cycle
++ * the same prepare works. In that cycle the supplies go off while the DSI
++ * host and PHY are powered down too, and stay off for about 300 ms before
++ * the link comes back. Powering the panel down at the start of the first
++ * prepare is not enough (tried with 100 and 500 ms): at that point the
++ * DSI host has already powered the PHY and drives the lanes to LP-11 into
++ * the unpowered panel.
++ *
++ * Power the panel down here instead, before attaching to the DSI host.
++ * drm/msm resets the whole MDSS (controller and PHY included) when it
++ * probes, and the DSI host is not powered before the panel attaches, so
++ * the lanes are idle during this off time, as in the DPMS cycle. Reset is
++ * already asserted (GPIOD_OUT_HIGH). Take each supply and release it in
++ * the stock off order: releasing the last Linux reference sends an RPMh
++ * disable from the APPS DRV, which replaces the vote ABL made from the
++ * same DRV (no other consumer votes for these LDOs), so the rails turn
++ * off. This delays the display bring-up by the off time, once per probe.
++ */
++static int xiaomi_m16t_0d0b_handover(struct xiaomi_m16t_0d0b *ctx)
++{
++	struct device *dev = &ctx->dsi->dev;
++	int ret;
++
++	ret = regulator_bulk_enable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
++	if (ret < 0)
++		return dev_err_probe(dev, ret,
++				     "Failed to take the supplies for the power-down\n");
++
++	dev_info(dev, "powering the panel down for %d ms after the bootloader handover\n",
++		 XIAOMI_M16T_0D0B_HANDOVER_OFF_MS);
++	xiaomi_m16t_0d0b_power_off(ctx);
++	msleep(XIAOMI_M16T_0D0B_HANDOVER_OFF_MS);
++
++	return 0;
++}
++
++static int xiaomi_m16t_0d0b_prepare(struct drm_panel *panel)
++{
++	struct xiaomi_m16t_0d0b *ctx = to_xiaomi_m16t_0d0b(panel);
++	struct device *dev = &ctx->dsi->dev;
++	struct drm_dsc_picture_parameter_set pps;
++	int ret;
++
++	ret = regulator_enable(ctx->supplies[SUPPLY_VDDIO].consumer);
++	if (ret < 0)
++		return ret;
++	usleep_range(10000, 11000);
++	ret = regulator_enable(ctx->supplies[SUPPLY_VCI].consumer);
++	if (ret < 0)
++		goto err_vddio;
++	usleep_range(10000, 11000);
++	ret = regulator_enable(ctx->supplies[SUPPLY_VDDD].consumer);
++	if (ret < 0)
++		goto err_vci;
++
++	xiaomi_m16t_0d0b_reset(ctx);
++
++	ret = xiaomi_m16t_0d0b_on(ctx);
++	if (ret < 0) {
++		dev_err(dev, "Failed to initialize panel: %d\n", ret);
++		goto err_power;
++	}
++
++	/*
++	 * The decoder already has its PPS from command 0x70; send the same
++	 * parameters as a standard PPS too so that host and panel agree
++	 * whichever one the DDIC honours.
++	 */
++	drm_dsc_pps_payload_pack(&pps, &ctx->dsc);
++
++	ret = mipi_dsi_picture_parameter_set(ctx->dsi, &pps);
++	if (ret < 0) {
++		dev_err(dev, "failed to transmit PPS: %d\n", ret);
++		goto err_power;
++	}
++
++	ret = mipi_dsi_compression_mode(ctx->dsi, true);
++	if (ret < 0) {
++		dev_err(dev, "failed to enable compression mode: %d\n", ret);
++		goto err_power;
++	}
++
++	msleep(28);
++
++	return 0;
++
++err_power:
++	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
++	xiaomi_m16t_0d0b_power_off(ctx);
++	return ret;
++err_vci:
++	regulator_disable(ctx->supplies[SUPPLY_VCI].consumer);
++err_vddio:
++	regulator_disable(ctx->supplies[SUPPLY_VDDIO].consumer);
++	return ret;
++}
++
++static int xiaomi_m16t_0d0b_unprepare(struct drm_panel *panel)
++{
++	struct xiaomi_m16t_0d0b *ctx = to_xiaomi_m16t_0d0b(panel);
++	struct device *dev = &ctx->dsi->dev;
++	int ret;
++
++	ret = xiaomi_m16t_0d0b_off(ctx);
++	if (ret < 0)
++		dev_err(dev, "Failed to un-initialize panel: %d\n", ret);
++
++	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
++	xiaomi_m16t_0d0b_power_off(ctx);
++
++	return 0;
++}
++
++static const struct drm_display_mode xiaomi_m16t_0d0b_mode = {
++	.clock = (1080 + 48 + 4 + 64) * (2400 + 16 + 4 + 12) * 120 / 1000,
++	.hdisplay = 1080,
++	.hsync_start = 1080 + 48,
++	.hsync_end = 1080 + 48 + 4,
++	.htotal = 1080 + 48 + 4 + 64,
++	.vdisplay = 2400,
++	.vsync_start = 2400 + 16,
++	.vsync_end = 2400 + 16 + 4,
++	.vtotal = 2400 + 16 + 4 + 12,
++	.width_mm = 70,
++	.height_mm = 154,
++	.type = DRM_MODE_TYPE_DRIVER,
++};
++
++static int xiaomi_m16t_0d0b_get_modes(struct drm_panel *panel,
++				      struct drm_connector *connector)
++{
++	return drm_connector_helper_get_modes_fixed(connector,
++						    &xiaomi_m16t_0d0b_mode);
++}
++
++static const struct drm_panel_funcs xiaomi_m16t_0d0b_panel_funcs = {
++	.prepare = xiaomi_m16t_0d0b_prepare,
++	.unprepare = xiaomi_m16t_0d0b_unprepare,
++	.get_modes = xiaomi_m16t_0d0b_get_modes,
++};
++
++/*
++ * Stock bl_ctrl_dcs with qcom,mdss-dsi-bl-inverted-dbv: the 12-bit level is
++ * sent high byte first, as mipi_dsi_dcs_set_display_brightness_large() does.
++ */
++static int xiaomi_m16t_0d0b_bl_update_status(struct backlight_device *bl)
++{
++	struct mipi_dsi_device *dsi = bl_get_data(bl);
++	struct xiaomi_m16t_0d0b *ctx = mipi_dsi_get_drvdata(dsi);
++	u16 brightness = backlight_get_brightness(bl);
++	int ret;
++
++	/*
++	 * The DSI host rejects transfers while the link is off. The level
++	 * is kept in bl->props and sent by backlight_enable() from
++	 * drm_panel_enable() at the next power-on.
++	 */
++	if (!ctx->panel.prepared)
++		return 0;
++
++	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
++	ret = mipi_dsi_dcs_set_display_brightness_large(dsi, brightness);
++	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
++
++	return ret < 0 ? ret : 0;
++}
++
++static const struct backlight_ops xiaomi_m16t_0d0b_bl_ops = {
++	.update_status = xiaomi_m16t_0d0b_bl_update_status,
++};
++
++static struct backlight_device *
++xiaomi_m16t_0d0b_create_backlight(struct mipi_dsi_device *dsi)
++{
++	struct device *dev = &dsi->dev;
++	const struct backlight_properties props = {
++		.type = BACKLIGHT_RAW,
++		.brightness = 4095,
++		.max_brightness = 4095,
++	};
++
++	return devm_backlight_device_register(dev, dev_name(dev), dev, dsi,
++					      &xiaomi_m16t_0d0b_bl_ops, &props);
++}
++
++static void xiaomi_m16t_0d0b_setup_dsc(struct drm_dsc_config *dsc)
++{
++	/* Values of the PPS in command 0x70 (see xiaomi_m16t_0d0b_on()). */
++	static const u8 min_qp[DSC_NUM_BUF_RANGES] = {
++		0, 4, 5, 5, 7, 7, 7, 7, 7, 7, 9, 9, 9, 13, 16 };
++	static const u8 max_qp[DSC_NUM_BUF_RANGES] = {
++		8, 8, 9, 10, 11, 11, 11, 12, 13, 14, 14, 15, 15, 16, 17 };
++	static const s8 bpg[DSC_NUM_BUF_RANGES] = {
++		2, 0, 0, -2, -4, -6, -8, -8, -8, -10, -10, -12, -12, -12, -12 };
++
++	dsc->dsc_version_major = 1;
++	dsc->dsc_version_minor = 1;
++
++	/*
++	 * Stock describes slice height 20 in qcom,mdss-dsc-slice-height but
++	 * programs the decoder with 12 (PPS bytes 10-11 of command 0x70, and
++	 * nfl_bpg_offset/slice_bpg_offset there are derived from 12). Encode
++	 * with what the decoder is told.
++	 */
++	dsc->slice_height = 12;
++	dsc->slice_width = 540;
++	dsc->slice_count = 1080 / dsc->slice_width;
++	dsc->bits_per_component = 10;
++	dsc->bits_per_pixel = 8 << 4; /* 4 fractional bits */
++	dsc->block_pred_enable = true;
++
++	/*
++	 * Explicit RC parameters make drm/msm keep them instead of its DSC
++	 * 1.1 pre-SCR table; drm_dsc_compute_rc_parameters() then derives the
++	 * remaining fields to the values in command 0x70.
++	 */
++	dsc->first_line_bpg_offset = 12;
++	dsc->initial_offset = 6144;
++	dsc->initial_xmit_delay = 512;
++	dsc->flatness_min_qp = 7;
++	dsc->flatness_max_qp = 16;
++	dsc->rc_quant_incr_limit0 = 15;
++	dsc->rc_quant_incr_limit1 = 15;
++	for (int i = 0; i < DSC_NUM_BUF_RANGES; i++) {
++		dsc->rc_range_params[i].range_min_qp = min_qp[i];
++		dsc->rc_range_params[i].range_max_qp = max_qp[i];
++		dsc->rc_range_params[i].range_bpg_offset =
++			bpg[i] & DSC_RANGE_BPG_OFFSET_MASK;
++	}
++}
++
++static int xiaomi_m16t_0d0b_probe(struct mipi_dsi_device *dsi)
++{
++	struct device *dev = &dsi->dev;
++	struct xiaomi_m16t_0d0b *ctx;
++	int ret;
++
++	ctx = devm_drm_panel_alloc(dev, struct xiaomi_m16t_0d0b, panel,
++				   &xiaomi_m16t_0d0b_panel_funcs,
++				   DRM_MODE_CONNECTOR_DSI);
++	if (IS_ERR(ctx))
++		return PTR_ERR(ctx);
++
++	ctx->supplies[SUPPLY_VDDIO].supply = "vddio";
++	ctx->supplies[SUPPLY_VCI].supply = "vci";
++	ctx->supplies[SUPPLY_VDDD].supply = "vddd";
++	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(ctx->supplies),
++				      ctx->supplies);
++	if (ret < 0)
++		return dev_err_probe(dev, ret, "Failed to get regulators\n");
++
++	ctx->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(ctx->reset_gpio))
++		return dev_err_probe(dev, PTR_ERR(ctx->reset_gpio),
++				     "Failed to get reset-gpios\n");
++
++	ctx->dsi = dsi;
++	mipi_dsi_set_drvdata(dsi, ctx);
++
++	dsi->lanes = 4;
++	dsi->format = MIPI_DSI_FMT_RGB888;
++	/* stock qcom,mdss-dsc-slice-per-pkt = <2>: both slices in a packet */
++	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST |
++			  MIPI_DSI_CLOCK_NON_CONTINUOUS | MIPI_DSI_MODE_LPM |
++			  MIPI_DSI_MODE_DSC_ALL_SLICES_IN_PKT;
++
++	ctx->panel.prepare_prev_first = true;
++
++	ctx->panel.backlight = xiaomi_m16t_0d0b_create_backlight(dsi);
++	if (IS_ERR(ctx->panel.backlight))
++		return dev_err_probe(dev, PTR_ERR(ctx->panel.backlight),
++				     "Failed to create backlight\n");
++
++	ret = devm_drm_panel_add(dev, &ctx->panel);
++	if (ret)
++		return ret;
++
++	/* This panel only supports DSC; unconditionally enable it */
++	xiaomi_m16t_0d0b_setup_dsc(&ctx->dsc);
++	dsi->dsc = &ctx->dsc;
++
++	ret = xiaomi_m16t_0d0b_handover(ctx);
++	if (ret < 0)
++		return ret;
++
++	ret = devm_mipi_dsi_attach(dev, dsi);
++	if (ret < 0)
++		return dev_err_probe(dev, ret, "Failed to attach to DSI host\n");
++
++	return 0;
++}
++
++static const struct of_device_id xiaomi_m16t_0d0b_of_match[] = {
++	{ .compatible = "xiaomi,marble-m16t-36-0d-0b" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, xiaomi_m16t_0d0b_of_match);
++
++static struct mipi_dsi_driver xiaomi_m16t_0d0b_driver = {
++	.probe = xiaomi_m16t_0d0b_probe,
++	.driver = {
++		.name = "panel-xiaomi-m16t-36-0d-0b",
++		.of_match_table = xiaomi_m16t_0d0b_of_match,
++	},
++};
++module_mipi_dsi_driver(xiaomi_m16t_0d0b_driver);
++
++MODULE_DESCRIPTION("DRM driver for the Xiaomi marble M16T 36 0d 0b DSC video mode panel");
++MODULE_LICENSE("GPL");

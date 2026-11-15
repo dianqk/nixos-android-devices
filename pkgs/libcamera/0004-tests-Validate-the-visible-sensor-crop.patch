@@ -1,0 +1,104 @@
+From 81c871f360fc40bc96693fd577e2d4c50310557b Mon Sep 17 00:00:00 2001
+From: Ray Strode <rstrode@redhat.com>
+Date: Thu, 29 Oct 2026 11:20:52 -0400
+Subject: [PATCH 4/5] tests: Validate the visible sensor crop
+
+This commit adds a geometry unit test with expected sensor rectangles for
+native, downscaled, wider, narrower, and portrait outputs. It also checks
+integer rounding that leaves an odd top coordinate before Bayer alignment.
+
+Signed-off-by: Ray Strode <rstrode@redhat.com>
+
+Link: https://patchwork.libcamera.org/patch/28708/
+Backport: Reduce unrelated context for libcamera 0.7.2; code unchanged.
+Status: Experimental local backport; upstream v5 series is rejected/unmerged.
+---
+ test/debayer-geometry.cpp | 63 +++++++++++++++++++++++++++++++++++++++
+ test/meson.build          |  1 +
+ 2 files changed, 64 insertions(+)
+ create mode 100644 test/debayer-geometry.cpp
+
+diff --git a/test/debayer-geometry.cpp b/test/debayer-geometry.cpp
+new file mode 100644
+index 0000000..cfc757f
+--- /dev/null
++++ b/test/debayer-geometry.cpp
+@@ -0,0 +1,63 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Copyright (C) 2026, Red Hat Inc.
++ *
++ * Sensor crop tests
++ */
++
++#include <iostream>
++
++#include <libcamera/geometry.h>
++
++#include "libcamera/internal/software_isp/debayer_geometry.h"
++
++#include "test.h"
++
++using namespace libcamera;
++
++class DebayerGeometryTest : public Test
++{
++protected:
++	int run() override
++	{
++		if (testCrop())
++			return TestFail;
++
++		return TestPass;
++	}
++
++private:
++	int testCrop()
++	{
++		static const struct {
++			Size input;
++			Size native;
++			Size output;
++			Rectangle expected;
++		} cases[] = {
++			{ { 1920, 1080 }, { 1920, 1080 }, { 1920, 1080 }, { 0, 0, 1920, 1080 } },
++			{ { 1928, 1092 }, { 1920, 1092 }, { 1920, 1092 }, { 4, 0, 1920, 1092 } },
++			/* Output resolution changes must not shrink the sensor window. */
++			{ { 1928, 1092 }, { 1920, 1092 }, { 1920, 1080 }, { 4, 6, 1920, 1080 } },
++			{ { 1928, 1092 }, { 1920, 1092 }, { 1280, 720 }, { 4, 6, 1920, 1080 } },
++			{ { 1928, 1092 }, { 1920, 1092 }, { 640, 480 }, { 236, 0, 1456, 1092 } },
++			{ { 1928, 1092 }, { 1920, 1092 }, { 512, 768 }, { 600, 0, 728, 1092 } },
++			{ { 1928, 1092 }, { 1920, 1092 }, { 1280, 640 }, { 4, 66, 1920, 960 } },
++			/* A smaller Bayer border leaves an odd top coordinate. */
++			{ { 1928, 1092 }, { 1924, 1092 }, { 1280, 720 }, { 2, 5, 1924, 1082 } },
++		};
++
++		for (const auto &entry : cases) {
++			Rectangle crop = debayerCrop(entry.input, entry.native, entry.output);
++			if (crop != entry.expected) {
++				std::cerr << "Crop " << entry.input << " -> " << entry.output
++					  << " is " << crop << ", expected " << entry.expected << std::endl;
++				return TestFail;
++			}
++		}
++
++		return TestPass;
++	}
++};
++
++TEST_REGISTER(DebayerGeometryTest)
+diff --git a/test/meson.build b/test/meson.build
+index e445062..191e000 100644
+--- a/test/meson.build
++++ b/test/meson.build
+@@ -53,6 +53,7 @@ internal_tests = [
+     {'name': 'bayer-format', 'sources': ['bayer-format.cpp']},
+     {'name': 'byte-stream-buffer', 'sources': ['byte-stream-buffer.cpp']},
+     {'name': 'camera-sensor', 'sources': ['camera-sensor.cpp']},
++    {'name': 'debayer-geometry', 'sources': ['debayer-geometry.cpp']},
+     {'name': 'delayed_controls', 'sources': ['delayed_controls.cpp']},
+     {'name': 'event', 'sources': ['event.cpp']},
+     {'name': 'event-dispatcher', 'sources': ['event-dispatcher.cpp']},
+-- 
+2.56.0
+

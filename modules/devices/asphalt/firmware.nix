@@ -7,14 +7,24 @@
 }:
 let
   cfg = config.hardware.asphalt;
-  stock = androidPackages.devices.asphalt.firmware;
-  wifi = androidPackages.devices.asphalt.wifi-firmware.override { inherit (cfg) wifiBoardFile; };
+  stock = androidPackages.devices.asphalt.firmware.override { firmware-source = cfg.firmwareSource; };
+  wifi = androidPackages.devices.asphalt.wifi-firmware.override {
+    firmware-source = cfg.firmwareSource;
+    inherit (cfg) wifiBoardFile;
+  };
   audioTopology = androidPackages.devices.asphalt.audio-topology;
 in
 {
+  options.hardware.asphalt.firmwareSource = lib.mkOption {
+    type = lib.types.path;
+    default = androidPackages.devices.asphalt.firmware-source;
+    defaultText = lib.literalExpression "androidPackages.devices.asphalt.firmware-source";
+    description = "TB320FC firmware payload tree (lenovo/tb320fc and oneplus/negroni/WCN6855/hw2.1), for example from androidPackages.mkFirmwareArchive or a local directory.";
+  };
   options.hardware.asphalt.wifiBoardFile = lib.mkOption {
     type = lib.types.nullOr lib.types.path;
-    default = "${androidPackages.devices.asphalt.firmware-source}/lenovo/tb320fc/wifi/board-2.bin";
+    default = "${cfg.firmwareSource}/lenovo/tb320fc/wifi/board-2.bin";
+    defaultText = lib.literalExpression ''"''${config.hardware.asphalt.firmwareSource}/lenovo/tb320fc/wifi/board-2.bin"'';
     description = "WCN6855 board-2.bin; defaults to the included TB320FC board data.";
   };
   config = {

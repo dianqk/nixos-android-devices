@@ -31,6 +31,11 @@ in
       type = types.listOf types.package;
       default = [ ];
     };
+    initrdKernelModules = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      description = "Kernel module roots to include and load in the mobile initrd, with their module dependencies.";
+    };
     usb = {
       enable = mkOption {
         type = types.bool;

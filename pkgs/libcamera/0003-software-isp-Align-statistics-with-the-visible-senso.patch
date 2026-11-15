@@ -1,0 +1,124 @@
+From cf1a27090858af769c2e0605463d6e31f8ecf03e Mon Sep 17 00:00:00 2001
+From: Ray Strode <rstrode@redhat.com>
+Date: Thu, 29 Oct 2026 11:20:51 -0400
+Subject: [PATCH 3/5] software-isp: Align statistics with the visible sensor
+ crop
+
+This commit changes statistics gathering to follow the sensor area visible
+in the GPU output.
+
+The GPU debayer path fills the requested output with a centered crop of the
+sensor image. CPU statistics read the original sensor buffer, but their
+window uses the output dimensions and starts at the buffer's origin. A
+centered origin is calculated but never passed to the statistics engine.
+Metering therefore covers a different sensor region when the image is
+cropped or scaled.
+
+The window is now derived in sensor coordinates, accounting for Bayer
+border removal and cropping to the output aspect ratio, and centered in the
+sensor buffer. Changing resolution without changing aspect ratio leaves the
+rectangle unchanged.
+
+Signed-off-by: Ray Strode <rstrode@redhat.com>
+
+Link: https://patchwork.libcamera.org/patch/28707/
+Backport: Reduce unrelated context for libcamera 0.7.2; code unchanged.
+Status: Experimental local backport; upstream v5 series is rejected/unmerged.
+---
+ .../internal/software_isp/debayer_geometry.h  | 23 +++++++++++++++++++
+ .../internal/software_isp/meson.build         |  1 +
+ src/libcamera/software_isp/debayer_egl.cpp    | 14 ++++-------
+ src/libcamera/software_isp/debayer_egl.h      |  1 -
+ 4 files changed, 28 insertions(+), 11 deletions(-)
+ create mode 100644 include/libcamera/internal/software_isp/debayer_geometry.h
+
+diff --git a/include/libcamera/internal/software_isp/debayer_geometry.h b/include/libcamera/internal/software_isp/debayer_geometry.h
+new file mode 100644
+index 0000000..8812a3c
+--- /dev/null
++++ b/include/libcamera/internal/software_isp/debayer_geometry.h
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, Red Hat Inc.
++ *
++ * Geometry for scaling and cropping debayered images
++ */
++
++#pragma once
++
++
++#include <libcamera/geometry.h>
++
++namespace libcamera {
++
++/* Return the visible sensor rectangle, before statistics Bayer alignment. */
++inline Rectangle debayerCrop(const Size &inputSize, const Size &nativeSize,
++			     const Size &outputSize)
++{
++	const Size visibleSize = nativeSize.boundedToAspectRatio(outputSize);
++	return visibleSize.centeredTo(Rectangle(inputSize).center());
++}
++
++} /* namespace libcamera */
+diff --git a/include/libcamera/internal/software_isp/meson.build b/include/libcamera/internal/software_isp/meson.build
+index df7c3b9..e18597e 100644
+--- a/include/libcamera/internal/software_isp/meson.build
++++ b/include/libcamera/internal/software_isp/meson.build
+@@ -2,6 +2,7 @@
+ 
+ libcamera_internal_headers += files([
+     'benchmark.h',
++    'debayer_geometry.h',
+     'debayer_params.h',
+     'software_isp.h',
+     'swisp_stats.h',
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+index 995d0c2..a1f5637 100644
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -24,6 +24,7 @@
+ 
+ #include "libcamera/internal/formats.h"
+ #include "libcamera/internal/framebuffer.h"
++#include "libcamera/internal/software_isp/debayer_geometry.h"
+ 
+ #include "../shaders/glsl_shaders.h"
+ 
+@@ -332,18 +333,11 @@ int DebayerEGL::configure(const StreamConfiguration &inputCfg,
+ 	outputSize_ = outputCfg.size;
+ 	nativeOutputSize_ = outSizeRange.max;
+ 
+-	window_.x = ((inputCfg.size.width - outputCfg.size.width) / 2) &
+-		    ~(inputConfig_.patternSize.width - 1);
+-	window_.y = ((inputCfg.size.height - outputCfg.size.height) / 2) &
+-		    ~(inputConfig_.patternSize.height - 1);
+-	window_.width = outputCfg.size.width;
+-	window_.height = outputCfg.size.height;
+-
+ 	/*
+-	 * Don't pass x,y from window_ since process() already adjusts for it.
+-	 * But crop the window to 2/3 of its width and height for speedup.
++	 * The GPU scales the visible sensor crop to outputSize_. Statistics
++	 * consume the original input buffer, so use sensor coordinates here.
+ 	 */
+-	stats_->setWindow(Rectangle(window_.size()));
++	stats_->setWindow(debayerCrop(inputCfg.size, nativeOutputSize_, outputSize_));
+ 
+ 	inputBufferCount_ = inputCfg.bufferCount;
+ 	outputBufferCount_ = outputCfg.bufferCount;
+diff --git a/src/libcamera/software_isp/debayer_egl.h b/src/libcamera/software_isp/debayer_egl.h
+index d6223f3..349927e 100644
+--- a/src/libcamera/software_isp/debayer_egl.h
++++ b/src/libcamera/software_isp/debayer_egl.h
+@@ -112,7 +112,6 @@ private:
+ 	GLint contrastExpUniformDataIn_;
+ 
+ 	Size nativeOutputSize_;
+-	Rectangle window_;
+ 	std::unique_ptr<SwStatsCpu> stats_;
+ 	eGL egl_;
+ 	uint32_t width_;
+-- 
+2.56.0
+

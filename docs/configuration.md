@@ -1,12 +1,12 @@
 # Configure your own system
 
-Device-specific settings use `hardware.{asphalt,polaris,sheng,aurora,clover}.*`.
+Device-specific settings use `hardware.<device>.*` for `asphalt`, `polaris`, `sheng`, `aurora`, `clover`, `marble`, `t880` and `dodge`.
 Shared boot, USB and recovery settings use `androidDevices.*`.
 
 [中文](configuration.zh.md) · [Installation guides](README.md) · [USB access](usb-signaller.md)
 
 Use a Linux computer with Nix flakes enabled. Choose `x86_64-linux` or
-`aarch64-linux` for the **build computer**; all five devices run AArch64. An
+`aarch64-linux` for the **build computer**; all supported devices run AArch64. An
 x86_64 build uses the cross toolchain for this repository's compiled device
 packages. Upstream system packages remain native AArch64 so their binary caches
 can be reused.
@@ -66,7 +66,9 @@ there is no dependency on an `examples/` path in the upstream input.
 Before building for installation, edit these values:
 
 1. Set `buildSystem` to your computer's architecture.
-2. Set `androidDevices.usbSerial` to a unique, stable identifier for this device.
+2. Optionally set `androidDevices.usbSerial`. Each model defaults to one fixed
+   name (`POLARIS`, `ASPHALT`, …; `RECOVERY_POLARIS`, … in RAM recovery); override
+   it only to tell several units of one model apart.
 3. Add your SSH public key to `users.users.root.openssh.authorizedKeys.keys`.
    Without a key, the default console system has no configured login credential.
 4. For Polaris, inspect the [stock GPT partition names](polaris/first-install.md#identify-this-phone).
@@ -131,7 +133,7 @@ EFI menu booting. Direct-kernel boot remains unverified on both devices.
 ## Choose a device and role
 
 `lib.mkSystem { device; buildSystem; modules; }` returns a normal NixOS system
-configuration. Device names are `asphalt`, `polaris`, `sheng`, `aurora` and `clover`.
+configuration. Device names are `asphalt`, `polaris`, `sheng`, `aurora`, `clover`, `marble`, `t880` and `dodge`.
 `modules` holds your ordinary NixOS modules; optional `specialArgs`, `overlays`,
 and `nixpkgsConfig` configure arguments and packages.
 
@@ -140,7 +142,7 @@ and `nixpkgsConfig` configure arguments and packages.
 | Installed boot | U-Boot/EFI | U-Boot/EFI | U-Boot/EFI | U-Boot/EFI | U-Boot/EFI |
 | Root GPT partition | `linux` | `userdata` | `linux` | `linux` | `userdata` |
 | Default ext4 label | `NIXOS` | `NIXOS` | `NIXOS` | `NIXOS` | `NIXOS` |
-| USB NCM address, if selected | `172.16.43.1/24` | `172.16.42.1/24` | `172.16.45.1/24` | `172.16.42.1/24` (shared default) | `172.16.44.1/24` |
+| USB NCM address, if selected | `172.16.43.1/24` | `172.16.42.1/24` | `172.16.45.1/24` | `172.16.46.1/24` | `172.16.44.1/24` |
 
 All devices default to the ext4 label `NIXOS`. For an existing installation,
 keep its configured label and recovery storage contract consistent; changing
@@ -185,10 +187,9 @@ its board-specific support. For example:
 
 ```nix
 imports = [ inputs.androidDevices.nixosModules.polaris ];
-androidDevices.usbSerial = "my-polaris-01";
 ```
 
-Use `asphalt`, `sheng`, `aurora` or `clover` in place of `polaris` for the other boards.
+Use `asphalt`, `sheng`, `aurora`, `clover`, `marble`, `t880` or `dodge` in place of `polaris` for the other boards.
 No separate common-module import or `androidDevices.enable = true` is needed.
 Device modules do not select a desktop or supply device identities.
 
@@ -220,6 +221,9 @@ explicit demo-user autologin and an always-visible wvkbd keyboard at the bottom
 with reserved screen space. Copy and adapt the parts you want rather than
 importing it as an upstream interface. The example uses `/etc/niri/config.kdl`,
 selected through `NIRI_CONFIG`, and starts `niri-session` from the demo tty1 login.
+The `demo` account uses UID 1001, leaving UID 1000 available for a personal
+account on a fresh installation. Existing account IDs and file ownership need
+separate review when changing from an older example installation.
 `example.desktop.scale` sets the internal display scale in these example files;
 it is not an exported hardware-module option.
 Niri uses its default screen orientation: the examples add no output transform,
@@ -252,6 +256,142 @@ For camera tools, set `environment.systemPackages = [ config.androidDevices.came
 in a module accepting `config`. This selects libcamera with the mobile sensor
 adaptations. Use `cam --list` to enumerate cameras; consult the board hardware
 reference for capture commands and limitations.
+
+## Suspend wakeup sources
+
+Device modules may declare named wakeup sources in
+`androidDevices.power.wakeup.sources` (each a list of sysfs device paths); see
+the device's hardware notes for its names and verified wake behavior. The policy
+is off by default. To use it, enable it and list the sources to keep:
+
+```nix
+androidDevices.power.wakeup = {
+  enable = true;
+  keep = [ "powerKey" ];
+};
+```
+
+Every other device wakeup (`power/wakeup`) is then disabled at boot, when a
+device appears or binds, and again right before each system sleep; kept sources
+keep the setting their driver chose. Check the result with
+`grep -l enabled $(find /sys/devices -path '*/power/wakeup')` and the
+`android-devices-wakeup-policy` service log. Whether and when the system
+suspends (systemd sleep settings, idle daemons, menus) remains your own
+configuration.
+
+## Speaker routing for screen orientation
+
+Applications send left and right channels to the speaker sink, and the sink
+always plays them on the same physical speakers. After a rotation, left and
+right can come from the wrong edges. Device modules with several speakers may
+describe, per output transform, the ALSA mixer settings that keep left and
+right on the matching edges in
+`androidDevices.audio.orientation.routes.{normal,"90","180","270"}`. The policy
+is off by default:
+
+```nix
+androidDevices.audio.orientation.enable = true;
+```
+
+This installs `/etc/android-audio-orientation.json`, the
+`android-audio-orientation` command and the `android-audio-orientation` user
+service. Your compositor integration triggers the change: call the command
+from your rotation handler with the new output transform, as the desktop user:
+
+```sh
+android-audio-orientation apply 90
+android-audio-orientation status
+```
+
+`apply` sets only the listed controls, after checking that each exists, and
+records the orientation in `$XDG_RUNTIME_DIR`. Activating the audio profile
+rewrites the controls, so the user service reapplies the recorded orientation
+(`normal` if none) whenever WirePlumber starts or restarts. Flipped transforms
+mirror the image and are rejected; no routing applies to them. An orientation
+without data leaves the routing unchanged. See the device's hardware notes for
+which orientations are verified.
+
+## System clock from a read-only RTC
+
+Some PMIC RTCs keep counting while the phone is off but cannot be set from
+Linux, so every boot starts the clock at the RTC's raw count (for example
+1970-01-10). Device modules for such boards enable
+`androidDevices.clock.rtcOffset` (Aurora, Clover and Polaris; installed system
+only), which keeps a userspace offset as Android's time daemon does:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `enable` | `false` | Restore the clock from RTC + saved offset at boot and save the offset. |
+| `rtc` | `"rtc0"` | RTC class device (`/sys/class/rtc/<rtc>`). |
+
+`rtc-offset-restore.service` runs before `time-set.target` and
+systemd-timesyncd. It sets the clock to the RTC count plus the saved offset,
+only forward, and creates `/run/rtc-offset/restored`. A saved RTC count above
+the current one means the RTC was reset; the saved offset is then discarded and
+the clock waits for NTP. Results before 2026-01-01 are rejected. The offset
+(`/var/lib/rtc-offset/offset`: RTC seconds and offset seconds) is saved after
+each systemd-timesyncd synchronisation (`rtc-offset-save.path`) and at shutdown
+(`rtc-offset-shutdown.service`), only when the clock was synchronised or
+restored during that boot. The first boot after installation or an RTC reset
+still needs NTP once. Check with
+`journalctl -b -u rtc-offset-restore -u rtc-offset-save -u rtc-offset-shutdown`.
+
+Do not enable it for an RTC that Linux can set (`allow-set-time` or an
+`offset` nvmem cell in its device tree node); the kernel then keeps the time
+itself.
+
+## Real-time task frequency clamp
+
+`androidDevices.power.rtUtilClampMin` (default `0`) sets
+`kernel.sched_util_clamp_min_rt_default` in the installed system. The kernel
+default (1024) runs every real-time wakeup, such as a threaded touch interrupt,
+at the highest CPU frequency, and through CPU bandwidth votes also raises the
+DDR frequency while the device is idle. Pixel device init files use 0. Set it to
+`null` to keep the kernel default.
+
+## Thermal charge current cap
+
+Some charger firmware leaves thermal charge limiting to the operating system,
+as Android's thermal daemons do. `androidDevices.charging.thermalLimit`
+writes a charge current cap that follows temperature. Device modules provide
+the inputs; Aurora sets steps from its stock thermal configuration, with
+the battery temperature as the sensor. The service is disabled by default:
+
+| Option | Meaning |
+| --- | --- |
+| `enable` | Run `charge-thermal-limit.service` (default `false`). |
+| `currentFile` | Writable cap in µA, for example `constant_charge_current`. |
+| `sensors` | Temperature files with a factor to m°C; the highest reading controls the cap. |
+| `steps` | `{ trip; clear; current; }` with ascending trips in m°C and caps in µA. |
+| `defaultCurrent` | Cap below the first step and after the service stops. |
+| `interval`, `refreshPolls` | Poll period (5 s) and rewrite period of an unchanged cap (12 polls). |
+
+A step applies from its trip temperature until the temperature falls below its
+clear temperature. Without a readable sensor the last (lowest) cap applies.
+
+## Battery care charge window
+
+`androidDevices.charging.window` keeps the battery partly charged while the
+device is plugged in: charging stops at the end threshold and resumes below
+the start threshold, and the device runs from the charger meanwhile. It uses
+the battery's standard `charge_control_start_threshold` and
+`charge_control_end_threshold`, which the charger driver enforces. It is off by
+default; the T880 module supplies its battery path and a 75/80 % example:
+
+| Option | Meaning |
+| --- | --- |
+| `enable` | Run `charge-window.service`. |
+| `battery` | power_supply directory of the battery. |
+| `startThreshold`, `endThreshold` | Resume below / stop at these levels (default 75 and 80 %). |
+| `requestGroup` | Group that may request a one-off full charge (default `users`). |
+
+For a full charge (before travel), create `/run/charge-window/full-charge`
+(`nexusctl battery full-charge` in the example session). The window is lifted
+until the charger reports the battery full or is unplugged, then returns.
+`/run/charge-window/state` reads `window START END`, `full-charge` or `off`.
+Stopping the service turns the window off (0/100 %).
+Check with `journalctl -b -u charge-thermal-limit`, and compare `current_now`
+with the cap while charging before relying on it.
 
 ## Select artifacts
 
@@ -290,7 +430,7 @@ For a failed boot, use the device's RAM recovery and the
 | Symptom | Check or next action |
 | --- | --- |
 | Unknown `androidDevices.*` option | Import the device module or use `mkSystem`; update the locked input if the option was added recently |
-| Missing USB serial | Set `androidDevices.usbSerial` in shared device configuration |
+| Two units of one model share a USB serial and MAC | Set a distinct `androidDevices.usbSerial` for each unit |
 | Missing rootfs UUID on another device | Set `androidDevices.persistentImage.rootfs.uuid` before building its optional image |
 | No desktop after boot | Device modules do not start one; configure and launch your chosen desktop |
 | USB exists but SSH fails | Check host DHCP/address, your public key, and `journalctl -u sshd -u usb-signaller`; see [USB troubleshooting](usb-signaller.md) |

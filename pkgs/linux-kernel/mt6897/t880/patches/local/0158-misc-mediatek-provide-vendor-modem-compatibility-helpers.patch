@@ -1,0 +1,244 @@
+From ec27fb8f548e3fde2b705e139bf47f2952a68218 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] misc: mediatek: provide vendor modem compatibility helpers
+
+Map retained vendor interfaces onto the selected kernel APIs, including
+secure calls, board GPIO resolution and network compatibility helpers.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T08:44:42+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T08:44:50+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T09:33:15+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T10:04:02+08:00
+Link: https://github.com/MT6895-Mainline/linux/tree/qqcandy (the MT6895 port, used as a reference for the sysctl path)
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../misc/mediatek/eccci/compat/eccci_compat.h | 75 +++++++++++++++++++
+ .../mediatek/eccci/compat/linux/of_gpio.h     | 41 ++++++++++
+ .../eccci/compat/mt-plat/dvfsrc-exp.h         | 15 ++++
+ .../mediatek/eccci/compat/net/page_pool.h     |  3 +
+ drivers/misc/mediatek/eccci/compat/rps_perf.h | 11 +++
+ drivers/misc/mediatek/eccci/compat/slbc_ops.h |  2 +
+ .../mediatek/eccci/compat/soc/mediatek/emi.h  |  2 +
+ .../mediatek/eccci/compat/soc/mediatek/smpu.h |  2 +
+ 8 files changed, 151 insertions(+)
+ create mode 100644 drivers/misc/mediatek/eccci/compat/eccci_compat.h
+ create mode 100644 drivers/misc/mediatek/eccci/compat/linux/of_gpio.h
+ create mode 100644 drivers/misc/mediatek/eccci/compat/mt-plat/dvfsrc-exp.h
+ create mode 100644 drivers/misc/mediatek/eccci/compat/net/page_pool.h
+ create mode 100644 drivers/misc/mediatek/eccci/compat/rps_perf.h
+ create mode 100644 drivers/misc/mediatek/eccci/compat/slbc_ops.h
+ create mode 100644 drivers/misc/mediatek/eccci/compat/soc/mediatek/emi.h
+ create mode 100644 drivers/misc/mediatek/eccci/compat/soc/mediatek/smpu.h
+
+diff --git a/drivers/misc/mediatek/eccci/compat/eccci_compat.h b/drivers/misc/mediatek/eccci/compat/eccci_compat.h
+new file mode 100644
+index 0000000000..a050c2c7f6
+--- /dev/null
++++ b/drivers/misc/mediatek/eccci/compat/eccci_compat.h
+@@ -0,0 +1,75 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Build glue for the vendor eccci/ccmni on this kernel, included in every
++ * file through the Makefile.
++ */
++#ifndef __ECCCI_COMPAT_H__
++#define __ECCCI_COMPAT_H__
++
++#include <linux/arm-smccc.h>
++#include <linux/hrtimer.h>
++#include <linux/preempt.h>
++#include <linux/sched/clock.h>
++#include <linux/string.h>
++#include <linux/timer.h>
++#include <linux/vmalloc.h>
++
++/* timer API renames */
++#define from_timer(var, callback_timer, timer_fieldname) \
++	timer_container_of(var, callback_timer, timer_fieldname)
++#define del_timer(t)		timer_delete(t)
++#define del_timer_sync(t)	timer_delete_sync(t)
++
++#define in_irq()		in_hardirq()
++
++/* strncpy() is gone: the vendor code relies on its zero padding */
++static inline char *eccci_strncpy(char *dst, const char *src, size_t n)
++{
++	size_t len = strnlen(src, n);
++
++	memcpy(dst, src, len);
++	memset(dst + len, 0, n - len);
++	return dst;
++}
++#define strncpy(d, s, n)	eccci_strncpy(d, s, n)
++
++/* no GPIO debounce through the legacy numbers (SWTP is not described) */
++static inline int gpio_set_debounce(unsigned int gpio, unsigned int debounce)
++{
++	return -EOPNOTSUPP;
++}
++
++/* no vendor minidump (mrdump) on this kernel */
++static inline int mrdump_mini_add_extra_file(unsigned long vaddr,
++	unsigned long paddr, unsigned long size, const char *name)
++{
++	return 0;
++}
++
++/*
++ * The vendor driver's MediaTek SiP CCCI control calls (modem power sequence,
++ * boot status, flight mode, CCIF clock votes, sleep/wake sources, dumps) are
++ * issued as the vendor driver issues them, and each one is logged with its
++ * arguments and results while the modem is brought up.
++ */
++#undef arm_smccc_smc
++#define arm_smccc_smc(a0, a1, a2, a3, a4, a5, a6, a7, res) \
++	eccci_smc(a0, a1, a2, a3, a4, a5, a6, a7, res)
++
++static inline void eccci_smc(unsigned long a0, unsigned long a1,
++			     unsigned long a2, unsigned long a3,
++			     unsigned long a4, unsigned long a5,
++			     unsigned long a6, unsigned long a7,
++			     struct arm_smccc_res *res)
++{
++	struct arm_smccc_res local;
++
++	if (!res)
++		res = &local;
++	__arm_smccc_smc(a0, a1, a2, a3, a4, a5, a6, a7, res, NULL);
++	pr_info("eccci: SiP %#lx(%#lx, %#lx, %#lx, %#lx, %#lx, %#lx, %#lx) = %#lx %#lx %#lx %#lx\n",
++		a0, a1, a2, a3, a4, a5, a6, a7,
++		res->a0, res->a1, res->a2, res->a3);
++}
++
++#endif
+diff --git a/drivers/misc/mediatek/eccci/compat/linux/of_gpio.h b/drivers/misc/mediatek/eccci/compat/linux/of_gpio.h
+new file mode 100644
+index 0000000000..a4d4bdf275
+--- /dev/null
++++ b/drivers/misc/mediatek/eccci/compat/linux/of_gpio.h
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * <linux/of_gpio.h> is gone from this kernel. The modem driver looks up
++ * the board's modem GPIOs (RF band detection, SIM hot plug) by the vendor
++ * property names of its "mediatek,gpio_usage_mapping" node and reads them
++ * through the legacy GPIO numbers; resolve such a property to that number.
++ */
++#ifndef __ECCCI_COMPAT_OF_GPIO_H__
++#define __ECCCI_COMPAT_OF_GPIO_H__
++#include <linux/err.h>
++#include <linux/errno.h>
++#include <linux/gpio.h>
++#include <linux/gpio/consumer.h>
++#include <linux/gpio/driver.h>
++#include <linux/of.h>
++
++static inline int of_get_named_gpio(const struct device_node *np,
++				    const char *propname, int index)
++{
++	struct of_phandle_args args;
++	struct gpio_device *gdev;
++	struct gpio_desc *desc;
++	int ret;
++
++	ret = of_parse_phandle_with_args(np, propname, "#gpio-cells", index,
++					 &args);
++	if (ret)
++		return ret;
++
++	gdev = gpio_device_find_by_fwnode(of_fwnode_handle(args.np));
++	of_node_put(args.np);
++	if (!gdev)
++		return -EPROBE_DEFER;
++
++	desc = gpio_device_get_desc(gdev, args.args[0]);
++	ret = IS_ERR(desc) ? PTR_ERR(desc) : desc_to_gpio(desc);
++	gpio_device_put(gdev);
++
++	return ret;
++}
++#endif
+diff --git a/drivers/misc/mediatek/eccci/compat/mt-plat/dvfsrc-exp.h b/drivers/misc/mediatek/eccci/compat/mt-plat/dvfsrc-exp.h
+new file mode 100644
+index 0000000000..f4e0650dd1
+--- /dev/null
++++ b/drivers/misc/mediatek/eccci/compat/mt-plat/dvfsrc-exp.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * The vendor DVFSRC export: no bandwidth hint from the modem data path here
++ * (the speed-based DRAM/CPU boosting stays off).
++ */
++#ifndef __ECCCI_COMPAT_DVFSRC_EXP_H__
++#define __ECCCI_COMPAT_DVFSRC_EXP_H__
++#include <linux/of.h>
++#include <linux/types.h>
++
++static inline u32 dvfsrc_get_required_opp_peak_bw(struct device_node *np, int index)
++{
++	return 0;
++}
++#endif
+diff --git a/drivers/misc/mediatek/eccci/compat/net/page_pool.h b/drivers/misc/mediatek/eccci/compat/net/page_pool.h
+new file mode 100644
+index 0000000000..c057d37cb5
+--- /dev/null
++++ b/drivers/misc/mediatek/eccci/compat/net/page_pool.h
+@@ -0,0 +1,3 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* <net/page_pool.h> was split; the vendor DPMAIF uses the helpers. */
++#include <net/page_pool/helpers.h>
+diff --git a/drivers/misc/mediatek/eccci/compat/rps_perf.h b/drivers/misc/mediatek/eccci/compat/rps_perf.h
+new file mode 100644
+index 0000000000..1df94749fa
+--- /dev/null
++++ b/drivers/misc/mediatek/eccci/compat/rps_perf.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* The vendor RPS helper: RPS maps are left to userspace (sysfs) here. */
++#ifndef __ECCCI_COMPAT_RPS_PERF_H__
++#define __ECCCI_COMPAT_RPS_PERF_H__
++struct netdev_rx_queue;
++
++static inline int set_rps_map(struct netdev_rx_queue *queue, unsigned long map)
++{
++	return 0;
++}
++#endif
+diff --git a/drivers/misc/mediatek/eccci/compat/slbc_ops.h b/drivers/misc/mediatek/eccci/compat/slbc_ops.h
+new file mode 100644
+index 0000000000..8d1cfac709
+--- /dev/null
++++ b/drivers/misc/mediatek/eccci/compat/slbc_ops.h
+@@ -0,0 +1,2 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* The vendor system level cache interface (CONFIG_MTK_SLBC) is not available here. */
+diff --git a/drivers/misc/mediatek/eccci/compat/soc/mediatek/emi.h b/drivers/misc/mediatek/eccci/compat/soc/mediatek/emi.h
+new file mode 100644
+index 0000000000..4a396bdf5e
+--- /dev/null
++++ b/drivers/misc/mediatek/eccci/compat/soc/mediatek/emi.h
+@@ -0,0 +1,2 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* The vendor EMI MPU interface (CONFIG_MTK_EMI) is not available here. */
+diff --git a/drivers/misc/mediatek/eccci/compat/soc/mediatek/smpu.h b/drivers/misc/mediatek/eccci/compat/soc/mediatek/smpu.h
+new file mode 100644
+index 0000000000..36bf75bb2d
+--- /dev/null
++++ b/drivers/misc/mediatek/eccci/compat/soc/mediatek/smpu.h
+@@ -0,0 +1,2 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* The vendor SMPU interface (CONFIG_MTK_EMI) is not available here. */
+-- 
+2.56.0
+

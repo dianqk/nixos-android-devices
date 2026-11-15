@@ -3,6 +3,7 @@
   profile,
   confirmationNonGptLunMask ? 0,
   androidNonGptLunMask ? 0,
+  nonSlotPartitionNames ? [ ],
   chargerConfirmationPath ? "",
 }:
 assert builtins.isInt confirmationNonGptLunMask;
@@ -11,6 +12,26 @@ assert profile == "qcom-ab" || confirmationNonGptLunMask == 0;
 assert builtins.isInt androidNonGptLunMask;
 assert androidNonGptLunMask >= 0 && androidNonGptLunMask <= 255;
 assert profile == "qcom-ab" || androidNonGptLunMask == 0;
+assert builtins.isList nonSlotPartitionNames;
+assert builtins.all (
+  name:
+  builtins.isString name
+  && builtins.stringLength name <= 35
+  && builtins.match "[A-Za-z0-9_][A-Za-z0-9_.-]*" name != null
+  && !(builtins.elem name [
+    "boot_a"
+    "boot_b"
+    "abl_a"
+    "abl_b"
+    "xbl_a"
+    "xbl_b"
+    "misc"
+    "linux-boot"
+    "recovery_a"
+    "recovery_b"
+  ])
+) nonSlotPartitionNames;
+assert profile == "qcom-ab" || nonSlotPartitionNames == [ ];
 assert builtins.isString chargerConfirmationPath;
 assert
   chargerConfirmationPath == "" || builtins.match "/[A-Za-z0-9_./-]+" chargerConfirmationPath != null;
@@ -22,10 +43,17 @@ else if profile == "pon" then
     CONFIG_EFI_MOBILE_BOOT_ACTION=y
     # CONFIG_EFI_MOBILE_BOOT_ACTION_QCOM_AB is not set
   ''
+else if profile == "qcom-reason" then
+  ''
+    CONFIG_EFI_MOBILE_BOOT_ACTION=y
+    CONFIG_EFI_MOBILE_BOOT_ACTION_QCOM_REASON=y
+    # CONFIG_EFI_MOBILE_BOOT_ACTION_QCOM_AB is not set
+  ''
 else if profile == "qcom-ab" then
   ''
     CONFIG_EFI_MOBILE_BOOT_ACTION=y
     CONFIG_EFI_MOBILE_BOOT_ACTION_QCOM_AB=y
+    CONFIG_EFI_MOBILE_QCOM_AB_NON_SLOT_NAMES="${builtins.concatStringsSep " " nonSlotPartitionNames}"
     CONFIG_EFI_MOBILE_QCOM_AB_ANDROID_NON_GPT_LUN_MASK=${toString androidNonGptLunMask}
     CONFIG_EFI_MOBILE_QCOM_AB_CONFIRM=y
     CONFIG_EFI_MOBILE_QCOM_AB_CONFIRM_ESP="linux-boot"

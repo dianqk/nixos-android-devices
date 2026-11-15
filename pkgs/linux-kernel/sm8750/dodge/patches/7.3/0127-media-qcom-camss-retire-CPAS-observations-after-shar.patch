@@ -1,0 +1,151 @@
+From 8b4f8dde6c9d723778b9dcf3004582fa3ecb6ed0 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 11 Nov 2026 05:08:31 +0800
+Subject: [PATCH 132/144] media: qcom: camss: retire CPAS observations after
+ shared-clock validation
+
+Fresh-boot IMX615 capture, full runtime suspend and a second scene capture succeed with the RT/NRT shared clocks retained and no software Q-channel writes. Keep that lifecycle fix and remove the temporary diagnostic mapping.
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0168-media-qcom-camss-retire-CPAS-observations-after-shar.patch
+Import-SHA256: 87efd706cef7f0b2d3f8081b20ebe10af8e594735ecbfda004df69cb7999bdc3
+Import-Provenance: mail headers
+(cherry picked from commit b63b015b45b0a8a9cacd9ad15459ff5ec107f525)
+---
+ .../bindings/media/qcom,sm8750-camss.yaml     |  9 +++----
+ arch/arm64/boot/dts/qcom/sm8750.dtsi          |  6 ++---
+ drivers/media/platform/qcom/camss/camss.c     | 24 -------------------
+ drivers/media/platform/qcom/camss/camss.h     |  1 -
+ 4 files changed, 5 insertions(+), 35 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/media/qcom,sm8750-camss.yaml b/Documentation/devicetree/bindings/media/qcom,sm8750-camss.yaml
+index bc765a0596..71a16a9363 100644
+--- a/Documentation/devicetree/bindings/media/qcom,sm8750-camss.yaml
++++ b/Documentation/devicetree/bindings/media/qcom,sm8750-camss.yaml
+@@ -25,7 +25,7 @@ properties:
+   ranges: true
+ 
+   reg:
+-    maxItems: 14
++    maxItems: 13
+ 
+   reg-names:
+     items:
+@@ -42,7 +42,6 @@ properties:
+       - const: vfe2
+       - const: vfe_lite0
+       - const: vfe_lite1
+-      - const: qchannel
+ 
+   clocks:
+     maxItems: 23
+@@ -223,8 +222,7 @@ examples:
+                   <0x0 0x0ac96000 0x0 0x10000>,
+                   <0x0 0x0aca6000 0x0 0x10000>,
+                   <0x0 0x0ad6e000 0x0 0x3000>,
+-                  <0x0 0x0ad73000 0x0 0x3000>,
+-                  <0x0 0x0ac040ec 0x0 0x10>;
++                  <0x0 0x0ad73000 0x0 0x3000>;
+             reg-names = "csid0",
+                         "csid1",
+                         "csid2",
+@@ -237,8 +235,7 @@ examples:
+                         "vfe1",
+                         "vfe2",
+                         "vfe_lite0",
+-                        "vfe_lite1",
+-                        "qchannel";
++                        "vfe_lite1";
+ 
+             clocks = <&camcc CAM_CC_CAMNOC_NRT_AXI_CLK>,
+                      <&camcc CAM_CC_CAMNOC_RT_AXI_CLK>,
+diff --git a/arch/arm64/boot/dts/qcom/sm8750.dtsi b/arch/arm64/boot/dts/qcom/sm8750.dtsi
+index 8ad9b64fea..20dc148c71 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8750.dtsi
+@@ -3584,8 +3584,7 @@ camss: isp@ad27000 {
+ 			      <0x0 0x0ac96000 0x0 0x10000>,
+ 			      <0x0 0x0aca6000 0x0 0x10000>,
+ 			      <0x0 0x0ad6e000 0x0 0x3000>,
+-			      <0x0 0x0ad73000 0x0 0x3000>,
+-			      <0x0 0x0ac040ec 0x0 0x10>;
++			      <0x0 0x0ad73000 0x0 0x3000>;
+ 			reg-names = "csid0",
+ 				    "csid1",
+ 				    "csid2",
+@@ -3598,8 +3597,7 @@ camss: isp@ad27000 {
+ 				    "vfe1",
+ 				    "vfe2",
+ 				    "vfe_lite0",
+-				    "vfe_lite1",
+-				    "qchannel";
++				    "vfe_lite1";
+ 
+ 			clocks = <&camcc CAM_CC_CAMNOC_NRT_AXI_CLK>,
+ 			      <&camcc CAM_CC_CAMNOC_RT_AXI_CLK>,
+diff --git a/drivers/media/platform/qcom/camss/camss.c b/drivers/media/platform/qcom/camss/camss.c
+index ae24d95033..c3d291d56b 100644
+--- a/drivers/media/platform/qcom/camss/camss.c
++++ b/drivers/media/platform/qcom/camss/camss.c
+@@ -5930,13 +5930,6 @@ static int camss_probe(struct platform_device *pdev)
+ 
+ 	atomic_set(&camss->ref_count, 0);
+ 	camss->dev = dev;
+-	/* CPAS-980 RT/NRT quiescence controls, separate from the AON mux. */
+-	if (camss->res->version == CAMSS_8750) {
+-		camss->qchannel_base = devm_platform_ioremap_resource_byname(pdev,
+-								 "qchannel");
+-		if (IS_ERR(camss->qchannel_base))
+-			return PTR_ERR(camss->qchannel_base);
+-	}
+ 	platform_set_drvdata(pdev, camss);
+ 
+ 	camss->csiphy = devm_kcalloc(dev, camss->res->csiphy_num,
+@@ -6371,28 +6364,12 @@ static const struct of_device_id camss_dt_match[] = {
+ 
+ MODULE_DEVICE_TABLE(of, camss_dt_match);
+ 
+-/* Observe the CPAS-980 handshake while the camera register clocks run. */
+-static void camss_qchannel_log(struct camss *camss, const char *state)
+-{
+-	int i;
+-
+-	if (!camss->qchannel_base)
+-		return;
+-
+-	for (i = 0; i < 2; i++)
+-		dev_dbg(camss->dev, "CAMNOC %s Q-channel %u control %#x status %#x\n",
+-			state, i, readl(camss->qchannel_base + i * 8),
+-			readl(camss->qchannel_base + i * 8 + 4));
+-}
+-
+ static int __maybe_unused camss_runtime_suspend(struct device *dev)
+ {
+ 	struct camss *camss = dev_get_drvdata(dev);
+ 	int i;
+ 	int ret;
+ 
+-	camss_qchannel_log(camss, "suspend");
+-
+ 	for (i = 0; i < camss->res->icc_path_num; i++) {
+ 		ret = icc_set_bw(camss->icc_path[i], 0, 0);
+ 		if (ret)
+@@ -6427,7 +6404,6 @@ static int __maybe_unused camss_runtime_resume(struct device *dev)
+ 			return ret;
+ 	}
+ 
+-	camss_qchannel_log(camss, "resume");
+ 
+ 	return 0;
+ }
+diff --git a/drivers/media/platform/qcom/camss/camss.h b/drivers/media/platform/qcom/camss/camss.h
+index 69400c4201..bcd4ed7be9 100644
+--- a/drivers/media/platform/qcom/camss/camss.h
++++ b/drivers/media/platform/qcom/camss/camss.h
+@@ -125,7 +125,6 @@ struct camss_resources {
+ };
+ 
+ struct camss {
+-	void __iomem *qchannel_base;
+ 	struct v4l2_device v4l2_dev;
+ 	struct v4l2_async_notifier notifier;
+ 	struct media_device media_dev;

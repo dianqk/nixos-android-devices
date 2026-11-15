@@ -1,0 +1,138 @@
+From 8f1a3619d3bfadb8b0892c22ad557bc1c9abdc86 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 7 Nov 2026 14:28:19 +0800
+Subject: [PATCH] arm64: dts: qcom: enable Dodge boot keys and reboot reason
+
+Describe the OnePlus 13 Power and Volume Up keys on PMK8550 PON, and
+Volume Down on PM8550 GPIO6 with its input bias and supply. Keep natural
+Linux key codes for the existing phone-key remapping layer. Add the
+PM8550 GPIO compatible to the existing controller driver.
+
+Restore the PMK8550 SDAM reboot-reason cell used by the normal Qualcomm
+EFI boot-action adapter. The SID, offset and bitfield match the Linux
+PMK8550 description and the board firmware.
+
+Link: https://github.com/torvalds/linux/blob/v7.3/arch/arm64/boot/dts/qcom/pmk8550.dtsi
+Link: https://github.com/torvalds/linux/blob/v7.3/arch/arm64/boot/dts/qcom/pm8550.dtsi
+Link: https://github.com/mrlund/linux-omarchy-mobile/commit/9613d6de1c8c93433250d49b8ce08dafa7a01203
+---
+ drivers/gpio/qcom_pmic_gpio.c                 |  1 +
+ .../src/arm64/qcom/sm8750-oneplus-dodge.dts   | 76 +++++++++++++++++++
+ 2 files changed, 77 insertions(+)
+
+diff --git a/drivers/gpio/qcom_pmic_gpio.c b/drivers/gpio/qcom_pmic_gpio.c
+index ad4a70dd..5190e20f 100644
+--- a/drivers/gpio/qcom_pmic_gpio.c
++++ b/drivers/gpio/qcom_pmic_gpio.c
+@@ -347,6 +347,7 @@ static const struct udevice_id qcom_gpio_ids[] = {
+ 	{ .compatible = "qcom,pms405-gpio" },
+ 	{ .compatible = "qcom,pm6125-gpio" },
+ 	{ .compatible = "qcom,pm8150-gpio" },
++	{ .compatible = "qcom,pm8550-gpio" },
+ 	{ }
+ };
+ 
+diff --git a/dts/upstream/src/arm64/qcom/sm8750-oneplus-dodge.dts b/dts/upstream/src/arm64/qcom/sm8750-oneplus-dodge.dts
+index 59eaa3c5..ff6ab3e7 100644
+--- a/dts/upstream/src/arm64/qcom/sm8750-oneplus-dodge.dts
++++ b/dts/upstream/src/arm64/qcom/sm8750-oneplus-dodge.dts
+@@ -3,6 +3,8 @@
+ #include <dt-bindings/clock/qcom,sm8750-gcc.h>
+ #include <dt-bindings/clock/qcom,sm8750-tcsr.h>
+ #include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/input/input.h>
++#include <dt-bindings/interrupt-controller/irq.h>
+ #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
+ #include <dt-bindings/soc/qcom,rpmh-rsc.h>
+ / {
+@@ -39,6 +41,26 @@
+ 			status = "okay";
+ 		};
+ 	};
++	gpio-keys {
++		compatible = "gpio-keys";
++		pinctrl-names = "default";
++		pinctrl-0 = <&volume_down_n>;
++
++		key-volume-down {
++			label = "Volume Down";
++			linux,code = <KEY_VOLUMEDOWN>;
++			gpios = <&pm8550_gpios 6 GPIO_ACTIVE_LOW>;
++		};
++	};
++
++	reboot-mode {
++		compatible = "nvmem-reboot-mode";
++		nvmem-cells = <&reboot_reason>;
++		nvmem-cell-names = "reboot-mode";
++		mode-recovery = <1>;
++		mode-bootloader = <2>;
++	};
++
+ 	vph_pwr: vph-pwr-regulator {
+ 		compatible = "regulator-fixed";
+ 		regulator-name = "vph_pwr";
+@@ -253,6 +275,60 @@
+ 				reg = <0 0>;
+ 				#address-cells = <1>;
+ 				#size-cells = <0>;
++
++				pon@1300 {
++					compatible = "qcom,pmk8350-pon";
++					reg = <0x1300>, <0x800>;
++					reg-names = "hlos", "pbs";
++
++					pwrkey {
++						compatible = "qcom,pmk8350-pwrkey";
++						interrupts = <0 0x13 7 IRQ_TYPE_EDGE_BOTH>;
++						linux,code = <KEY_POWER>;
++					};
++
++					resin {
++						compatible = "qcom,pmk8350-resin";
++						interrupts = <0 0x13 6 IRQ_TYPE_EDGE_BOTH>;
++						linux,code = <KEY_VOLUMEUP>;
++					};
++				};
++
++				nvram@7100 {
++					compatible = "qcom,spmi-sdam";
++					reg = <0x7100>;
++					#address-cells = <1>;
++					#size-cells = <1>;
++					ranges = <0 0x7100 0x100>;
++
++					reboot_reason: reboot-reason@48 {
++						reg = <0x48 1>;
++						bits = <1 7>;
++					};
++				};
++			};
++
++			pm8550: pmic@1 {
++				compatible = "qcom,pm8550", "qcom,spmi-pmic";
++				reg = <1 0>;
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				pm8550_gpios: gpio@8800 {
++					compatible = "qcom,pm8550-gpio", "qcom,spmi-gpio";
++					reg = <0x8800>;
++					gpio-controller;
++					gpio-ranges = <&pm8550_gpios 0 0 12>;
++					#gpio-cells = <2>;
++
++					volume_down_n: volume-down-n-state {
++						pins = "gpio6";
++						function = "normal";
++						input-enable;
++						bias-pull-up;
++						power-source = <1>;
++					};
++				};
+ 			};
+ 			pmih010: pmic@7 {
+ 				compatible = "qcom,spmi-pmic";
+-- 
+2.56.0
+

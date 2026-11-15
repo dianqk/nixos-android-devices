@@ -71,7 +71,16 @@ let
           # qcom_q6v5_pas auto-boots both PAS devices. Audio needs only ADSP;
           # wait for those asynchronous boots, then stop only CDSP while
           # retaining ADSP's one reliable boot this session.
-          wait_state adsp running
+          # A rejected image ("failed to authenticate image") leaves ADSP
+          # offline; it has authenticated on a later attempt, so request a
+          # fresh load twice before failing.
+          attempt=1
+          until wait_state adsp running; do
+            [ "$attempt" -lt 3 ] && [ "$(cat "$(wait_remoteproc adsp)/state")" = offline ] || exit 1
+            attempt=$((attempt + 1))
+            echo "Retrying adsp start (attempt $attempt of 3)." >&2
+            set_state adsp start
+          done
           wait_state cdsp running
           set_state cdsp stop
           ;;

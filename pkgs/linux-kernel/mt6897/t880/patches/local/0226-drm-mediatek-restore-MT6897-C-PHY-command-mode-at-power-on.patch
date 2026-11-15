@@ -1,0 +1,295 @@
+From e0445b5c17485988d59d2f88c00ecff30cdde113 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Mon, 9 Nov 2026 22:00:20 +0800
+Subject: [PATCH] drm/mediatek: restore MT6897 C-PHY command mode at power-on
+
+The MT6897 OEM preconfiguration clears CMD_CPHY_6BYTE_EN for C-PHY. The
+local driver does not initialize it. After a display-domain power cycle
+the observed controller has bit18 set on both links and stalls on the
+first seven-byte packet, while the healthy boot has the bit clear.
+
+Describe the optional CMD_TYPE1_HS register in MT6897 layout metadata
+and clear only that documented bit during each real C-PHY power-on,
+after clocks/reset and before panel commands. Preserve other bits,
+nested power-on owners, D-PHY and layouts without the register. Keep
+packing, completion, reset and clock sequencing unchanged.
+
+Include the mapped field in the existing bounded engine diagnostic line.
+Test actual dual-link power-on across lost-domain epochs, reserved-bit
+preservation, nested no-op and untouched D-PHY/legacy paths. Retain the
+captured seven-byte packet's exact software-composed payload/header
+words.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_dsi.c#L189
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_dsi.c#L1806
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_dsi.c#L3065
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/gpu/drm/mediatek/mtk_dsi.c            | 23 ++++-
+ .../selftests/mtk_clk/dsi_routing_cases.c     | 86 ++++++++++++++++++-
+ .../selftests/mtk_clk/test_dsi_routing.py     |  8 +-
+ 3 files changed, 113 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_dsi.c b/drivers/gpu/drm/mediatek/mtk_dsi.c
+index 6870b5ac85..582b7217f1 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dsi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dsi.c
+@@ -364,6 +364,7 @@ struct mtk_dsi_driver_data {
+ 	const u16 *reg_main;
+ 	const u16 *reg_adv;
+ 	const u16 *reg_qos;
++	u16 reg_cmd_type1_hs;
+ 
+ 	const u16 max_link_rate_mbps;
+ 	const u8 dsi_sram_bytes;
+@@ -1218,6 +1219,8 @@ static void mtk_dsi_config_hw_buffers(struct mtk_dsi *dsi)
+ 	mtk_dsi_mask(dsi, reg_qos[DSI_QOS_BUF_CON0], DSI_QOS_BUF_EN, DSI_QOS_BUF_EN);
+ }
+ 
++#define DSI_V1_CMD_TYPE1_HS		0x6c
++#define CMD_CPHY_6BYTE_EN		BIT(18)
+ #define DSI_V1_RESERVED			0xf0
+ #define DSI_V1_DEBUG_SEL		0x170
+ #  define DSI_V1_MM_RST_SEL		BIT(10)
+@@ -1237,6 +1240,15 @@ static void mtk_dsi_select_mm_reset(struct mtk_dsi *dsi)
+ 		     DSI_V1_MM_RST_SEL);
+ }
+ 
++/* Restore C-PHY command mode during power-on preconfiguration. */
++static void mtk_dsi_config_cmd_type1_hs(struct mtk_dsi *dsi)
++{
++	const struct mtk_dsi_driver_data *data = dsi->driver_data;
++
++	if (dsi->cphy && data->reg_cmd_type1_hs)
++		mtk_dsi_mask(dsi, data->reg_cmd_type1_hs, CMD_CPHY_6BYTE_EN, 0);
++}
++
+ /*
+  * The MT6897 command queue starts in the vendor's idle state after a domain
+  * reset; the engine reset leaves the SRAM words uninitialized. Clear both
+@@ -1421,7 +1433,11 @@ static void mtk_dsi_dump_regs(struct mtk_dsi *dsi, const char *phase)
+ {
+ 	const struct mtk_dsi_driver_data *data = dsi->driver_data;
+ 	u32 debug_sel = 0;
++	char cmd_type1_hs[32] = "";
+ 
++	if (dsi->cphy && data->reg_cmd_type1_hs)
++		snprintf(cmd_type1_hs, sizeof(cmd_type1_hs), " cmd_type1_hs=%08x",
++			 readl(dsi->regs + data->reg_cmd_type1_hs));
+ 	if (data->tx_buf)
+ 		debug_sel = readl(dsi->regs + DSI_V1_DEBUG_SEL);
+ 	dev_info(dsi->host.dev,
+@@ -1431,12 +1447,13 @@ static void mtk_dsi_dump_regs(struct mtk_dsi *dsi, const char *phase)
+ 		 readl(dsi->regs + data->reg_main[DSI_CON_CTRL]),
+ 		 readl(dsi->regs + data->reg_main[DSI_MODE_CTRL]));
+ 	dev_info(dsi->host.dev,
+-		 "C-PHY engine %s: start=%08x cmdq=%08x cmdq_size=%08x txrx=%08x ps=%08x debug_sel=%08x\n",
++		 "C-PHY engine %s: start=%08x cmdq=%08x cmdq_size=%08x txrx=%08x ps=%08x debug_sel=%08x%s\n",
+ 		 phase, readl(dsi->regs + data->reg_main[DSI_START]),
+ 		 readl(dsi->regs + data->reg_adv[DSI_CMDQ]),
+ 		 readl(dsi->regs + data->reg_main[DSI_CMDQ_SIZE]),
+ 		 readl(dsi->regs + data->reg_main[DSI_TXRX_CTRL]),
+-		 readl(dsi->regs + data->reg_main[DSI_PSCTRL]), debug_sel);
++		 readl(dsi->regs + data->reg_main[DSI_PSCTRL]), debug_sel,
++		 cmd_type1_hs);
+ 	dev_info(dsi->host.dev,
+ 		 "C-PHY phy %s: lccon=%08x lcpat=%08x timecon0=%08x timecon1=%08x cphy=%08x\n",
+ 		 phase, readl(dsi->regs + data->reg_main[DSI_PHY_LCCON]),
+@@ -1830,6 +1847,7 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
+ 	if (dsi->is_slave)
+ 		mtk_dsi_mask(dsi, data->reg_main[DSI_CON_CTRL], DSI_DUAL_EN, 0);
+ 	mtk_dsi_phy_timconfig(dsi);
++	mtk_dsi_config_cmd_type1_hs(dsi);
+ 
+ 	/* Setup HW FIFO if DSI supports QoS Anti-Latency buffers */
+ 	if (data->tx_buf)
+@@ -2885,6 +2903,7 @@ static const struct mtk_dsi_tx_buf mt6897_dsi_tx_buf = {
+ static const struct mtk_dsi_driver_data mt6897_dsi_driver_data = {
+ 	.reg_main = mtk_dsi_regs_main_v1,
+ 	.reg_adv = mtk_dsi_regs_mt6897,
++	.reg_cmd_type1_hs = DSI_V1_CMD_TYPE1_HS,
+ 	.max_link_rate_mbps = 2500,
+ 	.has_size_ctl = true,
+ 	.has_cphy = true,
+diff --git a/tools/testing/selftests/mtk_clk/dsi_routing_cases.c b/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
+index 4b8d4a6bbf..e33a98165e 100644
+--- a/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
++++ b/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
+@@ -24,6 +24,7 @@ typedef int irqreturn_t;
+ #define MTK_DSI_HOST_IS_READ(type) ((type) == 1)
+ #define MTK_DSI_CMD_RING_SIZE 16
+ #define MTK_DSI_CMDQ_WRITE_RING_SIZE 64
++#define BIT(n) (1U << (n))
+ #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+ static int log_count;
+ static int dump_log_count;
+@@ -97,6 +98,8 @@ static void test_log(const char *fmt, ...)
+ #define DATA_1 0xff000000
+ #define CMDQ_SIZE 0x3f
+ #define CMDQ_SIZE_SEL (1U << 15)
++#define DSI_V1_CMD_TYPE1_HS 0x6c
++#define CMD_CPHY_6BYTE_EN BIT(18)
+ #define DSI_V1_DEBUG_SEL 0x170
+ #define DSI_V1_MM_RST_SEL (1U << 10)
+ struct clk {
+@@ -149,6 +152,7 @@ struct mtk_dsi_cmdq_write {
+ struct mtk_dsi_driver_data {
+ 	const u16 *reg_adv;
+ 	u16 reg_main[16];
++	u16 reg_cmd_type1_hs;
+ 	bool tx_buf;
+ 	int dsi_sram_bytes;
+ 	bool reg_qos;
+@@ -460,6 +464,7 @@ static const struct mtk_dsi_driver_data pack_data = {
+ 	.poll_command_done = true,
+ 	.cmdq_long_packet_ctl = true,
+ 	.cmdq_software_pack = true,
++	.reg_cmd_type1_hs = DSI_V1_CMD_TYPE1_HS,
+ };
+ static void setup(bool dual)
+ {
+@@ -793,7 +798,7 @@ static void test_polled_completion(bool packed)
+ 
+ static void test_cmdq_packing(void)
+ {
+-	static const size_t lengths[] = { 0, 1, 2, 3, 4, 5, 8, 9, 248 };
++	static const size_t lengths[] = { 0, 1, 2, 3, 4, 5, 7, 8, 9, 248 };
+ 	u8 payload[249];
+ 
+ 	for (size_t i = 0; i < sizeof(payload); i++)
+@@ -848,6 +853,17 @@ static void test_cmdq_packing(void)
+ 		}
+ 	}
+ 
++	/* Preserve the exact seven-byte DCS packet from the warm failure. */
++	const u8 seven[] = { 0x3b, 0x03, 0x64, 0x1e, 0x04, 0x04, 0x00 };
++	struct mipi_dsi_msg seven_msg = { .type = 0x39, .tx_len = sizeof(seven),
++		.tx_buf = seven, .flags = MIPI_DSI_MSG_USE_LPM };
++
++	setup(false);
++	d[0].driver_data = &pack_data;
++	assert(!mtk_dsi_cmdq(&d[0], &seven_msg));
++	assert(bus[0].value == 0x1e64033b && bus[1].value == 0x00000404);
++	assert(bus[2].value == 0x00073902 && bus_count == 5);
++
+ 	/* Reproduce the actual d04 stale reads, then remove that dependency. */
+ 	const u8 long_payload[] = { 0xbc, 0x33, 0x03 };
+ 	struct mipi_dsi_msg msg = { .type = 0x29, .tx_len = 3,
+@@ -920,8 +936,76 @@ static void test_cmdq_packing(void)
+ 	}
+ }
+ 
++static void test_cmd_type1_poweron(void)
++{
++	struct mtk_dsi_driver_data selected = pack_data;
++	const u32 initial[] = { 0xa5a5ffff, 0x5a5effff };
++
++	selected.tx_buf = true;
++	setup(true);
++	for (int i = 0; i < 2; i++)
++		d[i].driver_data = &selected;
++	for (int epoch = 0; epoch < 2; epoch++) {
++		/* Model the observed lost-domain setting on both independent links. */
++		for (int i = 0; i < 2; i++)
++			regs[i][DSI_V1_CMD_TYPE1_HS] = initial[i] | CMD_CPHY_6BYTE_EN;
++		assert(!mtk_dsi_poweron(&d[0]));
++		for (int i = 0; i < 2; i++) {
++			int clear_count = 0;
++
++			assert(d[i].power_ready && d[i].refcount == 1);
++			assert(regs[i][DSI_V1_CMD_TYPE1_HS] ==
++			       (initial[i] & ~CMD_CPHY_6BYTE_EN));
++			for (int j = 0; j < bus_count; j++)
++				if (bus[j].address == regs[i] + DSI_V1_CMD_TYPE1_HS)
++					clear_count++;
++			assert(clear_count == epoch + 1);
++		}
++		int before = bus_count;
++
++		/* A nested owner must not reconfigure live hardware. */
++		regs[0][DSI_V1_CMD_TYPE1_HS] |= CMD_CPHY_6BYTE_EN;
++		assert(!mtk_dsi_poweron(&d[0]));
++		assert(bus_count == before &&
++		       (regs[0][DSI_V1_CMD_TYPE1_HS] & CMD_CPHY_6BYTE_EN));
++		mtk_dsi_poweroff(&d[0]);
++		mtk_dsi_poweroff(&d[0]);
++		balanced();
++	}
++	/* Neither a D-PHY link nor a layout without this register is touched. */
++	for (int legacy_layout = 0; legacy_layout < 2; legacy_layout++) {
++		setup(true);
++		selected.reg_cmd_type1_hs = legacy_layout ? 0 : DSI_V1_CMD_TYPE1_HS;
++		for (int i = 0; i < 2; i++) {
++			d[i].driver_data = &selected;
++			d[i].cphy = legacy_layout;
++			regs[i][DSI_V1_CMD_TYPE1_HS] = initial[i];
++		}
++		watched_read = regs[0] + DSI_V1_CMD_TYPE1_HS;
++		assert(!mtk_dsi_poweron(&d[0]));
++		int logs_before = log_count;
++
++		mtk_dsi_dump_regs(&d[0], "test");
++		assert(!watched_reads && log_count == logs_before + 3);
++		for (int i = 0; i < 2; i++) {
++			assert(regs[i][DSI_V1_CMD_TYPE1_HS] == initial[i]);
++			for (int j = 0; j < bus_count; j++)
++				assert(bus[j].address != regs[i] + DSI_V1_CMD_TYPE1_HS);
++		}
++		mtk_dsi_poweroff(&d[0]);
++		balanced();
++	}
++	setup(false);
++	d[0].driver_data = &pack_data;
++	regs[0][DSI_V1_CMD_TYPE1_HS] = 0x12345678;
++	watched_read = regs[0] + DSI_V1_CMD_TYPE1_HS;
++	mtk_dsi_dump_regs(&d[0], "test");
++	assert(watched_reads == 1 && regs[0][DSI_V1_CMD_TYPE1_HS] == 0x12345678);
++}
++
+ int main(void)
+ {
++	test_cmd_type1_poweron();
+ 	test_cmdq_operands();
+ 	test_cmdq_packing();
+ 	setup(true);
+diff --git a/tools/testing/selftests/mtk_clk/test_dsi_routing.py b/tools/testing/selftests/mtk_clk/test_dsi_routing.py
+index fbc10c9b7b..c4464ad6f2 100755
+--- a/tools/testing/selftests/mtk_clk/test_dsi_routing.py
++++ b/tools/testing/selftests/mtk_clk/test_dsi_routing.py
+@@ -42,7 +42,7 @@ production = tables + '\n' + '\n'.join(function(name).replace('static void mtk_d
+     'mtk_dsi_start', 'mtk_dsi_stop', 'mtk_output_dsi_enable',
+     'mtk_output_dsi_disable', 'mtk_dsi_recv_cnt',
+     'mtk_dsi_set_interrupt_enable', 'mtk_dsi_select_mm_reset',
+-    'mtk_dsi_clear_cmdq',
++    'mtk_dsi_clear_cmdq', 'mtk_dsi_config_cmd_type1_hs',
+     'mtk_dsi_poweron', 'mtk_dsi_poweroff', 'mtk_dsi_bridge_atomic_disable',
+     'mtk_dsi_bridge_atomic_enable', 'mtk_dsi_bridge_atomic_pre_enable',
+     'mtk_dsi_bridge_atomic_post_disable', 'mtk_dsi_ddp_start', 'mtk_dsi_ddp_stop',
+@@ -81,6 +81,8 @@ mt6897 = source.split('mt6897_dsi_driver_data = {', 1)[1].split('};', 1)[0]
+ assert '.cmdq_long_packet_ctl = true' in mt6897
+ assert '.cmdq_software_pack = true' in mt6897
+ assert source.count('.cmdq_software_pack = true') == 1
++assert '.reg_cmd_type1_hs = DSI_V1_CMD_TYPE1_HS' in mt6897
++assert source.count('.reg_cmd_type1_hs =') == 1
+ direct = function('mtk_dsi_cmdq_write')
+ assert 'readl' not in direct and direct.count('writel(') == 1
+ assert direct.index('writel(') < direct.index('mtk_dsi_record_cmdq_write')
+@@ -106,11 +108,15 @@ assert 'cmdq_full_word' not in source
+ assert 'mtk_dsi_cmdq_full_word' not in source
+ assert 'cmdq1' in function('mtk_dsi_dump_ring')
+ poweron = function('mtk_dsi_poweron')
++assert poweron.index('mtk_dsi_reset_engine') < \
++    poweron.index('mtk_dsi_config_cmd_type1_hs') < \
++    poweron.index('mtk_dsi_config_tx_buf_v1')
+ assert poweron.index('mtk_dsi_select_mm_reset') < \
+     poweron.index('mtk_dsi_reset_engine') < \
+     poweron.index('mtk_dsi_clear_cmdq') < \
+     poweron.index('mtk_dsi_config_tx_buf_v1')
+ assert 'DSI_V1_DEBUG_SEL' in function('mtk_dsi_dump_regs')
++assert 'reg_cmd_type1_hs' in function('mtk_dsi_dump_regs')
+ assert 'debug_sel' in function('mtk_dsi_record_cmd')
+ assert 'debug_sel' in function('mtk_dsi_dump_ring')
+ assert poweron.index('pm_runtime_resume_and_get') < \
+-- 
+2.56.0
+

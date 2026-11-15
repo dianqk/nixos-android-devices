@@ -1,0 +1,91 @@
+From 65cf2b056220e09b8660497075e40a48d2c526c8 Mon Sep 17 00:00:00 2001
+From: Martin Neiva de Carvalho <martincarvalho@gmail.com>
+Date: Thu, 29 Oct 2026 11:20:48 -0400
+Subject: [PATCH 2/5] libcamera: software_isp: Centre the crop the GPU debayer
+ applies
+
+A stream whose aspect ratio differs from the sensor's cannot show all of
+it, and cropping the sides is the right answer - black bars would be
+worse. But the crop has to be taken from both sides.
+
+The viewport is sized from the sensor frame while the buffer being drawn
+into is the size the application asked for, so that buffer covers only
+the corner of the viewport running from NDC -1 to where its own width
+reaches. Translating the quad by -(1 - scale) puts the texture's left
+and bottom edges exactly at that corner, so everything cropped comes off
+one side.
+
+Measured on an OV02C10 by registering a 640x480 stream against a
+1920x1080 one of the same scene - searching for the scale and offset
+that maximise the normalised correlation between them - the smaller
+stream showed a 1391x1043 window of the sensor's 1920x1080, starting at
+(48, 22). Centring the 4:3 window in the 16:9 frame calls for 1440x1080
+starting at (240, 0). A subject had to sit a sixth of a frame off centre
+to appear centred, and the framing moved whenever the application chose
+a different resolution.
+
+Translate to the middle of the region the buffer actually covers
+instead. That region spans NDC -1 to 2 * out / viewport - 1, so its
+midpoint is out / viewport - 1. The same measurement then reports
+1438x1079 starting at (243, 0), which is the centred window to within
+the three pixels the registration can resolve.
+
+At the native size this shares the eight columns and twelve rows of
+Bayer border between the two edges rather than taking them all off one,
+moving the picture by half a border. Nothing is resampled: the viewport
+and the scale factor are untouched.
+
+Signed-off-by: Martin Neiva de Carvalho <martincarvalho@gmail.com>
+Signed-off-by: Ray Strode <rstrode@redhat.com>
+
+Link: https://patchwork.libcamera.org/patch/28704/
+Backport: Reduce unrelated context for libcamera 0.7.2; code unchanged.
+Status: Experimental local backport; upstream v5 series is rejected/unmerged.
+---
+ src/libcamera/software_isp/debayer_egl.cpp | 23 +++++++++++++++++++---
+ 1 file changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+index b2c7aaf..995d0c2 100644
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -407,16 +407,33 @@ void DebayerEGL::setShaderVariableValues(eGLImage &eglImageIn, const DebayerPara
+ 	/*
+ 	 * Scale the output size from the native size the algorithm produces for
+ 	 * the input size. Keep the aspect ratio and prefer cropping over black
+-	 * bars.
++	 * bars - but crop from both sides, not from one.
++	 *
++	 * The viewport is the sensor frame while the buffer drawn into is the
++	 * requested size, so the buffer covers only the corner of the viewport
++	 * that starts at NDC -1 and ends where its own width reaches. Placing
++	 * the quad at -(1 - scale) puts the texture's left edge exactly at
++	 * that corner, so everything cropped is taken off one side: metered
++	 * by registering a 640x480 stream against a 1920x1080 one of the same
++	 * scene, the frame shown ran from x=48 rather than from the x=240
++	 * that centring the 4:3 window in a 16:9 sensor calls for.
++	 *
++	 * Centre it on the region the buffer actually covers instead. That
++	 * region spans NDC -1 to 2*out/viewport - 1, whose midpoint is
++	 * out/viewport - 1, and putting the quad's centre there splits the
++	 * crop evenly between the two edges at every size, the native one
++	 * included - where it shares the eight columns of Bayer border
++	 * instead of taking them all off the right.
+ 	 */
+ 	GLfloat scale = std::max((GLfloat)outputSize_.width / nativeOutputSize_.width,
+ 				 (GLfloat)outputSize_.height / nativeOutputSize_.height);
+-	GLfloat trans = -(1.0f - scale);
++	GLfloat transX = (GLfloat)outputSize_.width / width_ - 1.0f;
++	GLfloat transY = (GLfloat)outputSize_.height / height_ - 1.0f;
+ 	GLfloat projMatrix[] = {
+ 		scale, 0, 0, 0,
+ 		0, scale, 0, 0,
+ 		0, 0, 1, 0,
+-		trans, trans, 0, 1
++		transX, transY, 0, 1
+ 	};
+ 	/* Static const coordinates */
+ 	static const GLfloat vcoordinates[4][2] = {
+-- 
+2.56.0
+

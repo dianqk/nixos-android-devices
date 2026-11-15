@@ -1,0 +1,70 @@
+From e631585f6cf999fcdfa62fc55b9fd87666137f96 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 8 Nov 2026 12:11:20 +0800
+Subject: [PATCH] arm: qualcomm: reserve Dodge RMTFS before EFI allocations
+
+ABL describes a dynamic RMTFS pool, while the installed Dodge device tree
+uses a fixed 4 MiB region at 0xd7c00000. Reserving it only during EFI
+device-tree fixup leaves LMB allocating from a range EFI already excludes,
+causing the kernel stub relocation to fail with EFI_OUT_OF_RESOURCES.
+
+Subtract the fixed range before checking the loader initrd and running
+Image, and expose its geometry as a no-map node in the control tree. Reuse
+an identical OEM node and reject conflicting geometry.
+
+Link: https://github.com/mrlund/linux-omarchy-mobile/blob/6cc4b65df980355e00417df3d4b7b8109e7d0d21/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+---
+ arch/arm/mach-snapdragon/dodge.c | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/arch/arm/mach-snapdragon/dodge.c b/arch/arm/mach-snapdragon/dodge.c
+index 16fb01d8..81223e87 100644
+--- a/arch/arm/mach-snapdragon/dodge.c
++++ b/arch/arm/mach-snapdragon/dodge.c
+@@ -4,6 +4,8 @@
+ 
+ #define DODGE_MAX_RESERVED 128
+ #define DODGE_FDT_BYTES SZ_64K
++#define DODGE_RMTFS_BASE 0xd7c00000ULL
++#define DODGE_RMTFS_SIZE 0x400000ULL
+ /* board_fdt_blob_setup runs before BSS is available. */
+ static u8 dodge_fdt[DODGE_FDT_BYTES] __aligned(8) __section(".data") = { 1 };
+ 
+@@ -149,6 +151,34 @@ static void *dodge_import_fdt(const void *internal, const void *external)
+ 		    fdt_setprop(dodge_fdt, dst, "no-map", NULL, 0))
+ 			panic("Dodge: reservation flag import failed\n");
+ 	}
++	/*
++	 * Linux fixes RMTFS where ABL describes a size-only pool. Exclude it
++	 * before LMB/EFI allocation, not only during EFI DT fixup.
++	 */
++	dodge_add_range(reserved, &nres, DODGE_RMTFS_BASE, DODGE_RMTFS_SIZE);
++	dst = fdt_path_offset(dodge_fdt, "/reserved-memory");
++	node = fdt_subnode_offset(dodge_fdt, dst, "rmtfs@d7c00000");
++	if (node >= 0) {
++		reg = fdt_getprop(dodge_fdt, node, "reg", &len);
++		if (!reg || len != 16 ||
++		    get_unaligned_be64(&reg[0]) != DODGE_RMTFS_BASE ||
++		    get_unaligned_be64(&reg[1]) != DODGE_RMTFS_SIZE)
++			panic("Dodge: conflicting RMTFS reservation\n");
++	} else {
++		fdt64_t rmtfs_reg[] = {
++			cpu_to_fdt64(DODGE_RMTFS_BASE),
++			cpu_to_fdt64(DODGE_RMTFS_SIZE),
++		};
++
++		node = fdt_add_subnode(dodge_fdt, dst, "rmtfs@d7c00000");
++		if (node < 0 ||
++		    fdt_setprop(dodge_fdt, node, "reg", rmtfs_reg,
++				sizeof(rmtfs_reg)))
++			panic("Dodge: RMTFS reservation exceeds control FDT\n");
++	}
++	if (fdt_setprop(dodge_fdt, node, "no-map", NULL, 0))
++		panic("Dodge: RMTFS reservation flag failed\n");
++
+ 	for (i = 0; i < fdt_num_mem_rsv(external); i++) {
+ 		if (fdt_get_mem_rsv(external, i, &start, &size))
+ 			panic("Dodge: invalid FDT reservation\n");
+-- 
+2.56.0
+

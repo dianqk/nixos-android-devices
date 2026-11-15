@@ -1,0 +1,361 @@
+From: dianqk <dianqk@dianqk.net>
+Subject: [PATCH] t880: retire completed submissions without saving GOP prefixes
+
+All supported profiles complete pictures without a demand drain. Remove
+unused compressed-history storage and prefix resubmission. Retain bounded
+outstanding CLIENT/wire ledgers and retire entries only after both compressed
+return and picture completion, in either order. Unknown and duplicate tokens
+remain fatal.
+
+Explicit EOS still drains and restarts CAPTURE safely; require a new independent
+anchor before transferring ownership after EOS. Test delayed completion,
+completion ordering, duplicate retirement, bounded outstanding work and long
+completed streams without retained compressed history.
+
+--- a/src/t880-decoder.cpp
++++ b/src/t880-decoder.cpp
+@@ -14,7 +14,6 @@
+ constexpr unsigned OUT = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+ constexpr unsigned CAP = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+ constexpr size_t AU_LIMIT = 4u * 1024 * 1024;
+-constexpr size_t HISTORY_LIMIT = 64u * 1024 * 1024;
+ constexpr size_t COUNT_LIMIT = 4096;
+ int call(int fd, unsigned long request, void *arg) {
+     int r;
+@@ -46,10 +45,7 @@
+ T880Decoder::Plane::~Plane() { if (address) munmap(address, size); if (fd >= 0) close(fd); }
+ T880Decoder::T880Decoder(const std::string &device, unsigned width, unsigned height,
+                          VAProfile profile, unsigned rt_format, int render_fd)
+-    : render_fd_(render_fd), width_(width), height_(height),
+-      display_without_lookahead_(is_av1(profile) || is_vp9(profile) || is_hevc(profile) ||
+-                                 profile == VAProfileH264ConstrainedBaseline ||
+-                                 profile == VAProfileH264Main || profile == VAProfileH264High) {
++    : render_fd_(render_fd), width_(width), height_(height) {
+     check(rt_format == VA_RT_FORMAT_YUV420 && width >= 128 && height >= 128 && !(width & 1) &&
+           !(height & 1) && width <= 4096 && height <= 2176 &&
+           uint64_t(width) * height <= uint64_t(4096) * 2176,
+@@ -264,6 +260,7 @@
+         check(slot.queued && slot.wire == token(q.value.timestamp) && it != wire_.end() &&
+               !it->second.returned, "T880 unknown/duplicate OUTPUT token");
+         it->second.returned = true; slot.queued = false;
++        if (it->second.displayed) wire_.erase(it);
+     }
+     if (!capture_on_ || last_) return;
+     for (;;) {
+@@ -288,29 +285,16 @@
+             check(it != wire_.end() && !it->second.displayed,
+                   "T880 unknown/duplicate DISPLAY token");
+             auto &job = it->second;
+-            if (!job.replay) {
+-                auto target = pending_.find(job.client);
+-                check(target != pending_.end() && target->second->pending &&
+-                      target->second->token == job.client, "T880 missing CLIENT surface");
+-                copy(q.value.index, q.value, q.planes, target->second);
+-                target->second->status = VA_STATUS_SUCCESS;
+-                target->second->pending = false; pending_.erase(target);
+-            } else {
+-                // Replay duplicates never replace stable outputs, but malformed
+-                // scratch payloads are still errors, including byte bounds.
+-                for (unsigned plane = 0; plane < 2; ++plane) {
+-                    size_t rows = plane ? storage_height_ / 2 : storage_height_;
+-                    size_t end = size_t(q.planes[plane].data_offset) +
+-                                 rows * stride_[plane];
+-                    check(q.planes[plane].data_offset == slot.planes[plane].offset &&
+-                          end <= q.planes[plane].bytesused &&
+-                          q.planes[plane].bytesused <= slot.planes[plane].size,
+-                          "T880 replay payload bounds");
+-                }
+-            }
++            auto target = pending_.find(job.client);
++            check(target != pending_.end() && target->second->pending &&
++                  target->second->token == job.client, "T880 missing CLIENT surface");
++            copy(q.value.index, q.value, q.planes, target->second);
++            target->second->status = VA_STATUS_SUCCESS;
++            target->second->pending = false; pending_.erase(target);
+             job.displayed = true;
+-            trace("T880 display wire=%llu client=%llu replay=%d",
+-                  (unsigned long long)id, (unsigned long long)job.client, job.replay);
++            trace("T880 display wire=%llu client=%llu",
++                  (unsigned long long)id, (unsigned long long)job.client);
++            if (job.returned) wire_.erase(it);
+         }
+         if (q.value.flags & V4L2_BUF_FLAG_LAST) { last_ = true; break; }
+         check(payload, "T880 empty non-LAST CAPTURE");
+@@ -331,12 +315,11 @@
+     checked(fd_, VIDIOC_DECODER_CMD, &cmd, "T880 STOP");
+     while (!last_) pump(10);
+     wait_inputs();
+-    for (const auto &[id, job] : wire_)
+-        check(job.returned && job.displayed, "T880 missing completion at LAST");
++    check(wire_.empty(), "T880 missing completion at LAST");
+     check(pending_.empty(), "T880 pending CLIENT at LAST");
+     drained_ = true;
+ }
+-void T880Decoder::send(const History &picture, bool replay) {
++void T880Decoder::send(uint64_t client, const std::vector<uint8_t> &bytes) {
+     unsigned index;
+     for (;;) {
+         pump(0);
+@@ -345,36 +328,32 @@
+         pump(10);
+     }
+     auto &slot = output_[index];
+-    check(picture.bytes.size() <= slot.planes[0].size, "T880 negotiated OUTPUT limit");
++    check(bytes.size() <= slot.planes[0].size, "T880 negotiated OUTPUT limit");
+     check(next_wire_ < uint64_t(INT64_MAX),
+           "T880 wire token exhausted");
+     uint64_t id = next_wire_++;
+     // Allocate ledger nodes before transferring queue ownership.
+-    wire_.emplace(id, Submission{picture.client, replay, false, false});
+-    memcpy(slot.planes[0].address, picture.bytes.data(), picture.bytes.size());
++    wire_.emplace(id, Submission{client, false, false});
++    memcpy(slot.planes[0].address, bytes.data(), bytes.size());
+     T880Buffer q(OUT, index); q.value.length = 1;
+-    q.planes[0].length = slot.planes[0].size; q.planes[0].bytesused = picture.bytes.size();
++    q.planes[0].length = slot.planes[0].size; q.planes[0].bytesused = bytes.size();
+     q.value.timestamp.tv_sec = id / 1000000; q.value.timestamp.tv_usec = id % 1000000;
+     checked(fd_, VIDIOC_QBUF, &q.value, "T880 QBUF OUTPUT");
+     slot.wire = id; slot.queued = true;
+-    trace("T880 submit wire=%llu client=%llu replay=%d bytes=%zu",
+-          (unsigned long long)id, (unsigned long long)picture.client, replay, picture.bytes.size());
++    trace("T880 submit wire=%llu client=%llu bytes=%zu",
++          (unsigned long long)id, (unsigned long long)client, bytes.size());
+     while (!capture_on_) pump(10);
+ }
+-void T880Decoder::rebuild() {
+-    check(drained_ && last_ && pending_.empty(), "T880 unsafe replay reset");
++void T880Decoder::restart() {
++    check(drained_ && last_ && pending_.empty() && wire_.empty(), "T880 unsafe EOS restart");
+     unsigned type = CAP;
+     checked(fd_, VIDIOC_STREAMOFF, &type, "T880 powered CAPTURE reset");
+     capture_on_ = false;
+     for (auto &s : capture_) s.queued = false;
+-    wire_.clear(); last_ = false;
++    last_ = false;
+     for (unsigned i = 0; i < capture_.size(); ++i) queue_capture(i);
+     checked(fd_, VIDIOC_STREAMON, &type, "T880 powered CAPTURE resume");
+     capture_on_ = true; drained_ = false;
+-    for (const auto &picture : history_) send(picture, true);
+-    // Return all compressed ownership before accepting a new CLIENT AU. The
+-    // replay tail remains in the DPB and may display only with later input.
+-    wait_inputs();
+ }
+ void T880Decoder::submit(const std::vector<uint8_t> &bytes,
+                           const std::shared_ptr<Surface> &s,
+@@ -387,42 +366,26 @@
+     const auto &accepted = anchor.empty() ? bytes : anchor;
+     check(!accepted.empty() && accepted.size() <= AU_LIMIT, "T880 AU size limit",
+           VA_STATUS_ERROR_INVALID_BUFFER);
+-    check(!history_.empty() || !anchor.empty(), "T880 first picture must be an independent key anchor",
++    check((started_ && !drained_) || !anchor.empty(), "T880 initial or drained picture requires an independent anchor",
+           VA_STATUS_ERROR_INVALID_PARAMETER);
+     check(next_client_ != std::numeric_limits<uint64_t>::max(), "T880 CLIENT token exhausted");
+-    check(!anchor.empty() || (history_.size() < COUNT_LIMIT &&
+-          accepted.size() <= HISTORY_LIMIT - history_bytes_), "T880 contiguous history limit",
+-          VA_STATUS_ERROR_ALLOCATION_FAILED);
+-    History picture{next_client_, accepted};
++    check(wire_.size() < COUNT_LIMIT && pending_.size() < COUNT_LIMIT,
++          "T880 outstanding picture limit", VA_STATUS_ERROR_ALLOCATION_FAILED);
+     auto memory = s->memory ? s->memory : allocate_t880_presentation_surface(render_fd_, s->width, s->height,
+                                                           VA_FOURCC_NV12);
+-    history_.reserve(history_.size() + 1);
+     try {
+         pump(0);
+-        if (!anchor.empty() && !history_.empty()) {
+-            // AV1 and VP9 complete every old CLIENT without future input. Keep
+-            // the active CAPTURE/DPB pool across independent keys; firmware
+-            // retires its own references while decoding the new key AU.
+-            if (display_without_lookahead_ && !drained_) {
+-                wait_inputs();
+-                while (!pending_.empty()) pump(10);
+-                for (const auto &[id, job] : wire_)
+-                    check(job.returned && job.displayed,
+-                          "T880 incomplete old-anchor wire ownership");
+-                wire_.clear();
+-            } else {
+-                // Other codecs retain demand-drain, and an already drained
+-                // stream still needs the normal CAPTURE restart below.
+-                drain();
+-            }
+-            history_.clear(); history_bytes_ = 0;
+-        }
+-        if (drained_) rebuild();
++        if (!anchor.empty() && started_ && !drained_) {
++            wait_inputs();
++            while (!pending_.empty()) pump(10);
++            check(wire_.empty(), "T880 incomplete old-anchor ownership");
++        }
++        if (drained_) restart();
+         s->memory = std::move(memory);
+-        pending_.emplace(picture.client, s);
+-        s->token = picture.client; s->status = VA_STATUS_SUCCESS; s->pending = true;
+-        send(picture, false);
+-        history_bytes_ += picture.bytes.size(); history_.push_back(std::move(picture));
++        pending_.emplace(next_client_, s);
++        s->token = next_client_; s->status = VA_STATUS_SUCCESS; s->pending = true;
++        send(next_client_, accepted);
++        started_ = true;
+         ++next_client_;
+     } catch (const Error &e) { fail(e.status); throw; }
+       catch (...) { fail(VA_STATUS_ERROR_ALLOCATION_FAILED); throw; }
+@@ -436,12 +399,10 @@
+         if (s->pending) {
+             wait_inputs(); pump(0);
+             // DISPLAY arrives asynchronously after compressed ownership
+-            // returns. Wait for that completion; STOP would flush the DPB and
+-            // force prefix replay on the next picture. The operation deadline
++            // returns. Wait for that completion; STOP would destroy live DPB
++            // references needed by later pictures. The operation deadline
+             // stays fixed even if unrelated outputs arrive while pumping.
+-            if (display_without_lookahead_) {
+-                while (s->pending) pump(10);
+-            } else if (s->pending) drain();
++            while (s->pending) pump(10);
+         }
+         check(!s->pending && s->status == VA_STATUS_SUCCESS, "T880 sync failed");
+     } catch (const Error &e) { fail(e.status); throw; }
+@@ -451,7 +412,7 @@
+     std::lock_guard<std::mutex> lock(mutex_);
+     if (failure_ != VA_STATUS_SUCCESS) return;
+     deadline_ = Clock::now() + std::chrono::seconds(30);
+-    try { if (!history_.empty()) drain(); }
++    try { if (started_ && !drained_) drain(); }
+     catch (const Error &e) { fail(e.status); throw; }
+     catch (...) { fail(VA_STATUS_ERROR_ALLOCATION_FAILED); throw; }
+ }
+--- a/src/t880-decoder.hpp
++++ b/src/t880-decoder.hpp
+@@ -26,13 +26,8 @@
+         bool queued = false;
+         uint64_t wire = 0;
+     };
+-    struct History {
+-        uint64_t client;
+-        std::vector<uint8_t> bytes;
+-    };
+     struct Submission {
+         uint64_t client;
+-        bool replay;
+         bool displayed = false;
+         bool returned = false;
+     };
+@@ -46,13 +41,11 @@
+     unsigned width_, height_, stride_[2]{}, storage_height_ = 0;
+     size_t tiled_size_[2]{};
+     std::mutex mutex_;
+-    bool display_without_lookahead_;
++    bool started_ = false;
+     bool output_on_ = false, capture_on_ = false, drained_ = false, last_ = false;
+     VAStatus failure_ = VA_STATUS_SUCCESS;
+     uint64_t next_client_ = 1, next_wire_ = 1;
+-    size_t history_bytes_ = 0;
+     std::vector<Slot> output_, capture_;
+-    std::vector<History> history_;
+     std::map<uint64_t, Submission> wire_;
+     std::map<uint64_t, std::shared_ptr<Surface>> pending_;
+     Clock::time_point deadline_;
+@@ -62,8 +55,8 @@
+     void pump(int timeout);
+     void wait_inputs();
+     void drain();
+-    void rebuild();
+-    void send(const History &picture, bool replay);
++    void restart();
++    void send(uint64_t client, const std::vector<uint8_t> &bytes);
+     void copy(unsigned index, const v4l2_buffer &buffer, const v4l2_plane *planes,
+               const std::shared_ptr<Surface> &surface);
+     void check_deadline();
+@@ -73,7 +66,8 @@
+                 VAProfile profile, unsigned rt_format, int render_fd);
+     ~T880Decoder();
+     // anchor contains complete codec parameters and an independent key AU.
+-    // Empty anchor means this AU depends on the current contiguous history.
++    // Empty anchor means this AU depends on the active decoder state.
++    // Initial submission and submission after explicit EOS require an anchor.
+     void submit(const std::vector<uint8_t> &bytes, const std::shared_ptr<Surface> &surface,
+                 const std::vector<uint8_t> &anchor);
+     void sync(const std::shared_ptr<Surface> &surface);
+--- a/tests/t880/replay.cpp
++++ b/tests/t880/replay.cpp
+@@ -25,6 +25,7 @@
+ namespace {
+ struct Fake {
+     bool event = false, configured = false, last = false;
++    bool hold_output = false;
+     bool duplicate = false, wrong_output = false, bad_alloc = false, bad_payload = false;
+     unsigned resets = 0, stops = 0, accepted = 0, display_after_polls = 0, polls = 0;
+     bool expire = false, gpu_fail = false, selected_direct = false, no_generated = false, wrong_offset = false;
+@@ -134,7 +135,7 @@
+     if (request == VIDIOC_DQBUF) {
+         auto &q = *static_cast<v4l2_buffer *>(arg);
+         if (q.type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
+-            if (f.output.empty()) { errno = EAGAIN; return -1; }
++            if (f.hold_output || f.output.empty()) { errno = EAGAIN; return -1; }
+             auto [index, ts] = f.output.front(); f.output.pop_front();
+             q.index = index; q.timestamp = ts; q.length = 1;
+             if (f.wrong_output) ++q.timestamp.tv_usec;
+@@ -145,6 +146,7 @@
+         if (f.display.empty()) { q.flags = V4L2_BUF_FLAG_LAST; f.last = false; }
+         else {
+             q.timestamp = f.display.front(); f.display.pop_front();
++            f.hold_output = false;
+             for (unsigned p = 0; p < 2; ++p) {
+                 q.m.planes[p].data_offset = p ? 20480 : 0;
+                 q.m.planes[p].bytesused = p ? 30720 : 20480;
+@@ -247,13 +249,15 @@
+     }
+     f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
+     {
+-        T880Decoder d("fake", 160, 128, VAProfileH264Main, VA_RT_FORMAT_YUV420, -1);
+-        std::vector<uint8_t> megabyte(1024 * 1024, 1);
+-        d.submit(megabyte, surface(), megabyte);
+-        for (unsigned i = 1; i < 64; ++i) d.submit(megabyte, surface(), {});
+-        unsigned accepted = f.accepted;
+-        rejects([&] { d.submit({1}, surface(), {}); });
+-        assert(f.accepted == accepted && f.resets == 0);
++        T880Decoder d("fake",160,128,VAProfileH264Main,VA_RT_FORMAT_YUV420,-1);
++        std::vector<uint8_t> megabyte(1024*1024,1);
++        for(unsigned i=0;i<80;i++) {
++            auto s=surface();d.submit(megabyte,s,i?std::vector<uint8_t>{}:megabyte);
++            f.display_after_polls=f.polls+1;d.sync(s);
++            assert(!s->pending);
++        }
++        assert(f.accepted==80 && f.stops==0 && f.resets==0);
++        d.finish();
+     }
+     f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
+     {
+@@ -294,7 +298,10 @@
+         assert((f.submitted == std::vector<uint64_t>{1,2,3}));
+         d.finish(); assert(f.stops == 1);
+         // An explicit drain is not an active stream, even for a fresh key.
+-        auto e = surface(); d.submit({4}, e, {4});
++        unsigned completed=f.accepted; auto e = surface();
++        rejects([&]{d.submit({4},e,{});});
++        assert(f.accepted==completed && !e->pending && f.resets==0);
++        d.submit({4}, e, {4});
+         assert(f.resets == 1); f.display_after_polls = f.polls + 2; d.sync(e);
+         assert(e->memory->map()[0] == 4 && f.submitted.back() == 4);
+     }
+@@ -345,6 +352,19 @@
+         assert(!a->pending && a->status != VA_STATUS_SUCCESS);
+     }
+     }
++    for(bool display_first:{false,true}) {
++        f=Fake{};t880_test::Clock::offset=std::chrono::seconds(0);
++        T880Decoder d("fake",160,128,VAProfileH264Main,VA_RT_FORMAT_YUV420,-1);
++        auto s=surface();f.hold_output=display_first;
++        d.submit({1},s,{1});f.display_after_polls=f.polls+1;d.sync(s);
++        assert(!s->pending);
++        if(display_first) assert(!f.output.empty());
++        d.refresh(); assert(f.output.empty());
++        // Both completion halves are retired; a duplicate must still fail closed.
++        f.display.push_back(timeval{0,1});
++        rejects([&]{d.refresh();});
++        assert(s->status==VA_STATUS_SUCCESS && !s->pending);
++    }
+     rejects([] { token(timeval{std::numeric_limits<long>::max(), 999999}); });
+-    std::cout << "T880 replay ownership, stable pixels, fresh anchor, limits and sticky faults passed\n";
+-}
++    std::cout << "T880 completion ownership, stable pixels, fresh anchor, limits and sticky faults passed\n";
++}

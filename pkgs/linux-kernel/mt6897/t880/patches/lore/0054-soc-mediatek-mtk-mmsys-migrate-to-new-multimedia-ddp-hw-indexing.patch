@@ -1,0 +1,245 @@
+From 4ca84cd2816c160443b595ce515f5480371a26ca Mon Sep 17 00:00:00 2001
+From: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Date: Tue, 14 Jul 2026 13:43:50 +0200
+Subject: [PATCH] soc: mediatek: mtk-mmsys: Migrate to new Multimedia DDP HW
+ indexing
+
+The mediatek-drm driver is ready to switch to the new Multimedia
+Subsystem Display Controller HW indexing.
+
+Perform the switch by:
+ - Adding new "from_comp_inst" and "to_comp_inst" members in the
+   Multimedia Subsystem HW Routes structure (mtk_mmsys_routes);
+ - Changing the MMSYS_ROUTE() macro to use those, which performs
+   the migration of all SoCs in one go (as all of them use this
+   macro to declare their route entries);
+ - Adding new mtk_mmsys_hw_connect() and mtk_mmsys_hw_disconnect()
+   functions, making use of the new HW Component Type-Instance
+   indexing.
+
+Unfortunately, this change needs to go along with the related one
+in the mediatek-drm driver, otherwise functionality of the Display
+Controller will regress.
+
+The only way to make this possible in two steps is to duplicate
+all of the routes structure arrays for all of the SoCs, which
+would result in a total of around ~1200 lines changed twice, and
+that ignores the big increase in size for this driver during the
+migration process so, in order to avoid useless bloat, I opted
+for an inter-dependency between the two changes: mediatek-drm
+and mtk-mmsys.
+
+Acked-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Signed-off-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Link: https://patchwork.kernel.org/project/linux-mediatek/list/?series=1127365
+[dianqk: from the Huge Restructuring v2 series, applied to v7.3-rc6; rc6 drift resolved]
+---
+ drivers/soc/mediatek/mtk-mmsys.c       | 99 ++++++++++++++++++++------
+ drivers/soc/mediatek/mtk-mmsys.h       | 15 ++--
+ include/linux/soc/mediatek/mtk-mmsys.h | 16 ++---
+ 3 files changed, 90 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/soc/mediatek/mtk-mmsys.c b/drivers/soc/mediatek/mtk-mmsys.c
+index 2f3e0778bb..f501a29a76 100644
+--- a/drivers/soc/mediatek/mtk-mmsys.c
++++ b/drivers/soc/mediatek/mtk-mmsys.c
+@@ -1,7 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /*
+  * Copyright (c) 2014 MediaTek Inc.
+- * Author: James Liao <jamesjj.liao@mediatek.com>
++ *                    James Liao <jamesjj.liao@mediatek.com>
++ *
++ * Copyrignt (c) 2026 Collabora Ltd.
++ *                    AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+  */
+ 
+ #include <linux/delay.h>
+@@ -182,38 +185,90 @@ static void mtk_mmsys_update_bits(struct mtk_mmsys *mmsys, u32 offset, u32 mask,
+ 	writel_relaxed(tmp, mmsys->regs + offset);
+ }
+ 
+-void mtk_mmsys_ddp_connect(struct device *dev,
+-			   enum mtk_ddp_comp_id cur,
+-			   enum mtk_ddp_comp_id next)
++/**
++ * mtk_mmsys_hw_connect - Connect MultiMedia Subsystem (MMSYS) Hardware IPs
++ * @dev:            Device pointer
++ * @src_type:       Type of the Source IP
++ * @src_hw_inst_id: Hardware instance of the Source IP
++ * @dst_type:       Type of the Destination IP
++ * @dst_hw_inst_id: Hardware instance of the Destination IP
++ *
++ * This function connects one MultiMedia Subsystem (MMSYS) related hardware
++ * to another (in the same subsystem), depending on supported connections.
++ * In short, this connects "Source" to "Destination", as in, enables sending
++ * data from a Source IP to a Destination IP.
++ *
++ * As a final note - depending on the SoC and on the specific IPs, it may
++ * also be possible to connect multiple Sources to a single Destination.
++ *
++ * Examples below follow this format to explain hardware components:
++ *      [Source Type][Instance ID] -> [Destination Type] [Instance ID]
++ *
++ * Example 1 - Single Source to Destination
++ *                         GAMMA 0 -> DITHER 0
++ *
++ * Example 2 - Multiple Sources to Single Destination
++ *                 MDP_RDMA 0 -----\
++ *                                  |
++ *                                  v
++ *                 MDP_RDMA 1 ---> MERGE 1 \
++ *                 MDP_RDMA 2 ---> MERGE 2 -\
++ *                                           >> ETHDR_MIXER 0
++ *                 (other 1)  ---> MERGE 3 -/
++ *                 (other 2)  ---> MERGE 4 /
++ *
++ * Note that in Example 2, some components are not chained together, but
++ * connected in parallel to a destination.
++ */
++void mtk_mmsys_hw_connect(struct device *dev,
++			  enum mtk_ddp_comp_type src_type, u8 src_hw_inst_id,
++			  enum mtk_ddp_comp_type dst_type, u8 dst_hw_inst_id)
+ {
+ 	struct mtk_mmsys *mmsys = dev_get_drvdata(dev);
+ 	const struct mtk_mmsys_routes *routes = mmsys->data->routes;
+-	int i;
+ 
+-	for (i = 0; i < mmsys->data->num_routes; i++)
+-		if (cur == routes[i].from_comp && next == routes[i].to_comp)
+-			mtk_mmsys_update_bits(mmsys, routes[i].addr, routes[i].mask,
+-					      routes[i].val, NULL);
++	for (int i = 0; i < mmsys->data->num_routes; i++) {
++		if (src_type != routes[i].from_comp_type ||
++		    src_hw_inst_id != routes[i].from_comp_inst ||
++		    dst_type != routes[i].to_comp_type ||
++		    dst_hw_inst_id != routes[i].to_comp_inst)
++			continue;
+ 
+-	if (mmsys->data->vsync_len)
+-		mtk_mmsys_update_bits(mmsys, MT8188_VDO1_MIXER_VSYNC_LEN, GENMASK(31, 0),
+-				      mmsys->data->vsync_len, NULL);
++		mtk_mmsys_update_bits(mmsys, routes[i].addr, routes[i].mask, routes[i].val, NULL);
++		dev_dbg(dev, "Connected %u-%u to %u-%u\n",
++			src_type, src_hw_inst_id, dst_type, dst_hw_inst_id);
++	}
+ }
+-EXPORT_SYMBOL_GPL(mtk_mmsys_ddp_connect);
+-
+-void mtk_mmsys_ddp_disconnect(struct device *dev,
+-			      enum mtk_ddp_comp_id cur,
+-			      enum mtk_ddp_comp_id next)
++EXPORT_SYMBOL_NS_GPL(mtk_mmsys_hw_connect, "MTK_MMSYS");
++
++/**
++ * mtk_mmsys_hw_disconnect - Disconnect MultiMedia Subsystem (MMSYS) Hardware IPs
++ * @dev:            Device pointer
++ * @src_type:       Type of the Source IP
++ * @src_hw_inst_id: Hardware instance of the Source IP
++ * @dst_type:       Type of the Destination IP
++ * @dst_hw_inst_id: Hardware instance of the Destination IP
++ */
++void mtk_mmsys_hw_disconnect(struct device *dev,
++			     enum mtk_ddp_comp_type src_type, u8 src_hw_inst_id,
++			     enum mtk_ddp_comp_type dst_type, u8 dst_hw_inst_id)
+ {
+ 	struct mtk_mmsys *mmsys = dev_get_drvdata(dev);
+ 	const struct mtk_mmsys_routes *routes = mmsys->data->routes;
+-	int i;
+ 
+-	for (i = 0; i < mmsys->data->num_routes; i++)
+-		if (cur == routes[i].from_comp && next == routes[i].to_comp)
+-			mtk_mmsys_update_bits(mmsys, routes[i].addr, routes[i].mask, 0, NULL);
++	for (int i = 0; i < mmsys->data->num_routes; i++) {
++		if (src_type != routes[i].from_comp_type ||
++		    src_hw_inst_id != routes[i].from_comp_inst ||
++		    dst_type != routes[i].to_comp_type ||
++		    dst_hw_inst_id != routes[i].to_comp_inst)
++			continue;
++
++		mtk_mmsys_update_bits(mmsys, routes[i].addr, routes[i].mask, 0, NULL);
++		dev_dbg(dev, "Disconnected %u-%u from %u-%u\n",
++			src_type, src_hw_inst_id, dst_type, dst_hw_inst_id);
++	}
+ }
+-EXPORT_SYMBOL_GPL(mtk_mmsys_ddp_disconnect);
++EXPORT_SYMBOL_NS_GPL(mtk_mmsys_hw_disconnect, "MTK_MMSYS");
+ 
+ void mtk_mmsys_merge_async_config(struct device *dev, int idx, int width, int height,
+ 				  struct cmdq_pkt *cmdq_pkt)
+diff --git a/drivers/soc/mediatek/mtk-mmsys.h b/drivers/soc/mediatek/mtk-mmsys.h
+index c51a5e334e..5c9319f3a2 100644
+--- a/drivers/soc/mediatek/mtk-mmsys.h
++++ b/drivers/soc/mediatek/mtk-mmsys.h
+@@ -80,20 +80,13 @@
+ 
+ #define MMSYS_RST_NR(bank, bit) (((bank) * 32) + (bit))
+ 
+-/* Temporary compatibility definitions */
+-#define DDP_COMPONENT_BLS0		DDP_COMPONENT_BLS
+-#define DDP_COMPONENT_CCORR0		DDP_COMPONENT_CCORR
+-#define DDP_COMPONENT_UFOE0		DDP_COMPONENT_UFOE
+-#define DDP_COMPONENT_GAMMA0		DDP_COMPONENT_GAMMA
+-#define DDP_COMPONENT_ETHDR_MIXER0	DDP_COMPONENT_ETHDR_MIXER
+-
+ /*
+  * This macro adds a compile time check to make sure that the in/out
+  * selection bit(s) fit in the register mask, similar to bitfield
+  * macros, but this does not transform the value.
+  */
+ #define MMSYS_ROUTE(from, fsid, to, tsid, reg_addr, reg_mask, selection)	\
+-	{ DDP_COMPONENT_##from##fsid, DDP_COMPONENT_##to##tsid, reg_addr, reg_mask,	\
++	{ MTK_DISP_##from, fsid, MTK_DISP_##to, tsid, reg_addr, reg_mask,	\
+ 	  (__BUILD_BUG_ON_ZERO_MSG((reg_mask) == 0, "Invalid mask") +		\
+ 	   __BUILD_BUG_ON_ZERO_MSG(~(reg_mask) & (selection),			\
+ 				   #selection " does not fit in "		\
+@@ -102,8 +95,10 @@
+ 	}
+ 
+ struct mtk_mmsys_routes {
+-	u32 from_comp;
+-	u32 to_comp;
++	u8 from_comp_type;
++	u8 from_comp_inst;
++	u8 to_comp_type;
++	u8 to_comp_inst;
+ 	u32 addr;
+ 	u32 mask;
+ 	u32 val;
+diff --git a/include/linux/soc/mediatek/mtk-mmsys.h b/include/linux/soc/mediatek/mtk-mmsys.h
+index bbdd0b0192..f67f21d041 100644
+--- a/include/linux/soc/mediatek/mtk-mmsys.h
++++ b/include/linux/soc/mediatek/mtk-mmsys.h
+@@ -118,14 +118,6 @@ enum mtk_ddp_comp_type {
+ 	MTK_DDP_COMP_TYPE_MAX
+ };
+ 
+-void mtk_mmsys_ddp_connect(struct device *dev,
+-			   enum mtk_ddp_comp_id cur,
+-			   enum mtk_ddp_comp_id next);
+-
+-void mtk_mmsys_ddp_disconnect(struct device *dev,
+-			      enum mtk_ddp_comp_id cur,
+-			      enum mtk_ddp_comp_id next);
+-
+ void mtk_mmsys_ddp_dpi_fmt_config(struct device *dev, u32 val);
+ 
+ void mtk_mmsys_merge_async_config(struct device *dev, int idx, int width,
+@@ -134,6 +126,14 @@ void mtk_mmsys_merge_async_config(struct device *dev, int idx, int width,
+ void mtk_mmsys_hdr_config(struct device *dev, int be_width, int be_height,
+ 			  struct cmdq_pkt *cmdq_pkt);
+ 
++void mtk_mmsys_hw_connect(struct device *dev,
++			  enum mtk_ddp_comp_type src_type, u8 src_hw_inst_id,
++			  enum mtk_ddp_comp_type dst_type, u8 dst_hw_inst_id);
++
++void mtk_mmsys_hw_disconnect(struct device *dev,
++			     enum mtk_ddp_comp_type src_type, u8 src_hw_inst_id,
++			     enum mtk_ddp_comp_type dst_type, u8 dst_hw_inst_id);
++
+ void mtk_mmsys_mixer_in_config(struct device *dev, int idx, bool alpha_sel, u16 alpha,
+ 			       u8 mode, u32 biwidth, struct cmdq_pkt *cmdq_pkt);
+ 
+-- 
+2.56.0
+

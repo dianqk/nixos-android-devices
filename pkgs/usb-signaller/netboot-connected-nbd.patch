@@ -1,0 +1,20 @@
+Local netboot detection fix for usb-signaller v0.4.2.
+Upstream: https://codeberg.org/DylanVanAssche/usb-signaller/src/tag/v0.4.2
+
+A kernel with built-in NBD creates idle /dev/nbd0..15 at boot, so the
+existence of /dev/nbd0 made every boot look like netboot: the service
+refused to change the read-only mode and exited, and systemd restarted it
+forever. Treat netboot as active only while nbd0 is connected; the kernel
+creates /sys/block/nbd0/pid only then.
+
+--- a/src/udc.rs
++++ b/src/udc.rs
+@@ -67,6 +67,6 @@
+ impl UDC {
+     fn detect_netboot_mode() -> bool {
+-        /* Netboot hook creates /dev/nbd0 and starts a NBD client */
+-        return PathBuf::from("/dev/nbd0").exists();
++        /* Netboot hook connects /dev/nbd0 through an NBD client */
++        return PathBuf::from("/sys/block/nbd0/pid").exists();
+     }
+ 

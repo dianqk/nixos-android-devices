@@ -100,6 +100,37 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
           }
         ];
       }).config;
+    # Wakeup policy: board-declared sources, consumer-selected keep list.
+    wakeupSources = {
+      androidDevices.power.wakeup.sources = {
+        key.devices = [ "/devices/platform/test-keys" ];
+        supply.devices = [ "/devices/platform/test-glink/*" ];
+      };
+    };
+    wakeup =
+      (system.extendModules {
+        modules = [
+          wakeupSources
+          {
+            androidDevices.power.wakeup = {
+              enable = true;
+              keep = [ "supply" ];
+            };
+          }
+        ];
+      }).config;
+    wakeupUnknown =
+      (system.extendModules {
+        modules = [
+          wakeupSources
+          {
+            androidDevices.power.wakeup = {
+              enable = true;
+              keep = [ "missing" ];
+            };
+          }
+        ];
+      }).config;
     missingFirmware =
       (system.extendModules {
         modules = [ { androidDevices.boot.firmwarePackage = lib.mkForce null; } ];
@@ -115,6 +146,15 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
     recovery
   ];
   assert !(lib.all (a: a.assertion) missingFirmware.assertions);
+  assert lib.all (a: a.assertion) wakeup.assertions;
+  assert !(lib.all (a: a.assertion) wakeupUnknown.assertions);
+  assert !(standard.systemd.services ? android-devices-wakeup-policy);
+  assert !(recovery.systemd.services ? android-devices-wakeup-policy);
+  assert
+    wakeup.systemd.services.android-devices-wakeup-policy.wantedBy == [
+      "multi-user.target"
+      "sleep.target"
+    ];
   assert !(system.options.androidDevices ? unregistered-board);
   assert standard.networking.hostName == "independent-host";
   assert standard.androidDevices.platformKernelParams == [ ];

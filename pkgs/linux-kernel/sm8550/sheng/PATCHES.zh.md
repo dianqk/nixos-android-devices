@@ -2,14 +2,14 @@
 
 [English](PATCHES.md) · [Sheng 指南](../../../../docs/sheng/README.zh.md)
 
-补丁集以 Linux 7.3-rc6 为目标；下文硬件结果基于此前的 7.3 内核取得。
+补丁集以 Linux 7.3 为目标；下文硬件结果基于此前的 7.3 内核取得。
 见[共享内核说明](../../README.zh.md)。
 
 `devices.sheng.kernel` 按顺序应用[补丁集](series.nix)；安装系统与 RAM recovery
 使用同一个内核包。
 该包使用 `config.aarch64`，构建 `sm8550-xiaomi-sheng.dtb`。
 
-每个补丁标明来源提交及本地 7.3 适配；[ORIGINS.md](patches/ORIGINS.md)
+每个补丁标明来源提交及本地 7.3 适配；补丁头
 保留原作者、日期、完整提交说明和 trailer。显示及 WCN7850 Wi-Fi 在安装系统中可用，其余外设限制见[硬件参考](../../../../docs/sheng/hardware.zh.md)。
 
 [Lucid OLE 补丁](patches/upstream/0001-lucid-ole-preserve-enabled-pll.patch)
@@ -18,7 +18,7 @@ SM8550 使用同一 PLL 配置路径；关闭继承的时钟可能导致显示�
 补丁原样保留作者及上游来源链接，不改变面板、DSI PLL 频率计算、DTB 或内核配置。
 没有该补丁时，显示启动黑屏并出现 MDP RCG 更新超时。见[硬件状态](../../../../docs/sheng/hardware.zh.md)。
 
-7.3-rc6 补丁集同样包含 Lucid OLE 保护及上游
+7.3 补丁集同样包含 Lucid OLE 保护及上游
 [Qualcomm PCIe IOMMU 字段解析修复](../../patches/pcie-qcom-iommu-cells.patch)。
 后者让 BDF-to-SID 表按提供方声明的字段数读取映射，避免以四字段步长错误解析
 SM8550 正确的五字段映射。原补丁、作者、日期及 trailer 保持不变，仅补充来源 Link。

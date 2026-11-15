@@ -1,0 +1,1053 @@
+From 7decc1312bce9d202ddf74589ad41f7f112797ce Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Thu, 12 Nov 2026 22:51:06 +0800
+Subject: [PATCH 140/144] power: supply: qcom_battmgr: expose Dodge wireless
+ diagnostics and limits
+
+Keep the read-only gate/suspend diagnostics, snapshots, pause checks and wireless input limit handling together.
+
+Consolidated from local follow-ups:
+  948aaec0ce97ba3e783ccb6b38f45d0ac6723c69 power: supply: qcom_battmgr: add read-only Dodge normal gate diagnostic
+  fa5884f3a2e628234fe4e83d00195ee234bbbf95 power: supply: nu1669: provide fresh generation-checked snapshots
+  bc48b3da6f7e8cba2c1e6655f83211d039224d39 power: supply: qcom_battmgr: add owned normal-path charging pauses
+  8a957893dc10094af024ae3e9197b1ee2880912b arm64: dts: qcom: link Dodge battery management to its receiver
+  fb84f6caedcd3a73f343a0881868209753095c45 power: supply: qcom_battmgr: avoid the task macro in pause checks
+  5bea5b76f5dfc36357d73f17b576e47bc357e3bc power: supply: qcom_battmgr: diagnose normal input suspend read-only
+  ab62c1a16bd2327a37a8137ef9c3a6b7082d670f power: supply: qcom_battmgr: read wireless input current limit
+---
+ MAINTAINERS                                   |   1 +
+ .../boot/dts/qcom/sm8750-oneplus-dodge.dts    |   1 +
+ drivers/power/supply/nu1669.c                 |  87 ++-
+ drivers/power/supply/qcom_battmgr.c           | 616 ++++++++++++++++++
+ include/linux/power/nu1669.h                  |  34 +
+ 5 files changed, 728 insertions(+), 11 deletions(-)
+ create mode 100644 include/linux/power/nu1669.h
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index fa91325893..f35c67d38f 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -8361,6 +8361,7 @@ S:	Maintained
+ F:	Documentation/ABI/testing/sysfs-bus-i2c-nu1669
+ F:	Documentation/devicetree/bindings/power/supply/nuvolta,nu1669.yaml
+ F:	drivers/power/supply/nu1669.c
++F:	include/linux/power/nu1669.h
+ 
+ DRM DRIVER FOR NVIDIA GEFORCE/QUADRO GPUS
+ M:	Lyude Paul <lyude@redhat.com>
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+index 0b4a3aa7a1..680934dde3 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
++++ b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+@@ -132,6 +132,7 @@ pmic-glink {
+ 		#address-cells = <1>;
+ 		#size-cells = <0>;
+ 		orientation-gpios = <&tlmm 61 GPIO_ACTIVE_HIGH>;
++		qcom,wireless-receiver = <&wireless_receiver>;
+ 
+ 		connector@0 {
+ 			compatible = "usb-c-connector";
+diff --git a/drivers/power/supply/nu1669.c b/drivers/power/supply/nu1669.c
+index ea0654a760..0a4331eeed 100644
+--- a/drivers/power/supply/nu1669.c
++++ b/drivers/power/supply/nu1669.c
+@@ -8,12 +8,14 @@
+  * acknowledges events, changes protection settings or enables power transfer.
+  */
+ 
++#include <linux/atomic.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/i2c.h>
+ #include <linux/interrupt.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/power_supply.h>
++#include <linux/power/nu1669.h>
+ #include <linux/regmap.h>
+ #include <linux/unaligned.h>
+ #include <linux/workqueue.h>
+@@ -31,7 +33,8 @@ struct nu1669 {
+ 	struct mutex lock;
+ 	int present;
+ 	int irq;
+-	u32 generation;
++	atomic_t generation;
++	u32 sample_generation;
+ 	bool suspended;
+ 	bool stopped;
+ 	bool valid;
+@@ -98,7 +101,9 @@ static int nu1669_get_property(struct power_supply *psy,
+ 	switch (prop) {
+ 	case POWER_SUPPLY_PROP_ONLINE:
+ 		/* Receiver output availability, never a battery charging-state claim. */
+-		val->intval = present && rx->valid && get_unaligned_le16(rx->info + 0x34);
++		val->intval = present && rx->valid &&
++			rx->sample_generation == atomic_read(&rx->generation) &&
++			get_unaligned_le16(rx->info + 0x34);
+ 		break;
+ 	case POWER_SUPPLY_PROP_MANUFACTURER:
+ 		val->strval = "NuVolta";
+@@ -108,7 +113,7 @@ static int nu1669_get_property(struct power_supply *psy,
+ 		break;
+ 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+ 	case POWER_SUPPLY_PROP_CURRENT_NOW:
+-		if (!rx->valid) {
++		if (!rx->valid || rx->sample_generation != atomic_read(&rx->generation)) {
+ 			ret = -ENODATA;
+ 			break;
+ 		}
+@@ -132,6 +137,53 @@ static const struct power_supply_desc nu1669_psy_desc = {
+ 	.get_property = nu1669_get_property,
+ };
+ 
++int nu1669_get_snapshot(struct power_supply *psy, struct nu1669_snapshot *snapshot)
++{
++	struct nu1669 *rx;
++	u8 info[NU1669_INFO_SIZE];
++	u32 generation;
++	int present, ret;
++
++	if (!psy || psy->desc != &nu1669_psy_desc)
++		return -EOPNOTSUPP;
++	rx = power_supply_get_drvdata(psy);
++	generation = atomic_read(&rx->generation);
++	mutex_lock(&rx->lock);
++	ret = rx->suspended || rx->stopped ? -EBUSY : 0;
++	mutex_unlock(&rx->lock);
++	if (ret)
++		return ret;
++	present = gpiod_get_value_cansleep(rx->connected);
++	if (present <= 0)
++		return present < 0 ? present : -ENODEV;
++	ret = regmap_bulk_read(rx->regmap, NU1669_INFO_BASE, info, sizeof(info));
++	if (ret)
++		return ret;
++	present = gpiod_get_value_cansleep(rx->connected);
++	if (present <= 0)
++		return present < 0 ? present : -ENODEV;
++
++	mutex_lock(&rx->lock);
++	if (rx->suspended || rx->stopped || generation != atomic_read(&rx->generation)) {
++		ret = -EAGAIN;
++	} else {
++		*snapshot = (struct nu1669_snapshot) {
++			.generation = generation,
++			.chip_id = get_unaligned_le16(info),
++			.vout_mv = get_unaligned_le16(info + 0x34),
++			.hw_version = info[2],
++			.customer_id = info[3],
++			.fw_version = info[4],
++			.protocol = info[0x11],
++			.b2b_on = info[0x44],
++			.b2b_state = info[0x46],
++		};
++	}
++	mutex_unlock(&rx->lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(nu1669_get_snapshot);
++
+ /* Read-only diagnostics: raw firmware values, not charging-state claims. */
+ static ssize_t firmware_state_show(struct device *dev,
+ 				   struct device_attribute *attr, char *buf)
+@@ -144,7 +196,7 @@ static ssize_t firmware_state_show(struct device *dev,
+ 		return ret < 0 ? ret : -ENODATA;
+ 
+ 	mutex_lock(&rx->lock);
+-	if (!rx->valid)
++	if (!rx->valid || rx->sample_generation != atomic_read(&rx->generation))
+ 		ret = -ENODATA;
+ 	else
+ 		ret = sysfs_emit(buf,
+@@ -169,7 +221,9 @@ static const struct attribute_group nu1669_group = {
+ 
+ static bool nu1669_online(struct nu1669 *rx)
+ {
+-	return rx->present > 0 && rx->valid && get_unaligned_le16(rx->info + 0x34);
++	return rx->present > 0 && rx->valid &&
++		rx->sample_generation == atomic_read(&rx->generation) &&
++		get_unaligned_le16(rx->info + 0x34);
+ }
+ 
+ static void nu1669_poll(struct work_struct *work)
+@@ -181,7 +235,7 @@ static void nu1669_poll(struct work_struct *work)
+ 	int present, ret;
+ 
+ 	mutex_lock(&rx->lock);
+-	generation = rx->generation;
++	generation = atomic_read(&rx->generation);
+ 	if (rx->suspended || rx->stopped) {
+ 		mutex_unlock(&rx->lock);
+ 		return;
+@@ -198,13 +252,14 @@ static void nu1669_poll(struct work_struct *work)
+ 	}
+ 
+ 	mutex_lock(&rx->lock);
+-	if (rx->suspended || rx->stopped || generation != rx->generation) {
++	if (rx->suspended || rx->stopped || generation != atomic_read(&rx->generation)) {
+ 		mutex_unlock(&rx->lock);
+ 		return;
+ 	}
+ 	online = nu1669_online(rx);
+ 	changed = rx->present != present || rx->valid != valid;
+ 	rx->present = present;
++	rx->sample_generation = generation;
+ 	rx->valid = valid;
+ 	if (valid)
+ 		memcpy(rx->info, info, sizeof(info));
+@@ -218,12 +273,20 @@ static void nu1669_poll(struct work_struct *work)
+ 	mutex_unlock(&rx->lock);
+ }
+ 
++static irqreturn_t nu1669_connected_irq_primary(int irq, void *data)
++{
++	struct nu1669 *rx = data;
++
++	/* Keep this atomic invalidation in hard IRQ context, including forced threading. */
++	atomic_inc(&rx->generation);
++	return IRQ_WAKE_THREAD;
++}
++
+ static irqreturn_t nu1669_connected_irq(int irq, void *data)
+ {
+ 	struct nu1669 *rx = data;
+ 
+ 	mutex_lock(&rx->lock);
+-	rx->generation++;
+ 	rx->valid = false;
+ 	memset(rx->info, 0, sizeof(rx->info));
+ 	if (!rx->suspended && !rx->stopped) {
+@@ -245,6 +308,7 @@ static void nu1669_stop(void *data)
+ 		return;
+ 	}
+ 	rx->stopped = true;
++	atomic_inc(&rx->generation);
+ 	rx->valid = false;
+ 	memset(rx->info, 0, sizeof(rx->info));
+ 	mutex_unlock(&rx->lock);
+@@ -293,8 +357,9 @@ static int nu1669_probe(struct i2c_client *client)
+ 	rx->irq = gpiod_to_irq(rx->connected);
+ 	if (rx->irq < 0)
+ 		return dev_err_probe(dev, rx->irq, "connection IRQ\n");
+-	ret = devm_request_threaded_irq(dev, rx->irq, NULL, nu1669_connected_irq,
+-			IRQF_ONESHOT | IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
++	ret = devm_request_threaded_irq(dev, rx->irq, nu1669_connected_irq_primary,
++			nu1669_connected_irq,
++			IRQF_NO_THREAD | IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
+ 			dev_name(dev), rx);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "connection IRQ\n");
+@@ -314,7 +379,7 @@ static int nu1669_suspend(struct device *dev)
+ 
+ 	mutex_lock(&rx->lock);
+ 	rx->suspended = true;
+-	rx->generation++;
++	atomic_inc(&rx->generation);
+ 	rx->valid = false;
+ 	memset(rx->info, 0, sizeof(rx->info));
+ 	mutex_unlock(&rx->lock);
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 65e4d34732..1c542ba816 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -6,12 +6,14 @@
+  */
+ #include <linux/auxiliary_bus.h>
+ #include <linux/devm-helpers.h>
++#include <linux/debugfs.h>
+ #include <linux/spinlock.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/nvmem-consumer.h>
+ #include <linux/of_device.h>
+ #include <linux/power_supply.h>
++#include <linux/power/nu1669.h>
+ #include <linux/property.h>
+ #include <linux/soc/qcom/pdr.h>
+ #include <linux/soc/qcom/pmic_glink.h>
+@@ -370,6 +372,18 @@ struct qcom_battmgr {
+ 	struct power_supply *bat_psy;
+ 	struct power_supply *usb_psy;
+ 	struct power_supply *wls_psy;
++	struct dentry *dodge_debugfs;
++	struct delayed_work charge_work;
++	struct nu1669_snapshot charge_receiver;
++	u32 charge_generation;
++	u32 charge_session_epoch;
++	bool charge_owned;
++	bool charge_pending;
++	bool charge_frozen;
++	/* Event invalidation and teardown flags use dodge_otg_lock. */
++	u32 charge_epoch;
++	bool charge_closing;
++	bool charge_suspending;
+ 	struct power_supply *wireless_receiver;
+ 	struct notifier_block wireless_nb;
+ 	bool wireless_notifier_registered;
+@@ -392,6 +406,8 @@ struct qcom_battmgr {
+ 
+ 	/* OnePlus ADSP gauge snapshot: temperature through state of health. */
+ 	u32 dodge_gauge[9];
++	u32 dodge_input_suspend;
++	int dodge_input_suspend_error;
+ 	unsigned long dodge_gauge_updated;
+ 	u32 dodge_gauge_generation;
+ 	u32 dodge_service_generation;
+@@ -541,6 +557,14 @@ static int qcom_battmgr_dodge_pd_decode(const void *data, size_t len,
+ 	return 0;
+ }
+ 
++/* Caller holds dodge_otg_lock; never wait for firmware in a notification. */
++static void qcom_battmgr_charge_event(struct qcom_battmgr *battmgr)
++{
++	battmgr->charge_epoch++;
++	if (battmgr->service_up && !battmgr->charge_closing && !battmgr->charge_suspending)
++		mod_delayed_work(system_percpu_wq, &battmgr->charge_work, 0);
++}
++
+ /* No firmware transaction or battmgr mutex in the provider notifier. */
+ static int qcom_battmgr_wireless_present(struct qcom_battmgr *battmgr, bool event)
+ {
+@@ -561,6 +585,7 @@ static int qcom_battmgr_wireless_present(struct qcom_battmgr *battmgr, bool even
+ 	battmgr->wireless_known = known;
+ 	battmgr->wireless_present = present;
+ 	if ((changed || event) && battmgr->variant == QCOM_BATTMGR_DODGE) {
++		qcom_battmgr_charge_event(battmgr);
+ 		/* Even coalesced attach/detach must revoke an in-flight authorization. */
+ 		battmgr->dodge_otg_epoch++;
+ 		battmgr->dodge_power_off_pending = true;
+@@ -992,6 +1017,8 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
+ 	return 0;
+ }
+ 
++#define DODGE_WLS_INPUT_CURR_LIMIT	8
++
+ #define DODGE_GAUGE_OPCODE	0x10000
+ #define DODGE_GAUGE_WORDS	128
+ 
+@@ -1033,6 +1060,21 @@ static int qcom_battmgr_dodge_decode(const void *data, size_t len, u32 gauge[9])
+ 	return 0;
+ }
+ 
++static int qcom_battmgr_charge_get_behaviour(struct qcom_battmgr *battmgr,
++					   union power_supply_propval *val)
++{
++	int ret = 0;
++
++	mutex_lock(&battmgr->lock);
++	if (battmgr->charge_owned && (battmgr->charge_pending || battmgr->charge_frozen))
++		ret = -EIO;
++	else
++		val->intval = battmgr->charge_owned ? POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE :
++			POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
++	mutex_unlock(&battmgr->lock);
++	return ret;
++}
++
+ static int qcom_battmgr_dodge_get_property(struct power_supply *psy,
+ 					 enum power_supply_property psp,
+ 					 union power_supply_propval *val)
+@@ -1047,6 +1089,9 @@ static int qcom_battmgr_dodge_get_property(struct power_supply *psy,
+ 	u32 generation;
+ 	int ret = 0;
+ 
++	if (psp == POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR)
++		return qcom_battmgr_charge_get_behaviour(battmgr, val);
++
+ 	switch (psp) {
+ 	case POWER_SUPPLY_PROP_STATUS:
+ 	case POWER_SUPPLY_PROP_HEALTH:
+@@ -1342,7 +1387,14 @@ static const struct power_supply_desc sm8350_bat_psy_desc = {
+ 	.get_property = qcom_battmgr_bat_get_property,
+ };
+ 
++static int qcom_battmgr_charge_set_property(struct power_supply *psy,
++					  enum power_supply_property prop,
++					  const union power_supply_propval *val);
++static int qcom_battmgr_charge_is_writeable(struct power_supply *psy,
++					  enum power_supply_property prop);
++
+ static const enum power_supply_property dodge_bat_props[] = {
++	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+ 	POWER_SUPPLY_PROP_STATUS,
+ 	POWER_SUPPLY_PROP_HEALTH,
+ 	POWER_SUPPLY_PROP_PRESENT,
+@@ -1360,6 +1412,10 @@ static const struct power_supply_desc dodge_bat_psy_desc = {
+ 	.properties = dodge_bat_props,
+ 	.num_properties = ARRAY_SIZE(dodge_bat_props),
+ 	.get_property = qcom_battmgr_dodge_get_property,
++	.set_property = qcom_battmgr_charge_set_property,
++	.property_is_writeable = qcom_battmgr_charge_is_writeable,
++	.charge_behaviours = BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
++		BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE),
+ };
+ 
+ static const enum power_supply_property sm8550_bat_props[] = {
+@@ -2175,6 +2231,523 @@ static int qcom_battmgr_dodge_otg_request(struct qcom_battmgr *battmgr,
+ 	return ret;
+ }
+ 
++/* Charge state below is protected by lock; event/closing state by dodge_otg_lock. */
++static bool qcom_battmgr_charge_transport_current(struct qcom_battmgr *battmgr, u32 generation)
++{
++	unsigned long flags;
++	bool valid;
++
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	valid = battmgr->service_up && !battmgr->dodge_otg_stopping &&
++		!battmgr->dodge_otg_broken && generation == battmgr->dodge_service_generation;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	return valid;
++}
++
++static int qcom_battmgr_charge_request(struct qcom_battmgr *battmgr,
++				     u32 opcode, u32 property, u32 value, u32 generation)
++{
++	int ret;
++
++	if (battmgr->charge_frozen)
++		return -EIO;
++	ret = qcom_battmgr_dodge_otg_request(battmgr, opcode, property, value, generation);
++	if (!ret && !qcom_battmgr_charge_transport_current(battmgr, generation))
++		ret = -ENOTCONN;
++	if (battmgr->charge_owned &&
++	    (ret == -ETIMEDOUT || !qcom_battmgr_charge_transport_current(battmgr, generation) ||
++	     (opcode == BATTMGR_BAT_PROPERTY_SET && ret)))
++		battmgr->charge_frozen = true;
++	return ret;
++}
++
++static int qcom_battmgr_charge_raw_get(struct qcom_battmgr *battmgr, u32 generation, u32 *value)
++{
++	int ret;
++
++	ret = qcom_battmgr_charge_request(battmgr, BATTMGR_BAT_PROPERTY_GET,
++					BATT_CHG_CTRL_EN, 0, generation);
++	if (ret)
++		return ret;
++	if (battmgr->dodge_otg_value > 1) {
++		if (battmgr->charge_owned)
++			battmgr->charge_frozen = true;
++		return -EPROTO;
++	}
++	*value = battmgr->dodge_otg_value;
++	return 0;
++}
++
++static int qcom_battmgr_charge_healthy(struct qcom_battmgr *battmgr, u32 generation)
++{
++	struct qcom_battmgr_dodge_request req = {
++		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
++		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
++		.hdr.opcode = cpu_to_le32(DODGE_GAUGE_OPCODE),
++		.data_size = cpu_to_le32(DODGE_GAUGE_WORDS * sizeof(__le32)),
++	};
++	int ret;
++
++	ret = qcom_battmgr_charge_request(battmgr, BATTMGR_BAT_PROPERTY_GET,
++					BATT_HEALTH, 0, generation);
++	if (ret)
++		return ret;
++	if (battmgr->dodge_otg_value != POWER_SUPPLY_HEALTH_GOOD)
++		return -EAGAIN;
++	WRITE_ONCE(battmgr->dodge_gauge_pending, true);
++	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
++	WRITE_ONCE(battmgr->dodge_gauge_pending, false);
++	if (ret == -ETIMEDOUT) {
++		unsigned long flags;
++
++		/* Retire this control channel; a late gauge reply has no transaction ID. */
++		spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++		if (generation == battmgr->dodge_service_generation)
++			battmgr->dodge_otg_broken = true;
++		spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	}
++	if (!ret && !qcom_battmgr_charge_transport_current(battmgr, generation))
++		ret = -ENOTCONN;
++	if (ret && battmgr->charge_owned &&
++	    !qcom_battmgr_charge_transport_current(battmgr, generation))
++		battmgr->charge_frozen = true;
++	if (ret)
++		return ret;
++	/* OEM gauge temperature is in deci-C; no interpretation of pack voltage. */
++	if ((s32)battmgr->dodge_gauge[0] < 0 || battmgr->dodge_gauge[0] > 430)
++		return -EAGAIN;
++	return 0;
++}
++
++static bool qcom_battmgr_charge_current(struct qcom_battmgr *battmgr, u32 generation, u32 epoch)
++{
++	unsigned long flags;
++	bool valid;
++
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	valid = battmgr->service_up && battmgr->dodge_otg_ready &&
++		!battmgr->dodge_otg_stopping && !battmgr->dodge_otg_broken &&
++		!battmgr->dodge_otg_requested && !battmgr->charge_closing &&
++		!battmgr->charge_suspending && generation == battmgr->dodge_service_generation &&
++		epoch == battmgr->charge_epoch;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	return valid;
++}
++
++static bool qcom_battmgr_charge_same_receiver(const struct nu1669_snapshot *a,
++					     const struct nu1669_snapshot *b)
++{
++	return a->generation == b->generation && a->chip_id == b->chip_id &&
++		a->hw_version == b->hw_version && a->customer_id == b->customer_id &&
++		a->fw_version == b->fw_version;
++}
++
++static int qcom_battmgr_charge_source(struct qcom_battmgr *battmgr, u32 generation,
++				    u32 epoch, struct nu1669_snapshot *snapshot)
++{
++	int ret;
++
++	if (!qcom_battmgr_charge_current(battmgr, generation, epoch) ||
++	    battmgr->dodge_power_state != DODGE_POWER_OFF)
++		return -EBUSY;
++	ret = qcom_battmgr_charge_request(battmgr, BATTMGR_USB_PROPERTY_GET,
++					USB_ONLINE, 0, generation);
++	if (ret || battmgr->dodge_otg_value)
++		return ret ?: -EBUSY;
++	ret = qcom_battmgr_charge_request(battmgr, BATTMGR_USB_PROPERTY_GET,
++					DODGE_USB_CID_STATUS, 0, generation);
++	if (ret || battmgr->dodge_otg_value)
++		return ret ?: -EBUSY;
++	ret = qcom_battmgr_charge_request(battmgr, BATTMGR_USB_PROPERTY_GET,
++					DODGE_USB_OTG_SWITCH, 0, generation);
++	if (ret || battmgr->dodge_otg_value)
++		return ret ?: -EBUSY;
++	ret = qcom_battmgr_charge_healthy(battmgr, generation);
++	if (ret)
++		return ret;
++	/* Finish with a fresh receiver read after all potentially blocking GLINK queries. */
++	ret = nu1669_get_snapshot(battmgr->wireless_receiver, snapshot);
++	if (ret)
++		return ret;
++	if (snapshot->protocol != 0x04 || snapshot->b2b_on || (snapshot->b2b_state & BIT(0)) ||
++	    snapshot->vout_mv < 4500 || snapshot->vout_mv > 6000)
++		return -EOPNOTSUPP;
++	return qcom_battmgr_charge_current(battmgr, generation, epoch) ? 0 : -EAGAIN;
++}
++
++/* Cleanup deliberately does not require a connected/readable receiver or USB absence. */
++static int qcom_battmgr_charge_restore(struct qcom_battmgr *battmgr)
++{
++	u32 value, generation = battmgr->charge_generation;
++	int ret;
++
++	if (!battmgr->charge_owned)
++		return 0;
++	battmgr->charge_pending = true;
++	if (battmgr->charge_frozen || !qcom_battmgr_charge_transport_current(battmgr, generation)) {
++		battmgr->charge_frozen = true;
++		return -ENOTCONN;
++	}
++	ret = qcom_battmgr_charge_raw_get(battmgr, generation, &value);
++	if (ret)
++		return ret;
++	if (!value) {
++		ret = qcom_battmgr_charge_healthy(battmgr, generation);
++		if (ret)
++			return ret;
++		/* Only a session acquired from a confirmed 1 can reach this SET1. */
++		ret = qcom_battmgr_charge_request(battmgr, BATTMGR_BAT_PROPERTY_SET,
++						BATT_CHG_CTRL_EN, 1, generation);
++		if (ret)
++			return ret;
++		ret = qcom_battmgr_charge_raw_get(battmgr, generation, &value);
++		if (ret)
++			return ret;
++		if (value != 1) {
++			battmgr->charge_frozen = true;
++			return -EPROTO;
++		}
++	}
++	battmgr->charge_owned = false;
++	battmgr->charge_pending = false;
++	power_supply_changed(battmgr->bat_psy);
++	return 0;
++}
++
++static void qcom_battmgr_charge_schedule(struct qcom_battmgr *battmgr)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	if (battmgr->charge_owned && !battmgr->charge_frozen &&
++	    !battmgr->charge_closing && !battmgr->charge_suspending)
++		schedule_delayed_work(&battmgr->charge_work, 2 * HZ);
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++}
++
++static int qcom_battmgr_charge_inhibit(struct qcom_battmgr *battmgr)
++{
++	struct nu1669_snapshot before, after;
++	unsigned long flags;
++	u32 generation, epoch, value;
++	int ret;
++
++	if (battmgr->charge_pending || battmgr->charge_frozen)
++		return -EBUSY;
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	generation = battmgr->dodge_service_generation;
++	epoch = battmgr->charge_epoch;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	if (battmgr->charge_owned &&
++	    (generation != battmgr->charge_generation || epoch != battmgr->charge_session_epoch)) {
++		ret = -EAGAIN;
++		goto cleanup;
++	}
++	ret = qcom_battmgr_charge_source(battmgr, generation, epoch, &before);
++	if (ret)
++		goto cleanup;
++	ret = qcom_battmgr_charge_raw_get(battmgr, generation, &value);
++	if (ret)
++		goto cleanup;
++	if (battmgr->charge_owned) {
++		if (value ||
++		    !qcom_battmgr_charge_same_receiver(&before, &battmgr->charge_receiver)) {
++			ret = -EAGAIN;
++			goto cleanup;
++		}
++		goto verify;
++	}
++	/* A pre-existing 0 belongs to somebody else; AUTO may never enable it. */
++	if (value != 1)
++		return -EBUSY;
++	ret = qcom_battmgr_charge_source(battmgr, generation, epoch, &after);
++	if (ret || !qcom_battmgr_charge_same_receiver(&before, &after))
++		return ret ?: -EAGAIN;
++	battmgr->charge_generation = generation;
++	battmgr->charge_session_epoch = epoch;
++	battmgr->charge_receiver = after;
++	/* Record possible ownership before firmware can apply an unacknowledged SET0. */
++	battmgr->charge_owned = true;
++	battmgr->charge_pending = true;
++	ret = qcom_battmgr_charge_request(battmgr, BATTMGR_BAT_PROPERTY_SET,
++					BATT_CHG_CTRL_EN, 0, generation);
++	if (ret)
++		goto cleanup;
++	ret = qcom_battmgr_charge_raw_get(battmgr, generation, &value);
++	if (ret)
++		goto cleanup;
++	if (value != 0) {
++		ret = -EPROTO;
++		goto cleanup;
++	}
++verify:
++	ret = qcom_battmgr_charge_source(battmgr, generation, epoch, &after);
++	if (ret || !qcom_battmgr_charge_same_receiver(&before, &after)) {
++		ret = ret ?: -EAGAIN;
++		goto cleanup;
++	}
++	battmgr->charge_pending = false;
++	qcom_battmgr_charge_schedule(battmgr);
++	return 0;
++cleanup:
++	if (battmgr->charge_owned) {
++		int restore_ret = qcom_battmgr_charge_restore(battmgr);
++
++		if (restore_ret)
++			dev_warn_ratelimited(battmgr->dev,
++					     "normal charge restore pending: %d\n", restore_ret);
++		qcom_battmgr_charge_schedule(battmgr);
++	}
++	return ret;
++}
++
++static int qcom_battmgr_charge_set_property(struct power_supply *psy,
++					  enum power_supply_property prop,
++					  const union power_supply_propval *val)
++{
++	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
++	int ret;
++
++	if (prop != POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR ||
++	    (val->intval != POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO &&
++	     val->intval != POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE))
++		return -EINVAL;
++	mutex_lock(&battmgr->lock);
++	if (READ_ONCE(battmgr->charge_closing) || READ_ONCE(battmgr->charge_suspending)) {
++		ret = -EBUSY;
++	} else if (val->intval == POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) {
++		ret = qcom_battmgr_charge_restore(battmgr);
++		qcom_battmgr_charge_schedule(battmgr);
++	} else {
++		ret = qcom_battmgr_charge_inhibit(battmgr);
++	}
++	mutex_unlock(&battmgr->lock);
++	power_supply_changed(psy);
++	return ret;
++}
++
++static int qcom_battmgr_charge_is_writeable(struct power_supply *psy,
++					  enum power_supply_property prop)
++{
++	return prop == POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR;
++}
++
++static void qcom_battmgr_charge_worker(struct work_struct *work)
++{
++	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
++						 struct qcom_battmgr, charge_work);
++	struct nu1669_snapshot snapshot;
++	int ret = 0;
++	u32 value;
++
++	mutex_lock(&battmgr->lock);
++	if (!battmgr->charge_owned || READ_ONCE(battmgr->charge_closing) ||
++	    READ_ONCE(battmgr->charge_suspending))
++		goto out;
++	if (!battmgr->charge_pending) {
++		ret = qcom_battmgr_charge_source(battmgr, battmgr->charge_generation,
++					       battmgr->charge_session_epoch, &snapshot);
++		if (!ret &&
++		    !qcom_battmgr_charge_same_receiver(&snapshot, &battmgr->charge_receiver))
++			ret = -EAGAIN;
++		if (!ret)
++			ret = qcom_battmgr_charge_raw_get(battmgr,
++							battmgr->charge_generation, &value);
++		if (!ret && value)
++			ret = -EAGAIN;
++	}
++	if (ret || battmgr->charge_pending)
++		ret = qcom_battmgr_charge_restore(battmgr);
++	if (ret)
++		dev_warn_ratelimited(battmgr->dev, "normal charge restore pending: %d\n", ret);
++	qcom_battmgr_charge_schedule(battmgr);
++out:
++	mutex_unlock(&battmgr->lock);
++}
++
++static int qcom_battmgr_charge_suspend(struct device *dev)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++	unsigned long flags;
++	int ret;
++
++	if (battmgr->variant != QCOM_BATTMGR_DODGE)
++		return 0;
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	battmgr->charge_suspending = true;
++	battmgr->charge_epoch++;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	cancel_delayed_work_sync(&battmgr->charge_work);
++	mutex_lock(&battmgr->lock);
++	ret = qcom_battmgr_charge_restore(battmgr);
++	if (ret) {
++		WRITE_ONCE(battmgr->charge_suspending, false);
++		qcom_battmgr_charge_schedule(battmgr);
++	}
++	mutex_unlock(&battmgr->lock);
++	return ret ? -EBUSY : 0;
++}
++
++static int qcom_battmgr_charge_resume(struct device *dev)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++
++	if (battmgr->variant == QCOM_BATTMGR_DODGE)
++		WRITE_ONCE(battmgr->charge_suspending, false);
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(qcom_battmgr_charge_pm_ops,
++			       qcom_battmgr_charge_suspend, qcom_battmgr_charge_resume);
++
++/* Validate the normal gauge packet before reading its optional input flag. */
++static int qcom_battmgr_dodge_decode_input_suspend(const void *data, size_t len, u32 *value)
++{
++	const struct qcom_battmgr_dodge_response *response = data;
++	u32 gauge[9], flag;
++	int ret;
++
++	ret = qcom_battmgr_dodge_decode(data, len, gauge);
++	if (ret)
++		return ret;
++	if (le32_to_cpu(response->data_size) < 10 * sizeof(__le32))
++		return -ENODATA;
++	flag = le32_to_cpu(response->data[9]);
++	if (flag > 1)
++		return -EPROTO;
++	*value = flag;
++	return 0;
++}
++
++static int qcom_battmgr_dodge_normal_input_suspend_get(void *data, u64 *value)
++{
++	struct qcom_battmgr *battmgr = data;
++	struct qcom_battmgr_dodge_request req = {
++		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
++		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
++		.hdr.opcode = cpu_to_le32(DODGE_GAUGE_OPCODE),
++		.data_size = cpu_to_le32(DODGE_GAUGE_WORDS * sizeof(__le32)),
++	};
++	unsigned long flags;
++	u32 generation;
++	int ret;
++
++	mutex_lock(&battmgr->lock);
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	generation = battmgr->dodge_service_generation;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	if (!qcom_battmgr_charge_transport_current(battmgr, generation)) {
++		ret = -ENOTCONN;
++		goto out;
++	}
++	/* Missing or failed replies must never expose a previous optional value. */
++	battmgr->dodge_input_suspend_error = -ENODATA;
++	WRITE_ONCE(battmgr->dodge_gauge_pending, true);
++	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
++	WRITE_ONCE(battmgr->dodge_gauge_pending, false);
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	if (ret == -ETIMEDOUT && generation == battmgr->dodge_service_generation)
++		battmgr->dodge_otg_broken = true;
++	if (!ret && (!battmgr->service_up || battmgr->dodge_otg_stopping ||
++		     battmgr->dodge_otg_broken || generation != battmgr->dodge_service_generation))
++		ret = -ENOTCONN;
++	if (!ret) {
++		ret = battmgr->dodge_input_suspend_error;
++		if (!ret)
++			*value = battmgr->dodge_input_suspend;
++	}
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++out:
++	mutex_unlock(&battmgr->lock);
++	return ret;
++}
++DEFINE_DEBUGFS_ATTRIBUTE(qcom_battmgr_dodge_normal_input_suspend_fops,
++			qcom_battmgr_dodge_normal_input_suspend_get, NULL, "%llu\n");
++
++/* Raw normal-path firmware gate, not a charging policy or aggregate status. */
++static int qcom_battmgr_dodge_normal_charge_enable_get(void *data, u64 *value)
++{
++	struct qcom_battmgr *battmgr = data;
++	unsigned long flags;
++	u32 generation;
++	int ret;
++
++	mutex_lock(&battmgr->lock);
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	generation = battmgr->dodge_service_generation;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_BAT_PROPERTY_GET,
++					   BATT_CHG_CTRL_EN, 0, generation);
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	if (!ret && (!battmgr->service_up || battmgr->dodge_otg_stopping ||
++		     generation != battmgr->dodge_service_generation))
++		ret = -ENOTCONN;
++	if (!ret) {
++		if (battmgr->dodge_otg_value > 1)
++			ret = -EPROTO;
++		else
++			*value = battmgr->dodge_otg_value;
++	}
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	mutex_unlock(&battmgr->lock);
++	return ret;
++}
++DEFINE_DEBUGFS_ATTRIBUTE(qcom_battmgr_dodge_normal_charge_enable_fops,
++			qcom_battmgr_dodge_normal_charge_enable_get, NULL, "%llu\n");
++
++/* OEM wireless input current limit, in microamps; no control writes. */
++static int qcom_battmgr_dodge_wireless_input_current_limit_get(void *data, u64 *value)
++{
++	struct qcom_battmgr *battmgr = data;
++	unsigned long flags;
++	u32 generation;
++	int ret;
++
++	mutex_lock(&battmgr->lock);
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	generation = battmgr->dodge_service_generation;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_WLS_PROPERTY_GET,
++					   DODGE_WLS_INPUT_CURR_LIMIT, 0, generation);
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	if (!ret && (!battmgr->service_up || battmgr->dodge_otg_stopping ||
++		     generation != battmgr->dodge_service_generation))
++		ret = -ENOTCONN;
++	if (!ret)
++		*value = battmgr->dodge_otg_value;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	mutex_unlock(&battmgr->lock);
++	return ret;
++}
++DEFINE_DEBUGFS_ATTRIBUTE(qcom_battmgr_dodge_wireless_input_current_limit_fops,
++			qcom_battmgr_dodge_wireless_input_current_limit_get, NULL, "%llu\n");
++
++static void qcom_battmgr_dodge_debugfs_remove(void *data)
++{
++	struct qcom_battmgr *battmgr = data;
++
++	/* Removal drains active accesses; retained open files cannot enter again. */
++	debugfs_remove_recursive(battmgr->dodge_debugfs);
++	battmgr->dodge_debugfs = NULL;
++}
++
++static int qcom_battmgr_dodge_debugfs_init(struct qcom_battmgr *battmgr)
++{
++	if (battmgr->variant != QCOM_BATTMGR_DODGE)
++		return 0;
++	battmgr->dodge_debugfs = debugfs_create_dir("qcom-battmgr-dodge", NULL);
++	if (IS_ERR_OR_NULL(battmgr->dodge_debugfs))
++		return 0;
++	debugfs_create_file("normal_charge_enable", 0400, battmgr->dodge_debugfs,
++			    battmgr, &qcom_battmgr_dodge_normal_charge_enable_fops);
++	debugfs_create_file("normal_input_suspend", 0400, battmgr->dodge_debugfs,
++			    battmgr, &qcom_battmgr_dodge_normal_input_suspend_fops);
++	debugfs_create_file("wireless_input_current_limit", 0400, battmgr->dodge_debugfs,
++			    battmgr, &qcom_battmgr_dodge_wireless_input_current_limit_fops);
++	return devm_add_action_or_reset(battmgr->dev, qcom_battmgr_dodge_debugfs_remove,
++				       battmgr);
++}
++
+ /* Caller holds lock; all checks and requests belong to the cached attachment. */
+ static bool qcom_battmgr_dodge_pd_valid(struct qcom_battmgr *battmgr)
+ {
+@@ -2859,6 +3432,16 @@ static bool qcom_battmgr_dodge_otg_notification(struct qcom_battmgr *battmgr,
+ 	if (battmgr->dodge_otg_stopping || !battmgr->service_up)
+ 		goto out;
+ 	switch (notification) {
++	case NOTIF_USB_PROPERTY:
++	case DODGE_NOTIF_CID_DETECT:
++	case DODGE_NOTIF_TYPEC_STATE_CHANGE:
++	case DODGE_NOTIF_OTG_ENABLE:
++	case DODGE_NOTIF_OTG_DISABLE:
++	case NOTIF_WLS_PROPERTY:
++		qcom_battmgr_charge_event(battmgr);
++		break;
++	}
++	switch (notification) {
+ 	case DODGE_NOTIF_PD_SOURCECAP_DONE:
+ 	case DODGE_NOTIF_PD_SOFT_RESET:
+ 		battmgr->dodge_pd_revision++;
+@@ -2966,6 +3549,9 @@ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
+ 		if (!xchg(&battmgr->dodge_gauge_pending, false))
+ 			return;
+ 		battmgr->error = qcom_battmgr_dodge_decode(data, len, battmgr->dodge_gauge);
++		battmgr->dodge_input_suspend_error = battmgr->error ?:
++			qcom_battmgr_dodge_decode_input_suspend(data, len,
++							       &battmgr->dodge_input_suspend);
+ 		complete(&battmgr->ack);
+ 		return;
+ 	}
+@@ -3031,6 +3617,7 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
+ 
+ 	if (battmgr->variant == QCOM_BATTMGR_DODGE) {
+ 		spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++		qcom_battmgr_charge_event(battmgr);
+ 		battmgr->service_up = state == SERVREG_SERVICE_STATE_UP;
+ 		if (!battmgr->service_up) {
+ 			battmgr->dodge_service_generation++;
+@@ -3212,6 +3799,10 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 		return ret;
+ 
+ 	if (battmgr->variant == QCOM_BATTMGR_DODGE) {
++		ret = devm_delayed_work_autocancel(dev, &battmgr->charge_work,
++						 qcom_battmgr_charge_worker);
++		if (ret)
++			return ret;
+ 		init_completion(&battmgr->dodge_otg_ack);
+ 		INIT_DELAYED_WORK(&battmgr->dodge_cid_work, qcom_battmgr_dodge_cid_worker);
+ 		INIT_DELAYED_WORK(&battmgr->dodge_typec_work, qcom_battmgr_dodge_typec_worker);
+@@ -3239,11 +3830,32 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	}
+ 
+ 	dev_set_drvdata(dev, battmgr);
++	ret = qcom_battmgr_dodge_debugfs_init(battmgr);
++	if (ret)
++		return ret;
+ 	pmic_glink_client_register(battmgr->client);
+ 
+ 	return 0;
+ }
+ 
++static void qcom_battmgr_charge_close(struct qcom_battmgr *battmgr)
++{
++	unsigned long flags;
++	int ret;
++
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	battmgr->charge_closing = true;
++	battmgr->charge_epoch++;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	cancel_delayed_work_sync(&battmgr->charge_work);
++	mutex_lock(&battmgr->lock);
++	ret = qcom_battmgr_charge_restore(battmgr);
++	if (ret)
++		dev_err(battmgr->dev,
++			"normal charge permission NOT restored before teardown: %d\n", ret);
++	mutex_unlock(&battmgr->lock);
++}
++
+ static void qcom_battmgr_remove(struct auxiliary_device *adev)
+ {
+ 	struct qcom_battmgr *battmgr = dev_get_drvdata(&adev->dev);
+@@ -3252,6 +3864,7 @@ static void qcom_battmgr_remove(struct auxiliary_device *adev)
+ 	qcom_battmgr_wireless_unregister(battmgr);
+ 	if (battmgr->variant != QCOM_BATTMGR_DODGE)
+ 		return;
++	qcom_battmgr_charge_close(battmgr);
+ 	/* Keep the client alive while in-flight requests drain and OFF is sent. */
+ 	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
+ 	battmgr->dodge_otg_stopping = true;
+@@ -3263,6 +3876,8 @@ static void qcom_battmgr_remove(struct auxiliary_device *adev)
+ 	battmgr->dodge_otg_requested = false;
+ 	battmgr->dodge_otg_epoch++;
+ 	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	/* Do not hold lock while waiting for a debugfs reader to leave it. */
++	qcom_battmgr_dodge_debugfs_remove(battmgr);
+ 	cancel_work_sync(&battmgr->enable_work);
+ 	cancel_delayed_work_sync(&battmgr->dodge_cid_work);
+ 	cancel_delayed_work_sync(&battmgr->dodge_typec_work);
+@@ -3285,6 +3900,7 @@ static struct auxiliary_driver qcom_battmgr_driver = {
+ 	.remove = qcom_battmgr_remove,
+ 	.shutdown = qcom_battmgr_remove,
+ 	.id_table = qcom_battmgr_id_table,
++	.driver.pm = pm_sleep_ptr(&qcom_battmgr_charge_pm_ops),
+ };
+ 
+ module_auxiliary_driver(qcom_battmgr_driver);
+diff --git a/include/linux/power/nu1669.h b/include/linux/power/nu1669.h
+new file mode 100644
+index 0000000000..0f82482d52
+--- /dev/null
++++ b/include/linux/power/nu1669.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_POWER_NU1669_H
++#define _LINUX_POWER_NU1669_H
++
++#include <linux/errno.h>
++#include <linux/kconfig.h>
++#include <linux/types.h>
++
++struct power_supply;
++
++/* Firmware values from one fresh read, guarded against connection edges. */
++struct nu1669_snapshot {
++	u32 generation;
++	u16 chip_id;
++	u16 vout_mv;
++	u8 hw_version;
++	u8 customer_id;
++	u8 fw_version;
++	u8 protocol;
++	u8 b2b_on;
++	u8 b2b_state;
++};
++
++#if IS_REACHABLE(CONFIG_CHARGER_NU1669)
++int nu1669_get_snapshot(struct power_supply *psy, struct nu1669_snapshot *snapshot);
++#else
++static inline int nu1669_get_snapshot(struct power_supply *psy,
++				      struct nu1669_snapshot *snapshot)
++{
++	return -EOPNOTSUPP;
++}
++#endif
++
++#endif

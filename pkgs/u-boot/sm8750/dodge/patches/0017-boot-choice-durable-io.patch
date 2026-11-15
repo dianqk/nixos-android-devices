@@ -1,0 +1,193 @@
+From: dianqk <dianqk@dianqk.net>
+Subject: [PATCH] efi: bind UFS sibling LUNs and provide checked cache synchronization
+
+Use actual DM ancestry rather than synthetic vendor device-path identity.
+Keep capability default-off and require FAT writes. Wait for bounded UFS
+completion and propagate transport errors before examining response memory.
+
+This is transport only; no slot selection, journal, or preference writer.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+--- /dev/null
++++ b/include/efi_boot_choice_io.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++#ifndef EFI_BOOT_CHOICE_IO_H
++#define EFI_BOOT_CHOICE_IO_H
++/* Boot-services lifetime only. Opaque controller identity, never a device path. */
++#define EFI_BOOT_CHOICE_IO_GUID \
++ EFI_GUID(0x6b58f5b8, 0x18c6, 0x47ad, 0x90, 0x45, 0x55, 0x46, 0x53, 0x49, 0x4f, 0x31)
++struct efi_boot_choice_io {
++ u32 revision, size;
++ u64 flags, controller;
++ u32 target, lun;
++ efi_status_t (EFIAPI *sync)(struct efi_boot_choice_io *this, u32 media_id);
++};
++efi_status_t efi_boot_choice_sync(struct blk_desc *desc);
++#endif
+--- a/lib/efi_loader/Kconfig
++++ b/lib/efi_loader/Kconfig
+@@ -1,4 +1,13 @@
+ menu "UEFI Support"
++
++config EFI_BOOT_CHOICE_DURABLE_IO
++ bool "UFS controller-scoped boot-choice durable I/O"
++ depends on EFI_LOADER && SCSI && UFS && FAT_WRITE
++ default n
++ help
++   Publish per-handle UFS controller/LUN identity and checked synchronous
++   SYNCHRONIZE CACHE(10). Enable only with the matching boot-choice helper.
++
+ 
+ config EFI_LOADER
+ 	bool "Support running UEFI applications"
+--- a/lib/efi_loader/efi_disk.c
++++ b/lib/efi_loader/efi_disk.c
+@@ -19,6 +19,8 @@
+ #include <log.h>
+ #include <part.h>
+ #include <malloc.h>
++#include <scsi.h>
++#include <efi_boot_choice_io.h>
+ 
+ struct efi_system_partition efi_system_partition = {
+ 	.uclass_id = UCLASS_INVALID,
+@@ -45,7 +47,11 @@
+ 	struct efi_device_path *dp;
+ 	struct efi_simple_file_system_protocol *volume;
+ 	struct efi_partition_info info;
++	struct efi_boot_choice_io choice_io;
++	struct blk_desc *choice_desc;
+ };
++
++#include "boot_choice_durable_io.h"
+ 
+ /**
+  * efi_disk_reset() - reset block device
+@@ -300,8 +306,16 @@
+  */
+ static efi_status_t EFIAPI efi_disk_flush_blocks(struct efi_block_io *this)
+ {
++	struct efi_disk_obj *disk = container_of(this, struct efi_disk_obj, ops);
++	efi_status_t ret = EFI_SUCCESS;
+ 	EFI_ENTRY("%p", this);
+-	return EFI_EXIT(EFI_SUCCESS);
++	if (IS_ENABLED(CONFIG_EFI_BOOT_CHOICE_DURABLE_IO)) {
++		if (!disk->media.media_present)
++			ret = EFI_NO_MEDIA;
++		else
++			ret = efi_boot_choice_sync(disk->choice_desc);
++	}
++	return EFI_EXIT(ret);
+ }
+ 
+ static const struct efi_block_io block_io_disk_template = {
+@@ -561,6 +575,19 @@
+ 	if (part)
+ 		diskobj->media.logical_partition = 1;
+ 	diskobj->ops.media = &diskobj->media;
++	diskobj->choice_desc = desc;
++	if (IS_ENABLED(CONFIG_EFI_BOOT_CHOICE_DURABLE_IO) && choice_controller(desc)) {
++		const efi_guid_t guid = EFI_BOOT_CHOICE_IO_GUID;
++		diskobj->choice_io = (struct efi_boot_choice_io) {
++			.revision = android_devices_boot_choice_durable_io_abi_v1, .size = sizeof(struct efi_boot_choice_io),
++			.flags = 3, /* UFS DM ancestry + synchronous LU cache flush */
++			.controller = (u64)(uintptr_t)choice_controller(desc),
++			.target = desc->target, .lun = desc->lun, .sync = choice_sync,
++		};
++		ret = efi_add_protocol(&diskobj->header, &guid, &diskobj->choice_io);
++		if (ret != EFI_SUCCESS)
++			goto error;
++	}
+ 	if (disk)
+ 		*disk = diskobj;
+ 
+--- a/lib/efi_loader/efi_file.c
++++ b/lib/efi_loader/efi_file.c
+@@ -14,6 +14,7 @@
+ #include <mapmem.h>
+ #include <fs.h>
+ #include <part.h>
++#include <efi_boot_choice_io.h>
+ 
+ /* GUID for file system information */
+ const efi_guid_t efi_file_system_info_guid = EFI_FILE_SYSTEM_INFO_GUID;
+@@ -35,6 +36,7 @@
+ 	loff_t offset;       /* current file position/cursor */
+ 	int isdir;
+ 	u64 open_mode;
++	bool write_failed;
+ 
+ 	/* for reading a directory: */
+ 	struct fs_dir_stream *dirs;
+@@ -688,6 +690,7 @@
+ 	}
+ 	if (fs_write(fh->path, map_to_sysmem(buffer), fh->offset, *buffer_size,
+ 		     &actwrite)) {
++		fh->write_failed = true;
+ 		ret = EFI_DEVICE_ERROR;
+ 		goto out;
+ 	}
+@@ -1067,7 +1070,16 @@
+ 	if (!(fh->open_mode & EFI_FILE_MODE_WRITE))
+ 		return EFI_ACCESS_DENIED;
+ 
+-	/* TODO: flush for file position after end of file */
++	if (IS_ENABLED(CONFIG_EFI_BOOT_CHOICE_DURABLE_IO)) {
++		/* FAT fs_write returns only after data, FAT and directory writes;
++		 * its buffers are per-call and freed, not deferred root caches.
++		 * Never bless an earlier failed write on this handle. */
++		if (fh->write_failed)
++			return EFI_DEVICE_ERROR;
++		if (set_blk_dev(fh) || fs_get_type() != FS_TYPE_FAT)
++			return EFI_UNSUPPORTED;
++		return efi_boot_choice_sync(fh->fs->desc);
++	}
+ 	return EFI_SUCCESS;
+ }
+ 
+--- a/drivers/ufs/ufs-uclass.c
++++ b/drivers/ufs/ufs-uclass.c
+@@ -959,8 +959,8 @@
+ 		enabled_intr_status = intr_status & hba->intr_mask;
+ 		ufshcd_writel(hba, intr_status, REG_INTERRUPT_STATUS);
+ 
+-		if (hba->max_pwr_info.info.pwr_rx != SLOWAUTO_MODE &&
+-		    hba->max_pwr_info.info.pwr_tx != SLOWAUTO_MODE) {
++		/* Completion must remain bounded, including slow-auto power mode. */
++		{
+ 			if (get_timer(start) > QUERY_REQ_TIMEOUT) {
+ 				dev_err(hba->dev,
+ 					"Timedout waiting for UTP response\n");
+@@ -1719,7 +1719,9 @@
+ 
+ 	ufshcd_cache_flush(pccb->pdata, pccb->datalen);
+ 
+-	ufshcd_send_command(hba, TASK_TAG);
++	result = ufshcd_send_command(hba, TASK_TAG);
++	if (result)
++		return result;
+ 
+ 	ufshcd_cache_invalidate(pccb->pdata, pccb->datalen);
+ 
+@@ -1732,7 +1734,7 @@
+ 			result = ufshcd_get_rsp_upiu_result(hba->ucd_rsp_ptr);
+ 
+ 			scsi_status = result & MASK_SCSI_STATUS;
+-			if (scsi_status)
++			if (scsi_status || (result >> 8))
+ 				return -EINVAL;
+ 
+ 			break;
+--- a/fs/fat/fat_write.c
++++ b/fs/fat/fat_write.c
+@@ -207,7 +207,7 @@
+ 	}
+ 
+ 	ret = blk_dwrite(cur_dev, cur_part_info.start + block, nr_blocks, buf);
+-	if (nr_blocks && ret == 0)
++	if (ret != nr_blocks)
+ 		return -1;
+ 
+ 	return ret;

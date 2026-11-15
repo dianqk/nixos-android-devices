@@ -1,0 +1,119 @@
+From: dianqk <dianqk@dianqk.net>
+Subject: [PATCH] t880: wait for natural VP9 picture completion
+
+VP9 returns visible and synthesized reference-only pictures asynchronously
+without future input. Reuse the existing bounded completion path and keep
+CAPTURE active across independent keys instead of draining and replaying the
+prefix for surface synchronization. Preserve framing, GPU fences, ownership,
+explicit-drain restart and sticky failure handling.
+
+Exercise the same delayed completion, continuous-key, drain, timeout, late
+completion and invalid-payload tests for both no-lookahead codecs.
+
+--- a/src/t880-decoder.cpp
++++ b/src/t880-decoder.cpp
+@@ -47,7 +47,7 @@
+ T880Decoder::T880Decoder(const std::string &device, unsigned width, unsigned height,
+                          VAProfile profile, unsigned rt_format, int render_fd)
+     : render_fd_(render_fd), width_(width), height_(height),
+-      display_without_lookahead_(is_av1(profile)) {
++      display_without_lookahead_(is_av1(profile) || is_vp9(profile)) {
+     check(rt_format == VA_RT_FORMAT_YUV420 && width >= 128 && height >= 128 && !(width & 1) &&
+           !(height & 1) && width <= 4096 && height <= 2176 &&
+           uint64_t(width) * height <= uint64_t(4096) * 2176,
+@@ -398,7 +398,7 @@
+     try {
+         pump(0);
+         if (!anchor.empty() && !history_.empty()) {
+-            // AV1 can complete every old CLIENT without future input. Keep
++            // AV1 and VP9 complete every old CLIENT without future input. Keep
+             // the active CAPTURE/DPB pool across independent keys; firmware
+             // retires its own references while decoding the new key AU.
+             if (display_without_lookahead_ && !drained_) {
+@@ -433,7 +433,7 @@
+         pump(0);
+         if (s->pending) {
+             wait_inputs(); pump(0);
+-            // AV1 DISPLAY arrives asynchronously after compressed ownership
++            // DISPLAY arrives asynchronously after compressed ownership
+             // returns. Wait for that completion; STOP would flush the DPB and
+             // force prefix replay on the next picture. The operation deadline
+             // stays fixed even if unrelated outputs arrive while pumping.
+--- a/tests/t880/replay.cpp
++++ b/tests/t880/replay.cpp
+@@ -216,7 +216,7 @@
+ template<class F> void rejects(F action) { bool rejected = false;
+     try { action(); } catch (const Error &) { rejected = true; } if (!rejected) std::cerr << "missing rejection\n"; assert(rejected); }
+ int main() {
+-    for (auto profile : {VAProfileH264Main, VAProfileHEVCMain, VAProfileVP9Profile0}) {
++    for (auto profile : {VAProfileH264Main, VAProfileHEVCMain}) {
+         f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
+         T880Decoder d("fake", 160, 128, profile, VA_RT_FORMAT_YUV420, -1);
+         auto a = surface(), b = surface(), c = surface();
+@@ -283,9 +283,10 @@
+         rejects([&] { d.submit({1}, surface(), {}); });
+         assert(f.accepted == accepted && f.resets == 0);
+     }
+-    f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
+-    {
+-        T880Decoder d("fake", 160, 128, VAProfileAV1Profile0, VA_RT_FORMAT_YUV420, -1);
++    for (auto natural_profile : {VAProfileAV1Profile0, VAProfileVP9Profile0}) {
++    f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
++    {
++        T880Decoder d("fake", 160, 128, natural_profile, VA_RT_FORMAT_YUV420, -1);
+         auto a = surface(), b = surface();
+         d.submit({1}, a, {1}); f.display_after_polls = f.polls + 3; d.sync(a);
+         assert(!a->pending && a->memory->map()[0] == 1 && f.stops == 0);
+@@ -296,7 +297,7 @@
+     }
+     f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
+     {
+-        T880Decoder d("fake", 160, 128, VAProfileAV1Profile0, VA_RT_FORMAT_YUV420, -1);
++        T880Decoder d("fake", 160, 128, natural_profile, VA_RT_FORMAT_YUV420, -1);
+         auto a = surface(), b = surface(), c = surface();
+         d.submit({1}, a, {1});
+         f.display_after_polls = f.polls + 3;
+@@ -316,7 +317,7 @@
+     }
+     f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
+     {
+-        T880Decoder d("fake", 160, 128, VAProfileAV1Profile0, VA_RT_FORMAT_YUV420, -1);
++        T880Decoder d("fake", 160, 128, natural_profile, VA_RT_FORMAT_YUV420, -1);
+         auto a = surface(), b = surface(); d.submit({1}, a, {1});
+         unsigned accepted = f.accepted, before = f.polls; f.expire = true;
+         bool timed_out = false;
+@@ -331,7 +332,7 @@
+     }
+     f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
+     {
+-        T880Decoder d("fake", 160, 128, VAProfileAV1Profile0, VA_RT_FORMAT_YUV420, -1);
++        T880Decoder d("fake", 160, 128, natural_profile, VA_RT_FORMAT_YUV420, -1);
+         auto a = surface(); d.submit({1}, a, {1}); unsigned before = f.polls; f.expire = true;
+         bool timed_out = false;
+         try { d.sync(a); } catch (const Error &e) { timed_out = e.status == VA_STATUS_ERROR_TIMEDOUT; }
+@@ -341,7 +342,7 @@
+     }
+     f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
+     {
+-        T880Decoder d("fake", 160, 128, VAProfileAV1Profile0, VA_RT_FORMAT_YUV420, -1);
++        T880Decoder d("fake", 160, 128, natural_profile, VA_RT_FORMAT_YUV420, -1);
+         auto a = surface(); d.submit({1}, a, {1});
+         f.display_after_polls = f.polls + 1; f.gpu_fail = true;
+         unsigned before = f.capture_qbufs;
+@@ -352,7 +353,7 @@
+     }
+     for (bool no_generated : {false, true}) {
+         f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
+-        T880Decoder d("fake", 160, 128, VAProfileAV1Profile0, VA_RT_FORMAT_YUV420, -1);
++        T880Decoder d("fake", 160, 128, natural_profile, VA_RT_FORMAT_YUV420, -1);
+         auto a = surface(); d.submit({1}, a, {1});
+         f.display_after_polls = f.polls + 1; f.no_generated = no_generated; f.wrong_offset = !no_generated;
+         unsigned before = f.capture_qbufs;
+@@ -360,6 +361,7 @@
+         assert(f.gpu_calls == 0 && f.capture_qbufs == before && a->pixel_generation == 0);
+         assert(!a->pending && a->status != VA_STATUS_SUCCESS);
+     }
++    }
+     rejects([] { token(timeval{std::numeric_limits<long>::max(), 999999}); });
+     std::cout << "T880 replay ownership, stable pixels, fresh anchor, limits and sticky faults passed\n";
+ }

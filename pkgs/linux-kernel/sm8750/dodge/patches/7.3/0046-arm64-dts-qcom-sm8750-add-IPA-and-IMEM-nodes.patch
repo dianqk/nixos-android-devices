@@ -1,0 +1,104 @@
+From e4c6036e1daa9ac784ef69b52c52e393c8be4c3f Mon Sep 17 00:00:00 2001
+From: Martin Lund <mrlund@hotmail.com>
+Date: Mon, 26 Oct 2026 13:16:58 +0100
+Subject: [PATCH 046/144] arm64: dts: qcom: sm8750: add IPA and IMEM nodes
+
+Add the IPA v5.5 node, based on SM8650. The values come from the
+stock SM8750 device tree and the downstream sun-ipa.dtsi:
+
+- IPA interrupt is SPI 655 (SM8650: 654)
+- the config path ends at SLAVE_IPA_CFG on cnoc_main
+- the modem tables live at IMEM 0x14683000, size 0x2000
+
+Add the IMEM node that holds the modem tables.
+
+Assisted-by: Grok Bot
+Signed-off-by: Martin Lund <mrlund@hotmail.com>
+(cherry picked from commit 044809a6c0c0f4319513abf01d3b908dded8f881)
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0064-arm64-dts-qcom-sm8750-add-IPA-and-IMEM-nodes.patch
+Import-SHA256: b2cd2d03a747aec17787dba07d9a137da728f1ad5d564f6dc066444ce975a6e1
+Import-Provenance: mail headers
+(cherry picked from commit e3661401b160174c1974dd39581e22c19e1bec63)
+---
+ arch/arm64/boot/dts/qcom/sm8750.dtsi | 60 ++++++++++++++++++++++++++++
+ 1 file changed, 60 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8750.dtsi b/arch/arm64/boot/dts/qcom/sm8750.dtsi
+index 1a960ff855..2e8e6bc603 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8750.dtsi
+@@ -2467,6 +2467,52 @@ adreno_smmu: iommu@3da0000 {
+ 			dma-coherent;
+ 		};
+ 
++		ipa: ipa@3f40000 {
++			compatible = "qcom,sm8750-ipa";
++
++			iommus = <&apps_smmu 0x4a0 0x0>,
++				 <&apps_smmu 0x4a2 0x0>;
++			reg = <0 0x3f40000 0 0x10000>,
++			      <0 0x3f50000 0 0x5000>,
++			      <0 0x3e04000 0 0xfc000>;
++			reg-names = "ipa-reg",
++				    "ipa-shared",
++				    "gsi";
++
++			interrupts-extended = <&intc GIC_SPI 655 IRQ_TYPE_EDGE_RISING>,
++					      <&intc GIC_SPI 432 IRQ_TYPE_LEVEL_HIGH>,
++					      <&ipa_smp2p_in 0 IRQ_TYPE_EDGE_RISING>,
++					      <&ipa_smp2p_in 1 IRQ_TYPE_EDGE_RISING>;
++			interrupt-names = "ipa",
++					  "gsi",
++					  "ipa-clock-query",
++					  "ipa-setup-ready";
++
++			clocks = <&rpmhcc RPMH_IPA_CLK>;
++			clock-names = "core";
++
++			interconnects = <&aggre2_noc MASTER_IPA QCOM_ICC_TAG_ALWAYS
++					 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>,
++					<&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ACTIVE_ONLY
++					 &cnoc_main SLAVE_IPA_CFG QCOM_ICC_TAG_ACTIVE_ONLY>;
++			interconnect-names = "memory",
++					     "config";
++
++			qcom,qmp = <&aoss_qmp>;
++
++			qcom,smem-states = <&ipa_smp2p_out 0>,
++					   <&ipa_smp2p_out 1>;
++			qcom,smem-state-names = "ipa-clock-enabled-valid",
++						"ipa-clock-enabled";
++
++			qcom,gsi-loader = "self";
++			memory-region = <&ipa_fw_mem>;
++
++			sram = <&ipa_modem_tables>;
++
++			status = "disabled";
++		};
++
+ 		remoteproc_mpss: remoteproc@4080000 {
+ 			compatible = "qcom,sm8750-mpss-pas";
+ 			reg = <0x0 0x04080000 0x0 0x10000>;
+@@ -5570,6 +5616,20 @@ tpdm_swao_out: endpoint {
+ 			};
+ 		};
+ 
++		sram@14680000 {
++			compatible = "qcom,sm8750-imem", "syscon", "simple-mfd";
++			reg = <0 0x14680000 0 0x2c000>;
++
++			#address-cells = <1>;
++			#size-cells = <1>;
++
++			ranges = <0 0 0x14680000 0x2c000>;
++
++			ipa_modem_tables: modem-tables@3000 {
++				reg = <0x3000 0x2000>;
++			};
++		};
++
+ 		apps_smmu: iommu@15000000 {
+ 			compatible = "qcom,sm8750-smmu-500", "qcom,smmu-500", "arm,mmu-500";
+ 			reg = <0x0 0x15000000 0x0 0x100000>;

@@ -2,11 +2,11 @@
 
 [中文](PATCHES.zh.md) · [Polaris index](../../../../docs/polaris/README.md)
 
-The queue targets Linux 7.3-rc6; hardware results for this device were obtained
+The queue targets Linux 7.3; hardware results for this device were obtained
 with earlier 7.x kernels. See the [shared kernel status](../../README.md).
 
-The package selects `linuxPackages_testing.kernel` from Nixpkgs.
-It targets Linux 7.3-rc6. [`series.nix`](series.nix) lists active patches in
+The package selects `linuxPackages_latest.kernel` from Nixpkgs.
+It targets Linux 7.3. [`series.nix`](series.nix) lists active patches in
 application order. The package builds `qcom/sdm845-xiaomi-polaris.dtb` and
 Android-compatible `Image.gz` with LLVM 23.
 

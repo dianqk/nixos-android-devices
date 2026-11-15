@@ -29,15 +29,21 @@ in
         recovery = lib.mkDefault true;
       };
       firmwarePackage = lib.mkDefault (androidPackages.mkUBoot { device = "clover"; });
+      # ABL boots recovery, whose ramdisk is a FIT (kernel, initrd, DTB) that
+      # this U-Boot copies into its fastboot buffer and boots. ABL does not
+      # start an image whose ramdisk exceeds 35 MiB (36 MiB failed on
+      # hardware); an LZMA kernel keeps the FIT below that.
+      recoveryLoader = "u-boot-fit";
+      recoveryFitKernelCompression = "lzma";
+      recoveryFitMaximumBytes = 36700160;
       directKernel.enable = lib.mkDefault true;
       uefi = {
         device = lib.mkDefault "/dev/disk/by-partlabel/system";
         requireStandardEsp = false;
+        # The physical system partition keeps its stock 3 GiB size; the
+        # recovery ESP role checks a plausible range instead.
+        espSizeBytes = lib.mkDefault null;
       };
-    };
-    initrdUsb.ssh.hostKeyStorage = {
-      compatible = "xiaomi,clover";
-      controller = "c0c4000.sdhci";
     };
     recovery.targetHostName = board.systemHostName;
   };

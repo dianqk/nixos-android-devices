@@ -1,0 +1,102 @@
+From 2b1dc727b213d6db3c6d861e5e53f863b6d100f6 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 8 Nov 2026 16:44:42 +0800
+Subject: [PATCH 060/144] cpufreq: refresh pressure after CPU capacity
+ normalization
+
+Policies registered before the last architecture capacity callback can
+cache pressure against an intermediate CPU capacity. Refresh pressure
+after all CPU capacities are normalized and the notifier is unregistered.
+
+Follow the pressure-only refresh API proposed by Zhongqiu Han in review,
+without calling the driver frequency getter or changing policy limits.
+Locally accept only the policy's managing CPU while holding the write
+lock, avoiding duplicate refreshes when architecture code visits all CPUs.
+Also provide the CPU_FREQ-disabled stub.
+
+Suggested-by: Zhongqiu Han <zhongqiu.han@oss.qualcomm.com>
+Link: https://lore.kernel.org/r/77749e58-84d6-43c1-bd37-98d0046231a1@oss.qualcomm.com
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0079-cpufreq-refresh-pressure-after-capacity-normalization.patch
+Import-SHA256: 31d9bb38df75891e65f12ca4ea88f7d3877e761e11931c8a62fc28c9c6c11007
+Import-Provenance: mail headers
+(cherry picked from commit b6080b762d68ec66b2ec0fef16270bd6752b7e5f)
+---
+ drivers/base/arch_topology.c |  6 ++++++
+ drivers/cpufreq/cpufreq.c    | 22 ++++++++++++++++++++++
+ include/linux/cpufreq.h      |  2 ++
+ 3 files changed, 30 insertions(+)
+
+diff --git a/drivers/base/arch_topology.c b/drivers/base/arch_topology.c
+index 92966be712..64656d71ae 100644
+--- a/drivers/base/arch_topology.c
++++ b/drivers/base/arch_topology.c
+@@ -455,9 +455,15 @@ core_initcall(register_cpufreq_notifier);
+ 
+ static void parsing_done_workfn(struct work_struct *work)
+ {
++	int cpu;
++
+ 	cpufreq_unregister_notifier(&init_cpu_capacity_notifier,
+ 					 CPUFREQ_POLICY_NOTIFIER);
+ 	free_cpumask_var(cpus_to_visit);
++
++	/* Earlier policies cached pressure before all CPU capacities were normalized. */
++	for_each_possible_cpu(cpu)
++		cpufreq_refresh_pressure(cpu);
+ }
+ 
+ #else
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index e7cc77632e..0901c1913c 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -2625,6 +2625,28 @@ static void cpufreq_update_pressure(struct cpufreq_policy *policy)
+ 		WRITE_ONCE(per_cpu(cpufreq_pressure, cpu), pressure);
+ }
+ 
++/**
++ * cpufreq_refresh_pressure - Recalculate cached pressure after capacity changes
++ * @cpu: Managing CPU of the policy to refresh
++ *
++ * Acquires the policy write lock; callers must not already hold it. Only the
++ * managing CPU refreshes a policy, allowing architecture code to visit all CPUs.
++ */
++void cpufreq_refresh_pressure(unsigned int cpu)
++{
++	struct cpufreq_policy *policy __free(put_cpufreq_policy) = cpufreq_cpu_get(cpu);
++
++	if (!policy)
++		return;
++
++	guard(cpufreq_policy_write)(policy);
++
++	if (cpu != policy->cpu || policy_is_inactive(policy))
++		return;
++
++	cpufreq_update_pressure(policy);
++}
++
+ /**
+  * cpufreq_set_policy - Modify cpufreq policy parameters.
+  * @policy: Policy object to modify.
+diff --git a/include/linux/cpufreq.h b/include/linux/cpufreq.h
+index aa8dadcbd1..ea7cc1a37f 100644
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@ -252,6 +252,7 @@ u64 get_cpu_idle_time(unsigned int cpu, u64 *wall, int io_busy);
+ void refresh_frequency_limits(struct cpufreq_policy *policy);
+ void cpufreq_update_policy(unsigned int cpu);
+ void cpufreq_update_limits(unsigned int cpu);
++void cpufreq_refresh_pressure(unsigned int cpu);
+ bool have_governor_per_policy(void);
+ bool cpufreq_supports_freq_invariance(void);
+ struct kobject *get_governor_parent_kobj(struct cpufreq_policy *policy);
+@@ -287,6 +288,7 @@ static inline bool cpufreq_supports_freq_invariance(void)
+ }
+ static inline void disable_cpufreq(void) { }
+ static inline void cpufreq_update_limits(unsigned int cpu) { }
++static inline void cpufreq_refresh_pressure(unsigned int cpu) { }
+ static inline unsigned long cpufreq_get_pressure(int cpu)
+ {
+ 	return 0;

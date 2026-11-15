@@ -1,0 +1,1577 @@
+From 6b833998c4b8c1a5fa2d5b82cb81a5dc23d3ac2c Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 13 Nov 2026 00:19:43 +0800
+Subject: [PATCH 141/144] power: supply: qcom_battmgr: prepare bounded normal
+ wireless charging
+
+Consolidate raw limits, receiver query lifecycle, FOD shadows, bounded experiments and fresh flow/voltage telemetry.
+
+Consolidated from local follow-ups:
+  e924f823f5ba2eb6bf899b32fc13c10f270c5811 power: supply: qcom_battmgr: read raw normal charging limits
+  bca178fd0eb9b7ad747cdb851e7ff8bc3705cb5e power: supply: nu1669: add an explicit bounded GET_TX_ID diagnostic
+  22a45879d46414115d4288a76664fddbb8584479 power: supply: nu1669: cancel queries before debugfs removal
+  0ca35466d2d9f00c664349f7b2aa74e40597a6f7 power: supply: nu1669: use the nonseekable default for query writes
+  1b7c5a61880ff36a01fab59179fc8b7214cb47a1 power: supply: nu1669: expose passive raw FOD mailbox shadows
+  b13306d29f8bf4da1115b4900fc123c0579ea546 power: supply: qcom_battmgr: bound an ACK-only input request experiment
+  08aa82e9ebc592d956e4ae0488e541b7a6679b9a power: supply: qcom_battmgr: couple a bounded 750mA input experiment to manual pause
+  ca45f232fb1bd168514554d1940eee1c42d4b4db power: supply: qcom_battmgr: report fresh normal wireless battery flow
+  f1eb7396f495fccb9f787131207239d0939dda76 power: supply: qcom_battmgr: read optional raw voltage sample pair
+---
+ drivers/power/supply/nu1669.c       | 551 ++++++++++++++++++++--
+ drivers/power/supply/qcom_battmgr.c | 679 +++++++++++++++++++++++++++-
+ 2 files changed, 1191 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/power/supply/nu1669.c b/drivers/power/supply/nu1669.c
+index 0a4331eeed..e83d8b7c9f 100644
+--- a/drivers/power/supply/nu1669.c
++++ b/drivers/power/supply/nu1669.c
+@@ -4,25 +4,40 @@
+  * Copyright (C) 2026 dianqk
+  *
+  * NU1669 firmware shadow layout derived from the Oplus NU1669 driver.
+- * This driver only observes the receiver. It never sends firmware commands,
+- * acknowledges events, changes protection settings or enables power transfer.
++ * Passive telemetry plus an explicit root-only GET_TX_ID diagnostic.
++ * No power, mode, protection, authentication or voltage commands are provided.
+  */
+ 
+ #include <linux/atomic.h>
++#include <linux/bits.h>
++#include <linux/debugfs.h>
++#include <linux/delay.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/i2c.h>
+ #include <linux/interrupt.h>
++#include <linux/jiffies.h>
++#include <linux/limits.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/power_supply.h>
+ #include <linux/power/nu1669.h>
+ #include <linux/regmap.h>
++#include <linux/seq_file.h>
+ #include <linux/unaligned.h>
++#include <linux/uaccess.h>
+ #include <linux/workqueue.h>
+ 
+ #define NU1669_INFO_BASE		0x2100
+ #define NU1669_INFO_SIZE		0x48
+ #define NU1669_POLL_MS		2000
++#define NU1669_FLAGS		0x2120
++#define NU1669_BC		0x215b
++#define NU1669_FOD_SHADOW	0x21a0
++#define NU1669_FOD_SHADOW_SIZE	43
++#define NU1669_BUSY		0x212c
++#define NU1669_RX_DATA		BIT(10)
++#define NU1669_QUERY_FAULTS	(GENMASK(6, 0) | BIT(11) | GENMASK(18, 14) | \
++				 BIT(20) | GENMASK(31, 24))
+ 
+ struct nu1669 {
+ 	struct regmap *regmap;
+@@ -30,7 +45,24 @@ struct nu1669 {
+ 	struct gpio_desc *event;
+ 	struct power_supply *psy;
+ 	struct delayed_work poll;
++	/* Serializes complete diagnostic transactions and every shadow/mailbox I/O. */
+ 	struct mutex lock;
++	struct dentry *debugfs;
++	bool physical_absent;
++	bool physical_verified;
++	bool query_rearm;
++	bool query_used;
++	bool query_quarantined;
++	bool result_valid;
++	unsigned long query_deadline;
++	u8 query_identity[5];
++	u32 query_sequence;
++	u32 query_generation;
++	u32 query_initial_flags;
++	u32 query_sticky;
++	u32 query_last_flags;
++	int query_status;
++	u8 query_reply[6];
+ 	int present;
+ 	int irq;
+ 	atomic_t generation;
+@@ -43,6 +75,8 @@ struct nu1669 {
+ 
+ static const struct regmap_range nu1669_read_ranges[] = {
+ 	regmap_reg_range(NU1669_INFO_BASE, NU1669_INFO_BASE + NU1669_INFO_SIZE - 1),
++	regmap_reg_range(NU1669_BC, NU1669_BC + 5),
++	regmap_reg_range(NU1669_FOD_SHADOW, NU1669_FOD_SHADOW + NU1669_FOD_SHADOW_SIZE - 1),
+ };
+ 
+ static const struct regmap_access_table nu1669_read_table = {
+@@ -52,14 +86,15 @@ static const struct regmap_access_table nu1669_read_table = {
+ 
+ static bool nu1669_writeable_reg(struct device *dev, unsigned int reg)
+ {
+-	return false;
++	/* No public register API: fixed typed helpers alone can reach these addresses. */
++	return reg <= 5 || reg == 0x0060 || reg == NU1669_BUSY;
+ }
+ 
+ static const struct regmap_config nu1669_regmap_config = {
+ 	.reg_bits = 16,
+ 	.val_bits = 8,
+ 	.reg_format_endian = REGMAP_ENDIAN_BIG,
+-	.max_register = NU1669_INFO_BASE + NU1669_INFO_SIZE - 1,
++	.max_register = NU1669_FOD_SHADOW + NU1669_FOD_SHADOW_SIZE - 1,
+ 	.rd_table = &nu1669_read_table,
+ 	.writeable_reg = nu1669_writeable_reg,
+ 	.cache_type = REGCACHE_NONE,
+@@ -137,36 +172,63 @@ static const struct power_supply_desc nu1669_psy_desc = {
+ 	.get_property = nu1669_get_property,
+ };
+ 
++/* Caller holds lock. Logical generation changes alone never rearm a query. */
++static void nu1669_observe_presence(struct nu1669 *rx, int present)
++{
++	if (present <= 0)
++		rx->result_valid = false;
++	if (!present)
++		rx->physical_absent = true;
++	else if (present > 0 && rx->physical_absent) {
++		rx->physical_absent = false;
++		rx->physical_verified = true;
++		rx->query_rearm = true;
++		rx->result_valid = false;
++	}
++}
++
++static int nu1669_live(struct nu1669 *rx, u32 generation)
++{
++	int present;
++
++	if (READ_ONCE(rx->suspended) || READ_ONCE(rx->stopped) ||
++	    generation != atomic_read(&rx->generation))
++		return -ECANCELED;
++	present = gpiod_get_value_cansleep(rx->connected);
++	nu1669_observe_presence(rx, present);
++	if (present <= 0)
++		return present < 0 ? present : -ENODEV;
++	return generation == atomic_read(&rx->generation) &&
++		!READ_ONCE(rx->suspended) && !READ_ONCE(rx->stopped) ? 0 : -ECANCELED;
++}
++
++static int nu1669_read_info(struct nu1669 *rx, u32 generation, u8 *info)
++{
++	int ret;
++
++	ret = nu1669_live(rx, generation);
++	if (ret)
++		return ret;
++	ret = regmap_bulk_read(rx->regmap, NU1669_INFO_BASE, info, NU1669_INFO_SIZE);
++	return ret ?: nu1669_live(rx, generation);
++}
++
+ int nu1669_get_snapshot(struct power_supply *psy, struct nu1669_snapshot *snapshot)
+ {
+ 	struct nu1669 *rx;
+ 	u8 info[NU1669_INFO_SIZE];
+ 	u32 generation;
+-	int present, ret;
++	int ret;
+ 
+ 	if (!psy || psy->desc != &nu1669_psy_desc)
+ 		return -EOPNOTSUPP;
+ 	rx = power_supply_get_drvdata(psy);
+-	generation = atomic_read(&rx->generation);
+-	mutex_lock(&rx->lock);
+-	ret = rx->suspended || rx->stopped ? -EBUSY : 0;
+-	mutex_unlock(&rx->lock);
+-	if (ret)
+-		return ret;
+-	present = gpiod_get_value_cansleep(rx->connected);
+-	if (present <= 0)
+-		return present < 0 ? present : -ENODEV;
+-	ret = regmap_bulk_read(rx->regmap, NU1669_INFO_BASE, info, sizeof(info));
+-	if (ret)
+-		return ret;
+-	present = gpiod_get_value_cansleep(rx->connected);
+-	if (present <= 0)
+-		return present < 0 ? present : -ENODEV;
+-
+ 	mutex_lock(&rx->lock);
+-	if (rx->suspended || rx->stopped || generation != atomic_read(&rx->generation)) {
+-		ret = -EAGAIN;
+-	} else {
++	generation = atomic_read(&rx->generation);
++	ret = nu1669_read_info(rx, generation, info);
++	if (ret == -ECANCELED)
++		ret = READ_ONCE(rx->suspended) || READ_ONCE(rx->stopped) ? -EBUSY : -EAGAIN;
++	if (!ret) {
+ 		*snapshot = (struct nu1669_snapshot) {
+ 			.generation = generation,
+ 			.chip_id = get_unaligned_le16(info),
+@@ -236,23 +298,24 @@ static void nu1669_poll(struct work_struct *work)
+ 
+ 	mutex_lock(&rx->lock);
+ 	generation = atomic_read(&rx->generation);
+-	if (rx->suspended || rx->stopped) {
++	if (READ_ONCE(rx->suspended) || READ_ONCE(rx->stopped)) {
+ 		mutex_unlock(&rx->lock);
+ 		return;
+ 	}
+-	mutex_unlock(&rx->lock);
+ 
+ 	present = gpiod_get_value_cansleep(rx->connected);
++	nu1669_observe_presence(rx, present);
+ 	if (present > 0) {
+ 		ret = regmap_bulk_read(rx->regmap, NU1669_INFO_BASE, info, sizeof(info));
+ 		if (!ret) {
+ 			present = gpiod_get_value_cansleep(rx->connected);
++			nu1669_observe_presence(rx, present);
+ 			valid = present > 0;
+ 		}
+ 	}
+ 
+-	mutex_lock(&rx->lock);
+-	if (rx->suspended || rx->stopped || generation != atomic_read(&rx->generation)) {
++	if (READ_ONCE(rx->suspended) || READ_ONCE(rx->stopped) ||
++	    generation != atomic_read(&rx->generation)) {
+ 		mutex_unlock(&rx->lock);
+ 		return;
+ 	}
+@@ -287,9 +350,10 @@ static irqreturn_t nu1669_connected_irq(int irq, void *data)
+ 	struct nu1669 *rx = data;
+ 
+ 	mutex_lock(&rx->lock);
++	nu1669_observe_presence(rx, gpiod_get_value_cansleep(rx->connected));
+ 	rx->valid = false;
+ 	memset(rx->info, 0, sizeof(rx->info));
+-	if (!rx->suspended && !rx->stopped) {
++	if (!READ_ONCE(rx->suspended) && !READ_ONCE(rx->stopped)) {
+ 		/* Always notify, including an attach/detach coalesced before sampling. */
+ 		power_supply_changed(rx->psy);
+ 		mod_delayed_work(system_percpu_wq, &rx->poll, 0);
+@@ -302,13 +366,11 @@ static void nu1669_stop(void *data)
+ {
+ 	struct nu1669 *rx = data;
+ 
+-	mutex_lock(&rx->lock);
+-	if (rx->stopped) {
+-		mutex_unlock(&rx->lock);
++	if (xchg(&rx->stopped, true))
+ 		return;
+-	}
+-	rx->stopped = true;
+ 	atomic_inc(&rx->generation);
++	mutex_lock(&rx->lock);
++	rx->result_valid = false;
+ 	rx->valid = false;
+ 	memset(rx->info, 0, sizeof(rx->info));
+ 	mutex_unlock(&rx->lock);
+@@ -317,6 +379,414 @@ static void nu1669_stop(void *data)
+ 	cancel_delayed_work_sync(&rx->poll);
+ }
+ 
++/* All helpers below hold lock; only an explicit root write enters this transport. */
++static int nu1669_query_live(struct nu1669 *rx)
++{
++	int ret = nu1669_live(rx, rx->query_generation);
++
++	if (!ret && time_after_eq(jiffies, rx->query_deadline))
++		ret = -ETIMEDOUT;
++	return ret;
++}
++
++static int nu1669_query_context(struct nu1669 *rx, bool initial)
++{
++	u8 info[NU1669_INFO_SIZE];
++	u16 mv;
++	int ret;
++
++	ret = nu1669_query_live(rx);
++	if (ret)
++		return ret;
++	ret = nu1669_read_info(rx, rx->query_generation, info);
++	if (ret)
++		return ret;
++	mv = get_unaligned_le16(info + 0x34);
++	if (get_unaligned_le16(info) != 0x1669 || info[0x11] != 0x04 || info[0x44] ||
++	    (info[0x46] & BIT(0)) || mv < 4500 || mv > 6000)
++		return -EOPNOTSUPP;
++	if (initial)
++		memcpy(rx->query_identity, info, sizeof(rx->query_identity));
++	else if (memcmp(rx->query_identity, info, sizeof(rx->query_identity)))
++		return -ESTALE;
++	return nu1669_query_live(rx);
++}
++
++static int nu1669_query_flags(struct nu1669 *rx, u32 *flags, bool initial)
++{
++	u8 data[4];
++	int ret;
++
++	ret = nu1669_query_live(rx);
++	if (ret)
++		return ret;
++	ret = regmap_bulk_read(rx->regmap, NU1669_FLAGS, data, sizeof(data));
++	if (ret)
++		return ret;
++	ret = nu1669_query_live(rx);
++	if (ret)
++		return ret;
++	*flags = get_unaligned_le32(data);
++	rx->query_last_flags = *flags;
++	if (*flags == U32_MAX)
++		return -EIO;
++	if (initial) {
++		rx->query_initial_flags = *flags;
++		rx->query_sticky = *flags & ~NU1669_RX_DATA;
++	} else {
++		/* New bits may arrive; loss of captured unrelated evidence is ambiguous. */
++		if (rx->query_sticky & ~*flags)
++			return -EPROTO;
++		if ((*flags & NU1669_QUERY_FAULTS) & ~rx->query_initial_flags)
++			return -EIO;
++		rx->query_sticky |= *flags & ~NU1669_RX_DATA;
++	}
++	return 0;
++}
++
++static int nu1669_query_idle(struct nu1669 *rx)
++{
++	unsigned int busy;
++	int ret, i;
++
++	for (i = 0; i < 30; i++) {
++		ret = nu1669_query_live(rx);
++		if (ret)
++			return ret;
++		ret = regmap_read(rx->regmap, NU1669_BUSY, &busy);
++		if (ret)
++			return ret;
++		ret = nu1669_query_live(rx);
++		if (ret)
++			return ret;
++		if (!busy)
++			return 0;
++		usleep_range(1000, 2000);
++	}
++	return -EBUSY;
++}
++
++/* The only two messages: exact five-byte GET05 or four-byte BIT10-only ACK. */
++static int nu1669_query_mailbox(struct nu1669 *rx, bool ack)
++{
++	static const u8 get_id[] = { 0x18, 0x05, 0x00, 0x00, 0x00 };
++	static const u8 ack_rx[] = { 0x00, 0x04, 0x00, 0x00 };
++	const u8 *data = ack ? ack_rx : get_id;
++	size_t length = ack ? sizeof(ack_rx) : sizeof(get_id);
++	int ret;
++
++	ret = nu1669_query_idle(rx);
++	if (ret)
++		return ret;
++	ret = regmap_write(rx->regmap, NU1669_BUSY, 1);
++	if (ret)
++		return ret;
++	ret = nu1669_query_live(rx);
++	if (ret)
++		return ret;
++	ret = regmap_write(rx->regmap, 0x0000, length);
++	if (ret)
++		return ret;
++	ret = nu1669_query_live(rx);
++	if (ret)
++		return ret;
++	ret = regmap_bulk_write(rx->regmap, 0x0001, data, length);
++	if (ret)
++		return ret;
++	ret = nu1669_query_context(rx, false);
++	if (ret)
++		return ret;
++	/* No retained/new receive event may precede this GET's execute trigger. */
++	{
++		u32 flags;
++
++		ret = nu1669_query_flags(rx, &flags, false);
++		if (ret || (!ack && (flags & NU1669_RX_DATA)))
++			return ret ?: -EBUSY;
++	}
++	ret = regmap_write(rx->regmap, 0x0060, ack ? 0x28 : 0x51);
++	if (ret)
++		return ret;
++	/* Firmware alone releases busy. Availability is not command acceptance. */
++	return nu1669_query_idle(rx);
++}
++
++static int nu1669_query_ack(struct nu1669 *rx)
++{
++	u32 flags;
++	int ret, i;
++
++	ret = nu1669_query_mailbox(rx, true);
++	if (ret)
++		return ret;
++	for (i = 0; i < 30; i++) {
++		ret = nu1669_query_flags(rx, &flags, false);
++		if (ret || !(flags & NU1669_RX_DATA))
++			return ret;
++		usleep_range(1000, 2000);
++	}
++	return -ETIMEDOUT;
++}
++
++static int nu1669_query_reply(struct nu1669 *rx, u8 reply[6])
++{
++	u8 again[6];
++	int ret;
++
++	ret = nu1669_query_live(rx);
++	if (ret)
++		return ret;
++	ret = regmap_bulk_read(rx->regmap, NU1669_BC, reply, 6);
++	if (ret)
++		return ret;
++	ret = nu1669_query_live(rx);
++	if (ret)
++		return ret;
++	ret = regmap_bulk_read(rx->regmap, NU1669_BC, again, sizeof(again));
++	if (ret)
++		return ret;
++	ret = nu1669_query_live(rx);
++	if (ret)
++		return ret;
++	return memcmp(reply, again, sizeof(again)) ? -EPROTO : 0;
++}
++
++static int nu1669_query_tx_id(struct nu1669 *rx)
++{
++	u8 reply[6];
++	u32 flags;
++	int ret, stale, unrelated = 0;
++
++	if (!mutex_trylock(&rx->lock))
++		return -EBUSY;
++	if (rx->query_used && !rx->query_rearm) {
++		ret = -EBUSY;
++		goto unlock;
++	}
++	rx->query_used = true;
++	rx->query_rearm = false;
++	rx->result_valid = false;
++	memset(rx->query_reply, 0, sizeof(rx->query_reply));
++	rx->query_initial_flags = 0;
++	rx->query_last_flags = 0;
++	rx->query_sticky = 0;
++	rx->query_sequence++;
++	rx->query_generation = atomic_read(&rx->generation);
++	rx->query_deadline = jiffies + 2 * HZ;
++	ret = nu1669_query_context(rx, true);
++	if (ret)
++		goto finish;
++	ret = nu1669_query_flags(rx, &flags, true);
++	if (ret)
++		goto finish;
++	/* A retained BC frame is never a response to this query. Drain at most twice. */
++	for (stale = 0; flags & NU1669_RX_DATA; stale++) {
++		if (stale == 2) {
++			ret = -EBUSY;
++			goto finish;
++		}
++		ret = nu1669_query_reply(rx, reply);
++		if (ret)
++			goto finish;
++		ret = nu1669_query_ack(rx);
++		if (ret)
++			goto finish;
++		ret = nu1669_query_flags(rx, &flags, false);
++		if (ret)
++			goto finish;
++	}
++	ret = nu1669_query_context(rx, false);
++	if (ret)
++		goto finish;
++	/* Observe zero immediately before reserving and committing the GET05. */
++	ret = nu1669_query_flags(rx, &flags, false);
++	if (ret || (flags & NU1669_RX_DATA)) {
++		ret = ret ?: -EBUSY;
++		goto finish;
++	}
++	rx->query_quarantined = false;
++	ret = nu1669_query_mailbox(rx, false);
++	if (ret)
++		goto finish;
++	for (;;) {
++		ret = nu1669_query_flags(rx, &flags, false);
++		if (ret)
++			goto finish;
++		if (!(flags & NU1669_RX_DATA)) {
++			msleep(50);
++			continue;
++		}
++		ret = nu1669_query_reply(rx, reply);
++		if (ret)
++			goto finish;
++		if (reply[0] != 0x5f || reply[1] != 0x05) {
++			if ((reply[0] != 0x5f && reply[0] != 0x4f) ||
++			    (reply[0] == 0x4f && ((reply[1] ^ reply[2]) != 0xff ||
++					       (reply[3] ^ reply[4]) != 0xff)) || ++unrelated > 2) {
++				ret = -EPROTO;
++				goto finish;
++			}
++			ret = nu1669_query_ack(rx);
++			if (ret)
++				goto finish;
++			continue;
++		}
++		ret = nu1669_query_ack(rx);
++		if (ret)
++			goto finish;
++		ret = nu1669_query_context(rx, false);
++		if (ret)
++			goto finish;
++		memcpy(rx->query_reply, reply, sizeof(rx->query_reply));
++		rx->result_valid = true;
++		break;
++	}
++finish:
++	rx->query_status = ret;
++	if (ret) {
++		rx->result_valid = false;
++		rx->query_quarantined = true;
++		memset(rx->query_reply, 0, sizeof(rx->query_reply));
++	}
++unlock:
++	mutex_unlock(&rx->lock);
++	return ret;
++}
++
++static ssize_t nu1669_query_tx_id_write(struct file *file, const char __user *buffer,
++				      size_t count, loff_t *position)
++{
++	struct nu1669 *rx = file->private_data;
++	char trigger[2];
++	int ret;
++
++	if (count != 1 && count != 2)
++		return -EINVAL;
++	if (copy_from_user(trigger, buffer, count))
++		return -EFAULT;
++	if (trigger[0] != '1' || (count == 2 && trigger[1] != '\n'))
++		return -EINVAL;
++	ret = nu1669_query_tx_id(rx);
++	return ret ? ret : (ssize_t)count;
++}
++
++static const struct file_operations nu1669_query_tx_id_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = nu1669_query_tx_id_write,
++};
++
++static int nu1669_last_tx_id_show(struct seq_file *s, void *unused)
++{
++	struct nu1669 *rx = s->private;
++	int present;
++
++	mutex_lock(&rx->lock);
++	present = gpiod_get_value_cansleep(rx->connected);
++	nu1669_observe_presence(rx, present);
++	if (present <= 0 || READ_ONCE(rx->suspended) || READ_ONCE(rx->stopped) ||
++	    rx->query_generation != atomic_read(&rx->generation))
++		rx->result_valid = false;
++	seq_printf(s, "sequence=%u generation=%u status=%d physical_attach_verified=%u quarantined=%u\n",
++		   rx->query_sequence, rx->query_generation, rx->query_status,
++		   rx->physical_verified, rx->query_quarantined);
++	seq_printf(s, "initial_flags=0x%08x last_flags=0x%08x\n",
++		   rx->query_initial_flags, rx->query_last_flags);
++	if (rx->result_valid)
++		seq_printf(s, "reply=%*ph\n", (int)sizeof(rx->query_reply), rx->query_reply);
++	else
++		seq_puts(s, "reply=unavailable\n");
++	mutex_unlock(&rx->lock);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(nu1669_last_tx_id);
++
++/* Passive mailbox shadows only: no read command or calibration write is sent. */
++static int nu1669_fod_shadow_get(struct nu1669 *rx, u8 *magcvr, u8 *shadow)
++{
++	u8 before[NU1669_INFO_SIZE], after[NU1669_INFO_SIZE];
++	u8 first[NU1669_FOD_SHADOW_SIZE], second[NU1669_FOD_SHADOW_SIZE];
++	u32 generation;
++	int ret;
++
++	mutex_lock(&rx->lock);
++	generation = atomic_read(&rx->generation);
++	ret = nu1669_read_info(rx, generation, before);
++	if (ret)
++		goto out;
++	if (get_unaligned_le16(before) != 0x1669) {
++		ret = -ENODEV;
++		goto out;
++	}
++	ret = regmap_bulk_read(rx->regmap, NU1669_FOD_SHADOW, first, sizeof(first));
++	if (ret)
++		goto out;
++	ret = nu1669_live(rx, generation);
++	if (ret)
++		goto out;
++	ret = regmap_bulk_read(rx->regmap, NU1669_FOD_SHADOW, second, sizeof(second));
++	if (ret)
++		goto out;
++	ret = nu1669_read_info(rx, generation, after);
++	if (ret)
++		goto out;
++	if (memcmp(before, after, 5)) {
++		ret = -ESTALE;
++		goto out;
++	}
++	if (before[0x18] != after[0x18] || memcmp(first, second, sizeof(first))) {
++		ret = -EAGAIN;
++		goto out;
++	}
++	*magcvr = after[0x18];
++	memcpy(shadow, second, sizeof(second));
++out:
++	if (ret == -ECANCELED)
++		ret = READ_ONCE(rx->suspended) || READ_ONCE(rx->stopped) ? -EBUSY : -ESTALE;
++	mutex_unlock(&rx->lock);
++	return ret;
++}
++
++static int nu1669_fod_shadow_show(struct seq_file *s, void *unused)
++{
++	u8 magcvr, shadow[NU1669_FOD_SHADOW_SIZE];
++	int ret;
++
++	ret = nu1669_fod_shadow_get(s->private, &magcvr, shadow);
++	if (ret)
++		return ret;
++	seq_printf(s, "magcvr_shadow=0x%02x write_mode_shadow=0x%02x length_shadow=%u read_mode_shadow=0x%02x\n",
++		   magcvr, shadow[0], shadow[1], shadow[2]);
++	seq_printf(s, "parameters_shadow=%*ph\n", NU1669_FOD_SHADOW_SIZE - 3, shadow + 3);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(nu1669_fod_shadow);
++
++static void nu1669_debugfs_remove(void *data)
++{
++	struct nu1669 *rx = data;
++
++	/* Cancel active I/O before the debugfs proxy waits for its callback to drain. */
++	nu1669_stop(rx);
++	debugfs_remove_recursive(rx->debugfs);
++	rx->debugfs = NULL;
++}
++
++static int nu1669_debugfs_init(struct nu1669 *rx, struct device *dev)
++{
++	struct dentry *directory;
++
++	/* Per-device name permits multiple receivers without sharing query state. */
++	directory = debugfs_create_dir(dev_name(dev), NULL);
++	if (IS_ERR_OR_NULL(directory))
++		return 0;
++	rx->debugfs = directory;
++	debugfs_create_file("fod_shadow", 0400, directory, rx, &nu1669_fod_shadow_fops);
++	debugfs_create_file("query_tx_id", 0200, directory, rx, &nu1669_query_tx_id_fops);
++	debugfs_create_file("last_tx_id", 0400, directory, rx, &nu1669_last_tx_id_fops);
++	return devm_add_action_or_reset(dev, nu1669_debugfs_remove, rx);
++}
++
+ static int nu1669_probe(struct i2c_client *client)
+ {
+ 	struct power_supply_config psy_cfg = {};
+@@ -368,6 +838,10 @@ static int nu1669_probe(struct i2c_client *client)
+ 	if (ret)
+ 		return ret;
+ 
++	ret = nu1669_debugfs_init(rx, dev);
++	if (ret)
++		return ret;
++
+ 	/* An unpowered receiver is normal; do not require an I2C reply at probe. */
+ 	schedule_delayed_work(&rx->poll, 0);
+ 	return 0;
+@@ -377,9 +851,10 @@ static int nu1669_suspend(struct device *dev)
+ {
+ 	struct nu1669 *rx = dev_get_drvdata(dev);
+ 
+-	mutex_lock(&rx->lock);
+-	rx->suspended = true;
++	WRITE_ONCE(rx->suspended, true);
+ 	atomic_inc(&rx->generation);
++	mutex_lock(&rx->lock);
++	rx->result_valid = false;
+ 	rx->valid = false;
+ 	memset(rx->info, 0, sizeof(rx->info));
+ 	mutex_unlock(&rx->lock);
+@@ -394,7 +869,7 @@ static int nu1669_resume(struct device *dev)
+ 	struct nu1669 *rx = dev_get_drvdata(dev);
+ 
+ 	mutex_lock(&rx->lock);
+-	rx->suspended = false;
++	WRITE_ONCE(rx->suspended, false);
+ 	mutex_unlock(&rx->lock);
+ 	enable_irq(rx->irq);
+ 	mod_delayed_work(system_percpu_wq, &rx->poll, 0);
+@@ -426,5 +901,5 @@ static struct i2c_driver nu1669_driver = {
+ module_i2c_driver(nu1669_driver);
+ 
+ MODULE_AUTHOR("dianqk <dianqk@dianqk.net>");
+-MODULE_DESCRIPTION("NU1669 read-only wireless receiver telemetry");
++MODULE_DESCRIPTION("NU1669 receiver telemetry and explicit GET_TX_ID diagnostic");
+ MODULE_LICENSE("GPL");
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 1c542ba816..265ccf068d 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) 2022, Linaro Ltd
+  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+  */
++#include <linux/atomic.h>
+ #include <linux/auxiliary_bus.h>
+ #include <linux/devm-helpers.h>
+ #include <linux/debugfs.h>
+@@ -15,11 +16,13 @@
+ #include <linux/power_supply.h>
+ #include <linux/power/nu1669.h>
+ #include <linux/property.h>
++#include <linux/seq_file.h>
+ #include <linux/soc/qcom/pdr.h>
+ #include <linux/soc/qcom/pmic_glink.h>
+ #include <linux/math.h>
+ #include <linux/delay.h>
+ #include <linux/units.h>
++#include <linux/uaccess.h>
+ 
+ #define BATTMGR_CHEMISTRY_LEN	4
+ #define BATTMGR_STRING_LEN	128
+@@ -362,6 +365,15 @@ enum qcom_battmgr_dodge_power_state {
+ 	DODGE_POWER_ON,
+ };
+ 
++enum dodge_input_boot_state {
++	INPUT_BOOT_UNUSED,
++	INPUT_BOOT_CONSUMED_NO_REQUEST,
++	INPUT_BOOT_MAYBE_OWNED,
++	INPUT_BOOT_CLEANUP_ACK,
++};
++/* The experimental start is disabled for modular builds, so this is boot-lifetime. */
++static atomic_t dodge_input_boot_state = ATOMIC_INIT(INPUT_BOOT_UNUSED);
++
+ struct qcom_battmgr {
+ 	struct device *dev;
+ 	struct pmic_glink_client *client;
+@@ -374,6 +386,22 @@ struct qcom_battmgr {
+ 	struct power_supply *wls_psy;
+ 	struct dentry *dodge_debugfs;
+ 	struct delayed_work charge_work;
++	struct delayed_work input_work;
++	struct nu1669_snapshot input_receiver;
++	u32 input_generation;
++	u32 input_usb_epoch;
++	u32 input_session_usb_epoch;
++	unsigned long input_deadline;
++	const char *input_phase;
++	const char *input_stage;
++	const char *input_reason;
++	const char *input_failure_stage;
++	int input_start_ack;
++	int input_cleanup_ack;
++	int input_error;
++	bool input_owned;
++	bool input_frozen;
++	bool input_closed;
+ 	struct nu1669_snapshot charge_receiver;
+ 	u32 charge_generation;
+ 	u32 charge_session_epoch;
+@@ -408,6 +436,10 @@ struct qcom_battmgr {
+ 	u32 dodge_gauge[9];
+ 	u32 dodge_input_suspend;
+ 	int dodge_input_suspend_error;
++	u32 dodge_voltage_word2;
++	u32 dodge_voltage_word13;
++	u32 dodge_voltage_words;
++	int dodge_voltage_error;
+ 	unsigned long dodge_gauge_updated;
+ 	u32 dodge_gauge_generation;
+ 	u32 dodge_service_generation;
+@@ -557,10 +589,20 @@ static int qcom_battmgr_dodge_pd_decode(const void *data, size_t len,
+ 	return 0;
+ }
+ 
++/* Notification side only queues validation; generic WLS data is not a detach. */
++static void qcom_battmgr_input_probe_event(struct qcom_battmgr *battmgr)
++{
++	if (READ_ONCE(battmgr->input_owned) && !READ_ONCE(battmgr->input_frozen) &&
++	    !battmgr->charge_closing && !battmgr->charge_suspending &&
++	    !battmgr->dodge_otg_stopping)
++		mod_delayed_work(system_percpu_wq, &battmgr->input_work, 0);
++}
++
+ /* Caller holds dodge_otg_lock; never wait for firmware in a notification. */
+ static void qcom_battmgr_charge_event(struct qcom_battmgr *battmgr)
+ {
+ 	battmgr->charge_epoch++;
++	qcom_battmgr_input_probe_event(battmgr);
+ 	if (battmgr->service_up && !battmgr->charge_closing && !battmgr->charge_suspending)
+ 		mod_delayed_work(system_percpu_wq, &battmgr->charge_work, 0);
+ }
+@@ -1075,6 +1117,124 @@ static int qcom_battmgr_charge_get_behaviour(struct qcom_battmgr *battmgr,
+ 	return ret;
+ }
+ 
++static bool qcom_battmgr_dodge_status_receiver(const struct nu1669_snapshot *snapshot)
++{
++	return snapshot->chip_id == 0x1669 && snapshot->protocol == 0x04 &&
++		!snapshot->b2b_on && !(snapshot->b2b_state & BIT(0)) &&
++		snapshot->vout_mv >= 4500 && snapshot->vout_mv <= 6000;
++}
++
++/* Firmware STATUS misses normal wireless charging; qualify fresh gauge flow. */
++static int qcom_battmgr_dodge_wireless_status(struct qcom_battmgr *battmgr,
++					    union power_supply_propval *val)
++{
++	struct qcom_battmgr_dodge_request request = {
++		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
++		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
++		.hdr.opcode = cpu_to_le32(DODGE_GAUGE_OPCODE),
++		.data_size = cpu_to_le32(DODGE_GAUGE_WORDS * sizeof(__le32)),
++	};
++	struct nu1669_snapshot before, after;
++	union power_supply_propval present;
++	unsigned long flags;
++	u32 generation, usb_epoch = 0;
++	bool derived = false;
++	int ret, present_ret, status;
++	s32 current_ua;
++
++	mutex_lock(&battmgr->lock);
++	generation = READ_ONCE(battmgr->dodge_service_generation);
++	if (!battmgr->service_up) {
++		ret = -EAGAIN;
++		goto out;
++	}
++	/* Even FULL is fetched fresh; an old cached enumeration is not authority. */
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET, BATT_STATUS, 0);
++	if (ret)
++		goto out;
++	status = battmgr->status.status;
++	if (status < POWER_SUPPLY_STATUS_UNKNOWN || status > POWER_SUPPLY_STATUS_FULL) {
++		ret = -EPROTO;
++		goto out;
++	}
++	if (!battmgr->wireless_receiver)
++		goto publish;
++	present_ret = power_supply_get_property(battmgr->wireless_receiver,
++					       POWER_SUPPLY_PROP_PRESENT, &present);
++	if (!present_ret && !present.intval)
++		goto publish;
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET, USB_ONLINE, 0);
++	if (ret)
++		goto out;
++	if (battmgr->usb.online)
++		goto publish;
++	if (present_ret) {
++		ret = present_ret;
++		goto out;
++	}
++	ret = nu1669_get_snapshot(battmgr->wireless_receiver, &before);
++	if (ret)
++		goto out;
++	if (!qcom_battmgr_dodge_status_receiver(&before))
++		goto publish;
++	usb_epoch = READ_ONCE(battmgr->input_usb_epoch);
++	/* STATUS always requests fresh gauge data, irrespective of the one-second cache. */
++	WRITE_ONCE(battmgr->dodge_gauge_valid, false);
++	WRITE_ONCE(battmgr->dodge_gauge_pending, true);
++	ret = qcom_battmgr_request(battmgr, &request, sizeof(request));
++	WRITE_ONCE(battmgr->dodge_gauge_pending, false);
++	if (ret)
++		goto out;
++	if ((s32)battmgr->dodge_gauge[1] == S32_MIN) {
++		ret = -ERANGE;
++		goto out;
++	}
++	/* Same OEM discharge-positive microamp conversion as CURRENT_NOW. */
++	current_ua = -(s32)battmgr->dodge_gauge[1];
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET, USB_ONLINE, 0);
++	if (ret)
++		goto out;
++	if (battmgr->usb.online) {
++		ret = -EAGAIN;
++		goto out;
++	}
++	ret = nu1669_get_snapshot(battmgr->wireless_receiver, &after);
++	if (ret)
++		goto out;
++	if (!qcom_battmgr_dodge_status_receiver(&after) ||
++	    before.generation != after.generation || before.hw_version != after.hw_version ||
++	    before.customer_id != after.customer_id || before.fw_version != after.fw_version) {
++		ret = -EAGAIN;
++		goto out;
++	}
++	if (current_ua > 50000)
++		status = POWER_SUPPLY_STATUS_CHARGING;
++	else if (current_ua < -50000)
++		status = POWER_SUPPLY_STATUS_DISCHARGING;
++	else if (status != POWER_SUPPLY_STATUS_FULL)
++		status = POWER_SUPPLY_STATUS_NOT_CHARGING;
++	derived = true;
++publish:
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	if (!battmgr->service_up || battmgr->dodge_otg_stopping ||
++	    generation != battmgr->dodge_service_generation)
++		ret = -ENOTCONN;
++	else if (derived && usb_epoch != battmgr->input_usb_epoch)
++		ret = -EAGAIN;
++	if (!ret) {
++		if (derived) {
++			battmgr->dodge_gauge_generation = generation;
++			battmgr->dodge_gauge_updated = jiffies;
++			WRITE_ONCE(battmgr->dodge_gauge_valid, true);
++		}
++		val->intval = status;
++	}
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++out:
++	mutex_unlock(&battmgr->lock);
++	return ret > 0 ? -EREMOTEIO : ret;
++}
++
+ static int qcom_battmgr_dodge_get_property(struct power_supply *psy,
+ 					 enum power_supply_property psp,
+ 					 union power_supply_propval *val)
+@@ -1094,6 +1254,7 @@ static int qcom_battmgr_dodge_get_property(struct power_supply *psy,
+ 
+ 	switch (psp) {
+ 	case POWER_SUPPLY_PROP_STATUS:
++		return qcom_battmgr_dodge_wireless_status(battmgr, val);
+ 	case POWER_SUPPLY_PROP_HEALTH:
+ 	case POWER_SUPPLY_PROP_PRESENT:
+ 	case POWER_SUPPLY_PROP_TECHNOLOGY:
+@@ -2375,6 +2536,345 @@ static int qcom_battmgr_charge_source(struct qcom_battmgr *battmgr, u32 generati
+ 	return qcom_battmgr_charge_current(battmgr, generation, epoch) ? 0 : -EAGAIN;
+ }
+ 
++/* This development experiment owns requests, never an effective/applied limit. */
++static void qcom_battmgr_input_probe_unknown(struct qcom_battmgr *battmgr, int error)
++{
++	unsigned long flags;
++
++	WRITE_ONCE(battmgr->input_frozen, true);
++	battmgr->input_phase = "UNKNOWN";
++	battmgr->input_error = error;
++	if (!battmgr->input_failure_stage)
++		battmgr->input_failure_stage = battmgr->input_stage;
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	if (battmgr->input_generation == battmgr->dodge_service_generation)
++		battmgr->dodge_otg_broken = true;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	dev_err(battmgr->dev, "input probe request UNKNOWN at %s: %d; no retry\n",
++		battmgr->input_stage, error);
++}
++
++static int qcom_battmgr_input_probe_send(struct qcom_battmgr *battmgr, bool enable)
++{
++	int ret;
++
++	if (battmgr->input_frozen)
++		return -ENOTCONN;
++	if (!qcom_battmgr_charge_transport_current(battmgr, battmgr->input_generation)) {
++		ret = -ENOTCONN;
++		goto unknown;
++	}
++	ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_WLS_PROPERTY_SET,
++					   DODGE_WLS_INPUT_CURR_LIMIT, enable ? 750000 : 0,
++					   battmgr->input_generation);
++	if (!ret && !qcom_battmgr_charge_transport_current(battmgr, battmgr->input_generation))
++		ret = -ENOTCONN;
++	if (!ret)
++		return 0;
++unknown:
++	/* SET750000 and SET0 ACKs have no transaction ID or reliable value echo. */
++	qcom_battmgr_input_probe_unknown(battmgr, ret);
++	return ret;
++}
++
++/* Only an owned live request can send SET0; no health/provider/readback gate. */
++static int qcom_battmgr_input_probe_cleanup(struct qcom_battmgr *battmgr, const char *reason)
++{
++	int ret;
++
++	if (!battmgr->input_owned)
++		return atomic_read(&dodge_input_boot_state) == INPUT_BOOT_MAYBE_OWNED ?
++			-ENOTCONN : 0;
++	battmgr->input_reason = reason;
++	if (battmgr->input_frozen)
++		return -ENOTCONN;
++	battmgr->input_stage = "cleanup-set0";
++	ret = qcom_battmgr_input_probe_send(battmgr, false);
++	battmgr->input_cleanup_ack = ret;
++	if (ret)
++		return ret;
++	WRITE_ONCE(battmgr->input_owned, false);
++	atomic_set(&dodge_input_boot_state, INPUT_BOOT_CLEANUP_ACK);
++	battmgr->input_phase = "CLEANUP_ACKNOWLEDGED";
++	battmgr->input_stage = "cleanup-ack";
++	return 0;
++}
++
++static int qcom_battmgr_input_probe_current(struct qcom_battmgr *battmgr)
++{
++	unsigned long flags;
++	bool valid;
++
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	valid = battmgr->service_up && battmgr->dodge_otg_ready &&
++		!battmgr->dodge_otg_stopping && !battmgr->dodge_otg_broken &&
++		!battmgr->dodge_otg_requested && !battmgr->charge_closing &&
++		!battmgr->charge_suspending &&
++		battmgr->input_generation == battmgr->dodge_service_generation &&
++		battmgr->input_session_usb_epoch == battmgr->input_usb_epoch;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	if (!valid) {
++		battmgr->input_stage =
++			battmgr->input_session_usb_epoch != READ_ONCE(battmgr->input_usb_epoch) ?
++			"usb-state-event" : "service-lifecycle-or-otg";
++		return -EAGAIN;
++	}
++	if (battmgr->input_owned && time_after_eq(jiffies, battmgr->input_deadline)) {
++		battmgr->input_stage = "deadline";
++		return -ETIME;
++	}
++	return 0;
++}
++
++/* Gate0 is acceptable only while the existing manual pause owns this exact source. */
++static bool qcom_battmgr_input_probe_pause_confirmed(struct qcom_battmgr *battmgr)
++{
++	return battmgr->charge_owned && !battmgr->charge_pending && !battmgr->charge_frozen &&
++		battmgr->charge_generation == battmgr->input_generation &&
++		qcom_battmgr_charge_same_receiver(&battmgr->charge_receiver,
++						 &battmgr->input_receiver) &&
++		qcom_battmgr_charge_current(battmgr, battmgr->charge_generation,
++					    battmgr->charge_session_epoch);
++}
++
++/* Reuse health/temperature validation, but never charge_epoch or GET8 readback. */
++static int qcom_battmgr_input_probe_source(struct qcom_battmgr *battmgr, bool initial)
++{
++	struct nu1669_snapshot snapshot;
++	u32 gate;
++	int ret;
++	unsigned int i;
++	static const u32 properties[] = { USB_ONLINE, DODGE_USB_CID_STATUS, DODGE_USB_OTG_SWITCH };
++	static const char * const stages[] = { "usb-online", "usb-cid", "usb-otg" };
++
++	ret = qcom_battmgr_input_probe_current(battmgr);
++	if (ret)
++		return ret;
++	if (battmgr->dodge_power_state != DODGE_POWER_OFF)
++		return -EBUSY;
++	for (i = 0; i < ARRAY_SIZE(properties); i++) {
++		battmgr->input_stage = stages[i];
++		ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_USB_PROPERTY_GET,
++						   properties[i], 0, battmgr->input_generation);
++		if (ret || battmgr->dodge_otg_value)
++			return ret ?: -EBUSY;
++		ret = qcom_battmgr_input_probe_current(battmgr);
++		if (ret)
++			return ret;
++	}
++	battmgr->input_stage = "battery-health-temperature";
++	ret = qcom_battmgr_charge_healthy(battmgr, battmgr->input_generation);
++	if (ret)
++		return ret;
++	ret = qcom_battmgr_input_probe_current(battmgr);
++	if (ret)
++		return ret;
++	battmgr->input_stage = "battery-gate";
++	ret = qcom_battmgr_charge_raw_get(battmgr, battmgr->input_generation, &gate);
++	if (ret)
++		return ret;
++	if (gate != 1 && (gate != 0 || !qcom_battmgr_input_probe_pause_confirmed(battmgr)))
++		return -EBUSY;
++	battmgr->input_stage = "receiver-snapshot";
++	ret = nu1669_get_snapshot(battmgr->wireless_receiver, &snapshot);
++	if (ret)
++		return ret;
++	if (snapshot.chip_id != 0x1669 || snapshot.protocol != 0x04 || snapshot.b2b_on ||
++	    (snapshot.b2b_state & BIT(0)) || snapshot.vout_mv < 4500 || snapshot.vout_mv > 6000)
++		return -EOPNOTSUPP;
++	if (initial)
++		battmgr->input_receiver = snapshot;
++	else if (!qcom_battmgr_charge_same_receiver(&battmgr->input_receiver, &snapshot))
++		return -ESTALE;
++	return qcom_battmgr_input_probe_current(battmgr);
++}
++
++static void qcom_battmgr_input_probe_schedule(struct qcom_battmgr *battmgr)
++{
++	unsigned long delay;
++
++	if (!battmgr->input_owned || battmgr->input_frozen ||
++	    READ_ONCE(battmgr->charge_closing) || READ_ONCE(battmgr->charge_suspending))
++		return;
++	delay = time_after_eq(jiffies, battmgr->input_deadline) ? 0 :
++		min_t(unsigned long, HZ, battmgr->input_deadline - jiffies);
++	mod_delayed_work(system_percpu_wq, &battmgr->input_work, delay);
++}
++
++static void qcom_battmgr_input_probe_worker(struct work_struct *work)
++{
++	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
++						 struct qcom_battmgr, input_work);
++	int ret;
++
++	mutex_lock(&battmgr->lock);
++	if (!battmgr->input_owned || battmgr->input_frozen ||
++	    READ_ONCE(battmgr->charge_closing) || READ_ONCE(battmgr->charge_suspending))
++		goto out;
++	if (time_after_eq(jiffies, battmgr->input_deadline)) {
++		qcom_battmgr_input_probe_cleanup(battmgr, "deadline");
++		goto out;
++	}
++	ret = qcom_battmgr_input_probe_source(battmgr, false);
++	if (ret) {
++		battmgr->input_error = ret;
++		battmgr->input_failure_stage = battmgr->input_stage;
++		qcom_battmgr_input_probe_cleanup(battmgr, "source-or-health-revalidation");
++	} else {
++		battmgr->input_stage = "active";
++		qcom_battmgr_input_probe_schedule(battmgr);
++	}
++out:
++	mutex_unlock(&battmgr->lock);
++}
++
++static int qcom_battmgr_input_probe_control(struct qcom_battmgr *battmgr, bool start)
++{
++	unsigned long flags;
++	int ret;
++
++	if (start) {
++		if (!mutex_trylock(&battmgr->lock))
++			return -EBUSY;
++	} else {
++		mutex_lock(&battmgr->lock);
++	}
++	if (!start) {
++		ret = qcom_battmgr_input_probe_cleanup(battmgr, "explicit-stop");
++		goto out;
++	}
++	if (!IS_BUILTIN(CONFIG_BATTERY_QCOM_BATTMGR)) {
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
++	if (battmgr->charge_owned || battmgr->charge_pending || battmgr->charge_frozen ||
++	    READ_ONCE(battmgr->charge_closing) || READ_ONCE(battmgr->charge_suspending)) {
++		ret = -EBUSY;
++		goto out;
++	}
++	/* Static built-in state survives service restart, suspend and driver reprobe. */
++	if (atomic_cmpxchg(&dodge_input_boot_state, INPUT_BOOT_UNUSED,
++			   INPUT_BOOT_CONSUMED_NO_REQUEST) != INPUT_BOOT_UNUSED) {
++		ret = -EALREADY;
++		goto out;
++	}
++	battmgr->input_phase = "PREFLIGHT";
++	battmgr->input_start_ack = -ENODATA;
++	battmgr->input_cleanup_ack = -ENODATA;
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	battmgr->input_generation = battmgr->dodge_service_generation;
++	battmgr->input_session_usb_epoch = battmgr->input_usb_epoch;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	ret = qcom_battmgr_input_probe_source(battmgr, true);
++	if (!ret)
++		ret = qcom_battmgr_input_probe_source(battmgr, false);
++	if (ret) {
++		battmgr->input_phase = "REJECTED_NO_REQUEST";
++		battmgr->input_error = ret;
++		battmgr->input_failure_stage = battmgr->input_stage;
++		goto out;
++	}
++	battmgr->input_stage = "start-set750000";
++	battmgr->input_phase = "START_PENDING";
++	battmgr->input_deadline = jiffies + 45 * HZ;
++	atomic_set(&dodge_input_boot_state, INPUT_BOOT_MAYBE_OWNED);
++	WRITE_ONCE(battmgr->input_owned, true);
++	/* Arm before the potentially ambiguous SET; never extend this absolute deadline. */
++	mod_delayed_work(system_percpu_wq, &battmgr->input_work, 45 * HZ);
++	ret = qcom_battmgr_input_probe_send(battmgr, true);
++	battmgr->input_start_ack = ret;
++	if (ret)
++		goto out;
++	battmgr->input_phase = "ACTIVE_ACKNOWLEDGED";
++	ret = qcom_battmgr_input_probe_source(battmgr, false);
++	if (ret) {
++		battmgr->input_error = ret;
++		battmgr->input_failure_stage = battmgr->input_stage;
++		qcom_battmgr_input_probe_cleanup(battmgr, "post-start-revalidation");
++	} else {
++		battmgr->input_stage = "active";
++		qcom_battmgr_input_probe_schedule(battmgr);
++	}
++out:
++	mutex_unlock(&battmgr->lock);
++	return ret;
++}
++
++static void qcom_battmgr_input_probe_close(struct qcom_battmgr *battmgr)
++{
++	unsigned long flags;
++	int ret;
++
++	if (battmgr->variant != QCOM_BATTMGR_DODGE)
++		return;
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	battmgr->charge_closing = true;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	cancel_delayed_work_sync(&battmgr->input_work);
++	mutex_lock(&battmgr->lock);
++	if (!battmgr->input_closed) {
++		battmgr->input_closed = true;
++		ret = qcom_battmgr_input_probe_cleanup(battmgr, "teardown");
++		if (ret)
++			dev_err(battmgr->dev,
++				"input probe cleanup UNKNOWN before teardown: %d\n", ret);
++	}
++	mutex_unlock(&battmgr->lock);
++}
++
++static ssize_t qcom_battmgr_input_probe_write(struct file *file, const char __user *buffer,
++					    size_t count, loff_t *position)
++{
++	char trigger[2];
++	int ret;
++
++	if (count != 1 && count != 2)
++		return -EINVAL;
++	if (copy_from_user(trigger, buffer, count))
++		return -EFAULT;
++	if ((trigger[0] != '0' && trigger[0] != '1') || (count == 2 && trigger[1] != '\n'))
++		return -EINVAL;
++	ret = qcom_battmgr_input_probe_control(file->private_data, trigger[0] == '1');
++	return ret ? ret : (ssize_t)count;
++}
++
++static const struct file_operations qcom_battmgr_input_probe_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = qcom_battmgr_input_probe_write,
++};
++
++static int qcom_battmgr_input_probe_status_show(struct seq_file *s, void *unused)
++{
++	struct qcom_battmgr *battmgr = s->private;
++	unsigned long remaining = 0;
++	int boot;
++
++	mutex_lock(&battmgr->lock);
++	boot = atomic_read(&dodge_input_boot_state);
++	if (battmgr->input_owned && time_before(jiffies, battmgr->input_deadline))
++		remaining = jiffies_to_msecs(battmgr->input_deadline - jiffies);
++	seq_printf(s, "phase=%s boot_consumed=%u may_own_request=%u instance_owner=%u frozen=%u\n",
++		   !battmgr->input_owned && boot == INPUT_BOOT_MAYBE_OWNED ?
++		   "UNKNOWN_OWNER_UNAVAILABLE" : battmgr->input_phase ?: "IDLE",
++		   boot != INPUT_BOOT_UNUSED, boot == INPUT_BOOT_MAYBE_OWNED,
++		   battmgr->input_owned, battmgr->input_frozen);
++	seq_printf(s, "stage=%s failure_stage=%s reason=%s error=%d start_ack=%d cleanup_ack=%d\n",
++		   battmgr->input_stage ?: "none", battmgr->input_failure_stage ?: "none",
++		   battmgr->input_reason ?: "none",
++		   battmgr->input_error, battmgr->input_start_ack, battmgr->input_cleanup_ack);
++	seq_printf(s, "service_generation=%u current_service_generation=%u receiver_generation=%u deadline_jiffies=%lu remaining_ms=%lu\n",
++		   battmgr->input_generation, READ_ONCE(battmgr->dodge_service_generation),
++		   battmgr->input_receiver.generation, battmgr->input_deadline, remaining);
++	seq_printf(s, "charge_owned=%u charge_pending=%u charge_frozen=%u charge_epoch=%u charge_session_epoch=%u\n",
++		   battmgr->charge_owned, battmgr->charge_pending, battmgr->charge_frozen,
++		   READ_ONCE(battmgr->charge_epoch), battmgr->charge_session_epoch);
++	seq_puts(s, "ACKs describe requests only; applied/original limit and power are unverified\n");
++	mutex_unlock(&battmgr->lock);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(qcom_battmgr_input_probe_status);
++
+ /* Cleanup deliberately does not require a connected/readable receiver or USB absence. */
+ static int qcom_battmgr_charge_restore(struct qcom_battmgr *battmgr)
+ {
+@@ -2443,6 +2943,15 @@ static int qcom_battmgr_charge_inhibit(struct qcom_battmgr *battmgr)
+ 		ret = -EAGAIN;
+ 		goto cleanup;
+ 	}
++	if (atomic_read(&dodge_input_boot_state) == INPUT_BOOT_MAYBE_OWNED) {
++		if (!battmgr->input_owned || battmgr->input_frozen || battmgr->input_start_ack) {
++			ret = -EBUSY;
++			goto cleanup;
++		}
++		ret = qcom_battmgr_input_probe_source(battmgr, false);
++		if (ret)
++			goto cleanup;
++	}
+ 	ret = qcom_battmgr_charge_source(battmgr, generation, epoch, &before);
+ 	if (ret)
+ 		goto cleanup;
+@@ -2463,6 +2972,11 @@ static int qcom_battmgr_charge_inhibit(struct qcom_battmgr *battmgr)
+ 	ret = qcom_battmgr_charge_source(battmgr, generation, epoch, &after);
+ 	if (ret || !qcom_battmgr_charge_same_receiver(&before, &after))
+ 		return ret ?: -EAGAIN;
++	if (atomic_read(&dodge_input_boot_state) == INPUT_BOOT_MAYBE_OWNED) {
++		ret = qcom_battmgr_input_probe_current(battmgr);
++		if (ret)
++			return ret;
++	}
+ 	battmgr->charge_generation = generation;
+ 	battmgr->charge_session_epoch = epoch;
+ 	battmgr->charge_receiver = after;
+@@ -2486,6 +3000,11 @@ static int qcom_battmgr_charge_inhibit(struct qcom_battmgr *battmgr)
+ 		ret = ret ?: -EAGAIN;
+ 		goto cleanup;
+ 	}
++	if (atomic_read(&dodge_input_boot_state) == INPUT_BOOT_MAYBE_OWNED) {
++		ret = qcom_battmgr_input_probe_current(battmgr);
++		if (ret)
++			goto cleanup;
++	}
+ 	battmgr->charge_pending = false;
+ 	qcom_battmgr_charge_schedule(battmgr);
+ 	return 0;
+@@ -2578,8 +3097,11 @@ static int qcom_battmgr_charge_suspend(struct device *dev)
+ 	battmgr->charge_epoch++;
+ 	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
+ 	cancel_delayed_work_sync(&battmgr->charge_work);
++	cancel_delayed_work_sync(&battmgr->input_work);
+ 	mutex_lock(&battmgr->lock);
+-	ret = qcom_battmgr_charge_restore(battmgr);
++	ret = qcom_battmgr_input_probe_cleanup(battmgr, "suspend");
++	if (!ret)
++		ret = qcom_battmgr_charge_restore(battmgr);
+ 	if (ret) {
+ 		WRITE_ONCE(battmgr->charge_suspending, false);
+ 		qcom_battmgr_charge_schedule(battmgr);
+@@ -2619,6 +3141,24 @@ static int qcom_battmgr_dodge_decode_input_suspend(const void *data, size_t len,
+ 	return 0;
+ }
+ 
++static int qcom_battmgr_dodge_decode_voltage_samples(const void *data, size_t len,
++						    u32 *word2, u32 *word13, u32 *words)
++{
++	const struct qcom_battmgr_dodge_response *response = data;
++	u32 gauge[9];
++	int ret;
++
++	ret = qcom_battmgr_dodge_decode(data, len, gauge);
++	if (ret)
++		return ret;
++	if (le32_to_cpu(response->data_size) < 14 * sizeof(__le32))
++		return -ENODATA;
++	*word2 = le32_to_cpu(response->data[2]);
++	*word13 = le32_to_cpu(response->data[13]);
++	*words = le32_to_cpu(response->data_size) / sizeof(__le32);
++	return 0;
++}
++
+ static int qcom_battmgr_dodge_normal_input_suspend_get(void *data, u64 *value)
+ {
+ 	struct qcom_battmgr *battmgr = data;
+@@ -2722,10 +3262,123 @@ static int qcom_battmgr_dodge_wireless_input_current_limit_get(void *data, u64 *
+ DEFINE_DEBUGFS_ATTRIBUTE(qcom_battmgr_dodge_wireless_input_current_limit_fops,
+ 			qcom_battmgr_dodge_wireless_input_current_limit_get, NULL, "%llu\n");
+ 
++/* Raw OEM limit responses, not a measurement of effective charging policy. */
++static int qcom_battmgr_dodge_normal_charge_limits_get(struct qcom_battmgr *battmgr,
++						      u32 *current_ua, u32 *voltage_raw)
++{
++	unsigned long flags;
++	u32 generation, fcc, fv;
++	int ret;
++
++	mutex_lock(&battmgr->lock);
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	generation = battmgr->dodge_service_generation;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_BAT_PROPERTY_GET,
++					   BATT_CHG_CTRL_LIM, 0, generation);
++	if (ret)
++		goto out;
++	fcc = battmgr->dodge_otg_value;
++	ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_BAT_PROPERTY_GET,
++					   BATT_VOLT_MAX, 0, generation);
++	if (ret)
++		goto out;
++	fv = battmgr->dodge_otg_value;
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	if (!battmgr->service_up || battmgr->dodge_otg_stopping || battmgr->dodge_otg_broken ||
++	    generation != battmgr->dodge_service_generation)
++		ret = -ENOTCONN;
++	if (!ret) {
++		*current_ua = fcc;
++		*voltage_raw = fv;
++	}
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++out:
++	mutex_unlock(&battmgr->lock);
++	return ret;
++}
++
++static int qcom_battmgr_dodge_normal_charge_limits_show(struct seq_file *s, void *unused)
++{
++	u32 current_ua, voltage_raw;
++	int ret;
++
++	ret = qcom_battmgr_dodge_normal_charge_limits_get(s->private, &current_ua, &voltage_raw);
++	if (ret)
++		return ret;
++	seq_printf(s, "current_max_ua=%u\nvoltage_max_raw=%u\n", current_ua, voltage_raw);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(qcom_battmgr_dodge_normal_charge_limits);
++
++static int qcom_battmgr_dodge_normal_voltage_samples_get(struct qcom_battmgr *battmgr,
++						       u32 *word2, u32 *word13, u32 *words,
++						       u32 *generation_out)
++{
++	struct qcom_battmgr_dodge_request req = {
++		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
++		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
++		.hdr.opcode = cpu_to_le32(DODGE_GAUGE_OPCODE),
++		.data_size = cpu_to_le32(DODGE_GAUGE_WORDS * sizeof(__le32)),
++	};
++	unsigned long flags;
++	u32 generation;
++	int ret;
++
++	mutex_lock(&battmgr->lock);
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	generation = battmgr->dodge_service_generation;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	if (!qcom_battmgr_charge_transport_current(battmgr, generation)) {
++		ret = -ENOTCONN;
++		goto out;
++	}
++	/* Missing or failed replies must never expose a previous optional value. */
++	battmgr->dodge_voltage_error = -ENODATA;
++	WRITE_ONCE(battmgr->dodge_gauge_pending, true);
++	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
++	WRITE_ONCE(battmgr->dodge_gauge_pending, false);
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	if (ret == -ETIMEDOUT && generation == battmgr->dodge_service_generation)
++		battmgr->dodge_otg_broken = true;
++	if (!ret && (!battmgr->service_up || battmgr->dodge_otg_stopping ||
++		     battmgr->dodge_otg_broken || generation != battmgr->dodge_service_generation))
++		ret = -ENOTCONN;
++	if (!ret) {
++		ret = battmgr->dodge_voltage_error;
++		if (!ret) {
++			*word2 = battmgr->dodge_voltage_word2;
++			*word13 = battmgr->dodge_voltage_word13;
++			*words = battmgr->dodge_voltage_words;
++			*generation_out = generation;
++		}
++	}
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++out:
++	mutex_unlock(&battmgr->lock);
++	return ret;
++}
++
++static int qcom_battmgr_dodge_normal_voltage_samples_show(struct seq_file *s, void *unused)
++{
++	u32 word2, word13, words, generation;
++	int ret;
++
++	ret = qcom_battmgr_dodge_normal_voltage_samples_get(s->private, &word2, &word13,
++							  &words, &generation);
++	if (ret)
++		return ret;
++	seq_printf(s, "word2_raw=%u word13_raw=%u declared_words=%u generation=%u\n",
++		   word2, word13, words, generation);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(qcom_battmgr_dodge_normal_voltage_samples);
++
+ static void qcom_battmgr_dodge_debugfs_remove(void *data)
+ {
+ 	struct qcom_battmgr *battmgr = data;
+ 
++	qcom_battmgr_input_probe_close(battmgr);
+ 	/* Removal drains active accesses; retained open files cannot enter again. */
+ 	debugfs_remove_recursive(battmgr->dodge_debugfs);
+ 	battmgr->dodge_debugfs = NULL;
+@@ -2744,6 +3397,14 @@ static int qcom_battmgr_dodge_debugfs_init(struct qcom_battmgr *battmgr)
+ 			    battmgr, &qcom_battmgr_dodge_normal_input_suspend_fops);
+ 	debugfs_create_file("wireless_input_current_limit", 0400, battmgr->dodge_debugfs,
+ 			    battmgr, &qcom_battmgr_dodge_wireless_input_current_limit_fops);
++	debugfs_create_file("normal_charge_limits", 0400, battmgr->dodge_debugfs,
++			    battmgr, &qcom_battmgr_dodge_normal_charge_limits_fops);
++	debugfs_create_file("normal_input_probe", 0200, battmgr->dodge_debugfs,
++			    battmgr, &qcom_battmgr_input_probe_fops);
++	debugfs_create_file("normal_input_probe_status", 0400, battmgr->dodge_debugfs,
++			    battmgr, &qcom_battmgr_input_probe_status_fops);
++	debugfs_create_file("normal_voltage_samples", 0400, battmgr->dodge_debugfs,
++			    battmgr, &qcom_battmgr_dodge_normal_voltage_samples_fops);
+ 	return devm_add_action_or_reset(battmgr->dev, qcom_battmgr_dodge_debugfs_remove,
+ 				       battmgr);
+ }
+@@ -3437,6 +4098,8 @@ static bool qcom_battmgr_dodge_otg_notification(struct qcom_battmgr *battmgr,
+ 	case DODGE_NOTIF_TYPEC_STATE_CHANGE:
+ 	case DODGE_NOTIF_OTG_ENABLE:
+ 	case DODGE_NOTIF_OTG_DISABLE:
++		battmgr->input_usb_epoch++;
++		fallthrough;
+ 	case NOTIF_WLS_PROPERTY:
+ 		qcom_battmgr_charge_event(battmgr);
+ 		break;
+@@ -3484,6 +4147,7 @@ static bool qcom_battmgr_dodge_otg_notification(struct qcom_battmgr *battmgr,
+ 	case NOTIF_BAT_PROPERTY:
+ 	case NOTIF_BAT_STATUS:
+ 	case NOTIF_BAT_CHARGING_STATE:
++		qcom_battmgr_input_probe_event(battmgr);
+ 		mod_delayed_work(system_percpu_wq, &battmgr->dodge_otg_work, 0);
+ 		break;
+ 	}
+@@ -3552,6 +4216,11 @@ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
+ 		battmgr->dodge_input_suspend_error = battmgr->error ?:
+ 			qcom_battmgr_dodge_decode_input_suspend(data, len,
+ 							       &battmgr->dodge_input_suspend);
++		battmgr->dodge_voltage_error = battmgr->error ?:
++			qcom_battmgr_dodge_decode_voltage_samples(data, len,
++								&battmgr->dodge_voltage_word2,
++								&battmgr->dodge_voltage_word13,
++								&battmgr->dodge_voltage_words);
+ 		complete(&battmgr->ack);
+ 		return;
+ 	}
+@@ -3710,6 +4379,8 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	psy_cfg_supply.supplied_to = qcom_battmgr_battery;
+ 	psy_cfg_supply.num_supplicants = 1;
+ 
++	battmgr->input_start_ack = -ENODATA;
++	battmgr->input_cleanup_ack = -ENODATA;
+ 	spin_lock_init(&battmgr->dodge_otg_lock);
+ 	mutex_init(&battmgr->lock);
+ 	init_completion(&battmgr->ack);
+@@ -3799,6 +4470,10 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 		return ret;
+ 
+ 	if (battmgr->variant == QCOM_BATTMGR_DODGE) {
++		ret = devm_delayed_work_autocancel(dev, &battmgr->input_work,
++						 qcom_battmgr_input_probe_worker);
++		if (ret)
++			return ret;
+ 		ret = devm_delayed_work_autocancel(dev, &battmgr->charge_work,
+ 						 qcom_battmgr_charge_worker);
+ 		if (ret)
+@@ -3843,6 +4518,7 @@ static void qcom_battmgr_charge_close(struct qcom_battmgr *battmgr)
+ 	unsigned long flags;
+ 	int ret;
+ 
++	qcom_battmgr_input_probe_close(battmgr);
+ 	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
+ 	battmgr->charge_closing = true;
+ 	battmgr->charge_epoch++;
+@@ -3861,6 +4537,7 @@ static void qcom_battmgr_remove(struct auxiliary_device *adev)
+ 	struct qcom_battmgr *battmgr = dev_get_drvdata(&adev->dev);
+ 	unsigned long flags;
+ 
++	qcom_battmgr_input_probe_close(battmgr);
+ 	qcom_battmgr_wireless_unregister(battmgr);
+ 	if (battmgr->variant != QCOM_BATTMGR_DODGE)
+ 		return;

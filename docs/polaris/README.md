@@ -1,8 +1,8 @@
 # Xiaomi Mi MIX 2S (polaris)
 
-[中文](README.zh.md) · [All devices](../README.md) · [Hardware support](hardware.md)
+[中文](README.zh.md) · [All devices](../README.md) · [Support status](status.md) · [Hardware support](hardware.md)
 
-Support: Tier 2. See [support criteria](../README.md#support-tiers).
+Status: see the [hardware page](hardware.md) and [support status](status.md).
 
 ## Configure and install
 
@@ -19,7 +19,6 @@ Prepare the **latest LineageOS 22.2 build for polaris** first. See the
 
 ```nix
 {
-  androidDevices.usbSerial = "my-polaris-01";
   androidDevices.usb.ssh.enable = true;
   users.users.root.openssh.authorizedKeys.keys = [ "ssh-ed25519 REPLACE_WITH_YOUR_PUBLIC_KEY" ];
 }
@@ -63,7 +62,7 @@ The repository examples use `.#devices.polaris.<role>`, for example `.#devices.p
 Device-specific firmware is fetched from a pinned upstream commit; this repository
 does not store its binary payloads.
 
-- Source: [MollySophia/firmware-xiaomi-polaris at `d88ffb2`](https://github.com/MollySophia/firmware-xiaomi-polaris/tree/d88ffb2ee182d07567bf280fc4a8493f975ae977).
+- Archive: [`polaris-firmware-d88ffb2-20261115.tar.zst`](https://github.com/dianqk/nixos-android-devices/releases/download/firmware/polaris-firmware-d88ffb2-20261115.tar.zst), assembled from [MollySophia/firmware-xiaomi-polaris at `d88ffb2`](https://github.com/MollySophia/firmware-xiaomi-polaris/tree/d88ffb2ee182d07567bf280fc4a8493f975ae977).
 - Used for: Device-specific modem, Wi-Fi, Bluetooth, GPU, IPA and multimedia firmware.
 
 See the [firmware license notes](../README.md#firmware-sources-and-licensing) for generic firmware

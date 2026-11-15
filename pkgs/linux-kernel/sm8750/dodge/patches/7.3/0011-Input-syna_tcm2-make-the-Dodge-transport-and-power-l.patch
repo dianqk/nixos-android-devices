@@ -1,0 +1,1603 @@
+From dcfe616eb171d9fe7db783b721dd55c86460bb1d Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 7 Nov 2026 15:10:39 +0800
+Subject: [PATCH 011/144] Input: syna_tcm2: make the Dodge transport and power
+ lifecycle robust
+
+Consolidate the local report, SPI transport, modalias, teardown and panel-sleep follow-ups.
+
+Consolidated from local follow-ups:
+  70e8fb990dc5d588782863d8f87e21dca5a20213 Input: syna_tcm2: bound reports and balance device resources
+  0ad078e0e4d607e8cbf1f789f57e45591c60c9cb Input: syna_tcm2: depend on its SPI transport
+  0bd057112672d9398572d707cede76ea4b4cad33 Input: syna_tcm2: export the OF-created SPI modalias
+  57ddd9d60ca58565a4974946c8da3b0233645c6a input: syna_tcm2: retain ownership of the static SPI interface
+  a496b606f10af2557e5a58c7ac41fdafabfb53ea input: syna_tcm2: detach the borrowed interface on transport removal
+  894f8990d3fa52cc6542e1bd89d76619ecc3bab1 input: syna_tcm2: accept an empty uncounted active-object list
+  529b4b4076896fd8260a57f7838977c97e8738c7 Input: syna_tcm2 - follow panel sleep without touch wake
+---
+ .../boot/dts/qcom/sm8750-oneplus-dodge.dts    |   3 +-
+ drivers/input/touchscreen/Kconfig             |   4 +-
+ drivers/input/touchscreen/Makefile            |   5 +-
+ drivers/input/touchscreen/syna_tcm2.c         | 521 ++++++++++++------
+ drivers/input/touchscreen/syna_tcm2.h         |  19 +-
+ drivers/input/touchscreen/syna_tcm2_spi.c     | 370 ++++---------
+ 6 files changed, 482 insertions(+), 440 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+index 614a37848d..5fad8fabba 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
++++ b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+@@ -415,7 +415,7 @@ &mdss_dsi0 {
+ 	vdda-supply = <&vreg_l3g_1p2>;
+ 	status = "okay";
+ 
+-	panel@0 {
++	panel: panel@0 {
+ 		compatible = "oneplus,dodge-panel";
+ 		reg = <0>;
+ 
+@@ -478,6 +478,7 @@ &spi4 {
+ 
+ 	touchscreen@0 {
+ 		compatible = "synaptics,tcm-spi-hbp";
++		panel = <&panel>;
+ 		reg = <0>;
+ 		spi-max-frequency = <19000000>;
+ 		interrupt-parent = <&tlmm>;
+diff --git a/drivers/input/touchscreen/Kconfig b/drivers/input/touchscreen/Kconfig
+index 20b50b6b15..4b75dd0966 100644
+--- a/drivers/input/touchscreen/Kconfig
++++ b/drivers/input/touchscreen/Kconfig
+@@ -1416,8 +1416,8 @@ config TOUCHSCREEN_HIMAX_HX83112B
+ 
+ config TOUCHSCREEN_SYNA_TCM2
+ 	tristate "Synaptics TCM touchscreen"
+-	depends on I2C
+-	select REGMAP_I2C
++	depends on SPI
++	depends on DRM_PANEL || !DRM_PANEL
+ 	help
+ 	  Say Y here if you have a Synaptics TCM touchscreen connected
+ 	  to your system.
+diff --git a/drivers/input/touchscreen/Makefile b/drivers/input/touchscreen/Makefile
+index 2d213bf137..92a33cff9e 100644
+--- a/drivers/input/touchscreen/Makefile
++++ b/drivers/input/touchscreen/Makefile
+@@ -120,6 +120,5 @@ obj-$(CONFIG_TOUCHSCREEN_IQS7211)	+= iqs7211.o
+ obj-$(CONFIG_TOUCHSCREEN_ZINITIX)	+= zinitix.o
+ obj-$(CONFIG_TOUCHSCREEN_HIMAX_HX83112B)	+= himax_hx83112b.o
+ 
+-syna_tcm2-y := syna_tcm2.o
+-syna_tcm2-y += syna_tcm2_spi.o
+-obj-$(CONFIG_TOUCHSCREEN_SYNA_TCM2) += syna_tcm2.o
++synaptics_tcm2-y := syna_tcm2.o syna_tcm2_spi.o
++obj-$(CONFIG_TOUCHSCREEN_SYNA_TCM2) += synaptics_tcm2.o
+diff --git a/drivers/input/touchscreen/syna_tcm2.c b/drivers/input/touchscreen/syna_tcm2.c
+index 4255bb72b6..4472515e08 100644
+--- a/drivers/input/touchscreen/syna_tcm2.c
++++ b/drivers/input/touchscreen/syna_tcm2.c
+@@ -33,6 +33,10 @@
+ #include <linux/sched/signal.h>
+ #include <linux/wait.h>
+ 
++static bool follow_panel = true;
++module_param(follow_panel, bool, 0444);
++MODULE_PARM_DESC(follow_panel, "Put the controller to sleep while its panel is off");
++
+ static DECLARE_WAIT_QUEUE_HEAD(state_waiter);
+ 
+ extern struct platform_device *syna_spi_device;
+@@ -44,7 +48,7 @@ static void syna_dev_free_input_events(struct syna_tcm *tcm)
+ 	if (input_dev == NULL)
+ 		return;
+ 	syna_pal_mutex_lock(&tcm->tp_event_mutex);
+-	for (idx = 0; idx < MAX_NUM_OBJECTS; idx++) {
++	for (idx = 0; idx < tcm->tcm_dev->max_objects; idx++) {
+ 		input_mt_slot(input_dev, idx);
+ 		input_mt_report_slot_state(input_dev, MT_TOOL_FINGER, 0);
+ 	}
+@@ -153,7 +157,11 @@ static int syna_dev_create_input_device(struct syna_tcm *tcm)
+ 	set_bit(KEY_SLEEP, input_dev->keybit);
+ 	input_set_abs_params(input_dev, ABS_MT_POSITION_X, 0, tcm_dev->max_x, 0, 0);
+ 	input_set_abs_params(input_dev, ABS_MT_POSITION_Y, 0, tcm_dev->max_y, 0, 0);
+-	input_mt_init_slots(input_dev, tcm_dev->max_objects, INPUT_MT_DIRECT);
++	retval = input_mt_init_slots(input_dev, tcm_dev->max_objects, INPUT_MT_DIRECT);
++	if (retval) {
++		input_free_device(input_dev);
++		return retval;
++	}
+ 	input_set_abs_params(input_dev, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
+ 	input_set_abs_params(input_dev, ABS_MT_TOUCH_MINOR, 0, 255, 0, 0);
+ 	input_set_abs_params(input_dev, ABS_PROFILE, 0, 1, 0, 0);
+@@ -216,8 +224,7 @@ int syna_tcm_get_touch_data(const unsigned char *report,
+ 		return _EINVAL;
+ 
+ 	if (offset + bits > report_size * 8) {
+-		*data = 0;
+-		return 0;
++		return -EINVAL;
+ 	}
+ 
+ 	output_data = 0;
+@@ -332,6 +339,39 @@ static int syna_tcm_get_gesture_data(const unsigned char *report,
+ 	return 0;
+ }
+ 
++static int syna_tcm_foreach_end(const unsigned char *config, unsigned int size,
++				unsigned int start, bool inside, unsigned int *end)
++{
++	unsigned int depth = inside ? 1 : 0;
++	unsigned int i = start;
++
++	while (i < size) {
++		switch (config[i++]) {
++		case TOUCH_REPORT_FOREACH_ACTIVE_OBJECT:
++		case TOUCH_REPORT_FOREACH_OBJECT:
++			if (depth++)
++				return -EINVAL;
++			break;
++		case TOUCH_REPORT_FOREACH_END:
++			if (!depth)
++				return -EINVAL;
++			*end = i;
++			return 0;
++		case TOUCH_REPORT_END:
++			return -EINVAL;
++		case TOUCH_REPORT_PAD_TO_NEXT_BYTE:
++			break;
++		default:
++			/* Other opcodes consume the following field-width byte. */
++			if (i >= size)
++				return -EINVAL;
++			i++;
++			break;
++		}
++	}
++	return -EINVAL;
++}
++
+ int syna_tcm_parse_touch_report(struct tcm_dev *tcm_dev,
+ 		unsigned char *report, unsigned int report_size,
+ 		struct tcm_touch_data_blob *touch_data)
+@@ -352,9 +392,11 @@ int syna_tcm_parse_touch_report(struct tcm_dev *tcm_dev,
+ 	unsigned int config_size;
+ 	unsigned char *config_data;
+ 	struct tcm_objects_data_blob *object_data;
+-	static unsigned int end_of_foreach;
++	unsigned int budget;
++	bool in_foreach = false;
+ 
+-	if (!tcm_dev || !report || report_size <= 0 || !touch_data || tcm_dev->max_objects == 0)
++	if (!tcm_dev || !report || report_size <= 0 || !touch_data || tcm_dev->max_objects == 0 ||
++	    tcm_dev->max_objects > MAX_NUM_OBJECTS)
+ 		return _EINVAL;
+ 
+ 	object_data = touch_data->object_data;
+@@ -381,23 +423,41 @@ int syna_tcm_parse_touch_report(struct tcm_dev *tcm_dev,
+ 	obj = 0;
+ 	next = 0;
+ 
++	budget = (config_size + 1) * (MAX_NUM_OBJECTS + 1);
+ 	while (idx < config_size) {
++		if (!budget--)
++			return -EINVAL;
+ 		code = config_data[idx++];
+ 		switch (code) {
+ 		case TOUCH_REPORT_END:
+ 			goto exit;
+ 		case TOUCH_REPORT_FOREACH_ACTIVE_OBJECT:
++			if (in_foreach)
++				return -EINVAL;
++			/* Without an explicit count, EOF denotes an empty active list. */
++			if (!num_of_active_objects && offset == report_size * 8) {
++				retval = syna_tcm_foreach_end(config_data, config_size,
++							     idx, true, &idx);
++				if (retval)
++					return retval;
++				break;
++			}
++			in_foreach = true;
+ 			obj = 0;
+ 			next = idx;
+ 			active_only = true;
+ 			break;
+ 		case TOUCH_REPORT_FOREACH_OBJECT:
++			if (in_foreach)
++				return -EINVAL;
++			in_foreach = true;
+ 			obj = 0;
+ 			next = idx;
+ 			active_only = false;
+ 			break;
+ 		case TOUCH_REPORT_FOREACH_END:
+-			end_of_foreach = idx;
++			if (!in_foreach)
++				return -EINVAL;
+ 			if (active_only) {
+ 				if (num_of_active_objects) {
+ 					objects++;
+@@ -413,11 +473,15 @@ int syna_tcm_parse_touch_report(struct tcm_dev *tcm_dev,
+ 				if (obj < tcm_dev->max_objects)
+ 					idx = next;
+ 			}
++			if (idx != next)
++				in_foreach = false;
+ 			break;
+ 		case TOUCH_REPORT_PAD_TO_NEXT_BYTE:
+ 			offset = syna_pal_ceil_div(offset, 8) * 8;
+ 			break;
+ 		case TOUCH_REPORT_TIMESTAMP:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_touch_data(report, report_size,
+ 					offset, bits, &data);
+@@ -427,105 +491,148 @@ int syna_tcm_parse_touch_report(struct tcm_dev *tcm_dev,
+ 			offset += bits;
+ 			break;
+ 		case TOUCH_REPORT_OBJECT_N_INDEX:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_touch_data(report, report_size,
+ 					offset, bits, &data);
+ 			if (retval < 0)
+ 				return retval;
++			if (data >= tcm_dev->max_objects)
++				return -EINVAL;
+ 			obj = data;
+ 			touch_data->obji = data;
+ 			offset += bits;
+ 			break;
+ 		case TOUCH_REPORT_OBJECT_N_CLASSIFICATION:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_touch_data(report, report_size,
+ 					offset, bits, &data);
+ 			if (retval < 0)
+ 				return retval;
++			if (obj >= tcm_dev->max_objects)
++				return -EINVAL;
+ 			object_data[obj].status = (unsigned char)data;
+ 			offset += bits;
+ 			break;
+ 		case TOUCH_REPORT_OBJECT_N_X_POSITION:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_touch_data(report, report_size,
+ 					offset, bits, &data);
+ 			if (retval < 0)
+ 				return retval;
++			if (obj >= tcm_dev->max_objects)
++				return -EINVAL;
+ 			object_data[obj].x_pos = data;
+ 			offset += bits;
+ 			break;
+ 		case TOUCH_REPORT_OBJECT_N_Y_POSITION:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_touch_data(report, report_size,
+ 					offset, bits, &data);
+ 			if (retval < 0)
+ 				return retval;
++			if (obj >= tcm_dev->max_objects)
++				return -EINVAL;
+ 			object_data[obj].y_pos = data;
+ 			offset += bits;
+ 			break;
+ 		case TOUCH_REPORT_OBJECT_N_Z:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_touch_data(report, report_size,
+ 					offset, bits, &data);
+ 			if (retval < 0)
+ 				return retval;
++			if (obj >= tcm_dev->max_objects)
++				return -EINVAL;
+ 			object_data[obj].z = data;
+ 			offset += bits;
+ 			break;
+ 		case TOUCH_REPORT_OBJECT_N_X_WIDTH:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_touch_data(report, report_size,
+ 					offset, bits, &data);
+ 			if (retval < 0)
+ 				return retval;
++			if (obj >= tcm_dev->max_objects)
++				return -EINVAL;
+ 			object_data[obj].x_width = data;
+ 			offset += bits;
+ 			break;
+ 		case TOUCH_REPORT_OBJECT_N_Y_WIDTH:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_touch_data(report, report_size,
+ 					offset, bits, &data);
+ 			if (retval < 0)
+ 				return retval;
++			if (obj >= tcm_dev->max_objects)
++				return -EINVAL;
+ 			object_data[obj].y_width = data;
+ 			offset += bits;
+ 			break;
+ 		case TOUCH_REPORT_OBJECT_N_TX_POSITION_TIXELS:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_touch_data(report, report_size,
+ 					offset, bits, &data);
+ 			if (retval < 0)
+ 				return retval;
++			if (obj >= tcm_dev->max_objects)
++				return -EINVAL;
+ 			object_data[obj].tx_pos = data;
+ 			offset += bits;
+ 			break;
+ 		case TOUCH_REPORT_OBJECT_N_RX_POSITION_TIXELS:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_touch_data(report, report_size,
+ 					offset, bits, &data);
+ 			if (retval < 0)
+ 				return retval;
++			if (obj >= tcm_dev->max_objects)
++				return -EINVAL;
+ 			object_data[obj].rx_pos = data;
+ 			offset += bits;
+ 			break;
+ 		case TOUCH_REPORT_NUM_OF_ACTIVE_OBJECTS:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_touch_data(report, report_size,
+ 					offset, bits, &data);
+ 			if (retval < 0)
+ 				return retval;
++			if (data > tcm_dev->max_objects)
++				return -EINVAL;
+ 			active_objects = data;
+ 			num_of_active_objects = true;
+ 			touch_data->num_of_active_objects = data;
+ 			offset += bits;
+ 			if (touch_data->num_of_active_objects == 0) {
+-				if (end_of_foreach == 0)
+-					return 0;
+-
+-				idx = end_of_foreach;
++				retval = syna_tcm_foreach_end(config_data, config_size, idx,
++							     in_foreach, &idx);
++				if (retval)
++					return retval;
++				in_foreach = false;
+ 			}
+ 			break;
+ 		case TOUCH_REPORT_0D_BUTTONS_STATE:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_touch_data(report, report_size,
+ 					offset, bits, &data);
+@@ -535,6 +642,8 @@ int syna_tcm_parse_touch_report(struct tcm_dev *tcm_dev,
+ 			offset += bits;
+ 			break;
+ 		case TOUCH_REPORT_GESTURE_ID:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_touch_data(report,
+ 				report_size, offset, bits, &data);
+@@ -544,6 +653,8 @@ int syna_tcm_parse_touch_report(struct tcm_dev *tcm_dev,
+ 				return retval;
+ 			break;
+ 		case TOUCH_REPORT_GESTURE_DATA:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_gesture_data(report,
+ 					report_size,
+@@ -555,6 +666,8 @@ int syna_tcm_parse_touch_report(struct tcm_dev *tcm_dev,
+ 				return retval;
+ 			break;
+ 		case TOUCH_REPORT_FRAME_RATE:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_touch_data(report, report_size,
+ 					offset, bits, &data);
+@@ -564,6 +677,8 @@ int syna_tcm_parse_touch_report(struct tcm_dev *tcm_dev,
+ 			offset += bits;
+ 			break;
+ 		case TOUCH_REPORT_FORCE_MEASUREMENT:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_touch_data(report, report_size,
+ 					offset, bits, &data);
+@@ -573,6 +688,8 @@ int syna_tcm_parse_touch_report(struct tcm_dev *tcm_dev,
+ 			offset += bits;
+ 			break;
+ 		case TOUCH_REPORT_POWER_IM:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_touch_data(report, report_size,
+ 					offset, bits, &data);
+@@ -582,6 +699,8 @@ int syna_tcm_parse_touch_report(struct tcm_dev *tcm_dev,
+ 			offset += bits;
+ 			break;
+ 		case TOUCH_REPORT_CID_IM:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_touch_data(report, report_size,
+ 					offset, bits, &data);
+@@ -591,6 +710,8 @@ int syna_tcm_parse_touch_report(struct tcm_dev *tcm_dev,
+ 			offset += bits;
+ 			break;
+ 		case TOUCH_REPORT_RAIL_IM:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_touch_data(report, report_size,
+ 					offset, bits, &data);
+@@ -600,6 +721,8 @@ int syna_tcm_parse_touch_report(struct tcm_dev *tcm_dev,
+ 			offset += bits;
+ 			break;
+ 		case TOUCH_REPORT_CID_VARIANCE_IM:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_touch_data(report, report_size,
+ 					offset, bits, &data);
+@@ -609,6 +732,8 @@ int syna_tcm_parse_touch_report(struct tcm_dev *tcm_dev,
+ 			offset += bits;
+ 			break;
+ 		case TOUCH_REPORT_NSM_FREQUENCY_INDEX:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_touch_data(report, report_size,
+ 					offset, bits, &data);
+@@ -618,6 +743,8 @@ int syna_tcm_parse_touch_report(struct tcm_dev *tcm_dev,
+ 			offset += bits;
+ 			break;
+ 		case TOUCH_REPORT_NSM_STATE:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_touch_data(report, report_size,
+ 					offset, bits, &data);
+@@ -627,6 +754,8 @@ int syna_tcm_parse_touch_report(struct tcm_dev *tcm_dev,
+ 			offset += bits;
+ 			break;
+ 		case TOUCH_REPORT_SENSING_MODE:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
+ 			retval = syna_tcm_get_touch_data(report, report_size,
+ 					offset, bits, &data);
+@@ -636,7 +765,12 @@ int syna_tcm_parse_touch_report(struct tcm_dev *tcm_dev,
+ 			offset += bits;
+ 			break;
+ 		default:
++			if (idx >= config_size)
++				return -EINVAL;
+ 			bits = config_data[idx++];
++			if (offset > report_size * 8 ||
++			    bits > report_size * 8 - offset)
++				return -EINVAL;
+ 			offset += bits;
+ 			break;
+ 		}
+@@ -646,6 +780,7 @@ int syna_tcm_parse_touch_report(struct tcm_dev *tcm_dev,
+ 	return 0;
+ }
+ 
++
+ static irqreturn_t syna_dev_isr(int irq, void *data)
+ {
+ 	int retval;
+@@ -653,7 +788,7 @@ static irqreturn_t syna_dev_isr(int irq, void *data)
+ 	struct syna_tcm *tcm = data;
+ 	struct syna_hw_attn_data *attn = &tcm->hw_if->bdata_attn;
+ 
+-	if (unlikely(gpio_get_value(attn->irq_gpio) != attn->irq_on_state))
++	if (unlikely(gpiod_get_value_cansleep(attn->irq_gpio) != attn->irq_on_state))
+ 		goto exit;
+ 
+ 	tcm->isr_pid = current->pid;
+@@ -683,12 +818,12 @@ static int syna_dev_request_irq(struct syna_tcm *tcm)
+ 	int retval;
+ 	struct syna_hw_attn_data *attn = &tcm->hw_if->bdata_attn;
+ 
+-	if (attn->irq_gpio < 0) {
++	if (!attn->irq_gpio) {
+ 		retval = -EINVAL;
+ 		goto exit;
+ 	}
+ 
+-	attn->irq_id = gpio_to_irq(attn->irq_gpio);
++	attn->irq_id = gpiod_to_irq(attn->irq_gpio);
+ 	retval = request_threaded_irq(attn->irq_id,
+ 			NULL,
+ 			syna_dev_isr,
+@@ -742,6 +877,10 @@ int syna_tcm_preserve_touch_report_config(struct tcm_dev *tcm_dev)
+ 	syna_tcm_buf_lock(&tcm_dev->resp_buf);
+ 
+ 	size = tcm_dev->resp_buf.data_length;
++	if (!size) {
++		syna_tcm_buf_unlock(&tcm_dev->resp_buf);
++		return -EINVAL;
++	}
+ 	retval = syna_tcm_buf_alloc(&tcm_dev->touch_config,
+ 			size);
+ 	if (retval < 0) {
+@@ -797,6 +936,9 @@ int syna_tcm_get_app_info(struct tcm_dev *tcm_dev,
+ 		goto exit;
+ 
+ 	resp_data_len = tcm_dev->resp_buf.data_length;
++	if (resp_data_len < offsetof(struct tcm_application_info, num_of_image_cols) +
++			    sizeof(info->num_of_image_cols))
++		return -EINVAL;
+ 	copy_size = MIN(sizeof(tcm_dev->app_info), resp_data_len);
+ 
+ 	info = &tcm_dev->app_info;
+@@ -834,6 +976,9 @@ int syna_tcm_get_app_info(struct tcm_dev *tcm_dev,
+ 	tcm_dev->max_objects = syna_pal_le2_to_uint(info->max_objects);
+ 	tcm_dev->max_x = syna_pal_le2_to_uint(info->max_x);
+ 	tcm_dev->max_y = syna_pal_le2_to_uint(info->max_y);
++	if (!tcm_dev->max_x || !tcm_dev->max_y || !tcm_dev->max_objects ||
++	    tcm_dev->max_objects > MAX_NUM_OBJECTS)
++		return -EINVAL;
+ 
+ 	tcm_dev->cols = syna_pal_le2_to_uint(info->num_of_image_cols);
+ 	tcm_dev->rows = syna_pal_le2_to_uint(info->num_of_image_rows);
+@@ -914,52 +1059,40 @@ static int syna_dev_enter_normal_sensing(struct syna_tcm *tcm)
+ static int syna_dev_resume(struct device *dev)
+ {
+ 	struct syna_tcm *tcm = dev_get_drvdata(dev);
+-	queue_work(tcm->speedup_resume_wq, &tcm->speed_up_work);
++	if (tcm && tcm->probe_done && tcm->driver_current_state != IS_REMOVE)
++		queue_work(tcm->speedup_resume_wq, &tcm->speed_up_work);
+ 	return 0;
+ }
+ 
++/* Panel callbacks and system PM serialize commands with the resume worker. */
+ static void syna_speedup_resume(struct work_struct *work)
+ {
+-	struct syna_tcm *tcm = container_of(work, struct syna_tcm,
+-				     speed_up_work);
+-	int retval;
++	struct syna_tcm *tcm = container_of(work, struct syna_tcm, speed_up_work);
+ 	struct syna_hw_interface *hw_if = tcm->hw_if;
+-	bool irq_enabled = true;
++	int ret;
+ 
+-	if (tcm->pwr_state == PWR_ON) {
+-		tcm->sub_pwr_state = SUB_PWR_RESUME_DONE;
+-		return;
+-	}
+ 	mutex_lock(&tcm->mutex);
+-
+-	if (IS_REMOVE == tcm->driver_current_state) {
+-		mutex_unlock(&tcm->mutex);
+-		return;
+-	};
++	if (tcm->driver_current_state == IS_REMOVE || tcm->panel_asleep ||
++	    !tcm->bus_ready || tcm->pwr_state == PWR_ON)
++		goto out;
+ 
+ 	tcm->sub_pwr_state = SUB_PWR_RESUMING;
+-
+-	irq_enabled = (!hw_if->bdata_attn.irq_enabled);
+-
+-	if (irq_enabled && (hw_if->ops_enable_irq))
+-		hw_if->ops_enable_irq(hw_if, true);
+-	
+-	retval = syna_dev_enter_normal_sensing(tcm);
+-	if (retval < 0)
+-		goto exit;
+-	
++	/* Keep the IRQ masked until polling has completed all initialization. */
++	ret = syna_dev_enter_normal_sensing(tcm);
++	if (!ret)
++		ret = syna_dev_set_up_app_fw(tcm);
++	tcm->panel_error = ret;
++	if (ret) {
++		dev_err(&tcm->pdev->dev, "Touch panel resume failed: %d\n", ret);
++		goto done;
++	}
+ 	tcm->pwr_state = PWR_ON;
+-
+-	retval = syna_dev_set_up_app_fw(tcm);
+-	if (retval < 0)
+-		goto exit;
+-
+-	retval = 0;
+-
+-exit:
++	tcm->panel_wakes++;
++	if (hw_if->ops_enable_irq)
++		hw_if->ops_enable_irq(hw_if, true);
++done:
+ 	tcm->sub_pwr_state = SUB_PWR_RESUME_DONE;
+-	tcm->slept_in_early_suspend = false;
+-
++out:
+ 	mutex_unlock(&tcm->mutex);
+ }
+ 
+@@ -967,51 +1100,91 @@ static int syna_dev_suspend(struct device *dev)
+ {
+ 	struct syna_tcm *tcm = dev_get_drvdata(dev);
+ 	struct syna_hw_interface *hw_if = tcm->hw_if;
+-	struct touchpanel_event event_data;
+-	bool irq_disabled = true;
++	int ret = 0;
+ 
+-	if (tcm->pwr_state != PWR_ON)
+-		return 0;
+ 	mutex_lock(&tcm->mutex);
+-
+-	if (IS_REMOVE == tcm->driver_current_state) {
+-		mutex_unlock(&tcm->mutex);
+-		return -EINVAL;
+-	};
+-
++	if (tcm->driver_current_state == IS_REMOVE)
++		goto out;
+ 	tcm->sub_pwr_state = SUB_PWR_SUSPENDING;
++	/* The transport helper masks without waiting; drain before lifting slots. */
++	if (hw_if->ops_enable_irq)
++		hw_if->ops_enable_irq(hw_if, false);
++	if (hw_if->bdata_attn.irq_id > 0)
++		synchronize_irq(hw_if->bdata_attn.irq_id);
+ 	syna_dev_free_input_events(tcm);
+ 	tcm->pwr_state = PWR_OFF;
+-	memset(&event_data, 0, sizeof(struct touchpanel_event));
+-	irq_disabled = (!tcm->lpwg_enabled);
+-
+-	if (irq_disabled && (hw_if->ops_enable_irq))
+-		hw_if->ops_enable_irq(hw_if, false);
+-
++	if (!tcm->tcm_dev->is_sleep)
++		ret = syna_tcm_sleep(tcm->tcm_dev, true);
++	tcm->panel_error = ret;
++	if (!ret)
++		tcm->panel_sleeps++;
++	else
++		dev_err(dev, "Touch panel sleep failed: %d\n", ret);
+ 	tcm->sub_pwr_state = SUB_PWR_SUSPEND_DONE;
++out:
+ 	mutex_unlock(&tcm->mutex);
++	return ret;
++}
+ 
++static int syna_panel_prepared(struct drm_panel_follower *follower)
++{
++	struct syna_tcm *tcm = container_of(follower, struct syna_tcm, panel_follower);
++
++	mutex_lock(&tcm->mutex);
++	tcm->panel_asleep = false;
++	if (tcm->driver_current_state != IS_REMOVE && tcm->bus_ready)
++		queue_work(tcm->speedup_resume_wq, &tcm->speed_up_work);
++	mutex_unlock(&tcm->mutex);
+ 	return 0;
+ }
+ 
++static int syna_panel_unpreparing(struct drm_panel_follower *follower)
++{
++	struct syna_tcm *tcm = container_of(follower, struct syna_tcm, panel_follower);
++
++	mutex_lock(&tcm->mutex);
++	tcm->panel_asleep = true;
++	mutex_unlock(&tcm->mutex);
++	cancel_work_sync(&tcm->speed_up_work);
++	return syna_dev_suspend(&tcm->pdev->dev);
++}
++
++static const struct drm_panel_follower_funcs syna_panel_funcs = {
++	.panel_prepared = syna_panel_prepared,
++	.panel_unpreparing = syna_panel_unpreparing,
++};
++
++static ssize_t panel_state_show(struct device *dev,
++			       struct device_attribute *attr, char *buf)
++{
++	struct syna_tcm *tcm = dev_get_drvdata(dev);
++	ssize_t ret;
++
++	mutex_lock(&tcm->mutex);
++	ret = sysfs_emit(buf,
++		"following=%u panel_asleep=%u controller_asleep=%u irq_enabled=%u "
++		"sleeps=%u wakes=%u error=%d\n",
++		tcm->panel_following, tcm->panel_asleep, tcm->tcm_dev->is_sleep,
++		tcm->hw_if->bdata_attn.irq_enabled, tcm->panel_sleeps,
++		tcm->panel_wakes, tcm->panel_error);
++	mutex_unlock(&tcm->mutex);
++	return ret;
++}
++static DEVICE_ATTR_RO(panel_state);
++
+ static int syna_dev_disconnect(struct syna_tcm *tcm)
+ {
+ 	struct syna_hw_interface *hw_if = tcm->hw_if;
+-	int ret = 0;
+ 
+ 	if (tcm->is_connected == false)
+ 		return 0;
+ 
+-	cancel_delayed_work_sync(&tcm->reflash_work);
+ 
+ 	if (hw_if->bdata_attn.irq_id)
+ 		syna_dev_release_irq(tcm);
+ 
+-	if (hw_if->bdata_rst.reset_gpio >= 0) {
+-		ret = gpio_direction_output(hw_if->bdata_rst.reset_gpio, 0);
+-		if (ret)
+-			return -EINVAL;
+-	}
++	if (hw_if->bdata_rst.reset_gpio)
++		gpiod_set_value_cansleep(hw_if->bdata_rst.reset_gpio, 1);
+ 
+ 	syna_dev_release_input_device(tcm);
+ 
+@@ -1998,7 +2171,7 @@ static int syna_dev_connect(struct syna_tcm *tcm)
+ 	if (hw_if->ops_power_on) {
+ 		retval = hw_if->ops_power_on(hw_if, true);
+ 		if (retval < 0)
+-			return -ENODEV;
++			return retval;
+ 	}
+ 
+ 	if (hw_if->ops_hw_reset)
+@@ -2008,19 +2181,16 @@ static int syna_dev_connect(struct syna_tcm *tcm)
+ 	if (retval < 0)
+ 		goto err_detect_dev;
+ 
+-	switch (retval) {
+-	case MODE_APPLICATION_FIRMWARE:
+-		retval = syna_dev_set_up_app_fw(tcm);
+-		if (retval >= 0) {
+-			retval = syna_dev_set_up_input_device(tcm);
+-			if (retval < 0) 
+-				goto err_setup_input_dev;
+-		}
+-
+-		break;
+-	default:
+-		break;
++	if (retval != MODE_APPLICATION_FIRMWARE) {
++		retval = -ENODEV;
++		goto err_detect_dev;
+ 	}
++	retval = syna_dev_set_up_app_fw(tcm);
++	if (retval < 0)
++		goto err_detect_dev;
++	retval = syna_dev_set_up_input_device(tcm);
++	if (retval < 0)
++		goto err_setup_input_dev;
+ 
+ 	retval = syna_dev_request_irq(tcm);
+ 	if (retval < 0)
+@@ -2191,84 +2361,83 @@ int syna_tcm_enable_predict_reading(struct tcm_dev *tcm_dev, bool en)
+ 
+ static int syna_dev_probe(struct platform_device *pdev)
+ {
+-	int retval;
+-	struct syna_tcm *tcm = NULL;
+-	struct tcm_dev *tcm_dev = NULL;
+-	struct syna_hw_interface *hw_if = NULL;
+-	struct device * syna_spi_pdev;
++	struct syna_hw_interface *hw_if = pdev->dev.platform_data;
++	struct syna_tcm *tcm;
++	int ret;
+ 
+-	hw_if = pdev->dev.platform_data;
+ 	if (!hw_if)
+ 		return -EINVAL;
+-
+-	tcm = syna_pal_mem_alloc(1, sizeof(struct syna_tcm));
++	tcm = kzalloc(sizeof(*tcm), GFP_KERNEL);
+ 	if (!tcm)
+ 		return -ENOMEM;
+-	
+-	retval = syna_tcm_allocate_device(&tcm_dev, hw_if, RESP_IN_POLLING);
+-	if (retval < 0 || !tcm_dev)
+-		goto err_allocate_cdev;
+-
+-	tcm->tcm_dev = tcm_dev;
+ 	tcm->pdev = pdev;
+ 	tcm->hw_if = hw_if;
+-
+-	syna_spi_pdev = syna_spi_device->dev.parent;
+-
+-	retval = init_chip_dts(syna_spi_pdev, tcm);
+-
+-	if (retval < 0)
+-		goto err_manufacture_info;
+-	
++	ret = syna_tcm_allocate_device(&tcm->tcm_dev, hw_if, RESP_IN_POLLING);
++	if (ret)
++		goto free_tcm;
++	ret = init_chip_dts(pdev->dev.parent, tcm);
++	if (ret)
++		goto free_device;
+ 	syna_tcm_buf_init(&tcm->event_data);
+-
+ 	mutex_init(&tcm->tp_event_mutex);
+-
+ 	mutex_init(&tcm->mutex);
+ 	init_completion(&tcm->fw_complete);
+-
+-	tcm->is_connected = false;
+-	tcm->pwr_state = PWR_OFF;
+-
++	init_completion(&tcm->report_complete);
++	INIT_WORK(&tcm->speed_up_work, syna_speedup_resume);
++	tcm->speedup_resume_wq = create_singlethread_workqueue("sp_resume0");
++	if (!tcm->speedup_resume_wq) {
++		ret = -ENOMEM;
++		goto free_event;
++	}
+ 	tcm->dev_connect = syna_dev_connect;
+ 	tcm->dev_disconnect = syna_dev_disconnect;
+ 	tcm->dev_set_up_app_fw = syna_dev_set_up_app_fw;
+ 	tcm->dev_resume = syna_dev_resume;
+ 	tcm->dev_suspend = syna_dev_suspend;
+-
+-	tcm->wait_for_ioctl_operation = 0;
+-	tcm->waiting_frame = 0;
+-	tcm->use_short_frame_waiting = 0;
+-	tcm->primary_timestamp_enabled = 1;
+-
+ 	platform_set_drvdata(pdev, tcm);
+-
+-	device_init_wakeup(&pdev->dev, 1);
+-	init_completion(&tcm->report_complete);
+-	
+-	retval = tcm->dev_connect(tcm);
+-	if (retval < 0) {
+-		mutex_destroy(&tcm->mutex);
+-		goto err_connect;
+-	}
+-
+-	tcm->speedup_resume_wq = create_singlethread_workqueue("sp_resume0");
+-	INIT_WORK(&tcm->speed_up_work, syna_speedup_resume);
+-
++	ret = syna_dev_connect(tcm);
++	if (ret)
++		goto free_workqueue;
+ 	syna_tcm_enable_predict_reading(tcm->tcm_dev, true);
+-
+ 	tcm->probe_done = 1;
+-
++	if (follow_panel && drm_is_panel_follower(pdev->dev.parent)) {
++		/* Start asleep: add_follower wakes us immediately if already prepared. */
++		tcm->panel_asleep = true;
++		ret = syna_dev_suspend(&pdev->dev);
++		if (ret)
++			goto disconnect;
++		tcm->panel_follower.funcs = &syna_panel_funcs;
++		ret = drm_panel_add_follower(pdev->dev.parent, &tcm->panel_follower);
++		if (ret)
++			goto disconnect;
++		tcm->panel_following = true;
++	}
++	ret = device_create_file(&pdev->dev, &dev_attr_panel_state);
++	if (ret)
++		goto remove_follower;
++	device_init_wakeup(&pdev->dev, true);
+ 	return 0;
+-	tcm->dev_disconnect(tcm);
+-err_manufacture_info:
+-err_connect:
++
++remove_follower:
++	if (tcm->panel_following)
++		drm_panel_remove_follower(&tcm->panel_follower);
++disconnect:
++	mutex_lock(&tcm->mutex);
++	tcm->probe_done = 0;
++	tcm->driver_current_state = IS_REMOVE;
++	mutex_unlock(&tcm->mutex);
++	cancel_work_sync(&tcm->speed_up_work);
++	syna_dev_disconnect(tcm);
++free_workqueue:
++	platform_set_drvdata(pdev, NULL);
++	destroy_workqueue(tcm->speedup_resume_wq);
++free_event:
+ 	syna_tcm_buf_release(&tcm->event_data);
+-	mutex_destroy(&tcm->mutex);
+-err_allocate_cdev:
++free_device:
++	syna_tcm_remove_device(tcm->tcm_dev);
++free_tcm:
+ 	kfree(tcm);
+-
+-	return retval;
++	return dev_err_probe(&pdev->dev, ret, "Failed to initialize TCM input\n");
+ }
+ 
+ static void syna_tcm_del_message_wrap(struct tcm_message_data_blob *tcm_msg)
+@@ -2295,52 +2464,79 @@ void syna_tcm_remove_device(struct tcm_dev *tcm_dev)
+ 	kfree(tcm_dev);
+ }
+ 
+-static void syna_dev_remove(struct platform_device *pdev)
++static void syna_dev_quiesce(struct platform_device *pdev)
+ {
+ 	struct syna_tcm *tcm = platform_get_drvdata(pdev);
+-	msleep(25);
++
++	if (!tcm)
++		return;
++	mutex_lock(&tcm->mutex);
++	tcm->probe_done = 0;
+ 	tcm->driver_current_state = IS_REMOVE;
++	mutex_unlock(&tcm->mutex);
++	if (tcm->panel_following) {
++		drm_panel_remove_follower(&tcm->panel_follower);
++		tcm->panel_following = false;
++	}
++	cancel_work_sync(&tcm->speed_up_work);
+ 	mutex_lock(&tcm->mutex);
+-    tcm->dev_disconnect(tcm);
++	syna_dev_disconnect(tcm);
+ 	mutex_unlock(&tcm->mutex);
++}
++
++static void syna_dev_remove(struct platform_device *pdev)
++{
++	struct syna_tcm *tcm = platform_get_drvdata(pdev);
++
++	if (!tcm)
++		return;
++	device_remove_file(&pdev->dev, &dev_attr_panel_state);
++	syna_dev_quiesce(pdev);
++	destroy_workqueue(tcm->speedup_resume_wq);
++	device_init_wakeup(&pdev->dev, false);
+ 	syna_tcm_buf_release(&tcm->event_data);
+ 	syna_tcm_remove_device(tcm->tcm_dev);
++	platform_set_drvdata(pdev, NULL);
+ 	kfree(tcm);
+ }
+ 
+ static void syna_dev_shutdown(struct platform_device *pdev)
+ {
+-	syna_dev_remove(pdev);
++	syna_dev_quiesce(pdev);
+ }
+ 
+-static int syna_spi_suspend(struct device *dev) {
++static int syna_spi_suspend(struct device *dev)
++{
+ 	struct syna_tcm *tcm = dev_get_drvdata(dev);
+-	struct syna_hw_attn_data *attn;
+-	if (!tcm || !tcm->hw_if) {
+-		return 0;
+-	}
+-	attn = &tcm->hw_if->bdata_attn;
+-	if (attn->irq_id == 0)
++
++	if (!tcm)
+ 		return 0;
++	mutex_lock(&tcm->mutex);
+ 	tcm->bus_ready = false;
++	mutex_unlock(&tcm->mutex);
++	cancel_work_sync(&tcm->speed_up_work);
+ 	if (tcm->hw_if->ops_enable_irq)
+ 		tcm->hw_if->ops_enable_irq(tcm->hw_if, false);
+ 	return 0;
+ }
+ 
+-static int syna_spi_resume(struct device *dev) {
++static int syna_spi_resume(struct device *dev)
++{
+ 	struct syna_tcm *tcm = dev_get_drvdata(dev);
+-	struct syna_hw_attn_data *attn;
+ 
+-	if (!tcm || !tcm->hw_if) {
+-		return 0;
+-	}
+-	attn = &tcm->hw_if->bdata_attn;
+-	if (attn->irq_id == 0)
++	if (!tcm)
+ 		return 0;
+-	if (tcm->hw_if->ops_enable_irq)
+-		tcm->hw_if->ops_enable_irq(tcm->hw_if, true);
++	mutex_lock(&tcm->mutex);
+ 	tcm->bus_ready = true;
++	if (!tcm->panel_asleep) {
++		if (tcm->pwr_state == PWR_ON) {
++			if (tcm->hw_if->ops_enable_irq)
++				tcm->hw_if->ops_enable_irq(tcm->hw_if, true);
++		} else {
++			queue_work(tcm->speedup_resume_wq, &tcm->speed_up_work);
++		}
++	}
++	mutex_unlock(&tcm->mutex);
+ 	return 0;
+ }
+ 
+@@ -2365,7 +2561,10 @@ static int __init syna_dev_module_init(void) {
+ 	retval = syna_hw_interface_init();
+ 	if (retval < 0)
+ 		return retval;
+-	return platform_driver_register(&syna_dev_driver);
++	retval = platform_driver_register(&syna_dev_driver);
++	if (retval)
++		syna_hw_interface_exit();
++	return retval;
+ }
+ 
+ static void __exit syna_dev_module_exit(void) {
+diff --git a/drivers/input/touchscreen/syna_tcm2.h b/drivers/input/touchscreen/syna_tcm2.h
+index 2294f1e64f..a1f354c4c0 100644
+--- a/drivers/input/touchscreen/syna_tcm2.h
++++ b/drivers/input/touchscreen/syna_tcm2.h
+@@ -32,14 +32,16 @@
+ #ifndef _SYNAPTICS_TCM2_DRIVER_H_
+ #define _SYNAPTICS_TCM2_DRIVER_H_
+ 
++#include <drm/drm_panel.h>
++
+ #define REMOVE_OPLUS_FUNCTION 1
+ #include <linux/version.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/input.h>
+ #include <linux/delay.h>
+-#include <linux/gpio.h>
+-#include <linux/of_gpio.h>
++#include <linux/gpio/consumer.h>
++#include <linux/of.h>
+ #include <linux/interrupt.h>
+ #include <linux/init.h>
+ #include <linux/major.h>
+@@ -653,7 +655,7 @@ struct syna_hw_bus_data {
+ };
+ 
+ struct syna_hw_attn_data {
+-	int irq_gpio;
++	struct gpio_desc *irq_gpio;
+ 	int irq_on_state;
+ 	unsigned long irq_flags;
+ 	int irq_id;
+@@ -662,7 +664,7 @@ struct syna_hw_attn_data {
+ };
+ 
+ struct syna_hw_rst_data {
+-	int reset_gpio;
++	struct gpio_desc *reset_gpio;
+ 	int reset_on_state;
+ 	unsigned int reset_delay_ms;
+ 	unsigned int reset_active_ms;
+@@ -670,9 +672,10 @@ struct syna_hw_rst_data {
+ };
+ 
+ struct syna_hw_pwr_data {
++	bool powered;
+ 	int psu;
+ 	int vdd_gpio;
+-	int avdd_gpio;
++	struct gpio_desc *avdd_gpio;
+ 	int power_on_state;
+ 	unsigned int power_on_delay_ms;
+ 	unsigned int vdd;
+@@ -833,6 +836,12 @@ struct syna_tcm {
+ 	struct work_struct speed_up_work;
+ 	struct workqueue_struct *speedup_resume_wq;
+ 	bool bus_ready;
++	struct drm_panel_follower panel_follower;
++	bool panel_following;
++	bool panel_asleep;
++	unsigned int panel_sleeps;
++	unsigned int panel_wakes;
++	int panel_error;
+ 	wait_queue_head_t wait;
+ 	int (*dev_connect)(struct syna_tcm *tcm);
+ 	int (*dev_disconnect)(struct syna_tcm *tcm);
+diff --git a/drivers/input/touchscreen/syna_tcm2_spi.c b/drivers/input/touchscreen/syna_tcm2_spi.c
+index 676f0bda4e..b5f1762b0f 100644
+--- a/drivers/input/touchscreen/syna_tcm2_spi.c
++++ b/drivers/input/touchscreen/syna_tcm2_spi.c
+@@ -41,73 +41,26 @@ static unsigned char *tx_buf;
+ static unsigned int buf_size;
+ 
+ static struct spi_transfer *xfer;
++static unsigned int xfer_count;
+ 
+ struct platform_device *syna_spi_device;
+ 
+-static struct device *syna_request_managed_device(void) {
+-	if (!syna_spi_device)
+-		return NULL;
+ 
+-	return syna_spi_device->dev.parent;
+-}
+ 
+ static void syna_spi_hw_reset(struct syna_hw_interface *hw_if) {
+ 	struct syna_hw_rst_data *rst = &hw_if->bdata_rst;
+ 
+-	if (rst->reset_gpio >= 0) {
++	if (rst->reset_gpio) {
+ 		syna_pal_mutex_lock(&rst->reset_en_mutex);
+-		gpio_set_value(rst->reset_gpio, rst->reset_on_state);
++		gpiod_set_value_cansleep(rst->reset_gpio, rst->reset_on_state);
+ 		msleep(rst->reset_active_ms);
+-		gpio_set_value(rst->reset_gpio, !rst->reset_on_state);
++		gpiod_set_value_cansleep(rst->reset_gpio, !rst->reset_on_state);
+ 		msleep(rst->reset_delay_ms);
+ 		syna_pal_mutex_unlock(&rst->reset_en_mutex);
+ 	}
+ }
+ 
+-static int syna_spi_request_gpio(int gpio, bool config, int dir, int state, char *label) {
+-	int retval;
+-
+-	struct device *dev = syna_request_managed_device();
+-
+-	if (!dev)
+-		return -ENODEV;
+-
+-	if (gpio < 0)
+-		return -EINVAL;
+-
+-	if (config) {
+-		retval = snprintf(label, 16, "tcm_gpio_%d\n", gpio);
+-		if (retval < 0)
+-			return retval;
+-		
+-		retval = gpio_request(gpio, label);
+-		if (retval < 0)
+-			return retval;
+-
+-		if (dir == 0)
+-			retval = gpio_direction_input(gpio);
+-		else
+-			retval = gpio_direction_output(gpio, state);
+-
+-		if (retval < 0)
+-			return retval;
+-	} else {
+-		gpio_free(gpio);
+-	}
+-
+-	return 0;
+-}
+-
+-static void syna_spi_release_gpio(struct syna_hw_interface *hw_if)
+-{
+-	struct syna_hw_attn_data *attn = &hw_if->bdata_attn;
+-	struct syna_hw_rst_data *rst = &hw_if->bdata_rst;
+ 
+-	if (rst->reset_gpio >= 0)
+-		syna_spi_request_gpio(rst->reset_gpio, false, 0, 0, NULL);
+-	if (attn->irq_gpio >= 0)
+-		syna_spi_request_gpio(attn->irq_gpio, false, 0, 0, NULL);
+-}
+ 
+ static int syna_spi_active_pinctrl(struct syna_hw_interface *hw_if)
+ {
+@@ -124,168 +77,52 @@ static int syna_spi_active_pinctrl(struct syna_hw_interface *hw_if)
+ 	return retval;
+ }
+ 
+-static int syna_spi_config_gpio(struct syna_hw_interface *hw_if) {
+-	int retval;
+-	static char str_irq_gpio[32] = {0};
+-	static char str_rst_gpio[32] = {0};
+-	struct syna_hw_attn_data *attn = &hw_if->bdata_attn;
+-	struct syna_hw_rst_data *rst = &hw_if->bdata_rst;
+-
+-	if (attn->irq_gpio >= 0) {
+-		retval = syna_spi_request_gpio(attn->irq_gpio, true, 0, 0, str_irq_gpio);
+-		if (retval < 0)
+-			goto err_set_gpio_irq;
+-	}
+-
+-	if (rst->reset_gpio >= 0) {
+-		retval = syna_spi_request_gpio(rst->reset_gpio, true, 1, !rst->reset_on_state, str_rst_gpio);
+-		if (retval < 0)
+-			goto err_set_gpio_reset;
+-	}
+-
+-	return 0;
+-
+-err_set_gpio_reset:
+-	if (attn->irq_gpio >= 0)
+-		syna_spi_request_gpio(attn->irq_gpio, false, 0, 0, NULL);
+-err_set_gpio_irq:
+-	return retval;
+-}
+-
+-static int syna_spi_enable_pwr_gpio(struct syna_hw_interface *hw_if, bool en) {
++static int syna_spi_power_on(struct syna_hw_interface *hw_if, bool en)
++{
+ 	struct syna_hw_pwr_data *pwr = &hw_if->bdata_pwr;
+-	int state = (en) ? pwr->power_on_state : !pwr->power_on_state;
+-	int ret = 0;
++	int ret;
+ 
+-	if (pwr->avdd_gpio >= 0) {
+-		ret = gpio_direction_output(pwr->avdd_gpio, state);
+-		if (ret)
+-			return ret;
+-	}
++	if (pwr->powered == en)
++		return 0;
+ 
+-	if (pwr->vdd_gpio >= 0) {
+-		ret = gpio_direction_output(pwr->vdd_gpio, state);
+-		if (ret)
++	if (en) {
++		if (pwr->avdd_gpio) {
++			gpiod_set_value_cansleep(pwr->avdd_gpio, pwr->power_on_state);
++		}
++		ret = regulator_enable(pwr->vdd_reg_dev);
++		if (ret) {
++			if (pwr->avdd_gpio)
++				gpiod_set_value_cansleep(pwr->avdd_gpio, !pwr->power_on_state);
+ 			return ret;
+-	}
+-
+-	return ret;
+-}
+-
+-static int syna_spi_enable_regulator(struct syna_hw_interface *hw_if, bool en) {
+-	int retval;
+-	struct syna_hw_pwr_data *pwr = &hw_if->bdata_pwr;
+-	struct regulator *vdd_reg = pwr->vdd_reg_dev;
+-
+-	if (!en) {
+-		retval = 0;
+-		goto disable_pwr_reg;
+-	}
+-
+-	if (vdd_reg) {
+-		retval = regulator_enable(vdd_reg);
+-		if (retval < 0)
+-			goto exit;
+-	}
+-
+-	return 0;
+-
+-disable_pwr_reg:
+-	if (vdd_reg)
+-		regulator_disable(vdd_reg);
+-
+-exit:
+-	return retval;
+-}
+-
+-static int syna_spi_power_on(struct syna_hw_interface *hw_if, bool en) {
+-	int retval;
+-	struct syna_hw_pwr_data *pwr = &hw_if->bdata_pwr;
+-
+-	retval = syna_spi_enable_pwr_gpio(hw_if, en);
+-	if (retval < 0)
+-		return retval;
+-
+-	retval = syna_spi_enable_regulator(hw_if, en);
+-	if (retval < 0)
+-		return retval;
+-
+-	msleep(pwr->power_on_delay_ms);
+-
+-	return 0;
+-}
+-
+-static int syna_spi_get_regulator(struct syna_hw_interface *hw_if, bool get) {
+-	int retval;
+-	struct device *dev = syna_spi_device->dev.parent;
+-	struct syna_hw_pwr_data *pwr = &hw_if->bdata_pwr;
+-
+-	if (!get) {
+-		retval = 0;
+-		goto regulator_put;
+-	}
+-
+-	pwr->vdd_reg_dev = regulator_get(dev, "vdd");
+-	if (IS_ERR((struct regulator *)pwr->vdd_reg_dev)) {
+-		retval = PTR_ERR((struct regulator *)pwr->vdd_reg_dev);
+-		goto exit;
++		}
++		msleep(pwr->power_on_delay_ms);
+ 	} else {
+-		if (regulator_count_voltages(pwr->vdd_reg_dev) > 0) {
+-			retval = regulator_set_voltage(pwr->vdd_reg_dev, 1800000, 1800000);
+-			if (retval)
+-				goto exit;
+-
+-			retval = regulator_set_load(pwr->vdd_reg_dev, 200000);
+-			if (retval < 0)
+-				goto exit;
++		if (pwr->avdd_gpio) {
++			gpiod_set_value_cansleep(pwr->avdd_gpio, !pwr->power_on_state);
+ 		}
++		ret = regulator_disable(pwr->vdd_reg_dev);
++		if (ret)
++			return ret;
+ 	}
+-
++	pwr->powered = en;
+ 	return 0;
+-
+-regulator_put:
+-	if (pwr->vdd_reg_dev) {
+-		regulator_put(pwr->vdd_reg_dev);
+-		pwr->vdd_reg_dev = NULL;
+-	}
+-exit:
+-	return retval;
+ }
+ 
+ static int syna_spi_config_psu(struct syna_hw_interface *hw_if)
+ {
+-	int retval;
+-	static char str_avdd_gpio[32] = {0};
+-	struct syna_hw_pwr_data *pwr = &hw_if->bdata_pwr;
+-
+-	if (pwr->psu == PSU_GPIO) {
+-		if (pwr->avdd_gpio >= 0) {
+-			retval = syna_spi_request_gpio(pwr->avdd_gpio, true, 1, !pwr->power_on_state, str_avdd_gpio);
+-			if (retval < 0) {
+-				syna_spi_request_gpio(pwr->vdd_gpio, false, 0, 0, NULL);
+-				return retval;
+-			}
+-		}
+-	} else {
+-		retval = syna_spi_get_regulator(hw_if, true);
+-		if (retval < 0)
+-			return retval;
+-	}
+-
+-	return 0;
+-}
+-
+-static int syna_spi_release_psu(struct syna_hw_interface *hw_if)
+-{
++	struct spi_device *spi = hw_if->pdev;
++	struct device *dev = &spi->dev;
+ 	struct syna_hw_pwr_data *pwr = &hw_if->bdata_pwr;
+-
+-	if (pwr->psu == PSU_GPIO) {
+-		syna_spi_request_gpio(pwr->avdd_gpio, false, 0, 0, NULL);
+-	} else {
+-		syna_spi_get_regulator(hw_if, false);
+-	}
+-
+-	return 0;
++	int ret;
++
++	pwr->vdd_reg_dev = devm_regulator_get(dev, "vdd");
++	if (IS_ERR(pwr->vdd_reg_dev))
++		return PTR_ERR(pwr->vdd_reg_dev);
++	ret = regulator_set_voltage(pwr->vdd_reg_dev, 1800000, 1800000);
++	if (ret)
++		return ret;
++	ret = regulator_set_load(pwr->vdd_reg_dev, 200000);
++	return ret < 0 ? ret : 0;
+ }
+ 
+ static int syna_spi_enable_irq(struct syna_hw_interface *hw_if, bool en) {
+@@ -324,44 +161,30 @@ static int syna_spi_enable_irq(struct syna_hw_interface *hw_if, bool en) {
+ 
+ static int syna_spi_parse_dt(struct syna_hw_interface *hw_if, struct device *dev) {
+ 	int retval;
+-	struct property *prop;
+-	struct device_node *np = dev->of_node;
+ 	struct syna_hw_attn_data *attn = &hw_if->bdata_attn;
+ 	struct syna_hw_pwr_data *pwr = &hw_if->bdata_pwr;
+ 	struct syna_hw_rst_data *rst = &hw_if->bdata_rst;
+ 	struct syna_hw_bus_data *bus = &hw_if->bdata_io;
+ 
+-	prop = of_find_property(np, "synaptics,irq-gpio", NULL);
+-	if (prop && prop->length) {
+-		attn->irq_gpio = of_get_named_gpio(np, "synaptics,irq-gpio", 0);
+-	} else {
+-		attn->irq_gpio = -1;
+-	}
+-
+-	attn->irq_on_state = 0;
+-	pwr->psu = (int)PSU_REGULATOR;
++	attn->irq_gpio = devm_gpiod_get(dev, "synaptics,irq", GPIOD_IN);
++	if (IS_ERR(attn->irq_gpio))
++		return PTR_ERR(attn->irq_gpio);
++	attn->irq_on_state = 1;
++	attn->irq_flags = IRQF_TRIGGER_LOW;
+ 
+-	prop = of_find_property(np, "synaptics,avdd-gpio", NULL);
+-	if (prop && prop->length) {
+-		pwr->avdd_gpio = of_get_named_gpio(np, "synaptics,avdd-gpio", 0);
+-	} else {
+-		pwr->avdd_gpio = -1;
+-	}
+-	
++	pwr->avdd_gpio = devm_gpiod_get_optional(dev, "synaptics,avdd", GPIOD_OUT_LOW);
++	if (IS_ERR(pwr->avdd_gpio))
++		return PTR_ERR(pwr->avdd_gpio);
+ 	pwr->power_on_state = 1;
+ 	pwr->power_on_delay_ms = 200;
+ 
+-	prop = of_find_property(np, "synaptics,reset-gpio", NULL);
+-	if (prop && prop->length) {
+-		rst->reset_gpio = of_get_named_gpio(np, "synaptics,reset-gpio", 0);
+-	} else {
+-		rst->reset_gpio = -1;
+-	}
+-
+-	rst->reset_on_state = 0;
++	rst->reset_gpio = devm_gpiod_get_optional(dev, "synaptics,reset", GPIOD_OUT_LOW);
++	if (IS_ERR(rst->reset_gpio))
++		return PTR_ERR(rst->reset_gpio);
++	rst->reset_on_state = 1;
+ 	rst->reset_active_ms = 10;
+ 	rst->reset_delay_ms = 80;
+-	
++
+ 	bus->spi_byte_delay_us = 0;
+ 	bus->spi_block_delay_us = 0;
+ 	bus->spi_mode = 0;
+@@ -370,7 +193,13 @@ static int syna_spi_parse_dt(struct syna_hw_interface *hw_if, struct device *dev
+ 
+ 	bus->pinctrl = devm_pinctrl_get(dev);
+ 
+-	if (!IS_ERR_OR_NULL(bus->pinctrl)) {
++	if (IS_ERR(bus->pinctrl)) {
++		retval = PTR_ERR(bus->pinctrl);
++		bus->pinctrl = NULL;
++		if (retval != -ENODEV)
++			return retval;
++	}
++	if (bus->pinctrl) {
+ 		bus->pin_spi_mode_active = pinctrl_lookup_state(bus->pinctrl, "ts_spi_active");
+ 		if (IS_ERR_OR_NULL(bus->pin_spi_mode_active)) {
+ 			retval = PTR_ERR(bus->pin_spi_mode_active);
+@@ -388,7 +217,6 @@ static int syna_spi_parse_dt(struct syna_hw_interface *hw_if, struct device *dev
+ }
+ 
+ static int syna_spi_alloc_mem(unsigned int count, unsigned int size) {
+-	static unsigned int xfer_count;
+ 
+ 	if (count > xfer_count) {
+ 		kfree(xfer);
+@@ -541,7 +369,7 @@ static struct syna_hw_interface syna_spi_hw_if = {
+ 		.irq_on_state = 0,
+ 	},
+ 	.bdata_rst = {
+-		.reset_on_state = 0,
++		.reset_on_state = 1,
+ 		.reset_delay_ms = 80,
+ 		.reset_active_ms = 10,
+ 	},
+@@ -558,61 +386,64 @@ static struct syna_hw_interface syna_spi_hw_if = {
+ 
+ static int syna_spi_probe(struct spi_device *spi)
+ {
+-	int retval;
+ 	struct syna_hw_attn_data *attn = &syna_spi_hw_if.bdata_attn;
+ 	struct syna_hw_bus_data *bus = &syna_spi_hw_if.bdata_io;
+ 	struct syna_hw_rst_data *rst = &syna_spi_hw_if.bdata_rst;
++	int ret;
+ 
++	if (syna_spi_device)
++		return -EBUSY;
+ 	syna_spi_device = platform_device_alloc(PLATFORM_DRIVER_NAME, 0);
+ 	if (!syna_spi_device)
+-		return _ENODEV;
+-
+-	syna_spi_parse_dt(&syna_spi_hw_if, &spi->dev);
+-
+-	mutex_init((struct mutex *)&attn->irq_en_mutex);
+-	mutex_init((struct mutex *)&bus->io_mutex);
+-	mutex_init((struct mutex *)&rst->reset_en_mutex);
+-
+-	spi->mode = SPI_MODE_0;
+-
+-	syna_spi_hw_if.pdev = spi;
+-
++		return -ENOMEM;
+ 	syna_spi_device->dev.parent = &spi->dev;
+ 	syna_spi_device->dev.platform_data = &syna_spi_hw_if;
++	syna_spi_hw_if.pdev = spi;
++	ret = syna_spi_parse_dt(&syna_spi_hw_if, &spi->dev);
++	if (ret)
++		goto put_device;
+ 
++	mutex_init(&attn->irq_en_mutex);
++	mutex_init(&bus->io_mutex);
++	mutex_init(&rst->reset_en_mutex);
++	spi->mode = SPI_MODE_0;
+ 	spi->bits_per_word = 8;
+-
+-	retval = spi_setup(spi);
+-	if (retval < 0)
+-		return retval;
+-
+-	retval = syna_spi_config_psu(&syna_spi_hw_if);
+-	if (retval < 0)
+-		return retval;
+-
+-	retval = syna_spi_config_gpio(&syna_spi_hw_if);
+-	if (retval < 0)
+-		return retval;
+-
+-	retval = syna_spi_active_pinctrl(&syna_spi_hw_if);
+-	if (retval < 0)
+-		return retval;
+-
+-	retval = platform_device_add(syna_spi_device);
+-	if (retval < 0)
+-		return retval;
+-
++	ret = spi_setup(spi);
++	if (ret)
++		goto put_device;
++	ret = syna_spi_config_psu(&syna_spi_hw_if);
++	if (ret)
++		goto put_device;
++	ret = syna_spi_active_pinctrl(&syna_spi_hw_if);
++	if (ret)
++		goto put_device;
++	ret = platform_device_add(syna_spi_device);
++	if (ret)
++		goto put_device;
+ 	return 0;
++
++put_device:
++	/* The hardware interface is borrowed static storage, not pdev-owned. */
++	syna_spi_device->dev.platform_data = NULL;
++	platform_device_put(syna_spi_device);
++	syna_spi_device = NULL;
++	syna_spi_hw_if.pdev = NULL;
++	return dev_err_probe(&spi->dev, ret, "Failed to initialize TCM transport\n");
+ }
+ 
+ static void syna_spi_remove(struct spi_device *spi)
+ {
+-	syna_spi_release_gpio(&syna_spi_hw_if);
+-	syna_spi_release_psu(&syna_spi_hw_if);
++	/* The core must quiesce before the parent's managed resources disappear. */
++	platform_device_del(syna_spi_device);
++	/* The child borrows this static interface until core remove completes. */
+ 	syna_spi_device->dev.platform_data = NULL;
+-	platform_device_unregister(syna_spi_device);
++	platform_device_put(syna_spi_device);
++	syna_spi_device = NULL;
++	syna_spi_hw_if.pdev = NULL;
+ }
++
+ static const struct spi_device_id syna_spi_id_table[] = {
++	{"tcm-spi-hbp", 0},
+ 	{SPI_MODULE_NAME, 0},
+ 	{},
+ };
+@@ -645,6 +476,8 @@ int syna_hw_interface_init(void)
+ 
+ void syna_hw_interface_exit(void)
+ {
++	spi_unregister_driver(&syna_spi_driver);
++
+ 	if (rx_buf) {
+ 		kfree(rx_buf);
+ 		rx_buf = NULL;
+@@ -660,7 +493,8 @@ void syna_hw_interface_exit(void)
+ 		xfer = NULL;
+ 	}
+ 
+-	spi_unregister_driver(&syna_spi_driver);
++	buf_size = 0;
++	xfer_count = 0;
+ }
+ 
+ MODULE_AUTHOR("Synaptics, Inc.");

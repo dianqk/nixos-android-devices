@@ -1,0 +1,459 @@
+From d7e6eabbd9672c2a514af5de6663867af1e4da83 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] drm/panel: novatek: support the Alldocube T880 panel
+
+Describe the T880 NT36523N panel, DSC setup, modes and vendor power-off
+sequence alongside the existing panel variants.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-16T13:11:50+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-16T13:16:48+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T14:13:47+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T21:11:52+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/panel/Kconfig                 |   4 +-
+ drivers/gpu/drm/panel/panel-novatek-nt36523.c | 301 +++++++++++++++++-
+ 2 files changed, 296 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/panel/Kconfig b/drivers/gpu/drm/panel/Kconfig
+index cbdf7b8f7f..73db428736 100644
+--- a/drivers/gpu/drm/panel/Kconfig
++++ b/drivers/gpu/drm/panel/Kconfig
+@@ -534,8 +534,8 @@ config DRM_PANEL_LG_SW43408
+ 	depends on OF
+ 	depends on DRM_MIPI_DSI
+ 	depends on BACKLIGHT_CLASS_DEVICE
+-	select DRM_DISPLAY_DSC_HELPER
+ 	select DRM_DISPLAY_HELPER
++	select DRM_DISPLAY_DSC_HELPER
+ 	help
+ 	  Say Y here if you want to enable support for LG sw43408 panel.
+ 	  The panel has a 1080x2160@60Hz resolution and uses 24 bit RGB per
+@@ -659,6 +659,8 @@ config DRM_PANEL_NOVATEK_NT36523
+ 	depends on OF
+ 	depends on DRM_MIPI_DSI
+ 	depends on BACKLIGHT_CLASS_DEVICE
++	select DRM_DISPLAY_DSC_HELPER
++	select DRM_DISPLAY_HELPER
+ 	help
+ 	  Say Y here if you want to enable support for the panels built
+ 	  around the Novatek NT36523 display controller, such as some
+diff --git a/drivers/gpu/drm/panel/panel-novatek-nt36523.c b/drivers/gpu/drm/panel/panel-novatek-nt36523.c
+index 34b9123d3f..b6ab698ffb 100644
+--- a/drivers/gpu/drm/panel/panel-novatek-nt36523.c
++++ b/drivers/gpu/drm/panel/panel-novatek-nt36523.c
+@@ -15,6 +15,8 @@
+ 
+ #include <video/mipi_display.h>
+ 
++#include <drm/display/drm_dsc.h>
++#include <drm/display/drm_dsc_helper.h>
+ #include <drm/drm_connector.h>
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_mipi_dsi.h>
+@@ -26,6 +28,7 @@
+ 
+ struct panel_info {
+ 	struct drm_panel panel;
++	struct drm_dsc_config dsc;
+ 	struct mipi_dsi_device *dsi[2];
+ 	const struct panel_desc *desc;
+ 	enum drm_panel_orientation orientation;
+@@ -33,6 +36,10 @@ struct panel_info {
+ 	struct gpio_desc *reset_gpio;
+ 	struct backlight_device *backlight;
+ 	struct regulator *vddio;
++	struct regulator *vsp;
++	struct regulator *vsn;
++	/* Panels with bias supplies keep VDDIO on once enabled, as stock */
++	bool vddio_on;
+ };
+ 
+ struct panel_desc {
+@@ -43,14 +50,25 @@ struct panel_desc {
+ 	unsigned int lanes;
+ 	unsigned long mode_flags;
+ 	enum mipi_dsi_pixel_format format;
++	/* Fixed link rate per lane (per trio for C-PHY), 0 to derive it */
++	unsigned long hs_rate;
+ 
+ 	const struct drm_display_mode *modes;
++	const struct drm_dsc_config *dsc_cfg;
+ 	unsigned int num_modes;
+ 	const struct mipi_dsi_device_info dsi_info;
+ 	int (*init_sequence)(struct panel_info *pinfo);
++	int (*off_sequence)(struct panel_info *pinfo);
+ 
+ 	bool is_dual_dsi;
+ 	bool has_dcs_backlight;
++	bool has_bias_supplies;
++	/*
++	 * The init sequence configures the panel's decoder itself; send no
++	 * standard PPS and compression-mode packets (the stock driver never
++	 * does).
++	 */
++	bool no_pps_packet;
+ };
+ 
+ static inline struct panel_info *to_panel_info(struct drm_panel *panel)
+@@ -981,6 +999,153 @@ static const struct panel_desc j606f_boe_desc = {
+ 	.has_dcs_backlight = true,
+ };
+ 
++static int t880_wandeqi_init_sequence(struct panel_info *pinfo)
++{
++	struct mipi_dsi_device *dsi0 = pinfo->dsi[0];
++	struct mipi_dsi_device *dsi1 = pinfo->dsi[1];
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = NULL };
++
++	/* Page switches are generic writes, as in the stock driver. */
++	mipi_dsi_dual_generic_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0xd0);
++	mipi_dsi_dual_generic_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x00, 0x30);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x09, 0xee);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x1c, 0x99);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x1d, 0x09);
++	mipi_dsi_dual_generic_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0xf0);
++	mipi_dsi_dual_generic_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x24, 0x02);
++	mipi_dsi_dual_generic_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x2a);
++	mipi_dsi_dual_generic_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_generic_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xbc, 0x33, 0x03);
++	mipi_dsi_dual_generic_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x20);
++	mipi_dsi_dual_generic_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x30, 0x10);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x31, 0x02);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x32, 0x52);
++	mipi_dsi_dual_generic_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x10);
++	mipi_dsi_dual_generic_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x35, 0x00);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x3b,
++					  0x03, 0x64, 0x1e, 0x04, 0x04, 0x00);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x51, 0x01, 0xff);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x53, 0x2c);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x55, 0x00);
++	/* Panel-side DSC: enable and the controller's compressed settings. */
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x90, 0x03);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x91,
++					  0x89, 0x28, 0x00, 0x14, 0xd2, 0x00,
++					  0x02, 0xb2, 0x02, 0x2b, 0x00, 0x0b,
++					  0x05, 0x7a, 0x03, 0x68);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x92, 0x10, 0xe0);
++	mipi_dsi_dual_generic_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xb2, 0x00);
++	mipi_dsi_dual_generic_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xb3, 0x12);
++	mipi_dsi_dual_generic_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xbb, 0x13);
++	mipi_dsi_dual(mipi_dsi_dcs_exit_sleep_mode_multi, &dsi_ctx, dsi0, dsi1);
++	mipi_dsi_msleep(&dsi_ctx, 10);
++	mipi_dsi_dual(mipi_dsi_dcs_set_display_on_multi, &dsi_ctx, dsi0, dsi1);
++	mipi_dsi_msleep(&dsi_ctx, 200);
++
++	if (!dsi_ctx.accum_err) {
++		u8 mode0 = 0, mode1 = 0;
++		int r0 = mipi_dsi_dcs_get_power_mode(dsi0, &mode0);
++		int r1 = mipi_dsi_dcs_get_power_mode(dsi1, &mode1);
++
++		/* 0x9c: booster on, sleep out, display on, normal mode */
++		dev_info(&dsi0->dev, "power mode %#x (%d) / %#x (%d)\n",
++			mode0, r0, mode1, r1);
++	}
++
++	return dsi_ctx.accum_err;
++}
++
++static int t880_wandeqi_off_sequence(struct panel_info *pinfo)
++{
++	struct mipi_dsi_device *dsi0 = pinfo->dsi[0];
++	struct mipi_dsi_device *dsi1 = pinfo->dsi[1];
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = NULL };
++
++	mipi_dsi_dual(mipi_dsi_dcs_set_display_off_multi, &dsi_ctx, dsi0, dsi1);
++	mipi_dsi_msleep(&dsi_ctx, 50);
++	mipi_dsi_dual(mipi_dsi_dcs_enter_sleep_mode_multi, &dsi_ctx, dsi0, dsi1);
++	mipi_dsi_msleep(&dsi_ctx, 150);
++
++	return dsi_ctx.accum_err;
++}
++
++/*
++ * The DSC settings of the stock panel parameters, one 800x20 slice per
++ * link. They match the controller settings written with 0x91 above; the
++ * rate control uses the DSC 1.1 pre-SCR 8 bpc / 8 bpp table except for a
++ * first line BPG offset of 13 (the corrected C-model value for 20-line
++ * slices), so nfl_bpg_offset is 1402.
++ */
++static const struct drm_dsc_config t880_wandeqi_dsc_cfg = {
++	.dsc_version_major = 1,
++	.dsc_version_minor = 1,
++	.slice_height = 20,
++	.slice_width = 800,
++	.slice_count = 1,
++	.bits_per_component = 8,
++	.bits_per_pixel = 8 << 4,
++	.block_pred_enable = true,
++};
++
++/*
++ * The stock modes, for the whole 1600-pixel panel. Only the vertical front
++ * porch changes between them; the link rate is fixed. 144 Hz is the mode
++ * the bootloader leaves running.
++ */
++#define T880_WANDEQI_MODE(_clock, _hfp, _hsa, _hbp, _vfp)		\
++	{								\
++		.clock = _clock,					\
++		.hdisplay = 1600,					\
++		.hsync_start = 1600 + (_hfp),				\
++		.hsync_end = 1600 + (_hfp) + (_hsa),			\
++		.htotal = 1600 + (_hfp) + (_hsa) + (_hbp),		\
++		.vdisplay = 2560,					\
++		.vsync_start = 2560 + (_vfp),				\
++		.vsync_end = 2560 + (_vfp) + 2,				\
++		.vtotal = 2560 + (_vfp) + 2 + 98,			\
++	}
++
++static const struct drm_display_mode t880_wandeqi_modes[] = {
++	T880_WANDEQI_MODE(639919, 21, 10, 21, 30),	/* 144 Hz */
++	T880_WANDEQI_MODE(627955, 23, 10, 23, 500),	/* 120 Hz */
++	T880_WANDEQI_MODE(679622, 23, 10, 23, 1900),	/*  90 Hz */
++	T880_WANDEQI_MODE(684079, 23, 10, 23, 4200),	/*  60 Hz */
++};
++
++static const struct panel_desc t880_wandeqi_desc = {
++	.modes = t880_wandeqi_modes,
++	.num_modes = ARRAY_SIZE(t880_wandeqi_modes),
++	.dsc_cfg = &t880_wandeqi_dsc_cfg,
++	.dsi_info = {
++		.type = "NT36523N",
++		.channel = 0,
++		.node = NULL,
++	},
++	.width_mm = 118,
++	.height_mm = 190,
++	.bpc = 8,
++	.lanes = 3,
++	/*
++	 * The stock module fixes the link at 754 Msym/s per trio for every
++	 * mode (mtk_panel_params data_rate 754, pll_clk 377): 16/7 bits per
++	 * symbol.
++	 */
++	.hs_rate = 1723428571,
++	.format = MIPI_DSI_FMT_RGB888,
++	/* LK and the stock driver send EoT packets */
++	.mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_SYNC_PULSE |
++		      MIPI_DSI_CLOCK_NON_CONTINUOUS | MIPI_DSI_MODE_LPM,
++	.init_sequence = t880_wandeqi_init_sequence,
++	.off_sequence = t880_wandeqi_off_sequence,
++	.is_dual_dsi = true,
++	.has_bias_supplies = true,
++	.no_pps_packet = true,
++};
++
+ static void nt36523_reset(struct panel_info *pinfo)
+ {
+ 	gpiod_set_value_cansleep(pinfo->reset_gpio, 1);
+@@ -993,26 +1158,98 @@ static void nt36523_reset(struct panel_info *pinfo)
+ 	usleep_range(12000, 13000);
+ }
+ 
+-static int nt36523_prepare(struct drm_panel *panel)
++/*
++ * Stock order: a reset pulse, the positive then (2 ms later) the negative
++ * bias, and a second reset pulse with 25-30 ms before the first command.
++ */
++static int t880_wandeqi_power_on(struct panel_info *pinfo)
+ {
+-	struct panel_info *pinfo = to_panel_info(panel);
+ 	int ret;
+ 
+-	ret = regulator_enable(pinfo->vddio);
++	gpiod_set_value_cansleep(pinfo->reset_gpio, 1);
++	usleep_range(10000, 11000);
++	gpiod_set_value_cansleep(pinfo->reset_gpio, 0);
++
++	ret = regulator_enable(pinfo->vsp);
++	if (ret) {
++		dev_err(pinfo->panel.dev, "failed to enable vsp: %d\n", ret);
++		return ret;
++	}
++	usleep_range(2000, 3000);
++
++	ret = regulator_enable(pinfo->vsn);
+ 	if (ret) {
+-		dev_err(panel->dev, "failed to enable vddio regulator: %d\n", ret);
++		dev_err(pinfo->panel.dev, "failed to enable vsn: %d\n", ret);
++		regulator_disable(pinfo->vsp);
+ 		return ret;
+ 	}
+ 
+-	nt36523_reset(pinfo);
++	usleep_range(10000, 15000);
++	gpiod_set_value_cansleep(pinfo->reset_gpio, 1);
++	usleep_range(10000, 15000);
++	gpiod_set_value_cansleep(pinfo->reset_gpio, 0);
++	usleep_range(25000, 30000);
++
++	return 0;
++}
++
++static int nt36523_prepare(struct drm_panel *panel)
++{
++	struct panel_info *pinfo = to_panel_info(panel);
++	int ret;
++
++	if (!pinfo->vddio_on) {
++		ret = regulator_enable(pinfo->vddio);
++		if (ret) {
++			dev_err(panel->dev, "failed to enable vddio regulator: %d\n", ret);
++			return ret;
++		}
++		pinfo->vddio_on = true;
++	}
++
++	if (pinfo->desc->has_bias_supplies) {
++		ret = t880_wandeqi_power_on(pinfo);
++		if (ret < 0)
++			return ret;
++	} else {
++		nt36523_reset(pinfo);
++	}
+ 
+ 	ret = pinfo->desc->init_sequence(pinfo);
+ 	if (ret < 0) {
+-		regulator_disable(pinfo->vddio);
++		gpiod_set_value_cansleep(pinfo->reset_gpio, 1);
++		if (!pinfo->desc->has_bias_supplies) {
++			regulator_disable(pinfo->vddio);
++			pinfo->vddio_on = false;
++		}
+ 		dev_err(panel->dev, "failed to initialize panel: %d\n", ret);
+ 		return ret;
+ 	}
+ 
++	if (pinfo->desc->dsc_cfg && !pinfo->desc->no_pps_packet) {
++		struct drm_dsc_picture_parameter_set pps;
++		int i;
++
++		drm_dsc_pps_payload_pack(&pps, &pinfo->dsc);
++		for (i = 0; i < DSI_NUM_MIN + pinfo->desc->is_dual_dsi; i++) {
++			struct mipi_dsi_multi_context dsi_ctx = { .dsi = pinfo->dsi[i] };
++
++			mipi_dsi_picture_parameter_set_multi(&dsi_ctx, &pps);
++			mipi_dsi_compression_mode_multi(&dsi_ctx, true);
++			if (dsi_ctx.accum_err) {
++				gpiod_set_value_cansleep(pinfo->reset_gpio, 1);
++				if (!pinfo->desc->has_bias_supplies) {
++					regulator_disable(pinfo->vddio);
++					pinfo->vddio_on = false;
++				}
++				dev_err(panel->dev,
++					"failed to enable panel DSC: %d\n",
++					dsi_ctx.accum_err);
++				return dsi_ctx.accum_err;
++			}
++		}
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1021,6 +1258,9 @@ static int nt36523_disable(struct drm_panel *panel)
+ 	struct panel_info *pinfo = to_panel_info(panel);
+ 	int i;
+ 
++	if (pinfo->desc->off_sequence)
++		return 0;
++
+ 	for (i = 0; i < DSI_NUM_MIN + pinfo->desc->is_dual_dsi; i++) {
+ 		struct mipi_dsi_multi_context dsi_ctx = { .dsi = pinfo->dsi[i]};
+ 
+@@ -1041,10 +1281,34 @@ static int nt36523_disable(struct drm_panel *panel)
+ static int nt36523_unprepare(struct drm_panel *panel)
+ {
+ 	struct panel_info *pinfo = to_panel_info(panel);
++	int ret = 0;
+ 
+-	gpiod_set_value_cansleep(pinfo->reset_gpio, 1);
+-	regulator_disable(pinfo->vddio);
++	if (pinfo->desc->off_sequence) {
++		ret = pinfo->desc->off_sequence(pinfo);
++		if (ret < 0)
++			dev_err(panel->dev, "failed to turn panel off: %d\n", ret);
++	}
++
++	if (pinfo->desc->has_bias_supplies) {
++		/*
++		 * As the stock driver: only the bias supplies go down (negative
++		 * first), reset and VDDIO stay as they are; the next prepare
++		 * pulses reset again.
++		 */
++		regulator_disable(pinfo->vsn);
++		usleep_range(2000, 3000);
++		regulator_disable(pinfo->vsp);
++	} else {
++		gpiod_set_value_cansleep(pinfo->reset_gpio, 1);
++		regulator_disable(pinfo->vddio);
++		pinfo->vddio_on = false;
++	}
+ 
++	/*
++	 * The panel is off now, whether or not its off commands went out:
++	 * report success, so that the next prepare powers it up and
++	 * initialises it again instead of being skipped.
++	 */
+ 	return 0;
+ }
+ 
+@@ -1182,6 +1446,21 @@ static int nt36523_probe(struct mipi_dsi_device *dsi)
+ 	if (!pinfo->desc)
+ 		return -ENODEV;
+ 
++	if (pinfo->desc->has_bias_supplies) {
++		pinfo->vsp = devm_regulator_get(dev, "vsp");
++		if (IS_ERR(pinfo->vsp))
++			return dev_err_probe(dev, PTR_ERR(pinfo->vsp),
++					     "failed to get vsp regulator\n");
++
++		pinfo->vsn = devm_regulator_get(dev, "vsn");
++		if (IS_ERR(pinfo->vsn))
++			return dev_err_probe(dev, PTR_ERR(pinfo->vsn),
++					     "failed to get vsn regulator\n");
++	}
++
++	if (pinfo->desc->dsc_cfg)
++		pinfo->dsc = *pinfo->desc->dsc_cfg;
++
+ 	/* If the panel is dual dsi, register DSI1 */
+ 	if (pinfo->desc->is_dual_dsi) {
+ 		info = &pinfo->desc->dsi_info;
+@@ -1232,6 +1511,8 @@ static int nt36523_probe(struct mipi_dsi_device *dsi)
+ 		pinfo->dsi[i]->lanes = pinfo->desc->lanes;
+ 		pinfo->dsi[i]->format = pinfo->desc->format;
+ 		pinfo->dsi[i]->mode_flags = pinfo->desc->mode_flags;
++		pinfo->dsi[i]->hs_rate = pinfo->desc->hs_rate;
++		pinfo->dsi[i]->dsc = pinfo->desc->dsc_cfg ? &pinfo->dsc : NULL;
+ 
+ 		ret = devm_mipi_dsi_attach(dev, pinfo->dsi[i]);
+ 		if (ret < 0)
+@@ -1242,6 +1523,10 @@ static int nt36523_probe(struct mipi_dsi_device *dsi)
+ }
+ 
+ static const struct of_device_id nt36523_of_match[] = {
++	{
++		.compatible = "alldocube,t880-wandeqi-nt36523n",
++		.data = &t880_wandeqi_desc,
++	},
+ 	{
+ 		.compatible = "lenovo,j606f-boe-nt36523w",
+ 		.data = &j606f_boe_desc,
+-- 
+2.56.0
+

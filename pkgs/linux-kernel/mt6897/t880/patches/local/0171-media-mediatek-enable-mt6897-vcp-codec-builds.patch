@@ -1,0 +1,97 @@
+From 2f240cad418acd6f38f0ab740ac858f2020308f2 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] media: mediatek: enable MT6897 VCP codec builds
+
+Enable the implemented MT6897 sources through their Kconfig and
+Makefile entries after the component implementations are present.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T16:46:12+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T20:55:18+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T23:52:01+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-04T00:33:53+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-04T02:05:27+08:00
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec/venc/venc_vcp_if.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec/venc/venc_ipi_msg.h
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec/mtk_vcodec_enc_pm.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec/mtk_vcodec_enc.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec/venc_ipi_msg.h
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ .../media/platform/mediatek/vcodec/Kconfig    | 29 +++++++++++++++++++
+ .../media/platform/mediatek/vcodec/Makefile   |  1 +
+ .../platform/mediatek/vcodec/vcp/Makefile     |  6 ++++
+ 3 files changed, 36 insertions(+)
+ create mode 100644 drivers/media/platform/mediatek/vcodec/vcp/Makefile
+
+diff --git a/drivers/media/platform/mediatek/vcodec/Kconfig b/drivers/media/platform/mediatek/vcodec/Kconfig
+index bc82922325..63f1486967 100644
+--- a/drivers/media/platform/mediatek/vcodec/Kconfig
++++ b/drivers/media/platform/mediatek/vcodec/Kconfig
+@@ -34,3 +34,32 @@ config VIDEO_MEDIATEK_VCODEC
+ 
+ 	  To compile this driver as modules, choose M here: the
+ 	  modules will be called mtk-vcodec-dec and mtk-vcodec-enc.
++
++config VIDEO_MEDIATEK_VCP
++	tristate "MediaTek MT6897 VCP stateful decoder"
++	depends on V4L_MEM2MEM_DRIVERS && VIDEO_DEV
++	depends on ARCH_MEDIATEK || COMPILE_TEST
++	depends on MTK_IOMMU && MTK_SMI && MTK_VCP
++	select MEDIA_CONTROLLER
++	select VIDEOBUF2_DMA_SG
++	select VIDEOBUF2_VMALLOC
++	select V4L2_MEM2MEM_DEV
++	help
++	  Stateful H.264 and HEVC decoding with the bootloader-owned MT6897
++	  VCP firmware. Firmware starts only for an active decoding session.
++
++	  To compile as a module, choose M here: the module is mtk-vcp-dec.
++
++config VIDEO_MEDIATEK_VCP_ENCODER
++	tristate "MediaTek MT6897 VCP stateful encoder"
++	depends on V4L_MEM2MEM_DRIVERS && VIDEO_DEV && DEBUG_FS
++	depends on ARCH_MEDIATEK || COMPILE_TEST
++	depends on MTK_IOMMU && MTK_SMI && MTK_VCP
++	select VIDEOBUF2_VMALLOC
++	select V4L2_MEM2MEM_DEV
++	help
++	  Stateful H.264 and HEVC encoding with the bootloader-owned MT6897
++	  VCP firmware, using MMAP NV12 input and Annex B output.
++	  Root-only debugfs actions provide bounded encoder diagnostics.
++
++	  To compile as a module, choose M here: the module is mtk-vcp-enc.
+diff --git a/drivers/media/platform/mediatek/vcodec/Makefile b/drivers/media/platform/mediatek/vcodec/Makefile
+index 014abbfbd9..01b3c26a71 100644
+--- a/drivers/media/platform/mediatek/vcodec/Makefile
++++ b/drivers/media/platform/mediatek/vcodec/Makefile
+@@ -3,3 +3,4 @@
+ obj-y += common/
+ obj-y += encoder/
+ obj-y += decoder/
++obj-y += vcp/
+diff --git a/drivers/media/platform/mediatek/vcodec/vcp/Makefile b/drivers/media/platform/mediatek/vcodec/vcp/Makefile
+new file mode 100644
+index 0000000000..5b84dcf9dc
+--- /dev/null
++++ b/drivers/media/platform/mediatek/vcodec/vcp/Makefile
+@@ -0,0 +1,6 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_VIDEO_MEDIATEK_VCP) += mtk-vcp-dec.o
++mtk-vcp-dec-y := mtk_vcp_vdec_drv.o mtk_vcp_vdec.o mtk_vcp_vdec_hw.o
++
++obj-$(CONFIG_VIDEO_MEDIATEK_VCP_ENCODER) += mtk-vcp-enc.o
++mtk-vcp-enc-y := mtk_vcp_venc_drv.o mtk_vcp_venc.o mtk_vcp_venc_hw.o mtk_vcp_venc_frames.o mtk_vcp_venc_v4l2.o
+-- 
+2.56.0
+

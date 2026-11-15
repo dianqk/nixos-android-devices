@@ -42,10 +42,10 @@ nix eval --impure --json --option allow-import-from-derivation false --expr '
 任务如何回退到 QEMU。
 
 `tests/native-userspace.nix` 将上游 derivation 身份与纯原生 Nixpkgs 对比，并检查
-主机上的固件/脚本/镜像组装、目标脚本解释器、所选编译器平台，以及全部五款设备
+主机上的固件/脚本/镜像组装、目标脚本解释器、所选编译器平台，以及全部受支持设备
 （包括实验性的 Aurora）的模块选择。
 
-在目标设备上显式运行[基本硬件测试](../tests/basic/README.zh.md)。求值、实际编译、
+在目标设备上显式运行[基本硬件测试](../tests/basic/README.zh.md)和[主机测试](../tests/README.zh.md)。求值、实际编译、
 启动以及物理输入/显示验证是彼此独立的结果；请测试你打算部署的配置。
 
 实现参考：[U-Boot](../pkgs/u-boot/README.md)、
@@ -57,6 +57,25 @@ nix eval --impure --json --option allow-import-from-derivation false --expr '
 [Aurora](aurora/firmware.zh.md)。
 
 <a id="recovery-on-a-new-board"></a>
+## 设备支持状态
+
+每台设备在 `docs/<device>/status.toml` 中记录支持情况，为
+[`docs/status/items.toml`](status/items.toml) 的每个项目给出一个状态：Works、
+Partial、Broken、Untested，设备没有该硬件时写 N/A。说明同时写英文（`note`）和
+中文（`note_zh`）；Partial 和 Broken 必须附简短说明。项目还可以记录最近一次真机
+验证的日期 `verified = "YYYY-MM-DD"`（页面上显示为“（日期 验证。）”），以及
+Geekbench 结果 `benchmark = "https://browser.geekbench.com/…"`（页面上显示为链接）。
+修改后重新生成并检查页面：
+
+```sh
+tools/status-pages.py
+tools/status-pages.py --check
+```
+
+生成器会拒绝缺失或未知的项目、未知状态或字段、只有一种语言的说明、没有说明的
+Partial 或 Broken 项目，以及格式错误的 `verified` 日期或 `benchmark` URL；页面过期时
+`status-pages` flake 检查失败。新增项目时先加入 `items.toml`，再加入每台设备的文件。
+
 ## 在新设备上启用 recovery
 
 先打通内核/DTB 和 USB 控制器/PHY/设备角色支持，然后是 ACM shell
@@ -82,24 +101,24 @@ nix eval --impure --json --option allow-import-from-derivation false --expr '
 
 ```sh
 git init linux
-git -C linux remote add upstream https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
-git -C linux fetch --depth=1 upstream tag v7.3-rc6
-git -C linux show v7.3-rc6
+git -C linux remote add upstream https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+git -C linux fetch --depth=1 --no-tags upstream tag v7.3.4
+git -C linux show v7.3.4
 ```
 
-导入前，将标签身份与所选 Nix 源码核对。`v7.3-rc6` 标签对象为
-`4eeccbed21e50c19f97be9d325511f3de6343f2d`，提交为
-`a90ee4305c4a5df72c11b31dacfdc76e00fcf78a`；解压后源码的递归 SHA256 为
-`sha256-310GZztrJw+mkRFQ3IQ1pvTafElqHVKU0HMcZDk1x2c=`。仅获取签名标签并不能确立
+导入前，将标签身份与所选 Nix 源码核对。`v7.3.4` 标签对象为
+`8310b43a724c54668eeaa6860234078a7886915a`，提交为
+`7595a62d45ee1a2297eafa5f2ef5d0a45142d84d`；Nixpkgs 获取的 `linux-7.3.4.tar.xz`
+SHA256 为 `sha256-sRtt+Clejpkf8EC3GqpJlKi1XKojtrCSkH8ZW1hA/R8=`。仅获取签名标签并不能确立
 签名可信；有条件时用可信维护者的密钥验证。
 
 将设备队列导入为分支 `android/<release>/<device>` 并验证：
 
 ```sh
 python3 tools/kernel-queue.py import --repo ../linux --device aurora \
-  --version 7.3-rc6 --base v7.3-rc6
+  --version 7.3.4 --base v7.3.4
 python3 tools/kernel-queue.py verify --repo ../linux --device aurora \
-  --version 7.3-rc6 --base v7.3-rc6
+  --version 7.3.4 --base v7.3.4
 ```
 
 使用 `pkgs/linux-kernel/default.nix` 为该设备预期的发布版本；见
@@ -109,12 +128,12 @@ python3 tools/kernel-queue.py verify --repo ../linux --device aurora \
 则归属于执行导入的用户。导入清单位于 `.git/android-queues/`。导入失败时，先检查
 不完整的分支再删除；该工具不会重置已有工作。
 
-用普通 Git 编辑分支（例如 `git rebase -i v7.3-rc6`）。保留作者、上游链接和
+用普通 Git 编辑分支（例如 `git rebase -i v7.3.4`）。保留作者、上游链接和
 review/sign-off trailer，并单独说明本地适配。然后导出到新目录：
 
 ```sh
 python3 tools/kernel-queue.py export --repo ../linux --device aurora \
-  --version 7.3-rc6 --base v7.3-rc6 --output ../export-aurora
+  --version 7.3.4 --base v7.3.4 --output ../export-aurora
 ```
 
 审阅导出的补丁，将每个补丁复制到 `pkgs/linux-kernel/` 下其现有的共享或板级路径，

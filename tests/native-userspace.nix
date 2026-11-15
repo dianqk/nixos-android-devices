@@ -53,12 +53,15 @@ lib.genAttrs systems (
     compiled = lib.genAttrs [
       "usb-signaller"
       "mobile-boot-action"
-      "libcamera"
       "pd-mapper"
       "umtp-responder"
       "mobile-tqftpserv"
     ] (name: check buildSystem p.${name});
-    devices = lib.genAttrs [ "polaris" "asphalt" "clover" "sheng" "aurora" ] (
+    # The libcamera override intentionally follows native target pkgs.
+    nativePatched.libcamera =
+      assert p.libcamera.drvPath == native.androidDevicePackages.libcamera.drvPath;
+      check "aarch64-linux" p.libcamera;
+    devices = lib.genAttrs [ "polaris" "asphalt" "clover" "sheng" "aurora" "marble" ] (
       device:
       let
         n = env.nixosSystem {

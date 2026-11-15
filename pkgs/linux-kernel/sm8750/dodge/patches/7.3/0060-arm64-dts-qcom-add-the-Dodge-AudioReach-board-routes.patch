@@ -1,0 +1,143 @@
+From bc6c3ebcaf402cbdece74ed24de1e511e2102979 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 8 Nov 2026 19:57:13 +0800
+Subject: [PATCH 065/144] arm64: dts: qcom: add the Dodge AudioReach board
+ routes
+
+Add the AudioReach routes, recovery separation and TLMM ordering together.
+
+Consolidated from local follow-ups:
+  0438ab24321964205b8e57528134bfe1159ca783 arm64: dts: qcom: enable Dodge WCD9395 AudioReach routes
+  d91b0d0f521c8225d59626e56550e8ba10e9ca1c arm64: dts: qcom: keep Dodge recovery independent of audio
+  f83734160edf9bd5659fc64fdee21f4d17501849 arm64: dts: qcom: order Dodge TLMM properties before audio pins
+---
+ .../qcom/sm8750-oneplus-dodge-recovery.dts    | 17 ++++++
+ .../boot/dts/qcom/sm8750-oneplus-dodge.dts    | 57 ++-----------------
+ 2 files changed, 23 insertions(+), 51 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge-recovery.dts b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge-recovery.dts
+index fe6a19274f..ce2fc0b9f1 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge-recovery.dts
++++ b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge-recovery.dts
+@@ -63,3 +63,20 @@ &rmtfs_mem {
+ &iris {
+ 	status = "disabled";
+ };
++
++&sound {
++	status = "disabled";
++};
++
++&wcd939x {
++	status = "disabled";
++	/delete-node/ port;
++};
++
++&swr1 {
++	status = "disabled";
++};
++
++&swr2 {
++	status = "disabled";
++};
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+index ba83af9e4e..19772527bd 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
++++ b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+@@ -19,13 +19,10 @@ / {
+ 	compatible = "oneplus,dodge", "qcom,sm8750";
+ 	chassis-type = "handset";
+ 
+-	sound {
++	sound: sound {
+ 		compatible = "qcom,sm8750-sndcard", "qcom,sm8450-sndcard";
+ 		model = "OnePlus-dodge";
+ 
+-		pinctrl-0 = <&i2s1_active>;
+-		pinctrl-names = "default";
+-
+ 		/* Mic bias wiring as on stock; AMIC2 is the USB-C headset mic. */
+ 		audio-routing = "AMIC1", "MIC BIAS1",
+ 				"AMIC2", "MIC BIAS2",
+@@ -71,21 +68,6 @@ platform {
+ 			};
+ 		};
+ 
+-		speaker-dai-link {
+-			link-name = "Speaker Playback";
+-
+-			cpu {
+-				sound-dai = <&q6apmbedai SECONDARY_MI2S_RX>;
+-			};
+-
+-			codec {
+-				sound-dai = <&speaker_left>, <&speaker_right>;
+-			};
+-
+-			platform {
+-				sound-dai = <&q6apm>;
+-			};
+-		};
+ 	};
+ 
+ 	wcd939x: audio-codec {
+@@ -662,6 +644,9 @@ &pon_resin {
+ };
+ 
+ &tlmm {
++	/* reserved for secure world */
++	gpio-reserved-ranges = <36 4>, <74 1>;
++
+ 	wcd_default: wcd-reset-n-active-state {
+ 		pins = "gpio101";
+ 		function = "gpio";
+@@ -669,37 +654,7 @@ wcd_default: wcd-reset-n-active-state {
+ 		bias-disable;
+ 		output-low;
+ 	};
+-	i2s1_active: i2s1-active-state {
+-		sck-pins {
+-			pins = "gpio121";
+-			function = "i2s1_sck";
+-			drive-strength = <4>;
+-			bias-disable;
+-		};
+-
+-		data0-pins {
+-			pins = "gpio122";
+-			function = "i2s1_data0";
+-			drive-strength = <4>;
+-			bias-disable;
+-		};
+ 
+-		ws-pins {
+-			pins = "gpio123";
+-			function = "i2s1_ws";
+-			drive-strength = <4>;
+-			bias-disable;
+-		};
+-
+-		data1-pins {
+-			pins = "gpio124";
+-			function = "i2s1_data1";
+-			drive-strength = <4>;
+-			bias-disable;
+-		};
+-	};
+-	/* reserved for secure world */
+-	gpio-reserved-ranges = <36 4>, <74 1>;
+ 
+ 	disp0_reset_n_active: disp0-reset-n-active-state {
+ 		pins = "gpio98";
+@@ -999,9 +954,9 @@ &remoteproc_adsp {
+ 	status = "okay";
+ 
+ 	glink-edge {
+-		/* Charging uses QRTR/PDR; the audio GPR topology is not available. */
++		/* AudioReach uses the board-specific topology installed with the card. */
+ 		gpr {
+-			status = "disabled";
++			status = "okay";
+ 		};
+ 	};
+ };

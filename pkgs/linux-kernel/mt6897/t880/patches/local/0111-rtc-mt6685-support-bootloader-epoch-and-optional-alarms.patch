@@ -1,0 +1,128 @@
+From 2b7836580642d51739ea33c966afa1e456dff1e6 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] rtc: mt6685: support bootloader epoch and optional alarms
+
+Use the bootloader-compatible 1968 year epoch and allow timekeeping
+without an alarm interrupt.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-15T19:09:44+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-15T19:38:28+08:00
+Link: https://lore.kernel.org/all/20251024083318.25890-3-angelogioacchino.delregno@collabora.com/
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/rtc/rtc-mt6685.c | 55 +++++++++++++++++++++++++---------------
+ 1 file changed, 34 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/rtc/rtc-mt6685.c b/drivers/rtc/rtc-mt6685.c
+index 3e632a3edb..f46e1a4391 100644
+--- a/drivers/rtc/rtc-mt6685.c
++++ b/drivers/rtc/rtc-mt6685.c
+@@ -46,6 +46,12 @@
+ #define  RTC_AL_TC_MON			GENMASK(3, 0)
+ #define  RTC_AL_TC_DOW			GENMASK(2, 0)
+ 
++/*
++ * The bootloader and the vendor kernel count the year register from 1968
++ * (a leap year, so the hardware leap year rule holds).
++ */
++#define RTC_BASE_YEAR			1968
++
+ #define RTC_REG_PDN2			0x36
+ #define  RTC_PDN2_PWRON_ALARM		BIT(4)
+ 
+@@ -195,7 +201,8 @@ static int rtc_mt6685_read_time_regs(struct mt6685_rtc *rtc, struct rtc_time *tm
+ 	tm->tm_mday = FIELD_GET(RTC_AL_TC_HOUR_DOM, data[RTC_AL_TC_REGIDX_DOM]);
+ 	tm->tm_wday = FIELD_GET(RTC_AL_TC_DOW, data[RTC_AL_TC_REGIDX_DOW]);
+ 	tm->tm_mon  = FIELD_GET(RTC_AL_TC_MON, data[RTC_AL_TC_REGIDX_MON]);
+-	tm->tm_year = FIELD_GET(RTC_AL_TC_YEAR, data[RTC_AL_TC_REGIDX_YEAR]);
++	tm->tm_year = FIELD_GET(RTC_AL_TC_YEAR, data[RTC_AL_TC_REGIDX_YEAR]) +
++		      RTC_BASE_YEAR - 1900;
+ 
+ 	/* HW register start mon/wday from one, but tm_mon/tm_wday start from zero. */
+ 	tm->tm_mon--;
+@@ -250,7 +257,8 @@ static int rtc_mt6685_set_time(struct device *dev, struct rtc_time *tm)
+ 	data[RTC_AL_TC_REGIDX_DOM] = FIELD_PREP(RTC_AL_TC_HOUR_DOM, tm->tm_mday);
+ 	data[RTC_AL_TC_REGIDX_DOW] = FIELD_PREP(RTC_AL_TC_DOW, tm->tm_wday);
+ 	data[RTC_AL_TC_REGIDX_MON] = FIELD_PREP(RTC_AL_TC_MON, tm->tm_mon);
+-	data[RTC_AL_TC_REGIDX_YEAR] = FIELD_PREP(RTC_AL_TC_YEAR, tm->tm_year);
++	data[RTC_AL_TC_REGIDX_YEAR] = FIELD_PREP(RTC_AL_TC_YEAR,
++						 tm->tm_year + 1900 - RTC_BASE_YEAR);
+ 
+ 	ret = regmap_bulk_write(rtc->regmap, RTC_REG_TC_SEC, data,
+ 				RTC_AL_TC_REGIDX_MAX * sizeof(data[0]));
+@@ -323,7 +331,8 @@ static int rtc_mt6685_set_alarm(struct device *dev, struct rtc_wkalrm *alm)
+ 	FIELD_MODIFY(RTC_AL_TC_HOUR_DOM, &data[RTC_AL_TC_REGIDX_DOM], tm->tm_mday);
+ 	FIELD_MODIFY(RTC_AL_TC_DOW, &data[RTC_AL_TC_REGIDX_DOW], tm->tm_wday);
+ 	FIELD_MODIFY(RTC_AL_TC_MON, &data[RTC_AL_TC_REGIDX_MON], tm->tm_mon);
+-	FIELD_MODIFY(RTC_AL_TC_YEAR, &data[RTC_AL_TC_REGIDX_YEAR], tm->tm_year);
++	FIELD_MODIFY(RTC_AL_TC_YEAR, &data[RTC_AL_TC_REGIDX_YEAR],
++		     tm->tm_year + 1900 - RTC_BASE_YEAR);
+ 
+ 	if (alm->enabled) {
+ 		u16 val = RTC_AL_MASK_DOW;
+@@ -386,8 +395,8 @@ static int rtc_mt6685_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
+-	rtc->irq = platform_get_irq(pdev, 0);
+-	if (rtc->irq < 0)
++	rtc->irq = platform_get_irq_optional(pdev, 0);
++	if (rtc->irq < 0 && rtc->irq != -ENXIO)
+ 		return rtc->irq;
+ 
+ 	rtc->mclk = devm_clk_get(dev, 0);
+@@ -404,26 +413,30 @@ static int rtc_mt6685_probe(struct platform_device *pdev)
+ 
+ 	platform_set_drvdata(pdev, rtc);
+ 
+-	/* Clock is required to auto-synchronize IRQ enable to RTC */
+-	ret = clk_prepare_enable(rtc->mclk);
+-	if (ret)
+-		return ret;
++	if (rtc->irq > 0) {
++		/* Clock is required to auto-synchronize IRQ enable to RTC */
++		ret = clk_prepare_enable(rtc->mclk);
++		if (ret)
++			return ret;
+ 
+-	ret = devm_request_threaded_irq(&pdev->dev, rtc->irq, NULL,
+-					rtc_mt6685_irq_handler_thread,
+-					IRQF_ONESHOT | IRQF_TRIGGER_HIGH,
+-					"mt6685-rtc", rtc);
+-	clk_disable_unprepare(rtc->mclk);
+-	if (ret)
+-		return dev_err_probe(&pdev->dev, ret, "Cannot request alarm IRQ");
++		ret = devm_request_threaded_irq(&pdev->dev, rtc->irq, NULL,
++						rtc_mt6685_irq_handler_thread,
++						IRQF_ONESHOT | IRQF_TRIGGER_HIGH,
++						"mt6685-rtc", rtc);
++		clk_disable_unprepare(rtc->mclk);
++		if (ret)
++			return dev_err_probe(&pdev->dev, ret, "Cannot request alarm IRQ");
+ 
+-	device_init_wakeup(&pdev->dev, true);
++		device_init_wakeup(&pdev->dev, true);
++	} else {
++		/* Without the alarm interrupt, only keep time */
++		clear_bit(RTC_FEATURE_ALARM, rtc->rdev->features);
++	}
+ 
+ 	rtc->rdev->ops = &rtc_mt6685_ops;
+-	rtc->rdev->range_min = RTC_TIMESTAMP_BEGIN_1900;
+-	rtc->rdev->range_max = mktime64(2027, 12, 31, 23, 59, 59);
+-	rtc->rdev->start_secs = mktime64(1968, 1, 1, 0, 0, 0);
+-	rtc->rdev->set_start_time = true;
++	rtc->rdev->range_min = mktime64(RTC_BASE_YEAR, 1, 1, 0, 0, 0);
++	rtc->rdev->range_max = mktime64(RTC_BASE_YEAR + FIELD_MAX(RTC_AL_TC_YEAR),
++					12, 31, 23, 59, 59);
+ 
+ 	return devm_rtc_register_device(rtc->rdev);
+ }
+-- 
+2.56.0
+

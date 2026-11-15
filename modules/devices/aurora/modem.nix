@@ -16,7 +16,7 @@ in
       default = false;
       description = ''
         Experimental cellular modem support through `androidDevices.modem`:
-        Android 14 modem/IPA firmware, rmtfs on the modemst1, modemst2, fsg and
+        Android 16 modem/IPA firmware, rmtfs on the modemst1, modemst2, fsg and
         fsc partitions, tqftpserv and ModemManager over QRTR. The installed
         system only.
       '';
@@ -49,13 +49,6 @@ in
     # IPA firmware is only installed with the modem; do not probe IPA without it.
     (lib.mkIf (!cfg.enable) { boot.blacklistedKernelModules = [ "ipa" ]; })
     (lib.mkIf cfg.enable {
-      assertions = [
-        {
-          assertion = aurora.firmwareVariant == "android14";
-          message = "Aurora modem support requires the OS1.0.3.0.UNACNXM Android 14 firmware baseline.";
-        }
-      ];
-
       androidDevices.modem = {
         enable = true;
         remoteproc = "4080000.remoteproc";

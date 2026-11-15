@@ -2,12 +2,12 @@
 
 [中文](PATCHES.zh.md) · [Y700 2023 guide](../../../../docs/asphalt/README.md)
 
-The queue is adapted to the current Linux 7.3-rc6 lock. Independent patch replay,
+The queue is adapted to the current Linux 7.3 lock. Independent patch replay,
 resolved configuration checks, the board DTB and the 43 C files touched by the
 queue pass validation. A full kernel build and device tests remain separate.
 See the [shared kernel status](../../README.md) for the other devices.
 
-The `asphalt` patch queue targets Linux 7.3-rc6. The
+The `asphalt` patch queue targets Linux 7.3. The
 ordered queue is defined in [`series.nix`](series.nix), and the kernel
 configuration is [`kernel.config`](kernel.config).
 
@@ -17,7 +17,7 @@ configuration is [`kernel.config`](kernel.config).
 | 0002 | Display, panel, and backlight |
 | 0003 | Touchscreen |
 | [Shared PCIe fix](../../patches/pcie-qcom-iommu-cells.patch) | Parse IOMMU cells for PCIe BDF-to-SID mapping |
-| 0005 | UFS clocks |
+| 0005 | SM8475 850 MHz UFS clock parent (GPLL3) |
 | 0006 | Y700 2023 device tree |
 | 0007 | Video codec |
 | 0008 | USB and audio wiring |
@@ -37,6 +37,12 @@ configuration is [`kernel.config`](kernel.config).
 | [Shared GMU series](../../patches/gmu-sync-state/README.md) | Bind a driver to the GMU so GCC/GPUCC `sync_state()` completes |
 | 0026 | Disable the unused QCE node (driver is BROKEN upstream) so interconnect `sync_state()` completes |
 | 0027 | Power down UFS controller/device/PHY in system suspend (no PHY retention across CX collapse) |
+| 0028–0030 | Parent the SM8450 GCC GDSCs to RPMh CX (upstream) |
+| 0031 | Moved to the shared Qualcomm patches: [UFS lane clocks only](../../patches/ufs-qcom-lane-clocks-only.patch) (upstream f07317a8d57f) |
+| 0032 | Program the full SM8475 UFS PHY sequence for every gear |
+| 0033 | `qcom,sm8475-ufshc` binding |
+| 0034 | SM8475 UFS turbo mode configuration above 300 MHz |
+| 0035 | SM8475 UFS operating points (75 and 850 MHz) with their CX levels |
 
 Build the kernel on an x86_64 or AArch64 Linux host with `nix build .#devices.asphalt.kernel`.
 For an x86_64 build, the derivation runs on x86_64 and produces an AArch64
@@ -44,6 +50,26 @@ kernel. Kbuild uses `ARCH=arm64`, the AArch64 target prefix, and Clang/LLD from
 `buildPackages`; no AArch64-hosted LLVM tools are needed.
 Linux kernel patches follow the upstream GPL-2.0 terms and the SPDX notices
 of the files they modify.
+
+## UFS clocks and PHY
+
+0035 replaces the legacy `freq-table-hz` with the two operating points of
+Lenovo's stock table: 75 MHz at LOW_SVS (HS-G1) and 850 MHz at TURBO_L1
+(HS-G4), the CX levels Qualcomm's GCC driver requires for those rates. Stock
+firmware also drops to 300 MHz at HS-G4 while the controller is less than half
+busy; that level is not described, so HS-G4 runs only at 850 MHz. The
+`qcom,sm8475-ufshc` compatible (0033) selects the controller's turbo
+configuration (0034), following Qualcomm's downstream driver: above 300 MHz
+the HCI turbo clock path and UniPro `ATTR_HW_CGC_EN` are set, `SYS1CLK_1US`
+counts at half the core clock and the UniPro 1 µs/40 ns cycle counts are 213
+and 9; at or below 300 MHz both bits are cleared. Link startup after a host
+reset or a powered-down resume uses the maximum frequency and so enters turbo
+mode. 0005 supplies the 850 MHz GPLL3 parent. 0032 moves SM8475's PLL, TX/RX
+and PCS values out of the HS-G4-only overlay into its base tables and adds
+`BG_TIMER`, matching the downstream table for all gears. 0031 (upstream
+f07317a8d57f) is now a shared Qualcomm patch. See the
+[UFS clock limit](../../../../docs/asphalt/hardware.md#ufs-clock-limit) for
+the measured behaviour.
 
 ## Shared PCIe fix
 
@@ -78,7 +104,7 @@ S5K4H7 control semantics were also checked against the [MediaTek GPL driver (201
 without code changes. Keeping an inherited PLL enabled lets the MDP RCG park
 safely before Linux takes over. Pair this kernel with the U-Boot
 `/reserved-memory/splash_region` reservation; renaming that node alone breaks
-display and touch with older kernels. See the [firmware requirements](../../../u-boot/sm8475/README.md).
+display and touch with older kernels. See the the U-Boot firmware requirements.
 
 ## Battery notification serialization
 

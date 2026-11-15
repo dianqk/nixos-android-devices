@@ -4,10 +4,10 @@ use anyhow::{bail, ensure, Context, Result};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::Read,
     os::unix::{
-        fs::{FileExt, PermissionsExt},
+        fs::{FileExt, OpenOptionsExt, PermissionsExt},
         net::UnixStream,
     },
     path::{Path, PathBuf},
@@ -21,7 +21,7 @@ const ACTIONS: &[&str] = &[
     "prepare-boot",
     "safe-ufs",
     "format-root",
-    "install-initial",
+    "install-initial-system",
     "deploy-query",
     "deploy-offline",
     "deploy-check-boot",
@@ -34,15 +34,22 @@ const ACTIONS: &[&str] = &[
     "update-firmware",
     "update-recovery",
     "clear-boot-request",
+    "mark-slot-successful",
     "repair-backup-gpt",
+    "restore-gpt",
+    "gpt-backup",
     "repair-filesystems",
     "reboot-system",
     "reboot-recovery",
     "reboot-bootloader",
     "poweroff",
 ];
-pub fn capabilities() -> Vec<String> {
-    ACTIONS.iter().map(|s| s.to_string()).collect()
+pub fn capabilities(config: &Config) -> Vec<String> {
+    ACTIONS
+        .iter()
+        .filter(|a| !(config.mediatek_a() && **a == "update-recovery"))
+        .map(|s| s.to_string())
+        .collect()
 }
 pub fn validate(a: &[String], input: bool) -> Result<()> {
     ensure!(
@@ -57,18 +64,23 @@ pub fn validate(a: &[String], input: bool) -> Result<()> {
     let argc = a.len();
     match action {
         "prepare-install" => ensure!(
-            argc == 2 && ["--check", "--confirm-erase-userdata"].contains(&a[1].as_str()),
-            "use prepare-install --check|--confirm-erase-userdata"
+            ["--check", "--confirm-erase-userdata"].contains(&a[argc - 1].as_str())
+                && (argc == 2
+                    || (argc == 4
+                        && a[1] == "--android-userdata"
+                        && super::gpt::parse_gib(&a[2]).is_ok())),
+            "use prepare-install [--android-userdata SIZE] --check|--confirm-erase-userdata"
         ),
-        "format-root" | "prepare-boot" | "clear-boot-request" | "repair-backup-gpt"
-        | "repair-filesystems" => ensure!(
+        "format-root" | "prepare-boot" | "clear-boot-request" | "mark-slot-successful"
+        | "repair-backup-gpt" | "restore-gpt" | "repair-filesystems" => ensure!(
             argc == 2 && ["--check", "--confirm"].contains(&a[1].as_str()),
-            "use format-root|prepare-boot|clear-boot-request|repair-backup-gpt|repair-filesystems --check|--confirm"
+            "use format-root|prepare-boot|clear-boot-request|mark-slot-successful|repair-backup-gpt|restore-gpt|repair-filesystems --check|--confirm"
         ),
-        "install-initial" => ensure!(
+        "install-initial-system" => ensure!(
             argc == 6 && ["--check", "--confirm", "--resume-check", "--resume-confirm"].contains(&a[5].as_str()),
-            "use install-initial MANIFEST REGISTRATION SYSTEM MIN_BYTES --check|--confirm|--resume-check|--resume-confirm"
+            "use install-initial-system MANIFEST REGISTRATION SYSTEM MIN_BYTES --check|--confirm|--resume-check|--resume-confirm"
         ),
+        "gpt-backup" => ensure!(argc == 1, "use gpt-backup"),
         "deploy-query" => ensure!(argc == 3, "use deploy-query MANIFEST SYSTEM"),
         "deploy-offline" => ensure!(
             argc == 5 && a[4] == "--confirm",
@@ -118,7 +130,7 @@ pub fn validate(a: &[String], input: bool) -> Result<()> {
         _ => ensure!(argc == 1, "unexpected arguments"),
     }
     let wants_input =
-        (action == "install-initial" && a[5] == "--confirm") || action == "deploy-offline";
+        (action == "install-initial-system" && a[5] == "--confirm") || action == "deploy-offline";
     ensure!(
         wants_input == input,
         "input channel does not match operation"
@@ -128,13 +140,23 @@ pub fn validate(a: &[String], input: bool) -> Result<()> {
 pub fn execute(j: &Job, a: &[String], input: Option<mpsc::Receiver<UnixStream>>) -> Result<String> {
     j.engine.config.identity()?;
     match a[0].as_str() {
-        "prepare-install" => prepare(j, a[1] == "--check"),
+        "prepare-install" => prepare(
+            j,
+            a[a.len() - 1] == "--check",
+            if a.len() == 4 {
+                Some(super::gpt::parse_gib(&a[2])?)
+            } else {
+                None
+            },
+        ),
         "prepare-boot" => prepare_boot(j, a[1] == "--check"),
         "safe-ufs" => safe_ufs(j),
         "format-root" => format(j, a[1] == "--check"),
         "repair-backup-gpt" => repair_backup_gpt(j, a[1] == "--check"),
+        "restore-gpt" => restore_gpt(j, a[1] == "--check"),
+        "gpt-backup" => gpt_backup(j),
         "repair-filesystems" => repair_filesystems(j, a[1] == "--check"),
-        "install-initial" => initial(j, a, input),
+        "install-initial-system" => initial(j, a, input),
         "deploy-offline" => deploy(j, a, input.unwrap()),
         "deploy-query" => query(j, a),
         "deploy-check-boot" => check_boot(j),
@@ -149,6 +171,7 @@ pub fn execute(j: &Job, a: &[String], input: Option<mpsc::Receiver<UnixStream>>)
             config(j).ram_gate(j)?;
             clear_bcb(j, a[1] == "--check")
         }
+        "mark-slot-successful" => mark_slot_successful(j, a[1] == "--check"),
         "reboot-system" | "reboot-recovery" | "reboot-bootloader" | "poweroff" => reboot(j, &a[0]),
         _ => bail!("unsupported operation"),
     }
@@ -176,48 +199,485 @@ fn safe_ufs(j: &Job) -> Result<String> {
     ufs_safe_mode(Path::new(controller))?;
     Ok("UFS clock gating and scaling disabled".into())
 }
+/// Repair stale backup GPTs on the disks holding the firmware slot
+/// (`boot_b`, MediaTek `boot_a`) and Android userdata, from their CRC-verified
+/// primaries. Only the backup array/header of a disk is written.
 fn repair_backup_gpt(j: &Job, check: bool) -> Result<String> {
     ab_only(j, "repair-backup-gpt")?;
-    config(j).ram_gate(j)?;
-    let target = config(j).partition_for_backup_repair(j, "linux")?;
-    target
-        .gpt
-        .check_linux_layout(config(j).esp_bytes, config(j).minimum_root_bytes)?;
-    if !target.gpt.backup_needs_repair() {
-        return Ok("Both GPT copies agree; no repair needed".into());
+    let c = config(j);
+    c.ram_gate_for_backup_repair(j)?;
+    let firmware = if c.mediatek_a() { "boot_a" } else { "boot_b" };
+    let mut targets: Vec<Device> = Vec::new();
+    for name in [firmware, "userdata"] {
+        let d = c.partition_for_backup_repair(j, name)?;
+        if targets.iter().all(|t| t.disk != d.disk) {
+            targets.push(d);
+        }
     }
-    let plan = format!("Repair backup GPT on {} from its CRC-verified primary; only stale A/B metadata/backup CRC may differ. Preserve primary GPT, layout, payloads and OEM padding.", target.disk.display());
+    for t in &targets {
+        if t.gpt.partition("linux").is_err() {
+            continue;
+        }
+        if c.mediatek_a() {
+            t.gpt
+                .check_userdata_layout(c.esp_size(), c.minimum_root_bytes)?;
+        } else {
+            t.gpt
+                .check_linux_layout(c.esp_bytes, c.minimum_root_bytes)?;
+        }
+    }
+    let mut plan = Vec::new();
+    for t in &targets {
+        if t.gpt.backup_needs_repair() {
+            plan.push(format!(
+                "Repair backup GPT on {} from its CRC-verified primary: {}.",
+                t.disk.display(),
+                t.gpt.backup_repair_summary()?
+            ));
+        }
+    }
+    if plan.is_empty() {
+        let disks: Vec<_> = targets
+            .iter()
+            .map(|t| t.disk.display().to_string())
+            .collect();
+        return Ok(format!(
+            "Both GPT copies agree on {}; no repair needed",
+            disks.join(", ")
+        ));
+    }
+    plan.push("Only stale A/B type GUIDs, slot attributes and the backup CRC may differ. Preserve primary GPT, layout, payloads and OEM padding.".into());
+    let plan = plan.join("\n");
     if check {
         return Ok(plan);
     }
-    config(j).ram_gate(j)?;
+    c.ram_gate_for_backup_repair(j)?;
     j.phase("Repairing backup GPT; do not reboot", false)?;
-    let disk = exclusive(&target.disk)?;
-    let evidence = PathBuf::from(format!("/run/mobile-recovery/gpt-repair-{}", j.id));
-    target.gpt.snapshot(&evidence)?;
-    target.gpt.repair_backup(&disk)?;
+    let mut evidence = Vec::new();
+    for t in targets.iter().filter(|t| t.gpt.backup_needs_repair()) {
+        let disk = exclusive(&t.disk)?;
+        let name = t.disk.file_name().context("disk name")?.to_string_lossy();
+        let dir = PathBuf::from(format!("/run/mobile-recovery/gpt-repair-{}-{name}", j.id));
+        t.gpt.snapshot(&dir)?;
+        t.gpt.repair_backup(&disk)?;
+        evidence.push(dir.display().to_string());
+    }
     Ok(format!(
-        "{plan}\nReadback verified; metadata snapshot: {}",
-        evidence.display()
+        "{plan}\nReadback verified; metadata snapshots: {}",
+        evidence.join(", ")
     ))
 }
-fn prepare(j: &Job, check: bool) -> Result<String> {
-    ab_only(j, "prepare-install; use format-root and prepare-boot")?;
-    config(j).ram_gate(j)?;
+fn type_name(kind: &str) -> &'static str {
+    use super::gpt::{ANDROID, BASIC_DATA, ESP, LINUX};
+    match kind {
+        k if k == ESP => "EFI system",
+        k if k == LINUX => "Linux filesystem",
+        k if k == BASIC_DATA => "basic data",
+        k if k == ANDROID => "Android data",
+        _ => "other",
+    }
+}
+/// The exact planned table: every entry that changes or is added, the entry
+/// count and what stays untouched.
+fn describe_split(
+    old: &super::gpt::Gpt,
+    parts: &[super::gpt::Partition],
+    count: usize,
+    disk: &Path,
+) -> Result<String> {
+    use std::fmt::Write as _;
+    let user = old.partition("userdata")?;
+    let mib = |b: u64| b as f64 / (1u64 << 20) as f64;
+    let mut out = String::new();
+    writeln!(
+        out,
+        "Userdata split on {} (4096-byte sectors; LBA in 4 KiB units)",
+        disk.display()
+    )?;
+    writeln!(
+        out,
+        "Userdata span: LBA {}-{} ({:.1} MiB); nothing outside it changes.",
+        user.start,
+        user.end,
+        mib(user.bytes())
+    )?;
+    writeln!(
+        out,
+        "GPT entries: {} -> {} in both headers (arrays stay in their sectors).",
+        old.entry_count(),
+        count
+    )?;
+    writeln!(
+        out,
+        "{:>3} {:<15} {:>10} {:>10} {:>12}  {:<16} {:<36} change",
+        "#", "name", "first LBA", "last LBA", "MiB", "type", "partition GUID"
+    )?;
+    let mut unchanged = 0;
+    for p in parts {
+        let change = match old.partitions.iter().find(|o| o.number == p.number) {
+            Some(o) if o == p => {
+                unchanged += 1;
+                continue;
+            }
+            Some(o) => format!("end {} -> {}", o.end, p.end),
+            None => "new".into(),
+        };
+        writeln!(
+            out,
+            "{:>3} {:<15} {:>10} {:>10} {:>12.1}  {:<16} {:<36} {}",
+            p.number,
+            p.name,
+            p.start,
+            p.end,
+            mib(p.bytes()),
+            type_name(&p.kind),
+            p.uuid,
+            change
+        )?;
+        ensure!(p.start % 256 == 0, "{} is not 1 MiB aligned", p.name);
+    }
+    writeln!(
+        out,
+        "All starts are 1 MiB aligned; {unchanged} other entries unchanged (super, misc, metadata, both slots, calibration and partitions after userdata)."
+    )?;
+    write!(
+        out,
+        "Destroys Android userdata: the new userdata is left unformatted (first 8 MiB zeroed) and metadata is untouched; wipe data from the stock recovery on slot B before using Android."
+    )?;
+    Ok(out)
+}
+/// Where the host pushes a saved original GPT for `restore-gpt`.
+const GPT_RESTORE: &str = "/run/mobile-recovery/gpt-restore";
+/// The original GPT saved in RAM before a userdata split (header and array
+/// images of both copies). The split saves it itself; the host may copy it
+/// for a permanent backup. It is lost when the recovery restarts.
+const GPT_BACKUP: &str = "/run/mobile-recovery/gpt-original";
+/// How the check's saved copy is used.
+const CHECK_NOTE: &str = "The split itself keeps this RAM copy (restore-gpt undoes it during this recovery session); for a permanent copy, download it to the host first (mobile-device recovery prepare-install --gpt-backup DIR). restore-gpt prefers a host copy pushed to /run/mobile-recovery/gpt-restore.";
+/// Save the original GPT once. An existing copy is never replaced: it is
+/// kept when it still matches the disk and refused otherwise. The copy is
+/// written to a temporary directory, verified against the disk and only
+/// then renamed into place, so a failed save leaves no partial copy.
+fn save_gpt_backup(dir: &Path, disk: &File, g: &super::gpt::Gpt) -> Result<String> {
+    let current = g.capture(disk)?;
+    if dir.exists() {
+        let saved = super::gpt::load_snapshot(dir, g).with_context(|| {
+            format!(
+                "the saved original GPT ({}) cannot be read for this disk and is never overwritten; inspect it before restarting recovery",
+                dir.display()
+            )
+        })?;
+        ensure!(
+            saved == current,
+            "the saved original GPT ({}) differs from the disk and is never overwritten; the disk changed after it was saved (undo with restore-gpt, or copy it to the host before restarting recovery)",
+            dir.display()
+        );
+        return describe_snapshot(dir, "Original GPT already saved in RAM (matches the disk)");
+    }
+    let partial = dir.with_extension("partial");
+    if partial.exists() {
+        fs::remove_dir_all(&partial)?;
+    }
+    g.snapshot(&partial)?;
+    ensure!(
+        super::gpt::load_snapshot(&partial, g)? == current,
+        "the GPT changed while it was saved; nothing written"
+    );
+    fs::rename(&partial, dir)?;
+    describe_snapshot(dir, "Original GPT saved in RAM")
+}
+/// The userdata split's GPT write: keep the original GPT in RAM (saved now
+/// unless an identical copy exists; a different copy refuses the write),
+/// record the evidence copy and write the planned table.
+fn write_split_gpt(
+    original: &Path,
+    f: &File,
+    g: &super::gpt::Gpt,
+    evidence: &Path,
+    write: impl FnOnce(&File) -> Result<()>,
+) -> Result<String> {
+    let saved = save_gpt_backup(original, f, g)?;
+    g.snapshot(evidence)?;
+    write(f)?;
+    Ok(saved)
+}
+/// Text shown after a userdata split: how to undo it during this recovery
+/// session and what Android needs.
+fn split_epilogue(saved: &str) -> String {
+    format!(
+        "{saved}\nUndo during this recovery session: recovery restore-gpt --check, then --confirm (uses the RAM copy; lost when the recovery restarts unless copied to the host).\nAndroid needs a factory reset (wipe data) before it boots again."
+    )
+}
+/// Short plan lines ("Plan: ...") for the recovery screen: the userdata
+/// entries that change or are added.
+fn plan_summary(old: &super::gpt::Gpt, parts: &[super::gpt::Partition]) -> String {
+    let gib = |p: &super::gpt::Partition| p.bytes() as f64 / (1u64 << 30) as f64;
+    let mut out = Vec::new();
+    for p in parts {
+        match old.partitions.iter().find(|o| o.number == p.number) {
+            Some(o) if o == p => {}
+            Some(o) if p.name == "userdata" => out.push(format!(
+                "Plan: userdata {:.1} -> {:.1} GiB (Android, erased)",
+                gib(o),
+                gib(p)
+            )),
+            Some(o) => out.push(format!(
+                "Plan: {} {:.1} -> {:.1} GiB",
+                p.name,
+                gib(o),
+                gib(p)
+            )),
+            None => out.push(format!("Plan: new {} {:.1} GiB", p.name, gib(p))),
+        }
+    }
+    out.join("\n")
+}
+/// The saved GPT `restore-gpt` writes back: a copy the host pushed, else
+/// the original the split saved in RAM during this recovery session.
+fn restore_source<'a>(pushed: &'a Path, original: &'a Path) -> Result<&'a Path> {
+    if pushed.exists() {
+        Ok(pushed)
+    } else if original.exists() {
+        Ok(original)
+    } else {
+        bail!(
+            "no saved original GPT: neither a host copy pushed to {} nor the copy prepare-install saved in RAM ({}; lost when the recovery restarts)",
+            pushed.display(),
+            original.display()
+        )
+    }
+}
+/// What a rollback image may change: only its userdata span. Every other
+/// entry of the image is unchanged on the disk, and the entries it lacks
+/// are the Linux partitions of the split inside that span.
+fn rollback_scope<'a>(
+    image: &'a [super::gpt::Partition],
+    now: &[super::gpt::Partition],
+) -> Result<&'a super::gpt::Partition> {
+    let user = image
+        .iter()
+        .find(|p| p.name == "userdata")
+        .context("rollback image has no userdata")?;
+    for old in image.iter().filter(|p| p.name != "userdata") {
+        ensure!(
+            now.contains(old),
+            "rollback image differs from the disk outside the userdata span ({})",
+            old.name
+        );
+    }
+    let current = now
+        .iter()
+        .find(|p| p.name == "userdata")
+        .context("the disk has no userdata")?;
+    ensure!(
+        current.start == user.start,
+        "rollback image userdata starts elsewhere than on the disk"
+    );
+    for p in now
+        .iter()
+        .filter(|p| p.name != "userdata" && !image.contains(p))
+    {
+        ensure!(
+            super::gpt::USERDATA_SPLIT.contains(&p.name.as_str())
+                && p.start >= user.start
+                && p.end <= user.end,
+            "{} is not a Linux partition inside the saved userdata span",
+            p.name
+        );
+    }
+    Ok(user)
+}
+fn describe_snapshot(dir: &Path, what: &str) -> Result<String> {
+    use std::fmt::Write as _;
+    let mut out = format!("{what}: {}", dir.display());
+    let mut names: Vec<_> = fs::read_dir(dir)?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<_>>()?;
+    names.sort();
+    for p in names {
+        write!(out, "\n  {} SHA256 {}", p.display(), hash_file(&p)?)?;
+    }
+    Ok(out)
+}
+/// Save the current GPT (both copies, byte images) in RAM for the host,
+/// in a new directory per task; the original from prepare-install is
+/// left alone.
+fn gpt_backup(j: &Job) -> Result<String> {
+    ab_only(j, "gpt-backup")?;
     let user = config(j).partition(j, "userdata")?;
-    let parts = user
-        .gpt
-        .split(config(j).esp_bytes, config(j).minimum_root_bytes)?;
-    let plan = serde_json::to_string_pretty(&parts)?;
+    let dir = PathBuf::from(format!("/run/mobile-recovery/gpt-current-{}", j.id));
+    user.gpt.snapshot(&dir)?;
+    describe_snapshot(&dir, "Current GPT saved in RAM")
+}
+/// Roll the userdata split back: write a saved original GPT (a host copy
+/// pushed to `GPT_RESTORE`, else the RAM copy `prepare-install` saved in
+/// this recovery session) byte for byte, backup copy first, verify it and
+/// make the kernel re-read the table.
+fn restore_gpt(j: &Job, check: bool) -> Result<String> {
+    ab_only(j, "restore-gpt")?;
+    config(j).ram_gate(j)?;
+    let misc = config(j).partition(j, "userdata")?;
+    let source = restore_source(Path::new(GPT_RESTORE), Path::new(GPT_BACKUP))?;
+    let image = super::gpt::load_snapshot(source, &misc.gpt)?;
+    let (count, parts) = super::gpt::image_partitions(&image, super::gpt::SECTOR)?;
+    let user = rollback_scope(&parts, &misc.gpt.partitions)?;
+    let plan = format!(
+        "Restore the saved GPT from {} ({count} entries, userdata LBA {}-{}) on {}; current table has {} entries. Linux partitions and their data become unreachable.",
+        source.display(),
+        user.start,
+        user.end,
+        misc.disk.display(),
+        misc.gpt.entry_count()
+    );
     if check {
-        return Ok(format!("{plan}\nDestroys Android userdata; preserves A, DTBO, super and metadata. Android requires a separate factory reset."));
+        return Ok(format!("{plan}\nCheck only; no writes."));
+    }
+    j.phase("Restoring the original GPT; do not reboot", false)?;
+    let disk = exclusive(&misc.disk)?;
+    super::gpt::restore(&disk, &image)?;
+    reread(&disk)?;
+    drop(disk);
+    tool(j, "udevadm", &["settle"])?;
+    let now = config(j).partition(j, "userdata")?;
+    ensure!(
+        now.gpt.partitions == parts && now.gpt.entry_count() == count,
+        "restored GPT readback differs; stay in recovery"
+    );
+    Ok(format!("{plan}\nRestored and verified."))
+}
+/// MediaTek slot-A install storage inside the userdata span.
+fn prepare_userdata(j: &Job, check: bool, android: u64, offered: &str) -> Result<String> {
+    let c = config(j);
+    c.ram_gate(j)?;
+    let user = c.partition(j, "userdata")?;
+    let (parts, count) = user
+        .gpt
+        .split_userdata(c.esp_size(), c.minimum_root_bytes, android)?;
+    let plan = format!(
+        "{offered}\n{}\n{}",
+        describe_split(&user.gpt, &parts, count, &user.disk)?,
+        plan_summary(&user.gpt, &parts)
+    );
+    if check {
+        let saved = save_gpt_backup(Path::new(GPT_BACKUP), &File::open(&user.disk)?, &user.gpt)?;
+        return Ok(format!(
+            "{plan}\nCheck only; no partition or filesystem writes.\n{saved}\n{CHECK_NOTE}"
+        ));
+    }
+    c.ram_gate(j)?;
+    j.phase("Writing GPT; do not reboot", false)?;
+    let disk = exclusive(&user.disk)?;
+    let evidence = PathBuf::from(format!("/run/mobile-recovery/gpt-{}", j.id));
+    let saved = write_split_gpt(Path::new(GPT_BACKUP), &disk, &user.gpt, &evidence, |f| {
+        user.gpt.write_plan(f, &parts, count)
+    })?;
+    reread(&disk)?;
+    drop(disk);
+    tool(j, "udevadm", &["settle"])?;
+    let layout = c.layout(j, false)?;
+    let user = c.partition(j, "userdata")?;
+    j.phase("Clearing Android userdata and formatting Linux", false)?;
+    let zeros = vec![0; 8 << 20];
+    {
+        let f = exclusive(&user.node)?;
+        f.write_all_at(&zeros, 0)?;
+        f.sync_all()?;
+    }
+    tool(
+        j,
+        "mke2fs",
+        &[
+            "-F",
+            "-t",
+            "ext4",
+            "-m",
+            "0",
+            "-L",
+            &c.root_label,
+            layout.root.node.to_str().unwrap(),
+        ],
+    )?;
+    tool(
+        j,
+        "mkfs.fat",
+        &[
+            "-F",
+            "32",
+            "-n",
+            &c.boot_label,
+            layout.esp.node.to_str().unwrap(),
+        ],
+    )?;
+    sync();
+    c.layout(j, true)?;
+    fsck(j, &layout)?;
+    Ok(format!(
+        "{plan}\nDone. GPT evidence: {}. Next: wipe data from the stock recovery on slot B, then install NixOS before booting Linux.\n{}",
+        evidence.display(),
+        split_epilogue(&saved)
+    ))
+}
+/// A/B devices: the user chooses how much of the userdata allocation Android
+/// keeps (32/64/128/256/512 GiB, offered when the Linux ESP and root keep at
+/// least 64 GiB); Linux gets the rest.
+fn prepare(j: &Job, check: bool, android: Option<u64>) -> Result<String> {
+    use super::gpt::MINIMUM_LINUX;
+    ab_only(j, "prepare-install; use format-root and prepare-boot")?;
+    let c = config(j);
+    c.ram_gate(j)?;
+    let user = c.partition(j, "userdata")?;
+    let gib = |b: u64| format!("{}G", b >> 30);
+    let choices = user.gpt.android_userdata_choices()?;
+    let offered = format!(
+        "Android userdata choices: {}\n(sizes that leave the Linux ESP and root at least {} of the {:.1} GiB userdata allocation)",
+        if choices.is_empty() {
+            "none".into()
+        } else {
+            choices.iter().map(|b| gib(*b)).collect::<Vec<_>>().join(" ")
+        },
+        gib(MINIMUM_LINUX),
+        user.entry.bytes() as f64 / (1u64 << 30) as f64
+    );
+    ensure!(
+        !choices.is_empty() || check,
+        "no Android userdata size leaves Linux enough space; the userdata split is refused\n{offered}"
+    );
+    let Some(android) = android else {
+        ensure!(
+            check,
+            "choose the Android userdata size: prepare-install --android-userdata SIZE --confirm-erase-userdata\n{offered}"
+        );
+        return Ok(format!(
+            "{offered}\nCheck only. {}",
+            if choices.is_empty() {
+                "The userdata split is refused on this disk."
+            } else {
+                "Show the plan with prepare-install --android-userdata SIZE --check."
+            }
+        ));
+    };
+    if c.mediatek_a() {
+        return prepare_userdata(j, check, android, &offered);
+    }
+    let parts =
+        user.gpt
+            .split_keeping(config(j).esp_bytes, config(j).minimum_root_bytes, android)?;
+    let plan = serde_json::to_string_pretty(&parts)?;
+    let summary = plan_summary(&user.gpt, &parts);
+    if check {
+        let saved = save_gpt_backup(Path::new(GPT_BACKUP), &File::open(&user.disk)?, &user.gpt)?;
+        return Ok(format!(
+            "{offered}\n{plan}\n{summary}\nKeeps {} for Android userdata and erases it; preserves A, DTBO, super and metadata. Android requires a separate factory reset.\nCheck only; no partition or filesystem writes.\n{saved}\n{CHECK_NOTE}",
+            gib(android)
+        ));
     }
     config(j).ram_gate(j)?;
     j.phase("Writing GPT; do not reboot", false)?;
     let disk = exclusive(&user.disk)?;
     let evidence = PathBuf::from(format!("/run/mobile-recovery/gpt-{}", j.id));
-    user.gpt.snapshot(&evidence)?;
-    user.gpt.write_split(&disk, &parts)?;
+    let saved = write_split_gpt(Path::new(GPT_BACKUP), &disk, &user.gpt, &evidence, |f| {
+        user.gpt.write_split(f, &parts)
+    })?;
     reread(&disk)?;
     drop(disk);
     tool(j, "udevadm", &["settle"])?;
@@ -251,14 +711,18 @@ fn prepare(j: &Job, check: bool) -> Result<String> {
             "-F",
             "32",
             "-n",
-            "LINUXBOOT",
+            &config(j).boot_label,
             layout.esp.node.to_str().unwrap(),
         ],
     )?;
     sync();
     config(j).layout(j, true)?;
     fsck(j, &layout)?;
-    Ok(format!("Prepared ext4 root and FAT ESP; Android userdata erased. GPT evidence: {}. Install explicitly before Linux boot.",evidence.display()))
+    Ok(format!(
+        "{summary}\nPrepared ext4 root and FAT ESP; Android userdata erased. GPT evidence: {}. Install explicitly before Linux boot.\n{}",
+        evidence.display(),
+        split_epilogue(&saved)
+    ))
 }
 fn format(j: &Job, check: bool) -> Result<String> {
     config(j).ram_gate(j)?;
@@ -321,8 +785,13 @@ fn prepare_boot(j: &Job, check: bool) -> Result<String> {
     config(j).ram_gate(j)?;
     let l = config(j).layout(j, false)?;
     let roles = config(j).roles.as_ref().context("missing roles")?;
-    // An explicit ESP label is also verified later; otherwise use the default.
-    let label = roles.esp.fs_label.as_deref().unwrap_or("NIXOS_BOOT");
+    // An explicit ESP label is also verified later; otherwise use the
+    // configured boot label.
+    let label = roles
+        .esp
+        .fs_label
+        .as_deref()
+        .unwrap_or(&config(j).boot_label);
     let volume = roles.esp.fs_uuid.as_deref();
     valid_fat_identity(label, volume)?;
     ensure!(
@@ -361,7 +830,7 @@ fn prepare_boot(j: &Job, check: bool) -> Result<String> {
     }
     m.cleanup()?;
     if probe(j, &l.esp.node, "TYPE")? == "vfat" {
-        tool(j, "fsck.fat", &["-n", l.esp.node.to_str().unwrap()])?;
+        fat_check(j, &l.esp.node)?;
         return Ok("Matching FAT boot filesystem already prepared; no formatting performed".into());
     }
     let plan = format!(
@@ -397,7 +866,7 @@ fn prepare_boot(j: &Job, check: bool) -> Result<String> {
     args.push(l.esp.node.to_str().unwrap());
     tool(j, "mkfs.fat", &args)?;
     sync();
-    tool(j, "fsck.fat", &["-n", l.esp.node.to_str().unwrap()])?;
+    fat_check(j, &l.esp.node)?;
     ensure!(
         probe(j, &l.esp.node, "TYPE")? == "vfat" && probe(j, &l.esp.node, "LABEL")? == label,
         "formatted FAT identity mismatch"
@@ -440,8 +909,50 @@ fn repair_filesystems(j: &Job, check: bool) -> Result<String> {
 }
 fn fsck(j: &Job, l: &Layout) -> Result<()> {
     tool(j, "e2fsck", &["-fn", l.root.node.to_str().unwrap()])?;
-    tool(j, "fsck.fat", &["-n", l.esp.node.to_str().unwrap()])?;
+    fat_check(j, &l.esp.node)
+}
+/// Read-only FAT check. `fsck.fat -n` exits 1 whenever it would change
+/// anything, including the FSInfo free-cluster count, which is only a hint:
+/// U-Boot's FAT writer (systemd-boot's random seed, EFI variables) leaves it
+/// stale and Linux recounts it. Exit 1 is accepted only when that count is
+/// the sole finding; nothing is repaired here (`repair-filesystems` does).
+fn fat_check(j: &Job, node: &Path) -> Result<()> {
+    let output = j.run_codes(
+        Command::new("/bin/fsck.fat").arg("-n").arg(node),
+        None,
+        &[0, 1],
+    )?;
+    if fat_hint_only(&output)? {
+        j.log("FAT FSInfo free-cluster count is stale (a hint only); not repaired");
+    }
     Ok(())
+}
+/// Classify `fsck.fat -n` output: Ok(false) when it found nothing to change,
+/// Ok(true) when the only change is the FSInfo free-cluster count.
+fn fat_hint_only(output: &str) -> Result<bool> {
+    if !output
+        .lines()
+        .any(|l| l.trim() == "Leaving filesystem unchanged.")
+    {
+        return Ok(false);
+    }
+    let mut hint = false;
+    for line in output.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if line.starts_with("Free cluster summary wrong (") && line.ends_with(')') {
+            hint = true;
+        } else if !(line.starts_with("fsck.fat ")
+            || line == "Auto-correcting."
+            || line == "Leaving filesystem unchanged."
+            || (line.contains(" files, ") && line.ends_with(" clusters")))
+        {
+            bail!("FAT filesystem check found errors; run repair-filesystems:\n{output}");
+        }
+    }
+    ensure!(
+        hint,
+        "FAT filesystem check found errors; run repair-filesystems:\n{output}"
+    );
+    Ok(true)
 }
 fn mount_root(j: &Job, l: &Layout, root: &Path, rw: bool, m: &mut Mounts) -> Result<()> {
     ensure!(
@@ -663,9 +1174,12 @@ fn identity(d: &Device) -> String {
         d.entry.bytes()
     )
 }
-/// Resume only the EFI/finalization stage of the same explicitly selected system.
-/// Earlier failures without a registered profile still require a fresh target.
-fn resume_initial(root: &Path, system: &str) -> Result<()> {
+/// Resume the same pending first installation without transferring the closure
+/// again. With a selected profile it must be this system. Without one (a
+/// failure after the transfer, before the profile was set), the store may hold
+/// only objects of this system's manifest; the resumed run registers and
+/// hashes the whole closure again before writing the profile, EFI or firmware.
+fn resume_initial(root: &Path, system: &str, entries: &BTreeMap<String, String>) -> Result<()> {
     let marker = "/var/lib/mobile-efi-preparation/pending";
     let path = root.join(marker.trim_start_matches('/'));
     ensure!(
@@ -682,12 +1196,44 @@ fn resume_initial(root: &Path, system: &str) -> Result<()> {
             "another operation is pending"
         );
     }
+    let profile = inside(root, "/nix/var/nix/profiles")?.join("system");
+    if fs::symlink_metadata(&profile).is_err() {
+        ensure!(
+            inside(root, system)?.is_dir(),
+            "resume requires the transferred system; format the root and install again"
+        );
+        for e in fs::read_dir(inside(root, "/nix/store")?)? {
+            let e = e?;
+            let name = e.file_name();
+            let name = name.to_str().context("store object name")?;
+            if nix_store_internal(name, &e.file_type()?, entries) {
+                continue;
+            }
+            ensure!(
+                entries.contains_key(&format!("/nix/store/{name}")),
+                "store object {name} is not in the manifest; format the root and install again"
+            );
+        }
+        return Ok(());
+    }
     let selected = inside(root, "/nix/var/nix/profiles/system")?;
     ensure!(
         selected == inside(root, system)? && selected.is_dir(),
         "resume requires the same registered system profile"
     );
     Ok(())
+}
+/// Nix's own entries in /nix/store that are not store objects: the
+/// hard-link deduplication directory `.links` (auto-optimise-store, filled
+/// while the closure is registered) and path lock files `<object>.lock` of
+/// declared objects. Symlinks or other types under these names do not count.
+fn nix_store_internal(name: &str, kind: &fs::FileType, entries: &BTreeMap<String, String>) -> bool {
+    if name == ".links" {
+        return kind.is_dir();
+    }
+    name.strip_suffix(".lock").is_some_and(|object| {
+        kind.is_file() && entries.contains_key(&format!("/nix/store/{object}"))
+    })
 }
 fn initial(j: &Job, a: &[String], input: Option<mpsc::Receiver<UnixStream>>) -> Result<String> {
     let root = Path::new(ROOT);
@@ -704,14 +1250,11 @@ fn initial(j: &Job, a: &[String], input: Option<mpsc::Receiver<UnixStream>>) -> 
     ensure!(bytes > 0 && bytes <= 1 << 40, "invalid closure size");
     config(j).ram_gate(j)?;
     let l = config(j).layout(j, true)?;
-    let boot = config(j).named(j, "firmware")?;
-    let before = identity(&boot);
-    let boot_hash = hash_file(&boot.node)?;
     fsck(j, &l)?;
     let mut m = Mounts::new();
     mount_root(j, &l, root, false, &mut m)?;
     if resume {
-        resume_initial(root, s)?;
+        resume_initial(root, s, &entries)?;
     } else {
         empty_root(root)?;
     }
@@ -728,7 +1271,7 @@ fn initial(j: &Job, a: &[String], input: Option<mpsc::Receiver<UnixStream>>) -> 
     m.cleanup()?;
     if ["--check", "--resume-check"].contains(&a[5].as_str()) {
         return Ok(format!(
-            "{} root, FAT ESP and firmware partition verified; firmware SHA256 {boot_hash}",
+            "{} root and FAT ESP verified",
             if resume {
                 "Pending same-system"
             } else {
@@ -752,7 +1295,7 @@ fn initial(j: &Job, a: &[String], input: Option<mpsc::Receiver<UnixStream>>) -> 
     );
     mount_root(j, &l, root, true, &mut m)?;
     if resume {
-        resume_initial(root, s)?;
+        resume_initial(root, s, &entries)?;
     } else {
         empty_root(root)?;
     }
@@ -824,38 +1367,17 @@ fn initial(j: &Job, a: &[String], input: Option<mpsc::Receiver<UnixStream>>) -> 
     )?;
     nix(j, root, s, "nix-store", &["--verify", "--check-contents"])?;
     verify_closure(j, root, s, s, &entries)?;
-    let image = inside(root, &format!("{s}/mobile-boot.img"))?;
-    let rel = format!(
-        "/{}",
-        image
-            .strip_prefix(root)?
-            .to_str()
-            .context("firmware path")?
-    );
-    let object = rel.split('/').take(4).collect::<Vec<_>>().join("/");
-    ensure!(
-        entries.contains_key(&object),
-        "firmware outside verified closure"
-    );
-    validate_image(j, &image, boot.entry.bytes(), false)?;
     j.phase("Installing EFI generation", false)?;
     directory(root, "etc")?;
     fs::write(root.join("etc/NIXOS"), b"")?;
     mount_esp(j, &l, root, true, &mut m)?;
     activate(j, root, s, s, &l)?;
-    let after = config(j).named(j, "firmware")?;
-    ensure!(
-        before == identity(&after) && hash_file(&after.node)? == boot_hash,
-        "firmware partition changed during install"
-    );
-    j.phase("Writing and verifying U-Boot", false)?;
-    write_image(&image, &after)?;
     sync();
     fs::remove_file(marker)?;
     sync();
     m.cleanup()?;
     Ok(format!(
-        "Installed {s}; closure, EFI and firmware readback verified. Reboot explicitly."
+        "Installed {s}; closure and EFI verified. Reboot explicitly."
     ))
 }
 fn query(j: &Job, a: &[String]) -> Result<String> {
@@ -961,6 +1483,10 @@ fn deploy(j: &Job, a: &[String], input: mpsc::Receiver<UnixStream>) -> Result<St
 }
 fn check_boot(j: &Job) -> Result<String> {
     config(j).ram_gate(j)?;
+    check_installed(j)
+}
+/// Read-only check of the selected installed system and its EFI entry.
+fn check_installed(j: &Job) -> Result<String> {
     let l = config(j).layout(j, true)?;
     fsck(j, &l)?;
     let root = Path::new(ROOT);
@@ -1151,44 +1677,60 @@ fn activate(j: &Job, root: &Path, old: &str, new: &str, l: &Layout) -> Result<()
     );
     Ok(())
 }
-fn validate_image(j: &Job, p: &Path, capacity: u64, recovery: bool) -> Result<()> {
-    let meta = fs::metadata(p)?;
+fn validated_image(j: &Job, p: &Path, capacity: u64, recovery: bool) -> Result<Vec<u8>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(p)?;
+    let meta = file.metadata()?;
+    let limit = capacity.min(256 << 20);
     ensure!(
-        meta.is_file() && meta.len() > 4096 && meta.len() <= capacity && meta.len() <= 256 << 20,
+        meta.is_file() && meta.len() > 4096 && meta.len() <= limit,
         "image size invalid"
     );
-    let data = fs::read(p)?;
+    let mut data = Vec::with_capacity(meta.len() as usize);
+    file.take(limit + 1).read_to_end(&mut data)?;
+    ensure!(
+        data.len() as u64 == meta.len(),
+        "image size changed during read"
+    );
     let c = config(j);
-    super::image::inspect(
-        &data,
-        if recovery {
-            &c.compatible
-        } else {
-            &c.firmware_compatible
-        },
-        recovery,
-    )?;
+    if c.mediatek_a() {
+        ensure!(
+            !recovery,
+            "this slot model uses USB RAM recovery; no recovery partition"
+        );
+        super::image::inspect_v4_firmware(&data, &c.firmware_compatible)?;
+        super::image::avb_hash_footer(&data, capacity as usize, "boot")?;
+        return Ok(data);
+    }
+    if recovery && super::image::has_fit_ramdisk(&data) {
+        // u-boot-fit: the board's U-Boot image with a RAM recovery FIT ramdisk.
+        super::image::inspect_fit_recovery_image(&data, &c.firmware_compatible, &c.compatible)?;
+    } else {
+        super::image::inspect(
+            &data,
+            if recovery {
+                &c.compatible
+            } else {
+                &c.firmware_compatible
+            },
+            recovery,
+        )?;
+    }
     if recovery && config(j).recovery_avb {
         super::image::recovery_avb(&data)?;
     }
-    Ok(())
+    Ok(data)
 }
-fn write_image(image: &Path, d: &Device) -> Result<()> {
+fn write_image(image: &[u8], d: &Device) -> Result<()> {
     let out = exclusive(&d.node)?;
-    let mut input = File::open(image)?;
-    let bytes = input.metadata()?.len();
-    ensure!(bytes <= d.entry.bytes(), "image too large");
+    let mut offset = image.len() as u64;
+    ensure!(offset <= d.entry.bytes(), "image too large");
+    out.write_all_at(image, 0)?;
     let mut expected = Sha256::new();
+    expected.update(image);
     let mut b = [0; 65536];
-    let mut offset = 0;
-    while offset < bytes {
-        let n = input.read(&mut b)?;
-        ensure!(n > 0, "image truncated during write");
-        out.write_all_at(&b[..n], offset)?;
-        expected.update(&b[..n]);
-        offset += n as u64;
-    }
-    b.fill(0);
     while offset < d.entry.bytes() {
         let n = (d.entry.bytes() - offset).min(b.len() as u64) as usize;
         out.write_all_at(&b[..n], offset)?;
@@ -1214,30 +1756,96 @@ fn update_image(j: &Job, a: &[String]) -> Result<String> {
     config(j).ram_gate(j)?;
     let recovery = a[0] == "update-recovery";
     let d = config(j).named(j, if recovery { "recovery" } else { "firmware" })?;
-    let image = Path::new(&a[1]);
-    validate_image(j, image, d.entry.bytes(), recovery)?;
-    let digest = hash_file(image)?;
+    let image = validated_image(j, Path::new(&a[1]), d.entry.bytes(), recovery)?;
+    let digest = format!("{:x}", Sha256::digest(&image));
     if a[2] == "--check" {
         return Ok(format!(
             "{} {} SHA256 {digest}",
             d.node.display(),
-            fs::metadata(image)?.len()
+            image.len()
         ));
     }
     j.phase("Writing image and verifying readback", false)?;
     config(j).ram_gate(j)?;
-    write_image(image, &d)?;
+    write_image(&image, &d)?;
     sync();
     Ok(format!("{} verified: {digest}", d.node.display()))
+}
+/// Repair for the U-Boot slot confirmation: set slot A's successful_boot in
+/// the AOSP boot control (misc + 2048), keeping priority, tries and slot B.
+fn mark_slot_successful(j: &Job, check: bool) -> Result<String> {
+    let c = config(j);
+    ensure!(
+        c.mediatek_a(),
+        "mark-slot-successful is only available with the MediaTek slot-A model"
+    );
+    c.ram_gate(j)?;
+    let misc = c.partition(j, "misc")?;
+    ensure!(
+        misc.entry.bytes() == c.misc_bytes as u64,
+        "misc capacity mismatch"
+    );
+    let f = if check {
+        File::open(&misc.node)?
+    } else {
+        j.phase("Marking slot A successful", false)?;
+        exclusive(&misc.node)?
+    };
+    let mut before = vec![0; c.misc_bytes];
+    f.read_exact_at(&mut before, 0)?;
+    let off = BOOT_CONTROL_OFFSET as usize;
+    let block: [u8; 32] = before[off..off + 32].try_into()?;
+    let slots = boot_control(&block)?;
+    let Some(new) = mark_slot_a_successful(&block)? else {
+        return Ok(format!("Slot A is already successful: {:?}", slots[0]));
+    };
+    if check {
+        return Ok(format!(
+            "Would mark slot A successful ({:?}); only its successful bit and the CRC change; slot B {:?} unchanged",
+            slots[0], slots[1]
+        ));
+    }
+    let evidence = format!("/run/mobile-recovery/misc-{}.before", j.id);
+    fs::write(&evidence, &before)?;
+    let mut expected = before.clone();
+    expected[off..off + 32].copy_from_slice(&new);
+    let mut readback = vec![0; before.len()];
+    let result = (|| -> Result<()> {
+        f.write_all_at(&new, BOOT_CONTROL_OFFSET)?;
+        f.sync_all()?;
+        f.read_exact_at(&mut readback, 0)?;
+        ensure!(readback == expected, "boot control readback mismatch");
+        Ok(())
+    })();
+    if let Err(e) = result {
+        f.write_all_at(&block, BOOT_CONTROL_OFFSET)?;
+        f.sync_all()?;
+        f.read_exact_at(&mut readback, 0)?;
+        ensure!(
+            readback == before,
+            "CRITICAL: boot control restoration failed; {e}; snapshot {evidence}"
+        );
+        bail!("{e}; boot control restored; snapshot {evidence}");
+    }
+    Ok(format!(
+        "Slot A marked successful; full misc readback verified; snapshot {evidence}"
+    ))
 }
 fn clear_bcb(j: &Job, check: bool) -> Result<String> {
     bcb(j, check, None)
 }
 fn bcb(j: &Job, check: bool, request: Option<&[u8]>) -> Result<String> {
-    let d = config(j).named(j, "misc")?;
+    let c = config(j);
+    // Qualcomm misc carries its own type GUID; MediaTek misc is a basic data
+    // partition, found as the unique "misc" on the configured controller.
+    let d = if c.mediatek_a() {
+        c.partition(j, "misc")?
+    } else {
+        c.named(j, "misc")?
+    };
     ensure!(
-        d.entry.kind == "82acc91f-357c-4a68-9c8f-689e1b1a23a1"
-            && d.entry.bytes() == config(j).misc_bytes as u64,
+        (c.mediatek_a() || d.entry.kind == "82acc91f-357c-4a68-9c8f-689e1b1a23a1")
+            && d.entry.bytes() == c.misc_bytes as u64,
         "unexpected misc partition"
     );
     let f = if check {
@@ -1326,14 +1934,23 @@ fn bcb_file(
         None => format!("One-time boot request cleared; full misc readback verified; snapshot {evidence}. Slot unchanged; no reboot requested"),
     })
 }
+/// Whether a restart request writes the BCB (`boot_request = "bcb"`); only
+/// then are the slot and partition-table checks of the RAM gate required.
+fn reboot_writes(boot_request: &str, action: &str) -> bool {
+    boot_request == "bcb" && action != "poweroff"
+}
 fn reboot(j: &Job, action: &str) -> Result<String> {
-    config(j).ram_gate(j)?;
-    if action == "reboot-system" {
-        check_boot(j)?;
-    }
-    j.phase("Rebooting", false)?;
     let c = config(j);
     let bcb_request = c.boot_request == "bcb";
+    if reboot_writes(&c.boot_request, action) {
+        c.ram_gate(j)?;
+    } else {
+        c.reboot_gate()?;
+    }
+    if action == "reboot-system" {
+        check_installed(j)?;
+    }
+    j.phase("Rebooting", false)?;
     match action {
         "reboot-system" => {
             clear_bcb(j, false)?;
@@ -1365,12 +1982,192 @@ fn reboot(j: &Job, action: &str) -> Result<String> {
         .into(),
     );
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    // Let clients see the acknowledgement before the connection drops.
+    j.phase(super::protocol::RESTART_PHASE, false)?;
+    std::thread::sleep(std::time::Duration::from_millis(500));
     tool(j, "systemctl", &args)?;
     Ok("Restart requested".into())
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn open_rw(disk: &Path) -> File {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(disk)
+            .unwrap()
+    }
+    fn scratch(name: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("recovery-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir(&base).unwrap();
+        base
+    }
+    #[test]
+    fn original_gpt_backup_is_never_overwritten() {
+        use super::super::gpt::{write_t880_disk, Gpt};
+        let base = scratch("gpt-original");
+        let disk = base.join("disk");
+        let dir = base.join("gpt-original");
+        write_t880_disk(&disk, false);
+        let f = open_rw(&disk);
+        let size = f.metadata().unwrap().len();
+        let g = Gpt::read(&f, size).unwrap();
+        assert!(save_gpt_backup(&dir, &f, &g)
+            .unwrap()
+            .starts_with("Original GPT saved"));
+        assert!(!dir.with_extension("partial").exists());
+        let original = g.capture(&f).unwrap();
+        assert!(save_gpt_backup(&dir, &f, &g)
+            .unwrap()
+            .contains("already saved"));
+        let (parts, count) = g.split_userdata(1 << 30, 16 << 30, 64 << 30).unwrap();
+        g.write_plan(&f, &parts, count).unwrap();
+        let split = Gpt::read(&f, size).unwrap();
+        let err = format!("{:#}", save_gpt_backup(&dir, &f, &split).unwrap_err());
+        assert!(err.contains("differs from the disk"), "{err}");
+        assert_eq!(
+            super::super::gpt::load_snapshot(&dir, &g).unwrap(),
+            original
+        );
+        fs::remove_dir_all(&base).unwrap();
+    }
+    /// The confirm path of a userdata split without a prior check (the
+    /// recovery screen or the on-device CLI, no host): the write saves the
+    /// original GPT itself, a matching copy is reused, a different or
+    /// unreadable one refuses the write and leaves the disk unchanged.
+    fn confirm_path_keeps_the_original(
+        name: &str,
+        write_disk: impl Fn(&Path),
+        split: impl Fn(&super::super::gpt::Gpt, &File) -> Result<()>,
+    ) {
+        use super::super::gpt::Gpt;
+        let base = scratch(name);
+        let disk = base.join("disk");
+        let dir = base.join("gpt-original");
+        write_disk(&disk);
+        let f = open_rw(&disk);
+        let size = f.metadata().unwrap().len();
+        let g = Gpt::read(&f, size).unwrap();
+        let original = g.capture(&f).unwrap();
+        // No saved copy: the write saves it, then splits.
+        let saved =
+            write_split_gpt(&dir, &f, &g, &base.join("evidence-1"), |f| split(&g, f)).unwrap();
+        assert!(saved.starts_with("Original GPT saved in RAM"), "{saved}");
+        assert!(split_epilogue(&saved).contains("restore-gpt"));
+        assert_eq!(
+            super::super::gpt::load_snapshot(&dir, &g).unwrap(),
+            original
+        );
+        assert_ne!(Gpt::read(&f, size).unwrap(), g);
+        // The RAM copy undoes the split (restore-gpt without a host copy).
+        let pushed = base.join("gpt-restore");
+        assert_eq!(restore_source(&pushed, &dir).unwrap(), dir.as_path());
+        let now = Gpt::read(&f, size).unwrap();
+        let image = super::super::gpt::load_snapshot(&dir, &now).unwrap();
+        let (_, parts) =
+            super::super::gpt::image_partitions(&image, super::super::gpt::SECTOR).unwrap();
+        rollback_scope(&parts, &now.partitions).unwrap();
+        super::super::gpt::restore(&f, &image).unwrap();
+        assert_eq!(Gpt::read(&f, size).unwrap(), g);
+        // A matching saved copy (from a check or the host flow) is reused.
+        let saved =
+            write_split_gpt(&dir, &f, &g, &base.join("evidence-2"), |f| split(&g, f)).unwrap();
+        assert!(saved.contains("already saved"), "{saved}");
+        super::super::gpt::restore(&f, &image).unwrap();
+        // A saved copy that differs from the disk refuses before any write.
+        let table = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("table-")
+            })
+            .unwrap();
+        let mut bytes = fs::read(&table).unwrap();
+        bytes[0] ^= 1;
+        fs::write(&table, &bytes).unwrap();
+        let err =
+            write_split_gpt(&dir, &f, &g, &base.join("evidence-3"), |f| split(&g, f)).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("differs from the disk"), "{err}");
+        assert!(!base.join("evidence-3").exists());
+        assert_eq!(g.capture(&f).unwrap(), original);
+        // An incomplete copy is reported as unreadable, never as missing.
+        fs::remove_file(&table).unwrap();
+        let err = format!(
+            "{:#}",
+            write_split_gpt(&dir, &f, &g, &base.join("evidence-4"), |f| split(&g, f)).unwrap_err()
+        );
+        assert!(err.contains("cannot be read"), "{err}");
+        assert_eq!(g.capture(&f).unwrap(), original);
+        // Without any copy restore-gpt names both sources.
+        fs::remove_dir_all(&dir).unwrap();
+        let err = format!("{:#}", restore_source(&pushed, &dir).unwrap_err());
+        assert!(err.contains("no saved original GPT"), "{err}");
+        fs::create_dir(&pushed).unwrap();
+        assert_eq!(restore_source(&pushed, &dir).unwrap(), pushed.as_path());
+        fs::remove_dir_all(&base).unwrap();
+    }
+    #[test]
+    fn qualcomm_ab_split_saves_the_original_gpt_without_a_check() {
+        confirm_path_keeps_the_original(
+            "ab-gpt",
+            |p| {
+                super::super::gpt::tests::write_marble_lun0(p);
+            },
+            |g, f| {
+                let parts = g.split_keeping(1 << 30, 16 << 30, 64 << 30)?;
+                let summary = plan_summary(g, &parts);
+                assert!(summary.contains("Plan: userdata"), "{summary}");
+                assert!(summary.contains("Plan: new linux "), "{summary}");
+                g.write_split(f, &parts)
+            },
+        );
+    }
+    #[test]
+    fn mediatek_split_saves_the_original_gpt_without_a_check() {
+        confirm_path_keeps_the_original(
+            "mediatek-gpt",
+            |p| super::super::gpt::write_t880_disk(p, false),
+            |g, f| {
+                let (parts, count) = g.split_userdata(1 << 30, 16 << 30, 64 << 30)?;
+                let summary = plan_summary(g, &parts);
+                g.write_plan(f, &parts, count)
+            },
+        );
+    }
+    #[test]
+    fn ab_rollback_scope_only_accepts_the_userdata_span() {
+        use super::super::gpt::{image_partitions, load_snapshot, Gpt, SECTOR};
+        let base = scratch("ab-rollback");
+        let disk = base.join("disk");
+        let dir = base.join("gpt-original");
+        super::super::gpt::tests::write_marble_lun0(&disk);
+        let f = open_rw(&disk);
+        let size = f.metadata().unwrap().len();
+        let g = Gpt::read(&f, size).unwrap();
+        save_gpt_backup(&dir, &f, &g).unwrap();
+        let parts = g.split_keeping(1 << 30, 16 << 30, 64 << 30).unwrap();
+        g.write_split(&f, &parts).unwrap();
+        let split = Gpt::read(&f, size).unwrap();
+        let image = load_snapshot(&dir, &split).unwrap();
+        let (_, original) = image_partitions(&image, SECTOR).unwrap();
+        assert_eq!(original, g.partitions);
+        let user = rollback_scope(&original, &split.partitions).unwrap();
+        assert_eq!(user, g.partition("userdata").unwrap());
+        let mut other = original.clone();
+        other.iter_mut().find(|p| p.name == "super").unwrap().end -= 256;
+        assert!(rollback_scope(&other, &split.partitions).is_err());
+        let mut foreign = split.partitions.clone();
+        foreign.iter_mut().find(|p| p.name == "linux").unwrap().name = "data2".into();
+        assert!(rollback_scope(&original, &foreign).is_err());
+        fs::remove_dir_all(&base).unwrap();
+    }
     #[test]
     fn bcb_transaction_preserves_tail_and_rejects_unknown_requests() {
         for bytes in [1048576, 4194304] {
@@ -1483,15 +2280,15 @@ mod tests {
         ] {
             assert!(validate(&a.into_iter().map(String::from).collect::<Vec<_>>(), false).is_ok());
         }
-        valid_fat_identity("NIXOS_BOOT", None).unwrap();
-        valid_fat_identity("NIXOS_BOOT", Some("ABCD-1234")).unwrap();
+        valid_fat_identity("BOOT", None).unwrap();
+        valid_fat_identity("BOOT", Some("ABCD-1234")).unwrap();
         for (label, volume) in [
             ("", None),
             ("lowercase", None),
             ("TOO_LONG_LABEL", None),
-            ("NIXOS_BOOT", Some("ABCD1234")),
-            ("NIXOS_BOOT", Some("ABCD-12345")),
-            ("NIXOS_BOOT", Some("ABCD-12G4")),
+            ("BOOT", Some("ABCD1234")),
+            ("BOOT", Some("ABCD-12345")),
+            ("BOOT", Some("ABCD-12G4")),
         ] {
             assert!(
                 valid_fat_identity(label, volume).is_err(),
@@ -1503,6 +2300,16 @@ mod tests {
     fn explicit_confirmation_and_stream_contract() {
         for a in [
             vec!["prepare-install", "--confirm"],
+            vec!["prepare-install", "--android-userdata", "--check"],
+            vec!["prepare-install", "--android-userdata", "64", "--check"],
+            vec!["prepare-install", "--android-userdata", "64G", "--confirm"],
+            vec![
+                "prepare-install",
+                "--size",
+                "64G",
+                "--confirm-erase-userdata",
+            ],
+            vec!["prepare-install", "--check", "--android-userdata", "64G"],
             vec!["clear-boot-request"],
             vec!["clear-boot-request", "--force"],
             vec!["repair-backup-gpt"],
@@ -1526,6 +2333,13 @@ mod tests {
             false
         )
         .is_ok());
+        for flag in ["--check", "--confirm-erase-userdata"] {
+            assert!(validate(
+                &["prepare-install", "--android-userdata", "128G", flag].map(String::from),
+                false
+            )
+            .is_ok());
+        }
         assert!(validate(
             &["deploy-offline", "m", "s", "0", "--confirm"].map(String::from),
             false
@@ -1540,6 +2354,7 @@ mod tests {
             controller: "ufs".into(),
             hostname: "aurora".into(),
             root_label: "ROOT".into(),
+            boot_label: "BOOT".into(),
             esp_bytes: 1 << 30,
             minimum_root_bytes: 16 << 30,
             slot_metadata: "qcom-gpt".into(),
@@ -1559,16 +2374,81 @@ mod tests {
         fs::remove_file(p).unwrap();
     }
     #[test]
+    fn fat_check_tolerates_only_the_fsinfo_free_count() {
+        let clean = "fsck.fat 4.2 (2021-01-31)\n/dev/sda34: 12 files, 3/245476 clusters\n";
+        assert!(!fat_hint_only(clean).unwrap());
+        // Marble t15: U-Boot's FAT writes left the FSInfo count one off.
+        let hint = "fsck.fat 4.2 (2021-01-31)\nFree cluster summary wrong (245474 vs. really 245473)\n  Auto-correcting.\n\nLeaving filesystem unchanged.\n/dev/sda34: 19 files, 3/245476 clusters\n";
+        assert!(fat_hint_only(hint).unwrap());
+        for other in [
+            "Dirty bit is set. Fs was not properly unmounted and some data may be corrupt.\n 1) Remove dirty bit\n",
+            "/EFI/nixos/x.efi\n  File size is 10 bytes, cluster chain length is 0 bytes.\n  Truncating file to 0 bytes.\n",
+            "There are differences between boot sector and its backup.\n",
+        ] {
+            let text = hint.replace("  Auto-correcting.\n", &format!("  Auto-correcting.\n{other}"));
+            assert!(fat_hint_only(&text).is_err(), "{text}");
+        }
+        let unknown = "fsck.fat 4.2 (2021-01-31)\n\nLeaving filesystem unchanged.\n/dev/sda34: 19 files, 3/245476 clusters\n";
+        assert!(fat_hint_only(unknown).is_err());
+    }
+    #[test]
+    fn reboot_without_bcb_write_skips_the_slot_gate() {
+        for action in [
+            "reboot-system",
+            "reboot-recovery",
+            "reboot-bootloader",
+            "poweroff",
+        ] {
+            assert!(!reboot_writes("argument", action));
+            assert_eq!(reboot_writes("bcb", action), action != "poweroff");
+        }
+    }
+    #[test]
     fn initial_resume_requires_pending_same_profile_and_no_other_job() {
         let root = std::env::temp_dir().join(format!("recovery-resume-{}", std::process::id()));
         let system = "/nix/store/00000000000000000000000000000000-nixos-system-test-1";
-        fs::create_dir_all(root.join(system.trim_start_matches('/'))).unwrap();
+        let other = "/nix/store/11111111111111111111111111111111-other";
+        let mut entries = BTreeMap::new();
+        entries.insert(system.to_string(), String::new());
         fs::create_dir_all(root.join("nix/var/nix/profiles")).unwrap();
         fs::create_dir_all(root.join("var/lib/mobile-efi-preparation")).unwrap();
         let marker = root.join("var/lib/mobile-efi-preparation/pending");
+        let resume_initial =
+            |root: &Path, system: &str| super::resume_initial(root, system, &entries);
         assert!(resume_initial(&root, system).is_err());
         fs::write(&marker, "First installation incomplete\n").unwrap();
+        // No profile and no transferred system.
         assert!(resume_initial(&root, system).is_err());
+        fs::create_dir_all(root.join(system.trim_start_matches('/'))).unwrap();
+        // No profile yet (failure after the transfer): only declared objects.
+        resume_initial(&root, system).unwrap();
+        // Nix's dedup directory and lock files of declared objects are not
+        // store objects; a .links symlink or a foreign lock file still refuses.
+        let store = root.join("nix/store");
+        fs::create_dir_all(store.join(".links")).unwrap();
+        fs::write(store.join(".links/0abc"), b"x").unwrap();
+        fs::write(store.join(format!("{}.lock", &system[11..])), b"").unwrap();
+        resume_initial(&root, system).unwrap();
+        fs::write(
+            store.join("11111111111111111111111111111111-other.lock"),
+            b"",
+        )
+        .unwrap();
+        assert!(resume_initial(&root, system).is_err());
+        fs::remove_file(store.join("11111111111111111111111111111111-other.lock")).unwrap();
+        fs::remove_dir_all(store.join(".links")).unwrap();
+        std::os::unix::fs::symlink("/", store.join(".links")).unwrap();
+        assert!(resume_initial(&root, system).is_err());
+        fs::remove_file(store.join(".links")).unwrap();
+        fs::create_dir(store.join(".lock")).unwrap();
+        assert!(resume_initial(&root, system).is_err());
+        fs::remove_dir(store.join(".lock")).unwrap();
+        fs::create_dir_all(root.join(other.trim_start_matches('/'))).unwrap();
+        assert!(resume_initial(&root, system).is_err());
+        fs::remove_dir(root.join(other.trim_start_matches('/'))).unwrap();
+        std::os::unix::fs::symlink(other, root.join("nix/var/nix/profiles/system")).unwrap();
+        assert!(resume_initial(&root, system).is_err());
+        fs::remove_file(root.join("nix/var/nix/profiles/system")).unwrap();
         std::os::unix::fs::symlink(system, root.join("nix/var/nix/profiles/system")).unwrap();
         resume_initial(&root, system).unwrap();
         assert!(resume_initial(&root, "/nix/store/other-system").is_err());
@@ -1583,10 +2463,23 @@ mod tests {
         std::os::unix::fs::symlink("pending.real", &marker).unwrap();
         assert!(resume_initial(&root, system).is_err());
         for flag in ["--resume-check", "--resume-confirm"] {
-            let args = ["install-initial", "m", "r", system, "4096", flag].map(String::from);
+            let args = ["install-initial-system", "m", "r", system, "4096", flag].map(String::from);
             assert!(validate(&args, false).is_ok());
             assert!(validate(&args, true).is_err());
         }
+        let old_args = ["install-initial", "m", "r", system, "4096", "--confirm"].map(String::from);
+        assert!(validate(&old_args, true).is_err());
+        let args = [
+            "install-initial-system",
+            "m",
+            "r",
+            system,
+            "4096",
+            "--confirm",
+        ]
+        .map(String::from);
+        assert!(validate(&args, true).is_ok());
+        assert!(validate(&args, false).is_err());
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -1621,5 +2514,41 @@ mod tests {
         assert!(empty_root(&root).is_err());
         assert!(no_pending(&root).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ram_only_slot_model_has_no_recovery_update_capability() {
+        let mediatek = Config {
+            slot_model: "mediatek-a".into(),
+            ..Config::default()
+        };
+        assert!(!capabilities(&mediatek)
+            .iter()
+            .any(|a| a == "update-recovery"));
+        assert!(capabilities(&Config {
+            slot_model: "ab".into(),
+            ..Config::default()
+        })
+        .iter()
+        .any(|a| a == "update-recovery"));
+    }
+    #[test]
+    fn t880_check_prints_the_exact_split() {
+        let path = std::env::temp_dir().join(format!("recovery-t880-plan-{}", std::process::id()));
+        super::super::gpt::write_t880_disk(&path, false);
+        let file = File::open(&path).unwrap();
+        let g = super::super::gpt::Gpt::read(&file, file.metadata().unwrap().len()).unwrap();
+        let (parts, count) = g.split_userdata(1 << 30, 16 << 30, 64 << 30).unwrap();
+        let text = describe_split(&g, &parts, count, Path::new("/dev/sdc")).unwrap();
+        assert!(text.contains("GPT entries: 82 -> 84"));
+        assert!(text.contains("81 other entries unchanged"));
+        for name in ["userdata", "linux-boot", "linux "] {
+            assert!(text.contains(name), "{name}\n{text}");
+        }
+        assert!(text.contains("end 62410743 ->"));
+        assert_eq!(text.lines().filter(|l| l.ends_with(" new")).count(), 2);
+        assert!(!text.contains("super "));
+        drop(file);
+        let _ = fs::remove_file(&path);
     }
 }

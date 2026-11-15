@@ -1,0 +1,160 @@
+From 6dc456c05e90b51d056d51b1032597a0a2856975 Mon Sep 17 00:00:00 2001
+From: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Date: Fri, 16 Oct 2026 16:23:43 +0200
+Subject: [PATCH 028/144] crypto: qce - Fix HMAC self-test failures for empty
+ messages
+
+BAM DMA cannot process zero-length transfers, so the driver always holds
+back at least one byte to submit to the engine and only ever finalizes
+with an empty buffer when nothing is left to submit. For plain hashes
+this was handled by returning the precomputed hash of the empty message
+(tmpl->hash_zero), but HMAC's result depends on the key and cannot be
+constant, so hmac(sha256) produced an incorrect digest for an empty
+message and the crypto self-tests failed.
+
+A zero pending buffer at finalization time does not necessarily mean the
+message itself is empty, though: the caller can also reach it by
+importing a state that already reflects some hashed data with nothing
+currently buffered (crypto_ahash_import() followed directly by
+finalization). Special-casing only a genuinely empty message would
+silently compute the wrong result for an imported state in that
+scenario.
+
+Handle every zero-length finalization consistently through the software
+fallback ahash instead. When nothing has been processed yet, let the
+fallback compute the result from scratch using the key already propagated
+to it via setkey(). Otherwise, reconstruct the fallback's running hash
+state from the state kept by the driver and finalize from there,
+accounting for the HMAC ipad block that the engine absorbs internally and
+that never goes through update().
+
+Cc: stable@vger.kernel.org
+Fixes: ec8f5d8f6f76 ("crypto: qce - Qualcomm crypto engine driver")
+Tested-by: Kuldeep Singh <kuldeep.singh@oss.qualcomm.com>
+Tested-by: Pankaj Patil <pankaj.patil@oss.qualcomm.com>
+Signed-off-by: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit 01e1a392347dc31e6eb2868a01287647a9f1007b)
+Link: https://git.kernel.org/pub/scm/linux/kernel/git/herbert/cryptodev-2.6.git/commit/?id=01e1a392347dc31e6eb2868a01287647a9f1007b
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0046-crypto-qce-Fix-HMAC-self-test-failures-for-empty-mes.patch
+Import-SHA256: 9b0d5648db9a6460dd993f21b32481e5366b92d15973cde5e2c358d01c31f230
+Import-Provenance: mail headers
+(cherry picked from commit b4ec484122dee9e6c4962030940d86744c3a34bd)
+---
+ drivers/crypto/qce/common.h |  1 -
+ drivers/crypto/qce/sha.c    | 62 ++++++++++++++++++++++++++++---------
+ 2 files changed, 47 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/crypto/qce/common.h b/drivers/crypto/qce/common.h
+index 9cd2e6ed8b..587d349da9 100644
+--- a/drivers/crypto/qce/common.h
++++ b/drivers/crypto/qce/common.h
+@@ -82,7 +82,6 @@ struct qce_alg_template {
+ 		struct aead_alg aead;
+ 	} alg;
+ 	struct qce_device *qce;
+-	const u8 *hash_zero;
+ 	const u32 digest_size;
+ };
+ 
+diff --git a/drivers/crypto/qce/sha.c b/drivers/crypto/qce/sha.c
+index eb8a5b0c41..745cd4def8 100644
+--- a/drivers/crypto/qce/sha.c
++++ b/drivers/crypto/qce/sha.c
+@@ -7,6 +7,7 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/interrupt.h>
+ #include <linux/string.h>
++#include <linux/unaligned.h>
+ #include <crypto/internal/hash.h>
+ 
+ #include "common.h"
+@@ -249,18 +250,56 @@ static int qce_ahash_update(struct ahash_request *req)
+ 	return qce->async_req_enqueue(tmpl->qce, &req->base);
+ }
+ 
++/*
++ * BAM DMA cannot handle zero-length transfers, so the driver always holds
++ * back at least one byte to submit to the engine. A zero rctx->buflen at
++ * finalization time does not necessarily mean the message is empty: the
++ * caller may have imported a state that already reflects some hashed data
++ * with nothing currently buffered. Handle both cases through the software
++ * fallback: reconstruct the running state when there is one instead of
++ * assuming the message is empty.
++ */
++static int qce_ahash_finalize_zero(struct ahash_request *req)
++{
++	struct qce_sha_reqctx *rctx = ahash_request_ctx_dma(req);
++	HASH_FBREQ_ON_STACK(fbreq, req);
++	struct __sha256_ctx core;
++	struct scatterlist sg;
++	int ret, i;
++
++	sg_init_table(&sg, 1);
++	ahash_request_set_crypt(fbreq, &sg, req->result, 0);
++
++	if (rctx->first_blk) {
++		ret = crypto_ahash_init(fbreq) ?: crypto_ahash_finup(fbreq);
++	} else {
++		core = (struct __sha256_ctx){
++			.bytecount = rctx->count,
++		};
++
++		/* rctx->digest is the raw big-endian dump of the engine's regs */
++		for (i = 0; i < SHA256_STATE_WORDS; i++)
++			core.state.h[i] = get_unaligned_be32(rctx->digest +
++							     i * sizeof(u32));
++		if (IS_SHA_HMAC(rctx->flags))
++			core.bytecount += SHA256_BLOCK_SIZE;
++
++		ret = crypto_ahash_import_core(fbreq, &core) ?:
++		      crypto_ahash_finup(fbreq);
++	}
++
++	HASH_REQUEST_ZERO(fbreq);
++	return ret;
++}
++
+ static int qce_ahash_final(struct ahash_request *req)
+ {
+ 	struct qce_sha_reqctx *rctx = ahash_request_ctx_dma(req);
+ 	struct qce_alg_template *tmpl = to_ahash_tmpl(req->base.tfm);
+ 	struct qce_device *qce = tmpl->qce;
+ 
+-	if (!rctx->buflen) {
+-		if (tmpl->hash_zero)
+-			memcpy(req->result, tmpl->hash_zero,
+-					tmpl->alg.ahash.halg.digestsize);
+-		return 0;
+-	}
++	if (!rctx->buflen)
++		return qce_ahash_finalize_zero(req);
+ 
+ 	rctx->last_blk = true;
+ 
+@@ -292,12 +331,8 @@ static int qce_ahash_digest(struct ahash_request *req)
+ 	rctx->first_blk = true;
+ 	rctx->last_blk = true;
+ 
+-	if (!rctx->nbytes_orig) {
+-		if (tmpl->hash_zero)
+-			memcpy(req->result, tmpl->hash_zero,
+-					tmpl->alg.ahash.halg.digestsize);
+-		return 0;
+-	}
++	if (!rctx->nbytes_orig)
++		return qce_ahash_finalize_zero(req);
+ 
+ 	return qce->async_req_enqueue(tmpl->qce, &req->base);
+ }
+@@ -431,9 +466,6 @@ static int qce_ahash_register_one(const struct qce_ahash_def *def,
+ 	alg->halg.digestsize = def->digestsize;
+ 	alg->halg.statesize = def->statesize;
+ 
+-	if (IS_SHA256(def->flags))
+-		tmpl->hash_zero = sha256_zero_message_hash;
+-
+ 	base = &alg->halg.base;
+ 	base->cra_blocksize = def->blocksize;
+ 	base->cra_priority = 175;

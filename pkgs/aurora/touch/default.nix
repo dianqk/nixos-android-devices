@@ -22,16 +22,16 @@ stdenv.mkDerivation {
   installPhase = ''
     runHook preInstall
     install -Dm755 aurora-touch $out/bin/aurora-touch
-    (cd ${firmware-source}/android14/touch && sha256sum -c SHA256SUMS)
-    install -Dm644 ${firmware-source}/android14/touch/libtouchreport.so $out/share/aurora-touch/libtouchreport.so
-    install -Dm644 ${firmware-source}/android14/touch/aurora_syna_thp_config.ini $out/share/aurora-touch/aurora_syna_thp_config.ini
+    (cd ${firmware-source}/touch && sha256sum -c SHA256SUMS)
+    install -Dm644 ${firmware-source}/touch/libtouchreport.so $out/share/aurora-touch/libtouchreport.so
+    install -Dm644 ${firmware-source}/touch/aurora_syna_thp_config.ini $out/share/aurora-touch/aurora_syna_thp_config.ini
     install -Dm644 README.md $out/share/doc/aurora-touch/README.md
     install -Dm644 ORIGINS.md $out/share/doc/aurora-touch/ORIGINS.md
     install -Dm644 COPYING $out/share/doc/aurora-touch/COPYING
     runHook postInstall
   '';
   meta = {
-    description = "Xiaomi 14 Ultra Android 14 touch host processor adapter";
+    description = "Xiaomi 14 Ultra Android 16 touch host processor adapter";
     license = with lib.licenses; [
       mit
       isc

@@ -1,0 +1,368 @@
+From c83013056613afddfdf7c81cd4ab33710649ae3d Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 25 Oct 2026 09:49:34 +0800
+Subject: [PATCH] ASoC: qcom: add the Xiaomi Marble speaker TDM card
+
+Integrate the board binding, machine driver, speaker/earpiece switch and board wiring.
+
+Source changes (original messages and trailers follow).
+
+Source-commit: fd8ce78776743dcc7d3cef0402334200009776f8
+Source-author: dianqk <dianqk@dianqk.net>
+Source-date: 2026-10-25T09:49:34+08:00
+Imported-from: pkgs/linux-kernel/sm7475/marble/patches/local/0054-ASoC-dt-bindings-qcom-sm8250-add-Xiaomi-Marble-sound.patch
+
+ASoC: dt-bindings: qcom,sm8250: add Xiaomi Marble sound card
+
+The Xiaomi Poco F5 / Redmi Note 12 Turbo (marble) card is an SM8450
+compatible card whose tertiary TDM speaker interface needs an LPASS core
+vote while it runs. Add its compatible and the optional "tdm-vote"
+clock.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Source-commit: b38dc3e3c80b559c39f229d7825f55fc39018846
+Source-author: dianqk <dianqk@dianqk.net>
+Source-date: 2026-10-25T09:49:34+08:00
+Imported-from: pkgs/linux-kernel/sm7475/marble/patches/local/0055-ASoC-qcom-sc8280xp-add-Xiaomi-Marble-speaker-TDM-bac.patch
+
+ASoC: qcom: sc8280xp: add Xiaomi Marble speaker TDM backend
+
+Marble's two AW88263S speaker amplifiers sit on the tertiary TDM
+interface. Stock Android runs it at 96 kHz with 32-bit samples in four
+32-bit slots (short frame sync) and holds an LPASS core vote while it is
+active ("qcom,mi2s-tdm-is-hw-vote-needed"). The amplifiers' interface
+registers come from their ACF profile, which expects that layout.
+
+Add a "xiaomi,marble-sndcard" card with the SM8450 card settings (the
+"sm8450" driver name keeps the qcom/sm8450 topology and UCM paths) plus
+board fields: the TDM backend rate and sample format applied in the
+backend fixup, and a "tdm-vote" clock held from backend startup to
+shutdown. Slot layout and bit clock use the 7.3 DAI-node TDM slot
+properties and the backend "bclk" clock (a689ee3b2fcd); framing comes
+from the topology.
+
+This replaces the qcom,tdm-* card properties and card clocks of
+iLtanaka's f5bc71d7372e ("ASoC: qcom: sc8280xp: support TDM backends
+and 32-bit slots", https://github.com/iLtanaka/linux-marble), which
+predates the 7.3 TDM support.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Source-commit: 7d7791df79cdad82d970bbaccb8f9aa0e3337350
+Source-author: dianqk <dianqk@dianqk.net>
+Source-date: 2026-10-25T09:50:08+08:00
+Imported-from: pkgs/linux-kernel/sm7475/marble/patches/local/0056-arm64-dts-qcom-sm8475-xiaomi-marble-describe-the-spe.patch
+
+arm64: dts: qcom: sm8475-xiaomi-marble: describe the speaker TDM link for 7.3
+
+Use the Linux 7.3 TDM description for the tertiary TDM speaker link
+instead of the qcom,tdm-* card properties and card clocks of the
+deferred iLtanaka commit f5bc71d7372e:
+
+- "xiaomi,marble-sndcard" (96 kHz S32_LE TDM backend, LPASS core vote
+  through the "tdm-vote" card clock);
+- standard DAI TDM slot properties on the CPU endpoint: four 32-bit
+  slots, slots 0 and 1 active;
+- the backend bit clock (TER_TDM_IBIT) as the "bclk" clock of the
+  TERTIARY_TDM_RX_0 backend DAI node.
+
+Framing (short frame sync, one-bit delay, internal sync, data output
+enabled) is described by the board topology.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Source-commit: 9360479ef94493e31e3e1d5ccd5004252d79b053
+Source-author: dianqk <dianqk@dianqk.net>
+Source-date: 2026-10-25T14:56:55+08:00
+Imported-from: pkgs/linux-kernel/sm7475/marble/patches/local/0063-ASoC-qcom-sc8280xp-drive-the-speaker-earpiece-switch.patch
+
+ASoC: qcom: sc8280xp: drive the speaker/earpiece switch to the speaker
+
+On the Xiaomi Poco F5 (marble) the top AW88263S amplifier drives either
+the top speaker or the earpiece through an output switch on gpio52,
+described by "speaker-earpiece-gpios" (active = earpiece). Nothing
+claimed the line, so it stayed a pulled-down input.
+
+Request the optional GPIO at probe as an output driven inactive, routing
+the amplifier to the speaker, as iLtanaka's linux-marble does (the card
+probe of e21870ba92a9 "ASoC: qcom: sc8280xp: connect Marble handset
+voice routes" by Halhadus <eneshakans45@proton.me>,
+https://github.com/iLtanaka/linux-marble). The ALSA switch control and
+the voice links of that commit are not included.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../bindings/sound/qcom,sm8250.yaml           | 11 +++
+ .../boot/dts/qcom/sm8475-xiaomi-marble.dts    | 32 +++---
+ sound/soc/qcom/sc8280xp.c                     | 99 ++++++++++++++++++-
+ 3 files changed, 128 insertions(+), 14 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/sound/qcom,sm8250.yaml b/Documentation/devicetree/bindings/sound/qcom,sm8250.yaml
+index fa0c38a541..438d552184 100644
+--- a/Documentation/devicetree/bindings/sound/qcom,sm8250.yaml
++++ b/Documentation/devicetree/bindings/sound/qcom,sm8250.yaml
+@@ -31,6 +31,7 @@ properties:
+               - qcom,sm8550-sndcard
+               - qcom,sm8650-sndcard
+               - qcom,sm8750-sndcard
++              - xiaomi,marble-sndcard
+           - const: qcom,sm8450-sndcard
+       - enum:
+           - ayaneo,pocket-s2-sndcard
+@@ -73,6 +74,16 @@ properties:
+     $ref: /schemas/types.yaml#/definitions/string
+     description: User visible long sound card name
+ 
++  clocks:
++    maxItems: 1
++
++  clock-names:
++    items:
++      - const: tdm-vote
++    description:
++      LPASS core vote held while a TDM backend is active, for boards whose
++      TDM interface needs it.
++
+   speaker-earpiece-gpios:
+     maxItems: 1
+     description:
+diff --git a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-marble.dts b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-marble.dts
+index 1b391d31ee..58f51e5b30 100644
+--- a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-marble.dts
++++ b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-marble.dts
+@@ -1103,8 +1103,9 @@ tx-pins {
+ 
+ /*
+  * Speakers: 2x Awinic AW88263S (register compatible with AW88261) on i2c15,
+- * fed by the tertiary TDM interface like stock ("TDM-LPAIF-RX-TERTIARY"),
+- * framed as I2S (2 x 32-bit slots, BCLK = 64 * fs) as set by the amp ACF.
++ * fed by the tertiary TDM interface like stock ("TDM-LPAIF-RX-TERTIARY"):
++ * 96 kHz, 32-bit samples, 4 x 32-bit slots (slots 0/1 carry the two amps),
++ * short frame sync; the amps' interface registers come from their ACF.
+  * 0x34 = top (also the earpiece, see gpio52), 0x35 = bottom. Pins and gpios
+  * from the stock device tree.
+  */
+@@ -1184,8 +1185,19 @@ data1-pins {
+ 	};
+ };
+ 
++&q6apmbedai {
++	#address-cells = <1>;
++	#size-cells = <0>;
++
++	dai@56 {
++		reg = <TERTIARY_TDM_RX_0>;
++		clocks = <&q6prmcc LPASS_CLK_ID_TER_TDM_IBIT LPASS_CLK_ATTRIBUTE_COUPLE_NO>;
++		clock-names = "bclk";
++	};
++};
++
+ &sound {
+-	compatible = "qcom,sm8450-sndcard";
++	compatible = "xiaomi,marble-sndcard", "qcom,sm8450-sndcard";
+ 	model = "SM8475-Xiaomi-Marble";
+ 	speaker-earpiece-gpios = <&tlmm 52 GPIO_ACTIVE_HIGH>;
+ 
+@@ -1193,15 +1205,8 @@ &sound {
+ 	pinctrl-names = "default";
+ 
+ 	/* Stock: qcom,mi2s-tdm-is-hw-vote-needed for the tertiary interface */
+-	clocks = <&q6prmcc LPASS_HW_MACRO_VOTE LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
+-		 <&q6prmcc LPASS_CLK_ID_TER_TDM_IBIT LPASS_CLK_ATTRIBUTE_COUPLE_NO>;
+-	clock-names = "tdm-vote", "tdm-bclk";
+-
+-	/* Stock speaker TDM: 96 kHz, 4 x 32-bit slots, short frame sync */
+-	qcom,tdm-slots = <4>;
+-	qcom,tdm-slot-width = <32>;
+-	qcom,tdm-rate = <96000>;
+-	qcom,tdm-format = "dsp_a";
++	clocks = <&q6prmcc LPASS_HW_MACRO_VOTE LPASS_CLK_ATTRIBUTE_COUPLE_NO>;
++	clock-names = "tdm-vote";
+ 
+ 	/* Analog mics on the WCD9385; ADCs feed the TX macro over SoundWire */
+ 	audio-routing = "AMIC1", "MIC BIAS1",
+@@ -1234,6 +1239,9 @@ speaker-dai-link {
+ 
+ 		cpu {
+ 			sound-dai = <&q6apmbedai TERTIARY_TDM_RX_0>;
++			dai-tdm-slot-num = <4>;
++			dai-tdm-slot-width = <32>;
++			dai-tdm-slot-rx-mask = <1 1 0 0>;
+ 		};
+ 
+ 		codec {
+diff --git a/sound/soc/qcom/sc8280xp.c b/sound/soc/qcom/sc8280xp.c
+index 4d48e1012c..cc7c85bfa8 100644
+--- a/sound/soc/qcom/sc8280xp.c
++++ b/sound/soc/qcom/sc8280xp.c
+@@ -2,6 +2,8 @@
+ // Copyright (c) 2022, Linaro Limited
+ 
+ #include <dt-bindings/sound/qcom,q6afe.h>
++#include <linux/clk.h>
++#include <linux/gpio/consumer.h>
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+ #include <sound/soc.h>
+@@ -71,6 +73,11 @@ struct qcom_snd_soc_common {
+ 	bool mi2s_mclk_enable;
+ 	bool mi2s_bclk_enable;
+ 	bool wcd_jack;
++	/* TDM backend rate and sample format; 0 keeps 48 kHz S16_LE */
++	unsigned int tdm_rate;
++	snd_pcm_format_t tdm_format;
++	/* TDM backends need an LPASS core vote ("tdm-vote" clock) */
++	bool tdm_hw_vote;
+ 	int (*snd_prepare)(struct snd_pcm_substream *substream);
+ };
+ 
+@@ -80,6 +87,7 @@ struct sc8280xp_snd_data {
+ 	struct snd_soc_jack jack;
+ 	struct snd_soc_jack dp_jack[8];
+ 	const struct qcom_snd_soc_common *priv;
++	struct clk *tdm_vote;
+ 	bool jack_setup;
+ };
+ 
+@@ -218,6 +226,7 @@ static int sc8280xp_snd_init(struct snd_soc_pcm_runtime *rtd)
+ static int sc8280xp_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
+ 				     struct snd_pcm_hw_params *params)
+ {
++	struct sc8280xp_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
+ 	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+ 	struct snd_interval *rate = hw_param_interval(params,
+ 					SNDRV_PCM_HW_PARAM_RATE);
+@@ -236,6 +245,14 @@ static int sc8280xp_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
+ 	case TX_CODEC_DMA_TX_3:
+ 		channels->min = 1;
+ 		break;
++	case PRIMARY_TDM_RX_0 ... QUINARY_TDM_TX_7:
++		if (data->priv->tdm_rate)
++			rate->min = rate->max = data->priv->tdm_rate;
++		if (data->priv->tdm_format) {
++			snd_mask_none(fmt);
++			snd_mask_set_format(fmt, data->priv->tdm_format);
++		}
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -368,9 +385,46 @@ static int sc8280xp_snd_hw_free(struct snd_pcm_substream *substream)
+ 	return qcom_snd_sdw_hw_free(substream, &data->stream_prepared[cpu_dai->id]);
+ }
+ 
++static bool sc8280xp_is_tdm(struct snd_soc_dai *cpu_dai)
++{
++	return cpu_dai->id >= PRIMARY_TDM_RX_0 && cpu_dai->id <= QUINARY_TDM_TX_7;
++}
++
++static int sc8280xp_snd_startup(struct snd_pcm_substream *substream)
++{
++	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
++	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
++	struct sc8280xp_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
++	int ret;
++
++	if (sc8280xp_is_tdm(cpu_dai)) {
++		ret = clk_prepare_enable(data->tdm_vote);
++		if (ret)
++			return ret;
++	}
++
++	ret = qcom_snd_sdw_startup(substream);
++	if (ret && sc8280xp_is_tdm(cpu_dai))
++		clk_disable_unprepare(data->tdm_vote);
++
++	return ret;
++}
++
++static void sc8280xp_snd_shutdown(struct snd_pcm_substream *substream)
++{
++	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
++	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
++	struct sc8280xp_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
++
++	qcom_snd_sdw_shutdown(substream);
++
++	if (sc8280xp_is_tdm(cpu_dai))
++		clk_disable_unprepare(data->tdm_vote);
++}
++
+ static const struct snd_soc_ops sc8280xp_be_ops = {
+-	.startup = qcom_snd_sdw_startup,
+-	.shutdown = qcom_snd_sdw_shutdown,
++	.startup = sc8280xp_snd_startup,
++	.shutdown = sc8280xp_snd_shutdown,
+ 	.hw_params = sc8280xp_snd_hw_params,
+ 	.hw_free = sc8280xp_snd_hw_free,
+ 	.prepare = sc8280xp_snd_prepare,
+@@ -395,6 +449,7 @@ static int sc8280xp_platform_probe(struct platform_device *pdev)
+ 	struct snd_soc_card *card;
+ 	struct sc8280xp_snd_data *data;
+ 	struct device *dev = &pdev->dev;
++	struct gpio_desc *speaker_earpiece;
+ 	int ret;
+ 
+ 	card = devm_kzalloc(dev, sizeof(*card), GFP_KERNEL);
+@@ -410,6 +465,23 @@ static int sc8280xp_platform_probe(struct platform_device *pdev)
+ 	if (!data->priv)
+ 		return -ENODEV;
+ 
++	if (data->priv->tdm_hw_vote) {
++		data->tdm_vote = devm_clk_get(dev, "tdm-vote");
++		if (IS_ERR(data->tdm_vote))
++			return dev_err_probe(dev, PTR_ERR(data->tdm_vote),
++					     "failed to get tdm-vote clock\n");
++	}
++
++	/*
++	 * Speaker/earpiece output switch (Marble: the top amplifier drives
++	 * either the top speaker or the earpiece): select the speaker.
++	 */
++	speaker_earpiece = devm_gpiod_get_optional(dev, "speaker-earpiece",
++						   GPIOD_OUT_LOW);
++	if (IS_ERR(speaker_earpiece))
++		return dev_err_probe(dev, PTR_ERR(speaker_earpiece),
++				     "failed to get speaker-earpiece GPIO\n");
++
+ 	card->owner = THIS_MODULE;
+ 	card->dev = dev;
+ 	dev_set_drvdata(dev, card);
+@@ -518,6 +590,28 @@ static const struct qcom_snd_soc_common sm8450_priv_data = {
+ 			 SND_SOC_DAIFMT_I2S,
+ };
+ 
++/*
++ * Xiaomi Poco F5 / Redmi Note 12 Turbo (marble): two AW88263S speaker
++ * amplifiers on the tertiary TDM interface, run like stock at 96 kHz with
++ * 32-bit samples in four 32-bit slots; the interface needs the LPASS core
++ * vote of stock "qcom,mi2s-tdm-is-hw-vote-needed". The SM8450 card name
++ * keeps the qcom/sm8450 topology and UCM directories.
++ */
++static const struct qcom_snd_soc_common marble_priv_data = {
++	.driver_name = "sm8450",
++	.dapm_widgets = sc8280xp_dapm_widgets,
++	.num_dapm_widgets = ARRAY_SIZE(sc8280xp_dapm_widgets),
++	.wcd_jack = true,
++	.mi2s_mclk_enable = true,
++	.mi2s_bclk_enable = true,
++	.codec_dai_fmt = SND_SOC_DAIFMT_BC_FC |
++			 SND_SOC_DAIFMT_NB_NF |
++			 SND_SOC_DAIFMT_I2S,
++	.tdm_rate = 96000,
++	.tdm_format = SNDRV_PCM_FORMAT_S32_LE,
++	.tdm_hw_vote = true,
++};
++
+ static const struct qcom_snd_soc_common sm8475_priv_data = {
+ 	.driver_name = "sm8475",
+ 	.dapm_widgets = sc8280xp_dapm_widgets,
+@@ -576,6 +670,7 @@ static const struct of_device_id snd_sc8280xp_dt_match[] = {
+ 	{ .compatible = "qcom,sm8550-sndcard", .data = &sm8550_priv_data },
+ 	{ .compatible = "qcom,sm8650-sndcard", .data = &sm8650_priv_data },
+ 	{ .compatible = "qcom,sm8750-sndcard", .data = &sm8750_priv_data },
++	{ .compatible = "xiaomi,marble-sndcard", .data = &marble_priv_data },
+ 	{}
+ };
+ 

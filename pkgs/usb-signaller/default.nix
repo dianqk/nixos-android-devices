@@ -20,7 +20,14 @@ rustPlatform.buildRustPackage (finalAttrs: {
   buildInputs = [ systemd ];
   patches = [
     ./nixos-integration.patch
+    ./external-role.patch
+    ./acm-lifecycle.patch
     ./optional-acm.patch
+    # Request 900 mA (capped by the kernel at 500 mA below SuperSpeed)
+    # instead of the 2 mA configfs default, as Android does.
+    ./max-power.patch
+    ./netboot-connected-nbd.patch
+    ./ncm-mode-identity.patch
   ];
   postPatch = ''
     substituteInPlace src/service.rs \

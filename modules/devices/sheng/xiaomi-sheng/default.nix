@@ -11,7 +11,6 @@
     ../xiaomi-mipps-auth.nix
   ];
   androidDevices = {
-    kernelPackage = lib.mkDefault androidPackages.devices.sheng.kernel;
 
     boot.android = {
       base = "0x00000000";

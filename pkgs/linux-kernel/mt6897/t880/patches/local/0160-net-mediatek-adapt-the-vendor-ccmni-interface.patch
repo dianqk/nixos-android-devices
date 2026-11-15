@@ -1,0 +1,202 @@
+From 1c1ec88ef7fff3a6ac6426bde6f06d6eef54c034 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] net: mediatek: adapt the vendor CCMNI interface
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Build the vendor CCMNI network interface against the selected kernel
+network and sysctl APIs.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T08:13:54+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T08:44:42+08:00
+Link: https://github.com/MiCode/MTK_kernel_device_modules (commit 3c4ccd07d5624879555ec710c11bb8818e5cb5c6, drivers/misc/mediatek/eccci, drivers/misc/mediatek/ccmni)
+Source commit: 3c4ccd07d562 "Kernel: Xiaomi kernel_device_modules changes for
+Redmi K70E Android U" by 何发云 <hefayun@xiaomi.com>, 2024-01-12.
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Link: https://github.com/MT6895-Mainline/linux/tree/qqcandy (the MT6895 port, used as a reference for the sysctl path)
+---
+ drivers/misc/mediatek/ccmni/Kconfig  | 15 ++++------
+ drivers/misc/mediatek/ccmni/Makefile | 43 +++++-----------------------
+ drivers/misc/mediatek/ccmni/ccmni.c  | 28 ++++++++----------
+ 3 files changed, 24 insertions(+), 62 deletions(-)
+
+diff --git a/drivers/misc/mediatek/ccmni/Kconfig b/drivers/misc/mediatek/ccmni/Kconfig
+index d9e4e3e96b..71d9efc272 100644
+--- a/drivers/misc/mediatek/ccmni/Kconfig
++++ b/drivers/misc/mediatek/ccmni/Kconfig
+@@ -1,12 +1,7 @@
++# SPDX-License-Identifier: GPL-2.0-only
+ config MTK_NET_CCMNI
+-	tristate "MediaTek CCMNI driver"
+-	depends on MTK_CCCI_DEVICES
++	tristate "MediaTek CCMNI modem network devices"
++	depends on MTK_ECCCI_DRIVER
+ 	help
+-	  Cross Core Multi Network Interface:
+-	  This option enables CCMNI driver, if yes,
+-	  then CCMNI driver is used
+-	  to communicate with CCCI
+-	  driver by Kernel network, if no,
+-	  Kernel network uses ccci port_net
+-	  to send and recevie data.
+-	  The option default depends on MTK_CCCI_DEVICES.
++	  Cross Core Multi Network Interface: the ccmni network devices of
++	  the modem's data connections, fed by the CCCI DPMAIF interface.
+diff --git a/drivers/misc/mediatek/ccmni/Makefile b/drivers/misc/mediatek/ccmni/Makefile
+index 11479fb8fa..6c5892e668 100644
+--- a/drivers/misc/mediatek/ccmni/Makefile
++++ b/drivers/misc/mediatek/ccmni/Makefile
+@@ -1,37 +1,8 @@
+-#
+-# Copyright (C) 2016 MediaTek Inc.
+-#
+-# This program is free software; you can redistribute it and/or modify
+-# it under the terms of the GNU General Public License version 2 as
+-# published by the Free Software Foundation.
+-#
+-# This program is distributed in the hope that it will be useful,
+-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+-# See http://www.gnu.org/licenses/gpl-2.0.html for more details.
+-#
+-
+-ifeq ($(CONFIG_MTK_NET_CCMNI), y)
+-CCCI_CCMNI_OBJ=y
+-else ifeq ($(CONFIG_MTK_NET_CCMNI), m)
+-CCCI_CCMNI_OBJ=m
++# SPDX-License-Identifier: GPL-2.0-only
+ ccflags-y += -DCCCI_CCMNI_MODULE
+-else
+-CCCI_CCMNI_OBJ=n
+-endif
+-
+-ifneq ($(CCCI_CCMNI_OBJ), n)
+-
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/ccmni/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/inc/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/c2k_ccci/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/include/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/rps/
+-
+-obj-$(CCCI_CCMNI_OBJ) += ccmni.o
+-
+-ccflags-y += -DMET_USER_EVENT_SUPPORT
+-
+-else
+-obj-  := dummy.o # avoid build error
+-endif
++ccflags-y += -I$(srctree)/drivers/misc/mediatek/ccmni \
++	     -I$(srctree)/drivers/misc/mediatek/eccci/compat \
++	     -I$(srctree)/drivers/misc/mediatek/eccci/inc \
++	     -I$(srctree)/drivers/misc/mediatek/include
++ccflags-y += -include $(srctree)/drivers/misc/mediatek/eccci/compat/eccci_compat.h
++obj-$(CONFIG_MTK_NET_CCMNI) += ccmni.o
+diff --git a/drivers/misc/mediatek/ccmni/ccmni.c b/drivers/misc/mediatek/ccmni/ccmni.c
+index 46b7df940e..660037d6a0 100644
+--- a/drivers/misc/mediatek/ccmni/ccmni.c
++++ b/drivers/misc/mediatek/ccmni/ccmni.c
+@@ -23,6 +23,7 @@
+  *
+  ****************************************************************************/
+ #include <linux/netdevice.h>
++#include <net/gro.h>
+ #include <linux/etherdevice.h>
+ #include <linux/ip.h>
+ #include <linux/tcp.h>
+@@ -80,21 +81,12 @@ static struct ctl_table tcp_pacing_table[] = {
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+ 	},
+-	{}
+-};
+-static struct ctl_table tcp_pacing_sysctl_root[] = {
+-	{
+-		.procname	= "net",
+-		.mode		= 0555,
+-		.child		= tcp_pacing_table,
+-	},
+-	{}
+ };
+ 
+ static struct ctl_table_header *sysctl_header;
+ static int register_tcp_pacing_sysctl(void)
+ {
+-	sysctl_header = register_sysctl_table(tcp_pacing_sysctl_root);
++	sysctl_header = register_sysctl("net/ccmni", tcp_pacing_table);
+ 	if (sysctl_header == NULL) {
+ 		pr_info("CCCI:CCMNI:register tcp_pacing failed\n");
+ 		return -1;
+@@ -107,6 +99,7 @@ static void unregister_tcp_pacing_sysctl(void)
+ 	unregister_sysctl_table(sysctl_header);
+ }
+ 
++void set_ccmni_rps(unsigned long value);
+ void set_ccmni_rps(unsigned long value)
+ {
+ 	int i = 0;
+@@ -121,12 +114,14 @@ void set_ccmni_rps(unsigned long value)
+ }
+ EXPORT_SYMBOL(set_ccmni_rps);
+ 
++void ccmni_set_cur_speed(u64 cur_dl_speed);
+ void ccmni_set_cur_speed(u64 cur_dl_speed)
+ {
+ 	g_cur_dl_speed = cur_dl_speed;
+ }
+ EXPORT_SYMBOL(ccmni_set_cur_speed);
+ 
++void ccmni_set_tcp_is_need_gro(u32 tcp_is_need_gro);
+ void ccmni_set_tcp_is_need_gro(u32 tcp_is_need_gro)
+ {
+ 	g_tcp_is_need_gro = tcp_is_need_gro;
+@@ -225,6 +220,7 @@ static int is_skb_gro(struct sk_buff *skb)
+ 	return 0;
+ }
+ 
++void ccmni_clr_flush_timer(void);
+ void ccmni_clr_flush_timer(void)
+ {
+ 	int i = 0;
+@@ -247,10 +243,10 @@ static inline void napi_gro_list_flush(struct ccmni_instance *ccmni)
+ 
+ 	napi = ccmni->napi;
+ 	napi_gro_flush(napi, false);
+-	if (napi->rx_count) {
+-		netif_receive_skb_list(&napi->rx_list);
+-		INIT_LIST_HEAD(&napi->rx_list);
+-		napi->rx_count = 0;
++	if (napi->gro.rx_count) {
++		netif_receive_skb_list(&napi->gro.rx_list);
++		INIT_LIST_HEAD(&napi->gro.rx_list);
++		napi->gro.rx_count = 0;
+ 	}
+ }
+ 
+@@ -453,7 +449,7 @@ static int ccmni_close(struct net_device *dev)
+ 	struct ccmni_instance *ccmni =
+ 		(struct ccmni_instance *)netdev_priv(dev);
+ 	struct ccmni_instance *ccmni_tmp = NULL;
+-	int usage_cnt = 0, ret = 0;
++	__maybe_unused int usage_cnt = 0, ret = 0;
+ 
+ 	if (ccmni->index < 0) {
+ 		netdev_err(dev, "%s : invalid ccmni idx:%d\n", __func__, ccmni->index);
+@@ -498,7 +494,7 @@ static netdev_tx_t ccmni_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	unsigned int priority_lev = 0;
+ 	struct md_tag_packet *tag = NULL;
+ 	unsigned int count = 0;
+-	struct iphdr *iph;
++	__maybe_unused struct iphdr *iph;
+ 
+ #if defined(CCMNI_MET_DEBUG)
+ 	char tag_name[32] = { '\0' };
+-- 
+2.56.0
+

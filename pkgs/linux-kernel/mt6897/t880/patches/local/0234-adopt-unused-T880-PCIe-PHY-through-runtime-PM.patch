@@ -1,0 +1,160 @@
+From 06403baaa915688a80eb1df85ba2963166b4e9bf Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 10 Nov 2026 22:09:03 +0800
+Subject: [PATCH] pmdomain: mediatek: adopt unused T880 PCIe PHY through
+ runtime PM
+
+Integrate the imported SCPSYS idle consumer with the current platform-device
+headers and managed runtime-PM lifecycle. Describe the consumer binding and
+select only the T880 PCIe PHY0 leaf. Its existing MAC0 parent is adopted before
+the PHY and can become idle after the child through normal genpd sequencing.
+
+Keep the driver optional for other boards. This does not change the PCIe
+controller configuration, power-domain register sequences or clock policy.
+
+Link: https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_mt6897/blob/76792af3e1fefabd34be6dd684bfc9facc4d5b17/kernel/kernel_device_modules-6.1/drivers/soc/mediatek/mtk-pm-domain-disable-unused.c
+Signed-off-by: Dian QK <dianqk@dianqk.net>
+---
+ .../power/mediatek,scpsys-disable-unused.yaml | 38 +++++++++++++++++++
+ .../dts/mediatek/mt6897-alldocube-t880.dts    |  9 ++++-
+ drivers/pmdomain/mediatek/Kconfig             |  7 ++++
+ drivers/pmdomain/mediatek/Makefile            |  2 +
+ .../mediatek/mtk-pm-domain-disable-unused.c   |  8 ++--
+ 5 files changed, 57 insertions(+), 7 deletions(-)
+ create mode 100644 Documentation/devicetree/bindings/power/mediatek,scpsys-disable-unused.yaml
+ rename drivers/{soc => pmdomain}/mediatek/mtk-pm-domain-disable-unused.c (88%)
+
+diff --git a/Documentation/devicetree/bindings/power/mediatek,scpsys-disable-unused.yaml b/Documentation/devicetree/bindings/power/mediatek,scpsys-disable-unused.yaml
+new file mode 100644
+index 0000000000..87cf9b4b2b
+--- /dev/null
++++ b/Documentation/devicetree/bindings/power/mediatek,scpsys-disable-unused.yaml
+@@ -0,0 +1,38 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/power/mediatek,scpsys-disable-unused.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: MediaTek idle SCPSYS power-domain consumer
++
++maintainers:
++  - Dian QK <dianqk@dianqk.net>
++
++description: |
++  An unused device may have a power domain left enabled by firmware. This
++  consumer enables runtime PM so the domain can become idle through the normal
++  power-domain provider. A leaf domain also follows its existing parent-domain
++  hierarchy.
++
++properties:
++  compatible:
++    const: mediatek,scpsys-disable-unused
++
++  power-domains:
++    maxItems: 1
++
++required:
++  - compatible
++  - power-domains
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/power/mediatek,mt6897-power.h>
++
++    unused-pcie-power-domain {
++        compatible = "mediatek,scpsys-disable-unused";
++        power-domains = <&spm MT6897_POWER_DOMAIN_PEXTP_PHY0>;
++    };
+diff --git a/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880.dts b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880.dts
+index 43e3ff822f..e30b3597de 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880.dts
+@@ -4,8 +4,7 @@
+  *
+  * Values read from a T880 (its runtime device tree and LK log). U-Boot
+  * replaces /memory with the banks reported by the stock LK and adds LK's
+- * fixed reserved-memory regions before booting this tree; clocks, pins and
+- * power domains stay as the bootloaders leave them.
++ * fixed reserved-memory regions before booting this tree.
+  */
+ 
+ /dts-v1/;
+@@ -23,6 +22,12 @@ aliases {
+ 		serial0 = &uart0;
+ 	};
+ 
++	/* The PHY is a child of the PCIe MAC power domain. */
++	unused-pcie-power-domain {
++		compatible = "mediatek,scpsys-disable-unused";
++		power-domains = <&spm MT6897_POWER_DOMAIN_PEXTP_PHY0>;
++	};
++
+ 	chosen {
+ 		#address-cells = <2>;
+ 		#size-cells = <2>;
+diff --git a/drivers/pmdomain/mediatek/Kconfig b/drivers/pmdomain/mediatek/Kconfig
+index a2eb704a77..80ea6c7f9b 100644
+--- a/drivers/pmdomain/mediatek/Kconfig
++++ b/drivers/pmdomain/mediatek/Kconfig
+@@ -26,6 +26,13 @@ config MTK_SCPSYS_PM_DOMAINS
+ 	  Control Processor System (SCPSYS) has several power management related
+ 	  tasks in the system.
+ 
++config MTK_SCPSYS_DISABLE_UNUSED
++	bool "MediaTek unused SCPSYS power domain consumers"
++	depends on PM_GENERIC_DOMAINS && OF
++	help
++	  Enable runtime PM for unused power domains described by devices with
++	  the mediatek,scpsys-disable-unused compatible string.
++
+ config MTK_MFG_PM_DOMAIN
+ 	bool "MediaTek MFlexGraphics power domain"
+ 	default ARCH_MEDIATEK
+diff --git a/drivers/pmdomain/mediatek/Makefile b/drivers/pmdomain/mediatek/Makefile
+index b424f1ed86..27fa12d3b5 100644
+--- a/drivers/pmdomain/mediatek/Makefile
++++ b/drivers/pmdomain/mediatek/Makefile
+@@ -10,3 +10,5 @@ ifeq ($(CONFIG_THUMB2_KERNEL)$(CONFIG_CC_IS_CLANG),yy)
+ # hooks are inserted via the -pg switch.
+ CFLAGS_REMOVE_airoha-cpu-pmdomain.o += $(CC_FLAGS_FTRACE)
+ endif
++
++obj-$(CONFIG_MTK_SCPSYS_DISABLE_UNUSED) += mtk-pm-domain-disable-unused.o
+diff --git a/drivers/soc/mediatek/mtk-pm-domain-disable-unused.c b/drivers/pmdomain/mediatek/mtk-pm-domain-disable-unused.c
+similarity index 88%
+rename from drivers/soc/mediatek/mtk-pm-domain-disable-unused.c
+rename to drivers/pmdomain/mediatek/mtk-pm-domain-disable-unused.c
+index b7576878c2..ee6bc0eddc 100644
+--- a/drivers/soc/mediatek/mtk-pm-domain-disable-unused.c
++++ b/drivers/pmdomain/mediatek/mtk-pm-domain-disable-unused.c
+@@ -6,11 +6,11 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+-#include <linux/of_platform.h>
++#include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ 
+ static const struct of_device_id scpsys_disable_unused_id_table[] = {
+-	{ .compatible = "mediatek,scpsys-disable-unused",},
++	{ .compatible = "mediatek,scpsys-disable-unused", },
+ 	{ },
+ };
+ 
+@@ -18,9 +18,7 @@ MODULE_DEVICE_TABLE(of, scpsys_disable_unused_id_table);
+ 
+ static int scpsys_disable_unused_probe(struct platform_device *pdev)
+ {
+-	pm_runtime_enable(&pdev->dev);
+-
+-	return 0;
++	return devm_pm_runtime_enable(&pdev->dev);
+ }
+ 
+ static struct platform_driver scpsys_disable_unused = {
+-- 
+2.56.0
+

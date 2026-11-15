@@ -1,0 +1,110 @@
+From 764bc3e1c8ca024eb9409535c23370829712cc29 Mon Sep 17 00:00:00 2001
+From: Martin Lund <mrlund@hotmail.com>
+Date: Tue, 20 Oct 2026 12:41:16 +0200
+Subject: [PATCH 064/144] arm64: dts: qcom: sm8750-oneplus-dodge: add the USB-C
+ headset path
+
+The OnePlus 13 has no 3.5 mm jack: analog headsets use USB-C audio
+accessory mode through the WCD939x USBSS switch at 0xe on QUP I2C3
+(no reset line, as on stock). Link it into the pmic-glink connector's
+SBU port and the codec's headset port, and add the WCD playback link
+from RX codec DMA 0 to HPHL/HPHR.
+
+Assisted-by: Grok
+Assisted-by: Grok Bot
+Signed-off-by: Martin Lund <mrlund@hotmail.com>
+(cherry picked from commit d5842286cdec248820ee807e87efb2585ac640f2)
+Link: https://github.com/mrlund/linux-omarchy-mobile/commit/d5842286cdec248820ee807e87efb2585ac640f2
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0083-arm64-dts-qcom-sm8750-oneplus-dodge-add-the-USB-C-he.patch
+Import-SHA256: 06f98163496ac0e9af7f89180e542fd7cb86ae82ba3389973c34cb99de80379e
+Import-Provenance: mail headers
+(cherry picked from commit 9c2ddf6fa6eff485a72cfd273105aba5896a6952)
+---
+ .../boot/dts/qcom/sm8750-oneplus-dodge.dts    | 40 ++++++++++++++++++-
+ 1 file changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+index 227b8131a0..ba83af9e4e 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
++++ b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+@@ -32,11 +32,29 @@ sound {
+ 				"AMIC3", "MIC BIAS4",
+ 				"AMIC4", "MIC BIAS3",
+ 				"AMIC5", "MIC BIAS1",
++				"IN1_HPHL", "HPHL_OUT",
++				"IN2_HPHR", "HPHR_OUT",
+ 				"TX SWR_INPUT0", "ADC1_OUTPUT",
+ 				"TX SWR_INPUT1", "ADC2_OUTPUT",
+ 				"TX SWR_INPUT2", "ADC3_OUTPUT",
+ 				"TX SWR_INPUT3", "ADC4_OUTPUT";
+ 
++		wcd-playback-dai-link {
++			link-name = "WCD Playback";
++
++			cpu {
++				sound-dai = <&q6apmbedai RX_CODEC_DMA_RX_0>;
++			};
++
++			codec {
++				sound-dai = <&wcd939x 0>, <&swr1 0>, <&lpass_rxmacro 0>;
++			};
++
++			platform {
++				sound-dai = <&q6apm>;
++			};
++		};
++
+ 		wcd-capture-dai-link {
+ 			link-name = "WCD Capture";
+ 
+@@ -95,6 +113,16 @@ wcd939x: audio-codec {
+ 		vdd-mic-bias-supply = <&vreg_bob1>;
+ 
+ 		#sound-dai-cells = <1>;
++
++		/* No 3.5 mm jack: the headset is analog audio over USB-C. */
++		mode-switch;
++		orientation-switch;
++
++		port {
++			wcd_codec_headset_in: endpoint {
++				remote-endpoint = <&wcd_usbss_headset_out>;
++			};
++		};
+ 	};
+ 
+ 	pmic-glink {
+@@ -736,21 +764,31 @@ &i2c3 {
+ 	wcd_usbss: typec-mux@e {
+ 		compatible = "qcom,wcd9395-usbss", "qcom,wcd9390-usbss";
+ 		reg = <0xe>;
++
+ 		vdd-supply = <&vreg_l15b_1p8>;
++
+ 		mode-switch;
+ 		orientation-switch;
+ 
+-		/* The OEM USBSS node has no reset GPIO or codec dependency. */
+ 		ports {
+ 			#address-cells = <1>;
+ 			#size-cells = <0>;
+ 
+ 			port@0 {
+ 				reg = <0>;
++
+ 				wcd_usbss_sbu_mux: endpoint {
+ 					remote-endpoint = <&pmic_glink_sbu>;
+ 				};
+ 			};
++
++			port@1 {
++				reg = <1>;
++
++				wcd_usbss_headset_out: endpoint {
++					remote-endpoint = <&wcd_codec_headset_in>;
++				};
++			};
+ 		};
+ 	};
+ };

@@ -1,0 +1,4017 @@
+From afeb8ce28188c9a1fab0976884581c774659b702 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] media: mediatek: add the MT6897 stateful VCP encoder
+
+Expose the MT6897 stateful H.264/HEVC encoder with committed controls,
+bounded geometry, frame/power ownership and opt-in diagnostic APIs,
+including force-intra.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T20:55:18+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T23:52:01+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-04T00:33:53+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-04T00:45:43+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-04T01:13:19+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-04T01:20:31+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-04T02:05:27+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-04T02:12:42+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-04T02:30:00+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-04T23:46:09+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-05T00:34:44+08:00
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec/venc/venc_vcp_if.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec/venc/venc_ipi_msg.h
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec/mtk_vcodec_enc_pm.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec/mtk_vcodec_enc.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec/venc_ipi_msg.h
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ .../mediatek/vcodec/vcp/mtk_vcp_venc.c        | 1229 +++++++++++++++++
+ .../mediatek/vcodec/vcp/mtk_vcp_venc.h        |   69 +
+ .../mediatek/vcodec/vcp/mtk_vcp_venc_drv.c    |  440 ++++++
+ .../mediatek/vcodec/vcp/mtk_vcp_venc_frames.c |  564 ++++++++
+ .../mediatek/vcodec/vcp/mtk_vcp_venc_frames.h |  206 +++
+ .../mediatek/vcodec/vcp/mtk_vcp_venc_hw.c     |  313 +++++
+ .../mediatek/vcodec/vcp/mtk_vcp_venc_hw.h     |   17 +
+ .../vcodec/vcp/mtk_vcp_venc_mt6897_abi.h      |  212 +++
+ .../mediatek/vcodec/vcp/mtk_vcp_venc_v4l2.c   |  822 +++++++++++
+ .../mediatek/vcodec/vcp/mtk_vcp_venc_v4l2.h   |   11 +
+ 10 files changed, 3883 insertions(+)
+ create mode 100644 drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc.c
+ create mode 100644 drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc.h
+ create mode 100644 drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_drv.c
+ create mode 100644 drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_frames.c
+ create mode 100644 drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_frames.h
+ create mode 100644 drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_hw.c
+ create mode 100644 drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_hw.h
+ create mode 100644 drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_mt6897_abi.h
+ create mode 100644 drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_v4l2.c
+ create mode 100644 drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_v4l2.h
+
+diff --git a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc.c b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc.c
+new file mode 100644
+index 0000000000..45e40f9d17
+--- /dev/null
++++ b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc.c
+@@ -0,0 +1,1229 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Protocol adapted from MediaTek venc_vcp_if.c:
++ * Copyright (c) 2016 MediaTek Inc.
++ * Author: Chia-Mao Hung <chia-mao.hung@mediatek.com>
++ * https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec/venc/venc_vcp_if.c
++ */
++/* MT6897 encoder transport for stateful V4L2 and bounded diagnostics.
++ * Private frame buffers retain explicit completion and shutdown ownership. */
++#include <linux/atomic.h>
++#include <linux/completion.h>
++#include <linux/device.h>
++#include <linux/dma-mapping.h>
++#include <linux/err.h>
++#include <linux/module.h>
++#include <linux/ktime.h>
++#include <linux/mutex.h>
++#include <linux/remoteproc/mtk_vcp.h>
++#include <linux/slab.h>
++#include <linux/overflow.h>
++#include <linux/sizes.h>
++#include "mtk_vcp_venc_hw.h"
++#include "mtk_vcp_venc.h"
++#define VENC_QUERY_TIMEOUT 5000
++struct venc_allocation {
++	struct list_head link;
++	struct mtk_vcp_mem memory;
++	struct mt6897_venc_memory tuple;
++	bool released;
++};
++struct mtk_vcp_venc {
++	struct device *dev;
++	struct mtk_vcp *vcp;
++	struct mtk_vcp_venc_hw *hw;
++	struct mtk_vcp_venc_frames *frames;
++	bool frame_trial, force_pending, closing, stream_submitted;
++	void *stream_owner, *stream_header;
++	size_t stream_header_bytes;
++	struct mtk_vcp_venc_config stream_config;
++	struct list_head allocations;
++	size_t allocated;
++	unsigned int allocation_count, codec;
++	u32 expected_id;
++	u64 instance, memory_cookie;
++	void *vsi;
++	bool init_trial, suspended;
++	struct mutex trial_lock, rx_lock;
++	struct completion reply;
++	struct mtk_vcp_venc_result result;
++	struct mt6897_venc_query_ack ack;
++	u64 cookie, data_cookie;
++	u32 expected_query;
++	int error, callback_error;
++	bool pending, registered, retained, broken;
++};
++static atomic64_t venc_cookie = ATOMIC64_INIT(0);
++static void venc_memory_trace(struct mtk_vcp_venc *q, const char *operation,
++			      const struct mt6897_venc_memory *m, int status)
++{
++	dev_dbg(q->dev,
++		"VENC memory %s phase %#x pending %u status %d type %u size %u iova %#llx pa %#llx token %#llx vcp %#x/%#x\n",
++		operation, q->expected_id, q->pending, status,
++		le32_to_cpu(m->type), le32_to_cpu(m->size),
++		le64_to_cpu(m->iova), le64_to_cpu(m->pa), le64_to_cpu(m->token),
++		le32_to_cpu(m->vcp_addr[0]), le32_to_cpu(m->vcp_addr[1]));
++}
++static void venc_unknown_free(struct mtk_vcp_venc *q,
++			      const struct mt6897_venc_memory *m)
++{
++	struct venc_allocation *a;
++	unsigned int matches = 0, shown = 0;
++	dev_err(q->dev,
++		"VENC unmatched FREE phase %#x pending %u incoming status %d type %u size %u iova %#llx pa %#llx token %#llx vcp %#x/%#x tracked %u\n",
++		q->expected_id, q->pending, (s32)le32_to_cpu(m->header.status),
++		le32_to_cpu(m->type), le32_to_cpu(m->size),
++		le64_to_cpu(m->iova), le64_to_cpu(m->pa), le64_to_cpu(m->token),
++		le32_to_cpu(m->vcp_addr[0]), le32_to_cpu(m->vcp_addr[1]),
++		q->allocation_count);
++	list_for_each_entry(a, &q->allocations, link) {
++		unsigned int diff;
++		if (!(m->token && m->token == a->tuple.token) &&
++		    !(m->iova && m->iova == a->tuple.iova) &&
++		    !(m->pa && m->pa == a->tuple.pa))
++			continue;
++		matches++;
++		if (shown == 4)
++			continue;
++		shown++;
++		diff = (m->type != a->tuple.type) |
++		       ((m->size != a->tuple.size) << 1) |
++		       ((m->iova != a->tuple.iova) << 2) |
++		       ((m->pa != a->tuple.pa) << 3) |
++		       ((m->token != a->tuple.token) << 4);
++		dev_err(q->dev,
++			"VENC FREE candidate diff %#x released %u type %u size %u iova %#llx pa %#llx token %#llx\n",
++			diff, a->released, le32_to_cpu(a->tuple.type),
++			le32_to_cpu(a->tuple.size), le64_to_cpu(a->tuple.iova),
++			le64_to_cpu(a->tuple.pa), le64_to_cpu(a->tuple.token));
++	}
++	dev_err(q->dev,
++		"VENC FREE candidates %u shown %u; strict identity retained\n",
++		matches, shown);
++}
++/* Keep all allocations until VCP shutdown and hardware quiescence are both
++ * confirmed. FREE acknowledges ownership return but does not unmap DMA. */
++static int venc_memory(struct mtk_vcp_venc *q, struct mt6897_venc_memory *m,
++		       bool allocate)
++{
++	struct venc_allocation *a;
++	u32 type = le32_to_cpu(m->type), size = le32_to_cpu(m->size);
++	size_t length;
++	int ret;
++	if (!allocate) {
++		list_for_each_entry(a, &q->allocations, link)
++			if (!memcmp(&a->tuple.type, &m->type, 32)) {
++				if (a->released)
++					return -EINVAL;
++				a->released = true;
++				return 0;
++			}
++		venc_unknown_free(q, m);
++		return -ENOENT;
++	}
++	m->iova = m->pa = m->token = 0;
++	if (q->broken || q->callback_error)
++		return q->callback_error ?: -EPROTO;
++	if (!q->init_trial || (type != 0 && type != 1))
++		return -EOPNOTSUPP;
++	if (!size || size > SZ_16M || q->allocation_count == 128)
++		return -E2BIG;
++	length = size;
++	if (!type && (check_add_overflow((size_t)ALIGN(size, 128), (size_t)128,
++					 &length)))
++		return -EOVERFLOW;
++	if (length > SZ_256M - q->allocated)
++		return -E2BIG;
++	a = kzalloc(sizeof(*a), GFP_KERNEL);
++	if (!a)
++		return -ENOMEM;
++	if (!type) {
++		ret = mtk_vcp_alloc_workmem(q->vcp, length, &a->memory);
++		if (ret)
++			goto fail;
++	} else {
++		a->memory.size = length;
++		a->memory.cpu = dma_alloc_coherent(q->dev, length,
++						   &a->memory.dma, GFP_KERNEL);
++		if (!a->memory.cpu) {
++			ret = -ENOMEM;
++			goto fail;
++		}
++		if (a->memory.dma > U32_MAX ||
++		    length - 1 > U32_MAX - a->memory.dma) {
++			dma_free_coherent(q->dev, length, a->memory.cpu,
++					  a->memory.dma);
++			ret = -ERANGE;
++			goto fail;
++		}
++	}
++	m->iova = m->pa = cpu_to_le64(a->memory.dma);
++	m->token = cpu_to_le64(++q->memory_cookie);
++	a->tuple = *m;
++	list_add_tail(&a->link, &q->allocations);
++	q->allocated += length;
++	q->allocation_count++;
++	dev_dbg(q->dev,
++		"VENC allocation type %u requested %u backing %zu DMA %pad\n",
++		type, size, length, &a->memory.dma);
++	return 0;
++fail:
++	kfree(a);
++	return ret;
++}
++static void venc_free_allocations(struct mtk_vcp_venc *q)
++{
++	struct venc_allocation *a, *next;
++	list_for_each_entry_safe(a, next, &q->allocations, link) {
++		if (!le32_to_cpu(a->tuple.type))
++			mtk_vcp_free_workmem(q->vcp, &a->memory);
++		else
++			dma_free_coherent(q->dev, a->memory.size, a->memory.cpu,
++					  a->memory.dma);
++		list_del(&a->link);
++		kfree(a);
++	}
++	q->allocated = q->allocation_count = 0;
++}
++
++static void venc_receive(void *priv, const void *data, size_t length)
++{
++	struct mtk_vcp_venc *q = priv;
++	u8 buffer[MTK_VCP_IPI_MAX_PAYLOAD] __aligned(8) = {};
++	struct mt6897_venc_prefix *h = (void *)buffer;
++	u32 id;
++	int ret;
++	mutex_lock(&q->rx_lock);
++	if (length < sizeof(*h) || length > sizeof(buffer))
++		goto protocol_error;
++	memcpy(buffer, data, length);
++	id = le32_to_cpu(h->id);
++	dev_dbg(q->dev, "VENC query RX %#x bytes=%zu status=%d\n", id, length,
++		(s32)le32_to_cpu(h->status));
++	if (id == MT6897_VENC_ENCODE_DONE) {
++		int status;
++		if (!q->frame_trial ||
++		    !mt6897_venc_encode_ack_valid(h, length, q->pending,
++						  q->expected_id, q->cookie))
++			goto protocol_error;
++		status = (s32)le32_to_cpu(h->status);
++		if (status > 0)
++			status = -EIO;
++		q->result.encode_ack_bytes = length;
++		memset(q->result.encode_tail, 0, sizeof(q->result.encode_tail));
++		memcpy(q->result.encode_tail, buffer + sizeof(*h),
++		       length - sizeof(*h));
++		dev_info(q->dev,
++			 "VENC ENCODE ACK bytes %zu status %d tail %*phN\n",
++			 length, status, (int)(length - sizeof(*h)),
++			 buffer + sizeof(*h));
++		if (!q->broken)
++			q->error = status;
++		if (q->broken || q->callback_error) {
++			ret = q->error ?: q->callback_error ?: -EPROTO;
++			mtk_vcp_venc_frames_fail(q->frames, ret);
++		} else {
++			ret = mtk_vcp_venc_frames_ack(q->frames, status);
++		}
++		if (ret && !q->callback_error)
++			q->callback_error = ret;
++		q->pending = false;
++		complete(&q->reply);
++		goto out;
++	}
++	if (id == MT6897_VENC_CONFIG_DONE) {
++		if (!mt6897_venc_config_ack_valid(h, length, q->pending,
++						  q->expected_id, q->cookie))
++			goto protocol_error;
++		/* CONFIG and FORCE_INTRA share SET_PARAM_DONE. The serialized
++		 * pending operation selects storage; no tail echo is assumed. */
++		if (q->force_pending) {
++			q->result.force_ack_bytes = length;
++			q->result.force_status = (s32)le32_to_cpu(h->status);
++			memcpy(q->result.force_tail, buffer + sizeof(*h),
++			       length - sizeof(*h));
++		} else {
++			q->result.config_ack_bytes = length;
++			q->result.config_status = (s32)le32_to_cpu(h->status);
++			memcpy(q->result.config_tail, buffer + sizeof(*h),
++			       length - sizeof(*h));
++		}
++		dev_info(q->dev,
++			 "VENC %s ACK bytes %zu status %d tail %*phN\n",
++			 q->force_pending ? "FORCE_INTRA" : "CONFIG", length,
++			 (s32)le32_to_cpu(h->status),
++			 (int)(length - sizeof(*h)), buffer + sizeof(*h));
++		if (!q->broken) {
++			s32 status = (s32)le32_to_cpu(h->status);
++
++			q->error = status > 0 ? -EIO : status;
++		}
++		q->pending = false;
++		complete(&q->reply);
++		goto out;
++	}
++	if (id == MT6897_VENC_INIT_DONE || id == MT6897_VENC_DEINIT_DONE) {
++		struct mt6897_venc_init_ack *a = (void *)buffer;
++		size_t expected = id == MT6897_VENC_INIT_DONE ? sizeof(*a) :
++								sizeof(*h);
++		if (!q->pending || q->expected_id != id || length != expected ||
++		    le64_to_cpu(h->cookie) != q->cookie)
++			goto protocol_error;
++		if (!q->broken)
++			q->error = (s32)le32_to_cpu(h->status) > 0 ?
++					   -EIO :
++					   (s32)le32_to_cpu(h->status);
++		if (id == MT6897_VENC_INIT_DONE && !q->error) {
++			struct mtk_vcp_mem memory;
++			size_t offset;
++			u64 instance = le64_to_cpu(a->instance);
++			dev_dbg(q->dev, "VENC INIT raw instance %#llx\n",
++				instance);
++			ret = mtk_vcp_get_mem(q->vcp, MTK_VCP_MEM_VENC,
++					      &memory);
++			if (ret || !instance ||
++			    !mt6897_venc_table_offset(instance, memory.dma,
++						      memory.size, 196,
++						      &offset)) {
++				q->error = ret ?: -ERANGE;
++			} else {
++				q->instance = instance;
++				q->vsi = memory.cpu + offset;
++				dma_rmb();
++				q->result.instance = q->instance;
++				q->result.sysram_enable = le32_to_cpu(
++					READ_ONCE(*(__le32 *)(q->vsi + 192)));
++				dev_info(
++					q->dev,
++					"VENC INIT instance %#llx VENC offset %#zx sysram %u\n",
++					q->instance, offset,
++					q->result.sysram_enable);
++			}
++		}
++		if (id == MT6897_VENC_DEINIT_DONE) {
++			q->vsi = NULL;
++			mtk_vcp_venc_frames_invalidate(q->frames);
++		}
++		q->pending = false;
++		complete(&q->reply);
++		goto out;
++	}
++	if (id == MT6897_VENC_QUERY_DONE) {
++		struct mt6897_venc_query_ack *a = (void *)buffer;
++		dev_dbg(q->dev, "VENC QUERY ACK context=%u\n",
++			le32_to_cpu(h->ctx));
++		if (q->expected_id != MT6897_VENC_QUERY_DONE ||
++		    !mt6897_venc_query_ack_valid(a, length, q->pending,
++						 q->cookie, q->data_cookie,
++						 q->expected_query))
++			goto protocol_error;
++		q->ack = *a;
++		if (!q->broken)
++			q->error = (s32)le32_to_cpu(h->status) > 0 ?
++					   -EIO :
++					   (s32)le32_to_cpu(h->status);
++		q->pending = false;
++		complete(&q->reply);
++		goto out;
++	}
++	/* Vendor dispatch validates the cookie, then replaces ctx before callbacks. */
++	if (le64_to_cpu(h->cookie) != q->cookie)
++		goto protocol_error;
++	if (id < 0x3000 || id > 0x3006)
++		goto protocol_error;
++	ret = -EOPNOTSUPP;
++	if (id == MT6897_VENC_MEM_ALLOC || id == MT6897_VENC_MEM_FREE) {
++		struct mt6897_venc_memory *m = (void *)buffer;
++		if (length != sizeof(*m) || le32_to_cpu(m->type) == 6)
++			goto protocol_error;
++		venc_memory_trace(q,
++				  id == MT6897_VENC_MEM_ALLOC ?
++					  "ALLOC request" :
++					  "FREE request",
++				  m, (s32)le32_to_cpu(h->status));
++		ret = q->closing && id == MT6897_VENC_MEM_ALLOC ? -ESHUTDOWN :
++			venc_memory(q, m, id == MT6897_VENC_MEM_ALLOC);
++		venc_memory_trace(q,
++				  id == MT6897_VENC_MEM_ALLOC ? "ALLOC reply" :
++								"FREE reply",
++				  m, ret);
++	} else {
++		struct mt6897_venc_callback *c = (void *)buffer;
++		unsigned int core = le32_to_cpu(h->status);
++		if (length != sizeof(*c))
++			goto protocol_error;
++		if (id == 0x3002 && q->frame_trial &&
++		    q->expected_id == MT6897_VENC_ENCODE_DONE) {
++			if (q->broken || q->callback_error) {
++				ret = q->error ?: q->callback_error ?: -EPROTO;
++				mtk_vcp_venc_frames_fail(q->frames, ret);
++			} else {
++				ret = mtk_vcp_venc_frames_put(q->frames);
++			}
++		}
++		if (id == 0x3006) {
++			/* A mismatching codec probe is normal negotiation, not a client fault. */
++			ret = le32_to_cpu(c->data[0]) == q->codec &&
++					      q->init_trial ?
++				      0 :
++				      -1;
++			h->status = cpu_to_le32(ret);
++			goto send_callback;
++		}
++		if (q->init_trial && (id == 0x3000 || id == 0x3001)) {
++			if (q->vsi) {
++				dma_rmb();
++				q->result.sysram_enable = le32_to_cpu(
++					READ_ONCE(*(__le32 *)(q->vsi + 192)));
++			}
++			if (!q->vsi)
++				ret = -EPROTO;
++			else if (q->result.sysram_enable)
++				ret = -EOPNOTSUPP;
++			else if (core < 2 &&
++				 (id == 0x3001 ||
++				  (!q->broken && !q->callback_error && !q->closing)))
++				ret = mtk_vcp_venc_hw_power(q->hw, core,
++							    id == 0x3000);
++			else
++				ret = q->callback_error ?: -EINVAL;
++			if (!ret) {
++				/* POWER success preserves the core selector in status. */
++				h->status = cpu_to_le32(core);
++				goto send_callback;
++			}
++		}
++	}
++	if (ret && id == 0x3005)
++		dev_err(q->dev, "VENC unsupported WAIT phase %#x raw %*phN\n",
++			q->expected_id, (int)length, buffer);
++	if (ret && !q->callback_error) {
++		q->callback_error = ret;
++		if (q->frame_trial)
++			mtk_vcp_venc_frames_fail(q->frames, ret);
++		dev_err(q->dev, "VENC callback %#x selector %d failed: %d\n",
++			id, (s32)le32_to_cpu(h->status), ret);
++	}
++	h->status = cpu_to_le32(ret);
++send_callback:
++	h->id = cpu_to_le32(id + 0x1000);
++	ret = mtk_vcp_ipi_send(q->vcp, MTK_VCP_ENCODER, buffer, length);
++	if (id == 0x3002 && q->frame_trial)
++		mtk_vcp_venc_frames_put_done(q->frames,
++					     ret ?: q->callback_error);
++
++	if (ret) {
++		if (!q->broken)
++			q->error = ret;
++		q->broken = true;
++		if (q->frame_trial)
++			mtk_vcp_venc_frames_fail(q->frames, q->error);
++		complete(&q->reply);
++	}
++	goto out;
++protocol_error:
++	dev_err(q->dev,
++		"encoder QUERY protocol mismatch: bytes=%zu pending=%u cookie=%#llx data=%#llx query=%u raw=%*phN\n",
++		length, q->pending, q->cookie, q->data_cookie,
++		q->expected_query, (int)min(length, sizeof(buffer)), buffer);
++	if (!q->broken)
++		q->error = -EPROTO;
++	q->broken = true;
++	if (q->frame_trial)
++		mtk_vcp_venc_frames_fail(q->frames, q->error);
++	complete(&q->reply);
++out:
++	mutex_unlock(&q->rx_lock);
++}
++static int venc_query_table(struct mtk_vcp_venc *q, unsigned int id,
++			    void *destination, size_t bytes)
++{
++	struct mt6897_venc_query message = {};
++	struct mtk_vcp_mem memory;
++	size_t offset;
++	int ret;
++	ret = mtk_vcp_get_mem(q->vcp, MTK_VCP_MEM_VENC, &memory);
++	if (ret)
++		return ret;
++	dev_dbg(q->dev, "VENC QUERY reserved DMA=%pad size=%#zx\n", &memory.dma,
++		memory.size);
++	mutex_lock(&q->rx_lock);
++	if (q->broken) {
++		ret = q->error ?: -EPROTO;
++		mutex_unlock(&q->rx_lock);
++		return ret;
++	}
++	q->data_cookie = q->cookie ^ (0x100000000ULL + id);
++	q->expected_query = id;
++	q->expected_id = MT6897_VENC_QUERY_DONE;
++	q->pending = true;
++	q->error = 0;
++	reinit_completion(&q->reply);
++	message.header.id = cpu_to_le32(MT6897_VENC_QUERY);
++	message.header.ctx = cpu_to_le32(lower_32_bits(q->cookie));
++	message.header.cookie = cpu_to_le64(q->cookie);
++	message.data_cookie = cpu_to_le64(q->data_cookie);
++	message.query = cpu_to_le32(id);
++	mutex_unlock(&q->rx_lock);
++	ret = mtk_vcp_ipi_send(q->vcp, MTK_VCP_ENCODER, &message,
++			       sizeof(message));
++	if (ret)
++		return ret;
++	if (!wait_for_completion_timeout(&q->reply,
++					 msecs_to_jiffies(VENC_QUERY_TIMEOUT)))
++		return -ETIMEDOUT;
++	mutex_lock(&q->rx_lock);
++	ret = q->error ?: q->callback_error;
++	if (ret)
++		goto out;
++	ret = mtk_vcp_get_mem(q->vcp, MTK_VCP_MEM_VENC, &memory);
++	if (ret)
++		goto out;
++	if (!mt6897_venc_table_offset(le64_to_cpu(q->ack.address), memory.dma,
++				      memory.size, bytes, &offset)) {
++		ret = -ERANGE;
++		goto out;
++	}
++	dma_rmb();
++	memcpy(destination, memory.cpu + offset, bytes);
++	dev_info(
++		q->dev,
++		"encoder QUERY %u copied %zu bytes from VENC SHM offset %#zx\n",
++		id, bytes, offset);
++out:
++	mutex_unlock(&q->rx_lock);
++	return ret;
++}
++/* A timed-out or failed send may still receive a late reply. Latch the
++ * transaction uncertainty before callers can issue a cleanup command. */
++static int venc_send_wait(struct mtk_vcp_venc *q, u32 id, const void *message,
++			  size_t bytes, unsigned int timeout_ms)
++{
++	int ret;
++	mutex_lock(&q->rx_lock);
++	if (q->broken || (id != MT6897_VENC_DEINIT && q->callback_error)) {
++		ret = q->error ?: q->callback_error ?: -EPROTO;
++		mutex_unlock(&q->rx_lock);
++		return ret;
++	}
++	q->expected_id = id + 0x1000;
++	q->pending = true;
++	q->error = 0;
++	reinit_completion(&q->reply);
++	mutex_unlock(&q->rx_lock);
++	ret = mtk_vcp_ipi_send(q->vcp, MTK_VCP_ENCODER, message, bytes);
++	if (!ret && !wait_for_completion_timeout(&q->reply,
++						 msecs_to_jiffies(timeout_ms)))
++		ret = -ETIMEDOUT;
++	mutex_lock(&q->rx_lock);
++	if (ret) {
++		if (!q->broken)
++			q->error = ret;
++		q->broken = true;
++	}
++	ret = q->error;
++	/* Cleanup must still receive its own ACK after a completed hardware fault. */
++	if (id != MT6897_VENC_DEINIT)
++		ret = ret ?: q->callback_error;
++	mutex_unlock(&q->rx_lock);
++	return ret;
++}
++static bool venc_can_deinit(struct mtk_vcp_venc *q)
++{
++	bool allowed;
++	mutex_lock(&q->rx_lock);
++	allowed = q->instance && !q->broken && !q->pending;
++	mutex_unlock(&q->rx_lock);
++	return allowed;
++}
++static int venc_command(struct mtk_vcp_venc *q, u32 id)
++{
++	struct mt6897_venc_command message = {};
++	message.id = cpu_to_le32(id);
++	message.ctx = cpu_to_le32(lower_32_bits(q->cookie));
++	message.instance =
++		cpu_to_le64(id == MT6897_VENC_INIT ? q->cookie : q->instance);
++	return venc_send_wait(q, id, &message, sizeof(message),
++			      VENC_QUERY_TIMEOUT);
++}
++static int venc_configure(struct mtk_vcp_venc *q)
++{
++	struct mt6897_venc_config message = {};
++	struct mtk_vcp_mem memory;
++	size_t offset;
++	int ret;
++	mutex_lock(&q->rx_lock);
++	ret = q->broken ? (q->error ?: -EPROTO) : q->callback_error;
++	if (ret)
++		goto out;
++	ret = mtk_vcp_get_mem(q->vcp, MTK_VCP_MEM_VENC, &memory);
++	if (ret)
++		goto out;
++	if (!q->vsi ||
++	    !mt6897_venc_table_offset(q->instance, memory.dma, memory.size,
++				      MT6897_VENC_CONFIG_EXTENT, &offset) ||
++	    q->vsi != memory.cpu + offset ||
++	    !mt6897_venc_config_defaults(q->vsi, memory.size - offset, q->codec,
++					 lower_32_bits(q->cookie))) {
++		ret = -ERANGE;
++		goto out;
++	}
++	if (q->stream_owner) {
++		const struct mtk_vcp_venc_config *c = &q->stream_config;
++		__le32 *words = q->vsi;
++
++		words[4 / 4] = cpu_to_le32(c->bitrate);
++		words[8 / 4] = cpu_to_le32(c->width);
++		words[12 / 4] = cpu_to_le32(c->height);
++		words[16 / 4] = cpu_to_le32(c->stride);
++		words[20 / 4] = cpu_to_le32(c->storage_height);
++		words[24 / 4] = words[28 / 4] = cpu_to_le32(c->gop);
++		words[32 / 4] = cpu_to_le32(c->fps);
++		words[36 / 4] = cpu_to_le32(c->profile);
++		words[40 / 4] = cpu_to_le32(c->level);
++	}
++
++	dma_wmb();
++	message.id = cpu_to_le32(MT6897_VENC_CONFIG);
++	message.ctx = cpu_to_le32(lower_32_bits(q->cookie));
++	message.instance = cpu_to_le64(q->instance);
++	mutex_unlock(&q->rx_lock);
++	/* Vendor first CONFIG permits 60 seconds; no ENCODE is submitted here. */
++	ret = venc_send_wait(q, MT6897_VENC_CONFIG, &message, sizeof(message),
++			     60000);
++	mutex_lock(&q->rx_lock);
++	if (!ret) {
++		unsigned int i;
++		dma_rmb();
++		for (i = 0; i < 3; i++)
++			q->result.sizeimage[i] = le32_to_cpu(
++				READ_ONCE(*(__le32 *)(q->vsi + 416 + i * 4)));
++		q->result.sync_mode =
++			le32_to_cpu(READ_ONCE(*(__le32 *)(q->vsi + 2728)));
++		dev_info(q->dev, "VENC CONFIG sizes %u/%u/%u sync %u\n",
++			 q->result.sizeimage[0], q->result.sizeimage[1],
++			 q->result.sizeimage[2], q->result.sync_mode);
++	}
++out:
++	mutex_unlock(&q->rx_lock);
++	return ret;
++}
++/* Shipping SET_PARAM FORCE_INTRA: parameter 1, count 0, no data. */
++static int venc_force_intra(struct mtk_vcp_venc *q)
++{
++	struct mt6897_venc_config message = {};
++	int ret;
++
++	message.id = cpu_to_le32(MT6897_VENC_CONFIG);
++	message.ctx = cpu_to_le32(lower_32_bits(q->cookie));
++	message.instance = cpu_to_le64(q->instance);
++	message.parameter = cpu_to_le32(1);
++	mutex_lock(&q->rx_lock);
++	q->force_pending = true;
++	mutex_unlock(&q->rx_lock);
++	ret = venc_send_wait(q, MT6897_VENC_CONFIG, &message, sizeof(message),
++			     VENC_QUERY_TIMEOUT);
++	/* Keep pending classification on uncertainty so a late ACK cannot
++	 * overwrite CONFIG evidence. No further command is allowed if broken. */
++	mutex_lock(&q->rx_lock);
++	if (!q->broken && !q->pending)
++		q->force_pending = false;
++	q->result.force_result = ret;
++	mutex_unlock(&q->rx_lock);
++	return ret;
++}
++static int venc_frame_command(struct mtk_vcp_venc *q, unsigned int mode)
++{
++	struct mt6897_venc_encode message;
++	int ret;
++	mutex_lock(&q->rx_lock);
++	ret = mtk_vcp_venc_frames_prepare(q->frames, mode, q->instance,
++					  lower_32_bits(q->cookie), &message);
++	if (!ret) {
++		dma_rmb();
++		dev_info(q->dev, "VENC ENCODE TX mode %u raw %*phN\n", mode,
++			 (int)sizeof(message), &message);
++		dev_info(
++			q->dev,
++			"VENC programmed instance %#llx output_cookie %#llx input_cookie %#llx bs_dma %#llx bs_addr %#llx general_fd %d general_size %u\n",
++			q->instance,
++			le64_to_cpu(READ_ONCE(*(__le64 *)(q->vsi + 2656))),
++			le64_to_cpu(READ_ONCE(*(__le64 *)(q->vsi + 2664))),
++			le64_to_cpu(READ_ONCE(*(__le64 *)(q->vsi + 2512))),
++			le64_to_cpu(READ_ONCE(*(__le64 *)(q->vsi + 2712))),
++			(s32)le32_to_cpu(READ_ONCE(*(__le32 *)(q->vsi + 2784))),
++			le32_to_cpu(READ_ONCE(*(__le32 *)(q->vsi + 2788))));
++	}
++	mutex_unlock(&q->rx_lock);
++	if (ret)
++		return ret;
++	ret = venc_send_wait(q, MT6897_VENC_ENCODE, &message, sizeof(message),
++			     5000);
++	if (!ret)
++		ret = mtk_vcp_venc_frames_wait(q->frames, 5000);
++	if (ret) {
++		mutex_lock(&q->rx_lock);
++		mtk_vcp_venc_frames_fail(q->frames, ret);
++		if (ret == -ETIMEDOUT) {
++			if (!q->broken)
++				q->error = ret;
++			q->broken = true;
++		}
++		mutex_unlock(&q->rx_lock);
++	}
++	return ret;
++}
++static int venc_frame_fault(struct mtk_vcp_venc *q)
++{
++	if (q->broken)
++		return q->error ?: -EIO;
++	return q->callback_error ?: mtk_vcp_venc_frames_error(q->frames);
++}
++static int venc_frames(struct mtk_vcp_venc *q, unsigned int count, bool force)
++{
++	struct mtk_vcp_mem memory;
++	size_t offset;
++	int ret;
++	mutex_lock(&q->rx_lock);
++	ret = mtk_vcp_get_mem(q->vcp, MTK_VCP_MEM_VENC, &memory);
++	if (!ret &&
++	    (!q->vsi ||
++	     !mt6897_venc_table_offset(q->instance, memory.dma, memory.size,
++				       MT6897_VENC_FRAME_EXTENT, &offset) ||
++	     q->vsi != memory.cpu + offset))
++		ret = -ERANGE;
++	if (!ret)
++		ret = mtk_vcp_venc_frames_begin(q->frames, q->vsi,
++						memory.size - offset, q->cookie,
++						q->result.sizeimage,
++						q->result.sync_mode);
++	mutex_unlock(&q->rx_lock);
++	if (!ret)
++		ret = venc_frame_command(q, 2);
++	if (!ret && count > 1) {
++		mutex_lock(&q->rx_lock);
++		ret = venc_frame_fault(q);
++		if (!ret)
++			ret = mtk_vcp_venc_frames_archive(q->frames);
++		mutex_unlock(&q->rx_lock);
++	}
++	for (unsigned int i = 0; !ret && i < count; i++) {
++		if (i) {
++			mutex_lock(&q->rx_lock);
++			ret = venc_frame_fault(q);
++			if (!ret)
++				ret = mtk_vcp_venc_frames_recycle(q->frames, i);
++			mutex_unlock(&q->rx_lock);
++		}
++		if (!ret && force && i == 2)
++			ret = venc_force_intra(q);
++		if (!ret) {
++			u64 started = ktime_get_ns();
++			ret = venc_frame_command(q, 3);
++			q->result.frame_latency_ns[i] =
++				ktime_get_ns() - started;
++		}
++		if (!ret && count > 1) {
++			mutex_lock(&q->rx_lock);
++			ret = venc_frame_fault(q);
++			if (!ret)
++				ret = mtk_vcp_venc_frames_archive(q->frames);
++			mutex_unlock(&q->rx_lock);
++		}
++	}
++	if (ret) {
++		mutex_lock(&q->rx_lock);
++		mtk_vcp_venc_frames_fail(q->frames, ret);
++		mutex_unlock(&q->rx_lock);
++	}
++	q->result.encode_result = ret;
++	if (!ret) {
++		ret = venc_frame_command(q, 4);
++		q->result.final_result = ret;
++	}
++	return ret;
++}
++struct mtk_vcp_venc *mtk_vcp_venc_create(struct device *dev,
++					 struct mtk_vcp *vcp)
++{
++	struct mtk_vcp_venc *q = kzalloc(sizeof(*q), GFP_KERNEL);
++	if (!q)
++		return ERR_PTR(-ENOMEM);
++	q->result.query_result = -ECANCELED;
++	q->result.init_result = q->result.deinit_result =
++		q->result.config_result = -ECANCELED;
++	q->result.hardware_result = q->result.shutdown_result = -ECANCELED;
++	q->result.encode_result = q->result.final_result = -ECANCELED;
++	q->result.force_result = -ECANCELED;
++	q->frames = mtk_vcp_venc_frames_create(dev, vcp);
++	if (!q->frames) {
++		kfree(q);
++		return ERR_PTR(-ENOMEM);
++	}
++	q->dev = dev;
++	q->vcp = vcp;
++	mutex_init(&q->trial_lock);
++	mutex_init(&q->rx_lock);
++	init_completion(&q->reply);
++	INIT_LIST_HEAD(&q->allocations);
++	return q;
++}
++static int venc_run(struct mtk_vcp_venc *q, struct mtk_vcp_venc_hw *hw,
++		    unsigned int codec, bool configure, unsigned int frames,
++		    bool force)
++{
++	bool boot_attempted = false;
++	int ret, stop = 0;
++	unsigned int i, j;
++	mutex_lock(&q->trial_lock);
++	if (q->retained || q->suspended || q->stream_owner) {
++		ret = -EBUSY;
++		goto out;
++	}
++	memset(&q->result, 0, sizeof(q->result));
++	q->result.query_result = -ECANCELED;
++	q->result.init_result = q->result.deinit_result =
++		q->result.config_result = -ECANCELED;
++	q->result.hardware_result = q->result.shutdown_result = -ECANCELED;
++	q->result.encode_result = q->result.final_result = -ECANCELED;
++	q->result.force_result = -ECANCELED;
++	q->hw = hw;
++	q->frame_trial = frames;
++	if (frames) {
++		ret = mtk_vcp_venc_frames_reset(q->frames);
++		if (ret) {
++			q->retained = q->result.retained = true;
++			__module_get(THIS_MODULE);
++			goto result;
++		}
++	}
++	q->codec = codec;
++	q->init_trial = !!hw;
++	q->instance = 0;
++	q->vsi = NULL;
++	ret = mtk_vcp_claim(q->vcp, q);
++	if (ret)
++		goto result;
++	q->cookie = atomic64_inc_return(&venc_cookie);
++	q->error = q->callback_error = 0;
++	q->pending = q->broken = q->force_pending = false;
++	ret = mtk_vcp_ipi_register(q->vcp, MTK_VCP_ENCODER, venc_receive, q);
++	if (ret)
++		goto release;
++	q->registered = true;
++	/* An unknown shutdown must retain code, listener, owner and context. */
++	__module_get(THIS_MODULE);
++	boot_attempted = true;
++	ret = mtk_vcp_boot(q->vcp);
++	if (!ret && q->init_trial) {
++		ret = venc_command(q, MT6897_VENC_INIT);
++		q->result.init_result = ret;
++		if (!ret && configure) {
++			ret = venc_configure(q);
++			q->result.config_result = ret;
++		}
++		if (!ret && frames)
++			ret = venc_frames(q, frames, force);
++		if (venc_can_deinit(q)) {
++			q->result.deinit_result =
++				venc_command(q, MT6897_VENC_DEINIT);
++			ret = ret ?: q->result.deinit_result;
++		}
++	}
++	if (!ret && !q->init_trial)
++		ret = venc_query_table(q, 0, q->result.formats,
++				       sizeof(q->result.formats));
++	if (!ret && !q->init_trial) {
++		q->result.copied_tables = 1;
++		ret = venc_query_table(q, 1, q->result.sizes,
++				       sizeof(q->result.sizes));
++		if (!ret)
++			q->result.copied_tables = 2;
++	}
++	if (!ret && !q->init_trial)
++		for (i = 0; i < MT6897_VENC_CAPS; i++)
++			if (!mt6897_venc_format_valid(&q->result.formats[i]) ||
++			    !mt6897_venc_framesize_valid(&q->result.sizes[i])) {
++				ret = -EPROTO;
++				break;
++			}
++	if (!ret && !q->init_trial) {
++		for (i = 0; i < MT6897_VENC_CAPS; i++) {
++			if (!q->result.formats[i].fourcc ||
++			    le32_to_cpu(q->result.formats[i].type) != 1)
++				continue;
++			for (j = 0; j < MT6897_VENC_CAPS; j++)
++				if (q->result.sizes[j].fourcc ==
++				    q->result.formats[i].fourcc) {
++					q->result.usable_formats++;
++					break;
++				}
++		}
++		if (!q->result.usable_formats)
++			ret = -ENODATA;
++	}
++	if (boot_attempted && !mtk_vcp_is_offline(q->vcp))
++		stop = mtk_vcp_shutdown(q->vcp);
++	q->result.shutdown_result = stop;
++	if (!mtk_vcp_is_offline(q->vcp)) {
++		q->retained = q->result.retained = true;
++		dev_err(q->dev,
++			"encoder QUERY shutdown uncertain: %d; retaining transport until reboot\n",
++			stop);
++		ret = ret ?: stop ?: -EIO;
++		goto result;
++	}
++	if (q->hw) {
++		q->result.hardware_result = mtk_vcp_venc_hw_stop(q->hw);
++		if (q->result.hardware_result) {
++			q->retained = q->result.retained = true;
++			ret = ret ?: q->result.hardware_result;
++			goto result;
++		}
++	}
++	mtk_vcp_ipi_unregister(q->vcp, MTK_VCP_ENCODER);
++	q->registered = false;
++	/* Reserved VENC memory has been released by confirmed shutdown. */
++	q->vsi = NULL;
++	mtk_vcp_venc_frames_invalidate(q->frames);
++	if (frames) {
++		int finish = mtk_vcp_venc_frames_finish(q->frames);
++		ret = ret ?: finish;
++	}
++	venc_free_allocations(q);
++	mutex_lock(&q->rx_lock);
++	ret = ret ?: q->error ?: q->callback_error ?: stop;
++	mutex_unlock(&q->rx_lock);
++	module_put(THIS_MODULE);
++release:
++	mtk_vcp_release(q->vcp, q);
++result:
++	q->result.query_result = ret;
++	q->result.complete = !ret && !stop;
++out:
++	mutex_unlock(&q->trial_lock);
++	return ret;
++}
++int mtk_vcp_venc_query_run(struct mtk_vcp_venc *q)
++{
++	return venc_run(q, NULL, 0, false, false, false);
++}
++int mtk_vcp_venc_init_run(struct mtk_vcp_venc *q, struct mtk_vcp_venc_hw *hw,
++			  unsigned int codec)
++{
++	if (!hw || (codec != 13 && codec != 14))
++		return -EINVAL;
++	return venc_run(q, hw, codec, false, false, false);
++}
++int mtk_vcp_venc_config_run(struct mtk_vcp_venc *q, struct mtk_vcp_venc_hw *hw,
++			    unsigned int codec)
++{
++	if (!hw || (codec != 13 && codec != 14))
++		return -EINVAL;
++	return venc_run(q, hw, codec, true, false, false);
++}
++int mtk_vcp_venc_frame_run(struct mtk_vcp_venc *q, struct mtk_vcp_venc_hw *hw,
++			   unsigned int codec)
++{
++	if (!hw || (codec != 13 && codec != 14))
++		return -EINVAL;
++	return venc_run(q, hw, codec, true, true, false);
++}
++int mtk_vcp_venc_sequence_run(struct mtk_vcp_venc *q,
++			      struct mtk_vcp_venc_hw *hw)
++{
++	if (!hw)
++		return -EINVAL;
++	return venc_run(q, hw, 13, true, 4, false);
++}
++int mtk_vcp_venc_force_run(struct mtk_vcp_venc *q,
++			   struct mtk_vcp_venc_hw *hw)
++{
++	if (!hw)
++		return -EINVAL;
++	return venc_run(q, hw, 13, true, 4, true);
++}
++/* Terminal only: drain/START never invoke this path. VCP and hardware must
++ * independently be quiescent before any private DMA or ownership is released.
++ * A protocol fault remains visible even when safe reclamation succeeds. */
++static int venc_stream_end_locked(struct mtk_vcp_venc *q)
++{
++	int ret = q->result.encode_result, stop;
++
++	if (!q->stream_owner)
++		return 0;
++	if (q->stream_submitted && !venc_frame_fault(q)) {
++		q->result.final_result = venc_frame_command(q, 4);
++		ret = ret ?: q->result.final_result;
++	}
++	mutex_lock(&q->rx_lock);
++	q->closing = true;
++	mutex_unlock(&q->rx_lock);
++	if (venc_can_deinit(q)) {
++		q->result.deinit_result = venc_command(q, MT6897_VENC_DEINIT);
++		ret = ret ?: q->result.deinit_result;
++	}
++	stop = mtk_vcp_is_offline(q->vcp) ? 0 : mtk_vcp_shutdown(q->vcp);
++	q->result.shutdown_result = stop;
++	if (!mtk_vcp_is_offline(q->vcp)) {
++		ret = ret ?: stop ?: -EIO;
++		goto retain;
++	}
++	q->result.hardware_result = mtk_vcp_venc_hw_stop(q->hw);
++	if (q->result.hardware_result) {
++		ret = ret ?: q->result.hardware_result;
++		goto retain;
++	}
++	if (q->registered)
++		mtk_vcp_ipi_unregister(q->vcp, MTK_VCP_ENCODER);
++	q->registered = false;
++	q->vsi = NULL;
++	mtk_vcp_venc_frames_invalidate(q->frames);
++	{
++		int finish = mtk_vcp_venc_frames_finish(q->frames);
++
++		ret = ret ?: finish;
++	}
++	venc_free_allocations(q);
++	mutex_lock(&q->rx_lock);
++	ret = ret ?: q->error ?: q->callback_error ?: stop;
++	q->closing = false;
++	mutex_unlock(&q->rx_lock);
++	mtk_vcp_release(q->vcp, q);
++	module_put(THIS_MODULE);
++	kvfree(q->stream_header);
++	q->stream_header = NULL;
++	q->stream_header_bytes = 0;
++	q->stream_owner = NULL;
++	q->result.query_result = ret;
++	q->result.complete = !ret;
++	if (ret)
++		dev_err(q->dev, "VENC stream ended with protocol error %d; hardware quiesced, owned DMA reclaimed\n", ret);
++	return ret;
++retain:
++	q->retained = q->result.retained = true;
++	q->result.query_result = ret;
++	q->result.complete = false;
++	/* No frontend memory is referenced by callbacks: the retained singleton
++	 * and its module hold keep transport/listener/code/private DMA alive. */
++	dev_err(q->dev, "VENC stream shutdown uncertain %d; retaining owner and DMA until reboot\n", ret);
++	return ret;
++}
++static bool venc_stream_level_valid(const struct mtk_vcp_venc_config *c)
++{
++	static const u32 hevc_main[] = {2, 8, 10, 13, 15, 18, 20, 23, 25, 27};
++	unsigned int i;
++
++	/* Firmware H264 capability is V4L2 level enum 16 (5.2). HEVC uses
++	 * translated wire values; expose Main tier only through 5.2. */
++	if (c->codec == 13)
++		return c->level <= 16;
++	for (i = 0; i < ARRAY_SIZE(hevc_main); i++)
++		if (c->level == hevc_main[i])
++			return true;
++	return false;
++}
++int mtk_vcp_venc_stream_start(struct mtk_vcp_venc *q,
++		struct mtk_vcp_venc_hw *hw, void *owner,
++		const struct mtk_vcp_venc_config *c)
++{
++	struct mtk_vcp_mem memory;
++	size_t offset;
++	bool key;
++	int ret;
++
++	if (!owner || !hw || !c || (c->codec != 13 && c->codec != 14) ||
++	    !venc_stream_level_valid(c) ||
++	    (c->codec == 13 ? (c->profile != 0 && c->profile != 2) :
++			      c->profile != 1) ||
++	    !mt6897_venc_geometry(c->codec, c->width, c->height) ||
++	    c->stride < c->width || c->stride > 4096 || (c->stride & 15) ||
++	    c->storage_height < c->height || c->storage_height > 4096 ||
++	    (c->storage_height & 7) || c->stride * c->storage_height > 4096 * 2176 ||
++	    !c->fps || c->fps > 240 || !c->bitrate || c->bitrate > 400000000 ||
++	    !c->gop || c->gop > 65535 || c->capacity > SZ_16M ||
++	    c->capacity < c->stride * c->storage_height * 3 / 2 + SZ_64K)
++		return -EINVAL;
++	mutex_lock(&q->trial_lock);
++	if (q->retained || q->suspended || q->stream_owner) {
++		ret = -EBUSY;
++		goto out;
++	}
++	ret = mtk_vcp_venc_frames_reset(q->frames);
++	if (ret)
++		goto out;
++	ret = mtk_vcp_claim(q->vcp, q);
++	if (ret)
++		goto out;
++	memset(&q->result, 0, sizeof(q->result));
++	q->result.deinit_result = q->result.final_result = -ECANCELED;
++	q->result.force_result = -ECANCELED;
++	q->hw = hw;
++	q->stream_owner = owner;
++	q->stream_config = *c;
++	q->stream_submitted = q->closing = q->force_pending = false;
++	q->cookie = atomic64_inc_return(&venc_cookie);
++	q->codec = c->codec;
++	q->init_trial = q->frame_trial = true;
++	q->instance = 0;
++	q->vsi = NULL;
++	q->error = q->callback_error = 0;
++	q->pending = q->broken = false;
++	ret = mtk_vcp_ipi_register(q->vcp, MTK_VCP_ENCODER, venc_receive, q);
++	if (ret) {
++		q->stream_owner = NULL;
++		mtk_vcp_release(q->vcp, q);
++		goto out;
++	}
++	q->registered = true;
++	__module_get(THIS_MODULE);
++	ret = mtk_vcp_boot(q->vcp);
++	if (!ret) {
++		ret = venc_command(q, MT6897_VENC_INIT);
++		q->result.init_result = ret;
++	}
++	if (!ret) {
++		ret = venc_configure(q);
++		q->result.config_result = ret;
++	}
++	if (!ret) {
++		mutex_lock(&q->rx_lock);
++		ret = venc_frame_fault(q);
++		if (!ret)
++			ret = mtk_vcp_get_mem(q->vcp, MTK_VCP_MEM_VENC, &memory);
++		if (!ret && (!mt6897_venc_table_offset(q->instance, memory.dma,
++			memory.size, MT6897_VENC_FRAME_EXTENT, &offset) ||
++			q->vsi != memory.cpu + offset))
++			ret = -ERANGE;
++		if (!ret)
++			ret = mtk_vcp_venc_frames_stream_begin(q->frames, q->vsi,
++				memory.size - offset, q->cookie, q->result.sizeimage,
++				q->result.sync_mode, c->stride, c->storage_height,
++				c->capacity);
++		mutex_unlock(&q->rx_lock);
++	}
++	if (!ret) {
++		q->stream_header = kvmalloc(c->capacity, GFP_KERNEL);
++		if (!q->stream_header)
++			ret = -ENOMEM;
++	}
++	if (!ret)
++		ret = venc_frame_command(q, 2);
++	if (!ret) {
++		mutex_lock(&q->rx_lock);
++		ret = mtk_vcp_venc_frames_take(q->frames, q->stream_header,
++			c->capacity, &q->stream_header_bytes, &key);
++		mutex_unlock(&q->rx_lock);
++	}
++	if (ret) {
++		q->result.encode_result = ret;
++		venc_stream_end_locked(q);
++	}
++out:
++	mutex_unlock(&q->trial_lock);
++	return ret;
++}
++int mtk_vcp_venc_stream_submit(struct mtk_vcp_venc *q, void *owner,
++		const void *input, size_t size, u64 timestamp, bool force,
++		void *output, size_t capacity, size_t *bytes, bool *key)
++{
++	size_t header;
++	int ret;
++
++	mutex_lock(&q->trial_lock);
++	if (q->retained || q->stream_owner != owner || q->closing) {
++		ret = -EBUSY;
++		goto out;
++	}
++	header = q->stream_submitted ? 0 : q->stream_header_bytes;
++	if (!output || capacity < q->stream_config.capacity || header >= capacity) {
++		ret = -ENOSPC;
++		goto out;
++	}
++	mutex_lock(&q->rx_lock);
++	ret = venc_frame_fault(q);
++	if (!ret)
++		ret = mtk_vcp_venc_frames_input(q->frames, input, size, timestamp);
++	mutex_unlock(&q->rx_lock);
++	if (!ret && force)
++		ret = venc_force_intra(q);
++	if (!ret)
++		ret = venc_frame_command(q, 3);
++	if (!ret) {
++		mutex_lock(&q->rx_lock);
++		ret = mtk_vcp_venc_frames_take(q->frames, output + header,
++			capacity - header, bytes, key);
++		mutex_unlock(&q->rx_lock);
++	}
++	if (!ret) {
++		if (header)
++			memcpy(output, q->stream_header, header);
++		*bytes += header;
++		q->stream_submitted = true;
++	}
++	q->result.encode_result = ret;
++out:
++	mutex_unlock(&q->trial_lock);
++	return ret;
++}
++int mtk_vcp_venc_stream_end(struct mtk_vcp_venc *q, void *owner)
++{
++	int ret;
++
++	mutex_lock(&q->trial_lock);
++	ret = q->retained ? -EBUSY :
++		(q->stream_owner == owner ? venc_stream_end_locked(q) : 0);
++	mutex_unlock(&q->trial_lock);
++	return ret;
++}
++int mtk_vcp_venc_bitstream_copy(struct mtk_vcp_venc *q, void **data,
++				size_t *size)
++{
++	int ret;
++	mutex_lock(&q->trial_lock);
++	ret = q->frame_trial ? mtk_vcp_venc_frames_copy(q->frames, data, size) :
++			       -ENODATA;
++	mutex_unlock(&q->trial_lock);
++	return ret;
++}
++void mtk_vcp_venc_get_result(struct mtk_vcp_venc *q,
++			     struct mtk_vcp_venc_result *result)
++{
++	mutex_lock(&q->trial_lock);
++	mutex_lock(&q->rx_lock);
++	*result = q->result;
++	if (q->frame_trial)
++		mtk_vcp_venc_frames_result(q->frames, &result->frame);
++	mutex_unlock(&q->rx_lock);
++	mutex_unlock(&q->trial_lock);
++}
++/* Caller removes the diagnostic entry point and joins its users first. */
++bool mtk_vcp_venc_destroy(struct mtk_vcp_venc *q)
++{
++	bool safe;
++	mutex_lock(&q->trial_lock);
++	safe = !q->retained && !q->registered;
++	mutex_unlock(&q->trial_lock);
++	if (safe) {
++		mtk_vcp_venc_frames_destroy(q->frames);
++		kfree(q);
++	}
++	return safe;
++}
++
++int mtk_vcp_venc_suspend(struct mtk_vcp_venc *q, bool suspend)
++{
++	int ret = 0;
++	if (suspend) {
++		if (!mutex_trylock(&q->trial_lock))
++			return -EBUSY;
++	} else {
++		mutex_lock(&q->trial_lock);
++	}
++	if (q->retained || q->registered)
++		ret = -EBUSY;
++	else
++		q->suspended = suspend;
++	mutex_unlock(&q->trial_lock);
++	return ret;
++}
+diff --git a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc.h b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc.h
+new file mode 100644
+index 0000000000..9623feb5d3
+--- /dev/null
++++ b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc.h
+@@ -0,0 +1,69 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __MTK_VCP_VENC_H
++#define __MTK_VCP_VENC_H
++#include "mtk_vcp_venc_frames.h"
++struct device;
++struct mtk_vcp;
++struct mtk_vcp_venc;
++struct mtk_vcp_venc_hw;
++/* Private stream API. The opaque owner prevents another file from ending or
++ * submitting to the active firmware context. All methods serialize internally. */
++struct mtk_vcp_venc_config {
++	u32 codec, width, height, stride, storage_height;
++	u32 bitrate, gop, fps, level, profile, capacity;
++};
++/* HEVC larger than 1080p can request the firmware SMI timeout path. */
++static inline bool mt6897_venc_geometry(u32 codec, u32 width, u32 height)
++{
++	u32 axis = codec == 14 ? 1920 : 4096;
++	u64 pixels = codec == 14 ? 1920 * 1080 : 4096 * 2176;
++
++	return (codec == 13 || codec == 14) && width >= 160 && height >= 128 &&
++	       !(width & 1) && !(height & 1) && width <= axis && height <= axis &&
++	       (u64)width * height <= pixels;
++}
++int mtk_vcp_venc_stream_start(struct mtk_vcp_venc *q,
++		struct mtk_vcp_venc_hw *hw, void *owner,
++		const struct mtk_vcp_venc_config *config);
++int mtk_vcp_venc_stream_submit(struct mtk_vcp_venc *q, void *owner,
++		const void *input, size_t size, u64 timestamp, bool force,
++		void *output, size_t capacity, size_t *bytes, bool *key);
++int mtk_vcp_venc_stream_end(struct mtk_vcp_venc *q, void *owner);
++struct mtk_vcp_venc_result {
++	struct mt6897_venc_format formats[MT6897_VENC_CAPS];
++	struct mt6897_venc_framesize sizes[MT6897_VENC_CAPS];
++	int query_result, shutdown_result, init_result, deinit_result,
++		hardware_result, config_result, encode_result, final_result, force_result;
++	u64 instance;
++	u32 sysram_enable, sizeimage[3], sync_mode, config_ack_bytes;
++	s32 config_status;
++	u8 config_tail[32], force_tail[32], encode_tail[16];
++	u32 force_ack_bytes;
++	s32 force_status;
++	u32 encode_ack_bytes;
++	struct mt6897_venc_frame_result frame;
++	unsigned int copied_tables, usable_formats;
++	u64 frame_latency_ns[4];
++	bool complete, retained;
++};
++struct mtk_vcp_venc *mtk_vcp_venc_create(struct device *dev,
++					 struct mtk_vcp *vcp);
++int mtk_vcp_venc_query_run(struct mtk_vcp_venc *query);
++/* Diagnostic INIT/DEINIT only; codec is the canonical encoder id 13 or 14. */
++int mtk_vcp_venc_init_run(struct mtk_vcp_venc *query,
++			  struct mtk_vcp_venc_hw *hw, unsigned int codec);
++int mtk_vcp_venc_config_run(struct mtk_vcp_venc *query,
++			    struct mtk_vcp_venc_hw *hw, unsigned int codec);
++int mtk_vcp_venc_frame_run(struct mtk_vcp_venc *query,
++			   struct mtk_vcp_venc_hw *hw, unsigned int codec);
++int mtk_vcp_venc_sequence_run(struct mtk_vcp_venc *query,
++			      struct mtk_vcp_venc_hw *hw);
++int mtk_vcp_venc_force_run(struct mtk_vcp_venc *query,
++			   struct mtk_vcp_venc_hw *hw);
++int mtk_vcp_venc_bitstream_copy(struct mtk_vcp_venc *query, void **data,
++				size_t *size);
++void mtk_vcp_venc_get_result(struct mtk_vcp_venc *query,
++			     struct mtk_vcp_venc_result *result);
++int mtk_vcp_venc_suspend(struct mtk_vcp_venc *query, bool suspend);
++bool mtk_vcp_venc_destroy(struct mtk_vcp_venc *query);
++#endif
+diff --git a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_drv.c b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_drv.c
+new file mode 100644
+index 0000000000..63d9da08f7
+--- /dev/null
++++ b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_drv.c
+@@ -0,0 +1,440 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* MT6897 stateful encoder consumer with explicit root diagnostics.
++ * Firmware remains idle until a streaming session or diagnostic starts. */
++#include <linux/capability.h>
++#include <linux/debugfs.h>
++#include <linux/dma-mapping.h>
++#include <linux/iommu.h>
++#include <linux/module.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++#include <linux/pm.h>
++#include <linux/remoteproc/mtk_vcp.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include "mtk_vcp_venc.h"
++#include "mtk_vcp_venc_hw.h"
++#include "mtk_vcp_venc_v4l2.h"
++struct venc_device {
++	struct mtk_vcp *vcp;
++	struct mtk_vcp_venc *client;
++	struct mtk_vcp_venc_hw *hw;
++	struct dentry *debugfs;
++	struct mtk_vcp_venc_video *video;
++};
++static ssize_t venc_trial_write(struct file *file, const char __user *buffer,
++				size_t count, bool configure)
++{
++	struct venc_device *d = file->private_data;
++	unsigned int value;
++	int ret;
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++	ret = kstrtouint_from_user(buffer, count, 0, &value);
++	if (ret)
++		return ret;
++	if (value == 1 && !configure)
++		ret = mtk_vcp_venc_query_run(d->client);
++	else if (value == 13 || value == 14)
++		ret = configure ?
++			      mtk_vcp_venc_config_run(d->client, d->hw, value) :
++			      mtk_vcp_venc_init_run(d->client, d->hw, value);
++	else
++		return -EINVAL;
++	return ret ?: count;
++}
++static ssize_t trial_write(struct file *file, const char __user *buffer,
++			   size_t count, loff_t *position)
++{
++	return venc_trial_write(file, buffer, count, false);
++}
++static ssize_t config_write(struct file *file, const char __user *buffer,
++			    size_t count, loff_t *position)
++{
++	return venc_trial_write(file, buffer, count, true);
++}
++static const struct file_operations config_ops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = config_write,
++	.llseek = noop_llseek,
++};
++static const struct file_operations trial_ops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = trial_write,
++	.llseek = noop_llseek,
++};
++static ssize_t frame_write(struct file *file, const char __user *buffer,
++			   size_t count, loff_t *position)
++{
++	struct venc_device *d = file->private_data;
++	unsigned int value;
++	int ret;
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++	ret = kstrtouint_from_user(buffer, count, 0, &value);
++	if (ret)
++		return ret;
++	if (value != 13 && value != 14)
++		return -EINVAL;
++	ret = mtk_vcp_venc_frame_run(d->client, d->hw, value);
++	return ret ?: count;
++}
++static const struct file_operations frame_ops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = frame_write,
++	.llseek = noop_llseek,
++};
++static ssize_t sequence_write(struct file *file, const char __user *buffer,
++			      size_t count, loff_t *position)
++{
++	struct venc_device *d = file->private_data;
++	unsigned int value;
++	int ret;
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++	ret = kstrtouint_from_user(buffer, count, 0, &value);
++	if (ret)
++		return ret;
++	if (value != 13)
++		return -EINVAL;
++	ret = mtk_vcp_venc_sequence_run(d->client, d->hw);
++	return ret ?: count;
++}
++static const struct file_operations sequence_ops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = sequence_write,
++	.llseek = noop_llseek,
++};
++/* Explicit four-picture H264 diagnostic; request force before picture 2. */
++static ssize_t force_write(struct file *file, const char __user *buffer,
++			   size_t count, loff_t *position)
++{
++	struct venc_device *d = file->private_data;
++	unsigned int value;
++	int ret;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++	ret = kstrtouint_from_user(buffer, count, 0, &value);
++	if (ret)
++		return ret;
++	if (value != 13)
++		return -EINVAL;
++	ret = mtk_vcp_venc_force_run(d->client, d->hw);
++	return ret ?: count;
++}
++static const struct file_operations force_ops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = force_write,
++	.llseek = noop_llseek,
++};
++struct venc_bitstream_view {
++	void *data;
++	size_t size;
++};
++static int bitstream_open(struct inode *inode, struct file *file)
++{
++	struct venc_device *d = inode->i_private;
++	struct venc_bitstream_view *view;
++	int ret;
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++	view = kzalloc(sizeof(*view), GFP_KERNEL);
++	if (!view)
++		return -ENOMEM;
++	ret = mtk_vcp_venc_bitstream_copy(d->client, &view->data, &view->size);
++	if (ret) {
++		kfree(view);
++		return ret;
++	}
++	file->private_data = view;
++	return 0;
++}
++static ssize_t bitstream_read(struct file *file, char __user *buffer,
++			      size_t count, loff_t *position)
++{
++	struct venc_bitstream_view *view = file->private_data;
++	return simple_read_from_buffer(buffer, count, position, view->data,
++				       view->size);
++}
++static int bitstream_release(struct inode *inode, struct file *file)
++{
++	struct venc_bitstream_view *view = file->private_data;
++	kvfree(view->data);
++	kfree(view);
++	return 0;
++}
++static const struct file_operations bitstream_ops = {
++	.owner = THIS_MODULE,
++	.open = bitstream_open,
++	.read = bitstream_read,
++	.release = bitstream_release,
++	.llseek = noop_llseek,
++};
++static int result_show(struct seq_file *s, void *unused)
++{
++	struct venc_device *d = s->private;
++	struct mtk_vcp_venc_result *caps;
++	unsigned int i;
++	caps = kzalloc(sizeof(*caps), GFP_KERNEL);
++	if (!caps)
++		return -ENOMEM;
++	mtk_vcp_venc_get_result(d->client, caps);
++	seq_printf(
++		s,
++		"result=%d init=%d deinit=%d shutdown=%d hardware=%d complete=%u retained=%u instance=%#llx sysram=%u tables=%u usable=%u\n",
++		caps->query_result, caps->init_result, caps->deinit_result,
++		caps->shutdown_result, caps->hardware_result, caps->complete,
++		caps->retained, caps->instance, caps->sysram_enable,
++		caps->copied_tables, caps->usable_formats);
++	seq_printf(
++		s,
++		"config=%d ack_bytes=%u status=%d sizes=%u/%u/%u sync=%u tail=%*phN\n",
++		caps->config_result, caps->config_ack_bytes,
++		caps->config_status, caps->sizeimage[0], caps->sizeimage[1],
++		caps->sizeimage[2], caps->sync_mode,
++		caps->config_ack_bytes >= 24 ?
++			(int)caps->config_ack_bytes - 24 :
++			0,
++		caps->config_tail);
++	seq_printf(s, "force=%d ack_bytes=%u status=%d tail=%*phN\n",
++		   caps->force_result, caps->force_ack_bytes, caps->force_status,
++		   caps->force_ack_bytes >= 24 ?
++			   (int)caps->force_ack_bytes - 24 : 0,
++		   caps->force_tail);
++	seq_printf(
++		s,
++		"encode=%d final=%d encode_ack_bytes=%u frame_error=%d mode=%u ACKs=%u PUTs=%u records=%u bytes=%u/%u flags=%#x/%#x snapshots=%u\n",
++		caps->encode_result, caps->final_result, caps->encode_ack_bytes,
++		caps->frame.error, caps->frame.mode,
++		caps->frame.acknowledgements, caps->frame.puts,
++		caps->frame.records, caps->frame.bytes[0], caps->frame.bytes[1],
++		caps->frame.flags[0], caps->frame.flags[1],
++		caps->frame.snapshots);
++	for (i = 0; i < min_t(unsigned int, caps->frame.snapshots, 16); i++)
++		seq_printf(s, "ring[%u] PUT=%u before=%u/%u/%u after=%u/%u\n",
++			   i, caps->frame.journal[i].from_put,
++			   caps->frame.journal[i].read,
++			   caps->frame.journal[i].write,
++			   caps->frame.journal[i].count,
++			   caps->frame.journal[i].new_read,
++			   caps->frame.journal[i].new_count);
++	for (i = 0; i < min_t(unsigned int, caps->frame.archived, 5); i++)
++		seq_printf(
++			s,
++			"sequence[%u] output=%#llx input=%#llx pts=%llu bytes=%u key=%u flags=%#x\n",
++			i, caps->frame.sequence[i].output,
++			caps->frame.sequence[i].input,
++			caps->frame.sequence[i].timestamp,
++			caps->frame.sequence[i].bytes,
++			caps->frame.sequence[i].key,
++			caps->frame.sequence[i].flags);
++	for (i = 0; i < 4; i++)
++		if (caps->frame_latency_ns[i])
++			seq_printf(s, "latency[%u]=%llu ns\n", i,
++				   caps->frame_latency_ns[i]);
++	for (i = 0; i < MT6897_VENC_CAPS; i++) {
++		struct mt6897_venc_format *f = &caps->formats[i];
++		struct mt6897_venc_framesize *z = &caps->sizes[i];
++		if (f->fourcc)
++			seq_printf(s, "format[%u]=%#x type=%u planes=%u\n", i,
++				   le32_to_cpu(f->fourcc), le32_to_cpu(f->type),
++				   le32_to_cpu(f->planes));
++		if (z->fourcc)
++			seq_printf(
++				s,
++				"size[%u]=%#x profile=%#x level=%#x %ux%u..%ux%u step=%ux%u\n",
++				i, le32_to_cpu(z->fourcc),
++				le32_to_cpu(z->profile), le32_to_cpu(z->level),
++				le32_to_cpu(z->min_width),
++				le32_to_cpu(z->min_height),
++				le32_to_cpu(z->max_width),
++				le32_to_cpu(z->max_height),
++				le32_to_cpu(z->step_width),
++				le32_to_cpu(z->step_height));
++	}
++	kfree(caps);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(result);
++static void venc_put_device(void *data)
++{
++	put_device(data);
++}
++static int venc_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *node;
++	struct platform_device *dma;
++	struct venc_device *d;
++	struct dentry *entry;
++	int ret;
++	d = devm_kzalloc(dev, sizeof(*d), GFP_KERNEL);
++	if (!d)
++		return -ENOMEM;
++	node = of_parse_phandle(dev->of_node, "mediatek,core0-dma", 0);
++	if (!node)
++		return -EINVAL;
++	dma = of_find_device_by_node(node);
++	of_node_put(node);
++	if (!dma)
++		return -EPROBE_DEFER;
++	ret = devm_add_action_or_reset(dev, venc_put_device, &dma->dev);
++	if (ret)
++		return ret;
++	if (!device_is_bound(&dma->dev))
++		return -EPROBE_DEFER;
++	d->vcp = mtk_vcp_get(dev);
++	if (IS_ERR(d->vcp))
++		return PTR_ERR(d->vcp);
++	d->hw = mtk_vcp_venc_hw_create(pdev, &dma->dev, d->vcp);
++	if (IS_ERR(d->hw)) {
++		ret = PTR_ERR(d->hw);
++		goto put_vcp;
++	}
++	d->client = mtk_vcp_venc_create(dev, d->vcp);
++	if (IS_ERR(d->client)) {
++		ret = PTR_ERR(d->client);
++		goto put_vcp;
++	}
++	platform_set_drvdata(pdev, d);
++	d->debugfs = debugfs_create_dir(dev_name(dev), NULL);
++	if (IS_ERR(d->debugfs)) {
++		ret = PTR_ERR(d->debugfs);
++		goto destroy;
++	}
++	entry = debugfs_create_file("trial", 0200, d->debugfs, d, &trial_ops);
++	if (IS_ERR(entry)) {
++		ret = PTR_ERR(entry);
++		goto remove_debugfs;
++	}
++	entry = debugfs_create_file("config_trial", 0200, d->debugfs, d,
++				    &config_ops);
++	if (IS_ERR(entry)) {
++		ret = PTR_ERR(entry);
++		goto remove_debugfs;
++	}
++	entry = debugfs_create_file("frame_trial", 0200, d->debugfs, d,
++				    &frame_ops);
++	if (IS_ERR(entry)) {
++		ret = PTR_ERR(entry);
++		goto remove_debugfs;
++	}
++	entry = debugfs_create_file("sequence_trial", 0200, d->debugfs, d,
++				    &sequence_ops);
++	if (IS_ERR(entry)) {
++		ret = PTR_ERR(entry);
++		goto remove_debugfs;
++	}
++	entry = debugfs_create_file("force_trial", 0200, d->debugfs, d,
++				    &force_ops);
++	if (IS_ERR(entry)) {
++		ret = PTR_ERR(entry);
++		goto remove_debugfs;
++	}
++	entry = debugfs_create_file("bitstream", 0400, d->debugfs, d,
++				    &bitstream_ops);
++	if (IS_ERR(entry)) {
++		ret = PTR_ERR(entry);
++		goto remove_debugfs;
++	}
++	entry = debugfs_create_file("result", 0400, d->debugfs, d,
++				    &result_fops);
++	if (IS_ERR(entry)) {
++		ret = PTR_ERR(entry);
++		goto remove_debugfs;
++	}
++	d->video = mtk_vcp_venc_video_register(dev, d->client, d->hw);
++	if (IS_ERR(d->video)) {
++		ret = PTR_ERR(d->video);
++		goto remove_debugfs;
++	}
++	return 0;
++remove_debugfs:
++	debugfs_remove_recursive(d->debugfs);
++destroy:
++	mtk_vcp_venc_destroy(d->client);
++put_vcp:
++	mtk_vcp_put(d->vcp);
++	return ret;
++}
++static void venc_remove(struct platform_device *pdev)
++{
++	struct venc_device *d = platform_get_drvdata(pdev);
++	mtk_vcp_venc_video_unregister(d->video);
++	debugfs_remove_recursive(d->debugfs);
++	/* Active files own the module; retained trials also hold it. Manual
++	 * unbind is suppressed, so neither can reach module removal. */
++	if (WARN_ON(!mtk_vcp_venc_destroy(d->client)))
++		return;
++	mtk_vcp_put(d->vcp);
++}
++static int venc_suspend(struct device *dev)
++{
++	struct venc_device *d = dev_get_drvdata(dev);
++	return mtk_vcp_venc_suspend(d->client, true);
++}
++static int venc_resume(struct device *dev)
++{
++	struct venc_device *d = dev_get_drvdata(dev);
++	return mtk_vcp_venc_suspend(d->client, false);
++}
++static DEFINE_SIMPLE_DEV_PM_OPS(venc_pm_ops, venc_suspend, venc_resume);
++static const struct of_device_id venc_match[] = {
++	{ .compatible = "mediatek,mt6897-vcodec-enc" },
++	{}
++};
++MODULE_DEVICE_TABLE(of, venc_match);
++static struct platform_driver venc_driver = {
++	.probe = venc_probe,
++	.remove = venc_remove,
++	.driver = { .name = "mtk-vcp-enc",
++		    .of_match_table = venc_match,
++		    .suppress_bind_attrs = true,
++		    .pm = pm_sleep_ptr(&venc_pm_ops) },
++};
++static int venc_dma_probe(struct platform_device *pdev)
++{
++	struct iommu_domain *domain = iommu_get_domain_for_dev(&pdev->dev);
++	if (!domain || !domain->geometry.force_aperture ||
++	    domain->geometry.aperture_start || !domain->geometry.aperture_end ||
++	    domain->geometry.aperture_end > DMA_BIT_MASK(32))
++		return -EINVAL;
++	return dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
++}
++static const struct of_device_id venc_dma_match[] = {
++	{ .compatible = "mediatek,mt6897-venc-core0-dma" },
++	{}
++};
++MODULE_DEVICE_TABLE(of, venc_dma_match);
++static struct platform_driver venc_dma_driver = {
++	.probe = venc_dma_probe,
++	.driver = { .name = "mtk-vcp-venc-dma",
++		    .of_match_table = venc_dma_match,
++		    .suppress_bind_attrs = true },
++};
++static int __init venc_init(void)
++{
++	int ret = platform_driver_register(&venc_dma_driver);
++	if (ret)
++		return ret;
++	ret = platform_driver_register(&venc_driver);
++	if (ret)
++		platform_driver_unregister(&venc_dma_driver);
++	return ret;
++}
++static void __exit venc_exit(void)
++{
++	platform_driver_unregister(&venc_driver);
++	platform_driver_unregister(&venc_dma_driver);
++}
++module_init(venc_init);
++module_exit(venc_exit);
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("MediaTek MT6897 VCP encoder diagnostic transport");
+diff --git a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_frames.c b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_frames.c
+new file mode 100644
+index 0000000000..0880dc6799
+--- /dev/null
++++ b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_frames.c
+@@ -0,0 +1,564 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Bounded encoder ownership follows the MediaTek host rendezvous contract:
++ * drain before PUT_DONE, or after matching synchronous/header ENCODE_DONE.
++ * AP serialization and DMA barriers do not prove firmware producer exclusion.
++ * Source: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec/venc/venc_vcp_if.c
++ */
++#include <linux/completion.h>
++#include <linux/device.h>
++#include <linux/dma-mapping.h>
++#include <linux/err.h>
++#include <linux/mm.h>
++#include <linux/slab.h>
++#include <linux/sizes.h>
++#include <linux/remoteproc/mtk_vcp.h>
++#include "mtk_vcp_venc_frames.h"
++struct mtk_vcp_venc_frames {
++	struct device *dev;
++	struct mtk_vcp *vcp;
++	void *vsi;
++	struct completion ready;
++	struct mtk_vcp_mem input[2], output[2];
++	struct mt6897_venc_owner owner[2];
++	struct mt6897_venc_snapshot snapshot;
++	struct mt6897_venc_frame_result result;
++	u64 generation, input_cookie;
++	bool sync, active, ack, put_pending, via_put[2], put_ok[2], done[2];
++	void *copy;
++	size_t copy_size, copy_capacity;
++	unsigned int frame_index;
++	u32 capacity, payload[2], width, height;
++	u64 timestamp;
++	bool production;
++	bool archived[2];
++};
++static int frame_buffer_alloc(struct mtk_vcp_venc_frames *f,
++			      struct mtk_vcp_mem *b, size_t size)
++{
++	if (!size || size > SZ_16M)
++		return -E2BIG;
++	b->size = PAGE_ALIGN(size);
++	b->cpu = dma_alloc_coherent(f->dev, b->size, &b->dma, GFP_KERNEL);
++	if (!b->cpu)
++		return -ENOMEM;
++	if (!mt6897_venc_normal_buffer(b->dma, b->size))
++		return -ERANGE;
++	return 0;
++}
++void mtk_vcp_venc_frames_fail(struct mtk_vcp_venc_frames *f, int error)
++{
++	if (!f->result.error)
++		f->result.error = error;
++	complete(&f->ready);
++}
++static void frame_maybe_ready(struct mtk_vcp_venc_frames *f)
++{
++	unsigned int slot = f->result.mode == 2 ? 0 : 1;
++	if (f->result.error || !f->ack || f->put_pending)
++		return;
++	if (f->result.mode != 4) {
++		if (!f->owner[slot].seen ||
++		    (f->via_put[slot] && !f->put_ok[slot]))
++			return;
++		f->done[slot] = true;
++	}
++	complete(&f->ready);
++}
++static int frame_drain(struct mtk_vcp_venc_frames *f, bool from_put)
++{
++	struct mt6897_venc_ring *ring;
++	struct mt6897_venc_snapshot *s = &f->snapshot;
++	u8 owner_index[MT6897_VENC_RING_LIMIT];
++	unsigned int i, event;
++	if (f->result.error)
++		return f->result.error;
++	if (!f->active || !f->vsi)
++		return -EPROTO;
++	event = f->production ? f->result.snapshots %
++		ARRAY_SIZE(f->result.journal) : f->result.snapshots;
++	if (event >= ARRAY_SIZE(f->result.journal))
++		return -E2BIG;
++	ring = f->vsi + 448;
++	dma_rmb();
++	s->read = le32_to_cpu(READ_ONCE(ring->read));
++	s->write = le32_to_cpu(READ_ONCE(ring->write));
++	s->count = le32_to_cpu(READ_ONCE(ring->count));
++	f->result.journal[event].read = s->read;
++	f->result.journal[event].write = s->write;
++	f->result.journal[event].count = s->count;
++	f->result.journal[event].new_read = s->read;
++	f->result.journal[event].new_count = s->count;
++	f->result.journal[event].from_put = from_put;
++	f->result.snapshots++;
++	if (s->read >= 64 || s->write >= 64 || s->count > 63)
++		return -EPROTO;
++	for (i = 0; i < s->count; i++) {
++		unsigned int at = (s->read + i) & 63;
++		s->record[i] = (struct mt6897_venc_record){
++			.output = le64_to_cpu(READ_ONCE(ring->output[at])),
++			.input = le64_to_cpu(READ_ONCE(ring->input[at])),
++			.bytes = le32_to_cpu(READ_ONCE(ring->bytes[at])),
++			.key = le32_to_cpu(READ_ONCE(ring->key[at])),
++			.last_slice =
++				le32_to_cpu(READ_ONCE(ring->last_slice[at])),
++			.flags = le32_to_cpu(READ_ONCE(ring->flags[at])),
++		};
++	}
++	if (!mt6897_venc_ring_valid(s, f->owner, owner_index))
++		return -EPROTO;
++	dma_rmb();
++	if (!mt6897_venc_ring_unchanged(s, le32_to_cpu(READ_ONCE(ring->read)),
++					le32_to_cpu(READ_ONCE(ring->write)),
++					le32_to_cpu(READ_ONCE(ring->count))))
++		return -EPROTO;
++	/* Whole snapshot validates before mutation. Decrement only validated
++  * records, checking the expected header before each bounded step. */
++	for (i = 0; i < s->count; i++) {
++		if (le32_to_cpu(READ_ONCE(ring->read)) !=
++			    ((s->read + i) & 63) ||
++		    le32_to_cpu(READ_ONCE(ring->write)) != s->write ||
++		    le32_to_cpu(READ_ONCE(ring->count)) != s->count - i)
++			return -EPROTO;
++		WRITE_ONCE(ring->read, cpu_to_le32((s->read + i + 1) & 63));
++		WRITE_ONCE(ring->count, cpu_to_le32(s->count - i - 1));
++		f->result.journal[event].new_read = (s->read + i + 1) & 63;
++		f->result.journal[event].new_count = s->count - i - 1;
++	}
++	dma_wmb();
++	for (i = 0; i < s->count; i++) {
++		unsigned int slot = owner_index[i];
++		f->owner[slot].seen = true;
++		f->via_put[slot] = from_put;
++		f->put_ok[slot] = !from_put;
++		f->result.record[slot] = s->record[i];
++		f->result.bytes[slot] = s->record[i].bytes;
++		f->result.flags[slot] = s->record[i].flags;
++		f->result.records++;
++	}
++
++	dev_dbg(f->dev,
++		"VENC ring mode %u PUT %u read/write/count %u/%u/%u records %u\n",
++		f->result.mode, from_put, s->read, s->write, s->count,
++		f->result.records);
++	return 0;
++}
++struct mtk_vcp_venc_frames *mtk_vcp_venc_frames_create(struct device *dev,
++						       struct mtk_vcp *vcp)
++{
++	struct mtk_vcp_venc_frames *f = kzalloc(sizeof(*f), GFP_KERNEL);
++	if (!f)
++		return NULL;
++	f->dev = dev;
++	f->vcp = vcp;
++	init_completion(&f->ready);
++	return f;
++}
++int mtk_vcp_venc_frames_reset(struct mtk_vcp_venc_frames *f)
++{
++	unsigned int i;
++	for (i = 0; i < 2; i++)
++		if (f->input[i].cpu || f->output[i].cpu)
++			return -EBUSY;
++	kvfree(f->copy);
++	f->copy = NULL;
++	f->copy_size = f->copy_capacity = 0;
++	f->frame_index = 0;
++	f->production = false;
++	memset(f->archived, 0, sizeof(f->archived));
++	memset(&f->result, 0, sizeof(f->result));
++	memset(f->owner, 0, sizeof(f->owner));
++	memset(f->done, 0, sizeof(f->done));
++	memset(f->via_put, 0, sizeof(f->via_put));
++	memset(f->put_ok, 0, sizeof(f->put_ok));
++	f->vsi = NULL;
++	f->active = false;
++	f->ack = f->put_pending = false;
++	return 0;
++}
++int mtk_vcp_venc_frames_begin(struct mtk_vcp_venc_frames *f, void *vsi,
++			      size_t extent, u64 generation, const u32 sizes[3],
++			      u32 sync_mode)
++{
++	size_t backing[2] = { 25600, 12800 };
++	unsigned int i, x, y;
++	int ret;
++	if (!vsi || extent < MT6897_VENC_FRAME_EXTENT || generation > U32_MAX ||
++	    !generation || sizes[2])
++		return -EINVAL;
++	for (i = 0; i < 2; i++)
++		if (f->input[i].cpu || f->output[i].cpu)
++			return -EBUSY;
++	if (!f->production) {
++		f->capacity = MT6897_VENC_OUTPUT_CAPACITY;
++		f->payload[0] = 20480;
++		f->payload[1] = 10240;
++	} else {
++		backing[0] = f->payload[0];
++		backing[1] = f->payload[1];
++	}
++	f->vsi = vsi;
++	f->generation = generation;
++	f->sync = !!sync_mode;
++	f->active = false;
++	f->input_cookie = (generation << 32) | 3;
++	for (i = 0; i < 2; i++) {
++		backing[i] = max(backing[i], (size_t)sizes[i]);
++		ret = frame_buffer_alloc(f, &f->input[i], backing[i]);
++		if (ret)
++			goto fail;
++		/* Stock compressed CAPTURE uses the VCP VIDEO_UP device. */
++		ret = mtk_vcp_alloc_workmem(
++			f->vcp,
++			PAGE_ALIGN(f->capacity + PAGE_SIZE),
++			&f->output[i]);
++		if (ret)
++			goto fail;
++		memset(f->output[i].cpu, 0, f->capacity);
++		memset(f->output[i].cpu + f->capacity, 0xa5,
++		       f->output[i].size - f->capacity);
++		f->owner[i].output = (generation << 32) | (i + 1);
++		f->owner[i].input = i ? f->input_cookie : 0;
++		f->owner[i].capacity = f->capacity;
++		dev_dbg(f->dev,
++			"VENC input %u DMA %pad backing %zu, output DMA %pad backing %zu capacity %u cookie %#llx\n",
++			i, &f->input[i].dma, f->input[i].size,
++			&f->output[i].dma, f->output[i].size,
++			f->capacity, f->owner[i].output);
++	}
++	if (f->production)
++		return 0;
++	memset(f->input[0].cpu, 16, f->input[0].size);
++	memset(f->input[1].cpu, 128, f->input[1].size);
++	for (y = 0; y < 128; y++)
++		for (x = 0; x < 160; x++)
++			((u8 *)f->input[0].cpu)[y * 160 + x] =
++				16 + ((x + 2 * y) % 220);
++	for (y = 0; y < 64; y++)
++		for (x = 0; x < 160; x += 2) {
++			((u8 *)f->input[1].cpu)[y * 160 + x] =
++				96 + ((x / 16) % 4) * 8;
++			((u8 *)f->input[1].cpu)[y * 160 + x + 1] =
++				112 + ((y / 16) % 4) * 8;
++		}
++	return 0;
++fail:
++	mtk_vcp_venc_frames_fail(f, ret);
++	return ret;
++}
++int mtk_vcp_venc_frames_prepare(struct mtk_vcp_venc_frames *f,
++				unsigned int mode, u64 instance, u32 context,
++				struct mt6897_venc_encode *message)
++{
++	unsigned int slot = mode == 2 ? 0 : 1;
++	u64 dma[2] = { f->input[0].dma, f->input[1].dma };
++	u32 *payload = f->payload;
++	if (f->result.error || !f->vsi ||
++	    (mode == 2 && (f->owner[0].active || f->done[0])) ||
++	    (mode == 3 && (!f->done[0] || f->owner[1].active)) ||
++	    (mode == 4 && (!f->done[1] || f->result.mode != 3)))
++		return f->result.error ?: -EINVAL;
++	if (!mt6897_venc_prepare_encode(
++		    f->vsi, MT6897_VENC_FRAME_EXTENT, message, instance,
++		    context, mode, mode == 4 ? 0 : f->output[slot].dma,
++		    mode == 4 ? 0 : f->capacity,
++		    mode == 4 ? 0 : f->owner[slot].output,
++		    mode == 3 ? f->input_cookie : 0, dma, payload,
++		    (f->production ? f->timestamp :
++		     ((u64)f->frame_index * 1000000000 / 30))))
++		return -EINVAL;
++	f->result.mode = mode;
++	f->ack = false;
++	f->put_pending = false;
++	f->active = true;
++	if (mode != 4)
++		f->owner[slot].active = true;
++	reinit_completion(&f->ready);
++	dma_wmb();
++	return 0;
++}
++/* The caller holds trial_lock and rx_lock, both mutexes. Firmware has
++ * returned this buffer via the validated record and successful rendezvous.
++ * Keep seen/cookies intact until the bounded private copy is complete. */
++int mtk_vcp_venc_frames_archive(struct mtk_vcp_venc_frames *f)
++{
++	unsigned int slot = f->result.mode == 2 ? 0 : 1;
++	unsigned int at = f->result.archived;
++	size_t bytes = f->result.bytes[slot];
++	if (f->result.error)
++		return f->result.error;
++	if ((f->result.mode != 2 && f->result.mode != 3) || !f->active ||
++	    !f->ack || f->put_pending || !f->done[slot] ||
++	    !f->owner[slot].seen || f->archived[slot] || at >= 5 ||
++	    (f->via_put[slot] && !f->put_ok[slot]) || !bytes ||
++	    bytes > MT6897_VENC_OUTPUT_CAPACITY ||
++	    f->copy_size > 5 * MT6897_VENC_OUTPUT_CAPACITY - bytes)
++		return -EPROTO;
++	dma_rmb();
++	if (memchr_inv(f->output[slot].cpu + MT6897_VENC_OUTPUT_CAPACITY, 0xa5,
++		       f->output[slot].size - MT6897_VENC_OUTPUT_CAPACITY))
++		return -EOVERFLOW;
++	if (!f->copy) {
++		f->copy_capacity = 5 * MT6897_VENC_OUTPUT_CAPACITY;
++		f->copy = kvmalloc(f->copy_capacity, GFP_KERNEL);
++		if (!f->copy)
++			return -ENOMEM;
++	}
++	memcpy(f->copy + f->copy_size, f->output[slot].cpu, bytes);
++	f->copy_size += bytes;
++	f->result.sequence[at].output = f->owner[slot].output;
++	f->result.sequence[at].input = f->owner[slot].input;
++	f->result.sequence[at].timestamp =
++		slot ? ((u64)f->frame_index * 1000000000 / 30) : 0;
++	f->result.sequence[at].bytes = bytes;
++	f->result.sequence[at].key = f->result.record[slot].key;
++	f->result.sequence[at].flags = f->result.flags[slot];
++	f->archived[slot] = true;
++	f->active = false;
++	f->result.archived++;
++	return 0;
++}
++int mtk_vcp_venc_frames_recycle(struct mtk_vcp_venc_frames *f,
++				unsigned int frame_index)
++{
++	unsigned int x, y;
++	if (f->result.error)
++		return f->result.error;
++	if (f->active || f->result.mode != 3 || !f->ack || f->put_pending ||
++	    !f->done[1] || !f->archived[1] || !f->owner[1].seen ||
++	    (f->via_put[1] && !f->put_ok[1]) ||
++	    frame_index != f->frame_index + 1 || frame_index >= 4)
++		return -EPROTO;
++	/* Previous ownership remains validated until this atomic AP transition.
++  * A late record with the old cookies cannot match the new generation slot. */
++	f->owner[1].output = (f->generation << 32) | (2 + 2 * frame_index);
++	f->input_cookie = (f->generation << 32) | (3 + 2 * frame_index);
++	f->owner[1].input = f->input_cookie;
++	f->owner[1].active = f->owner[1].seen = false;
++	f->done[1] = f->via_put[1] = f->put_ok[1] = f->archived[1] = false;
++	f->frame_index = frame_index;
++	memset(f->input[0].cpu, 16, f->input[0].size);
++	memset(f->input[1].cpu, 128, f->input[1].size);
++	for (y = 0; y < 128; y++)
++		for (x = 0; x < 160; x++)
++			((u8 *)f->input[0].cpu)[y * 160 + x] =
++				16 + ((x + 2 * y + 17 * frame_index) % 220);
++	for (y = 0; y < 64; y++)
++		for (x = 0; x < 160; x += 2) {
++			((u8 *)f->input[1].cpu)[y * 160 + x] =
++				96 + (((x / 16) + frame_index) % 4) * 8;
++			((u8 *)f->input[1].cpu)[y * 160 + x + 1] =
++				112 + (((y / 16) + frame_index) % 4) * 8;
++		}
++	memset(f->output[1].cpu, 0, MT6897_VENC_OUTPUT_CAPACITY);
++	dma_wmb();
++	return 0;
++}
++/* Streaming buffers remain private to the engine. Each returned AU is copied
++ * only after the same ACK/PUT rendezvous and guard checks as diagnostics. */
++int mtk_vcp_venc_frames_stream_begin(struct mtk_vcp_venc_frames *f, void *vsi,
++		size_t extent, u64 generation, const u32 sizes[3], u32 sync,
++		u32 stride, u32 height, u32 capacity)
++{
++	if (!stride || !height || (height & 1) || stride > 4096 ||
++	    height > 4096 || stride * height > 4096 * 2176 ||
++	    capacity > SZ_16M || capacity < 65536)
++		return -EINVAL;
++	f->production = true;
++	f->width = stride;
++	f->height = height;
++	f->payload[0] = stride * height;
++	f->payload[1] = f->payload[0] / 2;
++	f->capacity = capacity;
++	return mtk_vcp_venc_frames_begin(f, vsi, extent, generation, sizes, sync);
++}
++int mtk_vcp_venc_frames_input(struct mtk_vcp_venc_frames *f,
++			    const void *data, size_t bytes, u64 timestamp)
++{
++	size_t y = f->payload[0], uv = f->payload[1];
++
++	if (!f->production || !data || bytes < y + uv || f->active ||
++	    f->result.error || f->frame_index >= (U32_MAX - 3) / 2)
++		return f->result.error ?: -EINVAL;
++	if (f->owner[1].active) {
++		if (!f->done[1] || !f->archived[1] || !f->owner[1].seen ||
++		    !f->ack || f->put_pending ||
++		    (f->via_put[1] && !f->put_ok[1]))
++			return -EPROTO;
++		f->frame_index++;
++	}
++	f->owner[1].output = (f->generation << 32) | (2 + 2 * f->frame_index);
++	f->input_cookie = (f->generation << 32) | (3 + 2 * f->frame_index);
++	f->owner[1].input = f->input_cookie;
++	f->owner[1].active = f->owner[1].seen = false;
++	f->done[1] = f->via_put[1] = f->put_ok[1] = f->archived[1] = false;
++	memset(f->input[0].cpu, 16, f->input[0].size);
++	memset(f->input[1].cpu, 128, f->input[1].size);
++	memcpy(f->input[0].cpu, data, y);
++	memcpy(f->input[1].cpu, data + y, uv);
++	memset(f->output[1].cpu, 0, f->capacity);
++	f->timestamp = timestamp;
++	dma_wmb();
++	return 0;
++}
++int mtk_vcp_venc_frames_take(struct mtk_vcp_venc_frames *f, void *data,
++			   size_t capacity, size_t *bytes, bool *key)
++{
++	unsigned int slot = f->result.mode == 2 ? 0 : 1;
++	size_t size = f->result.bytes[slot];
++
++	if (!f->production || f->result.error || !data || !f->active ||
++	    (f->result.mode != 2 && f->result.mode != 3) || !f->ack ||
++	    f->put_pending || !f->done[slot] || !f->owner[slot].seen ||
++	    f->archived[slot] || (f->via_put[slot] && !f->put_ok[slot]) ||
++	    !size || size > f->capacity) {
++		mtk_vcp_venc_frames_fail(f, f->result.error ?: -EPROTO);
++		return f->result.error;
++	}
++	dma_rmb();
++	if (memchr_inv(f->output[slot].cpu + f->capacity, 0xa5,
++		       f->output[slot].size - f->capacity)) {
++		mtk_vcp_venc_frames_fail(f, -EOVERFLOW);
++		return -EOVERFLOW;
++	}
++	if (size > capacity)
++		return -ENOSPC;
++	memcpy(data, f->output[slot].cpu, size);
++	*bytes = size;
++	*key = !!f->result.record[slot].key;
++	f->archived[slot] = true;
++	f->active = false;
++	return 0;
++}
++int mtk_vcp_venc_frames_ack(struct mtk_vcp_venc_frames *f, int status)
++{
++	int ret = status;
++	if (f->result.error)
++		return f->result.error;
++	if (!f->active)
++		ret = -EPROTO;
++	f->result.acknowledgements++;
++	if (!ret && (f->sync || f->result.mode == 2 || f->result.mode == 4))
++		ret = frame_drain(f, false);
++	if (ret) {
++		mtk_vcp_venc_frames_fail(f, ret);
++		return ret;
++	}
++	f->ack = true;
++	frame_maybe_ready(f);
++	return 0;
++}
++int mtk_vcp_venc_frames_put(struct mtk_vcp_venc_frames *f)
++{
++	int ret;
++	if (f->result.error)
++		return f->result.error;
++	f->result.puts++;
++	f->put_pending = true;
++	ret = frame_drain(f, true);
++	if (ret)
++		mtk_vcp_venc_frames_fail(f, ret);
++	return ret;
++}
++void mtk_vcp_venc_frames_put_done(struct mtk_vcp_venc_frames *f, int status)
++{
++	unsigned int i;
++	if (f->result.error)
++		return;
++	if (status) {
++		mtk_vcp_venc_frames_fail(f, status);
++		return;
++	}
++	f->put_pending = false;
++	for (i = 0; i < 2; i++)
++		if (f->via_put[i] && f->owner[i].seen)
++			f->put_ok[i] = true;
++	frame_maybe_ready(f);
++}
++int mtk_vcp_venc_frames_wait(struct mtk_vcp_venc_frames *f,
++			     unsigned int timeout_ms)
++{
++	if (!wait_for_completion_timeout(&f->ready,
++					 msecs_to_jiffies(timeout_ms)))
++		return -ETIMEDOUT;
++	return READ_ONCE(f->result.error);
++}
++void mtk_vcp_venc_frames_invalidate(struct mtk_vcp_venc_frames *f)
++{
++	f->active = false;
++	f->vsi = NULL;
++}
++int mtk_vcp_venc_frames_finish(struct mtk_vcp_venc_frames *f)
++{
++	unsigned int i;
++	size_t total = 0, offset = 0;
++	int ret = 0;
++	/* Only private completion metadata is used after terminal shutdown. */
++	dma_rmb();
++	for (i = 0; i < 2; i++) {
++		if (f->output[i].cpu &&
++		    memchr_inv(f->output[i].cpu + f->capacity,
++			       0xa5,
++			       f->output[i].size - f->capacity))
++			ret = -EOVERFLOW;
++		if (f->done[i] && f->output[i].cpu && !f->archived[i])
++			total += f->result.bytes[i];
++	}
++	if (total && !f->copy_size && !f->production) {
++		f->copy = kvmalloc(total, GFP_KERNEL);
++		if (!f->copy)
++			ret = ret ?: -ENOMEM;
++		else {
++			for (i = 0; i < 2; i++)
++				if (f->done[i] && !f->archived[i]) {
++					memcpy(f->copy + offset,
++					       f->output[i].cpu,
++					       f->result.bytes[i]);
++					offset += f->result.bytes[i];
++				}
++			f->copy_size = total;
++		}
++	}
++	for (i = 0; i < 2; i++) {
++		if (f->input[i].cpu)
++			dma_free_coherent(f->dev, f->input[i].size,
++					  f->input[i].cpu, f->input[i].dma);
++		if (f->output[i].cpu)
++			mtk_vcp_free_workmem(f->vcp, &f->output[i]);
++		memset(&f->input[i], 0, sizeof(f->input[i]));
++		memset(&f->output[i], 0, sizeof(f->output[i]));
++	}
++	if (ret)
++		mtk_vcp_venc_frames_fail(f, ret);
++	return ret;
++}
++int mtk_vcp_venc_frames_error(struct mtk_vcp_venc_frames *f)
++{
++	return f->result.error;
++}
++void mtk_vcp_venc_frames_result(struct mtk_vcp_venc_frames *f,
++				struct mt6897_venc_frame_result *result)
++{
++	*result = f->result;
++}
++int mtk_vcp_venc_frames_copy(struct mtk_vcp_venc_frames *f, void **data,
++			     size_t *size)
++{
++	if (!f->copy_size)
++		return -ENODATA;
++	*data = kvmalloc(f->copy_size, GFP_KERNEL);
++	if (!*data)
++		return -ENOMEM;
++	memcpy(*data, f->copy, f->copy_size);
++	*size = f->copy_size;
++	return 0;
++}
++void mtk_vcp_venc_frames_destroy(struct mtk_vcp_venc_frames *f)
++{
++	if (!f)
++		return;
++	if (WARN_ON(f->input[0].cpu || f->input[1].cpu || f->output[0].cpu ||
++		    f->output[1].cpu))
++		return;
++	kvfree(f->copy);
++	kfree(f);
++}
+diff --git a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_frames.h b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_frames.h
+new file mode 100644
+index 0000000000..ed6478f66b
+--- /dev/null
++++ b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_frames.h
+@@ -0,0 +1,206 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __MTK_VCP_VENC_FRAMES_H
++#define __MTK_VCP_VENC_FRAMES_H
++/* Wire/ring offsets adapted from MediaTek venc_ipi_msg.h and shipping MT6897
++ * venc_vcp_if.c. Original authors/provenance are retained in the ABI header.
++ * https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec/venc_ipi_msg.h
++ */
++#include "mtk_vcp_venc_mt6897_abi.h"
++#include <linux/remoteproc/mtk_vcp_memory.h>
++#define MT6897_VENC_ENCODE 0x1002
++#define MT6897_VENC_ENCODE_DONE 0x2002
++#define MT6897_VENC_FRAME_EXTENT 2792
++#define MT6897_VENC_RING_SLOTS 64
++#define MT6897_VENC_RING_LIMIT 63
++#define MT6897_VENC_OUTPUT_CAPACITY 0x100000
++struct mt6897_venc_encode {
++	__le32 id, ctx;
++	__le64 instance;
++	__le32 input_size[3], capacity, offset[3];
++	u8 planes, mode;
++	__le16 reserved;
++	__le32 reserved2[2];
++};
++struct mt6897_venc_ring {
++	__le64 output[64], input[64];
++	__le32 bytes[64], key[64], read, write, count, reserved;
++	__le32 last_slice[64], flags[64];
++};
++static_assert(sizeof(struct mt6897_venc_encode) == 56);
++static_assert(offsetof(struct mt6897_venc_encode, input_size) == 16);
++static_assert(offsetof(struct mt6897_venc_encode, capacity) == 28);
++static_assert(offsetof(struct mt6897_venc_encode, planes) == 44);
++static_assert(offsetof(struct mt6897_venc_encode, mode) == 45);
++static_assert(sizeof(struct mt6897_venc_ring) == 2064);
++static_assert(offsetof(struct mt6897_venc_ring, read) == 1536);
++static_assert(offsetof(struct mt6897_venc_ring, last_slice) == 1552);
++static_assert(offsetof(struct mt6897_venc_ring, flags) == 1808);
++struct mt6897_venc_record {
++	u64 output, input;
++	u32 bytes, key, last_slice, flags;
++};
++struct mt6897_venc_snapshot {
++	u32 read, write, count;
++	struct mt6897_venc_record record[MT6897_VENC_RING_LIMIT];
++};
++struct mt6897_venc_owner {
++	u64 output, input;
++	u32 capacity;
++	bool active, seen;
++};
++/* Validate a complete private snapshot before changing owners or shared ring
++ * indices. This checks the vendor rendezvous contract, not producer exclusion. */
++static inline bool
++mt6897_venc_ring_valid(const struct mt6897_venc_snapshot *s,
++		       const struct mt6897_venc_owner owner[2],
++		       u8 index[MT6897_VENC_RING_LIMIT])
++{
++	unsigned int i, j, used = 0;
++	if (s->read >= 64 || s->write >= 64 || s->count > 63 ||
++	    ((s->write - s->read) & 63) != s->count)
++		return false;
++	for (i = 0; i < s->count; i++) {
++		const struct mt6897_venc_record *r = &s->record[i];
++		for (j = 0; j < 2; j++)
++			if (owner[j].active && r->output == owner[j].output)
++				break;
++		if (j == 2 || owner[j].seen || (used & (1U << j)) ||
++		    !r->output || r->input != owner[j].input || !r->bytes ||
++		    r->bytes > owner[j].capacity || (r->flags & ~1U) ||
++		    (r->input && r->last_slice != 1))
++			return false;
++		used |= 1U << j;
++		index[i] = j;
++	}
++	return true;
++}
++static inline bool
++mt6897_venc_ring_unchanged(const struct mt6897_venc_snapshot *s, u32 read,
++			   u32 write, u32 count)
++{
++	return s->read == read && s->write == write && s->count == count;
++}
++static inline bool mt6897_venc_normal_buffer(u64 dma, size_t bytes)
++{
++	return bytes && dma <= U32_MAX && bytes - 1 <= U32_MAX - dma;
++}
++static inline bool
++mt6897_venc_encode_ack_valid(const struct mt6897_venc_prefix *h, size_t bytes,
++			     bool pending, u32 expected, u64 cookie)
++{
++	return bytes >= 24 && bytes <= 40 && !(bytes & 3) && pending &&
++	       expected == MT6897_VENC_ENCODE_DONE &&
++	       le32_to_cpu(h->id) == expected &&
++	       le64_to_cpu(h->cookie) == cookie;
++}
++/* Only shipping-confirmed stores. FINAL has no buffers and preserves previous
++ * DMA metadata; no inferred VSI plane-count/index fields are assigned. */
++static inline bool mt6897_venc_prepare_encode(
++	void *vsi, size_t extent, struct mt6897_venc_encode *m, u64 instance,
++	u32 context, unsigned int mode, u64 output_dma, u32 capacity,
++	u64 output_cookie, u64 input_cookie, const u64 input_dma[2],
++	const u32 input_size[2], u64 timestamp)
++{
++	u8 *p = vsi;
++	unsigned int i;
++	if (!vsi || ((unsigned long)vsi & 7) ||
++	    extent < MT6897_VENC_FRAME_EXTENT ||
++	    (mode != 2 && mode != 3 && mode != 4))
++		return false;
++	if (mode != 4 &&
++	    (!output_cookie || !mtk_vcp_sw_dma_valid(output_dma, capacity)))
++		return false;
++	if (mode == 3 &&
++	    (!input_cookie || !input_dma || !input_size ||
++	     !mt6897_venc_normal_buffer(input_dma[0], input_size[0]) ||
++	     !mt6897_venc_normal_buffer(input_dma[1], input_size[1])))
++		return false;
++	*m = (struct mt6897_venc_encode){};
++	m->id = cpu_to_le32(MT6897_VENC_ENCODE);
++	m->ctx = cpu_to_le32(context);
++	m->instance = cpu_to_le64(instance);
++	m->mode = mode;
++	*(__le64 *)(p + 2656) = cpu_to_le64(mode == 4 ? 0 : output_cookie);
++	*(__le64 *)(p + 2664) = cpu_to_le64(mode == 3 ? input_cookie : 0);
++	if (mode != 4) {
++		*(__le64 *)(p + 2512) = cpu_to_le64(output_dma);
++		*(__le64 *)(p + 2712) = cpu_to_le64(output_dma);
++		*(__le32 *)(p + 2784) = cpu_to_le32(U32_MAX);
++		*(__le32 *)(p + 2788) = 0;
++		m->capacity = cpu_to_le32(capacity);
++	}
++	if (mode == 3) {
++		m->planes = 2;
++		for (i = 0; i < 2; i++) {
++			*(__le64 *)(p + 2528 + i * 8) =
++				cpu_to_le64(input_dma[i]);
++			*(__le64 *)(p + 2688 + i * 8) =
++				cpu_to_le64(input_dma[i]);
++			m->input_size[i] = cpu_to_le32(input_size[i]);
++		}
++		*(__le64 *)(p + 2680) = cpu_to_le64(timestamp);
++		*(__le32 *)(p + 2732) = 0;
++		*(__le64 *)(p + 2736) = 0;
++		*(__le32 *)(p + 2748) = 0;
++		*(__le64 *)(p + 2752) = 0;
++		*(__le64 *)(p + 2760) = 0;
++		*(__le32 *)(p + 2768) = 0;
++	}
++	return true;
++}
++
++/* Internal client API: serialize operations with the RPC RX lock; wait must
++ * run without that lock. finish requires confirmed firmware/hardware stop. */
++struct device;
++struct mtk_vcp;
++struct mtk_vcp_venc_frames;
++struct mt6897_venc_frame_result {
++	int error;
++	u32 mode, acknowledgements, puts, records, bytes[2], flags[2],
++		snapshots;
++	struct {
++		u32 read, write, count, new_read, new_count, from_put;
++	} journal[16];
++	u32 archived;
++	struct {
++		u64 output, input, timestamp;
++		u32 bytes, key, flags;
++	} sequence[5];
++	struct mt6897_venc_record record[2];
++};
++struct mtk_vcp_venc_frames *mtk_vcp_venc_frames_create(struct device *dev,
++						       struct mtk_vcp *vcp);
++int mtk_vcp_venc_frames_reset(struct mtk_vcp_venc_frames *f);
++int mtk_vcp_venc_frames_begin(struct mtk_vcp_venc_frames *f, void *vsi,
++			      size_t extent, u64 generation, const u32 sizes[3],
++			      u32 sync_mode);
++int mtk_vcp_venc_frames_prepare(struct mtk_vcp_venc_frames *f,
++				unsigned int mode, u64 instance, u32 context,
++				struct mt6897_venc_encode *message);
++/* Called after successful command/ownership completion, before reuse. */
++int mtk_vcp_venc_frames_archive(struct mtk_vcp_venc_frames *f);
++int mtk_vcp_venc_frames_recycle(struct mtk_vcp_venc_frames *f,
++				unsigned int frame_index);
++int mtk_vcp_venc_frames_stream_begin(struct mtk_vcp_venc_frames *f, void *vsi,
++		size_t extent, u64 generation, const u32 sizes[3], u32 sync,
++		u32 stride, u32 height, u32 capacity);
++int mtk_vcp_venc_frames_input(struct mtk_vcp_venc_frames *f,
++			    const void *data, size_t bytes, u64 timestamp);
++int mtk_vcp_venc_frames_take(struct mtk_vcp_venc_frames *f, void *data,
++			   size_t capacity, size_t *bytes, bool *key);
++int mtk_vcp_venc_frames_ack(struct mtk_vcp_venc_frames *f, int status);
++int mtk_vcp_venc_frames_put(struct mtk_vcp_venc_frames *f);
++void mtk_vcp_venc_frames_put_done(struct mtk_vcp_venc_frames *f, int status);
++void mtk_vcp_venc_frames_fail(struct mtk_vcp_venc_frames *f, int error);
++int mtk_vcp_venc_frames_wait(struct mtk_vcp_venc_frames *f,
++			     unsigned int timeout_ms);
++void mtk_vcp_venc_frames_invalidate(struct mtk_vcp_venc_frames *f);
++int mtk_vcp_venc_frames_finish(struct mtk_vcp_venc_frames *f);
++int mtk_vcp_venc_frames_error(struct mtk_vcp_venc_frames *f);
++void mtk_vcp_venc_frames_result(struct mtk_vcp_venc_frames *f,
++				struct mt6897_venc_frame_result *result);
++int mtk_vcp_venc_frames_copy(struct mtk_vcp_venc_frames *f, void **data,
++			     size_t *size);
++void mtk_vcp_venc_frames_destroy(struct mtk_vcp_venc_frames *f);
++
++#endif
+diff --git a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_hw.c b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_hw.c
+new file mode 100644
+index 0000000000..5b9694fc29
+--- /dev/null
++++ b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_hw.c
+@@ -0,0 +1,313 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Power sequence adapted from MediaTek mtk_vcodec_enc_pm.c:
++ * Copyright (c) 2016 MediaTek Inc.
++ * Author: Tiffany Lin <tiffany.lin@mediatek.com>
++ */
++/* MT6897 VCP encoder power ownership. Register sequences follow the shipping
++ * encoder clock_off implementation and MediaTek mtk_vcodec_enc_pm.c.
++ * https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec/mtk_vcodec_enc_pm.c
++ */
++#include <linux/clk.h>
++#include <linux/clk-provider.h>
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/iommu.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++#include <linux/pm_domain.h>
++#include <linux/pm_runtime.h>
++#include <linux/remoteproc/mtk_vcp.h>
++#include "mtk_vcp_venc_hw.h"
++
++#define VENC_STOP_US 100000
++struct mtk_vcp_venc_hw {
++	struct device *dev, *pm[7];
++	struct mtk_vcp *vcp;
++	struct dev_pm_domain_list *domains;
++	struct clk_bulk_data clocks[2];
++	void __iomem *regs[2];
++	struct mutex lock;
++	unsigned long held, pending;
++	bool powered, owned[2], uncertain, module_held;
++};
++
++/* put_sync consumes a reference even on error. Retry only the suspension,
++ * keeping upstream resources held until the child has suspended. */
++static int venc_pm_release(struct mtk_vcp_venc_hw *hw)
++{
++	int i, ret;
++	for (i = ARRAY_SIZE(hw->pm) - 1; i >= 0; i--) {
++		if (hw->held & BIT(i)) {
++			ret = pm_runtime_put_sync_suspend(hw->pm[i]);
++			hw->held &= ~BIT(i);
++		} else if (hw->pending & BIT(i)) {
++			ret = pm_runtime_suspend(hw->pm[i]);
++		} else {
++			continue;
++		}
++		if (ret < 0) {
++			hw->pending |= BIT(i);
++			dev_err(hw->dev,
++				"VENC PM resource %d suspend failed: %d\n", i,
++				ret);
++			return ret;
++		}
++		hw->pending &= ~BIT(i);
++	}
++	if (hw->module_held) {
++		hw->module_held = false;
++		module_put(THIS_MODULE);
++	}
++	return 0;
++}
++
++/* Both physical cores remain powered for the session, including the global
++ * stop register in core 0. Logical ownership follows firmware callbacks. */
++static int venc_power_on(struct mtk_vcp_venc_hw *hw)
++{
++	int i, ret;
++	if (hw->pending)
++		return -EIO;
++	if (hw->powered)
++		return 0;
++	__module_get(THIS_MODULE);
++	hw->module_held = true;
++	for (i = 0; i < ARRAY_SIZE(hw->pm); i++) {
++		ret = pm_runtime_resume_and_get(hw->pm[i]);
++		if (ret < 0)
++			goto rollback;
++		hw->held |= BIT(i);
++	}
++	ret = clk_bulk_prepare_enable(2, hw->clocks);
++	if (ret)
++		goto rollback;
++	hw->powered = true;
++	dev_info(
++		hw->dev,
++		"VENC inherited clocks %lu/%lu Hz; platform AP voltage floor retained\n",
++		clk_get_rate(hw->clocks[0].clk),
++		clk_get_rate(hw->clocks[1].clk));
++	return 0;
++rollback:
++	venc_pm_release(hw);
++	return ret;
++}
++
++/* Shipping normal core-0 POWER_OFF checks activity across powered cores.
++ * Mixed modes have no established contract. Issue every request before any
++ * polling, with one wall-clock deadline shared by all cores. */
++static int venc_break(struct mtk_vcp_venc_hw *hw)
++{
++	ktime_t deadline;
++	u32 mode = 0, value;
++	bool have_mode = false, mixed = false, active = false;
++	int i, ret;
++	if (!hw->powered || hw->held != GENMASK(ARRAY_SIZE(hw->pm) - 1, 0))
++		return -EIO;
++	for (i = 0; i < 2; i++) {
++		u32 next = readl(hw->regs[i] + 0x1448) & 0x7f;
++		u32 activity = readl(hw->regs[i] + 0x1398);
++		dev_dbg(hw->dev, "VENC stop core %d activity %#x mode %#x\n", i,
++			activity, next);
++		active |= !!(activity & 0x1f);
++		if (have_mode && (mode == 127) != (next == 127))
++			mixed = true;
++		mode = next;
++		have_mode = true;
++	}
++	if (!active)
++		return 0;
++	if (mixed)
++		return -EOPNOTSUPP;
++	deadline = ktime_add_us(ktime_get(), VENC_STOP_US);
++	if (mode != 127)
++		writel(0xf0000000, hw->regs[0] + 0x5040);
++	for (i = 0; i < 2; i++)
++		writel(1, hw->regs[i] + (mode == 127 ? 0x13b8 : 0x1228));
++	for (i = 0; i < 2; i++) {
++		void __iomem *reg =
++			hw->regs[i] + (mode == 127 ? 0x13b8 : 0x1228);
++		u32 mask = mode == 127 ? BIT(31) : 0x7ffffdfc;
++		s64 remaining = ktime_us_delta(deadline, ktime_get());
++		if (remaining <= 0)
++			return -ETIMEDOUT;
++		ret = readl_poll_timeout(reg, value, !(value & mask), 10,
++					 remaining);
++		if (ret) {
++			dev_err(hw->dev,
++				"VENC core %d stop mode %u status %#x: %d\n", i,
++				mode, value, ret);
++			return ret;
++		}
++	}
++	return 0;
++}
++
++int mtk_vcp_venc_hw_power(struct mtk_vcp_venc_hw *hw, unsigned int core,
++			  bool on)
++{
++	int ret = 0;
++	if (core >= 2)
++		return -EINVAL;
++	mutex_lock(&hw->lock);
++	if (hw->uncertain || hw->pending) {
++		ret = -EIO;
++		goto out;
++	}
++	if (hw->owned[core] == on) {
++		ret = -EINVAL;
++		goto out;
++	}
++	if (on)
++		ret = venc_power_on(hw);
++	else if (!core)
++		ret = venc_break(hw);
++	if (ret) {
++		if (!on)
++			hw->uncertain = true;
++	} else {
++		hw->owned[core] = on;
++	}
++out:
++	mutex_unlock(&hw->lock);
++	return ret;
++}
++
++int mtk_vcp_venc_hw_stop(struct mtk_vcp_venc_hw *hw)
++{
++	int ret = 0;
++	mutex_lock(&hw->lock);
++	if (!mtk_vcp_is_offline(hw->vcp)) {
++		ret = -EBUSY;
++		goto out;
++	}
++	if (hw->powered && (hw->uncertain || hw->owned[0] || hw->owned[1])) {
++		ret = venc_break(hw);
++		if (ret) {
++			hw->uncertain = true;
++			goto out;
++		}
++	}
++	hw->owned[0] = hw->owned[1] = false;
++	hw->uncertain = false;
++	if (hw->powered) {
++		clk_bulk_disable_unprepare(2, hw->clocks);
++		hw->powered = false;
++	}
++	ret = venc_pm_release(hw);
++out:
++	mutex_unlock(&hw->lock);
++	return ret;
++}
++
++/* VCP owns encoder completion IRQs. These actions stay disabled throughout
++ * VCP operation; unsupported WAIT requests must fail in the protocol client. */
++static irqreturn_t venc_irq(int irq, void *data)
++{
++	return IRQ_NONE;
++}
++static void venc_detach(void *data)
++{
++	dev_pm_domain_detach_list(data);
++}
++static void venc_put(void *data)
++{
++	put_device(data);
++}
++
++struct mtk_vcp_venc_hw *mtk_vcp_venc_hw_create(struct platform_device *pdev,
++					       struct device *core0_dma,
++					       struct mtk_vcp *vcp)
++{
++	struct device *dev = &pdev->dev;
++	struct iommu_domain *domain = iommu_get_domain_for_dev(dev);
++	static const char *const names[] = { "infra", "core0", "core1" };
++	const struct dev_pm_domain_attach_data attach = {
++		.pd_names = names,
++		.num_pd_names = ARRAY_SIZE(names),
++		.pd_flags = PD_FLAG_NO_DEV_LINK,
++	};
++	struct mtk_vcp_venc_hw *hw;
++	int i, ret;
++	if (!vcp || !domain || !core0_dma ||
++	    iommu_get_domain_for_dev(core0_dma) != domain ||
++	    !domain->geometry.force_aperture ||
++	    domain->geometry.aperture_start || !domain->geometry.aperture_end ||
++	    domain->geometry.aperture_end > DMA_BIT_MASK(32))
++		return ERR_PTR(-EINVAL);
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return ERR_PTR(ret);
++	hw = devm_kzalloc(dev, sizeof(*hw), GFP_KERNEL);
++	if (!hw)
++		return ERR_PTR(-ENOMEM);
++	hw->dev = dev;
++	hw->vcp = vcp;
++	mutex_init(&hw->lock);
++	hw->clocks[0].id = "core0";
++	hw->clocks[1].id = "core1";
++	ret = devm_clk_bulk_get(dev, 2, hw->clocks);
++	if (ret)
++		return ERR_PTR(ret);
++	ret = dev_pm_domain_attach_list(dev, &attach, &hw->domains);
++	if (ret < 0)
++		return ERR_PTR(ret);
++	if (!hw->domains || hw->domains->num_pds != 3) {
++		dev_pm_domain_detach_list(hw->domains);
++		return ERR_PTR(-ENODEV);
++	}
++	ret = devm_add_action_or_reset(dev, venc_detach, hw->domains);
++	if (ret)
++		return ERR_PTR(ret);
++	for (i = 0; i < 3; i++)
++		hw->pm[i] = hw->domains->pd_devs[i];
++	for (i = 0; i < 2; i++) {
++		struct device_node *node;
++		struct platform_device *larb;
++		int irq;
++		hw->regs[i] = devm_platform_ioremap_resource_byname(
++			pdev, names[i + 1]);
++		if (IS_ERR(hw->regs[i]))
++			return ERR_CAST(hw->regs[i]);
++		node = of_parse_phandle(dev->of_node, "mediatek,larbs", i);
++		if (!node)
++			return ERR_PTR(-EINVAL);
++		larb = of_find_device_by_node(node);
++		of_node_put(node);
++		if (!larb)
++			return ERR_PTR(-EPROBE_DEFER);
++		/* Keep an explicit provider reference until larb supplier puts have
++		 * completed. Otherwise those puts can idle the clock provider
++		 * asynchronously alongside the attached-domain suspend, leaving
++		 * genpd with two SUSPENDING devices and no final power-off. */
++		hw->pm[3 + i] = clk_hw_get_dev(__clk_get_hw(hw->clocks[i].clk));
++		if (!hw->pm[3 + i] || !get_device(hw->pm[3 + i])) {
++			put_device(&larb->dev);
++			return ERR_PTR(-ENODEV);
++		}
++		ret = devm_add_action_or_reset(dev, venc_put, hw->pm[3 + i]);
++		if (ret) {
++			put_device(&larb->dev);
++			return ERR_PTR(ret);
++		}
++		hw->pm[5 + i] = &larb->dev;
++		ret = devm_add_action_or_reset(dev, venc_put, &larb->dev);
++		if (ret)
++			return ERR_PTR(ret);
++		if (!device_is_bound(&larb->dev))
++			return ERR_PTR(-EPROBE_DEFER);
++		irq = platform_get_irq(pdev, i);
++		if (irq < 0)
++			return ERR_PTR(irq);
++		ret = devm_request_irq(dev, irq, venc_irq, IRQF_NO_AUTOEN,
++				       dev_name(dev), hw);
++		if (ret)
++			return ERR_PTR(ret);
++	}
++	return hw;
++}
+diff --git a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_hw.h b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_hw.h
+new file mode 100644
+index 0000000000..598403aa12
+--- /dev/null
++++ b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_hw.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __MTK_VCP_VENC_HW_H
++#define __MTK_VCP_VENC_HW_H
++#include <linux/types.h>
++struct platform_device;
++struct device;
++struct mtk_vcp;
++struct mtk_vcp_venc_hw;
++struct mtk_vcp_venc_hw *mtk_vcp_venc_hw_create(struct platform_device *pdev,
++					       struct device *core0_dma,
++					       struct mtk_vcp *vcp);
++int mtk_vcp_venc_hw_power(struct mtk_vcp_venc_hw *hw, unsigned int core,
++			  bool on);
++/* Caller must first establish that the VCP is offline. Failure retains all
++ * remaining clocks, PM references and DMA ownership. */
++int mtk_vcp_venc_hw_stop(struct mtk_vcp_venc_hw *hw);
++#endif
+diff --git a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_mt6897_abi.h b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_mt6897_abi.h
+new file mode 100644
+index 0000000000..233927a16c
+--- /dev/null
++++ b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_mt6897_abi.h
+@@ -0,0 +1,212 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (c) 2016 MediaTek Inc.
++ * Authors: Jungchang Tsao <jungchang.tsao@mediatek.com>,
++ * Daniel Hsiao <daniel.hsiao@mediatek.com>, Tiffany Lin <tiffany.lin@mediatek.com>,
++ * PC Chen <pc.chen@mediatek.com>
++ * Source: https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec
++ * Local adaptation: explicit encoder QUERY/INIT/CONFIG wire views, verified against the
++ * shipping MT6897 encoder module. Encoder cookie/status offsets differ from
++ * the decoder protocol. CONFIG writes only individually mapped fields; gaps
++ * and firmware-owned state are preserved.
++ */
++#ifndef __MTK_VCP_VENC_MT6897_ABI_H
++#define __MTK_VCP_VENC_MT6897_ABI_H
++#include <linux/build_bug.h>
++#include <linux/byteorder/generic.h>
++#include <linux/stddef.h>
++#include <linux/types.h>
++#define MT6897_VENC_CAPS 64
++#define MT6897_VENC_INIT 0x1000
++#define MT6897_VENC_CONFIG 0x1001
++#define MT6897_VENC_CONFIG_DONE 0x2001
++#define MT6897_VENC_CONFIG_EXTENT 2732
++#define MT6897_VENC_DEINIT 0x1003
++#define MT6897_VENC_INIT_DONE 0x2000
++#define MT6897_VENC_DEINIT_DONE 0x2003
++#define MT6897_VENC_QUERY 0x1004
++#define MT6897_VENC_QUERY_DONE 0x2004
++#define MT6897_VENC_MEM_ALLOC 0x3003
++#define MT6897_VENC_MEM_FREE 0x3004
++struct mt6897_venc_prefix {
++	__le32 id, ctx;
++	__le64 cookie;
++	__le32 status, reserved;
++};
++/* INIT uses host cookie at byte 8; DEINIT replaces it with the firmware
++ * instance token. The remaining eight request bytes are reserved. */
++struct mt6897_venc_command {
++	__le32 id, ctx;
++	__le64 instance, reserved;
++};
++struct mt6897_venc_config {
++	__le32 id, ctx;
++	__le64 instance;
++	__le32 parameter, count, data[8], reserved[2];
++};
++static_assert(sizeof(struct mt6897_venc_config) == 64);
++static_assert(offsetof(struct mt6897_venc_config, parameter) == 16);
++static_assert(offsetof(struct mt6897_venc_config, data) == 24);
++struct mt6897_venc_init_ack {
++	struct mt6897_venc_prefix header;
++	__le64 instance;
++};
++struct mt6897_venc_callback {
++	struct mt6897_venc_prefix header;
++	__le32 data[2];
++};
++static_assert(sizeof(struct mt6897_venc_command) == 24);
++static_assert(offsetof(struct mt6897_venc_command, instance) == 8);
++static_assert(sizeof(struct mt6897_venc_init_ack) == 32);
++static_assert(offsetof(struct mt6897_venc_init_ack, instance) == 24);
++static_assert(sizeof(struct mt6897_venc_callback) == 32);
++struct mt6897_venc_query {
++	struct mt6897_venc_prefix header;
++	__le64 data_cookie;
++	__le32 query, reserved;
++};
++struct mt6897_venc_query_ack {
++	struct mt6897_venc_prefix header;
++	__le64 data_cookie, address;
++	__le32 query, reserved;
++};
++struct mt6897_venc_memory {
++	struct mt6897_venc_prefix header;
++	__le32 type, size;
++	__le64 iova, pa, token;
++	__le32 vcp_addr[2];
++};
++struct mt6897_venc_format {
++	__le32 fourcc, type, planes, reserved;
++};
++struct mt6897_venc_framesize {
++	__le32 fourcc, profile, level, reserved;
++	__le32 min_width, max_width, step_width;
++	__le32 min_height, max_height, step_height;
++};
++static_assert(sizeof(struct mt6897_venc_prefix) == 24);
++static_assert(offsetof(struct mt6897_venc_prefix, cookie) == 8);
++static_assert(offsetof(struct mt6897_venc_prefix, status) == 16);
++static_assert(sizeof(struct mt6897_venc_query) == 40);
++static_assert(offsetof(struct mt6897_venc_query, data_cookie) == 24);
++static_assert(offsetof(struct mt6897_venc_query, query) == 32);
++static_assert(sizeof(struct mt6897_venc_query_ack) == 48);
++static_assert(offsetof(struct mt6897_venc_query_ack, address) == 32);
++static_assert(offsetof(struct mt6897_venc_query_ack, query) == 40);
++static_assert(sizeof(struct mt6897_venc_memory) == 64);
++static_assert(offsetof(struct mt6897_venc_memory, type) == 24);
++static_assert(offsetof(struct mt6897_venc_memory, size) == 28);
++static_assert(offsetof(struct mt6897_venc_memory, iova) == 32);
++static_assert(offsetof(struct mt6897_venc_memory, token) == 48);
++static_assert(offsetof(struct mt6897_venc_memory, vcp_addr) == 56);
++static_assert(sizeof(struct mt6897_venc_format) == 16);
++static_assert(sizeof(struct mt6897_venc_framesize) == 40);
++static inline bool
++mt6897_venc_query_ack_valid(const struct mt6897_venc_query_ack *ack,
++			    size_t bytes, bool pending, u64 cookie,
++			    u64 data_cookie, u32 query)
++{
++	/* Shipping QUERY replies use ctx 0 even for a nonzero request context.
++	 * The vendor dispatches these replies by instance/data cookies and id. */
++	return bytes == sizeof(*ack) && pending &&
++	       le32_to_cpu(ack->header.id) == MT6897_VENC_QUERY_DONE &&
++	       le64_to_cpu(ack->header.cookie) == cookie &&
++	       le64_to_cpu(ack->data_cookie) == data_cookie &&
++	       le32_to_cpu(ack->query) == query;
++}
++/* Firmware virtual 32-bit pointers use low-28-bit translation, distinct
++ * from PACK_IOVA. Full IOVAs must point directly inside reserved VENC SHM. */
++static inline bool mt6897_venc_table_offset(u64 address, u64 base,
++					    size_t region, size_t bytes,
++					    size_t *offset)
++{
++	u64 start = base & 0xfffffff, low = address & 0xfffffff;
++	if (address > U32_MAX && (address < base || address - base >= region))
++		return false;
++	if (low < start || ((low - start) & 3) || low - start > region ||
++	    bytes > region - (low - start))
++		return false;
++	*offset = low - start;
++	return true;
++}
++static inline bool mt6897_venc_format_valid(const struct mt6897_venc_format *f)
++{
++	return !f->fourcc ||
++	       ((le32_to_cpu(f->type) == 1 || le32_to_cpu(f->type) == 2) &&
++		le32_to_cpu(f->planes) >= 1 && le32_to_cpu(f->planes) <= 8);
++}
++static inline bool
++mt6897_venc_framesize_valid(const struct mt6897_venc_framesize *f)
++{
++	u32 min_w = le32_to_cpu(f->min_width),
++	    max_w = le32_to_cpu(f->max_width);
++	u32 min_h = le32_to_cpu(f->min_height),
++	    max_h = le32_to_cpu(f->max_height);
++	u32 step_w = le32_to_cpu(f->step_width),
++	    step_h = le32_to_cpu(f->step_height);
++	return !f->fourcc ||
++	       (min_w && min_h && min_w <= max_w && min_h <= max_h && step_w &&
++		step_h && step_w <= max_w && step_h <= max_h);
++}
++
++/* A source-declared CONFIG ACK is 56 bytes, but the shipping consumer uses
++ * only its common prefix. Tail fields are diagnostic, not identity. */
++static inline bool
++mt6897_venc_config_ack_valid(const struct mt6897_venc_prefix *h, size_t bytes,
++			     bool pending, u32 expected, u64 cookie)
++{
++	return bytes >= sizeof(*h) && bytes <= 56 && !(bytes & 3) && pending &&
++	       expected == MT6897_VENC_CONFIG_DONE &&
++	       le32_to_cpu(h->id) == expected &&
++	       le64_to_cpu(h->cookie) == cookie;
++}
++/* Explicit small NV12M diagnostic configuration. Only shipping-mapped words
++ * are written; offset 120 and all firmware-owned gaps remain untouched.
++ * Control defaults are distinct from test choices such as bitrate/GOP/FPS. */
++static inline bool mt6897_venc_config_defaults(void *vsi, size_t bytes,
++					       u32 codec, u32 context)
++{
++	static const struct {
++		unsigned int offset;
++		u32 value;
++	} fields[] = {
++		{ 0, 6 },	  { 4, 256000 },    { 8, 160 },
++		{ 12, 128 },	  { 16, 160 },	    { 20, 128 },
++		{ 24, 30 },	  { 28, 30 },	    { 32, 30 },
++		{ 44, 0 },	  { 48, 0 },	    { 52, 0 },
++		{ 56, 0 },	  { 60, 0 },	    { 64, 0 },
++		{ 72, 0 },	  { 76, 0 },	    { 84, 0 },
++		{ 88, 0 },	  { 92, 0 },	    { 96, 0 },
++		{ 100, 51 },	  { 104, 51 },	    { 108, 51 },
++		{ 112, 0 },	  { 116, 0 },	    { 124, U32_MAX },
++		{ 128, U32_MAX }, { 132, U32_MAX }, { 136, 0 },
++		{ 140, U32_MAX }, { 144, 0 },	    { 148, 0 },
++		{ 152, 0 },	  { 164, 1 },	    { 168, 0 },
++		{ 172, 0 },	  { 176, 0 },	    { 180, 0 },
++		{ 184, 0 },	  { 188, 0 },	    { 200, 0 },
++		{ 344, U32_MAX }, { 348, U32_MAX }, { 352, U32_MAX },
++		{ 356, 99 },	  { 360, 99 },	    { 364, U32_MAX },
++		{ 368, U32_MAX }, { 372, U32_MAX }, { 376, U32_MAX },
++		{ 380, U32_MAX }, { 384, U32_MAX }, { 388, U32_MAX },
++		{ 392, U32_MAX }, { 396, U32_MAX }, { 400, U32_MAX },
++		{ 404, U32_MAX }, { 408, U32_MAX }, { 412, U32_MAX },
++	};
++	unsigned int i;
++	__le32 *words = vsi;
++	if (!vsi || ((unsigned long)vsi & 3) ||
++	    bytes < MT6897_VENC_CONFIG_EXTENT || (codec != 13 && codec != 14))
++		return false;
++	for (i = 0; i < sizeof(fields) / sizeof(fields[0]); i++)
++		words[fields[i].offset / 4] = cpu_to_le32(fields[i].value);
++	words[36 / 4] = cpu_to_le32(codec == 13 ? 0 : 1);
++	words[40 / 4] = cpu_to_le32(codec == 13 ? 8 : 13);
++	words[196 / 4] = cpu_to_le32(context);
++	/* The vendor's HEVC format is H265, not the external V4L2 HEVC FourCC. */
++	words[204 / 4] = cpu_to_le32(codec == 13 ? 0x34363248 : 0x35363248);
++	/* Inline color description, multi-reference and VUI source defaults. */
++	for (i = 224 / 4; i < 344 / 4; i++)
++		words[i] = 0;
++	return true;
++}
++
++#endif
+diff --git a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_v4l2.c b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_v4l2.c
+new file mode 100644
+index 0000000000..f66437651e
+--- /dev/null
++++ b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_v4l2.c
+@@ -0,0 +1,822 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Stateful encoder with CPU-owned vb2 queues and private firmware DMA. */
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/sizes.h>
++#include <linux/workqueue.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-event.h>
++#include <media/v4l2-fh.h>
++#include <media/v4l2-ioctl.h>
++#include <media/v4l2-mem2mem.h>
++#include <media/videobuf2-vmalloc.h>
++#include "mtk_vcp_venc.h"
++#include "mtk_vcp_venc_v4l2.h"
++
++/* Intersection of firmware geometry and the implemented private DMA budget.
++ * QUERY's 7680x4320 limit is not a frontend or throughput claim. */
++#define VENC_MAX_WIDTH 4096
++#define VENC_MAX_HEIGHT 4096
++#define VENC_MAX_PIXELS (4096 * 2176)
++struct mtk_vcp_venc_video {
++	struct device *dev;
++	struct mtk_vcp_venc *client;
++	struct mtk_vcp_venc_hw *hw;
++	struct v4l2_device v4l2;
++	struct video_device video;
++	struct v4l2_m2m_dev *m2m;
++	struct workqueue_struct *workqueue;
++	struct mutex lock;
++};
++struct venc_ctx {
++	struct mtk_vcp_venc_video *dev;
++	struct v4l2_fh fh;
++	struct v4l2_ctrl_handler controls;
++	struct v4l2_ctrl *bitrate, *gop, *h264_profile, *h264_level, *hevc_level;
++	struct v4l2_pix_format_mplane raw, coded;
++	struct v4l2_rect crop;
++	struct work_struct work;
++	/* No worker takes video/vb2 lock. Ioctls may flush work while holding it;
++	 * RX completion uses only the transport's independent receive mutex. */
++	spinlock_t state_lock;
++	u64 queued, completed, barrier;
++	u32 src_sequence, dst_sequence, fps;
++	bool session, stopping, failed, draining, drained, last_pending;
++	atomic_t force;
++};
++struct venc_buffer {
++	struct v4l2_m2m_buffer m2m;
++	u64 ticket;
++	bool force;
++};
++static struct venc_ctx *file_ctx(struct file *file)
++{
++	return container_of(file->private_data, struct venc_ctx, fh);
++}
++static bool is_output(u32 type)
++{
++	return type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++}
++static bool valid_type(u32 type)
++{
++	return is_output(type) || type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++}
++static struct venc_buffer *to_buffer(struct vb2_v4l2_buffer *vb)
++{
++	return container_of(vb, struct venc_buffer, m2m.vb);
++}
++static u32 coded_capacity(u32 width, u32 height)
++{
++	/* An oversized AU is returned as an error, never truncated. This budget
++	 * includes parameter sets and exceeds the vendor's width*height default. */
++	return PAGE_ALIGN(width * height * 3 / 2 + SZ_64K);
++}
++static bool queues_busy(struct venc_ctx *c)
++{
++	return vb2_is_busy(v4l2_m2m_get_src_vq(c->fh.m2m_ctx)) ||
++	       vb2_is_busy(v4l2_m2m_get_dst_vq(c->fh.m2m_ctx));
++}
++static void raw_format(struct v4l2_pix_format_mplane *p)
++{
++	u32 width = clamp_t(u32, ALIGN(clamp_t(u32, p->width, 160,
++					      VENC_MAX_WIDTH), 16), 160,
++			    VENC_MAX_WIDTH);
++	u32 height = clamp_t(u32, ALIGN(clamp_t(u32, p->height, 128,
++					       VENC_MAX_HEIGHT), 8), 128,
++			     VENC_MAX_HEIGHT);
++
++	/* Keep portrait orientations within the same private DMA pixel budget. */
++	if (width * height > VENC_MAX_PIXELS)
++		height = (VENC_MAX_PIXELS / width) & ~7U;
++	memset(p, 0, sizeof(*p));
++	p->width = width;
++	p->height = height;
++	p->pixelformat = V4L2_PIX_FMT_NV12;
++	p->field = V4L2_FIELD_NONE;
++	p->colorspace = V4L2_COLORSPACE_REC709;
++	p->num_planes = 1;
++	p->plane_fmt[0].bytesperline = width;
++	p->plane_fmt[0].sizeimage = width * height * 3 / 2;
++}
++static void coded_format(struct venc_ctx *c, struct v4l2_pix_format_mplane *p)
++{
++	u32 fourcc = p->pixelformat == V4L2_PIX_FMT_HEVC ?
++		V4L2_PIX_FMT_HEVC : V4L2_PIX_FMT_H264;
++
++	memset(p, 0, sizeof(*p));
++	p->width = c->crop.width;
++	p->height = c->crop.height;
++	p->pixelformat = fourcc;
++	p->field = V4L2_FIELD_NONE;
++	p->colorspace = c->raw.colorspace;
++	p->num_planes = 1;
++	p->plane_fmt[0].sizeimage = coded_capacity(c->raw.width, c->raw.height);
++}
++static int querycap(struct file *file, void *priv, struct v4l2_capability *cap)
++{
++	strscpy(cap->driver, "mtk-vcp-enc", sizeof(cap->driver));
++	strscpy(cap->card, "MT6897 VCP encoder", sizeof(cap->card));
++	strscpy(cap->bus_info, "platform:mt6897-vcp-enc", sizeof(cap->bus_info));
++	return 0;
++}
++static int enum_format(struct file *file, void *priv, struct v4l2_fmtdesc *f)
++{
++	if (!valid_type(f->type) || f->index >= (is_output(f->type) ? 1 : 2))
++		return -EINVAL;
++	f->pixelformat = is_output(f->type) ? V4L2_PIX_FMT_NV12 :
++		(f->index ? V4L2_PIX_FMT_HEVC : V4L2_PIX_FMT_H264);
++	return 0;
++}
++static int try_format(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct venc_ctx *c = file_ctx(file);
++
++	if (!valid_type(f->type))
++		return -EINVAL;
++	if (is_output(f->type))
++		raw_format(&f->fmt.pix_mp);
++	else
++		coded_format(c, &f->fmt.pix_mp);
++	return 0;
++}
++static int get_format(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct venc_ctx *c = file_ctx(file);
++
++	if (!valid_type(f->type))
++		return -EINVAL;
++	f->fmt.pix_mp = is_output(f->type) ? c->raw : c->coded;
++	return 0;
++}
++static int set_format(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct venc_ctx *c = file_ctx(file);
++	int ret;
++
++	if (!valid_type(f->type))
++		return -EINVAL;
++	if (queues_busy(c) || c->session)
++		return -EBUSY;
++	ret = try_format(file, priv, f);
++	if (ret)
++		return ret;
++	if (is_output(f->type)) {
++		c->raw = f->fmt.pix_mp;
++		c->crop = (struct v4l2_rect){0, 0, c->raw.width, c->raw.height};
++		coded_format(c, &c->coded);
++	} else {
++		c->coded = f->fmt.pix_mp;
++	}
++	return 0;
++}
++static int enum_framesizes(struct file *file, void *priv,
++			   struct v4l2_frmsizeenum *f)
++{
++	if (f->index || (f->pixel_format != V4L2_PIX_FMT_NV12 &&
++	    f->pixel_format != V4L2_PIX_FMT_H264 &&
++	    f->pixel_format != V4L2_PIX_FMT_HEVC))
++		return -EINVAL;
++	f->type = V4L2_FRMSIZE_TYPE_STEPWISE;
++	f->stepwise = (struct v4l2_frmsize_stepwise){160, VENC_MAX_WIDTH, 16,
++		128, VENC_MAX_HEIGHT, 8};
++	if (f->pixel_format == V4L2_PIX_FMT_HEVC) {
++		f->stepwise.max_width = 1920;
++		f->stepwise.max_height = 1920;
++	}
++	return 0;
++}
++static int get_selection(struct file *file, void *priv, struct v4l2_selection *s)
++{
++	struct venc_ctx *c = file_ctx(file);
++
++	if ((s->type != V4L2_BUF_TYPE_VIDEO_OUTPUT && !is_output(s->type)) ||
++	    (s->target != V4L2_SEL_TGT_CROP &&
++	    s->target != V4L2_SEL_TGT_CROP_BOUNDS &&
++	    s->target != V4L2_SEL_TGT_CROP_DEFAULT))
++		return -EINVAL;
++	s->r = s->target == V4L2_SEL_TGT_CROP ? c->crop :
++		(struct v4l2_rect){0, 0, c->raw.width, c->raw.height};
++	return 0;
++}
++static int set_selection(struct file *file, void *priv, struct v4l2_selection *s)
++{
++	struct venc_ctx *c = file_ctx(file);
++
++	if (queues_busy(c) || c->session)
++		return -EBUSY;
++	/* Firmware exposes a top-left visible rectangle inside coded storage. */
++	if ((s->type != V4L2_BUF_TYPE_VIDEO_OUTPUT && !is_output(s->type)) ||
++	    s->target != V4L2_SEL_TGT_CROP || s->r.left || s->r.top ||
++	    s->r.width < 160 || s->r.height < 128 ||
++	    s->r.width > c->raw.width || s->r.height > c->raw.height ||
++	    (s->r.width & 1) || (s->r.height & 1))
++		return -EINVAL;
++	c->crop = s->r;
++	coded_format(c, &c->coded);
++	return 0;
++}
++static int get_parm(struct file *file, void *priv, struct v4l2_streamparm *p)
++{
++	struct venc_ctx *c = file_ctx(file);
++
++	if (!is_output(p->type))
++		return -EINVAL;
++	memset(&p->parm, 0, sizeof(p->parm));
++	p->parm.output.capability = V4L2_CAP_TIMEPERFRAME;
++	p->parm.output.timeperframe = (struct v4l2_fract){1, c->fps};
++	return 0;
++}
++static int set_parm(struct file *file, void *priv, struct v4l2_streamparm *p)
++{
++	struct venc_ctx *c = file_ctx(file);
++	struct v4l2_fract t = p->parm.output.timeperframe;
++	u32 fps;
++
++	if (!is_output(p->type) || !t.numerator || !t.denominator)
++		return -EINVAL;
++	if (queues_busy(c) || c->session)
++		return -EBUSY;
++	/* CONFIG has integer fps. Accept equivalent integers; reject fractional
++	 * requests rather than silently changing their time base. */
++	if (t.denominator % t.numerator)
++		return -EINVAL;
++	fps = t.denominator / t.numerator;
++	if (!fps || fps > 240)
++		return -ERANGE;
++	c->fps = fps;
++	return get_parm(file, priv, p);
++}
++static int set_control(struct v4l2_ctrl *ctrl)
++{
++	struct venc_ctx *c = container_of(ctrl->handler, struct venc_ctx, controls);
++
++	if (ctrl->id == V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME) {
++		atomic_set(&c->force, 1); /* A button value of zero also requests. */
++		return 0;
++	}
++	/* Controls have a separate lock: ioctl video lock is held by the caller,
++	 * worker never reads mutable controls after its session starts. */
++	if (c->fh.m2m_ctx && (queues_busy(c) || c->session))
++		return -EBUSY;
++	return 0;
++}
++static const struct v4l2_ctrl_ops control_ops = { .s_ctrl = set_control };
++static int queue_setup(struct vb2_queue *q, unsigned int *count,
++		       unsigned int *planes, unsigned int sizes[],
++		       struct device *alloc_devs[])
++{
++	struct venc_ctx *c = vb2_get_drv_priv(q);
++	u32 size = is_output(q->type) ? c->raw.plane_fmt[0].sizeimage :
++		c->coded.plane_fmt[0].sizeimage;
++
++	if (*planes)
++		return *planes == 1 && sizes[0] >= size ? 0 : -EINVAL;
++	*planes = 1;
++	sizes[0] = size;
++	return 0;
++}
++static int buffer_prepare(struct vb2_buffer *vb)
++{
++	struct venc_ctx *c = vb2_get_drv_priv(vb->vb2_queue);
++	u32 size = is_output(vb->type) ? c->raw.plane_fmt[0].sizeimage :
++		c->coded.plane_fmt[0].sizeimage;
++
++	if (vb2_plane_size(vb, 0) < size)
++		return -EINVAL;
++	if (is_output(vb->type)) {
++		if (vb2_get_plane_payload(vb, 0) > vb2_plane_size(vb, 0) ||
++		    vb->planes[0].data_offset > vb2_get_plane_payload(vb, 0) ||
++		    vb2_get_plane_payload(vb, 0) - vb->planes[0].data_offset < size)
++			return -EINVAL;
++	} else {
++		vb->planes[0].data_offset = 0;
++		vb2_set_plane_payload(vb, 0, 0);
++	}
++	return 0;
++}
++static void emit_last(struct venc_ctx *c, struct vb2_v4l2_buffer *dst);
++static void buffer_queue(struct vb2_buffer *vb)
++{
++	struct venc_ctx *c = vb2_get_drv_priv(vb->vb2_queue);
++	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
++	unsigned long flags;
++
++
++	if (!is_output(vb->type)) {
++		bool last;
++
++		spin_lock_irqsave(&c->state_lock, flags);
++		last = c->last_pending;
++		c->last_pending = false;
++		spin_unlock_irqrestore(&c->state_lock, flags);
++		if (last) {
++			emit_last(c, vbuf);
++			return;
++		}
++	}
++	v4l2_m2m_buf_queue(c->fh.m2m_ctx, vbuf);
++}
++/* Associate requests at the successful QBUF boundary, not buf_queue: vb2
++ * defers buf_queue until STREAMON for buffers queued while the queue is off.
++ * PREPARE_BUF never consumes a force request. The video lock serializes this
++ * reservation and rollback against controls and other queue ioctls. */
++static int queue_buffer(struct file *file, void *priv, struct v4l2_buffer *buffer)
++{
++	struct venc_ctx *c = file_ctx(file);
++	struct vb2_buffer *vb;
++	struct venc_buffer *b;
++	unsigned long flags;
++	u64 previous_ticket;
++	bool previous_force;
++	int ret;
++
++	if (!is_output(buffer->type))
++		return v4l2_m2m_ioctl_qbuf(file, priv, buffer);
++	vb = vb2_get_buffer(v4l2_m2m_get_src_vq(c->fh.m2m_ctx), buffer->index);
++	if (!vb || vb->state != VB2_BUF_STATE_DEQUEUED ||
++	    buffer->flags & V4L2_BUF_FLAG_REQUEST_FD)
++		return -EINVAL;
++	b = to_buffer(to_vb2_v4l2_buffer(vb));
++	spin_lock_irqsave(&c->state_lock, flags);
++	if (c->queued == U64_MAX) {
++		spin_unlock_irqrestore(&c->state_lock, flags);
++		return -EOVERFLOW;
++	}
++	previous_ticket = b->ticket;
++	previous_force = b->force;
++	b->ticket = ++c->queued;
++	b->force = atomic_xchg(&c->force, 0);
++	spin_unlock_irqrestore(&c->state_lock, flags);
++	ret = v4l2_m2m_ioctl_qbuf(file, priv, buffer);
++	if (ret) {
++		spin_lock_irqsave(&c->state_lock, flags);
++		c->queued--;
++		if (b->force)
++			atomic_set(&c->force, 1);
++		b->ticket = previous_ticket;
++		b->force = previous_force;
++		spin_unlock_irqrestore(&c->state_lock, flags);
++	}
++	return ret;
++}
++/* Source-backed Main-tier level translation, matching venc_h265_get_level. */
++static u32 hevc_wire_level(u32 level)
++{
++	static const u32 levels[] = {2, 8, 10, 13, 15, 18, 20, 23, 25,
++		27, 29, 31, 33};
++
++	return levels[level];
++}
++/* Snapshot committed controls: a rejected S_CTRL can leave its proposed
++ * value in val without changing the successfully committed cur.val. */
++static struct mtk_vcp_venc_config stream_config(struct venc_ctx *c)
++{
++	struct mtk_vcp_venc_config cfg = {
++		.codec = c->coded.pixelformat == V4L2_PIX_FMT_H264 ? 13 : 14,
++		.width = c->crop.width, .height = c->crop.height,
++		.stride = c->raw.width, .storage_height = c->raw.height,
++		.bitrate = c->bitrate->cur.val, .gop = c->gop->cur.val, .fps = c->fps,
++		.capacity = c->coded.plane_fmt[0].sizeimage,
++		.profile = c->coded.pixelformat == V4L2_PIX_FMT_H264 ?
++			c->h264_profile->cur.val : 1,
++	};
++
++	cfg.level = cfg.codec == 13 ? c->h264_level->cur.val :
++		hevc_wire_level(c->hevc_level->cur.val);
++	return cfg;
++}
++static int start_streaming(struct vb2_queue *q, unsigned int count)
++{
++	struct venc_ctx *c = vb2_get_drv_priv(q);
++	struct vb2_queue *other = is_output(q->type) ?
++		v4l2_m2m_get_dst_vq(c->fh.m2m_ctx) :
++		v4l2_m2m_get_src_vq(c->fh.m2m_ctx);
++	struct mtk_vcp_venc_config cfg = stream_config(c);
++	struct vb2_v4l2_buffer *vb;
++	int ret = 0;
++
++	if (vb2_is_streaming(other) && !c->session) {
++		ret = mtk_vcp_venc_stream_start(c->dev->client, c->dev->hw, c, &cfg);
++		if (ret)
++			goto return_buffers;
++		c->session = true;
++		c->failed = false;
++	}
++	if (is_output(q->type)) {
++		unsigned long flags;
++
++		c->src_sequence = 0;
++
++		spin_lock_irqsave(&c->state_lock, flags);
++		c->draining = c->drained = c->last_pending = false;
++		v4l2_m2m_clear_state(c->fh.m2m_ctx);
++		spin_unlock_irqrestore(&c->state_lock, flags);
++		vb2_clear_last_buffer_dequeued(v4l2_m2m_get_dst_vq(c->fh.m2m_ctx));
++	}
++	if (!is_output(q->type))
++		c->dst_sequence = 0;
++	WRITE_ONCE(c->stopping, false);
++	return 0;
++return_buffers:
++	while ((vb = is_output(q->type) ?
++		v4l2_m2m_src_buf_remove(c->fh.m2m_ctx) :
++		v4l2_m2m_dst_buf_remove(c->fh.m2m_ctx)))
++		v4l2_m2m_buf_done(vb, VB2_BUF_STATE_QUEUED);
++	return ret;
++}
++static void mark_last(struct venc_ctx *c, struct vb2_v4l2_buffer *dst)
++{
++	const struct v4l2_event event = { .type = V4L2_EVENT_EOS };
++
++	v4l2_m2m_last_buffer_done(c->fh.m2m_ctx, dst);
++	v4l2_event_queue_fh(&c->fh, &event);
++}
++static void emit_last(struct venc_ctx *c, struct vb2_v4l2_buffer *dst)
++{
++	vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
++	dst->sequence = c->dst_sequence++;
++	mark_last(c, dst);
++}
++static void stop_streaming(struct vb2_queue *q)
++{
++	struct venc_ctx *c = vb2_get_drv_priv(q);
++	struct vb2_v4l2_buffer *vb;
++	unsigned long flags;
++	bool finish_drain;
++
++	WRITE_ONCE(c->stopping, true);
++	flush_work(&c->work);
++	spin_lock_irqsave(&c->state_lock, flags);
++	finish_drain = is_output(q->type) && c->draining && !c->drained;
++	if (!is_output(q->type)) {
++		c->draining = c->drained = c->last_pending = false;
++		v4l2_m2m_clear_state(c->fh.m2m_ctx);
++	}
++	if (is_output(q->type)) {
++		c->completed = c->queued;
++		atomic_set(&c->force, 0);
++	}
++	if (finish_drain) {
++		c->drained = true;
++		c->last_pending = true;
++	}
++	spin_unlock_irqrestore(&c->state_lock, flags);
++	if (!is_output(q->type) ||
++	    !vb2_is_streaming(v4l2_m2m_get_dst_vq(c->fh.m2m_ctx))) {
++		mtk_vcp_venc_stream_end(c->dev->client, c);
++		c->session = false;
++	}
++	while ((vb = is_output(q->type) ?
++		v4l2_m2m_src_buf_remove(c->fh.m2m_ctx) :
++		v4l2_m2m_dst_buf_remove(c->fh.m2m_ctx)))
++		v4l2_m2m_buf_done(vb, VB2_BUF_STATE_ERROR);
++	if (finish_drain && (vb = v4l2_m2m_dst_buf_remove(c->fh.m2m_ctx))) {
++		c->last_pending = false;
++		emit_last(c, vb);
++	}
++	/* Pending empty LAST survives OUTPUT-off if no capture buffer exists. */
++}
++static const struct vb2_ops queue_ops = {
++	.queue_setup = queue_setup, .buf_prepare = buffer_prepare,
++	.buf_queue = buffer_queue, .start_streaming = start_streaming,
++	.stop_streaming = stop_streaming,
++};
++static int queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *dst)
++{
++	struct venc_ctx *c = priv;
++	struct vb2_queue *q;
++	int i, ret;
++
++	for (i = 0; i < 2; i++) {
++		q = i ? dst : src;
++		q->type = i ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE :
++			V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++		q->io_modes = VB2_MMAP;
++		q->drv_priv = c;
++		q->buf_struct_size = sizeof(struct venc_buffer);
++		q->ops = &queue_ops;
++		q->mem_ops = &vb2_vmalloc_memops;
++		q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
++		q->lock = &c->dev->lock;
++		q->dev = c->dev->dev;
++		q->allow_zero_bytesused = 1;
++		ret = vb2_queue_init(q);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++static int job_ready(void *priv)
++{
++	struct venc_ctx *c = priv;
++	struct vb2_v4l2_buffer *src;
++	unsigned long flags;
++	bool ready;
++
++	spin_lock_irqsave(&c->state_lock, flags);
++	ready = !c->stopping && !c->failed && c->session && !c->drained;
++	if (ready && !(c->draining && c->completed >= c->barrier)) {
++		src = v4l2_m2m_next_src_buf(c->fh.m2m_ctx);
++		ready = src && (!c->draining || to_buffer(src)->ticket <= c->barrier);
++	}
++	spin_unlock_irqrestore(&c->state_lock, flags);
++	return ready;
++}
++static void encode_work(struct work_struct *work)
++{
++	struct venc_ctx *c = container_of(work, struct venc_ctx, work);
++	struct vb2_v4l2_buffer *src = NULL, *dst;
++	unsigned long flags;
++	size_t bytes = 0;
++	bool last, key = false;
++	int ret = 0;
++
++	dst = v4l2_m2m_dst_buf_remove(c->fh.m2m_ctx);
++	if (!dst)
++		goto finish;
++	spin_lock_irqsave(&c->state_lock, flags);
++	last = c->draining && c->completed >= c->barrier;
++	if (last)
++		c->drained = true;
++	spin_unlock_irqrestore(&c->state_lock, flags);
++	if (last) {
++		emit_last(c, dst);
++		goto finish;
++	}
++	src = v4l2_m2m_src_buf_remove(c->fh.m2m_ctx);
++	if (!src) {
++		v4l2_m2m_buf_done(dst, VB2_BUF_STATE_ERROR);
++		goto finish;
++	}
++	if (READ_ONCE(c->stopping))
++		ret = -ECANCELED;
++	else
++		ret = mtk_vcp_venc_stream_submit(c->dev->client, c,
++			vb2_plane_vaddr(&src->vb2_buf, 0) + src->vb2_buf.planes[0].data_offset,
++			vb2_get_plane_payload(&src->vb2_buf, 0) - src->vb2_buf.planes[0].data_offset,
++			src->vb2_buf.timestamp, to_buffer(src)->force,
++			vb2_plane_vaddr(&dst->vb2_buf, 0),
++			vb2_plane_size(&dst->vb2_buf, 0), &bytes, &key);
++	dst->vb2_buf.timestamp = src->vb2_buf.timestamp;
++	dst->timecode = src->timecode;
++	dst->flags &= ~(V4L2_BUF_FLAG_KEYFRAME | V4L2_BUF_FLAG_PFRAME |
++		V4L2_BUF_FLAG_BFRAME | V4L2_BUF_FLAG_LAST);
++	if (!ret)
++		dst->flags |= key ? V4L2_BUF_FLAG_KEYFRAME : V4L2_BUF_FLAG_PFRAME;
++	src->sequence = c->src_sequence++;
++	dst->sequence = c->dst_sequence++;
++	vb2_set_plane_payload(&dst->vb2_buf, 0, ret ? 0 : bytes);
++	spin_lock_irqsave(&c->state_lock, flags);
++	c->completed = to_buffer(src)->ticket;
++	last = !ret && c->draining && c->completed >= c->barrier;
++	if (last)
++		c->drained = true;
++	if (ret && ret != -ECANCELED)
++		c->failed = true;
++	spin_unlock_irqrestore(&c->state_lock, flags);
++	v4l2_m2m_buf_done(src, ret ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
++	if (last)
++		mark_last(c, dst);
++	else
++		v4l2_m2m_buf_done(dst, ret ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
++	if (ret && ret != -ECANCELED) {
++		vb2_queue_error(v4l2_m2m_get_src_vq(c->fh.m2m_ctx));
++		vb2_queue_error(v4l2_m2m_get_dst_vq(c->fh.m2m_ctx));
++	}
++finish:
++	v4l2_m2m_job_finish(c->dev->m2m, c->fh.m2m_ctx);
++}
++static void device_run(void *priv)
++{
++	struct venc_ctx *c = priv;
++
++	queue_work(c->dev->workqueue, &c->work);
++}
++static void job_abort(void *priv)
++{
++	struct venc_ctx *c = priv;
++
++	WRITE_ONCE(c->stopping, true);
++	/* The bounded worker completes the outstanding job; it never needs the
++	 * caller's video lock. Do not reset firmware while RX still owns DMA. */
++}
++static const struct v4l2_m2m_ops m2m_ops = {
++	.device_run = device_run, .job_ready = job_ready, .job_abort = job_abort,
++};
++static int encoder_cmd(struct file *file, void *priv, struct v4l2_encoder_cmd *cmd)
++{
++	struct venc_ctx *c = file_ctx(file);
++	unsigned long flags;
++	int ret;
++
++	ret = v4l2_m2m_ioctl_try_encoder_cmd(file, priv, cmd);
++	if (ret)
++		return ret;
++	if (!vb2_is_streaming(v4l2_m2m_get_src_vq(c->fh.m2m_ctx)) ||
++	    !vb2_is_streaming(v4l2_m2m_get_dst_vq(c->fh.m2m_ctx)))
++		return 0;
++	spin_lock_irqsave(&c->state_lock, flags);
++	if (c->draining && !c->drained) {
++		ret = -EBUSY;
++	} else if (cmd->cmd == V4L2_ENC_CMD_STOP) {
++		if (!c->drained) {
++			c->draining = true;
++			c->barrier = c->queued;
++		}
++	} else if (cmd->cmd == V4L2_ENC_CMD_START) {
++		c->draining = c->drained = c->last_pending = false;
++		v4l2_m2m_clear_state(c->fh.m2m_ctx);
++		vb2_clear_last_buffer_dequeued(v4l2_m2m_get_dst_vq(c->fh.m2m_ctx));
++	} else {
++		ret = -EINVAL;
++	}
++	spin_unlock_irqrestore(&c->state_lock, flags);
++	if (!ret)
++		v4l2_m2m_try_schedule(c->fh.m2m_ctx);
++	return ret;
++}
++static int subscribe_event(struct v4l2_fh *fh,
++			   const struct v4l2_event_subscription *sub)
++{
++	if (sub->type == V4L2_EVENT_EOS)
++		return v4l2_event_subscribe(fh, sub, 1, NULL);
++	return v4l2_ctrl_subscribe_event(fh, sub);
++}
++static const struct v4l2_ioctl_ops ioctl_ops = {
++	.vidioc_querycap = querycap,
++	.vidioc_enum_fmt_vid_cap = enum_format, .vidioc_enum_fmt_vid_out = enum_format,
++	.vidioc_g_fmt_vid_cap_mplane = get_format, .vidioc_g_fmt_vid_out_mplane = get_format,
++	.vidioc_s_fmt_vid_cap_mplane = set_format, .vidioc_s_fmt_vid_out_mplane = set_format,
++	.vidioc_try_fmt_vid_cap_mplane = try_format, .vidioc_try_fmt_vid_out_mplane = try_format,
++	.vidioc_enum_framesizes = enum_framesizes,
++	.vidioc_g_selection = get_selection, .vidioc_s_selection = set_selection,
++	.vidioc_g_parm = get_parm, .vidioc_s_parm = set_parm,
++	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
++	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
++	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
++	.vidioc_qbuf = queue_buffer, .vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
++	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
++	.vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
++	.vidioc_encoder_cmd = encoder_cmd,
++	.vidioc_try_encoder_cmd = v4l2_m2m_ioctl_try_encoder_cmd,
++	.vidioc_subscribe_event = subscribe_event,
++	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
++};
++static int venc_open(struct file *file)
++{
++	struct mtk_vcp_venc_video *d = video_drvdata(file);
++	struct venc_ctx *c;
++	int ret;
++
++	if (mutex_lock_interruptible(&d->lock))
++		return -ERESTARTSYS;
++	c = kzalloc(sizeof(*c), GFP_KERNEL);
++	if (!c) {
++		ret = -ENOMEM;
++		goto unlock;
++	}
++	c->dev = d;
++	c->fps = 30;
++	spin_lock_init(&c->state_lock);
++	atomic_set(&c->force, 0);
++	INIT_WORK(&c->work, encode_work);
++	v4l2_fh_init(&c->fh, &d->video);
++	file->private_data = &c->fh;
++	v4l2_ctrl_handler_init(&c->controls, 12);
++	c->bitrate = v4l2_ctrl_new_std(&c->controls, &control_ops,
++		V4L2_CID_MPEG_VIDEO_BITRATE, 1, 400000000, 1, 256000);
++	c->gop = v4l2_ctrl_new_std(&c->controls, &control_ops,
++		V4L2_CID_MPEG_VIDEO_GOP_SIZE, 1, 65535, 1, 30);
++	v4l2_ctrl_new_std(&c->controls, &control_ops,
++		V4L2_CID_MPEG_VIDEO_B_FRAMES, 0, 0, 1, 0);
++	v4l2_ctrl_new_std(&c->controls, &control_ops,
++		V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0, 0, 0, 0);
++	v4l2_ctrl_new_std_menu(&c->controls, &control_ops,
++		V4L2_CID_MPEG_VIDEO_BITRATE_MODE, V4L2_MPEG_VIDEO_BITRATE_MODE_VBR,
++		0, V4L2_MPEG_VIDEO_BITRATE_MODE_VBR);
++	c->h264_profile = v4l2_ctrl_new_std_menu(&c->controls, &control_ops,
++		V4L2_CID_MPEG_VIDEO_H264_PROFILE, V4L2_MPEG_VIDEO_H264_PROFILE_MAIN,
++		1ULL << V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE,
++		V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE);
++	v4l2_ctrl_new_std_menu(&c->controls, &control_ops,
++		V4L2_CID_MPEG_VIDEO_HEVC_PROFILE, V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN,
++		0, V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
++	c->h264_level = v4l2_ctrl_new_std_menu(&c->controls, &control_ops,
++		V4L2_CID_MPEG_VIDEO_H264_LEVEL, V4L2_MPEG_VIDEO_H264_LEVEL_5_2,
++		0, V4L2_MPEG_VIDEO_H264_LEVEL_3_0);
++	c->hevc_level = v4l2_ctrl_new_std_menu(&c->controls, &control_ops,
++		V4L2_CID_MPEG_VIDEO_HEVC_LEVEL, V4L2_MPEG_VIDEO_HEVC_LEVEL_5_2,
++		0, V4L2_MPEG_VIDEO_HEVC_LEVEL_3);
++	v4l2_ctrl_new_std_menu(&c->controls, &control_ops,
++		V4L2_CID_MPEG_VIDEO_HEVC_TIER, V4L2_MPEG_VIDEO_HEVC_TIER_MAIN,
++		0, V4L2_MPEG_VIDEO_HEVC_TIER_MAIN);
++	v4l2_ctrl_new_std_menu(&c->controls, &control_ops,
++		V4L2_CID_MPEG_VIDEO_HEADER_MODE,
++		V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME,
++		1ULL << V4L2_MPEG_VIDEO_HEADER_MODE_SEPARATE,
++		V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME);
++	if (c->controls.error) {
++		ret = c->controls.error;
++		goto free;
++	}
++	c->fh.ctrl_handler = &c->controls;
++	c->raw.width = 160;
++	c->raw.height = 128;
++	raw_format(&c->raw);
++	c->crop = (struct v4l2_rect){0, 0, c->raw.width, c->raw.height};
++	coded_format(c, &c->coded);
++	c->fh.m2m_ctx = v4l2_m2m_ctx_init(d->m2m, c, queue_init);
++	if (IS_ERR(c->fh.m2m_ctx)) {
++		ret = PTR_ERR(c->fh.m2m_ctx);
++		c->fh.m2m_ctx = NULL;
++		goto free;
++	}
++	v4l2_m2m_set_src_buffered(c->fh.m2m_ctx, true);
++	v4l2_fh_add(&c->fh, file);
++	mutex_unlock(&d->lock);
++	return 0;
++free:
++	v4l2_ctrl_handler_free(&c->controls);
++	v4l2_fh_exit(&c->fh);
++	kfree(c);
++unlock:
++	mutex_unlock(&d->lock);
++	return ret;
++}
++static int venc_release(struct file *file)
++{
++	struct venc_ctx *c = file_ctx(file);
++	struct mtk_vcp_venc_video *d = c->dev;
++
++	mutex_lock(&d->lock);
++	WRITE_ONCE(c->stopping, true);
++	v4l2_m2m_ctx_release(c->fh.m2m_ctx);
++	flush_work(&c->work);
++	mtk_vcp_venc_stream_end(d->client, c);
++	v4l2_ctrl_handler_free(&c->controls);
++	v4l2_fh_del(&c->fh, file);
++	v4l2_fh_exit(&c->fh);
++	/* Retained transport state never references this frontend allocation. */
++	kfree(c);
++	mutex_unlock(&d->lock);
++	return 0;
++}
++static const struct v4l2_file_operations file_ops = {
++	.owner = THIS_MODULE, .open = venc_open, .release = venc_release,
++	.poll = v4l2_m2m_fop_poll, .mmap = v4l2_m2m_fop_mmap,
++	.unlocked_ioctl = video_ioctl2,
++};
++struct mtk_vcp_venc_video *mtk_vcp_venc_video_register(struct device *dev,
++		struct mtk_vcp_venc *client, struct mtk_vcp_venc_hw *hw)
++{
++	struct mtk_vcp_venc_video *d;
++	int ret;
++
++	d = devm_kzalloc(dev, sizeof(*d), GFP_KERNEL);
++	if (!d)
++		return ERR_PTR(-ENOMEM);
++	d->dev = dev;
++	d->client = client;
++	d->hw = hw;
++	mutex_init(&d->lock);
++	d->workqueue = alloc_ordered_workqueue("mtk-vcp-enc", WQ_MEM_RECLAIM);
++	if (!d->workqueue)
++		return ERR_PTR(-ENOMEM);
++	ret = v4l2_device_register(dev, &d->v4l2);
++	if (ret)
++		goto destroy_workqueue;
++	d->m2m = v4l2_m2m_init(&m2m_ops);
++	if (IS_ERR(d->m2m)) {
++		ret = PTR_ERR(d->m2m);
++		goto unregister_v4l2;
++	}
++	strscpy(d->video.name, "mtk-vcp-enc", sizeof(d->video.name));
++	d->video.fops = &file_ops;
++	d->video.ioctl_ops = &ioctl_ops;
++	d->video.v4l2_dev = &d->v4l2;
++	d->video.lock = &d->lock;
++	d->video.release = video_device_release_empty;
++	d->video.device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
++	d->video.vfl_dir = VFL_DIR_M2M;
++	video_set_drvdata(&d->video, d);
++	ret = video_register_device(&d->video, VFL_TYPE_VIDEO, -1);
++	if (ret)
++		goto release_m2m;
++	return d;
++release_m2m:
++	v4l2_m2m_release(d->m2m);
++unregister_v4l2:
++	v4l2_device_unregister(&d->v4l2);
++destroy_workqueue:
++	destroy_workqueue(d->workqueue);
++	return ERR_PTR(ret);
++}
++void mtk_vcp_venc_video_unregister(struct mtk_vcp_venc_video *d)
++{
++	video_unregister_device(&d->video);
++	v4l2_m2m_release(d->m2m);
++	v4l2_device_unregister(&d->v4l2);
++	destroy_workqueue(d->workqueue);
++}
+diff --git a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_v4l2.h b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_v4l2.h
+new file mode 100644
+index 0000000000..de261e9454
+--- /dev/null
++++ b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_venc_v4l2.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __MTK_VCP_VENC_V4L2_H
++#define __MTK_VCP_VENC_V4L2_H
++struct device;
++struct mtk_vcp_venc;
++struct mtk_vcp_venc_hw;
++struct mtk_vcp_venc_video;
++struct mtk_vcp_venc_video *mtk_vcp_venc_video_register(struct device *dev,
++		struct mtk_vcp_venc *client, struct mtk_vcp_venc_hw *hw);
++void mtk_vcp_venc_video_unregister(struct mtk_vcp_venc_video *video);
++#endif
+-- 
+2.56.0
+

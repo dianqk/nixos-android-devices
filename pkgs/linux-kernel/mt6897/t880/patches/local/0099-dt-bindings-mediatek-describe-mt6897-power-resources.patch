@@ -1,0 +1,318 @@
+From 2844f7dbbd3ff76e2956f33a9ca251b2085d4e6b Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] dt-bindings: mediatek: describe MT6897 power resources
+
+Describe the MT6897 power compatibles, resource limits and constants
+used by the corresponding controllers and device trees.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-15T15:49:29+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-16T17:57:44+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T14:13:44+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T15:35:35+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T17:01:01+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T20:29:20+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T21:26:56+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T21:53:56+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T07:08:26+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T20:25:46+08:00
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Link: https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/power/supply/mt6375-charger.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/clk/mediatek/clk-mt6897-vcodec.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/soc/mediatek/mtk-scpsys-mt6897.c
+---
+ .../power/mediatek,mt8196-gpufreq.yaml        | 46 ++++++++++++++++
+ .../power/mediatek,power-controller.yaml      | 18 +++++++
+ .../power/supply/mediatek,mt6375-power.yaml   | 53 +++++++++++++++++++
+ .../dt-bindings/power/mediatek,mt6897-power.h | 40 ++++++++++++++
+ 4 files changed, 157 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/power/supply/mediatek,mt6375-power.yaml
+ create mode 100644 include/dt-bindings/power/mediatek,mt6897-power.h
+
+diff --git a/Documentation/devicetree/bindings/power/mediatek,mt8196-gpufreq.yaml b/Documentation/devicetree/bindings/power/mediatek,mt8196-gpufreq.yaml
+index 66fc59b3c8..8e23ca5ac8 100644
+--- a/Documentation/devicetree/bindings/power/mediatek,mt8196-gpufreq.yaml
++++ b/Documentation/devicetree/bindings/power/mediatek,mt8196-gpufreq.yaml
+@@ -19,21 +19,25 @@ properties:
+ 
+   compatible:
+     enum:
++      - mediatek,mt6897-gpufreq
+       - mediatek,mt8196-gpufreq
+ 
+   reg:
++    minItems: 2
+     items:
+       - description: GPR memory area
+       - description: RPC memory area
+       - description: SoC variant ID register
+ 
+   reg-names:
++    minItems: 2
+     items:
+       - const: gpr
+       - const: rpc
+       - const: hw-revision
+ 
+   clocks:
++    minItems: 1
+     items:
+       - description: main clock of the embedded controller (EB)
+       - description: core PLL
+@@ -41,6 +45,7 @@ properties:
+       - description: stack 1 PLL
+ 
+   clock-names:
++    minItems: 1
+     items:
+       - const: eb
+       - const: core
+@@ -48,6 +53,7 @@ properties:
+       - const: stack1
+ 
+   mboxes:
++    minItems: 1
+     items:
+       - description: FastDVFS events
+       - description: frequency control
+@@ -58,6 +64,7 @@ properties:
+       - description: FastDVFS control
+ 
+   mbox-names:
++    minItems: 1
+     items:
+       - const: fast-dvfs-event
+       - const: gpufreq
+@@ -98,6 +105,45 @@ required:
+   - "#clock-cells"
+   - "#power-domain-cells"
+ 
++allOf:
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: mediatek,mt6897-gpufreq
++    then:
++      description:
++        The MT6897 GPUEB firmware is started by the bootloader and controls
++        the GPU clocks and supplies itself; only its gpufreq channel is used
++        (the channels before it keep their positions).
++      properties:
++        reg:
++          maxItems: 2
++        reg-names:
++          maxItems: 2
++        clocks:
++          maxItems: 1
++        clock-names:
++          maxItems: 1
++        mboxes:
++          minItems: 2
++        mbox-names:
++          minItems: 2
++    else:
++      properties:
++        reg:
++          minItems: 3
++        reg-names:
++          minItems: 3
++        clocks:
++          minItems: 4
++        clock-names:
++          minItems: 4
++        mboxes:
++          minItems: 7
++        mbox-names:
++          minItems: 7
++
+ additionalProperties: false
+ 
+ examples:
+diff --git a/Documentation/devicetree/bindings/power/mediatek,power-controller.yaml b/Documentation/devicetree/bindings/power/mediatek,power-controller.yaml
+index d03e4a9251..d318b900e7 100644
+--- a/Documentation/devicetree/bindings/power/mediatek,power-controller.yaml
++++ b/Documentation/devicetree/bindings/power/mediatek,power-controller.yaml
+@@ -27,6 +27,8 @@ properties:
+       - mediatek,mt6795-power-controller
+       - mediatek,mt6858-power-controller
+       - mediatek,mt6893-power-controller
++      - mediatek,mt6897-hwv-power-controller
++      - mediatek,mt6897-power-controller
+       - mediatek,mt8167-power-controller
+       - mediatek,mt8173-power-controller
+       - mediatek,mt8183-power-controller
+@@ -50,6 +52,16 @@ properties:
+   '#size-cells':
+     const: 0
+ 
++  power-domains:
++    maxItems: 1
++    description: External parent domain for the child selected below.
++
++  power-domains-child-ids:
++    $ref: /schemas/types.yaml#/definitions/uint32-array
++    minItems: 1
++    maxItems: 1
++    description: Domain ID whose external parent is specified by power-domains.
++
+   access-controllers:
+     description:
+       A number of phandles to external blocks to set and clear the required
+@@ -106,6 +118,7 @@ $defs:
+               "include/dt-bindings/power/mt6795-power.h" - for MT8167 type power domain.
+               "include/dt-bindings/power/mediatek,mt6858-power.h" - for MT6858 type power domain.
+               "include/dt-bindings/power/mediatek,mt6893-power.h" - for MT6893 type power domain.
++              "include/dt-bindings/power/mediatek,mt6897-power.h" - for MT6897 type power domain.
+               "include/dt-bindings/power/mt8167-power.h" - for MT8167 type power domain.
+               "include/dt-bindings/power/mt8173-power.h" - for MT8173 type power domain.
+               "include/dt-bindings/power/mt8183-power.h" - for MT8183 type power domain.
+@@ -157,6 +170,10 @@ $defs:
+ required:
+   - compatible
+ 
++dependentRequired:
++  power-domains-child-ids:
++    - power-domains
++
+ allOf:
+   - if:
+       properties:
+@@ -180,6 +197,7 @@ allOf:
+         compatible:
+           contains:
+             enum:
++              - mediatek,mt6897-power-controller
+               - mediatek,mt8183-power-controller
+               - mediatek,mt8196-power-controller
+     then:
+diff --git a/Documentation/devicetree/bindings/power/supply/mediatek,mt6375-power.yaml b/Documentation/devicetree/bindings/power/supply/mediatek,mt6375-power.yaml
+new file mode 100644
+index 0000000000..7994940ca3
+--- /dev/null
++++ b/Documentation/devicetree/bindings/power/supply/mediatek,mt6375-power.yaml
+@@ -0,0 +1,53 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/power/supply/mediatek,mt6375-power.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: MediaTek MT6375 battery and USB input reporting
++
++maintainers:
++  - dianqk <dianqk@dianqk.net>
++
++description:
++  The MT6375 sub-PMIC holds a charger with its ADC, a coulomb-counter fuel
++  gauge and a housekeeping AUXADC. This child of the MT6375 node describes
++  battery and USB input reporting, with optional bounded charger control.
++  Without the opt-in property the charger retains bootloader configuration.
++
++allOf:
++  - $ref: power-supply.yaml#
++
++properties:
++  compatible:
++    const: mediatek,mt6375-power
++
++  mediatek,enable-charge-control:
++    type: boolean
++    description: |
++      Enable bounded charger control linked synchronously to the sibling TCPC.
++      Starts disabled until explicitly armed unless auto-charge is set.
++      Only 5 V supplies are supported;
++      charge current is requested at 2.1 A and stopped above 2.2 A. Input
++      current is stopped above the smaller of the contract and 2.2 A,
++      with a 100 mA regulation margin where possible. Constant
++      voltage is capped at 4.40 V. Charging stops outside 10 to 45 degrees Celsius.
++      Termination is enabled with a 150 mA end-of-charge threshold.
++      Timers and hardware protection retain firmware settings.
++
++  mediatek,auto-charge:
++    type: boolean
++    description: |
++      Arm charging at probe. A valid supported input contract and fresh safe
++      battery measurements are still required before enabling the charger.
++      Electrical and sensor faults remain latched until explicitly rearmed.
++
++  monitored-battery: true
++
++required:
++  - compatible
++
++dependencies:
++  mediatek,auto-charge: ["mediatek,enable-charge-control"]
++
++unevaluatedProperties: false
+diff --git a/include/dt-bindings/power/mediatek,mt6897-power.h b/include/dt-bindings/power/mediatek,mt6897-power.h
+new file mode 100644
+index 0000000000..c0f201b908
+--- /dev/null
++++ b/include/dt-bindings/power/mediatek,mt6897-power.h
+@@ -0,0 +1,40 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++#ifndef _DT_BINDINGS_POWER_MT6897_POWER_H
++#define _DT_BINDINGS_POWER_MT6897_POWER_H
++
++/* SPM, direct control */
++#define MT6897_POWER_DOMAIN_PEXTP_MAC0	0
++#define MT6897_POWER_DOMAIN_PEXTP_PHY0	1
++#define MT6897_POWER_DOMAIN_AUDIO	2
++#define MT6897_POWER_DOMAIN_ADSP_AO	3
++#define MT6897_POWER_DOMAIN_ADSP_TOP_DORMANT	4
++#define MT6897_POWER_DOMAIN_MM_PROC_DORMANT	5
++#define MT6897_POWER_DOMAIN_ISP_MAIN	6
++#define MT6897_POWER_DOMAIN_ISP_DIP1	7
++#define MT6897_POWER_DOMAIN_ISP_VCORE	8
++#define MT6897_POWER_DOMAIN_VEN0	9
++#define MT6897_POWER_DOMAIN_VEN1	10
++#define MT6897_POWER_DOMAIN_CAM_MAIN	11
++#define MT6897_POWER_DOMAIN_CAM_MRAW	12
++#define MT6897_POWER_DOMAIN_CAM_SUBA	13
++#define MT6897_POWER_DOMAIN_CAM_SUBB	14
++#define MT6897_POWER_DOMAIN_CAM_SUBC	15
++#define MT6897_POWER_DOMAIN_CAM_VCORE	16
++#define MT6897_POWER_DOMAIN_CAM_CCU	17
++#define MT6897_POWER_DOMAIN_CAM_CCU_AO	18
++#define MT6897_POWER_DOMAIN_MDP0_SHUTDOWN	19
++#define MT6897_POWER_DOMAIN_MDP1_SHUTDOWN	20
++#define MT6897_POWER_DOMAIN_CSI_RX	21
++#define MT6897_POWER_DOMAIN_DP_TX	22
++#define MT6897_POWER_DOMAIN_MD		23
++
++/* Hardware voter (MM) */
++#define MT6897_POWER_DOMAIN_HWV_MM_INFRA	0
++#define MT6897_POWER_DOMAIN_HWV_VDE0	1
++#define MT6897_POWER_DOMAIN_HWV_VDE1	2
++#define MT6897_POWER_DOMAIN_HWV_DIS0	3
++#define MT6897_POWER_DOMAIN_HWV_DIS1	4
++#define MT6897_POWER_DOMAIN_HWV_OVL0	5
++#define MT6897_POWER_DOMAIN_HWV_OVL1	6
++
++#endif
+-- 
+2.56.0
+

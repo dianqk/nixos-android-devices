@@ -1,0 +1,277 @@
+From ee5cd2f567308548232f99d7b0643e6800ed546a Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] dt-bindings: mediatek: describe MT6897 memory resources
+
+Describe the MT6897 memory compatibles, resource limits and constants
+used by the corresponding controllers and device trees.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T03:57:58+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T13:01:02+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T20:11:16+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/include/dt-bindings/memory/mt6897-larb-port.h
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/include/dt-bindings/memory/mt6897-larb-port.h#L629
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/memory/mtk-smi.c
+---
+ .../bindings/iommu/mediatek,iommu.yaml        |  6 ++
+ .../mediatek,smi-common.yaml                  | 48 ++++++++++++--
+ .../memory-controllers/mediatek,smi-larb.yaml | 26 +++++++-
+ .../memory/mediatek,mt6897-memory-port.h      | 65 +++++++++++++++++++
+ 4 files changed, 139 insertions(+), 6 deletions(-)
+ create mode 100644 include/dt-bindings/memory/mediatek,mt6897-memory-port.h
+
+diff --git a/Documentation/devicetree/bindings/iommu/mediatek,iommu.yaml b/Documentation/devicetree/bindings/iommu/mediatek,iommu.yaml
+index 79c573c47b..a8418072d8 100644
+--- a/Documentation/devicetree/bindings/iommu/mediatek,iommu.yaml
++++ b/Documentation/devicetree/bindings/iommu/mediatek,iommu.yaml
+@@ -75,6 +75,8 @@ properties:
+           - mediatek,mt6779-m4u  # generation two
+           - mediatek,mt6795-m4u  # generation two
+           - mediatek,mt6893-iommu-mm         # generation two
++          - mediatek,mt6897-iommu-disp
++          - mediatek,mt6897-iommu-mdp
+           - mediatek,mt8167-m4u  # generation two
+           - mediatek,mt8173-m4u  # generation two
+           - mediatek,mt8183-m4u  # generation two
+@@ -164,6 +166,8 @@ allOf:
+               - mediatek,mt2712-m4u
+               - mediatek,mt6795-m4u
+               - mediatek,mt6893-iommu-mm
++              - mediatek,mt6897-iommu-disp
++              - mediatek,mt6897-iommu-mdp
+               - mediatek,mt8173-m4u
+               - mediatek,mt8186-iommu-mm
+               - mediatek,mt8188-iommu-vdo
+@@ -182,6 +186,8 @@ allOf:
+         compatible:
+           enum:
+             - mediatek,mt6893-iommu-mm
++            - mediatek,mt6897-iommu-disp
++            - mediatek,mt6897-iommu-mdp
+             - mediatek,mt8186-iommu-mm
+             - mediatek,mt8188-iommu-vdo
+             - mediatek,mt8188-iommu-vpp
+diff --git a/Documentation/devicetree/bindings/memory-controllers/mediatek,smi-common.yaml b/Documentation/devicetree/bindings/memory-controllers/mediatek,smi-common.yaml
+index 0762e0ff66..e3cb700f80 100644
+--- a/Documentation/devicetree/bindings/memory-controllers/mediatek,smi-common.yaml
++++ b/Documentation/devicetree/bindings/memory-controllers/mediatek,smi-common.yaml
+@@ -34,6 +34,12 @@ properties:
+           - mediatek,mt6779-smi-common
+           - mediatek,mt6795-smi-common
+           - mediatek,mt6893-smi-common
++          - mediatek,mt6897-smi-common-disp
++          - mediatek,mt6897-smi-common-mdp
++          - mediatek,mt6897-smi-common-sysram
++          - mediatek,mt6897-smi-mmsram-sub-common
++          - mediatek,mt6897-smi-mdp-sub-common
++          - mediatek,mt6897-smi-sub-common
+           - mediatek,mt8167-smi-common
+           - mediatek,mt8173-smi-common
+           - mediatek,mt8183-smi-common
+@@ -75,8 +81,12 @@ properties:
+     maxItems: 4
+ 
+   mediatek,smi:
+-    $ref: /schemas/types.yaml#/definitions/phandle
+-    description: a phandle to the smi-common node above. Only for sub-common.
++    $ref: /schemas/types.yaml#/definitions/phandle-array
++    minItems: 1
++    maxItems: 2
++    items:
++      maxItems: 1
++    description: SMI suppliers, or MMSRAM subcommons for the MT6897 SYSRAM common.
+ 
+ required:
+   - compatible
+@@ -86,6 +96,20 @@ required:
+   - clock-names
+ 
+ allOf:
++  - if:
++      properties:
++        compatible:
++          const: mediatek,mt6897-smi-common-sysram
++    then:
++      properties:
++        mediatek,smi:
++          minItems: 2
++          maxItems: 2
++    else:
++      properties:
++        mediatek,smi:
++          maxItems: 1
++
+   - if:  # only for gen1 HW
+       properties:
+         compatible:
+@@ -109,6 +133,7 @@ allOf:
+           contains:
+             enum:
+               - mediatek,mt8195-smi-sub-common
++              - mediatek,mt6897-smi-sub-common
+     then:
+       required:
+         - mediatek,smi
+@@ -122,13 +147,28 @@ allOf:
+             - const: smi
+             - const: gals0
+     else:
+-      properties:
+-        mediatek,smi: false
++      if:
++        properties:
++          compatible:
++            enum:
++              - mediatek,mt6897-smi-common-sysram
++              - mediatek,mt6897-smi-mdp-sub-common
++      then:
++        required:
++          - mediatek,smi
++      else:
++        properties:
++          mediatek,smi: false
+ 
+   - if:  # for gen2 HW that have gals
+       properties:
+         compatible:
+           enum:
++            - mediatek,mt6897-smi-common-disp
++            - mediatek,mt6897-smi-common-mdp
++            - mediatek,mt6897-smi-common-sysram
++            - mediatek,mt6897-smi-mmsram-sub-common
++            - mediatek,mt6897-smi-mdp-sub-common
+             - mediatek,mt6779-smi-common
+             - mediatek,mt8183-smi-common
+             - mediatek,mt8186-smi-common
+diff --git a/Documentation/devicetree/bindings/memory-controllers/mediatek,smi-larb.yaml b/Documentation/devicetree/bindings/memory-controllers/mediatek,smi-larb.yaml
+index 2e7fac4b50..4565fab380 100644
+--- a/Documentation/devicetree/bindings/memory-controllers/mediatek,smi-larb.yaml
++++ b/Documentation/devicetree/bindings/memory-controllers/mediatek,smi-larb.yaml
+@@ -22,6 +22,8 @@ properties:
+           - mediatek,mt6779-smi-larb
+           - mediatek,mt6795-smi-larb
+           - mediatek,mt6893-smi-larb
++          - mediatek,mt6897-smi-larb
++          - mediatek,mt6897-smi-venc-larb
+           - mediatek,mt8167-smi-larb
+           - mediatek,mt8173-smi-larb
+           - mediatek,mt8183-smi-larb
+@@ -60,8 +62,12 @@ properties:
+     maxItems: 1
+ 
+   mediatek,smi:
+-    $ref: /schemas/types.yaml#/definitions/phandle
+-    description: a phandle to the smi_common node.
++    $ref: /schemas/types.yaml#/definitions/phandle-array
++    minItems: 1
++    maxItems: 2
++    items:
++      maxItems: 1
++    description: SMI suppliers, primary DRAM common first, optional SYSRAM common second.
+ 
+   mediatek,larb-id:
+     $ref: /schemas/types.yaml#/definitions/uint32
+@@ -78,6 +84,22 @@ required:
+   - power-domains
+ 
+ allOf:
++  - if:
++      properties:
++        compatible:
++          const: mediatek,mt6897-smi-venc-larb
++    then:
++      required:
++        - mediatek,smi
++      properties:
++        mediatek,smi:
++          minItems: 2
++          maxItems: 2
++    else:
++      properties:
++        mediatek,smi:
++          maxItems: 1
++
+   - if:  # HW has gals
+       properties:
+         compatible:
+diff --git a/include/dt-bindings/memory/mediatek,mt6897-memory-port.h b/include/dt-bindings/memory/mediatek,mt6897-memory-port.h
+new file mode 100644
+index 0000000000..11fe6c3849
+--- /dev/null
++++ b/include/dt-bindings/memory/mediatek,mt6897-memory-port.h
+@@ -0,0 +1,65 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (c) 2022 MediaTek Inc.
++ * Author: Yunfei Wang <yf.wang@mediatek.com>
++ */
++
++#ifndef _DT_BINDINGS_MEMORY_MT6897_MEMORY_PORT_H_
++#define _DT_BINDINGS_MEMORY_MT6897_MEMORY_PORT_H_
++
++#include <dt-bindings/memory/mtk-memory-port.h>
++
++/* Display subset; hardware larb32/33 use compact IDs 6/10. */
++#define M4U_L0_P0_DISP_OVL0_2L_HDR	MTK_M4U_ID(0, 0)
++#define M4U_L0_P1_DISP_OVL0_2L_RDMA0	MTK_M4U_ID(0, 1)
++#define M4U_L0_P2_DISP_OVL1_2L_RDMA1	MTK_M4U_ID(0, 2)
++#define M4U_L0_P3_DISP_OVL2_2L_HDR	MTK_M4U_ID(0, 3)
++#define M4U_L0_P4_DISP_OVL2_2L_RDMA0	MTK_M4U_ID(0, 4)
++#define M4U_L0_P5_DISP_OVL3_2L_RDMA1	MTK_M4U_ID(0, 5)
++#define M4U_L0_P6_DISP_WDMA0	MTK_M4U_ID(0, 6)
++#define M4U_L0_P7_DISP_FAKE0	MTK_M4U_ID(0, 7)
++#define M4U_L1_P0_DISP_OVL0_2L_RDMA1	MTK_M4U_ID(1, 0)
++#define M4U_L1_P1_DISP_OVL1_2L_HDR	MTK_M4U_ID(1, 1)
++#define M4U_L1_P2_DISP_OVL1_2L_RDMA0	MTK_M4U_ID(1, 2)
++#define M4U_L1_P3_DISP_OVL2_2L_RDMA1	MTK_M4U_ID(1, 3)
++#define M4U_L1_P4_DISP_OVL3_2L_HDR	MTK_M4U_ID(1, 4)
++#define M4U_L1_P5_DISP_OVL3_2L_RDMA0	MTK_M4U_ID(1, 5)
++#define M4U_L1_P6_DISP_WDMA2	MTK_M4U_ID(1, 6)
++#define M4U_L1_P7_DISP_FAKE1	MTK_M4U_ID(1, 7)
++#define M4U_L20_P0_DISP1_OVL0_2L_HDR	MTK_M4U_ID(20, 0)
++#define M4U_L20_P1_DISP1_OVL0_2L_RDMA0	MTK_M4U_ID(20, 1)
++#define M4U_L20_P2_DISP1_OVL1_2L_RDMA1	MTK_M4U_ID(20, 2)
++#define M4U_L20_P3_DISP1_OVL2_2L_HDR	MTK_M4U_ID(20, 3)
++#define M4U_L20_P4_DISP1_OVL2_2L_RDMA0	MTK_M4U_ID(20, 4)
++#define M4U_L20_P5_DISP1_OVL3_2L_RDMA1	MTK_M4U_ID(20, 5)
++#define M4U_L20_P6_DISP1_WDMA0	MTK_M4U_ID(20, 6)
++#define M4U_L20_P7_DISP1_FAKE0	MTK_M4U_ID(20, 7)
++#define M4U_L21_P0_DISP1_OVL0_2L_RDMA1	MTK_M4U_ID(21, 0)
++#define M4U_L21_P1_DISP1_OVL1_2L_HDR	MTK_M4U_ID(21, 1)
++#define M4U_L21_P2_DISP1_OVL1_2L_RDMA0	MTK_M4U_ID(21, 2)
++#define M4U_L21_P3_DISP1_OVL2_2L_RDMA1	MTK_M4U_ID(21, 3)
++#define M4U_L21_P4_DISP1_OVL3_2L_HDR	MTK_M4U_ID(21, 4)
++#define M4U_L21_P5_DISP1_OVL3_2L_RDMA0	MTK_M4U_ID(21, 5)
++#define M4U_L21_P6_DISP1_WDMA2	MTK_M4U_ID(21, 6)
++#define M4U_L21_P7_DISP1_FAKE1	MTK_M4U_ID(21, 7)
++#define M4U_L32_P0_DISP_POSTMASK0	MTK_M4U_ID(6, 0)
++#define M4U_L32_P1_DISP_MDP_RDMA0	MTK_M4U_ID(6, 1)
++#define M4U_L32_P2_DISP_ODDMR0_DMRR	MTK_M4U_ID(6, 2)
++#define M4U_L32_P3_DISP_ODDMR0_ODR	MTK_M4U_ID(6, 3)
++#define M4U_L32_P4_DISP_ODDMR0_ODW	MTK_M4U_ID(6, 4)
++#define M4U_L32_P5_DISP_WDMA1	MTK_M4U_ID(6, 5)
++#define M4U_L32_P6_DISP_UFBC_WDMA1	MTK_M4U_ID(6, 6)
++#define M4U_L33_P0_DISP_POSTMASK0	MTK_M4U_ID(10, 0)
++#define M4U_L33_P1_DISP_MDP_RDMA0	MTK_M4U_ID(10, 1)
++#define M4U_L33_P2_DISP_ODDMR0_DMRR	MTK_M4U_ID(10, 2)
++#define M4U_L33_P3_DISP_ODDMR0_ODR	MTK_M4U_ID(10, 3)
++#define M4U_L33_P4_DISP_ODDMR0_ODW	MTK_M4U_ID(10, 4)
++#define M4U_L33_P5_DISP_WDMA1	MTK_M4U_ID(10, 5)
++#define M4U_L33_P6_DISP_UFBC_WDMA1	MTK_M4U_ID(10, 6)
++
++/* Fake larb 43 (no SMI larb, behind the mdp IOMMU) uses compact ID 31. */
++#define M4U_L43_P0_VIDEO_UP		MTK_M4U_ID(31, 0)
++#define M4U_L43_P1_GCE_D_M		MTK_M4U_ID(31, 1)
++#define M4U_L43_P2_GCE_M_M		MTK_M4U_ID(31, 2)
++
++#endif
+-- 
+2.56.0
+

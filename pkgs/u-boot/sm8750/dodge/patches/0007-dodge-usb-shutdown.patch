@@ -1,0 +1,156 @@
+From: Johannes Schneider <johannes.schneider@leica-geosystems.com>
+Date: Sat, 26 Sep 2026 14:11:37 +0000
+Subject: [PATCH] usb: dwc3: gadget: ack pending events while waiting for the halt
+
+The controller sets DSTS.DEVCTRLHLT only once every event in the event
+buffer has been acknowledged. Linux relies on its interrupt handler
+doing that while dwc3_gadget_run_stop() polls; barebox has no
+interrupts, and gadget_unbind_driver() unregisters the UDC poller
+before it disconnects. Any event left pending at that point keeps the
+controller running, and the poll ends in its 2 s timeout with
+-ETIMEDOUT.
+
+On an i.MX8MP board with the gadget enumerated by a host, 1 to 15
+events (GEVNTCOUNT 4 to 60) were pending on most boots, and each such
+boot lost 2.0 s between the start of shutdown_barebox() and the jump
+to Linux; with the events acknowledged, the controller halts within
+1 ms.
+
+The gadget is being stopped, so acknowledge the events from the poll
+loop without processing them, keeping lpos in step with the hardware.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Johannes Schneider <johannes.schneider@leica-geosystems.com>
+Link: https://lore.barebox.org/20260926141137.244764-1-johannes.schneider@leica-geosystems.com
+Signed-off-by: Sascha Hauer <s.hauer@pengutronix.de>
+(cherry picked from commit 9efea34d34b4bcfd4b06ca478647c07b8698cdd1)
+
+
+Local adaptation (separate source commit 40467411):
+usb: dwc3: bound Dodge shutdown event draining and cancellation
+
+Adapt the imported barebox event-discard fix to the existing multi-buffer polling driver. Restrict the new sequence to CONFIG_QCOM_DODGE, retain the existing timeout and connect path, reject malformed event state, and reconcile ring/count/pending/mask state before reconnect.
+
+End active non-control transfers without dispatching giveback callbacks before clearing RUN_STOP. Guard cancelled ACM RX completions so later endpoint teardown cannot resubmit them.
+
+Ordering rationale: Linux ae7e86108b12351028fa7e8796a59f9b2d9e1774 (Wesley Cheng) and 8f8034f493b5eb1ad21ff392fd30c0cf9e71f73f (Thinh Nguyen). Existing U-Boot ENDTRANSFER helpers are reused; the Linux interrupt-driven code is not copied.
+
+Link: https://github.com/barebox/barebox/commit/9efea34d34b4bcfd4b06ca478647c07b8698cdd1
+
+Link: https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/ae7e86108b12351028fa7e8796a59f9b2d9e1774
+
+Link: https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/8f8034f493b5eb1ad21ff392fd30c0cf9e71f73f
+
+
+---
+diff --git a/drivers/usb/dwc3/gadget.c b/drivers/usb/dwc3/gadget.c
+index 24ae0c23..bd337ce5 100644
+--- a/drivers/usb/dwc3/gadget.c
++++ b/drivers/usb/dwc3/gadget.c
+@@ -1393,10 +1393,50 @@ static int dwc3_gadget_set_selfpowered(struct usb_gadget *g,
+ 	return 0;
+ }
+ 
++/* Polling shutdown has no IRQ handler to consume events (barebox 9efea34d). */
++static int dwc3_gadget_discard_events(struct dwc3 *dwc)
++{
++	unsigned int i;
++
++	if (!dwc->ev_buffs || dwc->num_event_buffers <= 0 ||
++	    dwc->num_event_buffers > DWC3_NUM_INT(~0U))
++		return -EINVAL;
++
++	for (i = 0; i < dwc->num_event_buffers; i++) {
++		struct dwc3_event_buffer *evt = dwc->ev_buffs[i];
++		u32 count, reg;
++
++		if (!evt || !evt->length || evt->length > DWC3_EVENT_BUFFERS_SIZE ||
++		    (evt->length & 3) || evt->lpos >= evt->length ||
++		    (evt->lpos & 3) || evt->count > evt->length || (evt->count & 3))
++			return -EINVAL;
++
++		/* Keep the low reserved bits until validation; do not round down. */
++		count = dwc3_readl(dwc->regs, DWC3_GEVNTCOUNT(i)) &
++			(DWC3_GEVNTCOUNT_MASK | 3);
++		if ((count & 3) || count > evt->length)
++			return -EINVAL;
++
++		/* Hardware count is authoritative, including a cached pending batch. */
++		if (count) {
++			evt->lpos = (evt->lpos + count) % evt->length;
++			dwc3_writel(dwc->regs, DWC3_GEVNTCOUNT(i), count);
++		}
++		evt->count = 0;
++		evt->flags &= ~DWC3_EVENT_PENDING;
++		reg = dwc3_readl(dwc->regs, DWC3_GEVNTSIZ(i));
++		reg &= ~DWC3_GEVNTSIZ_INTMASK;
++		dwc3_writel(dwc->regs, DWC3_GEVNTSIZ(i), reg);
++	}
++
++	return 0;
++}
++
+ static int dwc3_gadget_run_stop(struct dwc3 *dwc, int is_on, int suspend)
+ {
+ 	u32			reg;
+ 	u32			timeout = 2000;
++	int ret;
+ 
+ 	reg = dwc3_readl(dwc->regs, DWC3_DCTL);
+ 	if (is_on) {
+@@ -1426,6 +1466,12 @@ static int dwc3_gadget_run_stop(struct dwc3 *dwc, int is_on, int suspend)
+ 
+ 	do {
+ 		udelay(2000);
++		/* the controller only halts once pending events are acked */
++		if (IS_ENABLED(CONFIG_QCOM_DODGE) && !is_on) {
++			ret = dwc3_gadget_discard_events(dwc);
++			if (ret)
++				return ret;
++		}
+ 		reg = dwc3_readl(dwc->regs, DWC3_DSTS);
+ 		if (is_on) {
+ 			if (!(reg & DWC3_DSTS_DEVCTRLHLT))
+@@ -1447,6 +1493,18 @@ static int dwc3_gadget_run_stop(struct dwc3 *dwc, int is_on, int suspend)
+ 	return 0;
+ }
+ 
++/* End DMA without giveback callbacks, which could resubmit requests. */
++static void dwc3_gadget_end_transfers(struct dwc3 *dwc)
++{
++	unsigned int epnum;
++
++	/* Linux ae7e86108b12: ENDTRANSFER must precede clearing RUN_STOP. */
++	for (epnum = 2; epnum < DWC3_ENDPOINTS_NUM; epnum++) {
++		if (dwc->eps[epnum])
++			dwc3_stop_active_transfer(dwc, epnum, true);
++	}
++}
++
+ static int dwc3_gadget_pullup(struct usb_gadget *g, int is_on)
+ {
+ 	struct dwc3		*dwc = gadget_to_dwc(g);
+@@ -1456,6 +1514,8 @@ static int dwc3_gadget_pullup(struct usb_gadget *g, int is_on)
+ 	is_on = !!is_on;
+ 
+ 	spin_lock_irqsave(&dwc->lock, flags);
++	if (IS_ENABLED(CONFIG_QCOM_DODGE) && !is_on)
++		dwc3_gadget_end_transfers(dwc);
+ 	ret = dwc3_gadget_run_stop(dwc, is_on, false);
+ 	spin_unlock_irqrestore(&dwc->lock, flags);
+ 
+diff --git a/drivers/usb/gadget/f_acm.c b/drivers/usb/gadget/f_acm.c
+index b6c11d97..3dfb6abc 100644
+--- a/drivers/usb/gadget/f_acm.c
++++ b/drivers/usb/gadget/f_acm.c
+@@ -293,6 +293,10 @@ static void acm_rx_complete(struct usb_ep *ep, struct usb_request *req)
+ {
+ 	struct f_acm *f_acm = req->context;
+ 
++	/* Cancellation during endpoint teardown must not start another transfer. */
++	if (IS_ENABLED(CONFIG_QCOM_DODGE) && req->status)
++		return;
++
+ 	buf_push(&f_acm->rx_buf, req->buf, req->actual);
+ 
+ 	/* Queue RX req again */

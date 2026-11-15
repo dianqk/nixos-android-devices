@@ -1,0 +1,463 @@
+From dc08fe3e23183d4154bf21213ce3ba0baa46ef10 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] drm/mediatek: declare MT6897 display controller interfaces
+
+Declare the shared component, twin-pipe, firmware handover and interface
+register APIs before their controller implementations.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T14:13:45+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T14:13:46+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T04:46:11+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T08:40:58+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T03:00:38+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T03:01:38+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T03:12:46+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T03:36:03+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T03:36:03+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T03:36:03+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-05T13:24:15+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-05T14:20:23+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Link: https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_drm_crtc.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/misc/mediatek/cmdq/mailbox/cmdq-util.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/misc/mediatek/cmdq/mailbox/mtk-cmdq-mailbox-ext.c
+---
+ drivers/gpu/drm/mediatek/mtk_ddp_comp.h   |   2 +
+ drivers/gpu/drm/mediatek/mtk_disp_drv.h   |   2 +
+ drivers/gpu/drm/mediatek/mtk_disp_va.h    |  25 +++
+ drivers/gpu/drm/mediatek/mtk_dp_reg.h     |   5 +
+ drivers/gpu/drm/mediatek/mtk_dpi_common.h |   3 +
+ drivers/gpu/drm/mediatek/mtk_dpi_regs.h   |   7 +
+ drivers/gpu/drm/mediatek/mtk_drm_drv.h    |   1 +
+ drivers/soc/mediatek/mt6897-mmsys.h       | 221 ++++++++++++++++++++++
+ drivers/soc/mediatek/mtk-mmsys.h          |   7 +
+ include/linux/soc/mediatek/mtk-mmsys.h    |   1 +
+ 10 files changed, 274 insertions(+)
+ create mode 100644 drivers/gpu/drm/mediatek/mtk_disp_va.h
+ create mode 100644 drivers/soc/mediatek/mt6897-mmsys.h
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_ddp_comp.h b/drivers/gpu/drm/mediatek/mtk_ddp_comp.h
+index 9f483d9cb8..db853e001f 100644
+--- a/drivers/gpu/drm/mediatek/mtk_ddp_comp.h
++++ b/drivers/gpu/drm/mediatek/mtk_ddp_comp.h
+@@ -92,6 +92,8 @@ struct mtk_ddp_comp {
+ 	int encoder_index;
+ 	const struct mtk_ddp_comp_funcs *funcs;
+ 	bool special_connect;
++	/* First component of a dual-pipe shadow path (owned by another CRTC) */
++	bool shadow_head;
+ 
+ 	struct hlist_node lnode;
+ };
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_drv.h b/drivers/gpu/drm/mediatek/mtk_disp_drv.h
+index eaec83cda5..39b0cc13f5 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_drv.h
++++ b/drivers/gpu/drm/mediatek/mtk_disp_drv.h
+@@ -88,6 +88,7 @@ void mtk_dsi_ddp_start(struct device *dev);
+ void mtk_dsi_ddp_stop(struct device *dev);
+ unsigned int mtk_dsi_encoder_index(struct device *dev);
+ struct drm_dsc_config *mtk_dsi_get_dsc_config(struct device *dev);
++struct device *mtk_dsi_get_slave_dev(struct device *dev);
+ 
+ void mtk_dvo_start(struct device *dev);
+ void mtk_dvo_stop(struct device *dev);
+@@ -165,6 +166,7 @@ void mtk_ovl_layer_on(struct device *dev, unsigned int idx,
+ void mtk_ovl_layer_off(struct device *dev, unsigned int idx,
+ 		       struct cmdq_pkt *cmdq_pkt);
+ void mtk_ovl_start(struct device *dev);
++struct device *mtk_ovl_get_twin(struct device *dev);
+ void mtk_ovl_stop(struct device *dev);
+ unsigned int mtk_ovl_supported_rotations(struct device *dev);
+ void mtk_ovl_register_vblank_cb(struct device *dev,
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_va.h b/drivers/gpu/drm/mediatek/mtk_disp_va.h
+new file mode 100644
+index 0000000000..594ab25ab3
+--- /dev/null
++++ b/drivers/gpu/drm/mediatek/mtk_disp_va.h
+@@ -0,0 +1,25 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __MTK_DISP_VA_H
++#define __MTK_DISP_VA_H
++#include <linux/device.h>
++#include <linux/errno.h>
++#include <linux/kconfig.h>
++#include <linux/of.h>
++#if IS_ENABLED(CONFIG_DRM_MEDIATEK_MT6897_VA_BOOTSTRAP)
++int mtk_disp_va_bootstrap_gate(struct device *consumer);
++int mtk_disp_va_runtime_gate(struct device *consumer);
++#else
++static inline int mtk_disp_va_bootstrap_gate(struct device *consumer)
++{
++	if (consumer->parent &&
++	    of_property_present(consumer->parent->of_node,
++				"mediatek,display-va-bootstrap"))
++		return -EOPNOTSUPP;
++	return 0;
++}
++static inline int mtk_disp_va_runtime_gate(struct device *consumer)
++{
++	return mtk_disp_va_bootstrap_gate(consumer);
++}
++#endif
++#endif
+diff --git a/drivers/gpu/drm/mediatek/mtk_dp_reg.h b/drivers/gpu/drm/mediatek/mtk_dp_reg.h
+index 8ad7a9cc25..7120d43b46 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dp_reg.h
++++ b/drivers/gpu/drm/mediatek/mtk_dp_reg.h
+@@ -262,6 +262,8 @@
+ #define HPD_DISC_THD_DP_TRANS_P0_MASK				GENMASK(11, 8)
+ #define HPD_CONN_THD_DP_TRANS_P0_MASK				GENMASK(15, 12)
+ #define MTK_DP_TRANS_P0_3414				0x3414
++#define HPD_OVR_EN_DP_TRANS_P0					BIT(0)
++#define HPD_SET_DP_TRANS_P0					BIT(1)
+ #define HPD_DB_DP_TRANS_P0_MASK					BIT(2)
+ #define MTK_DP_TRANS_P0_3418				0x3418
+ #define IRQ_CLR_DP_TRANS_P0_MASK				GENMASK(3, 0)
+@@ -298,6 +300,7 @@
+ /* offset: AUX_OFFSET (0x3600) */
+ #define MTK_DP_AUX_P0_360C			0x360c
+ #define AUX_TIMEOUT_THR_AUX_TX_P0_MASK			GENMASK(12, 0)
++#define AUX_PN_SWAP_AUX_TX_P0				BIT(15)
+ #define AUX_TIMEOUT_THR_AUX_TX_P0_VAL			0x1595
+ #define MTK_DP_AUX_P0_3614			0x3614
+ #define AUX_RX_UI_CNT_THR_AUX_TX_P0_MASK		GENMASK(6, 0)
+@@ -350,6 +353,8 @@
+ #define MCU_ACK_TRAN_COMPLETE_AUX_TX_P0			BIT(8)
+ #define MTK_DP_AUX_P0_3658			0x3658
+ #define AUX_TX_OV_EN_AUX_TX_P0_MASK			BIT(0)
++#define MTK_DP_AUX_P0_3680			0x3680
++#define AUX_PN_SWAP_TX_AUX_TX_P0			BIT(0)
+ #define MTK_DP_AUX_P0_3690			0x3690
+ #define RX_REPLY_COMPLETE_MODE_AUX_TX_P0		BIT(8)
+ #define MTK_DP_AUX_P0_3704			0x3704
+diff --git a/drivers/gpu/drm/mediatek/mtk_dpi_common.h b/drivers/gpu/drm/mediatek/mtk_dpi_common.h
+index af51efa4c9..bf8feeceee 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dpi_common.h
++++ b/drivers/gpu/drm/mediatek/mtk_dpi_common.h
+@@ -182,6 +182,9 @@ struct mtk_dpi_conf {
+ 	bool clocked_by_hdmi;
+ 	bool output_1pixel;
+ 	bool quirk_hfp_bs_fix;
++	bool buf_ctrl;
++	/* An external output whose failure must not stop the display */
++	bool output_optional;
+ };
+ 
+ static inline struct mtk_dpi *bridge_to_dpi(struct drm_bridge *b)
+diff --git a/drivers/gpu/drm/mediatek/mtk_dpi_regs.h b/drivers/gpu/drm/mediatek/mtk_dpi_regs.h
+index 23eeefce8f..b4e5266c30 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dpi_regs.h
++++ b/drivers/gpu/drm/mediatek/mtk_dpi_regs.h
+@@ -240,6 +240,13 @@
+ #define MATRIX_SEL_RGB_TO_JPEG		0
+ #define MATRIX_SEL_RGB_TO_BT601		2
+ 
++/* DP_INTF output buffer (MT6897) */
++#define DPINTF_BUF_CON0		0x210
++#define DPINTF_BUF_EN			BIT(0)
++#define DPINTF_BUF_UNDERFLOW_DONT_BLOCK	BIT(4)
++#define DPINTF_BUF_RW_TIMES	0x220
++#define DPINTF_SW_NP_SEL	0x250
++
+ #define DPI_PATTERN0		0xf00
+ #define DPI_PAT_EN			BIT(0)
+ #define DPI_PAT_SEL			GENMASK(6, 4)
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_drv.h b/drivers/gpu/drm/mediatek/mtk_drm_drv.h
+index 09aa0588ff..9b9401bbbf 100644
+--- a/drivers/gpu/drm/mediatek/mtk_drm_drv.h
++++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.h
+@@ -15,6 +15,7 @@ enum mtk_crtc_path {
+ 	CRTC_MAIN,
+ 	CRTC_EXT,
+ 	CRTC_THIRD,
++	CRTC_FOURTH,
+ 	MAX_CRTC,
+ };
+ 
+diff --git a/drivers/soc/mediatek/mt6897-mmsys.h b/drivers/soc/mediatek/mt6897-mmsys.h
+new file mode 100644
+index 0000000000..3b054d0320
+--- /dev/null
++++ b/drivers/soc/mediatek/mt6897-mmsys.h
+@@ -0,0 +1,221 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#ifndef __SOC_MEDIATEK_MT6897_MMSYS_H
++#define __SOC_MEDIATEK_MT6897_MMSYS_H
++
++/*
++ * MT6897 display: two OVLSYS and two DISPSYS controllers. Each OVLSYS
++ * blends its layers in a chain of OVL_2L engines and hands the result
++ * to its DISPSYS through an asynchronous direct link (DLO -> DLI relay,
++ * no mux of its own). In the DISPSYS the PQ chain sits between the PQ
++ * input and output crossbars; these routes take the PQ bypass (PQ input
++ * crossbar 0 straight to PQ output crossbar 3) and go on to the DSC
++ * cores and the DSI, which is what a panel needs before the PQ engines
++ * are supported. For a dual-port panel the second pipe goes from
++ * DISPSYS1 to DSC core 1 in DISPSYS0 and back to DSI1 in DISPSYS1.
++ *
++ * Crossbar registers (bit assignments as in the vendor driver, which
++ * shares them with MT6985).
++ */
++
++/* OVLSYS */
++#define MT6897_OVL_CON				0xf08
++#define MT6897_OVL_CON_OVL0_TO_BG		BIT(1)
++#define MT6897_OVL_CON_OVL1_TO_BG		BIT(3)
++#define MT6897_OVL_CON_OVL2_TO_BLEND		BIT(4)
++#define MT6897_OVL_BG_CROSSBAR0_MOUT_EN		0xf10
++#define MT6897_OVL_BG0_TO_OVL1			BIT(1)
++#define MT6897_OVL_BG_CROSSBAR1_MOUT_EN		0xf14
++#define MT6897_OVL_BG1_TO_OVL2			BIT(2)
++#define MT6897_OVL_BLEND_CROSSBAR2_MOUT_EN	0xf40
++#define MT6897_OVL_BLEND2_TO_DLO_RELAY3		BIT(0)
++#define MT6897_OVL_CON_OVL3_TO_BLEND		BIT(6)
++#define MT6897_OVL_BLEND_CROSSBAR3_MOUT_EN	0xf44
++#define MT6897_OVL_BLEND3_TO_DLO_RELAY5		BIT(2)
++
++/* DISPSYS */
++#define MT6897_COMP_OUT_CROSSBAR1_MOUT_EN	0xea4
++#define MT6897_DSC0_TO_MERGE_OUT_CROSSBAR0	BIT(0)
++#define MT6897_COMP_OUT_CROSSBAR2_MOUT_EN	0xea8
++#define MT6897_DSC1_TO_MERGE_OUT_CROSSBAR1	BIT(1)
++#define MT6897_COMP_OUT_CROSSBAR3_MOUT_EN	0xeac
++#define MT6897_PANEL_COMP_OUT3_TO_MERGE_OUT_CROSSBAR0	BIT(0)
++#define MT6897_COMP_OUT_CROSSBAR6_MOUT_EN	0xeb8
++#define MT6897_DLI_RELAY5_TO_MERGE_OUT_CROSSBAR1	BIT(1)
++#define MT6897_MERGE_OUT_CROSSBAR0_MOUT_EN	0xf0c
++#define MT6897_MERGE_OUT0_TO_DSI0		BIT(0)
++#define MT6897_MERGE_OUT0_TO_DLO_RELAY0		BIT(4)
++#define MT6897_MERGE_OUT_CROSSBAR1_MOUT_EN	0xf10
++#define MT6897_MERGE_OUT1_TO_DSI0		BIT(0)
++#define MT6897_MERGE_OUT1_TO_DLO_RELAY1		BIT(5)
++/* Crossbar shadow control: bypass bit 0 plus bits 23:16 (stock 0xff0001) */
++#define MT6897_DISPSYS_BYPASS_MUX_SHADOW	0xc30
++#define MT6897_OVLSYS_BYPASS_MUX_SHADOW		0xf00
++#define MT6897_BYPASS_MUX_SHADOW_ALL		(GENMASK(23, 16) | BIT(0))
++#define MT6897_PANEL_COMP_OUT_CROSSBAR0_MOUT_EN	0xf48
++#define MT6897_PANEL_COMP_OUT_CROSSBAR1_MOUT_EN	0xf4c
++#define MT6897_CROSSBAR_ALL			GENMASK(15, 0)
++#define MT6897_PQ_OUT1_TO_DSC0			BIT(1)
++#define MT6897_PQ_OUT1_TO_COMP_OUT_CROSSBAR3	BIT(3)
++#define MT6897_PANEL_COMP_OUT_CROSSBAR4_MOUT_EN	0xf58
++#define MT6897_DLI_RELAY4_TO_DSC1		BIT(2)
++#define MT6897_PANEL_COMP_OUT_CROSSBAR1_SEL_IN	0xf60
++#define MT6897_PANEL_COMP_OUT_CROSSBAR2_SEL_IN	0xf64
++#define MT6897_PANEL_COMP_OUT_CROSSBAR3_SEL_IN	0xf68
++#define MT6897_PANEL_COMP_OUT_SEL_IN_MASK	GENMASK(2, 0)
++#define MT6897_SEL_IN_FROM_PQ_OUT1		1
++#define MT6897_SEL_IN_FROM_DLI_RELAY4		4
++#define MT6897_PQ_IN_CROSSBAR0_MOUT_EN		0xf74
++#define MT6897_DLI_RELAY0_TO_PQ_OUT_CROSSBAR3	BIT(2)
++#define MT6897_PQ_OUT_CROSSBAR3_MOUT_EN		0xfa4
++#define MT6897_PQ_OUT3_TO_PANEL_COMP_OUT1	BIT(1)
++/*
++ * DisplayPort: DLI relay 2 -> PQ output crossbar 4 -> panel/comp output
++ * crossbar 2 -> comp output crossbar 4 -> merge output crossbar 2 ->
++ * DP_INTF0. The vendor goes through merge output crossbar 1, whose input
++ * lane the right half of the internal panel already uses; crossbar 2
++ * reaches DP_INTF0 as well.
++ */
++#define MT6897_PQ_IN_CROSSBAR2_MOUT_EN		0xf7c
++#define MT6897_DLI_RELAY2_TO_PQ_OUT_CROSSBAR4	BIT(3)
++#define MT6897_PQ_OUT_CROSSBAR4_MOUT_EN		0xfa8
++#define MT6897_PQ_OUT4_TO_PANEL_COMP_OUT2	BIT(2)
++#define MT6897_PANEL_COMP_OUT_CROSSBAR2_MOUT_EN	0xf50
++#define MT6897_PQ_OUT2_TO_COMP_OUT_CROSSBAR4	BIT(4)
++#define MT6897_COMP_OUT_CROSSBAR4_MOUT_EN	0xeb0
++#define MT6897_PANEL_COMP_OUT4_TO_MERGE_OUT_CROSSBAR2	BIT(2)
++#define MT6897_MERGE_OUT_CROSSBAR2_MOUT_EN	0xf14
++#define MT6897_MERGE_OUT2_TO_DP_INTF0		BIT(1)
++
++static const struct mtk_mmsys_routes mmsys_mt6897_ovlsys_routing_table[] = {
++	/* OVLSYS0: OVL0 -> OVL1 -> OVL2 -> DLO relay 3 */
++	MMSYS_ROUTE(OVL_2L, 0, OVL_2L, 1,
++		    MT6897_OVL_CON, MT6897_OVL_CON_OVL0_TO_BG, MT6897_OVL_CON_OVL0_TO_BG),
++	MMSYS_ROUTE(OVL_2L, 0, OVL_2L, 1,
++		    MT6897_OVL_BG_CROSSBAR0_MOUT_EN, MT6897_OVL_BG0_TO_OVL1,
++		    MT6897_OVL_BG0_TO_OVL1),
++	MMSYS_ROUTE(OVL_2L, 1, OVL_2L, 2,
++		    MT6897_OVL_CON, MT6897_OVL_CON_OVL1_TO_BG, MT6897_OVL_CON_OVL1_TO_BG),
++	MMSYS_ROUTE(OVL_2L, 1, OVL_2L, 2,
++		    MT6897_OVL_BG_CROSSBAR1_MOUT_EN, MT6897_OVL_BG1_TO_OVL2,
++		    MT6897_OVL_BG1_TO_OVL2),
++	MMSYS_ROUTE(OVL_2L, 2, DIRECT_LINK_OUT, 3,
++		    MT6897_OVL_CON, MT6897_OVL_CON_OVL2_TO_BLEND,
++		    MT6897_OVL_CON_OVL2_TO_BLEND),
++	MMSYS_ROUTE(OVL_2L, 2, DIRECT_LINK_OUT, 3,
++		    MT6897_OVL_BLEND_CROSSBAR2_MOUT_EN, MT6897_OVL_BLEND2_TO_DLO_RELAY3,
++		    MT6897_OVL_BLEND2_TO_DLO_RELAY3),
++	/* OVLSYS0, DisplayPort: OVL3 -> DLO relay 5 */
++	MMSYS_ROUTE(OVL_2L, 3, DIRECT_LINK_OUT, 5,
++		    MT6897_OVL_CON, MT6897_OVL_CON_OVL3_TO_BLEND,
++		    MT6897_OVL_CON_OVL3_TO_BLEND),
++	MMSYS_ROUTE(OVL_2L, 3, DIRECT_LINK_OUT, 5,
++		    MT6897_OVL_BLEND_CROSSBAR3_MOUT_EN, MT6897_OVL_BLEND3_TO_DLO_RELAY5,
++		    MT6897_OVL_BLEND3_TO_DLO_RELAY5),
++	/* OVLSYS1: OVL4 -> OVL5 -> OVL6 -> DLO relay 3, same registers */
++	MMSYS_ROUTE(OVL_2L, 4, OVL_2L, 5,
++		    MT6897_OVL_CON, MT6897_OVL_CON_OVL0_TO_BG, MT6897_OVL_CON_OVL0_TO_BG),
++	MMSYS_ROUTE(OVL_2L, 4, OVL_2L, 5,
++		    MT6897_OVL_BG_CROSSBAR0_MOUT_EN, MT6897_OVL_BG0_TO_OVL1,
++		    MT6897_OVL_BG0_TO_OVL1),
++	MMSYS_ROUTE(OVL_2L, 5, OVL_2L, 6,
++		    MT6897_OVL_CON, MT6897_OVL_CON_OVL1_TO_BG, MT6897_OVL_CON_OVL1_TO_BG),
++	MMSYS_ROUTE(OVL_2L, 5, OVL_2L, 6,
++		    MT6897_OVL_BG_CROSSBAR1_MOUT_EN, MT6897_OVL_BG1_TO_OVL2,
++		    MT6897_OVL_BG1_TO_OVL2),
++	MMSYS_ROUTE(OVL_2L, 6, DIRECT_LINK_OUT, 3,
++		    MT6897_OVL_CON, MT6897_OVL_CON_OVL2_TO_BLEND,
++		    MT6897_OVL_CON_OVL2_TO_BLEND),
++	MMSYS_ROUTE(OVL_2L, 6, DIRECT_LINK_OUT, 3,
++		    MT6897_OVL_BLEND_CROSSBAR2_MOUT_EN, MT6897_OVL_BLEND2_TO_DLO_RELAY3,
++		    MT6897_OVL_BLEND2_TO_DLO_RELAY3),
++};
++
++static const struct mtk_mmsys_routes mmsys_mt6897_dispsys0_routing_table[] = {
++	/* Pipe 0: DLI relay 0 -> PQ bypass -> DSC core 0 */
++	MMSYS_ROUTE(DIRECT_LINK_IN, 0, DSC, 0,
++		    MT6897_PQ_IN_CROSSBAR0_MOUT_EN, MT6897_CROSSBAR_ALL,
++		    MT6897_DLI_RELAY0_TO_PQ_OUT_CROSSBAR3),
++	MMSYS_ROUTE(DIRECT_LINK_IN, 0, DSC, 0,
++		    MT6897_PQ_OUT_CROSSBAR3_MOUT_EN, MT6897_CROSSBAR_ALL,
++		    MT6897_PQ_OUT3_TO_PANEL_COMP_OUT1),
++	/* the bootloader's PQ chain must not keep feeding the panel crossbar */
++	MMSYS_ROUTE(DIRECT_LINK_IN, 0, DSC, 0,
++		    MT6897_PANEL_COMP_OUT_CROSSBAR0_MOUT_EN, MT6897_CROSSBAR_ALL, 0),
++	MMSYS_ROUTE(DIRECT_LINK_IN, 0, DSC, 0,
++		    MT6897_PANEL_COMP_OUT_CROSSBAR1_SEL_IN, MT6897_PANEL_COMP_OUT_SEL_IN_MASK,
++		    MT6897_SEL_IN_FROM_PQ_OUT1),
++	MMSYS_ROUTE(DIRECT_LINK_IN, 0, DSC, 0,
++		    MT6897_PANEL_COMP_OUT_CROSSBAR1_MOUT_EN, MT6897_PQ_OUT1_TO_DSC0,
++		    MT6897_PQ_OUT1_TO_DSC0),
++	/* DSC core 0 -> DSI0 */
++	MMSYS_ROUTE(DSC, 0, DSI, 0,
++		    MT6897_COMP_OUT_CROSSBAR1_MOUT_EN, MT6897_DSC0_TO_MERGE_OUT_CROSSBAR0,
++		    MT6897_DSC0_TO_MERGE_OUT_CROSSBAR0),
++	MMSYS_ROUTE(DSC, 0, DSI, 0,
++		    MT6897_MERGE_OUT_CROSSBAR0_MOUT_EN, MT6897_MERGE_OUT0_TO_DSI0,
++		    MT6897_MERGE_OUT0_TO_DSI0),
++	/* Pipe 1: DLI relay 4 (from DISPSYS1) -> DSC core 1 -> DLO relay 1 */
++	MMSYS_ROUTE(DIRECT_LINK_IN, 4, DSC, 1,
++		    MT6897_PANEL_COMP_OUT_CROSSBAR4_MOUT_EN, MT6897_DLI_RELAY4_TO_DSC1,
++		    MT6897_DLI_RELAY4_TO_DSC1),
++	MMSYS_ROUTE(DIRECT_LINK_IN, 4, DSC, 1,
++		    MT6897_PANEL_COMP_OUT_CROSSBAR2_SEL_IN, MT6897_PANEL_COMP_OUT_SEL_IN_MASK,
++		    MT6897_SEL_IN_FROM_DLI_RELAY4),
++	MMSYS_ROUTE(DSC, 1, DIRECT_LINK_OUT, 1,
++		    MT6897_COMP_OUT_CROSSBAR2_MOUT_EN, MT6897_DSC1_TO_MERGE_OUT_CROSSBAR1,
++		    MT6897_DSC1_TO_MERGE_OUT_CROSSBAR1),
++	MMSYS_ROUTE(DSC, 1, DIRECT_LINK_OUT, 1,
++		    MT6897_MERGE_OUT_CROSSBAR1_MOUT_EN, MT6897_MERGE_OUT1_TO_DLO_RELAY1,
++		    MT6897_MERGE_OUT1_TO_DLO_RELAY1),
++	/* DisplayPort: DLI relay 2 (from OVLSYS0) -> DP_INTF0 */
++	MMSYS_ROUTE(DIRECT_LINK_IN, 2, DP_INTF, 0,
++		    MT6897_PQ_IN_CROSSBAR2_MOUT_EN, MT6897_DLI_RELAY2_TO_PQ_OUT_CROSSBAR4,
++		    MT6897_DLI_RELAY2_TO_PQ_OUT_CROSSBAR4),
++	MMSYS_ROUTE(DIRECT_LINK_IN, 2, DP_INTF, 0,
++		    MT6897_PQ_OUT_CROSSBAR4_MOUT_EN, MT6897_PQ_OUT4_TO_PANEL_COMP_OUT2,
++		    MT6897_PQ_OUT4_TO_PANEL_COMP_OUT2),
++	MMSYS_ROUTE(DIRECT_LINK_IN, 2, DP_INTF, 0,
++		    MT6897_PANEL_COMP_OUT_CROSSBAR2_MOUT_EN, MT6897_PQ_OUT2_TO_COMP_OUT_CROSSBAR4,
++		    MT6897_PQ_OUT2_TO_COMP_OUT_CROSSBAR4),
++	MMSYS_ROUTE(DIRECT_LINK_IN, 2, DP_INTF, 0,
++		    MT6897_COMP_OUT_CROSSBAR4_MOUT_EN, MT6897_PANEL_COMP_OUT4_TO_MERGE_OUT_CROSSBAR2,
++		    MT6897_PANEL_COMP_OUT4_TO_MERGE_OUT_CROSSBAR2),
++	MMSYS_ROUTE(DIRECT_LINK_IN, 2, DP_INTF, 0,
++		    MT6897_MERGE_OUT_CROSSBAR2_MOUT_EN, MT6897_MERGE_OUT2_TO_DP_INTF0,
++		    MT6897_MERGE_OUT2_TO_DP_INTF0),
++};
++
++static const struct mtk_mmsys_routes mmsys_mt6897_dispsys1_routing_table[] = {
++	/* Pipe 1: DLI relay 0 -> PQ bypass -> DLO relay 0 (to DSC core 1) */
++	MMSYS_ROUTE(DIRECT_LINK_IN, 0, DIRECT_LINK_OUT, 0,
++		    MT6897_PQ_IN_CROSSBAR0_MOUT_EN, MT6897_CROSSBAR_ALL,
++		    MT6897_DLI_RELAY0_TO_PQ_OUT_CROSSBAR3),
++	MMSYS_ROUTE(DIRECT_LINK_IN, 0, DIRECT_LINK_OUT, 0,
++		    MT6897_PQ_OUT_CROSSBAR3_MOUT_EN, MT6897_CROSSBAR_ALL,
++		    MT6897_PQ_OUT3_TO_PANEL_COMP_OUT1),
++	/* the bootloader's PQ chain must not keep feeding the panel crossbar */
++	MMSYS_ROUTE(DIRECT_LINK_IN, 0, DIRECT_LINK_OUT, 0,
++		    MT6897_PANEL_COMP_OUT_CROSSBAR0_MOUT_EN, MT6897_CROSSBAR_ALL, 0),
++	MMSYS_ROUTE(DIRECT_LINK_IN, 0, DIRECT_LINK_OUT, 0,
++		    MT6897_PANEL_COMP_OUT_CROSSBAR1_MOUT_EN, MT6897_PQ_OUT1_TO_COMP_OUT_CROSSBAR3,
++		    MT6897_PQ_OUT1_TO_COMP_OUT_CROSSBAR3),
++	MMSYS_ROUTE(DIRECT_LINK_IN, 0, DIRECT_LINK_OUT, 0,
++		    MT6897_PANEL_COMP_OUT_CROSSBAR3_SEL_IN, MT6897_PANEL_COMP_OUT_SEL_IN_MASK,
++		    MT6897_SEL_IN_FROM_PQ_OUT1),
++	MMSYS_ROUTE(DIRECT_LINK_IN, 0, DIRECT_LINK_OUT, 0,
++		    MT6897_COMP_OUT_CROSSBAR3_MOUT_EN, MT6897_PANEL_COMP_OUT3_TO_MERGE_OUT_CROSSBAR0,
++		    MT6897_PANEL_COMP_OUT3_TO_MERGE_OUT_CROSSBAR0),
++	MMSYS_ROUTE(DIRECT_LINK_IN, 0, DIRECT_LINK_OUT, 0,
++		    MT6897_MERGE_OUT_CROSSBAR0_MOUT_EN, MT6897_MERGE_OUT0_TO_DLO_RELAY0,
++		    MT6897_MERGE_OUT0_TO_DLO_RELAY0),
++	/* DLI relay 5 (DSC core 1 output from DISPSYS0) -> DSI1 */
++	MMSYS_ROUTE(DIRECT_LINK_IN, 5, DSI, 1,
++		    MT6897_COMP_OUT_CROSSBAR6_MOUT_EN, MT6897_DLI_RELAY5_TO_MERGE_OUT_CROSSBAR1,
++		    MT6897_DLI_RELAY5_TO_MERGE_OUT_CROSSBAR1),
++	MMSYS_ROUTE(DIRECT_LINK_IN, 5, DSI, 1,
++		    MT6897_MERGE_OUT_CROSSBAR1_MOUT_EN, MT6897_MERGE_OUT1_TO_DSI0,
++		    MT6897_MERGE_OUT1_TO_DSI0),
++};
++
++#endif /* __SOC_MEDIATEK_MT6897_MMSYS_H */
+diff --git a/drivers/soc/mediatek/mtk-mmsys.h b/drivers/soc/mediatek/mtk-mmsys.h
+index 5c9319f3a2..e505831990 100644
+--- a/drivers/soc/mediatek/mtk-mmsys.h
++++ b/drivers/soc/mediatek/mtk-mmsys.h
+@@ -141,6 +141,13 @@ struct mtk_mmsys_driver_data {
+ 	const u32 num_resets;
+ 	const bool is_vppsys;
+ 	const u8 vsync_len;
++	/*
++	 * @bypass_mux_shadow: offset of the crossbar shadow control, or 0.
++	 * The crossbar registers are double buffered; without a command
++	 * queue nothing commits them, so bypass the shadow (as the stock
++	 * driver does before every connection).
++	 */
++	const u16 bypass_mux_shadow;
+ };
+ 
+ /*
+diff --git a/include/linux/soc/mediatek/mtk-mmsys.h b/include/linux/soc/mediatek/mtk-mmsys.h
+index e33cb5b263..9a0a7c890f 100644
+--- a/include/linux/soc/mediatek/mtk-mmsys.h
++++ b/include/linux/soc/mediatek/mtk-mmsys.h
+@@ -107,6 +107,7 @@ enum mtk_ddp_comp_type {
+ 	MTK_DISP_OVL_ADAPTOR,
+ 	MTK_DISP_PADDING,
+ 	MTK_DISP_POSTMASK,
++	MTK_DISP_PQ_RELAY,
+ 	MTK_DISP_PWM,
+ 	MTK_DISP_RDMA,
+ 	MTK_DISP_RSZ,
+-- 
+2.56.0
+

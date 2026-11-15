@@ -1,0 +1,786 @@
+From 4db789ea9a0907f95c7509f9a21fd8504d454856 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] drm/mediatek: support MT6897 dual C-PHY DSI
+
+Support MT6897 dual DSI, C-PHY timing and the panel link lifecycle.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T14:13:46+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/gpu/drm/mediatek/mtk_dsi.c | 480 ++++++++++++++++++++++++++++-
+ 1 file changed, 465 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_dsi.c b/drivers/gpu/drm/mediatek/mtk_dsi.c
+index 4680067936..6b99fba419 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dsi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dsi.c
+@@ -17,6 +17,8 @@
+ #include <linux/reset.h>
+ #include <linux/units.h>
+ 
++#include <dt-bindings/phy/phy.h>
++
+ #include <video/mipi_display.h>
+ #include <video/videomode.h>
+ 
+@@ -51,6 +53,7 @@
+ /* DSI_CON_CTRL */
+ #define DSI_RESET			BIT(0)
+ #define DSI_EN				BIT(1)
++#define DSI_DUAL_EN			BIT(4)
+ #define DPHY_RESET			BIT(2)
+ #define CMDMODE_WAIT_DATA_EVERY_LINE_EN	BIT(24)
+ 
+@@ -223,6 +226,8 @@ enum mtk_dsi_main_regidx {
+ 	DSI_PHY_TIMECON1,
+ 	DSI_PHY_TIMECON2,
+ 	DSI_PHY_TIMECON3,
++	DSI_PHY_LCPAT,
++	DSI_CPHY_CON0,
+ 	DSI_MAIN_REG_MAX
+ };
+ 
+@@ -269,6 +274,22 @@ struct mtk_phy_timing {
+ 	u32 clk_hs_exit;
+ };
+ 
++/**
++ * struct mtk_dsi_tx_buf - DSI TX buffer (MT6897 and related SoCs)
++ * @buffer_unit: bytes per buffer unit
++ * @sram_unit: SRAM units per buffer
++ * @in_width: bytes taken per buffer read
++ * @urgent_lo_us: urgent low threshold in microseconds of link data
++ * @urgent_hi_us: urgent high threshold in microseconds of link data
++ */
++struct mtk_dsi_tx_buf {
++	u8 buffer_unit;
++	u8 sram_unit;
++	u8 in_width;
++	u8 urgent_lo_us;
++	u8 urgent_hi_us;
++};
++
+ struct phy;
+ 
+ struct mtk_dsi_driver_data {
+@@ -284,6 +305,9 @@ struct mtk_dsi_driver_data {
+ 	bool has_size_ctl;
+ 	bool cmdq_long_packet_ctl;
+ 	bool support_per_frame_lp;
++	bool has_cphy;
++	/** @tx_buf: TX buffer of the stock driver's v1 layout, or NULL */
++	const struct mtk_dsi_tx_buf *tx_buf;
+ };
+ 
+ struct mtk_dsi {
+@@ -303,6 +327,20 @@ struct mtk_dsi {
+ 	struct clk *hs_clk;
+ 
+ 	u32 data_rate;
++	/* Fixed per-lane (per-trio) bit rate requested by the peripheral */
++	unsigned long hs_rate;
++	/* C-PHY: the link runs at symbol_rate symbols/s per trio */
++	bool cphy;
++	u32 symbol_rate;
++	u32 data_phy_cycles;
++	/*
++	 * Dual DSI: the master drives the slave link. The slave has no encoder;
++	 * with DUAL_EN set, the master's START also starts the slave.
++	 */
++	struct mtk_dsi *slave;
++	/* the slave's master, which owns the video timing of both links */
++	struct mtk_dsi *master;
++	bool is_slave;
+ 
+ 	unsigned long mode_flags;
+ 	enum mipi_dsi_pixel_format format;
+@@ -347,6 +385,8 @@ static const u16 mtk_dsi_regs_main_v1[DSI_MAIN_REG_MAX] = {
+ 	[DSI_PHY_TIMECON1] = 0x114,
+ 	[DSI_PHY_TIMECON2] = 0x118,
+ 	[DSI_PHY_TIMECON3] = 0x11c,
++	[DSI_PHY_LCPAT] = 0x100,
++	[DSI_CPHY_CON0] = 0x120,
+ };
+ 
+ static const u16 mtk_dsi_regs_mt2701[DSI_ADV_REG_MAX] = {
+@@ -404,6 +444,22 @@ static const u16 mtk_dsi_regs_main_v2[DSI_MAIN_REG_MAX] = {
+ 	[DSI_PHY_TIMECON3] = 0x60c,
+ };
+ 
++/* TX buffer block of the stock driver's v1 layout (MT6897) */
++static const u16 mtk_dsi_regs_qos_v1[DSI_QOS_REG_MAX] = {
++	[DSI_QOS_BUF_CON0] = 0x400,
++	[DSI_QOS_BUF_CON1] = 0x404,
++	[DSI_QOS_TX_BUF_RW_TIMES] = 0x410,
++	[DSI_QOS_SODI_HIGH] = 0x414,
++	[DSI_QOS_SODI_LOW] = 0x418,
++	[DSI_QOS_PREULTRA_HIGH] = 0x424,
++	[DSI_QOS_PREULTRA_LOW] = 0x428,
++	[DSI_QOS_ULTRA_HIGH] = 0x42c,
++	[DSI_QOS_ULTRA_LOW] = 0x430,
++	[DSI_QOS_URGENT_HIGH] = 0x434,
++	[DSI_QOS_URGENT_LOW] = 0x438,
++	[DSI_QOS_PREURGENT_HIGH] = 0x43c,
++};
++
+ static const u16 mtk_dsi_regs_qos_v2[DSI_QOS_REG_MAX] = {
+ 	[DSI_QOS_BUF_CON0] = 0x300,
+ 	[DSI_QOS_BUF_CON1] = 0x304,
+@@ -443,6 +499,48 @@ static void mtk_dsi_mask(struct mtk_dsi *dsi, u32 offset, u32 mask, u32 data)
+ 	writel((temp & ~mask) | (data & mask), dsi->regs + offset);
+ }
+ 
++/* LK and the vendor driver: C-PHY timing in symbol-clock units */
++#define DSI_CPHY_HS_ZERO	48
++#define DSI_CPHY_HS_TRAIL	32
++#define DSI_CPHY_CON0_VAL	0x012c0003
++#define DSI_PHY_LCPAT_CPHY	0xaa
++
++static void mtk_dsi_cphy_timconfig(struct mtk_dsi *dsi)
++{
++	u32 sym_mhz = DIV_ROUND_UP(dsi->symbol_rate, HZ_PER_MHZ);
++	struct mtk_phy_timing *timing = &dsi->phy_timing;
++	const u16 *reg_main = dsi->driver_data->reg_main;
++
++	/* LPX and HS-PREPARE must be even, HS-EXIT odd */
++	timing->lpx = ALIGN(sym_mhz * 80 / 7000 + 1, 2);
++	timing->da_hs_prepare = ALIGN(sym_mhz * 50 / 7000 + 1, 2);
++	timing->da_hs_zero = DSI_CPHY_HS_ZERO;
++	timing->da_hs_trail = DSI_CPHY_HS_TRAIL;
++	/* As the vendor computes it: odd, and at least one cycle of margin */
++	timing->da_hs_exit = sym_mhz * 118 / 7000 + 1;
++	timing->da_hs_exit += timing->da_hs_exit % 2 ? 2 : 1;
++
++	timing->ta_go = 4 * timing->lpx;
++	timing->ta_get = 5 * timing->lpx;
++	timing->ta_sure = 3 * timing->lpx / 2;
++
++	dsi->data_phy_cycles = timing->da_hs_prepare + timing->da_hs_zero +
++			       timing->da_hs_exit + timing->lpx + 5;
++
++	writel(FIELD_PREP(LPX, timing->lpx) |
++	       FIELD_PREP(HS_PREP, timing->da_hs_prepare) |
++	       FIELD_PREP(HS_ZERO, timing->da_hs_zero) |
++	       FIELD_PREP(HS_TRAIL, timing->da_hs_trail),
++	       dsi->regs + reg_main[DSI_PHY_TIMECON0]);
++	writel(FIELD_PREP(TA_GO, timing->ta_go) |
++	       FIELD_PREP(TA_SURE, timing->ta_sure) |
++	       FIELD_PREP(TA_GET, timing->ta_get) |
++	       FIELD_PREP(DA_HS_EXIT, timing->da_hs_exit),
++	       dsi->regs + reg_main[DSI_PHY_TIMECON1]);
++	writel(DSI_CPHY_CON0_VAL, dsi->regs + reg_main[DSI_CPHY_CON0]);
++	writel(DSI_PHY_LCPAT_CPHY, dsi->regs + reg_main[DSI_PHY_LCPAT]);
++}
++
+ static void mtk_dsi_phy_timconfig(struct mtk_dsi *dsi)
+ {
+ 	u32 timcon0, timcon1, timcon2, timcon3;
+@@ -450,6 +548,9 @@ static void mtk_dsi_phy_timconfig(struct mtk_dsi *dsi)
+ 	struct mtk_phy_timing *timing = &dsi->phy_timing;
+ 	const u16 *reg_main = dsi->driver_data->reg_main;
+ 
++	if (dsi->cphy)
++		return mtk_dsi_cphy_timconfig(dsi);
++
+ 	timing->lpx = (60 * data_rate_mhz / (8 * 1000)) + 1;
+ 	timing->da_hs_prepare = (80 * data_rate_mhz + 4 * 1000) / 8000;
+ 	timing->da_hs_zero = (170 * data_rate_mhz + 10 * 1000) / 8000 + 1 -
+@@ -768,6 +869,46 @@ static void mtk_dsi_config_vdo_timing_per_frame_lp(struct mtk_dsi *dsi)
+ 	writel(horizontal_frontporch_byte, dsi->regs + reg_main[DSI_HFP_WC]);
+ }
+ 
++/*
++ * C-PHY horizontal porches in bytes, following the vendor driver: the
++ * packet overheads are counted per trio, and the front porch has to cover
++ * the HS exit/entry (data_phy_cycles) on every trio.
++ */
++static void mtk_dsi_config_vdo_timing_cphy(struct mtk_dsi *dsi)
++{
++	const u16 *reg_main = dsi->driver_data->reg_main;
++	struct videomode *vm = &dsi->vm;
++	u32 bpp = dsi->format == MIPI_DSI_FMT_RGB565 ? 2 : 3;
++	u32 hsa = vm->hsync_len * bpp, hbp = vm->hback_porch * bpp;
++	u32 hfp = vm->hfront_porch * bpp;
++	u32 lanes = dsi->lanes, hfp_min, hfp_ovh;
++
++	hsa = hsa < 10 * lanes + 26 + 5 ? 4 : ALIGN(hsa - 10 * lanes - 26, 2);
++	hbp = hbp < 12 * lanes + 26 + 5 ? 4 : ALIGN(hbp - 12 * lanes - 26, 2);
++
++	hfp_ovh = 8 * lanes + 28 + 2 * dsi->data_phy_cycles * lanes;
++	hfp_min = 2 * (32 + 1) * lanes - 6 * lanes - 14;
++	if (hfp < hfp_ovh + 9)
++		hfp = 8;
++	else if (hfp < hfp_ovh + hfp_min)
++		hfp = hfp_min;
++	else
++		hfp -= hfp_ovh;
++
++	/*
++	 * With a non-continuous clock the HS exit/entry wants this minimum;
++	 * the stock driver only reports it, and LK and Android run the
++	 * T880 panel with the same short front porch (HFP_WC 8).
++	 */
++	if ((dsi->mode_flags & MIPI_DSI_CLOCK_NON_CONTINUOUS) && hfp < hfp_min)
++		drm_dbg_kms(dsi->bridge.dev, "C-PHY HFP %u below the minimum %u\n",
++			    hfp / 2, hfp_min / 2);
++
++	writel(hsa, dsi->regs + reg_main[DSI_HSA_WC]);
++	writel(hbp, dsi->regs + reg_main[DSI_HBP_WC]);
++	writel(hfp, dsi->regs + reg_main[DSI_HFP_WC]);
++}
++
+ static void mtk_dsi_config_vdo_timing_per_line_lp(struct mtk_dsi *dsi)
+ {
+ 	const u16 *reg_main = dsi->driver_data->reg_main;
+@@ -851,6 +992,9 @@ static int mtk_dsi_set_dsc_params(struct mtk_dsi *dsi)
+ 		return -EINVAL;
+ 	}
+ 
++	/* The picture is what this link carries (half the screen in dual mode) */
++	dsc->pic_width = dsi->vm.hactive;
++	dsc->pic_height = dsi->vm.vactive;
+ 	dsc->simple_422 = false;
+ 	dsc->convert_rgb = true;
+ 	dsc->vbr_enable = false;
+@@ -858,12 +1002,22 @@ static int mtk_dsi_set_dsc_params(struct mtk_dsi *dsi)
+ 	drm_dsc_set_const_params(dsc);
+ 	drm_dsc_set_rc_buf_thresh(dsc);
+ 
+-	ret = drm_dsc_setup_rc_params(dsc, DRM_DSC_1_2_444);
++	ret = drm_dsc_setup_rc_params(dsc, dsc->dsc_version_minor == 1 ?
++					   DRM_DSC_1_1_PRE_SCR : DRM_DSC_1_2_444);
+ 	if (ret) {
+ 		dev_err(dev, "Cannot find DSC RC params\n");
+ 		return ret;
+ 	}
+ 
++	/*
++	 * DSC 1.1: first line BPG offset from the slice height, as the
++	 * MediaTek stock driver computes it (12 + 0.09 * min(34, sh - 8),
++	 * rounded down) instead of the table's fixed 12.
++	 */
++	if (dsc->dsc_version_minor == 1 && dsc->slice_height >= 8)
++		dsc->first_line_bpg_offset = 12 +
++			(9 * min(34, dsc->slice_height - 8)) / 100;
++
+ 	dsc->initial_scale_value = drm_dsc_initial_scale_value(dsc);
+ 	dsc->line_buf_depth = dsc->bits_per_component + 1;
+ 
+@@ -966,6 +1120,82 @@ static void mtk_dsi_config_hw_buffers(struct mtk_dsi *dsi)
+ 	mtk_dsi_mask(dsi, reg_qos[DSI_QOS_BUF_CON0], DSI_QOS_BUF_EN, DSI_QOS_BUF_EN);
+ }
+ 
++#define DSI_V1_RESERVED			0xf0
++#define DSI_V1_DEBUG_SEL		0x170
++#  define DSI_V1_MM_RST_SEL		BIT(10)
++
++/*
++ * TX buffer of the stock driver's v1 layout, in video mode, with its
++ * formulas (mtk_dsi_tx_buf_rw): the thresholds are microseconds of link
++ * data in buffer units, the output-valid threshold stays 0.
++ */
++static void mtk_dsi_config_tx_buf_v1(struct mtk_dsi *dsi)
++{
++	const struct mtk_dsi_driver_data *data = dsi->driver_data;
++	const struct mtk_dsi_tx_buf *buf = data->tx_buf;
++	const u16 *reg_qos = data->reg_qos;
++	u32 bpp = dsi->format == MIPI_DSI_FMT_RGB565 ? 2 : 3;
++	u32 mmclk_mhz, rate_mhz, fill_rate, buf_size, ps_wc;
++	u32 mul, div;
++	u64 rw_times;
++
++	if (dsi->dsc)
++		ps_wc = dsi->dsc->slice_chunk_size * dsi->dsc->slice_count;
++	else
++		ps_wc = dsi->vm.hactive * bpp;
++	rw_times = DIV_ROUND_UP_ULL((u64)ps_wc * dsi->vm.vactive, buf->in_width);
++
++	mtk_dsi_mask(dsi, reg_qos[DSI_QOS_BUF_CON1], BUF_OUT_VALID_THRESH, 0);
++	mtk_dsi_mask(dsi, DSI_V1_DEBUG_SEL, DSI_V1_MM_RST_SEL, DSI_V1_MM_RST_SEL);
++	/* ULTRA between SOF and VACT */
++	mtk_dsi_mask(dsi, DSI_V1_RESERVED, VDE_BLOCK_ULTRA, 0);
++
++	mmclk_mhz = clk_get_rate(dsi->engine_clk) / HZ_PER_MHZ;
++	if (!mmclk_mhz)
++		mmclk_mhz = 208;
++	fill_rate = mmclk_mhz * bpp / buf->buffer_unit;
++	buf_size = (readl(dsi->regs + reg_qos[DSI_QOS_BUF_CON1]) >> 16) *
++		   buf->sram_unit / buf->buffer_unit;
++
++	/*
++	 * Link bytes per microsecond: rate * lanes * mul / div, C-PHY with
++	 * 16 bits per 7 symbols per trio
++	 */
++	if (dsi->cphy) {
++		rate_mhz = dsi->symbol_rate / HZ_PER_MHZ;
++		mul = 2;
++		div = 7;
++	} else {
++		rate_mhz = dsi->data_rate / HZ_PER_MHZ;
++		mul = 1;
++		div = 8;
++	}
++
++	/* Microseconds of link data in buffer units (the stock rounding) */
++#define MTK_DSI_TX_BUF_US(us) \
++	((us) * rate_mhz * mul * dsi->lanes / div / buf->buffer_unit)
++	writel((buf_size - 12 * (fill_rate - MTK_DSI_TX_BUF_US(1)) / 10) &
++	       BUF_THRESHOLD_PARAM, dsi->regs + reg_qos[DSI_QOS_SODI_HIGH]);
++	writel(MTK_DSI_TX_BUF_US(23 + 5) & BUF_THRESHOLD_PARAM,
++	       dsi->regs + reg_qos[DSI_QOS_SODI_LOW]);
++	writel(MTK_DSI_TX_BUF_US(26) & BUF_THRESHOLD_PARAM,
++	       dsi->regs + reg_qos[DSI_QOS_PREULTRA_HIGH]);
++	writel(MTK_DSI_TX_BUF_US(25) & BUF_THRESHOLD_PARAM,
++	       dsi->regs + reg_qos[DSI_QOS_PREULTRA_LOW]);
++	writel(MTK_DSI_TX_BUF_US(25) & BUF_THRESHOLD_PARAM,
++	       dsi->regs + reg_qos[DSI_QOS_ULTRA_HIGH]);
++	writel(MTK_DSI_TX_BUF_US(23) & BUF_THRESHOLD_PARAM,
++	       dsi->regs + reg_qos[DSI_QOS_ULTRA_LOW]);
++	writel(MTK_DSI_TX_BUF_US(buf->urgent_hi_us) & BUF_THRESHOLD_PARAM,
++	       dsi->regs + reg_qos[DSI_QOS_URGENT_HIGH]);
++	writel(MTK_DSI_TX_BUF_US(buf->urgent_lo_us) & BUF_THRESHOLD_PARAM,
++	       dsi->regs + reg_qos[DSI_QOS_URGENT_LOW]);
++#undef MTK_DSI_TX_BUF_US
++	writel(rw_times, dsi->regs + reg_qos[DSI_QOS_TX_BUF_RW_TIMES]);
++
++	mtk_dsi_mask(dsi, reg_qos[DSI_QOS_BUF_CON0], DSI_QOS_BUF_EN, DSI_QOS_BUF_EN);
++}
++
+ static int mtk_dsi_config_vdo_timing(struct mtk_dsi *dsi)
+ {
+ 	const struct mtk_dsi_driver_data *data = dsi->driver_data;
+@@ -978,7 +1208,9 @@ static int mtk_dsi_config_vdo_timing(struct mtk_dsi *dsi)
+ 	writel(vm->vfront_porch, dsi->regs + reg_main[DSI_VFP_NL]);
+ 	writel(vm->vactive, dsi->regs + reg_main[DSI_VACT_NL]);
+ 
+-	if (data->support_per_frame_lp)
++	if (dsi->cphy)
++		mtk_dsi_config_vdo_timing_cphy(dsi);
++	else if (data->support_per_frame_lp)
+ 		mtk_dsi_config_vdo_timing_per_frame_lp(dsi);
+ 	else
+ 		mtk_dsi_config_vdo_timing_per_line_lp(dsi);
+@@ -1118,10 +1350,21 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
+ 	}
+ 	bit_per_pixel = ret;
+ 
+-	dsi->data_rate = DIV_ROUND_UP_ULL((u64)dsi->vm.pixelclock * bit_per_pixel,
+-					  dsi->lanes);
++	/* With DSC the link carries the compressed stream */
++	if (dsi->dsc)
++		bit_per_pixel = dsi->dsc->bits_per_pixel >> 4;
++
++	/* A peripheral with a fixed link rate states it in hs_rate */
++	if (dsi->hs_rate)
++		dsi->data_rate = dsi->hs_rate;
++	else
++		dsi->data_rate = DIV_ROUND_UP_ULL((u64)dsi->vm.pixelclock * bit_per_pixel,
++						  dsi->lanes);
++
++	/* A C-PHY trio carries 16 bits per 7 symbols */
++	dsi->symbol_rate = DIV_ROUND_CLOSEST_ULL((u64)dsi->data_rate * 7, 16);
+ 
+-	ret = clk_set_rate(dsi->hs_clk, dsi->data_rate);
++	ret = clk_set_rate(dsi->hs_clk, dsi->cphy ? dsi->symbol_rate : dsi->data_rate);
+ 	if (ret < 0) {
+ 		dev_err(dev, "Failed to set data rate: %d\n", ret);
+ 		goto err_refcount;
+@@ -1149,10 +1392,23 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
+ 		       dsi->regs + data->reg_adv[DSI_SHADOW_DEBUG]);
+ 
+ 	mtk_dsi_reset_engine(dsi);
++	/*
++	 * A bootloader may have left the link running in video mode, which
++	 * the engine reset does not clear: stop it and start from command
++	 * mode, so that the peripheral's commands do not wait for the end of
++	 * a video frame that never comes.
++	 */
++	mtk_dsi_stop(dsi);
++	mtk_dsi_set_cmd_mode(dsi);
++	/* Commands go out per link; the master sets DUAL_EN again for video */
++	if (dsi->is_slave)
++		mtk_dsi_mask(dsi, data->reg_main[DSI_CON_CTRL], DSI_DUAL_EN, 0);
+ 	mtk_dsi_phy_timconfig(dsi);
+ 
+ 	/* Setup HW FIFO if DSI supports QoS Anti-Latency buffers */
+-	if (data->dsi_sram_bytes && data->reg_qos)
++	if (data->tx_buf)
++		mtk_dsi_config_tx_buf_v1(dsi);
++	else if (data->dsi_sram_bytes && data->reg_qos)
+ 		mtk_dsi_config_hw_buffers(dsi);
+ 
+ 	mtk_dsi_ps_control(dsi, true);
+@@ -1163,6 +1419,20 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
+ 
+ 	mtk_dsi_set_interrupt_enable(dsi);
+ 
++	if (dsi->slave) {
++		if (dsi->slave->lanes != dsi->lanes || dsi->slave->format != dsi->format) {
++			dev_err(dev, "The slave DSI link is not attached or differs\n");
++			ret = -EINVAL;
++			goto err_disable_dsi_and_digital_clk;
++		}
++		dsi->slave->vm = dsi->vm;
++		ret = mtk_dsi_poweron(dsi->slave);
++		if (ret) {
++			dev_err(dev, "Failed to power on the slave DSI: %d\n", ret);
++			goto err_disable_dsi_and_digital_clk;
++		}
++	}
++
+ 	return 0;
+ 
+ err_disable_dsi_and_digital_clk:
+@@ -1179,6 +1449,8 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
+ 
+ static void mtk_dsi_poweroff(struct mtk_dsi *dsi)
+ {
++	bool video;
++
+ 	if (WARN_ON(dsi->refcount == 0))
+ 		return;
+ 
+@@ -1192,9 +1464,23 @@ static void mtk_dsi_poweroff(struct mtk_dsi *dsi)
+ 	 * mtk_dsi_start() needs to be called in mtk_output_dsi_enable(),
+ 	 * after dsi is fully set.
+ 	 */
++	video = readl(dsi->regs + dsi->driver_data->reg_main[DSI_MODE_CTRL]) & MODE;
+ 	mtk_dsi_stop(dsi);
+ 
+-	mtk_dsi_switch_to_cmd_mode(dsi, VM_DONE_INT_FLAG, 500);
++	/*
++	 * The panel's off commands may already have stopped video (the
++	 * bridges are post-disabled before the CRTC), so no VM_DONE comes.
++	 * Keep the time it took to wait for it: skipping the wait broke the
++	 * right pipe of the dual-DSI T880 at the next enable (S5b; root
++	 * cause not known yet), but do not report the expected timeout.
++	 */
++	if (video) {
++		if (mtk_dsi_switch_to_cmd_mode(dsi, VM_DONE_INT_FLAG, 500))
++			drm_err(dsi->bridge.dev, "failed to switch cmd mode\n");
++	} else {
++		mtk_dsi_set_cmd_mode(dsi);
++		msleep(500);
++	}
+ 	mtk_dsi_reset_engine(dsi);
+ 	mtk_dsi_lane0_ulp_mode_enter(dsi);
+ 	mtk_dsi_clk_ulp_mode_enter(dsi);
+@@ -1209,6 +1495,12 @@ static void mtk_dsi_poweroff(struct mtk_dsi *dsi)
+ 	phy_power_off(dsi->phy);
+ 
+ 	dsi->lanes_ready = false;
++
++	if (dsi->slave) {
++		mtk_dsi_mask(dsi->slave, dsi->slave->driver_data->reg_main[DSI_CON_CTRL],
++			     DSI_DUAL_EN, 0);
++		mtk_dsi_poweroff(dsi->slave);
++	}
+ }
+ 
+ static void mtk_output_dsi_enable(struct mtk_dsi *dsi)
+@@ -1217,6 +1509,17 @@ static void mtk_output_dsi_enable(struct mtk_dsi *dsi)
+ 		return;
+ 
+ 	mtk_dsi_set_mode(dsi);
++	if (dsi->slave) {
++		/*
++		 * Commands went out per link; video runs in lockstep, started
++		 * by the master only (the slave's START is still set from its
++		 * last command).
++		 */
++		mtk_dsi_stop(dsi->slave);
++		mtk_dsi_set_mode(dsi->slave);
++		mtk_dsi_mask(dsi->slave, dsi->slave->driver_data->reg_main[DSI_CON_CTRL],
++			     DSI_DUAL_EN, DSI_DUAL_EN);
++	}
+ 	mtk_dsi_start(dsi);
+ 
+ 	dsi->enabled = true;
+@@ -1248,6 +1551,12 @@ static void mtk_dsi_bridge_mode_set(struct drm_bridge *bridge,
+ 	struct mtk_dsi *dsi = bridge_to_dsi(bridge);
+ 
+ 	drm_display_mode_to_videomode(adjusted, &dsi->vm);
++
++	/* Dual DSI: each link carries one half, with the mode's porches */
++	if (dsi->slave) {
++		dsi->vm.hactive /= 2;
++		dsi->vm.pixelclock /= 2;
++	}
+ }
+ 
+ static void mtk_dsi_bridge_atomic_disable(struct drm_bridge *bridge,
+@@ -1282,6 +1591,10 @@ static void mtk_dsi_bridge_atomic_pre_enable(struct drm_bridge *bridge,
+ 
+ 	mtk_dsi_lane_ready(dsi);
+ 	mtk_dsi_clk_hs_mode(dsi, 1);
++	if (dsi->slave) {
++		mtk_dsi_lane_ready(dsi->slave);
++		mtk_dsi_clk_hs_mode(dsi->slave, 1);
++	}
+ }
+ 
+ static void mtk_dsi_bridge_atomic_post_disable(struct drm_bridge *bridge,
+@@ -1306,14 +1619,26 @@ mtk_dsi_bridge_mode_valid(struct drm_bridge *bridge,
+ 	if (bpp < 0)
+ 		return MODE_ERROR;
+ 
++	/* With DSC the link carries the compressed stream */
++	if (dsi->dsc)
++		bpp = dsi->dsc->bits_per_pixel >> 4;
++
++	/* In kbps over all lanes of this link; dual DSI splits the mode */
+ 	wanted_link_rate = mode->clock;
+ 	wanted_link_rate *= bpp;
++	if (dsi->slave)
++		wanted_link_rate /= 2;
+ 	max_link_rate = data->max_link_rate_mbps;
+ 	max_link_rate *= dsi->lanes;
+ 	max_link_rate *= KILO;
+ 
+-	if (wanted_link_rate > max_link_rate)
++	/* A peripheral with a fixed link rate states it per lane in hs_rate */
++	if (dsi->hs_rate) {
++		if (dsi->hs_rate > (unsigned long)data->max_link_rate_mbps * HZ_PER_MHZ)
++			return MODE_CLOCK_HIGH;
++	} else if (wanted_link_rate > max_link_rate) {
+ 		return MODE_CLOCK_HIGH;
++	}
+ 
+ 	if (dsi->dsc) {
+ 		if (dsi->dsc->slice_width == 0 || dsi->dsc->slice_height == 0) {
+@@ -1367,6 +1692,14 @@ void mtk_dsi_ddp_stop(struct device *dev)
+ 	mtk_dsi_poweroff(dsi);
+ }
+ 
++/* The dual-DSI slave driven by this master, if any */
++struct device *mtk_dsi_get_slave_dev(struct device *dev)
++{
++	struct mtk_dsi *dsi = dev_get_drvdata(dev);
++
++	return dsi->slave ? dsi->slave->host.dev : NULL;
++}
++
+ struct drm_dsc_config *mtk_dsi_get_dsc_config(struct device *dev)
+ {
+ 	struct mtk_dsi *dsi = dev_get_drvdata(dev);
+@@ -1424,6 +1757,12 @@ static int mtk_dsi_bind(struct device *dev, struct device *master, void *data)
+ 	struct drm_device *drm = data;
+ 	struct mtk_dsi *dsi = dev_get_drvdata(dev);
+ 
++	/* A dual-DSI slave has no encoder of its own */
++	if (dsi->is_slave) {
++		enable_irq(dsi->irq);
++		return 0;
++	}
++
+ 	ret = mtk_dsi_encoder_init(drm, dsi);
+ 	if (ret)
+ 		return ret;
+@@ -1446,7 +1785,8 @@ static void mtk_dsi_unbind(struct device *dev, struct device *master,
+ 
+ 	disable_irq(dsi->irq);
+ 
+-	drm_encoder_cleanup(&dsi->encoder);
++	if (!dsi->is_slave)
++		drm_encoder_cleanup(&dsi->encoder);
+ }
+ 
+ static const struct component_ops mtk_dsi_component_ops = {
+@@ -1454,6 +1794,37 @@ static const struct component_ops mtk_dsi_component_ops = {
+ 	.unbind = mtk_dsi_unbind,
+ };
+ 
++static int mtk_dsi_get_slave(struct mtk_dsi *dsi)
++{
++	struct device_node *np;
++	struct platform_device *pdev;
++	struct mtk_dsi *slave;
++
++	np = of_parse_phandle(dsi->host.dev->of_node, "mediatek,dual-dsi-slave", 0);
++	if (!np)
++		return 0;
++
++	pdev = of_find_device_by_node(np);
++	of_node_put(np);
++	if (!pdev)
++		return -EPROBE_DEFER;
++
++	slave = platform_get_drvdata(pdev);
++	put_device(&pdev->dev);
++	if (!slave || !slave->is_slave)
++		return -EPROBE_DEFER;
++
++	/* The panel attaches the slave link after this one */
++	if (slave->cphy != dsi->cphy) {
++		dev_err(dsi->host.dev, "Dual DSI links differ in PHY type\n");
++		return -EINVAL;
++	}
++
++	dsi->slave = slave;
++	slave->master = dsi;
++	return 0;
++}
++
+ static int mtk_dsi_host_attach(struct mipi_dsi_host *host,
+ 			       struct mipi_dsi_device *device)
+ {
+@@ -1465,6 +1836,24 @@ static int mtk_dsi_host_attach(struct mipi_dsi_host *host,
+ 	dsi->lanes = device->lanes;
+ 	dsi->format = device->format;
+ 	dsi->mode_flags = device->mode_flags;
++	dsi->hs_rate = device->hs_rate;
++
++	if (dsi->is_slave) {
++		/*
++		 * No bridge: the master drives this link. The component is
++		 * still registered, as the slave is part of a display path.
++		 */
++		dsi->dsc = device->dsc;
++		ret = component_add(host->dev, &mtk_dsi_component_ops);
++		if (ret)
++			dsi->dsc = NULL;
++		return ret;
++	}
++
++	ret = mtk_dsi_get_slave(dsi);
++	if (ret)
++		return ret;
++
+ 	dsi->next_bridge = devm_drm_of_get_bridge(dev, dev->of_node, 1, 0);
+ 	if (IS_ERR(dsi->next_bridge)) {
+ 		ret = PTR_ERR(dsi->next_bridge);
+@@ -1498,9 +1887,17 @@ static int mtk_dsi_host_detach(struct mipi_dsi_host *host,
+ {
+ 	struct mtk_dsi *dsi = host_to_dsi(host);
+ 
++	if (dsi->is_slave) {
++		component_del(host->dev, &mtk_dsi_component_ops);
++		dsi->lanes = 0;
++		dsi->dsc = NULL;
++		return 0;
++	}
++
+ 	component_del(host->dev, &mtk_dsi_component_ops);
+ 	drm_bridge_remove(&dsi->bridge);
+ 	dsi->dsc = NULL;
++	dsi->slave = NULL;
+ 
+ 	return 0;
+ }
+@@ -1610,13 +2007,29 @@ static ssize_t mtk_dsi_host_transfer(struct mipi_dsi_host *host,
+ 	u8 read_data[16];
+ 	void *src_addr;
+ 	u8 irq_flag = CMD_DONE_INT_FLAG;
++	/*
++	 * Dual DSI: the master runs the video of both links (the slave
++	 * follows with DUAL_EN and raises no VM_DONE of its own), so stop
++	 * and restore video through the master for either link.
++	 */
++	struct mtk_dsi *lead = dsi->master ?: dsi;
++	bool restore;
+ 	u32 dsi_mode;
+ 	int ret, i;
+ 
+-	dsi_mode = readl(dsi->regs + dsi->driver_data->reg_main[DSI_MODE_CTRL]);
++	dsi_mode = readl(lead->regs + lead->driver_data->reg_main[DSI_MODE_CTRL]);
++	/* Once the bridge is disabled, video stays off (panel off commands) */
++	restore = (dsi_mode & MODE) && lead->enabled;
+ 	if (dsi_mode & MODE) {
+-		mtk_dsi_stop(dsi);
+-		ret = mtk_dsi_switch_to_cmd_mode(dsi, VM_DONE_INT_FLAG, 500);
++		mtk_dsi_stop(lead);
++		ret = mtk_dsi_switch_to_cmd_mode(lead, VM_DONE_INT_FLAG, 500);
++		if (lead->slave) {
++			mtk_dsi_stop(lead->slave);
++			mtk_dsi_set_cmd_mode(lead->slave);
++			mtk_dsi_mask(lead->slave,
++				     lead->slave->driver_data->reg_main[DSI_CON_CTRL],
++				     DSI_DUAL_EN, 0);
++		}
+ 		if (ret)
+ 			goto restore_dsi_mode;
+ 	}
+@@ -1665,9 +2078,15 @@ static ssize_t mtk_dsi_host_transfer(struct mipi_dsi_host *host,
+ 		 recv_cnt, *((u8 *)(msg->tx_buf)));
+ 
+ restore_dsi_mode:
+-	if (dsi_mode & MODE) {
+-		mtk_dsi_set_mode(dsi);
+-		mtk_dsi_start(dsi);
++	if (restore) {
++		if (lead->slave) {
++			mtk_dsi_set_mode(lead->slave);
++			mtk_dsi_mask(lead->slave,
++				     lead->slave->driver_data->reg_main[DSI_CON_CTRL],
++				     DSI_DUAL_EN, DSI_DUAL_EN);
++		}
++		mtk_dsi_set_mode(lead);
++		mtk_dsi_start(lead);
+ 	}
+ 
+ 	return ret < 0 ? ret : recv_cnt;
+@@ -1683,6 +2102,7 @@ static int mtk_dsi_probe(struct platform_device *pdev)
+ {
+ 	struct mtk_dsi *dsi;
+ 	struct device *dev = &pdev->dev;
++	u32 phy_type;
+ 	int ret;
+ 
+ 	dsi = devm_drm_bridge_alloc(dev, struct mtk_dsi, bridge,
+@@ -1715,6 +2135,16 @@ static int mtk_dsi_probe(struct platform_device *pdev)
+ 	if (IS_ERR(dsi->phy))
+ 		return dev_err_probe(dev, PTR_ERR(dsi->phy), "Failed to get MIPI-DPHY\n");
+ 
++	/* The PHY node selects C-PHY (phy-type), as for the MIPI TX driver */
++	if (!of_property_read_u32(dsi->phy->dev.of_node, "phy-type", &phy_type) &&
++	    phy_type == PHY_TYPE_CPHY) {
++		if (!dsi->driver_data->has_cphy)
++			return dev_err_probe(dev, -EINVAL, "C-PHY is not supported\n");
++		dsi->cphy = true;
++	}
++
++	dsi->is_slave = of_property_present(dev->of_node, "mediatek,dual-dsi-master");
++
+ 	dsi->irq = platform_get_irq(pdev, 0);
+ 	if (dsi->irq < 0)
+ 		return dsi->irq;
+@@ -1779,6 +2209,25 @@ static const struct mtk_dsi_driver_data mt8186_dsi_driver_data = {
+ 	.has_size_ctl = true,
+ };
+ 
++static const struct mtk_dsi_tx_buf mt6897_dsi_tx_buf = {
++	.buffer_unit = 32,
++	.sram_unit = 18,
++	.in_width = 9,
++	.urgent_lo_us = 14,
++	.urgent_hi_us = 15,
++};
++
++/* MT6897: MT8186-style registers (VM_CMD at 0x200, CMDQ at 0xd00), no shadow */
++static const struct mtk_dsi_driver_data mt6897_dsi_driver_data = {
++	.reg_main = mtk_dsi_regs_main_v1,
++	.reg_adv = mtk_dsi_regs_mt8186,
++	.max_link_rate_mbps = 2500,
++	.has_size_ctl = true,
++	.has_cphy = true,
++	.reg_qos = mtk_dsi_regs_qos_v1,
++	.tx_buf = &mt6897_dsi_tx_buf,
++};
++
+ static const struct mtk_dsi_driver_data mt8188_dsi_driver_data = {
+ 	.reg_main = mtk_dsi_regs_main_v1,
+ 	.reg_adv = mtk_dsi_regs_mt8186,
+@@ -1813,6 +2262,7 @@ static const struct mtk_dsi_driver_data mt8196_dsi_driver_data = {
+ static const struct of_device_id mtk_dsi_of_match[] = {
+ 	{ .compatible = "mediatek,mt2701-dsi", .data = &mt2701_dsi_driver_data },
+ 	{ .compatible = "mediatek,mt8167-dsi", .data = &mt2701_dsi_driver_data },
++	{ .compatible = "mediatek,mt6897-dsi", .data = &mt6897_dsi_driver_data },
+ 	{ .compatible = "mediatek,mt8173-dsi", .data = &mt8173_dsi_driver_data },
+ 	{ .compatible = "mediatek,mt8183-dsi", .data = &mt8183_dsi_driver_data },
+ 	{ .compatible = "mediatek,mt8186-dsi", .data = &mt8186_dsi_driver_data },
+-- 
+2.56.0
+

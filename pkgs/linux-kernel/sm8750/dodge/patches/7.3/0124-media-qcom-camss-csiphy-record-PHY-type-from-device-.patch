@@ -1,0 +1,77 @@
+From 48776ee4ac72a557868b1e625f04d53fb3e731ae Mon Sep 17 00:00:00 2001
+From: Anusha Arun Nandi <anusha.nandi@oss.qualcomm.com>
+Date: Fri, 16 Oct 2026 20:52:20 -0700
+Subject: [PATCH 129/144] media: qcom: camss: csiphy: record PHY type from
+ device-tree bus-type
+
+The CSIPHY lane configuration only tracked D-PHY, and
+camss_parse_endpoint_node() rejected any endpoint whose bus-type was
+not V4L2_MBUS_CSI2_DPHY. To support C-PHY sensors, record the PHY type
+(D-PHY or C-PHY) parsed from the device-tree endpoint bus-type into
+struct csiphy_lanes_cfg, and accept C-PHY endpoints.
+
+This is consumed by subsequent patches that adjust the link-frequency
+calculation and PHY configuration for C-PHY operation. No functional
+change for D-PHY: phy_cfg is set to V4L2_MBUS_CSI2_DPHY and existing
+behaviour is retained.
+
+Co-developed-by: David Heidelberg <david@ixit.cz>
+Signed-off-by: David Heidelberg <david@ixit.cz>
+Signed-off-by: Anusha Arun Nandi <anusha.nandi@oss.qualcomm.com>
+Link: https://lore.kernel.org/r/20261017035221.3816464-2-anusha.nandi@oss.qualcomm.com
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0165-media-qcom-camss-csiphy-record-PHY-type-from-device-.patch
+Import-SHA256: ad84d03a57701645bc2a1bf2d0c9a631ba5c0810231e7d36514f86146ea83bd1
+Import-Provenance: mail headers
+(cherry picked from commit 57d5315952a00a8ca4bce1068dbc0d318eba46a9)
+---
+ drivers/media/platform/qcom/camss/camss-csiphy.h | 2 ++
+ drivers/media/platform/qcom/camss/camss.c        | 9 ++++++---
+ 2 files changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/media/platform/qcom/camss/camss-csiphy.h b/drivers/media/platform/qcom/camss/camss-csiphy.h
+index 8c3319f2ca..fff504d2d4 100644
+--- a/drivers/media/platform/qcom/camss/camss-csiphy.h
++++ b/drivers/media/platform/qcom/camss/camss-csiphy.h
+@@ -35,11 +35,13 @@ struct csiphy_lane {
+  * @num_data: number of data lanes
+  * @data:     data lanes configuration
+  * @clk:      clock lane configuration (only for D-PHY)
++ * @phy_cfg:  PHY type in use (D-PHY or C-PHY)
+  */
+ struct csiphy_lanes_cfg {
+ 	int num_data;
+ 	struct csiphy_lane *data;
+ 	struct csiphy_lane clk;
++	enum v4l2_mbus_type phy_cfg;
+ };
+ 
+ struct csiphy_csi2_cfg {
+diff --git a/drivers/media/platform/qcom/camss/camss.c b/drivers/media/platform/qcom/camss/camss.c
+index 7d698700e3..e4a9f7c58f 100644
+--- a/drivers/media/platform/qcom/camss/camss.c
++++ b/drivers/media/platform/qcom/camss/camss.c
+@@ -5173,10 +5173,12 @@ static int camss_parse_endpoint_node(struct device *dev,
+ 		return ret;
+ 
+ 	/*
+-	 * Most SoCs support both D-PHY and C-PHY standards, but currently only
+-	 * D-PHY is supported in the driver.
++	 * Most SoCs support both D-PHY and C-PHY standards. Record the PHY type
++	 * in use so that later stages (link-frequency calculation and PHY
++	 * configuration) can account for the encoding differences between them.
+ 	 */
+-	if (vep.bus_type != V4L2_MBUS_CSI2_DPHY) {
++	if (vep.bus_type != V4L2_MBUS_CSI2_DPHY &&
++	    vep.bus_type != V4L2_MBUS_CSI2_CPHY) {
+ 		dev_err(dev, "Unsupported bus type %d\n", vep.bus_type);
+ 		return -EINVAL;
+ 	}
+@@ -5184,6 +5186,7 @@ static int camss_parse_endpoint_node(struct device *dev,
+ 	csd->interface.csiphy_id = vep.base.port;
+ 
+ 	mipi_csi2 = &vep.bus.mipi_csi2;
++	lncfg->phy_cfg = vep.bus_type;
+ 	lncfg->clk.pos = mipi_csi2->clock_lane;
+ 	lncfg->clk.pol = mipi_csi2->lane_polarities[0];
+ 	lncfg->num_data = mipi_csi2->num_data_lanes;

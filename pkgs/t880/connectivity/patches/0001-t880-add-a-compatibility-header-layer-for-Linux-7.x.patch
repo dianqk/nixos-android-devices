@@ -1,0 +1,202 @@
+From c2d0abaff2965f44ee0360256814de754c860624 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 16 Oct 2026 12:20:48 +0800
+Subject: [PATCH] t880: add a compatibility header layer for Linux 7.x
+
+The vendor connectivity drivers target Android kernels and MediaTek
+platform headers. Add a force-included header with the renamed kernel
+APIs (timers, alarm, strncpy, the connsys SiP SMC id) and minimal stub
+headers for the MediaTek platform interfaces these drivers include but
+do not need on a mainline kernel (EMI, CCCI, build-in adapter, display
+notifier, connsys power throttling), plus <asm/unaligned.h> and the
+legacy of_gpio helper used by the Bluetooth driver.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ compat/include/asm/unaligned.h                |  3 ++
+ compat/include/conn_power_throttling.h        | 42 +++++++++++++++++++
+ .../include/connectivity_build_in_adapter.h   |  5 +++
+ compat/include/linux/of_gpio.h                | 12 ++++++
+ compat/include/mtk_ccci_common.h              |  2 +
+ compat/include/mtk_disp_notify.h              | 12 ++++++
+ compat/include/soc/mediatek/emi.h             |  2 +
+ compat/t880_compat.h                          | 40 ++++++++++++++++++
+ 8 files changed, 118 insertions(+)
+ create mode 100644 compat/include/asm/unaligned.h
+ create mode 100644 compat/include/conn_power_throttling.h
+ create mode 100644 compat/include/connectivity_build_in_adapter.h
+ create mode 100644 compat/include/linux/of_gpio.h
+ create mode 100644 compat/include/mtk_ccci_common.h
+ create mode 100644 compat/include/mtk_disp_notify.h
+ create mode 100644 compat/include/soc/mediatek/emi.h
+ create mode 100644 compat/t880_compat.h
+
+diff --git a/compat/include/asm/unaligned.h b/compat/include/asm/unaligned.h
+new file mode 100644
+index 0000000..f5d94b5
+--- /dev/null
++++ b/compat/include/asm/unaligned.h
+@@ -0,0 +1,3 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* T880 port: <asm/unaligned.h> moved to <linux/unaligned.h> (6.12). */
++#include <linux/unaligned.h>
+diff --git a/compat/include/conn_power_throttling.h b/compat/include/conn_power_throttling.h
+new file mode 100644
+index 0000000..b000845
+--- /dev/null
++++ b/compat/include/conn_power_throttling.h
+@@ -0,0 +1,42 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * T880 port: types of the MediaTek connsys power-throttling interface
++ * (connadp/power_throttling/conn_power_throttling.h) with no-op calls. The
++ * mainline kernel has no low-battery/thermal arbitration for connsys; the
++ * drivers keep their default (unthrottled) level.
++ */
++#ifndef T880_CONN_POWER_THROTTLING_H
++#define T880_CONN_POWER_THROTTLING_H
++enum conn_pwr_drv_type {
++	CONN_PRW_DRV_ALL = -1,
++	CONN_PWR_DRV_BT = 0,
++	CONN_PWR_DRV_FM = 1,
++	CONN_PWR_DRV_GPS = 2,
++	CONN_PWR_DRV_WIFI = 3,
++	CONN_PWR_DRV_MAX
++};
++enum conn_pwr_low_battery_level {
++	CONN_PWR_THR_LV_0 = 0,
++	CONN_PWR_THR_LV_1 = 1,
++	CONN_PWR_THR_LV_2 = 2,
++	CONN_PWR_THR_LV_3 = 3,
++	CONN_PWR_THR_LV_4 = 4,
++	CONN_PWR_THR_LV_5 = 5,
++	CONN_PWR_LOW_BATTERY_MAX
++};
++enum conn_pwr_event_type {
++	CONN_PWR_EVENT_LEVEL = 0,
++	CONN_PWR_EVENT_MAX_TEMP = 1,
++	CONN_PWR_EVENT_MAX
++};
++struct conn_pwr_event_max_temp {
++	int max_temp;
++	int recovery_temp;
++};
++typedef int (*CONN_PWR_EVENT_CB)(enum conn_pwr_event_type type, void *data);
++static inline int conn_pwr_register_event_cb(enum conn_pwr_drv_type type, CONN_PWR_EVENT_CB cb) { return 0; }
++static inline int conn_pwr_drv_pre_on(enum conn_pwr_drv_type type, enum conn_pwr_low_battery_level *level) { return 0; }
++static inline int conn_pwr_drv_post_off(enum conn_pwr_drv_type type) { return 0; }
++static inline int conn_pwr_get_drv_level(enum conn_pwr_drv_type type, enum conn_pwr_low_battery_level *level) { *level = CONN_PWR_THR_LV_0; return 0; }
++static inline int conn_pwr_notify_event(enum conn_pwr_drv_type drv, enum conn_pwr_event_type event, void *data) { return 0; }
++#endif
+diff --git a/compat/include/connectivity_build_in_adapter.h b/compat/include/connectivity_build_in_adapter.h
+new file mode 100644
+index 0000000..80174a6
+--- /dev/null
++++ b/compat/include/connectivity_build_in_adapter.h
+@@ -0,0 +1,5 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* T880 out-of-tree build: the vendor built-in adapter is not available. */
++#ifndef CONNECTIVITY_BUILD_IN_ADAPTER_H
++#define CONNECTIVITY_BUILD_IN_ADAPTER_H
++#endif
+diff --git a/compat/include/linux/of_gpio.h b/compat/include/linux/of_gpio.h
+new file mode 100644
+index 0000000..466eaa8
+--- /dev/null
++++ b/compat/include/linux/of_gpio.h
+@@ -0,0 +1,12 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* T880 port: the legacy of_gpio API is gone; nothing here needs a GPIO. */
++#ifndef T880_OF_GPIO_H
++#define T880_OF_GPIO_H
++#include <linux/errno.h>
++#include <linux/gpio.h>
++#include <linux/of.h>
++static inline int of_get_named_gpio(const struct device_node *np, const char *propname, int index)
++{
++	return -ENOENT;
++}
++#endif
+diff --git a/compat/include/mtk_ccci_common.h b/compat/include/mtk_ccci_common.h
+new file mode 100644
+index 0000000..a5a2159
+--- /dev/null
++++ b/compat/include/mtk_ccci_common.h
+@@ -0,0 +1,2 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* T880 out-of-tree build: vendor header not available (unused paths). */
+diff --git a/compat/include/mtk_disp_notify.h b/compat/include/mtk_disp_notify.h
+new file mode 100644
+index 0000000..2c33e2d
+--- /dev/null
++++ b/compat/include/mtk_disp_notify.h
+@@ -0,0 +1,12 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* T880 port: no MediaTek display notifier; registration is a no-op. */
++#ifndef _MTK_DISP_NOTIFY_H_
++#define _MTK_DISP_NOTIFY_H_
++#include <linux/notifier.h>
++#define MTK_DISP_EARLY_EVENT_BLANK 0x00
++#define MTK_DISP_EVENT_BLANK 0x01
++#define MTK_DISP_BLANK_UNBLANK 0x00
++#define MTK_DISP_BLANK_POWERDOWN 0x01
++static inline int mtk_disp_notifier_register(const char *source, struct notifier_block *nb) { return 0; }
++static inline int mtk_disp_notifier_unregister(struct notifier_block *nb) { return 0; }
++#endif
+diff --git a/compat/include/soc/mediatek/emi.h b/compat/include/soc/mediatek/emi.h
+new file mode 100644
+index 0000000..a5a2159
+--- /dev/null
++++ b/compat/include/soc/mediatek/emi.h
+@@ -0,0 +1,2 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* T880 out-of-tree build: vendor header not available (unused paths). */
+diff --git a/compat/t880_compat.h b/compat/t880_compat.h
+new file mode 100644
+index 0000000..538e578
+--- /dev/null
++++ b/compat/t880_compat.h
+@@ -0,0 +1,40 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Out-of-tree build of the MediaTek connectivity stack on mainline. */
++#ifndef T880_COMPAT_H
++#define T880_COMPAT_H
++#include <linux/string.h>
++#include <linux/vmalloc.h>
++#include <linux/timer.h>
++#include <linux/slab.h>
++
++/* MediaTek SiP SMC for the connsys (vendor mtk_sip_svc.h) */
++#ifndef MTK_SIP_KERNEL_CONNSYS_CONTROL
++#define MTK_SIP_KERNEL_CONNSYS_CONTROL	0xC2000534
++#endif
++
++#include <linux/alarmtimer.h>
++
++/* Removed or renamed APIs on 7.3 */
++#ifndef from_timer
++#define from_timer(var, callback_timer, timer_fieldname) \
++	timer_container_of(var, callback_timer, timer_fieldname)
++#endif
++#define del_timer_sync(t)	timer_delete_sync(t)
++#define del_timer(t)		timer_delete(t)
++
++static inline char *t880_strncpy(char *dst, const char *src, size_t n)
++{
++	size_t i;
++
++	for (i = 0; i < n && src[i]; i++)
++		dst[i] = src[i];
++	for (; i < n; i++)
++		dst[i] = '\0';
++	return dst;
++}
++#define strncpy t880_strncpy
++
++/* alarm_start_relative() became alarm_start_timer(..., true) */
++#define alarm_start_relative(a, t)	alarm_start_timer(a, t, true)
++
++#endif /* T880_COMPAT_H */
+-- 
+2.55.0
+

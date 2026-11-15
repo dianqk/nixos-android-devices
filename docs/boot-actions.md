@@ -2,15 +2,20 @@
 
 [中文](boot-actions.zh.md)
 
-All five device modules enable **Reboot The System**, **Power Off The System**,
+Each device module can enable **Reboot The System**, **Power Off The System**,
 **Reboot to bootloader**, and **Reboot to recovery** in systemd-boot. Asphalt, Sheng and
 Aurora also enable **Reboot to Android**. These run before Linux. Keep independent
 RAM recovery available when updating firmware.
+
+Dodge enables **Reboot to Android** using the same checked slot-A selection.
+Its independent recovery remains a host-supplied raw FIT through U-Boot USB
+fastboot; no recovery-partition action is enabled.
 
 | Device profile | Recovery | Android | Firmware backend |
 | --- | --- | --- | --- |
 | Polaris / Clover | OEM recovery target | Not enabled | Qualcomm PON |
 | Asphalt / Sheng / Aurora | NixOS RAM recovery installed in `recovery_b` | Android `boot_a` | Qualcomm SDAM + GPT A/B + UFS boot LUN |
+| Dodge | Independent USB RAM recovery | Android `boot_a` | Qualcomm SDAM + GPT A/B + UFS boot LUN |
 
 The reboot targets are not yet verified on hardware on any device; compilation and simulated fault tests do not
 verify the OEM firmware's behavior or installed recovery.
@@ -41,7 +46,7 @@ RAM recovery configurations do not install this EFI menu or helper.
 
 ## Automatic slot B confirmation
 
-Sheng, Asphalt and Aurora share one U-Boot patch and Qualcomm GPT/UFS backend. After
+Sheng, Asphalt, Aurora and experimental Marble share one U-Boot patch and Qualcomm GPT/UFS backend. After
 `fatload` / `bootefi` successfully loads `/EFI/BOOT/BOOTAA64.EFI` from the unique
 `linux-boot` ESP and sets up its load options, U-Boot marks **`boot_b` successful**
 before starting the EFI image. This acknowledges the firmware/storage/EFI-load
@@ -49,18 +54,44 @@ stage; it does not certify that the generation menu is displayed or Linux works.
 Other EFI paths, devices and partitions do not trigger confirmation. This hook
 does not cover EFI BootOrder/boot-manager entry execution.
 
+The UFS checks read the device and configuration descriptors like Linux:
+the maximum size is requested and each descriptor's own `bLength` is used,
+whatever LENGTH the device reports in the query response; a truncated
+descriptor is still refused. A refused check prints `UFS boot-LUN check: …`
+with the rejected values before `Mobile boot action: UFS descriptor check
+failed`, and the EFI boot continues unconfirmed.
+
 Only the successful bit and required CRCs in both GPT copies change. Android A,
 type and unique GUIDs, active flags, priorities, retry counters, UFS boot LUN,
 BCB and partition contents are preserved. Already-successful B needs no writes.
 The last allowed attempt with zero remaining retries can still be confirmed;
 Android A bootability, an empty BCB and `recovery_b` are not prerequisites.
 
+Some ABLs (Marble) rewrite only the primary GPT on each boot: the retry
+decrement and, after a slot switch, the type GUIDs of slot pairs, so the backup
+array differs and its CRC can be stale. Confirmation (only; Android and
+recovery actions still require identical copies) accepts such a backup when the
+primary header and array are CRC-valid, the backup header is CRC-valid with the
+same geometry, and every differing entry is a used `<name>_a`/`<name>_b` entry
+whose partner exists, differing only in its type GUID (not to zero) and in
+attribute bits 48–55 and 60 — the scope of `recovery repair-backup-gpt`. LBAs,
+unique GUIDs, names, other attributes, unused entries and other partitions must
+be identical; anything else is refused with the reason printed. The primary is
+authoritative: on `boot_b`'s LUN the successful bit is set there and the backup
+array and header are rebuilt from it in place. Other LUNs with such a backup are
+only validated, not written. As always the backup is written and read back
+before the primary: power loss after the backup leaves the old primary and a
+backup that differs only in slot metadata, which the next boot accepts and
+confirms; a torn primary write leaves a current backup.
+
 The common firmware profile explicitly enables confirmation and supplies the ESP
 name and EFI path. Polaris and Clover do not enable it. Different partition/LUN
 locations are discovered at runtime; this Qualcomm backend is not suitable for
 devices using AOSP `misc` boot-control metadata. Asphalt has prior hardware
 evidence for this minimal successful-bit update; the new hook and Sheng's OEM
-behavior still need hardware validation.
+behavior still need hardware validation. Marble compiles the same profile for
+B confirmation only; its menu offers just reboot and power-off until the other
+actions are verified on that board.
 
 Asphalt permits a zero-metadata layout on LUN6 and LUN7 **only for successful
 B confirmation**. This compatibility setting comes from one observed unit; it
@@ -206,9 +237,70 @@ boot LUN and the original reason, tries all restorations, and reports an
 aggregate restoration error. A failed restore disables further special actions
 for that firmware session; inspect state before rebooting or retrying.
 
+Boards may explicitly list OEM partition names that do not participate in slot
+selection. Dodge lists `last_parti`, `oplusstanvbk_a` and `oplusstanvbk_b`.
+Every matching entry must have zero Qualcomm slot-byte attributes (bits48–55);
+otherwise the action is refused. Listed entries are preserved byte-for-byte,
+including type GUIDs and independent attributes such as bit60. Only listed names
+may repeat or end in a slot suffix without taking part in selection. Mandatory
+boot, ABL, XBL, recovery, `misc` and ESP names cannot be exceptions. Other names
+retain the existing uniqueness, complete-pair and active-slot checks.
+
 A multi-LUN GPT/boot-LUN switch cannot be atomic across sudden power loss. Use a
 reliable power supply; the rollback guarantee covers returned errors, not power
 failure. No partition payload, Android super contents or fuses are written.
 
 A watchdog setup failure returns promptly to the parent menu. An entry that
 cannot load at all follows systemd-boot's configured `reboot-on-error` policy.
+
+### Rebooting from the running system
+
+`systemctl reboot --reboot-argument=bootloader` (or `recovery`) passes the
+argument to the kernel's reboot-mode driver instead of the boot menu. Every
+device module installs the `reboot-param` system-shutdown hook, which copies
+`/run/systemd/reboot-param` into the shutdown ramfs before systemd pivots into
+it; without that copy the final reboot is a plain restart. If such a reboot
+returns to the normal boot path, check that
+`/etc/systemd/system-shutdown/reboot-param` exists in the running generation
+and that the kernel's reboot-mode driver lists the requested mode.
+
+### Durable same-slot EFI filesystem errors
+
+Firmware used with `boot-choice-efi` must report `EFI_NOT_FOUND` only after a
+successful lookup proves the journal path is absent. A failed handle/path
+allocation, invalid path, device selection, filesystem initialization, FAT
+directory/FAT-chain read or create must return its error, not absence. The
+Dodge durable-I/O firmware uses checked FAT lookup with an explicit traversal
+errno; its legacy boolean `fs_exists()` API is not sufficient for this purpose.
+Volume-open allocation failures also return errors. Other boards retain their
+existing firmware behavior and do not acquire this capability implicitly.
+
+A pending journal is never optional merely because opening it failed. The helper
+refuses the boot action and preserves it for recovery. A genuinely absent journal
+allows the normal no-op path without writes or synchronization. Successful short
+EFI File Write counts are also rejected by the helper before any boot write.
+The host regression compiles the production EFI Open/FAT traversal functions and
+can link them into the full EFI-entry RAM service harness by setting
+`UBOOT_SOURCE` when running `tests/boot-choice-efi-execution.sh`. This validates
+error propagation, not real FAT/UFS hardware or power-loss persistence.
+
+### Same-slot initrd BOOTCONFIG contract
+
+The early producer reads slot identity only from the initrd range admitted by
+its FDT/memory guard. It requires the Linux size/checksum/`#BOOTCONFIG\n` trailer,
+allowing at most three trailing zero alignment bytes and a text size below 32767.
+It accepts flat `key=value` assignments with double-quoted or unquoted scalar
+values, including spaces/tabs around `=` and trailing whitespace. There must be
+exactly one `androidboot.slot_suffix`, with value `_a` or `_b`; quoted/unquoted
+mixed duplicates also refuse the boot action. There is no active-GPT/default-slot
+fallback. Trees, comments, arrays, escapes, key aliases and assignment operators
+other than `=` are outside this deliberately small subset and refuse the blob.
+
+[AOSP's bootconfig implementation guide](https://source.android.com/docs/core/architecture/bootloader/implementing-bootconfig)
+uses unquoted `BOARD_BOOTCONFIG` assignments. Build-time vendor bootconfig may
+therefore contain unquoted values even when a runtime slot value is quoted.
+`/proc/bootconfig` is normalized kernel output, not evidence of the raw initrd
+syntax or trailer. `tests/early-bootconfig.py` covers raw generic build-time
+assignments with **synthetic** runtime-slot appends and trailers, plus malformed
+framing/grammar and duplicate rejection; it does not establish an OEM loader's
+actual concatenation or physical boot success.

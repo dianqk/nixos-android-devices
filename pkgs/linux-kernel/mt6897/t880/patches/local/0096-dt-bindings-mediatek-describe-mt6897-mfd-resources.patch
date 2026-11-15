@@ -1,0 +1,286 @@
+From 2c3619219b5109022bdae9262e2e4f90b0df6196 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] dt-bindings: mediatek: describe MT6897 mfd resources
+
+Describe the MT6897 mfd compatibles, resource limits and constants
+used by the corresponding controllers and device trees.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-15T19:09:13+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-15T19:09:26+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-16T07:44:41+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T17:01:01+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ .../bindings/mfd/mediatek,mt6363.yaml         |  4 +
+ .../bindings/mfd/mediatek,mt6368.yaml         | 50 ++++++++++
+ .../bindings/mfd/mediatek,mt6375.yaml         | 95 +++++++++++++++++++
+ .../bindings/mfd/mediatek,mt6685.yaml         | 74 +++++++++++++++
+ 4 files changed, 223 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/mfd/mediatek,mt6368.yaml
+ create mode 100644 Documentation/devicetree/bindings/mfd/mediatek,mt6375.yaml
+ create mode 100644 Documentation/devicetree/bindings/mfd/mediatek,mt6685.yaml
+
+diff --git a/Documentation/devicetree/bindings/mfd/mediatek,mt6363.yaml b/Documentation/devicetree/bindings/mfd/mediatek,mt6363.yaml
+index ee90d16053..eeccba2271 100644
+--- a/Documentation/devicetree/bindings/mfd/mediatek,mt6363.yaml
++++ b/Documentation/devicetree/bindings/mfd/mediatek,mt6363.yaml
+@@ -49,6 +49,10 @@ properties:
+   "#interrupt-cells":
+     const: 3
+ 
++  keys:
++    type: object
++    $ref: /schemas/input/mediatek,pmic-keys.yaml#
++
+ patternProperties:
+   "^adc@[0-9a-f]+$":
+     type: object
+diff --git a/Documentation/devicetree/bindings/mfd/mediatek,mt6368.yaml b/Documentation/devicetree/bindings/mfd/mediatek,mt6368.yaml
+new file mode 100644
+index 0000000000..dd7065bdb5
+--- /dev/null
++++ b/Documentation/devicetree/bindings/mfd/mediatek,mt6368.yaml
+@@ -0,0 +1,50 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/mfd/mediatek,mt6368.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: MediaTek MT6368 SPMI PMIC
++
++maintainers:
++  - AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
++
++description:
++  The MT6368 is a secondary PMIC (regulators, audio codec, auxiliary ADC)
++  interfaced to the SoC through the System Power Management Interface
++  (SPMI) bus. Its sub modules are described as child nodes.
++
++properties:
++  compatible:
++    const: mediatek,mt6368
++
++  reg:
++    maxItems: 1
++
++  '#address-cells':
++    const: 1
++
++  '#size-cells':
++    const: 0
++
++required:
++  - compatible
++  - reg
++
++additionalProperties: true
++
++examples:
++  - |
++    #include <dt-bindings/spmi/spmi.h>
++
++    spmi {
++      #address-cells = <2>;
++      #size-cells = <0>;
++
++      pmic@5 {
++        compatible = "mediatek,mt6368";
++        reg = <0x5 SPMI_USID>;
++        #address-cells = <1>;
++        #size-cells = <0>;
++      };
++    };
+diff --git a/Documentation/devicetree/bindings/mfd/mediatek,mt6375.yaml b/Documentation/devicetree/bindings/mfd/mediatek,mt6375.yaml
+new file mode 100644
+index 0000000000..d4bd883c02
+--- /dev/null
++++ b/Documentation/devicetree/bindings/mfd/mediatek,mt6375.yaml
+@@ -0,0 +1,95 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/mfd/mediatek,mt6375.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: MediaTek MT6375 sub-PMIC
++
++maintainers:
++  - dianqk <dianqk@dianqk.net>
++
++description:
++  The MT6375 integrates a switching charger with an ADC, a fuel gauge,
++  housekeeping AUXADCs and a Type-C/PD port controller. Its blocks answer
++  at several I2C addresses (TCPC 0x4e, PMU 0x34, gauge 0x1a, HK1 0x4a,
++  HK2 0x64, test 0x3f); the node sits at the PMU address and the driver
++  reaches the others as banks of one register map.
++
++properties:
++  compatible:
++    const: mediatek,mt6375
++
++  reg:
++    description: PMU I2C address.
++    maxItems: 1
++
++  interrupts:
++    maxItems: 1
++
++  interrupt-controller: true
++
++  "#interrupt-cells":
++    const: 1
++
++  wakeup-source: true
++
++  power-monitor:
++    type: object
++    $ref: /schemas/power/supply/mediatek,mt6375-power.yaml#
++
++  tcpc:
++    type: object
++    $ref: /schemas/usb/mediatek,mt6375-tcpc.yaml#
++
++required:
++  - compatible
++  - reg
++  - interrupts
++  - interrupt-controller
++  - "#interrupt-cells"
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/interrupt-controller/irq.h>
++    #include <dt-bindings/mfd/mt6375.h>
++    #include <dt-bindings/usb/pd.h>
++
++    i2c {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        pmic@34 {
++            compatible = "mediatek,mt6375";
++            reg = <0x34>;
++            interrupts-extended = <&pio 7 IRQ_TYPE_LEVEL_LOW>;
++            interrupt-controller;
++            #interrupt-cells = <1>;
++
++            power-monitor {
++                compatible = "mediatek,mt6375-power";
++                monitored-battery = <&battery>;
++            };
++
++            tcpc {
++                compatible = "mediatek,mt6375-tcpc";
++                interrupts = <MT6375_PD_EVT>;
++                interrupt-names = "PD_IRQB";
++
++                connector {
++                    compatible = "usb-c-connector";
++                    label = "USB-C";
++                    data-role = "device";
++                    power-role = "sink";
++                    try-power-role = "sink";
++                    pd-disable;
++                    typec-power-opmode = "default";
++                    self-powered;
++                    sink-pdos = <PDO_FIXED(5000, 2000, PDO_FIXED_USB_COMM)>;
++                    op-sink-microwatt = <10000000>;
++                };
++            };
++        };
++    };
+diff --git a/Documentation/devicetree/bindings/mfd/mediatek,mt6685.yaml b/Documentation/devicetree/bindings/mfd/mediatek,mt6685.yaml
+new file mode 100644
+index 0000000000..c92e91db52
+--- /dev/null
++++ b/Documentation/devicetree/bindings/mfd/mediatek,mt6685.yaml
+@@ -0,0 +1,74 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/mfd/mediatek,mt6685.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: MediaTek MT6685 SPMI PM/Clock IC
++
++maintainers:
++  - AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
++
++description:
++  The MT6685 is a clock IC with an RTC, interfaced to the SoC through the
++  System Power Management Interface (SPMI) bus. Its sub modules are
++  described as child nodes addressed by their register base.
++
++properties:
++  compatible:
++    const: mediatek,mt6685
++
++  reg:
++    maxItems: 1
++
++  '#address-cells':
++    const: 1
++
++  '#size-cells':
++    const: 0
++
++patternProperties:
++  "^clock-controller@[0-9a-f]+$":
++    type: object
++    $ref: /schemas/clock/mediatek,mt6685-clock.yaml#
++
++  "^rtc@[0-9a-f]+$":
++    type: object
++    $ref: /schemas/rtc/mediatek,mt6685-rtc.yaml#
++
++required:
++  - compatible
++  - reg
++  - '#address-cells'
++  - '#size-cells'
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/clock/mediatek,mt6685-clock.h>
++    #include <dt-bindings/spmi/spmi.h>
++
++    spmi {
++      #address-cells = <2>;
++      #size-cells = <0>;
++
++      clock-ic@9 {
++        compatible = "mediatek,mt6685";
++        reg = <0x9 SPMI_USID>;
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        sck_top: clock-controller@514 {
++          compatible = "mediatek,mt6685-sck-top";
++          reg = <0x514>;
++          #clock-cells = <1>;
++        };
++
++        rtc@580 {
++          compatible = "mediatek,mt6685-rtc";
++          reg = <0x580>;
++          clocks = <&sck_top CLK_RTC_MCLK>;
++        };
++      };
++    };
+-- 
+2.56.0
+

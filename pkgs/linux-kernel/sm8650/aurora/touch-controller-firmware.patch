@@ -1,0 +1,554 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 24 Oct 2026 19:30:00 +0800
+Subject: [PATCH] input: aurora-tcm: report firmware touch through input-mt
+
+The driver refused any S3910P firmware but build 4337601 (Android 14) and
+application config N1CTE022; Android 16 (OS3.0.308.0) ships build 4360960
+with config N1CTE034, whose raw frames the Android 14 host-processing
+library no longer matches. Keep the protocol checks (TCM v1 application
+mode, part string, framing, geometry and object count) and only log the
+build and config ID.
+
+The firmware computes coordinates itself in the TouchCom touch report
+(0x11). Read the touch report config (0x25) on every configuration and
+decode 0x11 with it: little-endian bit fields, the active-object loop,
+object index, classification, X/Y, Z and widths. Report contacts through
+a type-B multitouch device (10 slots, INPUT_PROP_DIRECT, 0..1439 x
+0..3199, touch major/minor from the widths, pressure from Z), named as
+the former userspace adapter so desktop and udev rules keep matching;
+touchscreen-* properties apply. All contacts are lifted when the
+controller is reset, powered off with the panel or suspended.
+
+primary_report (default 0x11) is enabled and disable_report (default
+0xc0, which the firmware enables after reset) turned off after every
+reset, power-on and panel wake, as Xiaomi's syna_tcm2 driver switches
+between host and firmware processing. primary_report=0xc0
+disable_report=0 keeps the raw frame stream for a userspace host
+processor; the input device is then not registered. Report enables are
+runtime state; nothing is written to the controller's flash or
+configuration.
+---
+diff --git a/drivers/input/touchscreen/aurora-tcm.c b/drivers/input/touchscreen/aurora-tcm.c
+--- a/drivers/input/touchscreen/aurora-tcm.c
++++ b/drivers/input/touchscreen/aurora-tcm.c
+@@ -1,5 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+-/* Aurora S3910P SPI raw-frame transport. No firmware download or flash commands.
++/* Aurora S3910P SPI touch controller: firmware touch reports (0x11) through
++ * input-mt, or vendor raw frames (0xc0) for a userspace host processor.
++ * No firmware download, flash or configuration-commit commands.
+  * Protocol/wiring reference: lolipuru/kernel_xiaomi_sm8650-modules,
+  * 4a31d6ee77b27c1b93d329de7bf4cbe16e699599, synaptics_tcm2.
+  */
+@@ -9,6 +11,9 @@
+ #include <linux/mutex.h>
+ #include <linux/seq_file.h>
+ #include <linux/gpio/consumer.h>
++#include <linux/input.h>
++#include <linux/input/mt.h>
++#include <linux/input/touchscreen.h>
+ #include <linux/module.h>
+ #include <linux/interrupt.h>
+ #include <linux/regulator/consumer.h>
+@@ -46,7 +51,7 @@
+ 	struct gpio_desc *reset, *irq;
+ 	u8 tx[4096], rx[4096];
+ 	u16 max_x, max_y, max_objects, max_write;
+-	unsigned int reports;
++	unsigned int reports, other_reports;
+ 	bool stopping;
+ 	struct mutex raw_lock;
+ 	u8 raw[4096];
+@@ -74,6 +79,12 @@
+ 	struct mutex pm_lock;
+ 	bool powered, asleep, resume_pending;
+ 	unsigned int sleeps;
++	/* Firmware touch report 0x11, decoded with the 0x25 report config. */
++	struct input_dev *input;
++	struct touchscreen_properties props;
++	u8 touch_cfg[256];
++	u16 touch_cfg_len;
++	bool touch_parse_error;
+ };
+ 
+ struct aurora_stream_reader {
+@@ -388,7 +399,31 @@
+ static int aurora_tcm_power_on(struct aurora_tcm_probe *t);
+ static int aurora_tcm_identify(struct aurora_tcm_probe *t);
+ static int aurora_tcm_configure(struct aurora_tcm_probe *t);
+-static const u8 aurora_touch_report = 0xc0;
++#define AURORA_REPORT_TOUCH	0x11
++#define AURORA_REPORT_RAW	0xc0
++
++/* Report enabled after every reset, power-on and panel wake: the firmware's
++ * own touch report (0x11) for the in-kernel input device, or the vendor raw
++ * frame (0xc0) for a userspace host processor. disable_report (0 for none)
++ * is disabled afterwards; the firmware enables 0xc0 after reset, so firmware
++ * touch reporting turns it off, as the vendor driver does. Report enables are
++ * volatile and are not written to the controller's flash or configuration.
++ */
++static u8 aurora_touch_report = AURORA_REPORT_TOUCH;
++module_param_named(primary_report, aurora_touch_report, byte, 0444);
++MODULE_PARM_DESC(primary_report, "TouchCom report to enable: 0x11 touch (default) or 0xc0 raw frames");
++static u8 aurora_disable_report = AURORA_REPORT_RAW;
++module_param_named(disable_report, aurora_disable_report, byte, 0444);
++MODULE_PARM_DESC(disable_report, "TouchCom report to disable after enabling, 0 for none (default 0xc0)");
++
++static int aurora_tcm_enable_reports(struct aurora_tcm_probe *t, u16 *len)
++{
++	int ret = aurora_tcm_command(t, 0x05, &aurora_touch_report, 1, len);
++
++	if (!ret && aurora_disable_report && aurora_disable_report != aurora_touch_report)
++		ret = aurora_tcm_command(t, 0x06, &aurora_disable_report, 1, len);
++	return ret;
++}
+ 
+ /* Disable the IRQ once per recovery; recovery re-enables it. */
+ static void aurora_tcm_schedule_recovery(struct aurora_tcm_probe *t, int error, bool sync)
+@@ -408,6 +443,233 @@
+ 	queue_delayed_work(system_freezable_wq, &t->recover_work, 0);
+ }
+ 
++/* TouchCom touch report config entries (GET_TOUCH_REPORT_CONFIG, 0x25):
++ * a code, followed by a bit count except for the control codes below 0x05.
++ */
++enum {
++	AURORA_CFG_END = 0x00,
++	AURORA_CFG_FOREACH_ACTIVE_OBJECT = 0x01,
++	AURORA_CFG_FOREACH_OBJECT = 0x02,
++	AURORA_CFG_FOREACH_END = 0x03,
++	AURORA_CFG_PAD_TO_NEXT_BYTE = 0x04,
++	AURORA_CFG_OBJECT_N_INDEX = 0x06,
++	AURORA_CFG_OBJECT_N_CLASSIFICATION = 0x07,
++	AURORA_CFG_OBJECT_N_X_POSITION = 0x08,
++	AURORA_CFG_OBJECT_N_Y_POSITION = 0x09,
++	AURORA_CFG_OBJECT_N_Z = 0x0a,
++	AURORA_CFG_OBJECT_N_X_WIDTH = 0x0b,
++	AURORA_CFG_OBJECT_N_Y_WIDTH = 0x0c,
++	AURORA_CFG_NUM_OF_ACTIVE_OBJECTS = 0x18,
++};
++
++/* TouchCom object classifications. */
++enum {
++	AURORA_OBJECT_NONE = 0,
++	AURORA_OBJECT_FINGER = 1,
++	AURORA_OBJECT_GLOVED_FINGER = 2,
++	AURORA_OBJECT_STYLUS = 3,
++	AURORA_OBJECT_ERASER = 4,
++	AURORA_OBJECT_SMALL_OBJECT = 5,
++	AURORA_OBJECT_PALM = 6,
++	AURORA_OBJECT_EDGE_TOUCHED = 8,
++	AURORA_OBJECT_HOVER = 9,
++};
++
++#define AURORA_MAX_OBJECTS	10
++
++struct aurora_touch_object {
++	bool present;
++	u8 classification;
++	u16 x, y, z, x_width, y_width;
++};
++
++/* Little-endian bit field, least significant bit first; a field past the end
++ * of the report reads as zero, as in the TouchCom reference parser.
++ */
++static u32 aurora_report_bits(const u8 *data, u32 size_bits, u32 offset, u8 bits)
++{
++	u32 value = 0;
++	unsigned int i;
++
++	if (offset + bits > size_bits)
++		return 0;
++	for (i = 0; i < bits && i < 32; i++)
++		if (data[(offset + i) / 8] & BIT((offset + i) % 8))
++			value |= BIT(i);
++	return value;
++}
++
++static bool aurora_cfg_has_bits(u8 code)
++{
++	return code > AURORA_CFG_PAD_TO_NEXT_BYTE;
++}
++
++/* Index just past the FOREACH_END that closes the loop starting at idx. */
++static u16 aurora_cfg_skip_loop(const u8 *cfg, u16 cfg_len, u16 idx)
++{
++	while (idx < cfg_len) {
++		u8 code = cfg[idx++];
++
++		if (code == AURORA_CFG_FOREACH_END || code == AURORA_CFG_END)
++			break;
++		if (aurora_cfg_has_bits(code))
++			idx++;
++	}
++	return idx;
++}
++
++static int aurora_tcm_parse_touch(struct aurora_tcm_probe *t, const u8 *data, u16 len,
++				  struct aurora_touch_object *objects)
++{
++	const u8 *cfg = t->touch_cfg;
++	u16 cfg_len = t->touch_cfg_len, idx = 0, loop = 0;
++	u32 size_bits = len * 8, offset = 0, value;
++	unsigned int count = 0, active = 0;
++	bool have_active = false, in_loop = false, active_loop = false;
++	struct aurora_touch_object object = {};
++	int index = -1;
++	u8 code, bits;
++
++	while (idx < cfg_len) {
++		code = cfg[idx++];
++		switch (code) {
++		case AURORA_CFG_END:
++			return 0;
++		case AURORA_CFG_FOREACH_ACTIVE_OBJECT:
++		case AURORA_CFG_FOREACH_OBJECT:
++			if (in_loop)
++				return -EPROTO;
++			active_loop = code == AURORA_CFG_FOREACH_ACTIVE_OBJECT;
++			if ((active_loop && have_active && !active) || offset >= size_bits) {
++				idx = aurora_cfg_skip_loop(cfg, cfg_len, idx);
++				break;
++			}
++			in_loop = true;
++			loop = idx;
++			count = 0;
++			index = -1;
++			memset(&object, 0, sizeof(object));
++			break;
++		case AURORA_CFG_FOREACH_END:
++			if (!in_loop)
++				return -EPROTO;
++			if (index < 0 && !active_loop)
++				index = count;
++			if (index >= 0 && index < AURORA_MAX_OBJECTS) {
++				object.present = true;
++				objects[index] = object;
++			}
++			count++;
++			index = -1;
++			memset(&object, 0, sizeof(object));
++			if (count < AURORA_MAX_OBJECTS && offset < size_bits &&
++			    (!active_loop || !have_active || count < active)) {
++				idx = loop;
++				break;
++			}
++			in_loop = false;
++			break;
++		case AURORA_CFG_PAD_TO_NEXT_BYTE:
++			offset = ALIGN(offset, 8);
++			break;
++		default:
++			if (idx >= cfg_len)
++				return -EPROTO;
++			bits = cfg[idx++];
++			value = aurora_report_bits(data, size_bits, offset, bits);
++			offset += bits;
++			switch (code) {
++			case AURORA_CFG_NUM_OF_ACTIVE_OBJECTS:
++				have_active = true;
++				active = value;
++				break;
++			case AURORA_CFG_OBJECT_N_INDEX:
++				index = value;
++				break;
++			case AURORA_CFG_OBJECT_N_CLASSIFICATION:
++				object.classification = value;
++				break;
++			case AURORA_CFG_OBJECT_N_X_POSITION:
++				object.x = value;
++				break;
++			case AURORA_CFG_OBJECT_N_Y_POSITION:
++				object.y = value;
++				break;
++			case AURORA_CFG_OBJECT_N_Z:
++				object.z = value;
++				break;
++			case AURORA_CFG_OBJECT_N_X_WIDTH:
++				object.x_width = value;
++				break;
++			case AURORA_CFG_OBJECT_N_Y_WIDTH:
++				object.y_width = value;
++				break;
++			}
++			break;
++		}
++	}
++	return 0;
++}
++
++static bool aurora_object_is_contact(u8 classification)
++{
++	switch (classification) {
++	case AURORA_OBJECT_FINGER:
++	case AURORA_OBJECT_GLOVED_FINGER:
++	case AURORA_OBJECT_STYLUS:
++	case AURORA_OBJECT_SMALL_OBJECT:
++	case AURORA_OBJECT_EDGE_TOUCHED:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static void aurora_tcm_report_touch(struct aurora_tcm_probe *t, const u8 *data, u16 len)
++{
++	struct aurora_touch_object objects[AURORA_MAX_OBJECTS] = {};
++	struct input_dev *input = t->input;
++	unsigned int i;
++	int ret;
++
++	ret = aurora_tcm_parse_touch(t, data, len, objects);
++	if (ret) {
++		if (!t->touch_parse_error)
++			dev_err(&t->spi->dev, "Touch report config not understood (%d)\n", ret);
++		t->touch_parse_error = true;
++		return;
++	}
++	for (i = 0; i < AURORA_MAX_OBJECTS; i++) {
++		const struct aurora_touch_object *o = &objects[i];
++		bool contact = o->present && aurora_object_is_contact(o->classification);
++
++		input_mt_slot(input, i);
++		if (!input_mt_report_slot_state(input, MT_TOOL_FINGER, contact))
++			continue;
++		touchscreen_report_pos(input, &t->props, o->x, o->y, true);
++		input_report_abs(input, ABS_MT_TOUCH_MAJOR, max(o->x_width, o->y_width));
++		input_report_abs(input, ABS_MT_TOUCH_MINOR, min(o->x_width, o->y_width));
++		input_report_abs(input, ABS_MT_PRESSURE, min_t(u16, o->z, 255));
++	}
++	input_mt_sync_frame(input);
++	input_sync(input);
++}
++
++/* Lift every contact. Callers have the touch interrupt disabled and drained. */
++static void aurora_tcm_release_contacts(struct aurora_tcm_probe *t)
++{
++	unsigned int i;
++
++	if (!t->input)
++		return;
++	for (i = 0; i < AURORA_MAX_OBJECTS; i++) {
++		input_mt_slot(t->input, i);
++		input_mt_report_slot_inactive(t->input);
++	}
++	input_mt_sync_frame(t->input);
++	input_sync(t->input);
++}
++
+ static irqreturn_t aurora_tcm_irq(int irq, void *data)
+ {
+ 	struct aurora_tcm_probe *t = data;
+@@ -438,9 +700,14 @@
+ 	ret = aurora_tcm_message(t, &code, &len);
+ 	if (!ret && t->reports++ < 6)
+ 		dev_info(&t->spi->dev, "TCM interrupt report %02x length %u\n", code, len);
+-	if (!ret && code == 0xc0 && len != 1722)
++	if (!ret && code == AURORA_REPORT_TOUCH && t->input)
++		aurora_tcm_report_touch(t, t->rx + 2, len);
++	else if (!ret && code >= 0x10 && code != AURORA_REPORT_RAW &&
++		 t->other_reports++ < 8)
++		dev_info(&t->spi->dev, "Unhandled TCM report %02x length %u\n", code, len);
++	if (!ret && code == AURORA_REPORT_RAW && len != 1722)
+ 		ret = -EPROTO;
+-	if (!ret && code == 0xc0) {
++	if (!ret && code == AURORA_REPORT_RAW) {
+ 		mutex_lock(&t->raw_lock);
+ 		memcpy(t->raw, t->rx + 2, len);
+ 		t->raw_len = len;
+@@ -474,6 +741,7 @@
+ 		return;
+ 	/* The IRQ thread may still be returning from the failed packet. */
+ 	synchronize_irq(t->irq_number);
++	aurora_tcm_release_contacts(t);
+ 	/* A failed panel wake may have left the supplies off. */
+ 	ret = t->powered ? 0 : aurora_tcm_power_on(t);
+ 	if (!ret)
+@@ -481,7 +749,7 @@
+ 	if (!ret)
+ 		ret = aurora_tcm_configure(t);
+ 	if (!ret)
+-		ret = aurora_tcm_command(t, 0x05, &aurora_touch_report, 1, &len);
++		ret = aurora_tcm_enable_reports(t, &len);
+ 	if (ret) {
+ 		delay = min(100U << min(t->recover_attempts, 6U), 5000U);
+ 		t->recover_attempts++;
+@@ -511,18 +779,8 @@
+ 	return count;
+ }
+ 
+-/* Exact stock format read back from Aurora firmware build 4337601. It has an
+- * 18-byte header (count last), then packed slot/class, X/Y/Z and widths.
+- * Sensor/gesture header fields and Z/widths are not reported.
+- */
+-static const u8 aurora_tcm_format[] = {
+-	0x10, 8, 0x1b, 48, 0x16, 4, 0x1e, 4, 0x12, 16,
+-	0x20, 16, 0x21, 16, 0x22, 4, 0x23, 4, 0x25, 16,
+-	0x18, 8, 0x01, 0x06, 4, 0x07, 4, 0x08, 16, 0x09, 16,
+-	0x0a, 16, 0x0b, 8, 0x0c, 8, 0x03, 0x00,
+-};
+-
+-/* Verify the known application before enabling raw reports (0x05).
++/* Verify the known application geometry and read the touch report config
++ * before enabling reports (0x05).
+  * Probe and recovery share this; no firmware download or flash operations.
+  */
+ static int aurora_tcm_configure(struct aurora_tcm_probe *t)
+@@ -541,19 +799,25 @@
+ 	t->max_x = get_unaligned_le16(t->rx + 34);
+ 	t->max_y = get_unaligned_le16(t->rx + 36);
+ 	t->max_objects = get_unaligned_le16(t->rx + 38);
+-	dev_info(dev, "Aurora TCM application: max=%ux%u objects=%u config-size=%u\n",
+-		 t->max_x, t->max_y, t->max_objects, config_size);
++	dev_info(dev, "Aurora TCM application: max=%ux%u objects=%u config-size=%u config=%.8s\n",
++		 t->max_x, t->max_y, t->max_objects, config_size, t->rx + 18);
+ 	if (t->max_x != 1439 || t->max_y != 3199 || t->max_objects != 10 ||
+-	    memcmp(t->rx + 18, "N1CTE022", 8) ||
+-	    config_size < sizeof(aurora_tcm_format) || config_size > sizeof(t->rx) - 3)
+-		return -EINVAL;
++	    config_size > sizeof(t->rx) - 3)
++		return dev_err_probe(dev, -EINVAL, "unexpected application geometry\n");
+ 	ret = aurora_tcm_command(t, 0x06, &aurora_touch_report, 1, &len);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "disable report before setup\n");
+ 	ret = aurora_tcm_command(t, 0x25, NULL, 0, &len);
+-	if (ret || len != config_size || len < sizeof(aurora_tcm_format) ||
+-	    memcmp(t->rx + 2, aurora_tcm_format, sizeof(aurora_tcm_format)))
+-		return dev_err_probe(dev, ret ?: -EPROTO, "verify stock touch format\n");
++	if (ret)
++		return dev_err_probe(dev, ret, "get touch report config\n");
++	dev_dbg(dev, "Aurora TCM touch report config (%u bytes): %*ph\n", len,
++		(int)min_t(u16, len, 64), t->rx + 2);
++	if (len > sizeof(t->touch_cfg))
++		return dev_err_probe(dev, -EPROTO, "touch report config of %u bytes\n", len);
++	/* The interrupt is off: probe, wake and recovery reconfigure before enabling it. */
++	memcpy(t->touch_cfg, t->rx + 2, len);
++	t->touch_cfg_len = len;
++	t->touch_parse_error = false;
+ 	return 0;
+ }
+ 
+@@ -578,6 +842,36 @@
+ 	cancel_delayed_work_sync(&t->recover_work);
+ }
+ 
++static int aurora_tcm_setup_input(struct aurora_tcm_probe *t)
++{
++	struct device *dev = &t->spi->dev;
++	struct input_dev *input;
++	int ret;
++
++	input = devm_input_allocate_device(dev);
++	if (!input)
++		return -ENOMEM;
++	/* Name kept from the userspace adapter so desktop and udev rules match. */
++	input->name = "Xiaomi 14 Ultra Touchscreen";
++	input->phys = "aurora-tcm/input0";
++	input->id.bustype = BUS_SPI;
++	input_set_abs_params(input, ABS_MT_POSITION_X, 0, t->max_x, 0, 0);
++	input_set_abs_params(input, ABS_MT_POSITION_Y, 0, t->max_y, 0, 0);
++	input_set_abs_params(input, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
++	input_set_abs_params(input, ABS_MT_TOUCH_MINOR, 0, 255, 0, 0);
++	input_set_abs_params(input, ABS_MT_PRESSURE, 0, 255, 0, 0);
++	touchscreen_parse_properties(input, true, &t->props);
++	ret = input_mt_init_slots(input, AURORA_MAX_OBJECTS,
++				  INPUT_MT_DIRECT | INPUT_MT_DROP_UNUSED);
++	if (ret)
++		return ret;
++	ret = input_register_device(input);
++	if (ret)
++		return dev_err_probe(dev, ret, "register touchscreen\n");
++	t->input = input;
++	return 0;
++}
++
+ static int aurora_tcm_setup_stream(struct aurora_tcm_probe *t)
+ {
+ 	struct device *dev = &t->spi->dev;
+@@ -588,7 +882,7 @@
+ 	ret = aurora_tcm_configure(t);
+ 	if (ret)
+ 		return ret;
+-	ret = aurora_tcm_command(t, 0x05, &aurora_touch_report, 1, &len);
++	ret = aurora_tcm_enable_reports(t, &len);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "enable touch reports\n");
+ 	irq = gpiod_to_irq(t->irq);
+@@ -615,6 +909,11 @@
+ 	ret = devm_add_action_or_reset(dev, aurora_stream_unregister, t);
+ 	if (ret)
+ 		return ret;
++	if (aurora_touch_report == AURORA_REPORT_TOUCH) {
++		ret = aurora_tcm_setup_input(t);
++		if (ret)
++			return ret;
++	}
+ 	t->irq_number = irq;
+ 	ret = devm_request_threaded_irq(dev, irq, NULL, aurora_tcm_irq,
+ 					IRQF_ONESHOT | IRQF_TRIGGER_LOW,
+@@ -625,7 +924,8 @@
+ 	ret = devm_add_action_or_reset(dev, aurora_tcm_quiesce, t);
+ 	if (ret)
+ 		return ret;
+-	dev_info(dev, "Aurora TCM raw stream ready on IRQ %d\n", irq);
++	dev_info(dev, "Aurora TCM %s ready on IRQ %d\n",
++		 t->input ? "touchscreen" : "raw stream", irq);
+ 	return 0;
+ }
+ 
+@@ -674,9 +974,8 @@
+ 		 get_unaligned_le32(t->rx + 20), get_unaligned_le16(t->rx + 24));
+ 	if (t->rx[2] != 1 || t->rx[3] != 1 ||
+ 	    memcmp(t->rx + 4, "S3910 A0B0-15.2", 15) ||
+-	    get_unaligned_le32(t->rx + 20) != 4337601 ||
+ 	    t->rx[len + 3] != 0x5a || t->rx[len + 4] != 0x5a)
+-		return dev_err_probe(dev, -EPROTO, "untested firmware mode or CRC framing\n");
++		return dev_err_probe(dev, -EPROTO, "unexpected TCM mode, part or framing\n");
+ 	t->max_write = get_unaligned_le16(t->rx + 24);
+ 	return 0;
+ }
+@@ -741,7 +1040,7 @@
+ 	if (!ret)
+ 		ret = aurora_tcm_configure(t);
+ 	if (!ret)
+-		ret = aurora_tcm_command(t, 0x05, &aurora_touch_report, 1, &len);
++		ret = aurora_tcm_enable_reports(t, &len);
+ 	WRITE_ONCE(t->asleep, false);
+ 	if (ret) {
+ 		dev_err(&t->spi->dev, "Touch controller wake failed (%d); recovering\n", ret);
+@@ -781,6 +1080,7 @@
+ 	/* An unfinished recovery held its own interrupt disable. */
+ 	if (test_and_clear_bit(0, &t->recovering))
+ 		enable_irq(t->irq_number);
++	aurora_tcm_release_contacts(t);
+ 	aurora_stream_pause(t);
+ 	aurora_tcm_power_off(t);
+ 	t->sleeps++;
+@@ -879,8 +1179,10 @@
+ 	 */
+ 	cancel_work_sync(&t->wake_work);
+ 	mutex_lock(&t->pm_lock);
+-	if (t->irq_number > 0 && !t->asleep)
++	if (t->irq_number > 0 && !t->asleep) {
+ 		disable_irq(t->irq_number);
++		aurora_tcm_release_contacts(t);
++	}
+ 	mutex_unlock(&t->pm_lock);
+ 	mutex_lock(&t->raw_lock);
+ 	t->stream_error = -EPIPE;
+diff --git a/drivers/input/touchscreen/Kconfig b/drivers/input/touchscreen/Kconfig
+--- a/drivers/input/touchscreen/Kconfig
++++ b/drivers/input/touchscreen/Kconfig
+@@ -1417,8 +1417,9 @@ config TOUCHSCREEN_HIMAX_HX83112B
+ config TOUCHSCREEN_AURORA_TCM
+-	tristate "Xiaomi 14 Ultra Synaptics raw touch transport"
++	tristate "Xiaomi 14 Ultra Synaptics S3910P touchscreen"
+ 	depends on SPI && GPIOLIB
+ 	depends on DRM || !DRM
+ 	help
+-	  Raw-frame transport for Aurora's S3910P controller. Coordinates are
+-	  calculated by the Aurora userspace touch host processor via uinput.
++	  Aurora's S3910P controller over SPI. Reports the firmware's touch
++	  coordinates as a multitouch input device, or optionally raw frames
++	  for a userspace touch host processor.
+ 

@@ -1,0 +1,976 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Thu, 5 Nov 2026 12:00:00 +0800
+Subject: [PATCH] arm: qualcomm: add OnePlus 13 RAM console support
+
+Local U-Boot adaptation from the Linux sources below. Import ABL runtime
+memory/reservation geometry without OEM phandles or driver bindings. Keep
+relocation and heap in the shipped low USB DMA aperture, excluding the
+running image, initrd and source DT. USB2 only; no storage scan or EFI boot.
+
+Local API changes replace Linux platform/PHY/clock/regulator APIs with
+U-Boot DM, retain ABL supply votes, bound polling and propagate errors.
+M31 register sequence snapshot: Linux
+05441d697f7f9a927264f4058cbbc6a03dfcac9d.
+PMI H010 device-mode tuning: OnePlus PJZ110 shipped DT; OEM driver source:
+https://github.com/OnePlusOSS/android_kernel_oneplus_sm8750/blob/6028f47faddaa27700f8dd3a1d83906ea8f27170/drivers/usb/repeater/repeater-qti-pmic-eusb2.c
+
+Original source commit metadata (register-level adaptations, not identical diffs):
+
+From 9c8504861cc4102463f31fe1f5e120a6deb15c15 Mon Sep 17 00:00:00 2001
+From: Wesley Cheng <quic_wcheng@quicinc.com>
+Date: Tue, 27 May 2025 14:04:42 -0700
+Subject: [PATCH] phy: qcom: Add M31 based eUSB2 PHY driver
+
+SM8750 utilizes an eUSB2 PHY from M31. Add the initialization
+sequences to bring it out of reset and into an operational state. This
+differs to the M31 USB driver, in that the M31 eUSB2 driver will
+require a connection to an eUSB2 repeater. This PHY driver will handle
+the initialization of the associated eUSB2 repeater when required.
+
+Reviewed-by: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
+Signed-off-by: Wesley Cheng <quic_wcheng@quicinc.com>
+Signed-off-by: Melody Olvera <melody.olvera@oss.qualcomm.com>
+Link: https://lore.kernel.org/r/20250527-sm8750_usb_master-v6-6-d58de3b41d34@oss.qualcomm.com
+Signed-off-by: Vinod Koul <vkoul@kernel.org>
+Source: https://github.com/torvalds/linux/commit/9c8504861cc4102463f31fe1f5e120a6deb15c15
+
+From 7044ed6749c8a7d49e67b2f07f42da2f29d26be6 Mon Sep 17 00:00:00 2001
+From: Ronak Raheja <ronak.raheja@oss.qualcomm.com>
+Date: Fri, 19 Sep 2025 20:21:58 -0700
+Subject: [PATCH] phy: qcom: m31-eusb2: Update init sequence to set PHY_ENABLE
+
+Certain platforms may not have the PHY_ENABLE bit set on power on reset.
+Update the current sequence to explicitly write to enable the PHY_ENABLE
+bit.  This ensures that regardless of the platform, the PHY is properly
+enabled.
+
+Signed-off-by: Ronak Raheja <ronak.raheja@oss.qualcomm.com>
+Signed-off-by: Wesley Cheng <wesley.cheng@oss.qualcomm.com>
+Reviewed-by: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
+Reviewed-by: Neil Armstrong <neil.armstrong@linaro.org>
+Link: https://patch.msgid.link/20250920032158.242725-1-wesley.cheng@oss.qualcomm.com
+Signed-off-by: Vinod Koul <vkoul@kernel.org>
+Source: https://github.com/torvalds/linux/commit/7044ed6749c8a7d49e67b2f07f42da2f29d26be6
+
+From 520a98bdf7ae0130e22d8adced3d69a2e211b41f Mon Sep 17 00:00:00 2001
+From: Elson Serrao <elson.serrao@oss.qualcomm.com>
+Date: Tue, 17 Feb 2026 12:11:30 -0800
+Subject: [PATCH] phy: qcom: m31-eusb2: clear PLL_EN during init
+
+The driver currently sets bit 0 of USB_PHY_CFG1 (PLL_EN) during PHY
+initialization. According to the M31 EUSB2 PHY hardware documentation,
+this bit is intended only for test/debug scenarios and does not control
+mission mode operation. Keeping PLL_EN asserted causes the PHY to draw
+additional current during USB bus suspend. Clearing this bit results in
+lower suspend power consumption without affecting normal operation.
+
+Update the driver to leave PLL_EN cleared as recommended by the hardware
+documentation.
+
+Fixes: 9c8504861cc4 ("phy: qcom: Add M31 based eUSB2 PHY driver")
+Cc: stable@vger.kernel.org
+Signed-off-by: Elson Serrao <elson.serrao@oss.qualcomm.com>
+Reviewed-by: Konrad Dybcio <konrad.dybcio@oss.qualcomm.com>
+Link: https://patch.msgid.link/20260217201130.2804550-1-elson.serrao@oss.qualcomm.com
+Signed-off-by: Vinod Koul <vkoul@kernel.org>
+Source: https://github.com/torvalds/linux/commit/520a98bdf7ae0130e22d8adced3d69a2e211b41f
+
+From 361f533a2dce2c2841fe4dc0c9d85a67117edf95 Mon Sep 17 00:00:00 2001
+From: Krishna Kurapati <krishna.kurapati@oss.qualcomm.com>
+Date: Sat, 18 Jul 2026 15:01:31 +0530
+Subject: [PATCH] phy: qcom: m31-eusb2: Fix return value of init call
+
+The init call currently returns success irrespective of any failures
+during repeater init or clock enablement. Return appropriate error value
+in the init call failure path.
+
+Fixes: 9c8504861cc4 ("phy: qcom: Add M31 based eUSB2 PHY driver")
+Signed-off-by: Krishna Kurapati <krishna.kurapati@oss.qualcomm.com>
+Link: https://patch.msgid.link/20260718-m31-eusb2-fix-v1-1-8588a1b94d76@oss.qualcomm.com
+Signed-off-by: Vinod Koul <vkoul@kernel.org>
+Source: https://github.com/torvalds/linux/commit/361f533a2dce2c2841fe4dc0c9d85a67117edf95
+
+From 3267c774f3ff61fc945a7531b2ae6784c37cd14f Mon Sep 17 00:00:00 2001
+From: Taniya Das <quic_tdas@quicinc.com>
+Date: Wed, 4 Dec 2024 11:37:18 -0800
+Subject: [PATCH] clk: qcom: Add support for GCC on SM8750
+
+Add support for GCC for SM8750 platform.
+
+Signed-off-by: Melody Olvera <quic_molvera@quicinc.com>
+Signed-off-by: Taniya Das <quic_tdas@quicinc.com>
+Reviewed-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Link: https://lore.kernel.org/r/20241204-sm8750_master_clks-v3-6-1a8f31a53a86@quicinc.com
+Signed-off-by: Bjorn Andersson <andersson@kernel.org>
+Source: https://github.com/torvalds/linux/commit/3267c774f3ff61fc945a7531b2ae6784c37cd14f
+
+From 806761852608ebc4d924c2e1c031fb72dcb33ed0 Mon Sep 17 00:00:00 2001
+From: Taniya Das <quic_tdas@quicinc.com>
+Date: Wed, 4 Dec 2024 11:37:20 -0800
+Subject: [PATCH] clk: qcom: Add TCSR clock driver for SM8750
+
+The TCSR clock controller found on SM8750 provides refclks
+for PCIE, USB and UFS. Add clock driver for it.
+
+Signed-off-by: Melody Olvera <quic_molvera@quicinc.com>
+Reviewed-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Signed-off-by: Taniya Das <quic_tdas@quicinc.com>
+Link: https://lore.kernel.org/r/20241204-sm8750_master_clks-v3-8-1a8f31a53a86@quicinc.com
+Signed-off-by: Bjorn Andersson <andersson@kernel.org>
+Source: https://github.com/torvalds/linux/commit/806761852608ebc4d924c2e1c031fb72dcb33ed0
+
+From 56d77c9a10d97d15b8da900f861bc28b06b84b1c Mon Sep 17 00:00:00 2001
+From: Abel Vesa <abel.vesa@linaro.org>
+Date: Wed, 8 Feb 2023 21:01:57 +0200
+Subject: [PATCH] phy: qcom: Add QCOM SNPS eUSB2 repeater driver
+
+PM8550B contains a eUSB2 repeater used for making the eUSB2 from
+SM8550 USB 2.0 compliant. This can be modelled SW-wise as a Phy.
+So add a new phy driver for it.
+
+Signed-off-by: Abel Vesa <abel.vesa@linaro.org>
+Link: https://lore.kernel.org/r/20230208190200.2966723-5-abel.vesa@linaro.org
+Signed-off-by: Vinod Koul <vkoul@kernel.org>
+Source: https://github.com/torvalds/linux/commit/56d77c9a10d97d15b8da900f861bc28b06b84b1c
+
+---
+diff --git a/arch/arm/mach-snapdragon/Kconfig b/arch/arm/mach-snapdragon/Kconfig
+index d3de8693..a7cf8b9e 100644
+--- a/arch/arm/mach-snapdragon/Kconfig
++++ b/arch/arm/mach-snapdragon/Kconfig
+@@ -1,5 +1,9 @@
+ if ARCH_SNAPDRAGON
+ 
++config QCOM_DODGE
++	bool "OnePlus 13 ABL runtime memory handoff"
++
++
+ config SYS_SOC
+ 	default "snapdragon"
+ 
+diff --git a/arch/arm/mach-snapdragon/board.c b/arch/arm/mach-snapdragon/board.c
+index 35735f15..9734cb5e 100644
+--- a/arch/arm/mach-snapdragon/board.c
++++ b/arch/arm/mach-snapdragon/board.c
+@@ -13,6 +13,7 @@
+ #include <asm/gpio.h>
+ #include <asm/io.h>
+ #include <asm/psci.h>
++#include <asm/sections.h>
+ #include <asm/system.h>
+ #include <dm/device.h>
+ #include <dm/pinctrl.h>
+@@ -48,6 +49,36 @@ static struct {
+ 	phys_size_t size;
+ } prevbl_ddr_banks[CONFIG_NR_DRAM_BANKS] __section(".data") = { 0 };
+ 
++#ifdef CONFIG_QCOM_DODGE
++static u64 dodge_select_arena(const fdt64_t *banks, int count, u64 image_start,
++			      u64 image_end, u64 needed);
++
++phys_addr_t board_get_usable_ram_top(phys_size_t total_size)
++{
++	fdt64_t banks[CONFIG_NR_DRAM_BANKS * 2];
++	phys_addr_t top;
++	int i;
++
++	/* The shipped dwc3_mem_region leaves 0x90000000..0xf0000000 available
++  * for USB DMA. Preserve all RAM banks but keep this first console's heap,
++  * tables and relocation within that low aperture. ABL's SMMU state is
++  * inherited, not reprogrammed or claimed to be validated here.
++  */
++	for (i = 0; i < CONFIG_NR_DRAM_BANKS; i++) {
++		banks[i * 2] = cpu_to_fdt64(prevbl_ddr_banks[i].start);
++		banks[i * 2 + 1] = cpu_to_fdt64(prevbl_ddr_banks[i].size);
++	}
++	top = dodge_select_arena(
++		banks, CONFIG_NR_DRAM_BANKS, (uintptr_t)_start,
++		(uintptr_t)__bss_start + CONFIG_SYS_INIT_SP_BSS_OFFSET,
++		max_t(phys_size_t, total_size, CONFIG_SYS_MALLOC_LEN + SZ_32M));
++	if (!top)
++		panic("Dodge: no safe low USB relocation arena\n");
++	return top;
++}
++
++#endif
++
+ int dram_init(void)
+ {
+ 	/*
+@@ -69,7 +100,7 @@ static int ddr_bank_cmp(const void *v1, const void *v2)
+ 	if (!res2->size)
+ 		return -1;
+ 
+-	return (res1->start >> 24) - (res2->start >> 24);
++	return (res1->start > res2->start) - (res1->start < res2->start);
+ }
+ 
+ /* This has to be done post-relocation since gd->bd isn't preserved */
+@@ -204,6 +235,10 @@ static void qcom_psci_fixup(void *fdt)
+  * or for supporting quirky devices where it's easier to leave the downstream DT in place
+  * to improve ABL compatibility. Otherwise, we use the DT provided by ABL.
+  */
++#ifdef CONFIG_QCOM_DODGE
++#include "dodge.c"
++#endif
++
+ int board_fdt_blob_setup(void **fdtp)
+ {
+ 	struct fdt_header *external_fdt, *internal_fdt;
+@@ -223,6 +258,16 @@ int board_fdt_blob_setup(void **fdtp)
+ 		panic("Internal FDT is invalid and no external FDT was provided! (fdt=%#llx)\n",
+ 		      (phys_addr_t)external_fdt);
+ 
++#ifdef CONFIG_QCOM_DODGE
++	if (internal_valid &&
++	    !fdt_node_check_compatible(internal_fdt, 0, "oneplus,dodge")) {
++		internal_fdt = dodge_import_fdt(
++			internal_fdt, external_valid ? external_fdt : NULL);
++		*fdtp = internal_fdt;
++	}
++
++#endif
++
+ 	/* Prefer memory information from internal DT if it's present */
+ 	if (internal_valid)
+ 		ret = qcom_parse_memory(internal_fdt);
+@@ -252,6 +297,12 @@ int board_fdt_blob_setup(void **fdtp)
+ 	if (internal_valid) {
+ 		debug("Using built in FDT\n");
+ 		ret = -EEXIST;
++#ifdef CONFIG_QCOM_DODGE
++		/* fdtdec_setup accepts the replacement pointer only on success. */
++		if (!fdt_node_check_compatible(internal_fdt, 0,
++					       "oneplus,dodge"))
++			ret = 0;
++#endif
+ 	} else {
+ 		debug("Using external FDT\n");
+ 		*fdtp = external_fdt;
+@@ -526,6 +577,13 @@ int board_late_init(void)
+ 	phys_addr_t addr;
+ 	struct fdt_header *fdt_blob = (struct fdt_header *)gd->fdt_blob;
+ 
++	if (!fdt_node_check_compatible(gd->fdt_blob, 0, "oneplus,dodge")) {
++		env_set("board", "oneplus-dodge");
++		env_set("soc", "sm8750");
++		qcom_show_boot_source();
++		return 0;
++	}
++
+ 	/* We need to be fairly conservative here as we support boards with just 1G of TOTAL RAM */
+ 	status |= !lmb_alloc(SZ_128M, &addr) ?
+ 		env_set_hex("loadaddr", addr) : 1;
+diff --git a/arch/arm/mach-snapdragon/dodge.c b/arch/arm/mach-snapdragon/dodge.c
+new file mode 100644
+index 00000000..431a39a9
+--- /dev/null
++++ b/arch/arm/mach-snapdragon/dodge.c
+@@ -0,0 +1,196 @@
++// SPDX-License-Identifier: GPL-2.0+
++/* ABL runtime memory contract for the OnePlus 13 embedded control tree. */
++#include <asm/sections.h>
++
++#define DODGE_MAX_RESERVED 128
++#define DODGE_FDT_BYTES SZ_64K
++/* board_fdt_blob_setup runs before BSS is available. */
++static u8 dodge_fdt[DODGE_FDT_BYTES] __aligned(8) __section(".data") = { 1 };
++
++struct dodge_range {
++	u64 start, end;
++};
++
++/* Select a contiguous, DMA-addressable arena without the running Image. */
++static u64 dodge_select_arena(const fdt64_t *banks, int count, u64 image_start,
++			      u64 image_end, u64 needed)
++{
++	u64 top = 0, start, end;
++	int i;
++	for (i = 0; i < count; i++) {
++		start = max_t(u64, fdt64_to_cpu(banks[i * 2]), 0x90000000);
++		end = min_t(u64,
++			    fdt64_to_cpu(banks[i * 2]) +
++				    fdt64_to_cpu(banks[i * 2 + 1]),
++			    0xf0000000);
++		if (end <= start)
++			continue;
++		if (start < image_end && image_start < end) {
++			if (end > image_end && end - image_end >= needed)
++				start = image_end;
++			else
++				end = image_start;
++		}
++		if (end > start && end - start >= needed)
++			top = max(top, end);
++	}
++	return top;
++}
++
++static void dodge_add_range(struct dodge_range *ranges, int *count, u64 start,
++			    u64 size)
++{
++	if (!size)
++		return;
++	if (start + size < start || *count == DODGE_MAX_RESERVED)
++		panic("Dodge: invalid or excessive reserved ranges\n");
++	ranges[*count].start = ALIGN_DOWN(start, SZ_4K);
++	if (start + size > U64_MAX - (SZ_4K - 1))
++		panic("Dodge: reserved range overflow\n");
++	ranges[*count].end = ALIGN(start + size, SZ_4K);
++	(*count)++;
++}
++
++/* Called only for the embedded Dodge DT. Never alter the caller's ABL DT. */
++static void *dodge_import_fdt(const void *internal, const void *external)
++{
++	struct dodge_range reserved[DODGE_MAX_RESERVED];
++	const fdt64_t *reg;
++	fdt64_t banks[CONFIG_NR_DRAM_BANKS * 2];
++	int root, src, dst, node, len, nres = 0, nbanks = 0, i, j, ret;
++	u64 start, size, end, pos, next;
++	const void *prop;
++	const char *name;
++
++	if (!external || fdt_check_header(external) ||
++	    (fdt_node_check_compatible(external, 0, "qcom,sun") &&
++	     fdt_node_check_compatible(external, 0, "qcom,sm8750")))
++		panic("Dodge: SM8750 ABL FDT required\n");
++	if (fdt_address_cells(external, 0) != 2 ||
++	    fdt_size_cells(external, 0) != 2)
++		panic("Dodge: unsupported ABL cell widths\n");
++	ret = fdt_open_into(internal, dodge_fdt, sizeof(dodge_fdt));
++	if (ret)
++		panic("Dodge: cannot expand control FDT\n");
++	root = fdt_path_offset(external, "/reserved-memory");
++	if (root < 0 || fdt_address_cells(external, root) != 2 ||
++	    fdt_size_cells(external, root) != 2)
++		panic("Dodge: complete ABL reservations required\n");
++	/* Geometry only: OEM phandles and compatibles cannot collide or bind drivers. */
++	fdt_for_each_subnode(node, external, root) {
++		reg = fdt_getprop(external, node, "reg", &len);
++		if (!reg)
++			continue; /* size-only pools have no allocation before Linux. */
++		if (len <= 0 || len % 16)
++			panic("Dodge: invalid reservation tuple\n");
++		for (i = 0; i < len / 16; i++)
++			dodge_add_range(reserved, &nres,
++					get_unaligned_be64(&reg[i * 2]),
++					get_unaligned_be64(&reg[i * 2 + 1]));
++		dst = fdt_path_offset(dodge_fdt, "/reserved-memory");
++		name = fdt_get_name(external, node, NULL);
++		dst = fdt_add_subnode(dodge_fdt, dst, name);
++		if (dst < 0 || fdt_setprop(dodge_fdt, dst, "reg", reg, len))
++			panic("Dodge: reservation import exceeds control FDT\n");
++		if (fdt_getprop(external, node, "no-map", NULL) &&
++		    fdt_setprop(dodge_fdt, dst, "no-map", NULL, 0))
++			panic("Dodge: reservation flag import failed\n");
++	}
++	for (i = 0; i < fdt_num_mem_rsv(external); i++) {
++		if (fdt_get_mem_rsv(external, i, &start, &size))
++			panic("Dodge: invalid FDT reservation\n");
++		dodge_add_range(reserved, &nres, start, size);
++		if (fdt_add_mem_rsv(dodge_fdt, start, size))
++			panic("Dodge: reservation map import failed\n");
++	}
++	/* Keep the source FDT intact until relocation has copied the control tree. */
++	dodge_add_range(reserved, &nres, (uintptr_t)external,
++			fdt_totalsize(external));
++	src = fdt_path_offset(external, "/chosen");
++	if (src < 0)
++		panic("Dodge: missing ABL chosen node\n");
++	dst = fdt_path_offset(dodge_fdt, "/chosen");
++	name = "bootargs";
++	prop = fdt_getprop(external, src, name, &len);
++	if (prop && (len <= 0 || ((const char *)prop)[len - 1] ||
++		     fdt_setprop(dodge_fdt, dst, name, prop, len)))
++		panic("Dodge: invalid bootargs\n");
++	reg = fdt_getprop(external, src, "linux,initrd-start", &len);
++	if (reg) {
++		if (len != 8)
++			panic("Dodge: invalid initrd start\n");
++		start = get_unaligned_be64(reg);
++		reg = fdt_getprop(external, src, "linux,initrd-end", &len);
++		if (!reg || len != 8)
++			panic("Dodge: invalid initrd end\n");
++		end = get_unaligned_be64(reg);
++		if (end <= start)
++			panic("Dodge: invalid initrd range\n");
++		dodge_add_range(reserved, &nres, start, end - start);
++		if (fdt_setprop_u64(dodge_fdt, dst, "linux,initrd-start",
++				    start) ||
++		    fdt_setprop_u64(dodge_fdt, dst, "linux,initrd-end", end) ||
++		    fdt_add_mem_rsv(dodge_fdt, start, end - start))
++			panic("Dodge: initrd reservation import failed\n");
++	}
++	src = fdt_path_offset(external, "/memory");
++	reg = fdt_getprop(external, src, "reg", &len);
++	if (!reg || len <= 0 || len % 16 || len / 16 > CONFIG_NR_DRAM_BANKS)
++		panic("Dodge: invalid or excessive ABL memory banks\n");
++	/* Subtract every fixed reservation. No speculative mapping or relocation may
++  * touch a carveout; dynamic CMA allocation is left to the eventual kernel.
++  */
++	for (i = 0; i < len / 16; i++) {
++		start = get_unaligned_be64(&reg[i * 2]);
++		size = get_unaligned_be64(&reg[i * 2 + 1]);
++		if (!size)
++			continue;
++		end = start + size;
++		if (end < start || (start | size) & (SZ_4K - 1))
++			panic("Dodge: invalid ABL memory range\n");
++		for (j = 0; j < i; j++) {
++			u64 a = get_unaligned_be64(&reg[j * 2]);
++			u64 b = get_unaligned_be64(&reg[j * 2 + 1]);
++			if (b && start < a + b && a < end)
++				panic("Dodge: overlapping ABL memory banks\n");
++		}
++		pos = start;
++		while (pos < end) {
++			next = end;
++			for (j = 0; j < nres; j++) {
++				if (reserved[j].start <= pos &&
++				    reserved[j].end > pos) {
++					pos = min(end, reserved[j].end);
++					break;
++				}
++				if (reserved[j].start > pos)
++					next = min(next, reserved[j].start);
++			}
++			if (j < nres)
++				continue;
++			if (nbanks == CONFIG_NR_DRAM_BANKS)
++				panic("Dodge: carveouts exceed memory bank capacity\n");
++			banks[nbanks * 2] = cpu_to_fdt64(pos);
++			banks[nbanks * 2 + 1] = cpu_to_fdt64(next - pos);
++			nbanks++;
++			pos = next;
++		}
++	}
++	/* The Image header reserves the BSS/early-stack footprint for ABL. Check that
++  * footprint against the actual handoff before any relocation or MMU setup.
++  */
++	start = (uintptr_t)_start;
++	end = (uintptr_t)__bss_start + CONFIG_SYS_INIT_SP_BSS_OFFSET;
++	for (i = 0; i < nbanks; i++) {
++		u64 a = fdt64_to_cpu(banks[i * 2]);
++		u64 b = fdt64_to_cpu(banks[i * 2 + 1]);
++		if (a <= start && end <= a + b)
++			break;
++	}
++	if (i == nbanks)
++		panic("Dodge: Image and early stack outside usable ABL RAM\n");
++	dst = fdt_path_offset(dodge_fdt, "/memory");
++	if (!nbanks || fdt_setprop(dodge_fdt, dst, "reg", banks, nbanks * 16))
++		panic("Dodge: memory import failed\n");
++	return dodge_fdt;
++}
+diff --git a/drivers/clk/qcom/Kconfig b/drivers/clk/qcom/Kconfig
+index 9ad233c8..b79d5738 100644
+--- a/drivers/clk/qcom/Kconfig
++++ b/drivers/clk/qcom/Kconfig
+@@ -185,3 +185,7 @@ config CLK_QCOM_X1E80100
+ endmenu
+ 
+ endif
++
++config CLK_QCOM_SM8750
++	bool "SM8750 USB clocks"
++	depends on CLK_QCOM
+diff --git a/drivers/clk/qcom/Makefile b/drivers/clk/qcom/Makefile
+index c0d95a63..7ce2f6d6 100644
+--- a/drivers/clk/qcom/Makefile
++++ b/drivers/clk/qcom/Makefile
+@@ -25,3 +25,5 @@ obj-$(CONFIG_CLK_QCOM_SM8250) += clock-sm8250.o
+ obj-$(CONFIG_CLK_QCOM_SM8550) += clock-sm8550.o
+ obj-$(CONFIG_CLK_QCOM_SM8650) += clock-sm8650.o
+ obj-$(CONFIG_CLK_QCOM_X1E80100) += clock-x1e80100.o
++
++obj-$(CONFIG_CLK_QCOM_SM8750) += clock-sm8750.o
+diff --git a/drivers/clk/qcom/clock-sm8750.c b/drivers/clk/qcom/clock-sm8750.c
+new file mode 100644
+index 00000000..56f83189
+--- /dev/null
++++ b/drivers/clk/qcom/clock-sm8750.c
+@@ -0,0 +1,108 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++/*
++ * Copyright (c) 2024, Qualcomm Innovation Center, Inc. All rights reserved.
++ * Minimal USB2 support adapted from Linux gcc-sm8750.c/tcsrcc-sm8750.c
++ * by Taniya Das; see the patch message for source revisions.
++ */
++#include <clk-uclass.h>
++#include <dm.h>
++#include <asm/io.h>
++#include <linux/delay.h>
++#include <dt-bindings/clock/qcom,sm8750-gcc.h>
++#include <dt-bindings/clock/qcom,sm8750-tcsr.h>
++#include "clock-qcom.h"
++
++static const struct freq_tbl usb_master_rates[] = {
++	F(66666667, CFG_CLK_SRC_GPLL0_EVEN, 4.5, 0, 0),
++	F(133333333, CFG_CLK_SRC_GPLL0, 4.5, 0, 0),
++	F(200000000, CFG_CLK_SRC_GPLL0, 3, 0, 0),
++	F(240000000, CFG_CLK_SRC_GPLL0, 2.5, 0, 0),
++	{}
++};
++static ulong sm8750_set_rate(struct clk *clk, ulong rate)
++{
++	struct msm_clk_priv *priv = dev_get_priv(clk->dev);
++	const struct freq_tbl *f;
++	switch (clk->id) {
++	case GCC_USB30_PRIM_MASTER_CLK:
++		f = qcom_find_freq(usb_master_rates, rate);
++		clk_rcg_set_rate_mnd(priv->base, 0x39030, f->pre_div, f->m,
++				     f->n, f->src, 8);
++		return f->freq;
++	case GCC_USB30_PRIM_MOCK_UTMI_CLK:
++		/* CXO is 19.2MHz after the SM8750 GCC input divide-by-two.
++   * Preserve the read-only postdivider; reject an unexpected divider.
++   */
++		if (rate != 19200000 || (readl(priv->base + 0x39060) & 0xf))
++			return -EINVAL;
++		clk_rcg_set_rate(priv->base, 0x39048, 1, CFG_CLK_SRC_CXO);
++		return rate;
++	default:
++		return -EINVAL;
++	}
++}
++static const struct gate_clk sm8750_clks[] = {
++	GATE_CLK_POLLED(GCC_CFG_NOC_USB3_PRIM_AXI_CLK, 0x3908c, BIT(0),
++			0x3908c),
++	GATE_CLK_POLLED(GCC_USB30_PRIM_MASTER_CLK, 0x39018, BIT(0), 0x39018),
++	GATE_CLK_POLLED(GCC_AGGRE_USB3_PRIM_AXI_CLK, 0x39090, BIT(0), 0x39090),
++	GATE_CLK_POLLED(GCC_USB30_PRIM_SLEEP_CLK, 0x39028, BIT(0), 0x39028),
++	GATE_CLK_POLLED(GCC_USB30_PRIM_MOCK_UTMI_CLK, 0x3902c, BIT(0), 0x3902c),
++};
++static int sm8750_enable(struct clk *clk)
++{
++	struct msm_clk_priv *priv = dev_get_priv(clk->dev);
++	return qcom_gate_clk_en(priv, clk->id);
++}
++static const struct qcom_reset_map sm8750_resets[] = {
++	[GCC_QUSB2PHY_PRIM_BCR] = { 0x12000 },
++	[GCC_USB30_PRIM_BCR] = { 0x39000 },
++};
++static const struct qcom_power_map sm8750_domains[] = {
++	[GCC_USB30_PRIM_GDSC] = { 0x39004 },
++};
++static struct msm_clk_data sm8750_data = {
++	.clks = sm8750_clks,
++	.num_clks = ARRAY_SIZE(sm8750_clks),
++	.resets = sm8750_resets,
++	.num_resets = ARRAY_SIZE(sm8750_resets),
++	.power_domains = sm8750_domains,
++	.num_power_domains = ARRAY_SIZE(sm8750_domains),
++	.enable = sm8750_enable,
++	.set_rate = sm8750_set_rate,
++};
++static const struct udevice_id sm8750_ids[] = {
++	{ .compatible = "qcom,sm8750-gcc", .data = (ulong)&sm8750_data },
++	{}
++};
++U_BOOT_DRIVER(gcc_sm8750) = {
++	.name = "gcc_sm8750",
++	.id = UCLASS_NOP,
++	.of_match = sm8750_ids,
++	.bind = qcom_cc_bind,
++	.flags = DM_FLAG_PRE_RELOC | DM_FLAG_DEFAULT_PD_CTRL_OFF,
++};
++static int tcsr_enable(struct clk *clk)
++{
++	fdt_addr_t base = dev_read_addr(clk->dev);
++	if (clk->id != TCSR_USB2_CLKREF_EN)
++		return -EINVAL;
++	setbits_le32(base + 0x2000, BIT(0));
++	udelay(10);
++	return 0;
++}
++static ulong tcsr_rate(struct clk *clk)
++{
++	return 38400000;
++}
++static struct clk_ops tcsr_ops = { .enable = tcsr_enable,
++				   .get_rate = tcsr_rate };
++static const struct udevice_id tcsr_ids[] = { { .compatible =
++							"qcom,sm8750-tcsr" },
++					      {} };
++U_BOOT_DRIVER(tcsr_sm8750) = {
++	.name = "tcsr_sm8750",
++	.id = UCLASS_CLK,
++	.of_match = tcsr_ids,
++	.ops = &tcsr_ops,
++};
+diff --git a/drivers/phy/qcom/Kconfig b/drivers/phy/qcom/Kconfig
+index 1fdadacc..44ab7fb6 100644
+--- a/drivers/phy/qcom/Kconfig
++++ b/drivers/phy/qcom/Kconfig
+@@ -70,3 +70,7 @@ config PHY_QCOM_USB_SS
+ 	help
+ 	  Enable this to support the Super-Speed USB transceiver on various
+ 	  Qualcomm chipsets.
++
++config PHY_QCOM_M31_EUSB2
++	bool "SM8750 M31 eUSB2 PHY and Dodge repeater"
++	depends on PHY && ARCH_SNAPDRAGON && PMIC_QCOM
+diff --git a/drivers/phy/qcom/Makefile b/drivers/phy/qcom/Makefile
+index 714013dc..49279ac3 100644
+--- a/drivers/phy/qcom/Makefile
++++ b/drivers/phy/qcom/Makefile
+@@ -8,3 +8,5 @@ obj-$(CONFIG_PHY_QCOM_USB_SNPS_FEMTO_V2) += phy-qcom-snps-femto-v2.o
+ obj-$(CONFIG_PHY_QCOM_SNPS_EUSB2) += phy-qcom-snps-eusb2.o
+ obj-$(CONFIG_PHY_QCOM_USB_HS_28NM) += phy-qcom-usb-hs-28nm.o
+ obj-$(CONFIG_PHY_QCOM_USB_SS) += phy-qcom-usb-ss.o
++
++obj-$(CONFIG_PHY_QCOM_M31_EUSB2) += phy-qcom-m31-eusb2.o phy-dodge-eusb2-repeater.o
+diff --git a/drivers/phy/qcom/phy-dodge-eusb2-repeater.c b/drivers/phy/qcom/phy-dodge-eusb2-repeater.c
+new file mode 100644
+index 00000000..ae098234
+--- /dev/null
++++ b/drivers/phy/qcom/phy-dodge-eusb2-repeater.c
+@@ -0,0 +1,59 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * PMI H010 device-mode repeater for OnePlus 13.
++ * Register protocol follows Linux phy-qcom-eusb2-repeater.c (Abel Vesa).
++ * Tuning is the PJZ110 shipped qcom,param-override-seq, not PM8550B defaults.
++ * ABL owns the shared supply votes.
++ */
++#include <dm.h>
++#include <generic-phy.h>
++#include <power/pmic.h>
++#include <linux/delay.h>
++static int dodge_repeater_init(struct phy *phy)
++{
++	static const struct {
++		u8 reg, value;
++	} seq[] = {
++
++		{ 0x51, 0x0e }, { 0x53, 0x07 }, { 0x54, 0x04 },
++		{ 0x55, 0x02 }, { 0x57, 0x04 },
++
++	};
++	int i, ret;
++	ret = pmic_clrsetbits(phy->dev->parent, 0xfd46, 0x80, 0x80);
++	if (ret)
++		return ret;
++	for (i = 0; i < ARRAY_SIZE(seq); i++) {
++		ret = pmic_reg_write(phy->dev->parent, 0xfd00 + seq[i].reg,
++				     seq[i].value);
++		if (ret)
++			return ret;
++	}
++	/* Clear only the CM.Lx host workaround bit; preserve unrelated forces. */
++	ret = pmic_clrsetbits(phy->dev->parent, 0xfde8, 0x40, 0);
++	if (ret)
++		return ret;
++	ret = pmic_clrsetbits(phy->dev->parent, 0xfded, 0x40, 0);
++	if (ret)
++		return ret;
++	for (i = 0; i < 100; i++) {
++		ret = pmic_reg_read(phy->dev->parent, 0xfd08);
++		if (ret < 0)
++			return ret;
++		if (ret & 0x80)
++			return 0;
++		udelay(50);
++	}
++	return -ETIMEDOUT;
++}
++static struct phy_ops dodge_repeater_ops = { .init = dodge_repeater_init };
++static const struct udevice_id dodge_repeater_ids[] = {
++	{ .compatible = "oneplus,dodge-eusb2-repeater" },
++	{}
++};
++U_BOOT_DRIVER(dodge_eusb2_repeater) = {
++	.name = "dodge_eusb2_repeater",
++	.id = UCLASS_PHY,
++	.of_match = dodge_repeater_ids,
++	.ops = &dodge_repeater_ops,
++};
+diff --git a/drivers/phy/qcom/phy-qcom-m31-eusb2.c b/drivers/phy/qcom/phy-qcom-m31-eusb2.c
+new file mode 100644
+index 00000000..ed9b0237
+--- /dev/null
++++ b/drivers/phy/qcom/phy-qcom-m31-eusb2.c
+@@ -0,0 +1,187 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Copyright (c) 2024-2025 Qualcomm Innovation Center, Inc. All rights reserved.
++ * Adapted from Wesley Cheng's Linux M31 eUSB2 driver.
++ * ABL retains the shared supply votes; this driver does not change rails.
++ */
++#include <clk.h>
++#include <dm.h>
++#include <generic-phy.h>
++#include <reset.h>
++#include <asm/io.h>
++#include <linux/bitfield.h>
++#include <linux/delay.h>
++#define USB_PHY_UTMI_CTRL0 (0x3c)
++#define SLEEPM BIT(0)
++
++#define USB_PHY_UTMI_CTRL5 (0x50)
++#define POR BIT(1)
++
++#define USB_PHY_HS_PHY_CTRL_COMMON0 (0x54)
++#define PHY_ENABLE BIT(0)
++#define SIDDQ_SEL BIT(1)
++#define SIDDQ BIT(2)
++#define FSEL GENMASK(6, 4)
++#define FSEL_38_4_MHZ_VAL (0x6)
++
++#define USB_PHY_HS_PHY_CTRL2 (0x64)
++#define USB2_SUSPEND_N BIT(2)
++#define USB2_SUSPEND_N_SEL BIT(3)
++
++#define USB_PHY_CFG0 (0x94)
++#define UTMI_PHY_CMN_CTRL_OVERRIDE_EN BIT(1)
++
++#define USB_PHY_CFG1 (0x154)
++#define PLL_EN BIT(0)
++
++#define USB_PHY_FSEL_SEL (0xb8)
++#define FSEL_SEL BIT(0)
++
++#define USB_PHY_XCFGI_39_32 (0x16c)
++#define HSTX_PE GENMASK(3, 2)
++
++#define USB_PHY_XCFGI_71_64 (0x17c)
++#define HSTX_SWING GENMASK(3, 0)
++
++#define USB_PHY_XCFGI_31_24 (0x168)
++#define HSTX_SLEW GENMASK(2, 0)
++
++#define USB_PHY_XCFGI_7_0 (0x15c)
++#define PLL_LOCK_TIME GENMASK(1, 0)
++
++#define M31_EUSB_PHY_INIT_CFG(o, b, v) \
++	{                              \
++		.off = o,              \
++		.mask = b,             \
++		.val = v,              \
++	}
++
++struct m31_phy_tbl_entry {
++	u32 off;
++	u32 mask;
++	u32 val;
++};
++
++static const struct m31_phy_tbl_entry m31_eusb2_setup_tbl[] = {
++	M31_EUSB_PHY_INIT_CFG(USB_PHY_CFG0, UTMI_PHY_CMN_CTRL_OVERRIDE_EN, 1),
++	M31_EUSB_PHY_INIT_CFG(USB_PHY_UTMI_CTRL5, POR, 1),
++	M31_EUSB_PHY_INIT_CFG(USB_PHY_HS_PHY_CTRL_COMMON0, PHY_ENABLE, 1),
++	M31_EUSB_PHY_INIT_CFG(USB_PHY_CFG1, PLL_EN, 0),
++	M31_EUSB_PHY_INIT_CFG(USB_PHY_FSEL_SEL, FSEL_SEL, 1),
++};
++
++static const struct m31_phy_tbl_entry m31_eusb_phy_override_tbl[] = {
++	M31_EUSB_PHY_INIT_CFG(USB_PHY_XCFGI_39_32, HSTX_PE, 0),
++	M31_EUSB_PHY_INIT_CFG(USB_PHY_XCFGI_71_64, HSTX_SWING, 7),
++	M31_EUSB_PHY_INIT_CFG(USB_PHY_XCFGI_31_24, HSTX_SLEW, 0),
++	M31_EUSB_PHY_INIT_CFG(USB_PHY_XCFGI_7_0, PLL_LOCK_TIME, 0),
++};
++
++static const struct m31_phy_tbl_entry m31_eusb_phy_reset_tbl[] = {
++	M31_EUSB_PHY_INIT_CFG(USB_PHY_HS_PHY_CTRL2, USB2_SUSPEND_N_SEL, 1),
++	M31_EUSB_PHY_INIT_CFG(USB_PHY_HS_PHY_CTRL2, USB2_SUSPEND_N, 1),
++	M31_EUSB_PHY_INIT_CFG(USB_PHY_UTMI_CTRL0, SLEEPM, 1),
++	M31_EUSB_PHY_INIT_CFG(USB_PHY_HS_PHY_CTRL_COMMON0, SIDDQ_SEL, 1),
++	M31_EUSB_PHY_INIT_CFG(USB_PHY_HS_PHY_CTRL_COMMON0, SIDDQ, 0),
++	M31_EUSB_PHY_INIT_CFG(USB_PHY_UTMI_CTRL5, POR, 0),
++	M31_EUSB_PHY_INIT_CFG(USB_PHY_HS_PHY_CTRL2, USB2_SUSPEND_N_SEL, 0),
++	M31_EUSB_PHY_INIT_CFG(USB_PHY_CFG0, UTMI_PHY_CMN_CTRL_OVERRIDE_EN, 0),
++};
++
++struct m31_priv {
++	void __iomem *base;
++	struct clk ref;
++	struct reset_ctl reset;
++	struct phy repeater;
++};
++static int m31_write(struct m31_priv *p, u32 off, u32 mask, u32 value)
++{
++	clrsetbits_le32(p->base + off, mask, value);
++	return (readl(p->base + off) & mask) == value ? 0 : -EIO;
++}
++static int m31_sequence(struct m31_priv *p, const struct m31_phy_tbl_entry *t,
++			int n)
++{
++	int i, ret;
++	for (i = 0; i < n; i++) {
++		ret = m31_write(p, t[i].off, t[i].mask,
++				t[i].val << __ffs(t[i].mask));
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++static int m31_on(struct phy *phy)
++{
++	struct m31_priv *p = dev_get_priv(phy->dev);
++	int ret;
++	if (clk_get_rate(&p->ref) != 38400000)
++		return -EINVAL;
++	ret = generic_phy_init(&p->repeater);
++	if (ret)
++		return ret;
++	ret = clk_enable(&p->ref);
++	if (ret)
++		goto exit_repeater;
++	ret = reset_assert(&p->reset);
++	if (ret)
++		goto exit_repeater;
++	udelay(5);
++	ret = reset_deassert(&p->reset);
++	if (ret)
++		goto exit_repeater;
++	ret = m31_sequence(p, m31_eusb2_setup_tbl,
++			   ARRAY_SIZE(m31_eusb2_setup_tbl));
++	if (ret)
++		goto assert_reset;
++	ret = m31_write(p, USB_PHY_HS_PHY_CTRL_COMMON0, FSEL,
++			FIELD_PREP(FSEL, FSEL_38_4_MHZ_VAL));
++	if (ret)
++		goto assert_reset;
++	ret = m31_sequence(p, m31_eusb_phy_override_tbl,
++			   ARRAY_SIZE(m31_eusb_phy_override_tbl));
++	if (ret)
++		goto assert_reset;
++	ret = m31_sequence(p, m31_eusb_phy_reset_tbl,
++			   ARRAY_SIZE(m31_eusb_phy_reset_tbl));
++	if (!ret)
++		return 0;
++assert_reset:
++	reset_assert(&p->reset);
++exit_repeater:
++	generic_phy_exit(&p->repeater);
++	return ret;
++}
++static int m31_off(struct phy *phy)
++{
++	struct m31_priv *p = dev_get_priv(phy->dev);
++	reset_assert(&p->reset);
++	return generic_phy_exit(&p->repeater);
++}
++static int m31_probe(struct udevice *dev)
++{
++	struct m31_priv *p = dev_get_priv(dev);
++	int ret;
++	p->base = dev_read_addr_ptr(dev);
++	if (!p->base)
++		return -EINVAL;
++	ret = clk_get_by_name(dev, "ref", &p->ref);
++	if (ret)
++		return ret;
++	ret = reset_get_by_index(dev, 0, &p->reset);
++	if (ret)
++		return ret;
++	return generic_phy_get_by_index(dev, 0, &p->repeater);
++}
++static struct phy_ops m31_ops = { .power_on = m31_on, .power_off = m31_off };
++static const struct udevice_id m31_ids[] = {
++	{ .compatible = "qcom,sm8750-m31-eusb2-phy" },
++	{}
++};
++U_BOOT_DRIVER(qcom_m31_eusb2) = {
++	.name = "qcom_m31_eusb2",
++	.id = UCLASS_PHY,
++	.of_match = m31_ids,
++	.probe = m31_probe,
++	.ops = &m31_ops,
++	.priv_auto = sizeof(struct m31_priv),
++};
+diff --git a/dts/upstream/src/arm64/qcom/sm8750-oneplus-dodge.dts b/dts/upstream/src/arm64/qcom/sm8750-oneplus-dodge.dts
+new file mode 100644
+index 00000000..671f976e
+--- /dev/null
++++ b/dts/upstream/src/arm64/qcom/sm8750-oneplus-dodge.dts
+@@ -0,0 +1,89 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/dts-v1/;
++#include <dt-bindings/clock/qcom,sm8750-gcc.h>
++#include <dt-bindings/clock/qcom,sm8750-tcsr.h>
++/ {
++	model = "OnePlus 13";
++	compatible = "oneplus,dodge", "qcom,sm8750";
++	#address-cells = <2>;
++	#size-cells = <2>;
++	/* ABL supplies the complete memory and reservation contract at entry. */
++	memory { device_type = "memory"; };
++	reserved-memory { #address-cells = <2>; #size-cells = <2>; ranges; };
++	chosen { };
++	psci { compatible = "arm,psci-1.0"; method = "smc"; };
++	timer { compatible = "arm,armv8-timer"; };
++	soc {
++		compatible = "simple-bus";
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++		gcc: clock-controller@100000 {
++			compatible = "qcom,sm8750-gcc";
++			reg = <0 0x100000 0 0xc7000>;
++			#clock-cells = <1>;
++			#reset-cells = <1>;
++			#power-domain-cells = <1>;
++		};
++		tcsrcc: clock-controller@f204008 {
++			compatible = "qcom,sm8750-tcsr";
++			reg = <0 0xf204008 0 0x2004>;
++			#clock-cells = <1>;
++		};
++		spmi: spmi@c400000 {
++			compatible = "qcom,spmi-pmic-arb";
++			reg = <0 0xc400000 0 0x3000>, <0 0xc500000 0 0x400000>,
++				     <0 0xc440000 0 0x80000>, <0 0xc4c0000 0 0x10000>,
++				     <0 0xc42d000 0 0x4000>;
++			reg-names = "core", "chnls", "obsrvr", "intr", "cnfg";
++			qcom,ee = <0>;
++			qcom,channel = <0>;
++			qcom,bus-id = <0>;
++			#address-cells = <2>;
++			#size-cells = <0>;
++			pmih010: pmic@7 {
++				compatible = "qcom,spmi-pmic";
++				reg = <7 0>;
++				#address-cells = <1>;
++				#size-cells = <0>;
++				repeater: phy@fd00 {
++					compatible = "oneplus,dodge-eusb2-repeater";
++					reg = <0xfd00>;
++					#phy-cells = <0>;
++				};
++			};
++		};
++		hsphy: phy@88e3000 {
++			compatible = "qcom,sm8750-m31-eusb2-phy";
++			reg = <0 0x88e3000 0 0x29c>;
++			clocks = <&tcsrcc TCSR_USB2_CLKREF_EN>;
++			clock-names = "ref";
++			resets = <&gcc GCC_QUSB2PHY_PRIM_BCR>;
++			phys = <&repeater>;
++			#phy-cells = <0>;
++		};
++		usb@a600000 {
++			compatible = "qcom,sm8750-dwc3", "qcom,snps-dwc3";
++			reg = <0 0xa600000 0 0xfc100>;
++			clocks = <&gcc GCC_CFG_NOC_USB3_PRIM_AXI_CLK>,
++				        <&gcc GCC_USB30_PRIM_MASTER_CLK>,
++				        <&gcc GCC_AGGRE_USB3_PRIM_AXI_CLK>,
++				        <&gcc GCC_USB30_PRIM_SLEEP_CLK>,
++				        <&gcc GCC_USB30_PRIM_MOCK_UTMI_CLK>;
++			clock-names = "cfg_noc", "core", "iface", "sleep", "mock_utmi";
++			assigned-clocks = <&gcc GCC_USB30_PRIM_MOCK_UTMI_CLK>,
++				                 <&gcc GCC_USB30_PRIM_MASTER_CLK>;
++			assigned-clock-rates = <19200000>, <200000000>;
++			power-domains = <&gcc GCC_USB30_PRIM_GDSC>;
++			resets = <&gcc GCC_USB30_PRIM_BCR>;
++			phys = <&hsphy>;
++			phy-names = "usb2-phy";
++			dr_mode = "peripheral";
++			maximum-speed = "high-speed";
++			qcom,select-utmi-as-pipe-clk;
++			snps,dis_u2_susphy_quirk;
++			snps,dis_enblslpm_quirk;
++			snps,usb2-gadget-lpm-disable;
++		};
++	};
++};

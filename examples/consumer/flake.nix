@@ -8,8 +8,8 @@
       buildSystem = "x86_64-linux"; # Or aarch64-linux for a native build host.
       device = "polaris";
       common = {
-        androidDevices.usbSerial = "my-polaris-01";
-        androidDevices.persistentImage.rootfs.label = "NIXOS";
+        # The USB serial defaults to POLARIS (RECOVERY_POLARIS in recovery);
+        # set androidDevices.usbSerial only to tell several phones apart.
         # Optional exact per-phone checks; see the device's first-install guide.
         # Optional measured roles: hardware.polaris.storageRoles.root.partuuid = "...";
         system.stateVersion = "26.05";

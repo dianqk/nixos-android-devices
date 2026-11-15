@@ -1,0 +1,81 @@
+From 1628240a3ae5a4f197772de1ef4b17afb5964ed8 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 20 Oct 2026 11:44:06 +0800
+Subject: [PATCH] mtk-soc: skip the empty type-0 filler TLVs of MT6897
+ confirmations
+
+MT6897 data-call confirmations (DATA_ACT_CNF) follow each empty TLV
+(0x812f, 0x8130, 0x8131, 0x8132) with an empty TLV of type 0. The
+duplicate check took them for a second result code and failed every
+connection ("Duplicate MIPC TLV") although the modem had activated the
+call (addresses, gateway and DNS present). Skip empty type-0 TLVs while
+searching; a duplicated real TLV is still refused. Offline test added.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/plugins/mtk-soc/mm-mtk-mipc.c   |  7 +++++++
+ src/plugins/mtk-soc/test-mtk-mipc.c | 26 ++++++++++++++++++++++++++
+ 2 files changed, 33 insertions(+)
+
+diff --git a/src/plugins/mtk-soc/mm-mtk-mipc.c b/src/plugins/mtk-soc/mm-mtk-mipc.c
+index f5ae6d0..a571454 100644
+--- a/src/plugins/mtk-soc/mm-mtk-mipc.c
++++ b/src/plugins/mtk-soc/mm-mtk-mipc.c
+@@ -528,6 +528,13 @@ find_tlv_impl (GBytes        *payload,
+         padded = ((gsize) 4 + current_len + 7) & ~(gsize) 7;
+         if (padded > size - pos)
+             goto truncated;
++        /* MT6897 data-call confirmations follow each empty TLV (0x812f,
++         * 0x8130, 0x8131, 0x8132 seen) with an empty TLV of type 0; it is
++         * filler, not a second result code. */
++        if (current_kind == 0 && current_len == 0) {
++            pos += padded;
++            continue;
++        }
+         if (current_kind == kind) {
+             if (seen) {
+                 g_set_error_literal (error, MM_MTK_MIPC_ERROR,
+diff --git a/src/plugins/mtk-soc/test-mtk-mipc.c b/src/plugins/mtk-soc/test-mtk-mipc.c
+index 53b09de..f6b086e 100644
+--- a/src/plugins/mtk-soc/test-mtk-mipc.c
++++ b/src/plugins/mtk-soc/test-mtk-mipc.c
+@@ -567,10 +567,36 @@ test_spi_invalid (void)
+     }
+ }
+ 
++static void
++test_empty_type0_filler (void)
++{
++    /* RESULT 0; an empty TLV 0x812f followed by an empty type-0 filler, as
++     * in MT6897 data-call confirmations; DNS1 after it. */
++    static const guint8 payload_data[] = {
++        0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x2f, 0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x01, 0x00,
++        0x0e, 0x81, 0x04, 0x00, 0x7b, 0x7b, 0x7b, 0x7b,
++    };
++    g_autoptr(GBytes) payload = NULL;
++    g_autoptr(GError) error = NULL;
++    const guint8 *value = NULL;
++    guint16 length = 0;
++    guint32 result = 1;
++
++    payload = g_bytes_new_static (payload_data, sizeof (payload_data));
++    g_assert_true (mm_mtk_mipc_find_u32_tlv (payload, 0, &result, &error));
++    g_assert_no_error (error);
++    g_assert_cmpuint (result, ==, 0);
++    g_assert_true (mm_mtk_mipc_find_tlv (payload, 0x810e, &value, &length, &error));
++    g_assert_cmpuint (length, ==, 4);
++}
++
+ int
+ main (int argc, char **argv)
+ {
+     g_test_init (&argc, &argv, NULL);
++    g_test_add_func ("/MM/mtk-soc/mipc/empty-type0-filler", test_empty_type0_filler);
+     g_test_add_func ("/mipc/stock-wire", test_stock_wire);
+     g_test_add_func ("/mipc/stream-fragments", test_stream_fragments);
+     g_test_add_func ("/mipc/tlv-validation", test_tlv_validation);
+-- 
+2.55.0
+

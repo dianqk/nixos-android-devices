@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 14 Oct 2026 22:06:02 +0800
+Subject: [PATCH 16/24] arm: save_prev_bl_data: keep save_boot_params free of
+ stack accesses
+
+save_boot_params() runs before U-Boot sets up a stack, yet as a C function
+with a tail call it pushes a frame record. MediaTek LK starts the kernel
+(here U-Boot) at EL1 under its hypervisor with SP_EL1 = 0: the push
+faulted, the exception went to the unset VBAR_EL1 + 0x200 and the
+hypervisor stopped the CPU until the hardware watchdog reset the device
+(ATF watchdog dump: esr_el2 0x8200000e, elr_el2/far_el2 0x200,
+sp_el1 0). Implement it in assembly; it only stores x0.
+
+This also drops the entry hook added for bring-up tracing; the board's
+first C hook records entry instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm/lib/save_prev_bl_data.c | 57 ++++++++------------------------
+ 1 file changed, 13 insertions(+), 44 deletions(-)
+
+diff --git a/arch/arm/lib/save_prev_bl_data.c b/arch/arm/lib/save_prev_bl_data.c
+index 55c01a6969f..761ff9ce478 100644
+--- a/arch/arm/lib/save_prev_bl_data.c
++++ b/arch/arm/lib/save_prev_bl_data.c
+@@ -14,57 +14,26 @@
+ #include <asm/system.h>
+ #include <asm/armv8/mmu.h>
+ 
+-static ulong reg0 __section(".data");
++static ulong reg0 __section(".data") __used;
+ 
+ /**
+  * Save x0 register value, assuming previous bootloader set it to
+  * point on loaded fdt or (for older linux kernels)atags.
+  */
+-#if CONFIG_IS_ENABLED(MEDIATEK_MOBILE_ENTRY_TRACE)
+ /*
+- * Runs before the stack and the PIE fixups exist: only immediate stores and
+- * PC-relative literals, no calls. Restart the stock bootloader's watchdog
+- * and start a fresh ramoops-format console record with an entry marker.
++ * Runs before U-Boot has a stack: firmware may enter with SP = 0 (MediaTek
++ * LK starting a kernel at EL1 under its hypervisor does). Keep it free of
++ * stack accesses, which a C function with a frame record cannot promise.
+  */
+-static __always_inline void mediatek_mobile_entry_trace(void)
+-{
+-	static const char marker[] = "U-Boot: entry from previous bootloader\n";
+-	volatile u32 *header = (volatile u32 *)CONFIG_MEDIATEK_MOBILE_PSTORE_CONSOLE;
+-	volatile u8 *data = (volatile u8 *)(header + 3);
+-	u32 i;
+-
+-	if (CONFIG_MEDIATEK_MOBILE_ENTRY_WDT_RESTART)
+-		*(volatile u32 *)CONFIG_MEDIATEK_MOBILE_ENTRY_WDT_RESTART =
+-			CONFIG_MEDIATEK_MOBILE_ENTRY_WDT_RESTART_KEY;
+-	if (!CONFIG_MEDIATEK_MOBILE_PSTORE_CONSOLE)
+-		return;
+-	for (i = 0; i < sizeof(marker) - 1; i++)
+-		data[i] = marker[i];
+-	header[0] = 0x43474244; /* "DBGC", ramoops console without ECC */
+-	header[1] = sizeof(marker) - 1;
+-	header[2] = sizeof(marker) - 1;
+-	if (CONFIG_MEDIATEK_MOBILE_PROBE_STAGE == 1 &&
+-	    CONFIG_MEDIATEK_MOBILE_ENTRY_WDT_RESTART) {
+-		/* RGU: reboot mode "bootloader" (3) at 0x24, then reset at 0x14. */
+-		volatile u32 *rgu = (volatile u32 *)
+-			(CONFIG_MEDIATEK_MOBILE_ENTRY_WDT_RESTART - 0x8);
+-
+-		rgu[0x24 / 4] = (rgu[0x24 / 4] & ~0xf) | 0x3;
+-		rgu[0x14 / 4] = 0x1209;
+-		for (;;)
+-			;
+-	}
+-}
+-#endif
+-
+-void save_boot_params(ulong r0)
+-{
+-#if CONFIG_IS_ENABLED(MEDIATEK_MOBILE_ENTRY_TRACE)
+-	mediatek_mobile_entry_trace();
+-#endif
+-	reg0 = r0;
+-	save_boot_params_ret();
+-}
++asm(".pushsection .text.save_boot_params, \"ax\"\n"
++    ".global save_boot_params\n"
++    ".type save_boot_params, %function\n"
++    "save_boot_params:\n"
++    "	adrp	x1, reg0\n"
++    "	str	x0, [x1, :lo12:reg0]\n"
++    "	b	save_boot_params_ret\n"
++    ".size save_boot_params, . - save_boot_params\n"
++    ".popsection\n");
+ 
+ bool is_addr_accessible(phys_addr_t addr)
+ {
+-- 
+2.55.0
+

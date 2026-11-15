@@ -9,7 +9,8 @@ hardware.asphalt.sensors.enable = true;
 # Or: hardware.polaris.sensors.enable = true;
 ```
 
-This page covers Asphalt and Polaris. Aurora's sensors are described in
+This page covers Asphalt and Polaris. Marble's SLPI sensors (experimental) are
+described in [Marble sensors](marble/README.md#sensors). Aurora's sensors are described in
 [Aurora sensors](aurora/sensors.md); Sheng's optional `hardware.sheng.sensors`
 services are listed in [Sheng hardware](sheng/hardware.md).
 

@@ -1,0 +1,45 @@
+From 527a30dfd5a5c5682de6734935fa2790118114ad Mon Sep 17 00:00:00 2001
+From: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
+Date: Mon, 19 Oct 2026 17:39:20 +0300
+Subject: [PATCH] soc: qcom: spm: don't clobber the SAW control registers
+
+The SAWv4.1 and SAWv2.3 register tables have no sequence entry, so
+probe copies the all-zero sequence buffer to offset 0 instead, wiping
+the SPM_CTL, SPM_DLY and SAW_CFG values the boot firmware programmed.
+On MSM8998 the firmware then still powers the gold cluster down once
+its last CPU goes offline, but never brings it back: PSCI CPU_ON leaves
+the first CPU pending and the SoC hangs or resets.
+
+Only write the sequence when the SAW has a sequence entry, like the
+other registers.
+
+Fixes: 13e72c3e2261 ("soc: qcom: spm: Implement support for SAWv4.1, SDM630/660 L2 AVS")
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
+Reviewed-by: Konrad Dybcio <konrad.dybcio@oss.qualcomm.com>
+Link: https://lore.kernel.org/r/20261019-fix-qcom-saw-v1-2-9c7ba3fc2493@oss.qualcomm.com
+Link: https://patchwork.kernel.org/project/linux-arm-msm/patch/20261019-fix-qcom-saw-v1-2-9c7ba3fc2493@oss.qualcomm.com/
+Scope: SDM630/660 common
+Porting notes: Applied unchanged on v7.3 from the linux-arm-msm patchwork mbox (v1 series 1189007, not yet merged upstream).
+---
+ drivers/soc/qcom/spm.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/soc/qcom/spm.c b/drivers/soc/qcom/spm.c
+index d41c94d32b..6f2f14eb90 100644
+--- a/drivers/soc/qcom/spm.c
++++ b/drivers/soc/qcom/spm.c
+@@ -528,9 +528,11 @@ static int spm_dev_probe(struct platform_device *pdev)
+ 	platform_set_drvdata(pdev, drv);
+ 
+ 	/* Write the SPM sequences first.. */
+-	addr = drv->reg_base + drv->reg_data->reg_offset[SPM_REG_SEQ_ENTRY];
+-	__iowrite32_copy(addr, drv->reg_data->seq,
+-			ARRAY_SIZE(drv->reg_data->seq) / 4);
++	if (drv->reg_data->reg_offset[SPM_REG_SEQ_ENTRY]) {
++		addr = drv->reg_base + drv->reg_data->reg_offset[SPM_REG_SEQ_ENTRY];
++		__iowrite32_copy(addr, drv->reg_data->seq,
++				 ARRAY_SIZE(drv->reg_data->seq) / 4);
++	}
+ 
+ 	/*
+ 	 * ..and then the control registers.

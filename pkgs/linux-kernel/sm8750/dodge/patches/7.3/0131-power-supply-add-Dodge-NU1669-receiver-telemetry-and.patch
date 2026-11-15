@@ -1,0 +1,889 @@
+From 94fdc294781b9e2174e7c1518c2aec6d3df216b6 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Thu, 12 Nov 2026 21:13:36 +0800
+Subject: [PATCH 139/144] power: supply: add Dodge NU1669 receiver telemetry
+ and authorization
+
+Consolidate passive receiver telemetry, binding, authorization and scope changes.
+
+Consolidated from local follow-ups:
+  6b3dacc72c76100dadd0985093154b81b0aa74b0 power: supply: add passive NU1669 receiver telemetry on Dodge
+  c3a179ea0b3c58c7547d9c4c596b8b5841d239d3 dt-bindings: soc: qcom: describe a wireless receiver power supply
+  82b9c42064f3002e353509dd4ce16d9ee2046b7a power: supply: connect receiver presence to wireless power authorization
+  bbf66693d8d8c7a25439faab4c85c72468ea71bc power: supply: nu1669: expose raw direct-path firmware state
+  36f97c9cca4ea794e8fa3e1f93e21e47aa3f3f84 dt-bindings: soc: qcom: use common supply phandle typing
+  20a1549e34f3e9cafc73e1ce19381139ecfd83cb power: supply: scope wireless receiver dependency to battery manager
+---
+ .../ABI/testing/sysfs-bus-i2c-nu1669          |  24 ++
+ .../bindings/power/supply/nuvolta,nu1669.yaml |  52 +++
+ .../bindings/soc/qcom/qcom,pmic-glink.yaml    |   6 +
+ .../devicetree/bindings/vendor-prefixes.yaml  |   2 +
+ MAINTAINERS                                   |   7 +
+ .../boot/dts/qcom/sm8750-oneplus-dodge.dts    |  24 ++
+ drivers/power/supply/Kconfig                  |  11 +
+ drivers/power/supply/Makefile                 |   1 +
+ drivers/power/supply/nu1669.c                 | 365 ++++++++++++++++++
+ drivers/power/supply/qcom_battmgr.c           | 165 +++++++-
+ 10 files changed, 647 insertions(+), 10 deletions(-)
+ create mode 100644 Documentation/ABI/testing/sysfs-bus-i2c-nu1669
+ create mode 100644 Documentation/devicetree/bindings/power/supply/nuvolta,nu1669.yaml
+ create mode 100644 drivers/power/supply/nu1669.c
+
+diff --git a/Documentation/ABI/testing/sysfs-bus-i2c-nu1669 b/Documentation/ABI/testing/sysfs-bus-i2c-nu1669
+new file mode 100644
+index 0000000000..78d8c81d73
+--- /dev/null
++++ b/Documentation/ABI/testing/sysfs-bus-i2c-nu1669
+@@ -0,0 +1,24 @@
++What:           /sys/bus/i2c/devices/.../firmware_state
++Date:           November 2026
++Contact:        dianqk <dianqk@dianqk.net>
++Description:
++                Read-only NU1669 firmware shadow diagnostics. A line contains
++                chip_id, hw (hardware revision), customer, fw (firmware version),
++                protocol, events (unacknowledged firmware event bits), and
++                vrect_mv (rectifier voltage in millivolts), b2b_on and b2b_state
++                (raw firmware direct-path state). Identity, protocol
++                event and direct-path fields are hexadecimal raw firmware values. Protocol
++                0x04 denotes BPP and 0x31 denotes EPP; other values are not
++                interpreted. These values do not establish battery charging,
++                authentication, protection configuration or power-flow state.
++                Data is polled every two seconds while attached. Reads return
++                ENODATA after a failed sample, detach or system suspend until
++                a fresh attached sample succeeds. Events are never cleared by
++                this driver. The firmware shadow need not be an atomic hardware
++                snapshot.
++                Connection edges immediately invalidate the sampled shadow.
++                The power-supply PRESENT property reads the physical connection
++                input afresh and propagates GPIO errors. ONLINE means attached
++                with a valid sample reporting positive receiver output voltage;
++                it does not mean the battery is charging. No connection IRQ is
++                enabled as a system wake source.
+diff --git a/Documentation/devicetree/bindings/power/supply/nuvolta,nu1669.yaml b/Documentation/devicetree/bindings/power/supply/nuvolta,nu1669.yaml
+new file mode 100644
+index 0000000000..d661bfacb7
+--- /dev/null
++++ b/Documentation/devicetree/bindings/power/supply/nuvolta,nu1669.yaml
+@@ -0,0 +1,52 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/power/supply/nuvolta,nu1669.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: NuVolta NU1669 wireless power receiver
++
++maintainers:
++  - dianqk <dianqk@dianqk.net>
++
++description: |
++  NU1669 receiver with a firmware-managed wireless power interface. The
++  connection input indicates receiver attachment, independently of whether
++  output power is flowing. The event input requires firmware acknowledgment.
++
++properties:
++  compatible:
++    const: nuvolta,nu1669
++
++  reg:
++    maxItems: 1
++
++  connected-gpios:
++    maxItems: 1
++    description: Receiver connection indication, asserted while attached.
++
++  event-gpios:
++    maxItems: 1
++    description: Active-low firmware event indication.
++
++required:
++  - compatible
++  - reg
++  - connected-gpios
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/gpio/gpio.h>
++    i2c {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        wireless-charger@36 {
++            compatible = "nuvolta,nu1669";
++            reg = <0x36>;
++            connected-gpios = <&gpio 172 GPIO_ACTIVE_HIGH>;
++            event-gpios = <&gpio 108 GPIO_ACTIVE_LOW>;
++        };
++    };
+diff --git a/Documentation/devicetree/bindings/soc/qcom/qcom,pmic-glink.yaml b/Documentation/devicetree/bindings/soc/qcom/qcom,pmic-glink.yaml
+index f0cd40af13..1c4c5fadd9 100644
+--- a/Documentation/devicetree/bindings/soc/qcom/qcom,pmic-glink.yaml
++++ b/Documentation/devicetree/bindings/soc/qcom/qcom,pmic-glink.yaml
+@@ -57,6 +57,12 @@ properties:
+           - const: qcom,sm8550-pmic-glink
+           - const: qcom,pmic-glink
+ 
++  qcom,wireless-receiver:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description:
++      Wireless receiver providing physical attachment, output availability
++      and output voltage/current independently of the GLINK firmware reports.
++
+   '#address-cells':
+     const: 1
+ 
+diff --git a/Documentation/devicetree/bindings/vendor-prefixes.yaml b/Documentation/devicetree/bindings/vendor-prefixes.yaml
+index ba20029693..8132e7f4a9 100644
+--- a/Documentation/devicetree/bindings/vendor-prefixes.yaml
++++ b/Documentation/devicetree/bindings/vendor-prefixes.yaml
+@@ -1225,6 +1225,8 @@ patternProperties:
+     description: Nuvoton Technology Corporation
+   "^nvd,.*":
+     description: New Vision Display
++  "^nuvolta,.*":
++    description: NuVolta Technologies
+   "^nvidia,.*":
+     description: NVIDIA
+   "^nxp,.*":
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 663be6c55d..fa91325893 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -8355,6 +8355,13 @@ S:	Maintained
+ F:	Documentation/devicetree/bindings/display/panel/novatek,nt37801.yaml
+ F:	drivers/gpu/drm/panel/panel-novatek-nt37801.c
+ 
++NUVOLTA NU1669 WIRELESS RECEIVER
++M:	dianqk <dianqk@dianqk.net>
++S:	Maintained
++F:	Documentation/ABI/testing/sysfs-bus-i2c-nu1669
++F:	Documentation/devicetree/bindings/power/supply/nuvolta,nu1669.yaml
++F:	drivers/power/supply/nu1669.c
++
+ DRM DRIVER FOR NVIDIA GEFORCE/QUADRO GPUS
+ M:	Lyude Paul <lyude@redhat.com>
+ M:	Danilo Krummrich <dakr@kernel.org>
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+index 81a39fb02a..0b4a3aa7a1 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
++++ b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+@@ -1190,3 +1190,27 @@ front_camera_reset: front-camera-reset-state {
+ 		bias-disable;
+ 	};
+ };
++
++&i2c_hub_3 {
++	clock-frequency = <400000>;
++	status = "okay";
++
++	wireless_receiver: wireless-charger@36 {
++		compatible = "nuvolta,nu1669";
++		reg = <0x36>;
++		connected-gpios = <&tlmm 172 GPIO_ACTIVE_HIGH>;
++		event-gpios = <&tlmm 108 GPIO_ACTIVE_LOW>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&wireless_receiver_inputs>;
++	};
++};
++
++&tlmm {
++	wireless_receiver_inputs: wireless-receiver-inputs-state {
++		pins = "gpio108", "gpio172";
++		function = "gpio";
++		drive-strength = <2>;
++		input-enable;
++		bias-disable;
++	};
++};
+diff --git a/drivers/power/supply/Kconfig b/drivers/power/supply/Kconfig
+index b89ef40df7..8ce1f73605 100644
+--- a/drivers/power/supply/Kconfig
++++ b/drivers/power/supply/Kconfig
+@@ -1202,4 +1202,15 @@ config MACSMC_POWER
+ 
+ 	  Say Y or M here if you have an Apple Silicon based Mac.
+ 
++
++config CHARGER_NU1669
++	tristate "NuVolta NU1669 receiver telemetry"
++	depends on I2C && GPIOLIB
++	select REGMAP_I2C
++	help
++	  Read-only connection and output telemetry for the NU1669 wireless
++	  receiver. This does not enable charging or configure the receiver.
++	  The physical attachment input is independent of battery charging.
++	  Say M here to build the nu1669 diagnostic module.
++
+ endif # POWER_SUPPLY
+diff --git a/drivers/power/supply/Makefile b/drivers/power/supply/Makefile
+index f3c0d1006c..5be75ee8a7 100644
+--- a/drivers/power/supply/Makefile
++++ b/drivers/power/supply/Makefile
+@@ -135,3 +135,4 @@ obj-$(CONFIG_CHARGER_QCOM_SMB2)	+= qcom_smbx.o
+ obj-$(CONFIG_FUEL_GAUGE_MM8013)	+= mm8013.o
+ obj-$(CONFIG_MACSMC_POWER)	+= macsmc-power.o
+ obj-$(CONFIG_CHARGER_MAX77759)	+= max77759_charger.o
++obj-$(CONFIG_CHARGER_NU1669)	+= nu1669.o
+diff --git a/drivers/power/supply/nu1669.c b/drivers/power/supply/nu1669.c
+new file mode 100644
+index 0000000000..ea0654a760
+--- /dev/null
++++ b/drivers/power/supply/nu1669.c
+@@ -0,0 +1,365 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2023-2024 Oplus. All rights reserved.
++ * Copyright (C) 2026 dianqk
++ *
++ * NU1669 firmware shadow layout derived from the Oplus NU1669 driver.
++ * This driver only observes the receiver. It never sends firmware commands,
++ * acknowledges events, changes protection settings or enables power transfer.
++ */
++
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/interrupt.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/power_supply.h>
++#include <linux/regmap.h>
++#include <linux/unaligned.h>
++#include <linux/workqueue.h>
++
++#define NU1669_INFO_BASE		0x2100
++#define NU1669_INFO_SIZE		0x48
++#define NU1669_POLL_MS		2000
++
++struct nu1669 {
++	struct regmap *regmap;
++	struct gpio_desc *connected;
++	struct gpio_desc *event;
++	struct power_supply *psy;
++	struct delayed_work poll;
++	struct mutex lock;
++	int present;
++	int irq;
++	u32 generation;
++	bool suspended;
++	bool stopped;
++	bool valid;
++	u8 info[NU1669_INFO_SIZE];
++};
++
++static const struct regmap_range nu1669_read_ranges[] = {
++	regmap_reg_range(NU1669_INFO_BASE, NU1669_INFO_BASE + NU1669_INFO_SIZE - 1),
++};
++
++static const struct regmap_access_table nu1669_read_table = {
++	.yes_ranges = nu1669_read_ranges,
++	.n_yes_ranges = ARRAY_SIZE(nu1669_read_ranges),
++};
++
++static bool nu1669_writeable_reg(struct device *dev, unsigned int reg)
++{
++	return false;
++}
++
++static const struct regmap_config nu1669_regmap_config = {
++	.reg_bits = 16,
++	.val_bits = 8,
++	.reg_format_endian = REGMAP_ENDIAN_BIG,
++	.max_register = NU1669_INFO_BASE + NU1669_INFO_SIZE - 1,
++	.rd_table = &nu1669_read_table,
++	.writeable_reg = nu1669_writeable_reg,
++	.cache_type = REGCACHE_NONE,
++};
++
++static enum power_supply_property nu1669_properties[] = {
++	POWER_SUPPLY_PROP_ONLINE,
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_CURRENT_NOW,
++	POWER_SUPPLY_PROP_MANUFACTURER,
++	POWER_SUPPLY_PROP_MODEL_NAME,
++};
++
++static int nu1669_get_property(struct power_supply *psy,
++			      enum power_supply_property prop,
++			      union power_supply_propval *val)
++{
++	struct nu1669 *rx = power_supply_get_drvdata(psy);
++	int present, ret = 0;
++
++	if (prop == POWER_SUPPLY_PROP_PRESENT || prop == POWER_SUPPLY_PROP_ONLINE ||
++	    prop == POWER_SUPPLY_PROP_VOLTAGE_NOW || prop == POWER_SUPPLY_PROP_CURRENT_NOW) {
++		/* A safety consumer must never mistake a stale or errored input for absence. */
++		present = gpiod_get_value_cansleep(rx->connected);
++		if (present < 0)
++			return present;
++		if (prop == POWER_SUPPLY_PROP_PRESENT) {
++			val->intval = present;
++			return 0;
++		}
++		if (!present && prop != POWER_SUPPLY_PROP_ONLINE)
++			return -ENODATA;
++	} else {
++		present = 0;
++	}
++
++	mutex_lock(&rx->lock);
++	switch (prop) {
++	case POWER_SUPPLY_PROP_ONLINE:
++		/* Receiver output availability, never a battery charging-state claim. */
++		val->intval = present && rx->valid && get_unaligned_le16(rx->info + 0x34);
++		break;
++	case POWER_SUPPLY_PROP_MANUFACTURER:
++		val->strval = "NuVolta";
++		break;
++	case POWER_SUPPLY_PROP_MODEL_NAME:
++		val->strval = "NU1669";
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++	case POWER_SUPPLY_PROP_CURRENT_NOW:
++		if (!rx->valid) {
++			ret = -ENODATA;
++			break;
++		}
++		/* Firmware reports receiver output in mV and mA. */
++		val->intval = get_unaligned_le16(rx->info +
++			(prop == POWER_SUPPLY_PROP_VOLTAGE_NOW ? 0x34 : 0x36)) * 1000;
++		break;
++	default:
++		ret = -EINVAL;
++	}
++	mutex_unlock(&rx->lock);
++
++	return ret;
++}
++
++static const struct power_supply_desc nu1669_psy_desc = {
++	.name = "nu1669-receiver",
++	.type = POWER_SUPPLY_TYPE_WIRELESS,
++	.properties = nu1669_properties,
++	.num_properties = ARRAY_SIZE(nu1669_properties),
++	.get_property = nu1669_get_property,
++};
++
++/* Read-only diagnostics: raw firmware values, not charging-state claims. */
++static ssize_t firmware_state_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	struct nu1669 *rx = dev_get_drvdata(dev);
++	ssize_t ret;
++
++	ret = gpiod_get_value_cansleep(rx->connected);
++	if (ret <= 0)
++		return ret < 0 ? ret : -ENODATA;
++
++	mutex_lock(&rx->lock);
++	if (!rx->valid)
++		ret = -ENODATA;
++	else
++		ret = sysfs_emit(buf,
++			"chip_id=0x%04x hw=0x%02x customer=0x%02x fw=0x%02x protocol=0x%02x events=0x%08x vrect_mv=%u b2b_on=0x%02x b2b_state=0x%02x\n",
++			get_unaligned_le16(rx->info), rx->info[2], rx->info[3],
++			rx->info[4], rx->info[0x11],
++			get_unaligned_le32(rx->info + 0x20),
++			get_unaligned_le16(rx->info + 0x38), rx->info[0x44], rx->info[0x46]);
++	mutex_unlock(&rx->lock);
++
++	return ret;
++}
++static DEVICE_ATTR_RO(firmware_state);
++
++static struct attribute *nu1669_attrs[] = {
++	&dev_attr_firmware_state.attr,
++	NULL,
++};
++static const struct attribute_group nu1669_group = {
++	.attrs = nu1669_attrs,
++};
++
++static bool nu1669_online(struct nu1669 *rx)
++{
++	return rx->present > 0 && rx->valid && get_unaligned_le16(rx->info + 0x34);
++}
++
++static void nu1669_poll(struct work_struct *work)
++{
++	struct nu1669 *rx = container_of(to_delayed_work(work), struct nu1669, poll);
++	u8 info[NU1669_INFO_SIZE] = {};
++	bool valid = false, changed, online;
++	u32 generation;
++	int present, ret;
++
++	mutex_lock(&rx->lock);
++	generation = rx->generation;
++	if (rx->suspended || rx->stopped) {
++		mutex_unlock(&rx->lock);
++		return;
++	}
++	mutex_unlock(&rx->lock);
++
++	present = gpiod_get_value_cansleep(rx->connected);
++	if (present > 0) {
++		ret = regmap_bulk_read(rx->regmap, NU1669_INFO_BASE, info, sizeof(info));
++		if (!ret) {
++			present = gpiod_get_value_cansleep(rx->connected);
++			valid = present > 0;
++		}
++	}
++
++	mutex_lock(&rx->lock);
++	if (rx->suspended || rx->stopped || generation != rx->generation) {
++		mutex_unlock(&rx->lock);
++		return;
++	}
++	online = nu1669_online(rx);
++	changed = rx->present != present || rx->valid != valid;
++	rx->present = present;
++	rx->valid = valid;
++	if (valid)
++		memcpy(rx->info, info, sizeof(info));
++	else
++		memset(rx->info, 0, sizeof(rx->info));
++	changed |= online != nu1669_online(rx);
++	/* Telemetry is sampled quietly; notify changes affecting authorization. */
++	if (changed)
++		power_supply_changed(rx->psy);
++	schedule_delayed_work(&rx->poll, msecs_to_jiffies(NU1669_POLL_MS));
++	mutex_unlock(&rx->lock);
++}
++
++static irqreturn_t nu1669_connected_irq(int irq, void *data)
++{
++	struct nu1669 *rx = data;
++
++	mutex_lock(&rx->lock);
++	rx->generation++;
++	rx->valid = false;
++	memset(rx->info, 0, sizeof(rx->info));
++	if (!rx->suspended && !rx->stopped) {
++		/* Always notify, including an attach/detach coalesced before sampling. */
++		power_supply_changed(rx->psy);
++		mod_delayed_work(system_percpu_wq, &rx->poll, 0);
++	}
++	mutex_unlock(&rx->lock);
++	return IRQ_HANDLED;
++}
++
++static void nu1669_stop(void *data)
++{
++	struct nu1669 *rx = data;
++
++	mutex_lock(&rx->lock);
++	if (rx->stopped) {
++		mutex_unlock(&rx->lock);
++		return;
++	}
++	rx->stopped = true;
++	rx->valid = false;
++	memset(rx->info, 0, sizeof(rx->info));
++	mutex_unlock(&rx->lock);
++	/* Quiesce the producer before draining work and before devres frees the IRQ. */
++	disable_irq(rx->irq);
++	cancel_delayed_work_sync(&rx->poll);
++}
++
++static int nu1669_probe(struct i2c_client *client)
++{
++	struct power_supply_config psy_cfg = {};
++	struct device *dev = &client->dev;
++	struct nu1669 *rx;
++	int ret;
++
++	rx = devm_kzalloc(dev, sizeof(*rx), GFP_KERNEL);
++	if (!rx)
++		return -ENOMEM;
++
++	mutex_init(&rx->lock);
++	INIT_DELAYED_WORK(&rx->poll, nu1669_poll);
++	i2c_set_clientdata(client, rx);
++	rx->regmap = devm_regmap_init_i2c(client, &nu1669_regmap_config);
++	if (IS_ERR(rx->regmap))
++		return PTR_ERR(rx->regmap);
++
++	rx->connected = devm_gpiod_get(dev, "connected", GPIOD_IN);
++	if (IS_ERR(rx->connected))
++		return dev_err_probe(dev, PTR_ERR(rx->connected), "connection input\n");
++
++	/* A level event IRQ needs a firmware write to acknowledge: leave it alone. */
++	rx->event = devm_gpiod_get_optional(dev, "event", GPIOD_IN);
++	if (IS_ERR(rx->event))
++		return dev_err_probe(dev, PTR_ERR(rx->event), "event input\n");
++
++	psy_cfg.drv_data = rx;
++	psy_cfg.fwnode = dev_fwnode(dev);
++	rx->psy = devm_power_supply_register(dev, &nu1669_psy_desc, &psy_cfg);
++	if (IS_ERR(rx->psy))
++		return dev_err_probe(dev, PTR_ERR(rx->psy), "power supply\n");
++
++	ret = devm_device_add_group(dev, &nu1669_group);
++	if (ret)
++		return ret;
++
++	rx->irq = gpiod_to_irq(rx->connected);
++	if (rx->irq < 0)
++		return dev_err_probe(dev, rx->irq, "connection IRQ\n");
++	ret = devm_request_threaded_irq(dev, rx->irq, NULL, nu1669_connected_irq,
++			IRQF_ONESHOT | IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
++			dev_name(dev), rx);
++	if (ret)
++		return dev_err_probe(dev, ret, "connection IRQ\n");
++
++	ret = devm_add_action_or_reset(dev, nu1669_stop, rx);
++	if (ret)
++		return ret;
++
++	/* An unpowered receiver is normal; do not require an I2C reply at probe. */
++	schedule_delayed_work(&rx->poll, 0);
++	return 0;
++}
++
++static int nu1669_suspend(struct device *dev)
++{
++	struct nu1669 *rx = dev_get_drvdata(dev);
++
++	mutex_lock(&rx->lock);
++	rx->suspended = true;
++	rx->generation++;
++	rx->valid = false;
++	memset(rx->info, 0, sizeof(rx->info));
++	mutex_unlock(&rx->lock);
++	disable_irq(rx->irq);
++	cancel_delayed_work_sync(&rx->poll);
++	power_supply_changed(rx->psy);
++	return 0;
++}
++
++static int nu1669_resume(struct device *dev)
++{
++	struct nu1669 *rx = dev_get_drvdata(dev);
++
++	mutex_lock(&rx->lock);
++	rx->suspended = false;
++	mutex_unlock(&rx->lock);
++	enable_irq(rx->irq);
++	mod_delayed_work(system_percpu_wq, &rx->poll, 0);
++	return 0;
++}
++
++static void nu1669_shutdown(struct i2c_client *client)
++{
++	nu1669_stop(i2c_get_clientdata(client));
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(nu1669_pm_ops, nu1669_suspend, nu1669_resume);
++
++static const struct of_device_id nu1669_of_match[] = {
++	{ .compatible = "nuvolta,nu1669" },
++	{}
++};
++MODULE_DEVICE_TABLE(of, nu1669_of_match);
++
++static struct i2c_driver nu1669_driver = {
++	.driver = {
++		.name = "nu1669",
++		.of_match_table = nu1669_of_match,
++		.pm = pm_sleep_ptr(&nu1669_pm_ops),
++	},
++	.probe = nu1669_probe,
++	.shutdown = nu1669_shutdown,
++};
++module_i2c_driver(nu1669_driver);
++
++MODULE_AUTHOR("dianqk <dianqk@dianqk.net>");
++MODULE_DESCRIPTION("NU1669 read-only wireless receiver telemetry");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index f245e6c283..65e4d34732 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -370,6 +370,12 @@ struct qcom_battmgr {
+ 	struct power_supply *bat_psy;
+ 	struct power_supply *usb_psy;
+ 	struct power_supply *wls_psy;
++	struct power_supply *wireless_receiver;
++	struct notifier_block wireless_nb;
++	bool wireless_notifier_registered;
++	/* Attachment knowledge and power authorization share dodge_otg_lock. */
++	bool wireless_known;
++	bool wireless_present;
+ 
+ 	enum qcom_battmgr_unit unit;
+ 
+@@ -535,10 +541,65 @@ static int qcom_battmgr_dodge_pd_decode(const void *data, size_t len,
+ 	return 0;
+ }
+ 
++/* No firmware transaction or battmgr mutex in the provider notifier. */
++static int qcom_battmgr_wireless_present(struct qcom_battmgr *battmgr, bool event)
++{
++	union power_supply_propval val;
++	unsigned long flags;
++	bool known, present, changed;
++	int ret;
++
++	if (!battmgr->wireless_receiver)
++		return 0;
++
++	ret = power_supply_get_property(battmgr->wireless_receiver,
++					POWER_SUPPLY_PROP_PRESENT, &val);
++	known = !ret;
++	present = known && val.intval;
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	changed = known != battmgr->wireless_known || present != battmgr->wireless_present;
++	battmgr->wireless_known = known;
++	battmgr->wireless_present = present;
++	if ((changed || event) && battmgr->variant == QCOM_BATTMGR_DODGE) {
++		/* Even coalesced attach/detach must revoke an in-flight authorization. */
++		battmgr->dodge_otg_epoch++;
++		battmgr->dodge_power_off_pending = true;
++		if (battmgr->service_up && !battmgr->dodge_otg_stopping)
++			mod_delayed_work(system_percpu_wq, &battmgr->dodge_otg_work, 0);
++	}
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++
++	return ret ? ret : present;
++}
++
++static int qcom_battmgr_wireless_notifier(struct notifier_block *nb,
++					unsigned long event, void *data)
++{
++	struct qcom_battmgr *battmgr = container_of(nb, struct qcom_battmgr, wireless_nb);
++
++	if (event != PSY_EVENT_PROP_CHANGED || data != battmgr->wireless_receiver)
++		return NOTIFY_DONE;
++	qcom_battmgr_wireless_present(battmgr, true);
++	power_supply_changed(battmgr->wls_psy);
++	return NOTIFY_OK;
++}
++
++static void qcom_battmgr_wireless_unregister(void *data)
++{
++	struct qcom_battmgr *battmgr = data;
++
++	if (battmgr->wireless_notifier_registered) {
++		power_supply_unreg_notifier(&battmgr->wireless_nb);
++		battmgr->wireless_notifier_registered = false;
++	}
++}
++
+ /* Caller holds dodge_otg_lock. */
+ static bool qcom_battmgr_dodge_pd_current(struct qcom_battmgr *battmgr)
+ {
+ 	return battmgr->service_up && !battmgr->dodge_otg_stopping &&
++		(!battmgr->wireless_receiver ||
++		 (battmgr->wireless_known && !battmgr->wireless_present)) &&
+ 		!battmgr->dodge_otg_requested &&
+ 		battmgr->dodge_pd_caps_revision == battmgr->dodge_pd_revision &&
+ 		battmgr->dodge_pd_generation == battmgr->dodge_service_generation &&
+@@ -582,6 +643,10 @@ static int qcom_battmgr_dodge_pd_read_caps(struct qcom_battmgr *battmgr)
+ 	unsigned int i;
+ 	int ret;
+ 
++	ret = qcom_battmgr_wireless_present(battmgr, false);
++	if (ret)
++		return ret < 0 ? ret : -EBUSY;
++
+ 	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
+ 	if (!battmgr->service_up || battmgr->dodge_otg_stopping ||
+ 	    battmgr->dodge_otg_requested || battmgr->dodge_pd_broken) {
+@@ -603,6 +668,11 @@ static int qcom_battmgr_dodge_pd_read_caps(struct qcom_battmgr *battmgr)
+ 	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
+ 
+ 	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
++	if (!ret) {
++		ret = qcom_battmgr_wireless_present(battmgr, false);
++		if (ret > 0)
++			ret = -EBUSY;
++	}
+ 	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
+ 	/* There is no wire transaction ID: do not retry an ambiguous read. */
+ 	if (ret == -ETIMEDOUT &&
+@@ -1550,6 +1620,9 @@ static int qcom_battmgr_wls_get_property(struct power_supply *psy,
+ 	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
+ 	int ret;
+ 
++	if (battmgr->wireless_receiver)
++		return power_supply_get_property(battmgr->wireless_receiver, psp, val);
++
+ 	if (!battmgr->service_up)
+ 		return -EAGAIN;
+ 
+@@ -1612,6 +1685,21 @@ static const struct power_supply_desc sm8350_wls_psy_desc = {
+ 	.get_property = qcom_battmgr_wls_get_property,
+ };
+ 
++static const enum power_supply_property qcom_battmgr_receiver_props[] = {
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_ONLINE,
++	POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_CURRENT_NOW,
++};
++
++static const struct power_supply_desc qcom_battmgr_receiver_psy_desc = {
++	.name = "qcom-battmgr-wls",
++	.type = POWER_SUPPLY_TYPE_WIRELESS,
++	.properties = qcom_battmgr_receiver_props,
++	.num_properties = ARRAY_SIZE(qcom_battmgr_receiver_props),
++	.get_property = qcom_battmgr_wls_get_property,
++};
++
+ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
+ 				      const struct qcom_battmgr_message *msg,
+ 				      int len)
+@@ -2042,6 +2130,12 @@ static int qcom_battmgr_dodge_otg_request(struct qcom_battmgr *battmgr,
+ 	unsigned long flags, left;
+ 	int ret;
+ 
++	if (power && value) {
++		ret = qcom_battmgr_wireless_present(battmgr, false);
++		if (ret)
++			return ret < 0 ? ret : -EBUSY;
++	}
++
+ 	reinit_completion(&battmgr->dodge_otg_ack);
+ 	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
+ 	if (!battmgr->service_up ||
+@@ -2087,6 +2181,9 @@ static bool qcom_battmgr_dodge_pd_valid(struct qcom_battmgr *battmgr)
+ 	unsigned long flags;
+ 	bool valid;
+ 
++	if (qcom_battmgr_wireless_present(battmgr, false))
++		return false;
++
+ 	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
+ 	valid = qcom_battmgr_dodge_pd_current(battmgr) &&
+ 		!battmgr->dodge_otg_broken;
+@@ -2202,12 +2299,18 @@ static int qcom_battmgr_dodge_usb_set_property(struct power_supply *psy,
+ 		ret = ret ?: -ENODEV;
+ 		goto out;
+ 	}
+-	ret = qcom_battmgr_dodge_pd_property(battmgr, BATTMGR_WLS_PROPERTY_GET,
+-					   WLS_ONLINE, 0);
+-	if (ret || battmgr->dodge_otg_value) {
+-		ret = ret ?: -EBUSY;
+-		goto out;
++	if (battmgr->wireless_receiver) {
++		ret = qcom_battmgr_wireless_present(battmgr, false);
++		if (ret > 0)
++			ret = -EBUSY;
++	} else {
++		ret = qcom_battmgr_dodge_pd_property(battmgr, BATTMGR_WLS_PROPERTY_GET,
++						   WLS_ONLINE, 0);
++		if (!ret && battmgr->dodge_otg_value)
++			ret = -EBUSY;
+ 	}
++	if (ret)
++		goto out;
+ 	ret = qcom_battmgr_dodge_pd_property(battmgr, BATTMGR_USB_PROPERTY_GET,
+ 					   USB_ADAP_TYPE, 0);
+ 	if (ret)
+@@ -2573,10 +2676,15 @@ static bool qcom_battmgr_dodge_otg_allowed(struct qcom_battmgr *battmgr,
+ 	unsigned long flags;
+ 	bool allowed;
+ 
++	if (qcom_battmgr_wireless_present(battmgr, false))
++		return false;
++
+ 	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
+ 	allowed = battmgr->service_up && battmgr->dodge_otg_ready &&
+ 		battmgr->dodge_otg_requested && !battmgr->dodge_otg_stopping &&
+ 		!battmgr->dodge_otg_broken && !battmgr->dodge_otg_prohibited &&
++		(!battmgr->wireless_receiver ||
++		 (battmgr->wireless_known && !battmgr->wireless_present)) &&
+ 		generation == battmgr->dodge_service_generation &&
+ 		epoch == battmgr->dodge_otg_epoch;
+ 	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
+@@ -2654,9 +2762,15 @@ static void qcom_battmgr_dodge_otg_worker(struct work_struct *work)
+ 	if (battmgr->dodge_power_state == DODGE_POWER_ON &&
+ 	    qcom_battmgr_dodge_power_protect(battmgr, soc.intval, current_sample.intval))
+ 		goto off;
+-	ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_WLS_PROPERTY_GET,
+-					   WLS_ONLINE, 0, generation);
+-	if (ret || battmgr->dodge_otg_value)
++	if (battmgr->wireless_receiver) {
++		ret = qcom_battmgr_wireless_present(battmgr, false);
++	} else {
++		ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_WLS_PROPERTY_GET,
++						   WLS_ONLINE, 0, generation);
++		if (!ret)
++			ret = battmgr->dodge_otg_value ? -EBUSY : 0;
++	}
++	if (ret)
+ 		goto off;
+ 	limit = soc.intval <= 1 ? 500 : 1250;
+ 	if (battmgr->dodge_power_current_ma != limit) {
+@@ -3019,6 +3133,20 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	else
+ 		battmgr->variant = QCOM_BATTMGR_SM8350;
+ 
++	if (device_property_present(dev, "qcom,wireless-receiver")) {
++		battmgr->wireless_receiver = devm_power_supply_get_by_reference(dev,
++							 "qcom,wireless-receiver");
++		if (IS_ERR(battmgr->wireless_receiver))
++			return dev_err_probe(dev, PTR_ERR(battmgr->wireless_receiver),
++					     "wireless receiver reference\n");
++		if (!battmgr->wireless_receiver)
++			return -EPROBE_DEFER;
++		/* The reference alone does not keep the provider driver bound. */
++		if (!device_link_add(dev, battmgr->wireless_receiver->dev.parent,
++				     DL_FLAG_AUTOREMOVE_CONSUMER))
++			return -ENOMEM;
++	}
++
+ 	ret = qcom_battmgr_charge_control_thresholds_init(battmgr);
+ 	if (ret < 0)
+ 		return dev_err_probe(dev, ret,
+@@ -3046,7 +3174,9 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 			return dev_err_probe(dev, PTR_ERR(battmgr->usb_psy),
+ 					     "failed to register USB power supply\n");
+ 
+-		battmgr->wls_psy = devm_power_supply_register(dev, &sc8280xp_wls_psy_desc, &psy_cfg_supply);
++		battmgr->wls_psy = devm_power_supply_register(dev, battmgr->wireless_receiver ?
++				&qcom_battmgr_receiver_psy_desc : &sc8280xp_wls_psy_desc,
++				&psy_cfg_supply);
+ 		if (IS_ERR(battmgr->wls_psy))
+ 			return dev_err_probe(dev, PTR_ERR(battmgr->wls_psy),
+ 					     "failed to register wireless charing power supply\n");
+@@ -3068,7 +3198,9 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 			return dev_err_probe(dev, PTR_ERR(battmgr->usb_psy),
+ 					     "failed to register USB power supply\n");
+ 
+-		battmgr->wls_psy = devm_power_supply_register(dev, &sm8350_wls_psy_desc, &psy_cfg_supply);
++		battmgr->wls_psy = devm_power_supply_register(dev, battmgr->wireless_receiver ?
++				&qcom_battmgr_receiver_psy_desc : &sm8350_wls_psy_desc,
++				&psy_cfg_supply);
+ 		if (IS_ERR(battmgr->wls_psy))
+ 			return dev_err_probe(dev, PTR_ERR(battmgr->wls_psy),
+ 					     "failed to register wireless charing power supply\n");
+@@ -3094,6 +3226,18 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	if (IS_ERR(battmgr->client))
+ 		return PTR_ERR(battmgr->client);
+ 
++	if (battmgr->wireless_receiver) {
++		battmgr->wireless_nb.notifier_call = qcom_battmgr_wireless_notifier;
++		ret = power_supply_reg_notifier(&battmgr->wireless_nb);
++		if (ret)
++			return ret;
++		battmgr->wireless_notifier_registered = true;
++		ret = devm_add_action_or_reset(dev, qcom_battmgr_wireless_unregister, battmgr);
++		if (ret)
++			return ret;
++		qcom_battmgr_wireless_present(battmgr, false);
++	}
++
+ 	dev_set_drvdata(dev, battmgr);
+ 	pmic_glink_client_register(battmgr->client);
+ 
+@@ -3105,6 +3249,7 @@ static void qcom_battmgr_remove(struct auxiliary_device *adev)
+ 	struct qcom_battmgr *battmgr = dev_get_drvdata(&adev->dev);
+ 	unsigned long flags;
+ 
++	qcom_battmgr_wireless_unregister(battmgr);
+ 	if (battmgr->variant != QCOM_BATTMGR_DODGE)
+ 		return;
+ 	/* Keep the client alive while in-flight requests drain and OFF is sent. */

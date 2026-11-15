@@ -19,7 +19,7 @@
 
 ## Known limitations
 
-The packaged kernel is Nixpkgs Linux 7.3-rc6. The hardware results on this page
+The packaged kernel is Nixpkgs Linux 7.3. The hardware results on this page
 were obtained with the 7.3-rc5 queue. See
 the [kernel patches](../../pkgs/linux-kernel/sm8550/sheng/PATCHES.md).
 
@@ -41,11 +41,18 @@ Known issues and unverified areas:
   measured.
 - Bluetooth: LE and BR/EDR discovery work; pairing and audio are not verified.
   Configure the tablet's own Bluetooth address.
-- Audio: all six CS35L43 amplifiers bind and the ALSA card exposes two playback
-  PCMs and one capture PCM, but there is no PipeWire output: the UCM lookup
-  fails because the card's long name differs from the installed UCM filename,
-  so only Off/Pro Audio profiles appear. Speaker playback, recording and routing
-  do not work yet.
+- Audio: the community UCM, audio topology and six CS35L43 protection firmware
+  pairs restore automatic HiFi discovery, three playback PCMs and one capture
+  PCM. The default PulseAudio microphone path starts and produces PCM buffers.
+  Audible recording, speaker quality and DisplayPort playback are unverified.
+  See the [audio data and firmware troubleshooting notes](../../pkgs/sheng/README.md).
+- Speaker orientation: the module provides
+  [speaker routing data](../configuration.md#speaker-routing-for-screen-orientation)
+  for card `XiaomiPad6SPro`. Each amplifier's `<amp> ASPRX1 Slot Position`
+  selects slot 0 (left) or 1 (right). `normal` (native 3048×2032 landscape, T
+  amplifiers at the left edge) and `180` (slots swapped) are verified. `90` and
+  `270` are unverified and keep the `normal` routing until the portrait speaker
+  layout is checked.
 - Camera: libcamera captures front OV32D40 scenes at 3264×2448 and rear S5KJN1
   colour bars at 4080×3060. Rear scene quality, autofocus, flash, calibrated
   colour and the depth sensor are not verified.
@@ -66,3 +73,19 @@ Set `hardware.sheng.wifiMacAddress` to this
 unit's known factory address. `hardware.sheng.suspendWorkarounds.enable`
 is opt-in (default `false`): it filters unused wake sources and cold-cycles
 `ath12k_wifi7` across suspend. Suspend remains unverified in the minimal example.
+
+Suspend uses `deep` only (`hardware.sheng.suspend.memSleep`). The device
+module declares wakeup sources for the shared
+[wakeup policy](../configuration.md#suspend-wakeup-sources): `powerKey`,
+`rtc`, `cover` (gpio-keys: opening the cover wakes through the Hall switch,
+closing a keyboard cover through the tablet-mode switch), `usbPower` (USB
+supply and UCSI source supplies; plug and unplug wake are not yet confirmed)
+and `wirelessCharging` (untested). For example, to keep only the confirmed
+sources:
+
+```nix
+androidDevices.power.wakeup = {
+  enable = true;
+  keep = [ "powerKey" "rtc" "cover" ];
+};
+```

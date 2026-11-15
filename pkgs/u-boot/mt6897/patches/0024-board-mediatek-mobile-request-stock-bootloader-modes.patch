@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Thu, 15 Oct 2026 08:36:43 +0800
+Subject: [PATCH 24/24] board: mediatek-mobile: request stock bootloader modes
+ through reboot-mode
+
+LK reads the DT syscon-reboot-mode register (RGU non-reset register)
+like Android's "reboot bootloader". Set it for fastboot reboot-bootloader
+and add a "rebootmode <mode>" command that sets mode-<mode> and resets,
+so U-Boot can return to the stock fastboot without writing misc.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../mediatek-mobile/mediatek-mobile.c         | 53 +++++++++++++++++++
+ 1 file changed, 53 insertions(+)
+
+diff --git a/board/mediatek/mediatek-mobile/mediatek-mobile.c b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+index f9d9e18c543..498592165cb 100644
+--- a/board/mediatek/mediatek-mobile/mediatek-mobile.c
++++ b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+@@ -19,12 +19,14 @@
+ #include <asm/sections.h>
+ #include <asm/system.h>
+ #include <asm/unaligned.h>
++#include <command.h>
+ #include <cyclic.h>
+ #include <dm/device.h>
+ #include <dm/read.h>
+ #include <dm/uclass.h>
+ #include <dm/uclass-internal.h>
+ #include <env.h>
++#include <fastboot.h>
+ #include <fdt_support.h>
+ #include <fdtdec.h>
+ #include <image.h>
+@@ -803,6 +805,57 @@ static void mtk_autoreset_check(struct cyclic_info *c)
+ 		;
+ }
+ 
++/*
++ * Stock bootloader modes are requested through the DT syscon-reboot-mode
++ * node (RGU non-reset register), which LK reads like Android's "reboot
++ * bootloader" does. Nothing is written to storage.
++ */
++static int mtk_set_reboot_mode(const char *mode)
++{
++	char prop[32];
++	ofnode node;
++	u32 offset, value, mask = ~0U;
++	fdt_addr_t base;
++
++	node = ofnode_by_compatible(ofnode_null(), "syscon-reboot-mode");
++	if (!ofnode_valid(node))
++		return -ENOENT;
++	snprintf(prop, sizeof(prop), "mode-%s", mode);
++	if (ofnode_read_u32(node, "offset", &offset) ||
++	    ofnode_read_u32(node, prop, &value))
++		return -EINVAL;
++	ofnode_read_u32(node, "mask", &mask);
++	base = ofnode_get_addr(ofnode_get_parent(node));
++	if (base == FDT_ADDR_T_NONE)
++		return -EINVAL;
++	clrsetbits_le32((void *)(base + offset), mask, value & mask);
++	return 0;
++}
++
++int fastboot_set_reboot_flag(enum fastboot_reboot_reason reason)
++{
++	if (reason != FASTBOOT_REBOOT_REASON_BOOTLOADER)
++		return -EOPNOTSUPP;
++	return mtk_set_reboot_mode("bootloader");
++}
++
++static int do_rebootmode(struct cmd_tbl *cmdtp, int flag, int argc,
++			 char *const argv[])
++{
++	if (argc != 2)
++		return CMD_RET_USAGE;
++	if (mtk_set_reboot_mode(argv[1])) {
++		printf("No reboot mode \"%s\"\n", argv[1]);
++		return CMD_RET_FAILURE;
++	}
++	do_reset(NULL, 0, 0, NULL);
++	return CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(rebootmode, 2, 0, do_rebootmode,
++	   "reset into a stock bootloader mode",
++	   "<mode>  - mode-<mode> of the reboot-mode node, e.g. bootloader");
++
+ int misc_init_r(void)
+ {
+ 	phys_addr_t fastboot;
+-- 
+2.55.0
+

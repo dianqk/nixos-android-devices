@@ -2,10 +2,10 @@
 
 [Configuration, installation and updates](README.md) · [中文](hardware.zh.md)
 
-Aurora is Tier 2: buildable and evaluable. The observations below describe tested
+The observations below describe tested
 capabilities, not a commitment to runtime validation of every configuration.
-The kernel is Linux 7.3-rc6 with the Aurora patch queue.
-Use the exact Android 14 factory baseline in the [installation guide](README.md#required-factory-firmware-before-installation).
+The kernel is Linux 7.3 with the Aurora patch queue.
+Use the exact Android 16 factory baseline in the [installation guide](README.md#required-factory-firmware-before-installation).
 Runtime firmware packages do not replace the OEM boot/security firmware.
 
 ## Support overview
@@ -21,18 +21,51 @@ Runtime firmware packages do not replace the OEM boot/security firmware.
 | DisplayPort | Basic external picture output works. DP audio, additional modes, sustained operation and coexistence (USB3, touchscreen mapping) are not verified. |
 | Cellular modem | Opt-in and experimental: MPSS, IPA, rmtfs (read-only NV by default), tqftpserv, ModemManager and the QTEE license services. Registration (LTE/5G NR), IPv4/IPv6 mobile data and SMS work with the license services enabled, including the unfree `qwesd`. See [connectivity](connectivity.md#cellular-modem-experimental) and [modem services](../modem.md). |
 | Video | Iris V4L2 and an optional VA-API backend; supported test profiles and limitations are listed below. |
-| Audio and power | Stereo speaker playback works; see [audio](audio.md) for remaining limits. System suspend and charging-policy parity remain unverified. |
+| Audio and power | Stereo speaker playback works; see [audio](audio.md) for remaining limits. Suspend to idle works; see [standby](#standby). Charging-policy parity remains unverified. |
 
 Recovery can briefly access a verified Linux root to prepare its own SSH identity;
 no target remains mounted afterward. See [recovery access](../recovery.md#configure-and-connect).
 
+## Standby
+
+The module selects suspend to idle (`mem_sleep_default=s2idle`). During
+standby the kernel tears the Wi-Fi PCIe link down and powers the WCN7850 and
+the PCIe controller off, so CX and DDR can collapse. Measured on the
+Android 16 base with the modem idle: a power-key standby of 2 h 18 min
+resumed cleanly with CX/DDR collapse 99.8 % of the time and about 28 mA
+drain; 10-minute RTC-alarm runs resumed with 99.4 %. Wi-Fi reconnects after
+resume. Each suspend logs `qcom-pcie 1c00000.pcie: Timeout waiting for L2
+entry! LTSSM: 0x12`; the kernel continues by design and the link retrains
+(Gen 2 x2) on resume, so the message is harmless.
+
+Known limits:
+
+- AOSS sleep is never reached (`aosd` 0 % in `/sys/kernel/debug/qcom_stats`).
+- `deep` (PSCI SYSTEM_SUSPEND) never collapses CX/DDR and wakes after a few
+  seconds to under two minutes without a recorded wake source; it is not the
+  default.
+- Resume can log `gunyah-wdt: gunyah_wdt_start: Failed to stop gunyah wdt
+  -22`.
+- `pcie_qcom.suspend_opp_floor` keeps an optional PCIe memory vote during
+  s2idle as a fallback: `off` (default), `full` (the suspend OPP), `bw`
+  (memory vote only, `pcie_qcom.suspend_floor_kbps`, default 1000) or `cx`.
+  Any nonzero memory vote prevents the CX/DDR collapse (about 130 mA);
+  `pci_host_common.endpoint_d3cold=0` restores the old link handling, which
+  needs the floor.
+
 ## Touchscreen
 
-The Android 14 installed configuration enables `hardware.aurora.touch.enable`
-by default. The S3910P SPI transport feeds an ARM64 adapter using the matching
-OEM host-processing library and configuration. Allow the proprietary
-`aurora-touch` and `aurora-firmware` packages. Recovery uses physical keys and
-excludes this userspace touch runtime.
+The installed configuration enables `hardware.aurora.touch.enable` by default.
+The S3910P controller firmware computes the contacts and the `aurora-tcm`
+kernel driver reports them as the `Xiaomi 14 Ultra Touchscreen` multitouch
+device (10 contacts, 1440x3200); no OEM library or userspace service is
+needed. Recovery uses physical keys and does not load the driver. Set
+`hardware.aurora.touch.wakeDisplay = false` to stop touches from waking a
+DPMS-off panel; the touch controller is then powered off while the panel is
+off, which saves its SPI interrupts and processing. The experimental
+userspace host processor (`hardware.aurora.touch.hostProcessor.enable`)
+requires the Android 14 controller firmware and library, so it does not work on
+the required base.
 
 Inspect contacts with `evtest /dev/input/aurora-touch` or libinput tools. See the
 [touch runtime guide](../../pkgs/aurora/touch/README.md) for diagnostics,
@@ -42,7 +75,7 @@ correct touch routing.
 
 ## Sensors and rotation
 
-`hardware.aurora.sensors.enable` defaults on for the Android 14 installed system.
+`hardware.aurora.sensors.enable` defaults on for the installed system.
 It supplies SSC/FastRPC, the matching firmware's sensor data and iio-sensor-proxy.
 Consumers choose their SensorProxy/compositor rotation integration. Recovery
 excludes this userspace stack.
@@ -59,8 +92,8 @@ another ROM's sensor data is not a supported repair. See [sensor configuration](
 
 ## Video codecs
 
-The board uses Iris with OEM VPU33 firmware. The following results apply to the
-Android 14 stack with FFmpeg 9.0.1 and the packaged optional VA backend:
+The board uses Iris with OEM VPU33 firmware. The following results were measured
+with the former Android 14 firmware with FFmpeg 9.0.1 and the packaged optional VA backend:
 
 | Path | Observed operation | Known limits |
 | --- | --- | --- |

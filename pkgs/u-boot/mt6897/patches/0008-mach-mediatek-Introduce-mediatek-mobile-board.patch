@@ -1,0 +1,231 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Igor Belwon <igor.belwon@mentallysanemainliners.org>
+Date: Thu, 7 May 2026 19:03:02 +0200
+Subject: [PATCH 08/11] mach-mediatek: Introduce mediatek-mobile board
+
+[dianqk: resolved against the MT6897-only Kconfig above (no MT6878
+entry, no MTK_SMC_JUMP). MT6878-Mainline 015dd6becc, which this commit
+partly reverts in mt6897/init.c, is not taken, so that hunk is already
+present; board/mediatek/mtk-phone.env does not exist here.]
+(cherry picked from commit 5d29b1066c73dc794ff8bbe6744165f2a20fadcd)
+---
+ arch/arm/mach-mediatek/Kconfig                |  1 +
+ arch/arm/mach-mediatek/armv8-mem-map.c        |  2 +-
+ board/mediatek/mediatek-mobile/Kconfig        | 15 ++++
+ board/mediatek/mediatek-mobile/MAINTAINERS    |  2 +
+ board/mediatek/mediatek-mobile/Makefile       |  5 ++
+ .../mediatek-mobile/mediatek-mobile.c         | 81 +++++++++++++++++++
+ .../mediatek-mobile/mediatek-mobile.env       | 51 ++++++++++++
+ 7 files changed, 156 insertions(+), 1 deletion(-)
+ create mode 100644 board/mediatek/mediatek-mobile/Kconfig
+ create mode 100644 board/mediatek/mediatek-mobile/MAINTAINERS
+ create mode 100644 board/mediatek/mediatek-mobile/Makefile
+ create mode 100644 board/mediatek/mediatek-mobile/mediatek-mobile.c
+ create mode 100644 board/mediatek/mediatek-mobile/mediatek-mobile.env
+
+diff --git a/arch/arm/mach-mediatek/Kconfig b/arch/arm/mach-mediatek/Kconfig
+index 8d71c73c5c..0677dc414f 100644
+--- a/arch/arm/mach-mediatek/Kconfig
++++ b/arch/arm/mach-mediatek/Kconfig
+@@ -15,6 +15,7 @@ config TARGET_MT6897
+ 	select CPU
+ 	select REGMAP
+ 	select SYSCON
++	select TARGET_MEDIATEK_MOBILE
+ 	help
+ 	  The MediaTek MT6897 TODO.
+ 
+diff --git a/arch/arm/mach-mediatek/armv8-mem-map.c b/arch/arm/mach-mediatek/armv8-mem-map.c
+index cbaa9b4c26..b167112d5a 100644
+--- a/arch/arm/mach-mediatek/armv8-mem-map.c
++++ b/arch/arm/mach-mediatek/armv8-mem-map.c
+@@ -21,4 +21,4 @@ static struct mm_region mediatek_mem_map[] = {
+ 	}
+ };
+ 
+-struct mm_region *mem_map = mediatek_mem_map;
++//struct mm_region *mem_map = mediatek_mem_map;
+diff --git a/board/mediatek/mediatek-mobile/Kconfig b/board/mediatek/mediatek-mobile/Kconfig
+new file mode 100644
+index 0000000000..72de228ba0
+--- /dev/null
++++ b/board/mediatek/mediatek-mobile/Kconfig
+@@ -0,0 +1,15 @@
++if TARGET_MEDIATEK_MOBILE
++
++config ENV_SOURCE_FILE
++	default "mediatek-mobile"
++
++config SYS_BOARD
++	default "mediatek-mobile"
++
++config SYS_CONFIG_NAME
++	default "mediatek-mobile"
++
++config SYS_VENDOR
++	default "MediaTek"
++
++endif # TARGET_MEDIATEK_MOBILE
+diff --git a/board/mediatek/mediatek-mobile/MAINTAINERS b/board/mediatek/mediatek-mobile/MAINTAINERS
+new file mode 100644
+index 0000000000..bb641b0cf7
+--- /dev/null
++++ b/board/mediatek/mediatek-mobile/MAINTAINERS
+@@ -0,0 +1,2 @@
++MediaTek Generic Boards (for mobile devices)
++S:	Maintained
+diff --git a/board/mediatek/mediatek-mobile/Makefile b/board/mediatek/mediatek-mobile/Makefile
+new file mode 100644
+index 0000000000..7d063d2faf
+--- /dev/null
++++ b/board/mediatek/mediatek-mobile/Makefile
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# Copyright (C) 2026 Igor Belwon <igor.belwon@mentallysanemainliners.org>
++
++obj-y := mediatek-mobile.o
+diff --git a/board/mediatek/mediatek-mobile/mediatek-mobile.c b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+new file mode 100644
+index 0000000000..308f43eac2
+--- /dev/null
++++ b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+@@ -0,0 +1,81 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek generic mobile board source
++ * Mostly stolen from board/samsung/exynos-mobile/exynos-mobile.c
++ *
++ * Copyright (c) 2025 Kaustabh Chakraborty <kauschluss@disroot.org>
++ * Copyright (c) 2026 Igor Belwon <igor.belwon@mentallysanemainliners.org>
++ */
++
++#include <asm/armv8/mmu.h>
++#include <blk.h>
++#include <bootflow.h>
++#include <ctype.h>
++#include <dm/ofnode.h>
++#include <efi.h>
++#include <efi_loader.h>
++#include <env.h>
++#include <errno.h>
++#include <init.h>
++#include <linux/sizes.h>
++#include <lmb.h>
++#include <part.h>
++#include <stdbool.h>
++#include <string.h>
++
++#include <scsi.h>
++
++DECLARE_GLOBAL_DATA_PTR;
++
++#define lmb_alloc(size, addr) \
++	lmb_alloc_mem(LMB_MEM_ALLOC_ANY, SZ_2M, addr, size, LMB_NONE)
++
++struct efi_fw_image fw_images[] = {
++	{
++		.fw_name = u"UBOOT_BOOT_PARTITION",
++		.image_index = 1,
++	},
++};
++
++struct efi_capsule_update_info update_info = {
++	.dfu_string = NULL,
++	.images = fw_images,
++	.num_images = ARRAY_SIZE(fw_images),
++};
++
++static int mediatek_fastboot_setup(void)
++{
++	struct blk_desc *blk_dev;
++	struct disk_partition info = {0};
++	phys_addr_t addr;
++	int i;
++
++	/* Allocate and define buffer address for fastboot interface. */
++	if (lmb_alloc(CONFIG_FASTBOOT_BUF_SIZE, &addr)) {
++		log_err("%s: failed to allocate fastboot buffer\n", __func__);
++		return -ENOMEM;
++	}
++	env_set_hex("fastboot_addr_r", addr);
++
++	scsi_scan(true);
++
++	blk_dev = blk_get_dev("scsi", CONFIG_FASTBOOT_FLASH_BLOCK_DEVICE_ID);
++	if (!blk_dev) {
++		log_err("%s: required scsi device not available\n", __func__);
++		return -ENODEV;
++	}
++
++	for (i = 1; i < CONFIG_EFI_PARTITION_ENTRIES_NUMBERS; i++) {
++		if (part_get_info(blk_dev, i, &info))
++			continue;
++
++		// works printk("Partition: %s\n", info.name);
++	}
++
++	return 0;
++}
++
++int misc_init_r(void)
++{
++	return mediatek_fastboot_setup();
++}
+diff --git a/board/mediatek/mediatek-mobile/mediatek-mobile.env b/board/mediatek/mediatek-mobile/mediatek-mobile.env
+new file mode 100644
+index 0000000000..f559e265a7
+--- /dev/null
++++ b/board/mediatek/mediatek-mobile/mediatek-mobile.env
+@@ -0,0 +1,51 @@
++bootdelay=3
++bootretry=1
++stdin=serial,button-kbd
++stdout=serial,vidconsole
++stderr=serial,vidconsole
++
++# Fastboot is keen to use the address from kconfig, but we
++# allocate its buffer at runtime.
++fastboot=echo fastboot buffer located at 0x$fastboot_addr_r; fastboot -l $fastboot_addr_r usb 0
++
++# For kernels compressed with gzip
++kernel_comp_addr_r=0x52000000
++kernel_comp_size=0x10000000
++bootargs=clk_ignore_unused console=ttyS0,921600
++
++# scsi scan is done by our misc_init.
++
++normal_boot=ext4load scsi 2:51 0x42000000 /vmlinuz;                   \
++            ext4load scsi 2:51 0x45500000 /initramfs;                 \
++            ext4load scsi 2:51 0x47000000 /mt6897-lenovo-tb373fu.dtb; \
++            booti 0x42000000 0x45500000:0x1400000 0x47000000          \
++                setcurs 0 3; lcdputs "Failed to do normal boot!";     \
++            run menucmd;
++
++# bootretry will run this command over and over, if we fail once
++# then bail out to the boot menu instead (with a pause to read
++# the error message)
++bootcmd=bootefi bootmgr; pause; run menucmd
++
++# When entering the menu (either from button press or failed boot)
++# remap bootcmd so it will re-open the menu and we won't get stuck
++# at the console with no way to type
++menucmd=setenv bootcmd run menucmd; bootmenu -1
++
++# Pause is used so the output can be read on the display
++bootmenu_0=Boot=bootefi bootmgr; pause
++bootmenu_1=Enable serial console gadget=run serial_gadget
++bootmenu_2=Enable USB mass storage=echo "Press any key to exit UMS mode"; ums 0 scsi 0
++bootmenu_3=Enable fastboot mode=run fastboot
++# Disabling bootretry means we'll just drop the shell
++bootmenu_4=Drop to shell=setenv bootretry -1
++bootmenu_5=Reset device=reset
++bootmenu_6=Dump clocks=clk dump; pause
++bootmenu_7=Dump environment=printenv; pause
++bootmenu_8=Board info=bdinfo; pause
++bootmenu_9=Dump bootargs=fdt print /chosen bootargs; pause
++
++# Allow holding the volume down button while U-Boot loads to enter
++# the boot menu
++button_cmd_0_name=Volume Down
++button_cmd_0=run menucmd

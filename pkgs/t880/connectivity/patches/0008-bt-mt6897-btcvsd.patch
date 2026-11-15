@@ -1,0 +1,98 @@
+MT6897 opt-in BTCVSD mSBC transport and synchronized lifetime.
+SCO SRAM protocol reference: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/sound/soc/mediatek/common/mtk-btcvsd.c
+
+--- a/connectivity/bt/mt66xx/btif/Kbuild
++++ b/connectivity/bt/mt66xx/btif/Kbuild
+@@ -150,3 +150,5 @@
+ $(MODULE_NAME)-objs  += $(CORE_OBJS)
+ $(MODULE_NAME)-objs  += $(HIF_OBJS)
+ $(MODULE_NAME)-objs  += $(CHIP_OBJS)
++
++$(MODULE_NAME)-objs += btif/btmtk-btcvsd.o
+--- a/connectivity/bt/mt66xx/btif/btmtk_btif_main.c
++++ b/connectivity/bt/mt66xx/btif/btmtk_btif_main.c
+@@ -1,3 +1,4 @@
++#include "btmtk-btcvsd.h"
+ /* SPDX-License-Identifier: GPL-2.0 */
+ /*
+  * Copyright (c) 2019 MediaTek Inc.
+@@ -603,6 +604,7 @@
+ 	btmtk_cif_dump_btif_tx_no_rsp();
+ 	btmtk_cif_dump_fw_no_rsp(BT_BTIF_DUMP_ALL);
+ 
++	btmtk_btcvsd_shutdown();
+ 	is_1st_reset = (cif_dev->rst_count == 0) ? TRUE : FALSE;
+ 	cif_dev->rst_count++;
+ 	while (cif_dev->rst_level != RESET_LEVEL_NONE && retry > 0) {
+@@ -1666,6 +1668,7 @@
+  */
+ static int btmtk_cif_probe(struct platform_device *pdev)
+ {
++	int ret;
+ 	struct btmtk_btif_dev *cif_dev = NULL;
+ 
+ 	/* 1. allocate global context data */
+@@ -1680,6 +1683,12 @@
+ 
+ 	/* 2. Init HCI device */
+ 	btmtk_allocate_hci_device(g_sbdev, HCI_UART);
++	ret = btmtk_btcvsd_init(pdev, g_sbdev->hdev);
++	if (ret) {
++		btmtk_free_hci_device(g_sbdev, HCI_UART);
++		bt_reg_deinit();
++		return ret;
++	}
+ #if (USE_DEVICE_NODE == 0)
+ 	SET_HCIDEV_DEV(g_sbdev->hdev, BTMTK_GET_DEV(cif_dev));
+ 	btmtk_register_hci_device(g_sbdev);
+@@ -1771,6 +1780,7 @@
+ {
+ 	struct btmtk_btif_dev *cif_dev = (struct btmtk_btif_dev *)g_sbdev->cif_dev;
+ 
++	btmtk_btcvsd_remove();
+ 	conninfra_sub_drv_ops_unregister(CONNDRV_TYPE_BT);
+ 
+ 	bt_dev_dbg_deinit();
+--- a/connectivity/bt/mt66xx/btmtk_main.c
++++ b/connectivity/bt/mt66xx/btmtk_main.c
+@@ -1,3 +1,4 @@
++#include "btmtk-btcvsd.h"
+ /* SPDX-License-Identifier: GPL-2.0 */
+ /*
+  * Copyright (c) 2019 MediaTek Inc.
+@@ -832,7 +833,7 @@
+ 
+ static const struct h4_recv_pkt mtk_recv_pkts[] = {
+ 	{ H4_RECV_ACL,      .recv = btmtk_recv_acl },
+-	{ H4_RECV_SCO,      .recv = hci_recv_frame },
++	{ H4_RECV_SCO,      .recv = btmtk_btcvsd_recv },
+ 	{ H4_RECV_EVENT,    .recv = btmtk_recv_event },
+ 	{ H4_RECV_ISO,      .recv = btmtk_recv_iso },
+ };
+@@ -3299,6 +3300,7 @@
+ 		return ret;
+ 	}
+ 
++	btmtk_btcvsd_shutdown();
+ 	if (main_info.hif_hook.cif_mutex_lock) {
+ 		main_info.hif_hook.cif_mutex_lock(bdev);
+ 	}
+@@ -3480,6 +3482,7 @@
+ 	}
+ 
+ 	btmtk_fops_set_state(bdev, BTMTK_FOPS_STATE_OPENED);
++	btmtk_btcvsd_open();
+ 	main_info.reset_stack_flag = HW_ERR_NONE;
+ 
+ 	if (bdev->bt_cfg.support_bt_single_sku) {
+@@ -3644,6 +3647,10 @@
+ 
+ 	if (!is_mt66xx(bdev->chip_id))
+ 		btmtk_dispatch_fwlog_bluetooth_kpi(bdev, skb->data, skb->len, hci_skb_pkt_type(skb));
++
++	ret = btmtk_btcvsd_send(skb);
++	if (ret <= 0)
++		return ret;
+ 
+ 	memcpy(skb_push(skb, 1), &hci_skb_pkt_type(skb), 1);
+ 

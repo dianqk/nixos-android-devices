@@ -1,0 +1,82 @@
+From 185a5f193c03276d46eb1f0e1f0fdb5bb9e38bf0 Mon Sep 17 00:00:00 2001
+From: Hangxiang Ma <hangxiang.ma@oss.qualcomm.com>
+Date: Tue, 21 Jul 2026 05:46:05 -0700
+Subject: [PATCH 115/144] media: qcom: camss: vfe: Add support for VFE 980
+
+Add support for Video Front End (VFE) that is on the SM8750 SoCs. VFE
+gen4 has support for VFE 980. This change limits SM8750 VFE output lines
+to 3 for now as constrained by the CAMSS driver framework.
+
+The cpas_ahb and cpas_fast_ahb clocks are enabled here rather than in the
+CSIPHY resources since they belong to the CPAS/VFE power path, matching
+the Kaanapali layout.
+
+Reviewed-by: Bryan O'Donoghue <bryan.odonoghue@linaro.org>
+Co-developed-by: Atiya Kailany <atiya.kailany@oss.qualcomm.com>
+Signed-off-by: Atiya Kailany <atiya.kailany@oss.qualcomm.com>
+Signed-off-by: Hangxiang Ma <hangxiang.ma@oss.qualcomm.com>
+Link: https://lore.kernel.org/r/20260721-add-support-for-camss-on-sm8750-v6-6-a5f841061d18@oss.qualcomm.com
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0147-media-qcom-camss-vfe-Add-support-for-VFE-980.patch
+Import-SHA256: 6e6be6d10312656a12e0d577d91eddf2ec78aecb833ce0d6adf3079635cded66
+Import-Provenance: mail headers
+(cherry picked from commit 32b54dcf643c602464f243fa3bfd5d2188137cea)
+---
+ drivers/media/platform/qcom/camss/camss-vfe-1080.c | 6 +++++-
+ drivers/media/platform/qcom/camss/camss-vfe.c      | 2 ++
+ drivers/media/platform/qcom/camss/camss.c          | 2 ++
+ 3 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/platform/qcom/camss/camss-vfe-1080.c b/drivers/media/platform/qcom/camss/camss-vfe-1080.c
+index 68798f13fb..61e53b5eb8 100644
+--- a/drivers/media/platform/qcom/camss/camss-vfe-1080.c
++++ b/drivers/media/platform/qcom/camss/camss-vfe-1080.c
+@@ -14,7 +14,11 @@
+ #include "camss-vfe.h"
+ 
+ /* VFE-1080 Bus Register Base Addresses */
+-#define BUS_REG_BASE				(vfe_is_lite(vfe) ? 0x800 : 0x1000)
++#define IS_VFE_980(vfe)	((vfe)->camss->res->version == CAMSS_8750)
++#define BUS_REG_BASE_980	(vfe_is_lite(vfe) ? 0x200 : 0x800)
++#define BUS_REG_BASE_1080	(vfe_is_lite(vfe) ? 0x800 : 0x1000)
++#define BUS_REG_BASE \
++	(IS_VFE_980(vfe) ? BUS_REG_BASE_980 : BUS_REG_BASE_1080)
+ 
+ #define VFE_BUS_WM_CGC_OVERRIDE			(BUS_REG_BASE + 0x08)
+ #define		WM_CGC_OVERRIDE_ALL			(0x7FFFFFF)
+diff --git a/drivers/media/platform/qcom/camss/camss-vfe.c b/drivers/media/platform/qcom/camss/camss-vfe.c
+index 468371a0f6..a199117106 100644
+--- a/drivers/media/platform/qcom/camss/camss-vfe.c
++++ b/drivers/media/platform/qcom/camss/camss-vfe.c
+@@ -352,6 +352,7 @@ static u32 vfe_src_pad_code(struct vfe_line *line, u32 sink_code,
+ 	case CAMSS_845:
+ 	case CAMSS_8550:
+ 	case CAMSS_8650:
++	case CAMSS_8750:
+ 	case CAMSS_8775P:
+ 	case CAMSS_KAANAPALI:
+ 	case CAMSS_X1E80100:
+@@ -2016,6 +2017,7 @@ static int vfe_bpl_align_rdi(struct vfe_device *vfe)
+ 	case CAMSS_845:
+ 	case CAMSS_8550:
+ 	case CAMSS_8650:
++	case CAMSS_8750:
+ 	case CAMSS_8775P:
+ 	case CAMSS_KAANAPALI:
+ 	case CAMSS_X1E80100:
+diff --git a/drivers/media/platform/qcom/camss/camss.c b/drivers/media/platform/qcom/camss/camss.c
+index 0aa5db268e..bed02147e7 100644
+--- a/drivers/media/platform/qcom/camss/camss.c
++++ b/drivers/media/platform/qcom/camss/camss.c
+@@ -6142,9 +6142,11 @@ static const struct camss_resources sm8750_resources = {
+ 	.pd_name = "top",
+ 	.csiphy_res = csiphy_res_kaanapali,
+ 	.csid_res = csid_res_sm8750,
++	.vfe_res = vfe_res_kaanapali,
+ 	.icc_res = icc_res_sm8750,
+ 	.csiphy_num = ARRAY_SIZE(csiphy_res_kaanapali),
+ 	.csid_num = ARRAY_SIZE(csid_res_sm8750),
++	.vfe_num = ARRAY_SIZE(vfe_res_kaanapali),
+ 	.icc_path_num = ARRAY_SIZE(icc_res_sm8750),
+ };
+ 

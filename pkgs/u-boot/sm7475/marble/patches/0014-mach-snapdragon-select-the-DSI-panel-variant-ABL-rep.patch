@@ -1,0 +1,341 @@
+From 615c06b3fae1c3be809658a6ace793fd2b15350d Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 24 Oct 2026 10:41:48 +0800
+Subject: [PATCH] mach-snapdragon: select the DSI panel variant ABL reports
+
+Marble is fitted with either the M16T "36 02 0a" or the "36 0d 0b"
+panel. They need different Linux drivers and a different vddd voltage
+(1.2 V and 1.25 V), and only ABL knows which one is present: it names
+the downstream panel node in the command line it passes on, here
+msm_drm.dsi_display0=qcom,mdss_dsi_m16t_36_0d_0b_dsc_vid:.
+
+Describe the variants in the control device tree (a
+"android-devices,dsi-panel-variants" node: the bootloader argument and,
+per variant, the ABL panel name, the panel compatible and optionally a
+supply voltage). At late init, read the argument from /chosen/bootargs
+of the device tree ABL handed over into $abl_panel. In ft_board_setup(),
+which image_setup_libfdt() runs for bootm, for bootefi's own device tree
+and for EFI_DT_FIXUP_PROTOCOL, give the panel node that matches any
+variant the selected variant's compatible and set the regulator behind
+<supply-name>-supply to the variant's voltage. An unknown or missing
+panel name leaves the tree unchanged with a warning; the fixup never
+fails the boot.
+
+For marble the vddd value is 1.256 V, the nearest PM8350B L1 step at or
+above the stock 1.25 V: Linux rejects a fixed constraint that the
+regulator cannot produce.
+
+qcom-priv.h is now included by three files, so its stub of
+qcom_configure_capsule_updates() for builds without capsule support
+becomes static inline.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm/dts/sm8475-xiaomi-marble-u-boot.dtsi |  30 +++
+ arch/arm/mach-snapdragon/Makefile             |   2 +-
+ arch/arm/mach-snapdragon/board.c              |   1 +
+ arch/arm/mach-snapdragon/of_fixup.c           |   4 +
+ arch/arm/mach-snapdragon/panel_variant.c      | 193 ++++++++++++++++++
+ arch/arm/mach-snapdragon/qcom-priv.h          |   5 +-
+ 6 files changed, 233 insertions(+), 2 deletions(-)
+ create mode 100644 arch/arm/dts/sm8475-xiaomi-marble-u-boot.dtsi
+ create mode 100644 arch/arm/mach-snapdragon/panel_variant.c
+
+diff --git a/arch/arm/dts/sm8475-xiaomi-marble-u-boot.dtsi b/arch/arm/dts/sm8475-xiaomi-marble-u-boot.dtsi
+new file mode 100644
+index 000000000..72343c1f1
+--- /dev/null
++++ b/arch/arm/dts/sm8475-xiaomi-marble-u-boot.dtsi
+@@ -0,0 +1,30 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Marble is fitted with either of two M16T panels. ABL names the one present
++ * in msm_drm.dsi_display0; the OS device tree describes 36 02 0a and is fixed
++ * up for 36 0d 0b (arch/arm/mach-snapdragon/panel_variant.c).
++ */
++/ {
++	dsi-panel-variants {
++		compatible = "android-devices,dsi-panel-variants";
++		bootarg = "msm_drm.dsi_display0";
++
++		variant-36-02-0a {
++			abl-panel = "qcom,mdss_dsi_m16t_36_02_0a_dsc_vid";
++			panel-compatible = "xiaomi,marble-m16t-36-02-0a";
++			supply-name = "vddd";
++			supply-microvolt = <1200000>;
++		};
++
++		/*
++		 * Stock vddd is 1.25 V; the PM8350B L1 NLDO has 8 mV steps from
++		 * 320 mV, so the nearest voltage Linux can request is 1.256 V.
++		 */
++		variant-36-0d-0b {
++			abl-panel = "qcom,mdss_dsi_m16t_36_0d_0b_dsc_vid";
++			panel-compatible = "xiaomi,marble-m16t-36-0d-0b";
++			supply-name = "vddd";
++			supply-microvolt = <1256000>;
++		};
++	};
++};
+diff --git a/arch/arm/mach-snapdragon/Makefile b/arch/arm/mach-snapdragon/Makefile
+index e481e4f26..1291db3c1 100644
+--- a/arch/arm/mach-snapdragon/Makefile
++++ b/arch/arm/mach-snapdragon/Makefile
+@@ -2,6 +2,6 @@
+ #
+ # (C) Copyright 2015 Mateusz Kulikowski <mateusz.kulikowski@gmail.com>
+ 
+-obj-y += board.o dram.o
++obj-y += board.o dram.o panel_variant.o
+ obj-$(CONFIG_EFI_HAVE_CAPSULE_SUPPORT) += capsule_update.o
+ obj-$(CONFIG_OF_LIVE) += of_fixup.o
+diff --git a/arch/arm/mach-snapdragon/board.c b/arch/arm/mach-snapdragon/board.c
+index 56af5f02c..9d6651a8e 100644
+--- a/arch/arm/mach-snapdragon/board.c
++++ b/arch/arm/mach-snapdragon/board.c
+@@ -467,6 +467,7 @@ int board_late_init(void)
+ 		       fdt32_to_cpu(fdt_blob->totalsize));
+ 
+ 	configure_env();
++	qcom_read_abl_panel();
+ 	qcom_late_init();
+ 
+ 	qcom_show_boot_source();
+diff --git a/arch/arm/mach-snapdragon/of_fixup.c b/arch/arm/mach-snapdragon/of_fixup.c
+index 374e6262d..3f5b11014 100644
+--- a/arch/arm/mach-snapdragon/of_fixup.c
++++ b/arch/arm/mach-snapdragon/of_fixup.c
+@@ -31,6 +31,8 @@
+ #include <tee/optee.h>
+ #include <time.h>
+ 
++#include "qcom-priv.h"
++
+ /**
+  * find_ssphy_node() - Find the super-speed PHY node referenced by DWC3
+  * @dwc3: DWC3 device node
+@@ -283,5 +285,7 @@ EVENT_SPY_FULL(EVT_OF_LIVE_BUILT, qcom_of_fixup_nodes);
+ 
+ int ft_board_setup(void __maybe_unused *blob, struct bd_info __maybe_unused *bd)
+ {
++	qcom_fixup_panel_variant(blob);
++
+ 	return 0;
+ }
+diff --git a/arch/arm/mach-snapdragon/panel_variant.c b/arch/arm/mach-snapdragon/panel_variant.c
+new file mode 100644
+index 000000000..c60597ba4
+--- /dev/null
++++ b/arch/arm/mach-snapdragon/panel_variant.c
+@@ -0,0 +1,193 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * DSI panel variant selection for the OS device tree.
++ *
++ * Some phones are fitted with one of several DSI panels that need different
++ * drivers and supply voltages, and only ABL knows which one is present: it
++ * names the panel node of the downstream device tree in the command line it
++ * passes on, e.g. "msm_drm.dsi_display0=qcom,mdss_dsi_m16t_36_0d_0b_dsc_vid:".
++ *
++ * A board describes its variants in U-Boot's control device tree:
++ *
++ *	dsi-panel-variants {
++ *		compatible = "android-devices,dsi-panel-variants";
++ *		bootarg = "msm_drm.dsi_display0";
++ *
++ *		variant-0 {
++ *			abl-panel = "qcom,mdss_dsi_..._vid";
++ *			panel-compatible = "vendor,panel-a";
++ *			supply-name = "vddd";			(optional)
++ *			supply-microvolt = <1200000>;		(optional)
++ *		};
++ *		...
++ *	};
++ *
++ * At boot the ABL panel name is read from /chosen/bootargs of the device tree
++ * ABL handed over and kept in $abl_panel. When the OS device tree is prepared
++ * (bootm and the EFI paths, including EFI_DT_FIXUP_PROTOCOL), the panel node
++ * whose compatible matches any variant gets the compatible of the variant
++ * ABL named, and the regulator behind <supply-name>-supply gets the variant's
++ * voltage as its min/max constraint. Without a match the tree is left as is.
++ */
++
++#define LOG_CATEGORY LOGC_BOARD
++
++#include <env.h>
++#include <fdt_support.h>
++#include <init.h>
++#include <log.h>
++#include <dm/ofnode.h>
++#include <linux/libfdt.h>
++#include <linux/string.h>
++
++#include "qcom-priv.h"
++
++#define ABL_PANEL_ENV	"abl_panel"
++
++static ofnode qcom_panel_variants(void)
++{
++	return ofnode_by_compatible(ofnode_null(),
++				    "android-devices,dsi-panel-variants");
++}
++
++void qcom_read_abl_panel(void)
++{
++	const void *fdt = (const void *)get_prev_bl_fdt_addr();
++	const char *bootargs, *key, *p, *end;
++	char name[128], prefix[64];
++	ofnode variants;
++	size_t len;
++	int node;
++
++	variants = qcom_panel_variants();
++	if (!ofnode_valid(variants))
++		return;
++
++	key = ofnode_read_string(variants, "bootarg");
++	if (!key || snprintf(prefix, sizeof(prefix), "%s=", key) >= sizeof(prefix))
++		return;
++
++	if (!fdt || fdt_check_header(fdt)) {
++		log_warning("Panel: no device tree from the previous bootloader\n");
++		return;
++	}
++
++	node = fdt_path_offset(fdt, "/chosen");
++	bootargs = node < 0 ? NULL : fdt_getprop(fdt, node, "bootargs", NULL);
++	if (!bootargs) {
++		log_warning("Panel: no bootargs from the previous bootloader\n");
++		return;
++	}
++
++	/* Match the argument only at the start of a word. */
++	for (p = bootargs; (p = strstr(p, prefix)); p++)
++		if (p == bootargs || p[-1] == ' ')
++			break;
++	if (!p) {
++		log_warning("Panel: %s not in the bootloader command line\n", key);
++		return;
++	}
++
++	p += strlen(prefix);
++	for (end = p; *end && *end != ':' && *end != ' '; end++)
++		;
++	len = end - p;
++	if (!len || len >= sizeof(name)) {
++		log_warning("Panel: unusable %s value\n", key);
++		return;
++	}
++
++	memcpy(name, p, len);
++	name[len] = '\0';
++	env_set(ABL_PANEL_ENV, name);
++}
++
++static void qcom_fixup_supply(void *blob, int panel, ofnode variant)
++{
++	const char *supply;
++	char prop[64];
++	u32 uv, phandle;
++	int reg, ret;
++
++	supply = ofnode_read_string(variant, "supply-name");
++	if (!supply)
++		return;
++
++	if (ofnode_read_u32(variant, "supply-microvolt", &uv) ||
++	    snprintf(prop, sizeof(prop), "%s-supply", supply) >= sizeof(prop)) {
++		log_err("Panel: bad supply description\n");
++		return;
++	}
++
++	phandle = fdtdec_get_uint(blob, panel, prop, 0);
++	reg = phandle ? fdt_node_offset_by_phandle(blob, phandle) : -FDT_ERR_NOTFOUND;
++	if (reg < 0) {
++		log_warning("Panel: no %s in the OS device tree\n", prop);
++		return;
++	}
++
++	ret = fdt_setprop_u32(blob, reg, "regulator-min-microvolt", uv);
++	if (!ret)
++		ret = fdt_setprop_u32(blob, reg, "regulator-max-microvolt", uv);
++	if (ret) {
++		log_err("Panel: cannot set the %s voltage: %s\n", prop,
++			fdt_strerror(ret));
++		return;
++	}
++
++	printf("Panel: %s at %u uV\n", prop, uv);
++}
++
++/*
++ * Never fails the boot: an unknown or missing panel leaves the device tree
++ * as built, which still boots without a working panel.
++ */
++void qcom_fixup_panel_variant(void *blob)
++{
++	ofnode variants, variant, chosen = ofnode_null();
++	const char *abl_panel, *compatible;
++	int panel = -FDT_ERR_NOTFOUND, ret;
++
++	variants = qcom_panel_variants();
++	if (!ofnode_valid(variants))
++		return;
++
++	abl_panel = env_get(ABL_PANEL_ENV);
++	if (!abl_panel) {
++		log_warning("Panel: not reported by ABL; device tree unchanged\n");
++		return;
++	}
++
++	ofnode_for_each_subnode(variant, variants) {
++		const char *name = ofnode_read_string(variant, "abl-panel");
++
++		if (name && !strcmp(name, abl_panel))
++			chosen = variant;
++
++		compatible = ofnode_read_string(variant, "panel-compatible");
++		if (panel < 0 && compatible)
++			panel = fdt_node_offset_by_compatible(blob, -1, compatible);
++	}
++
++	if (!ofnode_valid(chosen)) {
++		log_warning("Panel: unknown panel %s; device tree unchanged\n",
++			    abl_panel);
++		return;
++	}
++	if (panel < 0) {
++		log_warning("Panel: no known panel node in the OS device tree\n");
++		return;
++	}
++
++	compatible = ofnode_read_string(chosen, "panel-compatible");
++	ret = compatible ? fdt_setprop_string(blob, panel, "compatible",
++					      compatible) : -FDT_ERR_BADVALUE;
++	if (ret) {
++		log_err("Panel: cannot select %s: %s\n", abl_panel,
++			fdt_strerror(ret));
++		return;
++	}
++	printf("Panel: %s -> %s\n", abl_panel, compatible);
++
++	qcom_fixup_supply(blob, panel, chosen);
++}
+diff --git a/arch/arm/mach-snapdragon/qcom-priv.h b/arch/arm/mach-snapdragon/qcom-priv.h
+index ce409314a..52480ffdd 100644
+--- a/arch/arm/mach-snapdragon/qcom-priv.h
++++ b/arch/arm/mach-snapdragon/qcom-priv.h
+@@ -20,9 +20,12 @@ extern enum qcom_boot_source qcom_boot_source;
+ #if IS_ENABLED(CONFIG_EFI_HAVE_CAPSULE_SUPPORT)
+ void qcom_configure_capsule_updates(void);
+ #else
+-void qcom_configure_capsule_updates(void) {}
++static inline void qcom_configure_capsule_updates(void) {}
+ #endif /* EFI_HAVE_CAPSULE_SUPPORT */
+ 
+ int qcom_parse_memory(const void *fdt);
+ 
++void qcom_read_abl_panel(void);
++void qcom_fixup_panel_variant(void *blob);
++
+ #endif /* __QCOM_PRIV_H__ */

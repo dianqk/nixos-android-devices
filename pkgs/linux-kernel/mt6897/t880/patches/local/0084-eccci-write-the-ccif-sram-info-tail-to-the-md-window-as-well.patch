@@ -1,0 +1,63 @@
+From 4ed1590a291dd4b311a4e18f0de20526712c7173 Mon Sep 17 00:00:00 2001
+From: Furruka <3483930638@qq.com>
+Date: Sun, 13 Sep 2026 19:59:45 +0800
+Subject: [PATCH] eccci: write the CCIF SRAM info tail to the MD window as well
+
+ccci_reset_ccif_hw() zeroes BOTH CCIF SRAM views and then republishes the
+"smem info" tail - magic 0x7274626E, the MDSS_DBG region's MD-view address and
+its size, i.e. the coordinates the modem reads early in its boot - to baseA
+only. The vendor code can afford that because on stock LK pre-writes the MD
+side; here the clear loop wipes it and nothing puts it back, so the modem's own
+view stays all zero, it stalls at early boot and never sends HS1.
+
+That is not a guess: this device's boot status is exactly 0x5443000C /
+0x53320000 ("TC" / "S2"), and the MT6895-Mainline pearl port reports the same
+stall (boot_status TC/S2, never sends HS1) fixed by exactly these three writes
+to baseB, verified there as reaching HS1 plus the 46-feature negotiation.
+
+baseB is the same MD CCIF window the clear loop above already writes, so this
+adds no new access class.
+
+(cherry picked from commit 60e35be508f38c136d0180799cfb90cbdcf6f95e)
+Link: https://github.com/MT6895-Mainline/linux/commit/60e35be508f38c136d0180799cfb90cbdcf6f95e (qqcandy branch)
+[dianqk: applied to the MT6897 vendor copy with reduced context (its
+ export line differs); no code change]
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../misc/mediatek/eccci/hif/ccci_hif_ccif.c   | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c b/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c
+index bae94bfba3..79b5d42b3c 100644
+--- a/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c
++++ b/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c
+@@ -1142,6 +1142,25 @@ void ccci_reset_ccif_hw(int ccif_id, void __iomem *baseA,
+ 	ccif_write32(baseA,
+ 		PCCIF_CHDATA + PCCIF_SRAM_SIZE - sizeof(u32),
+ 		region->size);
++	/*
++	 * qqcandy: the tail above goes to the AP-side view only, and the vendor
++	 * code can afford that because on stock LK pre-writes the MD side. Our
++	 * clear loop above zeroes BOTH views, so without these writes the MD's
++	 * own view stays all zero, the modem stalls at early boot (boot_status
++	 * 0x5443000C/0x53320000 = "TC"/"S2") and never sends HS1 - exactly what
++	 * this device shows. Same three values, written to the MD window.
++	 * (Cross-checked against the MT6895-Mainline pearl port, whose comment
++	 * and verified result report the same stall and the same fix.)
++	 */
++	ccif_write32(baseB,
++		PCCIF_CHDATA + PCCIF_SRAM_SIZE - 3 * sizeof(u32),
++		0x7274626E);
++	ccif_write32(baseB,
++		PCCIF_CHDATA + PCCIF_SRAM_SIZE - 2 * sizeof(u32),
++		region->base_md_view_phy);
++	ccif_write32(baseB,
++		PCCIF_CHDATA + PCCIF_SRAM_SIZE - sizeof(u32),
++		region->size);
+ }
+ //EXPORT_SYMBOL(ccci_reset_ccif_hw);
+ 
+-- 
+2.56.0
+

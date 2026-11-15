@@ -1,0 +1,410 @@
+From 502d49e821d7bcd3631aa3877aaec8bc9b48bb69 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 10 Nov 2026 13:04:10 +0800
+Subject: [PATCH] drm/mediatek: restore MT6897 OVL fetch controls before
+ enabling
+
+MT6897 direct-link OVL loses request and buffer threshold controls when
+its display domain powers off. Restore the stock direct-link values at
+each startup before enabling either the local OVL or its dual-pipe twin.
+
+Set BURST16 and output clamp while preserving their other register bits.
+Initialize the complete GREQ and urgent-request words, as the vendor golden
+settings do, rather than retaining reset fields in those words. The vendor
+uses 0xffff for request nibbles; restrict this to the two physical layers
+of this OVL variant (0xff). Restore zero low thresholds and the vendor
+pre-ultra-high-disable bit for both physical ports.
+
+Enable this behavior only for MT6897. Leave other OVL variants and the
+already initialized FIFO/GMC controls unchanged. Add a production-callback
+regression covering power loss, twins, masked and full-word writes, startup
+ordering and the unchanged legacy MMIO trace.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_disp_ovl.c#L3440-L3595
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_disp_ovl.c#L1087-L1103
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/gpu/drm/mediatek/mtk_disp_ovl.c       |  36 +++
+ tools/testing/selftests/mtk_clk/Makefile      |   4 +-
+ .../selftests/mtk_clk/ovl_fetch_cases.c       | 223 ++++++++++++++++++
+ .../selftests/mtk_clk/test_ovl_fetch.py       |  50 ++++
+ 4 files changed, 311 insertions(+), 2 deletions(-)
+ create mode 100644 tools/testing/selftests/mtk_clk/ovl_fetch_cases.c
+ create mode 100755 tools/testing/selftests/mtk_clk/test_ovl_fetch.py
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_ovl.c b/drivers/gpu/drm/mediatek/mtk_disp_ovl.c
+index 5c224114fa..c209e7d87d 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_ovl.c
++++ b/drivers/gpu/drm/mediatek/mtk_disp_ovl.c
+@@ -33,6 +33,7 @@
+ #define DISP_REG_OVL_ROI_SIZE			0x0020
+ #define DISP_REG_OVL_DATAPATH_CON		0x0024
+ #define OVL_LAYER_SMI_ID_EN				BIT(0)
++#define OVL_OUTPUT_CLAMP				BIT(26)
+ #define OVL_BGCLR_SEL_IN				BIT(2)
+ #define OVL_LAYER_AFBC_EN(n)				BIT(4+n)
+ #define DISP_REG_OVL_ROI_BGCLR			0x0028
+@@ -46,6 +47,13 @@
+ #define OVL_CONST_BLEND					BIT(28)
+ #define DISP_REG_OVL_RDMA_CTRL(n)		(0x00c0 + 0x20 * (n))
+ #define DISP_REG_OVL_RDMA_GMC(n)		(0x00c8 + 0x20 * (n))
++#define DISP_REG_OVL_RDMA_BURST_CON1		0x01f4
++#define OVL_RDMA_BURST16_EN			BIT(28)
++#define DISP_REG_OVL_RDMA_GREQ_NUM		0x01f8
++#define DISP_REG_OVL_RDMA_GREQ_URG_NUM		0x01fc
++#define DISP_REG_OVL_RDMA_BUF_LOW(n)		(0x0210 + 4 * (n))
++#define DISP_REG_OVL_RDMA_BUF_HIGH(n)		(0x0220 + 4 * (n))
++#define OVL_RDMA_PRE_ULTRA_HIGH_DIS		BIT(31)
+ #define DISP_REG_OVL_ADDR_MT2701		0x0040
+ #define DISP_REG_OVL_CLRFMT_EXT			0x02d0
+ #define OVL_CON_CLRFMT_BIT_DEPTH_MASK(n)		(GENMASK(1, 0) << (4 * (n)))
+@@ -147,6 +155,8 @@ struct mtk_disp_ovl_data {
+ 	 * and clear shadow bypass so plane updates latch together at SOF.
+ 	 */
+ 	bool en_keep;
++	/* Restore direct-link fetch controls before enabling after power loss. */
++	bool restore_fetch_config;
+ };
+ 
+ /*
+@@ -391,8 +401,33 @@ void mtk_ovl_stop(struct device *dev)
+ 	mtk_ovl_boot_handover(dev);
+ }
+ 
++static void mtk_ovl_restore_fetch_config(struct mtk_disp_ovl *ovl)
++{
++	u32 greq = GENMASK(4 * ovl->data->layer_nr - 1, 0);
++	u32 reg;
++	unsigned int i;
++
++	reg = readl(ovl->regs + DISP_REG_OVL_RDMA_BURST_CON1);
++	writel_relaxed(reg | OVL_RDMA_BURST16_EN,
++		       ovl->regs + DISP_REG_OVL_RDMA_BURST_CON1);
++	reg = readl(ovl->regs + DISP_REG_OVL_DATAPATH_CON);
++	writel_relaxed(reg | OVL_OUTPUT_CLAMP,
++		       ovl->regs + DISP_REG_OVL_DATAPATH_CON);
++
++	/* Each physical layer owns one request nibble; initialize the full words. */
++	writel_relaxed(0xf1ff0000 | greq, ovl->regs + DISP_REG_OVL_RDMA_GREQ_NUM);
++	writel_relaxed(greq, ovl->regs + DISP_REG_OVL_RDMA_GREQ_URG_NUM);
++	for (i = 0; i < ovl->data->layer_nr; i++) {
++		writel_relaxed(0, ovl->regs + DISP_REG_OVL_RDMA_BUF_LOW(i));
++		writel_relaxed(OVL_RDMA_PRE_ULTRA_HIGH_DIS,
++			       ovl->regs + DISP_REG_OVL_RDMA_BUF_HIGH(i));
++	}
++}
++
+ static void mtk_ovl_start_one(struct mtk_disp_ovl *ovl)
+ {
++	if (ovl->data->restore_fetch_config)
++		mtk_ovl_restore_fetch_config(ovl);
+ 
+ 	if (ovl->data->smi_id_en) {
+ 		unsigned int reg;
+@@ -1072,6 +1107,7 @@ static const struct mtk_disp_ovl_data mt6897_ovl_2l_driver_data = {
+ 	.num_formats = mt8173_ovl_formats_len,
+ 	.addr_msb = true,
+ 	.en_keep = true,
++	.restore_fetch_config = true,
+ };
+ 
+ static const struct mtk_disp_ovl_data mt8195_ovl_driver_data = {
+diff --git a/tools/testing/selftests/mtk_clk/Makefile b/tools/testing/selftests/mtk_clk/Makefile
+index 18b18a51f0..2c30a08fdd 100644
+--- a/tools/testing/selftests/mtk_clk/Makefile
++++ b/tools/testing/selftests/mtk_clk/Makefile
+@@ -1,4 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-TEST_PROGS := test_tinysys_mailbox.py test_dram_bootstrap.py test_mt6897.py test_domains.py test_boot_owner.py test_directlink.py test_display_pm.py test_dpintf_pm.py test_cmdq_stop.py test_crtc_stop.py test_dsi_routing.py test_dsc_epoch.py test_mipi_tx_order.py
+-TEST_FILES := tinysys_mailbox_cases.c mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c ven_cases.c boot_stubs.h boot_cases.c directlink_cases.c display_pm_cases.c mmsys_pm_cases.c dpintf_pm_cases.c cmdq_stop_cases.c crtc_stop_cases.c dsi_routing_cases.c dsi_mmsys_cases.c dsc_epoch_cases.c mipi_tx_order_cases.c
++TEST_PROGS := test_tinysys_mailbox.py test_dram_bootstrap.py test_mt6897.py test_domains.py test_boot_owner.py test_directlink.py test_display_pm.py test_dpintf_pm.py test_cmdq_stop.py test_crtc_stop.py test_dsi_routing.py test_dsc_epoch.py test_mipi_tx_order.py test_ovl_fetch.py
++TEST_FILES := tinysys_mailbox_cases.c mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c ven_cases.c boot_stubs.h boot_cases.c directlink_cases.c display_pm_cases.c mmsys_pm_cases.c dpintf_pm_cases.c cmdq_stop_cases.c crtc_stop_cases.c dsi_routing_cases.c dsi_mmsys_cases.c dsc_epoch_cases.c mipi_tx_order_cases.c ovl_fetch_cases.c
+ include ../lib.mk
+diff --git a/tools/testing/selftests/mtk_clk/ovl_fetch_cases.c b/tools/testing/selftests/mtk_clk/ovl_fetch_cases.c
+new file mode 100644
+index 0000000000..d36b204d54
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/ovl_fetch_cases.c
+@@ -0,0 +1,223 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++#define __iomem
++#define BIT(n) (1U << (n))
++#define GENMASK(h, l) ((UINT32_MAX << (l)) & (UINT32_MAX >> (31 - (h))))
++#define MTK_OVL_SUPPORT_BLEND_MODES 0
++
++typedef uint32_t u32;
++struct clk;
++struct drm_crtc;
++struct cmdq_client_reg { unsigned int unused; };
++struct device { void *data; };
++struct platform_device { struct device dev; };
++struct device_node { struct platform_device *device; };
++static const u32 mt8173_ovl_formats[] = { 0 };
++static const size_t mt8173_ovl_formats_len = 1;
++/* DECLARATIONS */
++
++static u32 registers[2][1024];
++static bool trace, oracle;
++static unsigned int unsafe_enable, fullword_reads, gets, handovers;
++
++static void *dev_get_drvdata(struct device *dev)
++{
++	return dev->data;
++}
++
++static struct platform_device *of_find_device_by_node(struct device_node *node)
++{
++	gets++;
++	return node->device;
++}
++
++static void mtk_ovl_boot_handover(struct device *dev)
++{
++	handovers++;
++}
++
++static int bank(void *reg, unsigned int *offset)
++{
++	uintptr_t address = (uintptr_t)reg;
++	int i;
++
++	for (i = 0; i < 2; i++) {
++		uintptr_t base = (uintptr_t)registers[i];
++
++		if (address >= base && address < base + sizeof(registers[i])) {
++			*offset = address - base;
++			assert(!(*offset % 4));
++			return i;
++		}
++	}
++	assert(false);
++	return -1;
++}
++
++static bool ready(int i)
++{
++	return (registers[i][0x1f4 / 4] & BIT(28)) &&
++		(registers[i][0x24 / 4] & BIT(26)) &&
++		registers[i][0x1f8 / 4] == 0xf1ff00ff &&
++		registers[i][0x1fc / 4] == 0xff &&
++		registers[i][0x210 / 4] == 0 && registers[i][0x214 / 4] == 0 &&
++		registers[i][0x220 / 4] == BIT(31) &&
++		registers[i][0x224 / 4] == BIT(31);
++}
++
++static u32 readl(void *reg)
++{
++	unsigned int offset;
++	int i = bank(reg, &offset);
++
++	if (oracle && (offset == 0x1f8 || offset == 0x1fc ||
++		       offset == 0x210 || offset == 0x214 ||
++		       offset == 0x220 || offset == 0x224))
++		fullword_reads++;
++	if (trace)
++		printf("R %d %03x %08x\n", i, offset, *(u32 *)reg);
++	return *(u32 *)reg;
++}
++
++static void writel_relaxed(u32 value, void *reg)
++{
++	unsigned int offset;
++	int i = bank(reg, &offset);
++
++	if (oracle && offset == 0xc && (value & 1) && !ready(i))
++		unsafe_enable++;
++	if (trace)
++		printf("W %d %03x %08x\n", i, offset, value);
++	*(u32 *)reg = value;
++}
++
++/* PRODUCTION */
++
++static bool changed_register(unsigned int offset)
++{
++	return offset == 0xc || offset == 0x24 || offset == 0x1f4 ||
++		offset == 0x1f8 || offset == 0x1fc || offset == 0x210 ||
++		offset == 0x214 || offset == 0x220 || offset == 0x224;
++}
++
++static void seed(unsigned int value, bool clamp_only)
++{
++	int i, j;
++
++	for (i = 0; i < 2; i++) {
++		for (j = 0; j < 1024; j++) {
++			value = value * 1664525U + 1013904223U;
++			registers[i][j] = value;
++		}
++		/* Measured fetch words; synthetic EN seed exercises preservation. */
++		registers[i][0xc / 4] = 0x00e00000;
++		registers[i][0x24 / 4] = 0x03000000 | (clamp_only ? BIT(26) : 0);
++		registers[i][0x1f4 / 4] = 0x06666442;
++		registers[i][0x1f8 / 4] = 0x41ff00ff;
++		registers[i][0x1fc / 4] = 0x60300077;
++		registers[i][0x210 / 4] = 0x30020;
++		registers[i][0x214 / 4] = 0x30020;
++		registers[i][0x220 / 4] = 0x40000;
++		registers[i][0x224 / 4] = 0x40000;
++	}
++}
++
++static void test_target(bool dual, bool clamp_only)
++{
++	struct mtk_disp_ovl cores[2] = { 0 };
++	struct platform_device partner = { .dev.data = &cores[1] };
++	struct device_node node = { .device = &partner };
++	struct device lead = { .data = &cores[0] };
++	u32 previous[2][1024];
++	unsigned int epoch, stage, i, j;
++
++	for (i = 0; i < 2; i++) {
++		cores[i].data = &mt6897_ovl_2l_driver_data;
++		cores[i].regs = registers[i];
++	}
++	assert(cores[0].data->layer_nr == 2);
++#if HAS_RESTORE
++	assert(cores[0].data->restore_fetch_config);
++#endif
++	cores[0].twin_np = dual ? &node : NULL;
++	oracle = true;
++	for (stage = 0; stage < 3; stage++) {
++		for (epoch = 0; epoch < 4; epoch++) {
++			seed(stage * 31 + epoch, clamp_only);
++			/* Arbitrary reset values exercise masked vs full-word ownership. */
++			if (epoch > 1) {
++				for (i = 0; i < 2; i++) {
++					registers[i][0x24 / 4] ^= 0xa19a03fe;
++					registers[i][0x1f4 / 4] ^= 0xe3c5a980;
++					registers[i][0x1f8 / 4] = epoch * 0x12345678;
++					registers[i][0x1fc / 4] = epoch * 0x7fedcba9;
++				}
++			}
++			memcpy(previous, registers, sizeof(previous));
++			mtk_ovl_start(&lead);
++			assert(unsafe_enable == 0);
++			assert(fullword_reads == 0);
++			for (i = 0; i < (dual ? 2U : 1U); i++) {
++				assert(ready(i));
++				assert(registers[i][0x1f4 / 4] ==
++				       (previous[i][0x1f4 / 4] | BIT(28)));
++				assert(registers[i][0x24 / 4] ==
++				       (previous[i][0x24 / 4] | BIT(26) | 1));
++				assert(registers[i][0xc / 4] ==
++				       ((previous[i][0xc / 4] & ~BIT(22)) | 1));
++				for (j = 0; j < 1024; j++)
++					if (!changed_register(j * 4))
++						assert(registers[i][j] == previous[i][j]);
++			}
++			if (!dual)
++				assert(!memcmp(registers[1], previous[1], sizeof(previous[1])));
++			mtk_ovl_stop(&lead);
++			for (i = 0; i < (dual ? 2U : 1U); i++)
++				assert(!(registers[i][0xc / 4] & 1));
++		}
++	}
++	if (dual)
++		assert(cores[0].twin == &partner.dev);
++	oracle = false;
++}
++
++static void legacy_trace(void)
++{
++	struct mtk_disp_ovl_data data = mt6897_ovl_2l_driver_data;
++	struct mtk_disp_ovl core = { .data = &data, .regs = registers[0] };
++	struct device dev = { .data = &core };
++	int smi, keep;
++
++#if HAS_RESTORE
++	data.restore_fetch_config = false;
++#endif
++	trace = true;
++	for (smi = 0; smi < 2; smi++) {
++		for (keep = 0; keep < 2; keep++) {
++			data.smi_id_en = smi;
++			data.en_keep = keep;
++			data.layer_nr = keep ? 4 : 2;
++			seed(42, false);
++			mtk_ovl_start(&dev);
++			mtk_ovl_stop(&dev);
++		}
++	}
++}
++
++int main(int argc, char **argv)
++{
++	if (argc > 1 && !strcmp(argv[1], "--legacy-trace")) {
++		legacy_trace();
++		return 0;
++	}
++	test_target(false, argc > 1);
++	test_target(true, argc > 1);
++	assert(gets == 1 && handovers == 24);
++	puts("OVL production startup/stop, both pipes and repeated epochs: PASS");
++	return 0;
++}
+diff --git a/tools/testing/selftests/mtk_clk/test_ovl_fetch.py b/tools/testing/selftests/mtk_clk/test_ovl_fetch.py
+new file mode 100755
+index 0000000000..193ac6872f
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/test_ovl_fetch.py
+@@ -0,0 +1,50 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Exercise production OVL startup restoration across register power loss."""
++from pathlib import Path
++import os
++import re
++import subprocess
++import tempfile
++
++assets = Path(__file__).resolve().parent
++repo = Path(os.environ.get('KERNEL_SRC', str(assets.parents[3])))
++source = Path(os.environ.get('OVL_SOURCE', str(repo / 'drivers/gpu/drm/mediatek/mtk_disp_ovl.c'))).read_text()
++
++
++def function(name):
++    pattern = r'^(?:static )?(?:void|struct mtk_disp_ovl \*)\s*' + name + r'\([^;]*?\)\n\{'
++    match = re.search(pattern, source, re.M)
++    start = match.start()
++    end = source.index('{', start) + 1
++    depth = 1
++    while depth:
++        depth += (source[end] == '{') - (source[end] == '}')
++        end += 1
++    return source[start:end]
++
++
++constants = '\n'.join(re.findall(r'^#\s*define [^\n]*(?:\\\n[^\n]*)*', source, re.M))
++structures = '\n'.join(re.search(r'^struct ' + name + r' \{.*?^};', source, re.M | re.S)[0]
++                       for name in ['mtk_disp_ovl_data', 'mtk_disp_ovl'])
++data = re.search(r'^static const struct mtk_disp_ovl_data mt6897_ovl_2l_driver_data = \{.*?^};',
++                 source, re.M | re.S)[0]
++restores = 'bool restore_fetch_config;' in source
++production = function('mtk_ovl_twin')
++if restores:
++    production += '\n' + function('mtk_ovl_restore_fetch_config')
++production += '\n' + '\n'.join(function(name) for name in [
++    'mtk_ovl_start_one', 'mtk_ovl_stop_one', 'mtk_ovl_start', 'mtk_ovl_stop'])
++cases = (assets / 'ovl_fetch_cases.c').read_text()
++with tempfile.TemporaryDirectory(prefix='mtk-ovl-fetch-') as tmp:
++    tmp = Path(tmp)
++    c = tmp / 'test.c'
++    c.write_text(cases.replace('/* DECLARATIONS */', constants + '\n' + structures + '\n' + data
++                              + '\n#define HAS_RESTORE ' + str(int(restores)))
++                 .replace('/* PRODUCTION */', production))
++    binary = tmp / 'test'
++    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
++                    '-Wno-unused-parameter', '-Werror', '-g', '-fsanitize=address,undefined',
++                    str(c), '-o', str(binary)], check=True)
++    args = os.environ.get('OVL_TEST_ARGS', '').split()
++    subprocess.run([str(binary), *args], check=True)
+-- 
+2.56.0
+

@@ -46,6 +46,8 @@ products are outside this command's scope. Image filenames and per-device serial
 allowlists are not used as board identity. Both check and execute validate again;
 only `--execute` sends the final boot/flash command. Size and SHA-256 are printed
 for review; these structural checks do not authenticate an image's publisher.
+T880 and marble images are recognised but refused before any fastboot
+command: their stock fastboot products are not yet verified.
 
 Some Asphalt OEM bootloaders report the SoC product `taro`. That product alone
 does not identify a tablet. For Asphalt/taro, the CLI accepts the OEM
@@ -112,7 +114,7 @@ An erase failure is reported without automatically flashing a replacement image.
 Every device's recovery runs the Rust recovery daemon and exposes the
 `/bin/recovery` client; the host tool calls it automatically and refuses a
 recovery without the daemon protocol. Configure `target` for SSH.
-All five boards expose [shared `install-initial`](../../docs/initial-install.md).
+All supported boards expose [shared `install-initial`](../../docs/initial-install.md).
 Prepare the empty root and FAT boot partition separately; installation does not
 partition or format storage. Follow the matching first-install guide before
 formatting:
@@ -121,6 +123,16 @@ formatting:
 [Sheng](../../docs/sheng/first-install.md),
 [Aurora](../../docs/aurora/README.md),
 [Clover](../../docs/clover/first-install.md).
+
+A/B devices split their userdata span with `recovery prepare-install` (see
+[recovery](../../docs/recovery.md#ab-devices-preparing-linux-storage) and the
+[T880 install guide](../../docs/t880/install.md)): without a size it lists the
+offered Android userdata sizes; `--android-userdata SIZE` prints the plan;
+`--android-userdata SIZE --execute` partitions; the recovery keeps the original
+GPT in RAM until it restarts. Adding `--gpt-backup DIR` (recommended) first
+downloads it to a new host directory as a permanent copy. `recovery restore-gpt
+[--gpt-backup DIR] [--execute]` writes the host copy back, or without
+`--gpt-backup` the RAM copy.
 
 Single-slot Polaris and Clover use physical `system` as FAT32 `/boot`. After
 `format-root`, check `recovery prepare-boot`, then explicitly run
@@ -159,7 +171,8 @@ mobile-device recovery --target HOST install-image ./recovery.img \
 ```
 
 `--partition` is the `/dev/disk/by-partlabel/` path of `boot` or `recovery`
-(`boot_b`/`recovery_b` on A/B devices). The
+(`boot_b`/`recovery_b` on A/B devices; the T880 supports only `boot_a`,
+with RAM recovery supplied over U-Boot USB fastboot). The
 daemon validates the image identity, size and target before writing and reads
 it back.
 

@@ -1,0 +1,70 @@
+From 23488a1eb20d7923ac81870d8678344909be46ee Mon Sep 17 00:00:00 2001
+From: Fan Wu <fanwu01@zju.edu.cn>
+Date: Wed, 17 Jun 2026 13:20:06 +0000
+Subject: [PATCH 079/144] drm/msm/a6xx: free all preempt buffers on teardown
+
+a6xx_destroy() never calls a6xx_preempt_fini(), so on teardown the
+preemption GEM buffers leak: the per-ring preempt_bo and preempt_smmu_bo
+(allocated in preempt_init_ring()) and the single preempt_postamble_bo
+(allocated in a6xx_preempt_init()). a6xx_preempt_fini() only released
+preempt_bo, and only on the a6xx_preempt_init() error path.
+
+Complete a6xx_preempt_fini() to also release preempt_smmu_bo and
+preempt_postamble_bo, and call it from a6xx_destroy(). Because
+a6xx_preempt_fini() is now reached on both the init-error path and
+normal teardown, null each pointer after msm_gem_kernel_put() so a
+second invocation is a no-op rather than a double-free.
+msm_gem_kernel_put() is already NULL-safe, and msm_gem_kernel_new()
+only stores the GEM object on success, so pointers that were never
+allocated stay NULL.
+
+This bug was found by static analysis.
+
+Fixes: e7ae83da4a28 ("drm/msm/a6xx: Implement preemption for a7xx targets")
+Fixes: 50117cad0c50 ("drm/msm/a6xx: Use posamble to reset counters on preemption")
+Cc: stable@vger.kernel.org
+Signed-off-by: Fan Wu <fanwu01@zju.edu.cn>
+Message-ID: <20260617132007.131079-3-fanwu01@zju.edu.cn>
+Link: https://lore.kernel.org/r/20260617132007.131079-3-fanwu01@zju.edu.cn
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0101-drm-msm-a6xx-free-all-preempt-buffers-on-teardown.patch
+Import-SHA256: 99da3434fbb6334691a03a8efd867b4d46174c5d97a7328bed00c63f3afcf462
+Import-Provenance: mail headers
+(cherry picked from commit 1abe87460f8521864dd122ca4a4d3a5c94bc7350)
+---
+ drivers/gpu/drm/msm/adreno/a6xx_gpu.c     | 1 +
+ drivers/gpu/drm/msm/adreno/a6xx_preempt.c | 8 +++++++-
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+index 9b13cba358..1d94709169 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -2307,6 +2307,7 @@ static void a6xx_destroy(struct msm_gpu *gpu)
+ 	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
+ 
+ 	timer_shutdown_sync(&a6xx_gpu->preempt_timer);
++	a6xx_preempt_fini(gpu);
+ 
+ 	if (a6xx_gpu->sqe_bo) {
+ 		msm_gem_unpin_iova(a6xx_gpu->sqe_bo, gpu->vm);
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_preempt.c b/drivers/gpu/drm/msm/adreno/a6xx_preempt.c
+index 033ef8ec9f..b272eb6e57 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_preempt.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_preempt.c
+@@ -349,8 +349,14 @@ void a6xx_preempt_fini(struct msm_gpu *gpu)
+ 	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
+ 	int i;
+ 
+-	for (i = 0; i < gpu->nr_rings; i++)
++	for (i = 0; i < gpu->nr_rings; i++) {
+ 		msm_gem_kernel_put(a6xx_gpu->preempt_bo[i], gpu->vm);
++		a6xx_gpu->preempt_bo[i] = NULL;
++		msm_gem_kernel_put(a6xx_gpu->preempt_smmu_bo[i], gpu->vm);
++		a6xx_gpu->preempt_smmu_bo[i] = NULL;
++	}
++	msm_gem_kernel_put(a6xx_gpu->preempt_postamble_bo, gpu->vm);
++	a6xx_gpu->preempt_postamble_bo = NULL;
+ }
+ 
+ /* Initialize the preemption watchdog timer at GPU allocation so that it is

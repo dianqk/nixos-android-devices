@@ -1,0 +1,76 @@
+From 2138de9ed0af3c497308663f2f4ede0ab8049505 Mon Sep 17 00:00:00 2001
+From: Joonhoe Kim <26rote@gmail.com>
+Date: Sat, 24 Oct 2026 14:19:52 +0900
+Subject: [PATCH 076/144] drm/msm/dp: hold one runtime PM reference per plugged
+ state
+
+msm_dp_bridge_detect() takes a runtime PM reference and keeps it when
+it leaves the sink plugged, so that the plugged state keeps the
+controller on. If the sink was plugged already, the plugged state holds
+a reference, and the new one is leaked. If the sink was plugged and
+detect() finds it gone, it drops only its own reference and clears the
+plugged state, so the unplug handler skips the put and the plugged
+state's reference is leaked as well.
+
+detect() runs on every probe of the connector. When HPD comes from a
+later bridge, such as a USB-C connector, nothing else keeps the
+controller on, and the leaked references keep it and the MDSS core GDSC
+powered after the display is unplugged.
+
+Hold the function's own reference for the duration of the call, take
+the plugged state's reference when detect() sets the plugged state and
+drop it when detect() clears it.
+
+Fixes: 3ea2d1c3d154 ("drm/msm/dp: turn link_ready into plugged")
+Signed-off-by: Joonhoe Kim <26rote@gmail.com>
+Message-ID: <20261024051952.2006-1-26rote@gmail.com>
+Link: https://lore.kernel.org/all/20261024051952.2006-1-26rote@gmail.com/
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0098-drm-msm-dp-hold-one-runtime-PM-reference-per-plugged.patch
+Import-SHA256: 4c285f34367374a22dd256fe9390dff1cd97117a7b57cabff29c2552c2f71f64
+Import-Provenance: mail headers
+(cherry picked from commit d7936433a462e2e89805d36a41077e3fefb66c92)
+---
+ drivers/gpu/drm/msm/dp/dp_display.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index ae5a1674cf..4af6f57f26 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -899,6 +899,7 @@ enum drm_connector_status msm_dp_bridge_detect(struct drm_bridge *bridge,
+ 	u8 dpcd[DP_RECEIVER_CAP_SIZE];
+ 	struct drm_dp_desc desc;
+ 	bool phy_deinit;
++	bool was_plugged;
+ 	int ret;
+ 
+ 	dp = to_dp_bridge(bridge)->msm_dp_display;
+@@ -906,12 +907,14 @@ enum drm_connector_status msm_dp_bridge_detect(struct drm_bridge *bridge,
+ 	priv = container_of(dp, struct msm_dp_display_private, msm_dp_display);
+ 
+ 	guard(mutex)(&priv->plugged_lock);
+-	ret = pm_runtime_resume_and_get(&dp->pdev->dev);
++	PM_RUNTIME_ACQUIRE_IF_ENABLED(&dp->pdev->dev, pm);
++	ret = PM_RUNTIME_ACQUIRE_ERR(&pm);
+ 	if (ret) {
+ 		DRM_ERROR("failed to pm_runtime_resume\n");
+ 		return status;
+ 	}
+ 
++	was_plugged = priv->plugged;
+ 	phy_deinit = msm_dp_display_host_phy_init(priv);
+ 
+ 	msm_dp_aux_enable_xfers(priv->aux, true);
+@@ -961,7 +964,10 @@ enum drm_connector_status msm_dp_bridge_detect(struct drm_bridge *bridge,
+ 			msm_dp_display_host_phy_exit(priv);
+ 		}
+ 
+-		pm_runtime_put_sync(&dp->pdev->dev);
++		if (was_plugged)
++			pm_runtime_put_noidle(&dp->pdev->dev);
++	} else if (!was_plugged) {
++		pm_runtime_get_noresume(&dp->pdev->dev);
+ 	}
+ 
+ 	return status;

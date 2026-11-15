@@ -1,0 +1,397 @@
+From 119c7058ef4b5d76b5673e896ee0cdc58f2a3656 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 7 Nov 2026 21:41:52 +0800
+Subject: [PATCH 216/216] drm/mediatek: capture MT6897 DSI CMDQ RMW operands
+
+Record the value returned by the existing command RMW read and the full word passed to writel. Preserve data/header/size ordering and one read/write per operation, and use the existing bounded timeout ring without success logging. Limit operand capture to the config-clock diagnostic path; other controllers keep the original mask helper.
+
+Exercise production helpers against a mock bus for read, short and long messages, size selection, stale reads, outside-mask bits, ring wrap and reset. The observer adds CPU work and does not establish hardware acceptance.
+---
+ drivers/gpu/drm/mediatek/mtk_dsi.c            |  44 ++++--
+ .../selftests/mtk_clk/dsi_routing_cases.c     | 129 +++++++++++++++++-
+ .../selftests/mtk_clk/test_dsi_routing.py     |  15 +-
+ 3 files changed, 165 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_dsi.c b/drivers/gpu/drm/mediatek/mtk_dsi.c
+index cef1472146..ba7fca7fae 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dsi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dsi.c
+@@ -342,7 +342,9 @@ enum mtk_dsi_cmdq_write_kind {
+  * @kind: data, config, size or size-select write
+  * @offset: target register offset
+  * @mask: write mask
+- * @value: write value
++ * @value: masked write argument
++ * @old: value returned by the existing RMW read
++ * @new: full word passed to writel
+  */
+ struct mtk_dsi_cmdq_write {
+ 	u32 cmd;
+@@ -352,6 +354,8 @@ struct mtk_dsi_cmdq_write {
+ 	u16 offset;
+ 	u32 mask;
+ 	u32 value;
++	u32 old;
++	u32 new;
+ };
+ 
+ struct mtk_dsi_driver_data {
+@@ -1440,7 +1444,7 @@ static u8 mtk_dsi_msg_tx(const struct mipi_dsi_msg *msg, size_t index)
+ static void mtk_dsi_record_cmdq_write(struct mtk_dsi *dsi,
+ 				      const struct mipi_dsi_msg *msg,
+ 				      u16 offset, u32 mask, u32 value,
+-				      u8 kind)
++				      u8 kind, u32 old, u32 new)
+ {
+ 	struct mtk_dsi_cmdq_write *rec =
+ 		&dsi->cmdq_write_ring[dsi->cmdq_write_head];
+@@ -1452,12 +1456,32 @@ static void mtk_dsi_record_cmdq_write(struct mtk_dsi *dsi,
+ 	rec->offset = offset;
+ 	rec->mask = mask;
+ 	rec->value = value;
++	rec->old = old;
++	rec->new = new;
+ 	dsi->cmdq_write_head = (dsi->cmdq_write_head + 1) %
+ 			       MTK_DSI_CMDQ_WRITE_RING_SIZE;
+ 	if (dsi->cmdq_write_count < MTK_DSI_CMDQ_WRITE_RING_SIZE)
+ 		dsi->cmdq_write_count++;
+ }
+ 
++/* Keep the command RMW bus accesses identical; retain their actual operands. */
++static void mtk_dsi_cmdq_mask(struct mtk_dsi *dsi,
++			      const struct mipi_dsi_msg *msg,
++			      u16 offset, u32 mask, u32 value, u8 kind)
++{
++	u32 old, new;
++
++	if (!dsi->config_clk) {
++		mtk_dsi_mask(dsi, offset, mask, value);
++		return;
++	}
++
++	old = readl(dsi->regs + offset);
++	new = (old & ~mask) | (value & mask);
++	writel(new, dsi->regs + offset);
++	mtk_dsi_record_cmdq_write(dsi, msg, offset, mask, value, kind, old, new);
++}
++
+ static void mtk_dsi_record_cmd(struct mtk_dsi *dsi,
+ 			       const struct mipi_dsi_msg *msg, u32 pre_intsta,
+ 			       u32 post_start_intsta, u32 post_done_intsta,
+@@ -1529,10 +1553,10 @@ static void mtk_dsi_dump_cmdq_writes(struct mtk_dsi *dsi, const char *phase)
+ 		rec = &dsi->cmdq_write_ring[(start + i) %
+ 					    MTK_DSI_CMDQ_WRITE_RING_SIZE];
+ 		dev_info(dsi->host.dev,
+-			 "C-PHY cmdq-write %s[%u]: cmd=%u type=%u tx_len=%zu kind=%s offset=%04x mask=%08x value=%08x\n",
++			 "C-PHY cmdq-write %s[%u]: cmd=%u type=%u tx_len=%zu kind=%s offset=%04x mask=%08x value=%08x old=%08x new=%08x\n",
+ 			 phase, i, rec->cmd, rec->type, rec->tx_len,
+ 			 kind_name[rec->kind], rec->offset, rec->mask,
+-			 rec->value);
++			 rec->value, rec->old, rec->new);
+ 	}
+ }
+ 
+@@ -2384,25 +2408,21 @@ static void mtk_dsi_cmdq(struct mtk_dsi *dsi, const struct mipi_dsi_msg *msg)
+ 		offset = (data->reg_adv[DSI_CMDQ] + cmdq_off + i) & (~0x3U);
+ 		mask = 0xffUL << (((i + cmdq_off) & 3U) * 8U);
+ 		value = tx_buf[i] << (((i + cmdq_off) & 3U) * 8U);
+-		mtk_dsi_record_cmdq_write(dsi, msg, offset, mask, value,
++		mtk_dsi_cmdq_mask(dsi, msg, offset, mask, value,
+ 					  MTK_DSI_CMDQ_WRITE_DATA);
+-		mtk_dsi_mask(dsi, offset, mask, value);
+ 	}
+ 
+-	mtk_dsi_record_cmdq_write(dsi, msg, data->reg_adv[DSI_CMDQ], cmdq_mask,
++	mtk_dsi_cmdq_mask(dsi, msg, data->reg_adv[DSI_CMDQ], cmdq_mask,
+ 				  reg_val, MTK_DSI_CMDQ_WRITE_CONFIG);
+-	mtk_dsi_mask(dsi, data->reg_adv[DSI_CMDQ], cmdq_mask, reg_val);
+-	mtk_dsi_record_cmdq_write(dsi, msg, data->reg_main[DSI_CMDQ_SIZE],
++	mtk_dsi_cmdq_mask(dsi, msg, data->reg_main[DSI_CMDQ_SIZE],
+ 				  CMDQ_SIZE, cmdq_size,
+ 				  MTK_DSI_CMDQ_WRITE_SIZE);
+-	mtk_dsi_mask(dsi, data->reg_main[DSI_CMDQ_SIZE], CMDQ_SIZE, cmdq_size);
+ 	if (data->cmdq_long_packet_ctl) {
+ 		/* Disable setting cmdq_size automatically for long packets */
+-		mtk_dsi_record_cmdq_write(dsi, msg,
++		mtk_dsi_cmdq_mask(dsi, msg,
+ 					  data->reg_main[DSI_CMDQ_SIZE],
+ 					  CMDQ_SIZE_SEL, CMDQ_SIZE_SEL,
+ 					  MTK_DSI_CMDQ_WRITE_SIZE_SEL);
+-		mtk_dsi_mask(dsi, data->reg_main[DSI_CMDQ_SIZE], CMDQ_SIZE_SEL, CMDQ_SIZE_SEL);
+ 	}
+ }
+ 
+diff --git a/tools/testing/selftests/mtk_clk/dsi_routing_cases.c b/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
+index da67b7addd..6c4556abac 100644
+--- a/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
++++ b/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
+@@ -122,6 +122,7 @@ struct mtk_dsi_cmdq_write {
+ 	u16 offset;
+ 	u32 mask;
+ 	u32 value;
++	u32 old, new;
+ };
+ struct mtk_dsi_driver_data {
+ 	u16 reg_adv[4], reg_main[16];
+@@ -305,12 +306,6 @@ static void mtk_dsi_clk_hs_mode(struct mtk_dsi *d, int mode)
+ {
+ 	writes++;
+ }
+-static void mtk_dsi_mask(struct mtk_dsi *d, int reg, int mask, int value)
+-{
+-	writes++;
+-	if (mask_count < (int)ARRAY_SIZE(mask_calls))
+-		mask_calls[mask_count++] = (struct mask_call){ reg, mask, value };
+-}
+ static int mtk_dsi_config_vdo_timing(struct mtk_dsi *d)
+ {
+ 	return step(60 + d->mmsys_dev->id);
+@@ -319,10 +314,16 @@ static int mtk_dsi_switch_to_cmd_mode(struct mtk_dsi *d, int flag, int timeout)
+ {
+ 	return 0;
+ }
++static u32 *stale_address;
++static u32 stale_value;
++static int bus_count;
++static struct { u32 *address; u32 old, value; } bus[512];
++static u32 last_read;
+ static u32 readl(u32 *p)
+ {
+ 	reg_reads++;
+-	return *p;
++	last_read = p == stale_address ? stale_value : *p;
++	return last_read;
+ }
+ #define msecs_to_jiffies(x) (x)
+ #define wait_event_interruptible_timeout(q, cond, timeout) \
+@@ -333,6 +334,11 @@ static u32 readl(u32 *p)
+ 	   (cond) ? 0 : -ETIME; })
+ static void writel(u32 v, u32 *p)
+ {
++	if (bus_count < (int)ARRAY_SIZE(bus)) {
++		bus[bus_count].address = p;
++		bus[bus_count].old = last_read;
++		bus[bus_count++].value = v;
++	}
+ 	*p = v;
+ 	writes++;
+ }
+@@ -358,8 +364,26 @@ static u8 readb(void *p)
+ {
+ 	return *(u8 *)p;
+ }
++static void production_mask(struct mtk_dsi *, u32, u32, u32);
++static void production_cmdq_mask(struct mtk_dsi *, const struct mipi_dsi_msg *,
++				 u16, u32, u32, u8);
++static void mtk_dsi_mask(struct mtk_dsi *d, u32 reg, u32 mask, u32 value)
++{
++	if (mask_count < (int)ARRAY_SIZE(mask_calls))
++		mask_calls[mask_count++] = (struct mask_call){ reg, mask, value };
++	production_mask(d, reg, mask, value);
++}
++static void mtk_dsi_cmdq_mask(struct mtk_dsi *d, const struct mipi_dsi_msg *msg,
++			    u16 reg, u32 mask, u32 value, u8 kind)
++{
++	if (d->config_clk && mask_count < (int)ARRAY_SIZE(mask_calls))
++		mask_calls[mask_count++] = (struct mask_call){ reg, mask, value };
++	production_cmdq_mask(d, msg, reg, mask, value, kind);
++}
++
+ /* PRODUCTION */
+ 
++
+ static struct mtk_dsi d[2];
+ static struct device dev[2];
+ static const u8 tx_payload[] = { 0xfb, 0x01, 0x33, 0x03 };
+@@ -387,6 +411,8 @@ static void setup(bool dual)
+ 	state_reads = reg_reads = timeout_ret = 0;
+ 	poll_calls = idle_waits = irq_waits = 0;
+ 	mask_count = 0;
++	bus_count = 0;
++	stale_address = NULL;
+ 	reset_engine_calls = 0;
+ 	log_count = dump_log_count = clk_rate_calls = 0;
+ 	poll_intsta = 0;
+@@ -424,8 +450,86 @@ static void balanced(void)
+ 			assert(!clocks[i][j].refs);
+ 	}
+ }
++/* Compare trace operands to real mock bus writes, including stale RMW reads. */
++static void test_cmdq_operands(void)
++{
++	for (int ctl = 0; ctl < 2; ctl++) {
++		for (int form = 0; form < 4; form++) {
++			struct mipi_dsi_msg msg = {
++				.type = form == 3 ? 1 : 0x29, /* host read in this mock */
++				.tx_len = form == 3 ? 1 : form == 2 ? 4 : form,
++				.tx_buf = tx_payload,
++			};
++			u32 expected[16], offsets[16];
++			int count = 0;
++
++			/* No diagnostic: the production RMW helper is the control. */
++			setup(false);
++			d[0].driver_data = ctl ? &poll_data : &data;
++			d[0].config_clk = NULL;
++			for (int i = 0; i < (int)ARRAY_SIZE(regs[0]); i++)
++				regs[0][i] = 0xa5a55a5a;
++			mtk_dsi_cmdq(&d[0], &msg);
++			count = bus_count;
++			assert(count == (int)msg.tx_len + 2 + ctl);
++			assert(reg_reads == count && writes == count);
++			assert(!d[0].cmdq_write_count && !log_count);
++			for (int i = 0; i < count; i++) {
++				expected[i] = bus[i].value;
++				offsets[i] = bus[i].address - regs[0];
++			}
++
++			setup(false);
++			d[0].driver_data = ctl ? &poll_data : &data;
++			for (int i = 0; i < (int)ARRAY_SIZE(regs[0]); i++)
++				regs[0][i] = 0xa5a55a5a;
++			mtk_dsi_cmdq(&d[0], &msg);
++			assert(bus_count == count && reg_reads == count && writes == count);
++			assert(d[0].cmdq_write_count == count && !log_count);
++			for (int i = 0; i < count; i++) {
++				struct mtk_dsi_cmdq_write *w = &d[0].cmdq_write_ring[i];
++				assert(bus[i].value == expected[i]);
++				assert(bus[i].address == regs[0] + offsets[i]);
++				assert(w->old == bus[i].old && w->new == bus[i].value);
++			}
++		}
++	}
++
++	setup(false);
++	struct mipi_dsi_msg msg = { .type = 0x29 };
++	stale_address = regs[0] + 0x14;
++	stale_value = 0xdeadbeef;
++	*stale_address = 0x11223344;
++	/* Bits outside mask must not enter the full bus word. */
++	mtk_dsi_cmdq_mask(&d[0], &msg, 0x14, 0xff00, 0x12345678,
++			  MTK_DSI_CMDQ_WRITE_DATA);
++	assert(reg_reads == 1 && writes == 1 && bus_count == 1);
++	assert(d[0].cmdq_write_ring[0].old == 0xdeadbeef);
++	assert(d[0].cmdq_write_ring[0].new == 0xdead56ef);
++	assert(bus[0].value == 0xdead56ef && *stale_address == 0xdead56ef);
++	/* A later mutation is not misrepresented as the word actually written. */
++	*stale_address = 0xbc;
++	assert(d[0].cmdq_write_ring[0].new != *stale_address);
++	stale_address = NULL;
++	for (int i = 0; i < 80; i++)
++		mtk_dsi_cmdq_mask(&d[0], &msg, 0x14, 0xff, i,
++				  MTK_DSI_CMDQ_WRITE_DATA);
++	assert(d[0].cmdq_write_count == 64 && d[0].cmdq_write_head == 17);
++	assert(!log_count && reg_reads == 81 && writes == 81);
++	setup(false);
++	d[0].cmdq_write_count = 64;
++	d[0].cmdq_write_head = 17;
++	d[0].cmdq_write_seq = 99;
++	assert(!mtk_dsi_poweron(&d[0]));
++	assert(!d[0].cmdq_write_count && !d[0].cmdq_write_head &&
++	       !d[0].cmdq_write_seq);
++	mtk_dsi_poweroff(&d[0]);
++	balanced();
++}
++
+ int main(void)
+ {
++	test_cmdq_operands();
+ 	setup(true);
+ 	assert(!mtk_dsi_poweron(&d[0]));
+ 	int operations = calls;
+@@ -564,6 +668,7 @@ int main(void)
+ 	struct mipi_dsi_msg short_msg = { .type = 0x23, .tx_len = 2,
+ 					  .tx_buf = tx_payload };
+ 	mask_count = 0;
++	bus_count = 0;
+ 	mtk_dsi_cmdq(&d[0], &short_msg);
+ 	int saw_size = 0;
+ 	for (int i = 0; i < mask_count; i++)
+@@ -578,6 +683,7 @@ int main(void)
+ 	struct mipi_dsi_msg long_msg = { .type = 0x29, .tx_len = 3,
+ 					 .tx_buf = tx_payload };
+ 	mask_count = 0;
++	bus_count = 0;
+ 	mtk_dsi_cmdq(&d[0], &long_msg);
+ 	assert(mask_calls[mask_count - 1].reg ==
+ 	       poll_data.reg_main[DSI_CMDQ_SIZE]);
+@@ -593,6 +699,7 @@ int main(void)
+ 	d[0].cmdq_write_head = d[0].cmdq_write_count = 0;
+ 	d[0].cmdq_write_seq = 0;
+ 	mask_count = 0;
++	bus_count = 0;
+ 	mtk_dsi_cmdq(&d[0], &short_msg);
+ 	struct mtk_dsi_cmdq_write *w = d[0].cmdq_write_ring;
+ 	assert(d[0].cmdq_write_count == 5 && mask_count == 5);
+@@ -613,12 +720,16 @@ int main(void)
+ 		assert(mask_calls[i].reg == w[i].offset &&
+ 		       (u32)mask_calls[i].mask == w[i].mask &&
+ 		       (u32)mask_calls[i].value == w[i].value);
++		assert(bus[i].old == w[i].old && bus[i].value == w[i].new);
++		assert(w[i].new == ((w[i].old & ~w[i].mask) |
++				    (w[i].value & w[i].mask)));
+ 	}
+ 	setup(false);
+ 	d[0].driver_data = &poll_data;
+ 	d[0].cmdq_write_head = d[0].cmdq_write_count = 0;
+ 	d[0].cmdq_write_seq = 0;
+ 	mask_count = 0;
++	bus_count = 0;
+ 	mtk_dsi_cmdq(&d[0], &long_msg);
+ 	w = d[0].cmdq_write_ring;
+ 	assert(d[0].cmdq_write_count == 6 && mask_count == 6);
+@@ -640,6 +751,9 @@ int main(void)
+ 		assert(mask_calls[i].reg == w[i].offset &&
+ 		       (u32)mask_calls[i].mask == w[i].mask &&
+ 		       (u32)mask_calls[i].value == w[i].value);
++		assert(bus[i].old == w[i].old && bus[i].value == w[i].new);
++		assert(w[i].new == ((w[i].old & ~w[i].mask) |
++				    (w[i].value & w[i].mask)));
+ 	}
+ 	setup(false);
+ 	d[0].driver_data = &v1_data;
+@@ -658,6 +772,7 @@ int main(void)
+ 	assert(d[0].cmd_ring_count == 1 && d[0].cmd_ring[0].cmdq1 == 0);
+ 	setup(false);
+ 	mask_count = 0;
++	bus_count = 0;
+ 	mtk_dsi_cmdq(&d[0], &short_msg);
+ 	for (int i = 0; i < mask_count; i++)
+ 		assert(mask_calls[i].mask != CMDQ_SIZE_SEL);
+diff --git a/tools/testing/selftests/mtk_clk/test_dsi_routing.py b/tools/testing/selftests/mtk_clk/test_dsi_routing.py
+index 5d4028413a..7e909af449 100755
+--- a/tools/testing/selftests/mtk_clk/test_dsi_routing.py
++++ b/tools/testing/selftests/mtk_clk/test_dsi_routing.py
+@@ -23,10 +23,13 @@ def function(name, text=source):
+     return text[start:end]
+ 
+ 
+-production = '\n'.join(function(name) for name in [
++production = '\n'.join(function(name).replace('static void mtk_dsi_mask(',
++    'static void production_mask(').replace('static void mtk_dsi_cmdq_mask(',
++    'static void production_cmdq_mask(') for name in [
+     'mtk_dsi_irq_data_set', 'mtk_dsi_irq_data_clear',
+     'mtk_dsi_dump_mmsys_state', 'mtk_dsi_dump_regs', 'mtk_dsi_msg_tx',
+-    'mtk_dsi_record_cmdq_write', 'mtk_dsi_dump_cmdq_writes',
++    'mtk_dsi_mask', 'mtk_dsi_record_cmdq_write', 'mtk_dsi_cmdq_mask',
++    'mtk_dsi_dump_cmdq_writes',
+     'mtk_dsi_record_cmd', 'mtk_dsi_dump_ring', 'mtk_dsi_dump_cmd_failure',
+     'mtk_dsi_dump_clocks', 'mtk_dsi_wait_for_irq_done', 'mtk_dsi_irq',
+     'mtk_dsi_poll_for_idle', 'mtk_dsi_cmdq', 'mtk_dsi_host_send_cmd',
+@@ -58,10 +61,14 @@ assert 'clk_get_rate' in clocks
+ cmdq = function('mtk_dsi_cmdq')
+ assert 'cmdq_long_packet_ctl' in cmdq
+ assert 'CMDQ_SIZE_SEL' in cmdq
+-assert 'mtk_dsi_mask' in cmdq
++assert 'mtk_dsi_cmdq_mask' in cmdq
+ assert 'writel' not in cmdq
+ assert 'dev_info' not in cmdq
+-assert cmdq.count('mtk_dsi_record_cmdq_write') == 4
++assert cmdq.count('mtk_dsi_cmdq_mask') == 4
++cmdq_mask = function('mtk_dsi_cmdq_mask')
++assert cmdq_mask.count('readl(') == 1 and cmdq_mask.count('writel(') == 1
++assert cmdq_mask.index('writel(') < cmdq_mask.index('mtk_dsi_record_cmdq_write')
++assert 'dev_info' not in cmdq_mask
+ mt6897 = source.split('mt6897_dsi_driver_data = {', 1)[1].split('};', 1)[0]
+ assert '.cmdq_long_packet_ctl = true' in mt6897
+ assert '.cmdq_full_word = true' not in mt6897

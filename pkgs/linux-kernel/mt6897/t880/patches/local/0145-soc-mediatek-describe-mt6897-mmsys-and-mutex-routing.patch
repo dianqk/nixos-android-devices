@@ -1,0 +1,234 @@
+From da2762c27131a72c0516a3a2f431c35605aff482 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] soc: mediatek: describe MT6897 mmsys and mutex routing
+
+Describe MT6897 mmsys routes, dual pipes and mutex source control.
+Avoid registering a clock child when the controller has no clock driver.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T07:34:09+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T14:13:45+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T03:36:03+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T06:50:28+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/soc/mediatek/mtk-mmsys.c | 45 ++++++++++++++++--
+ drivers/soc/mediatek/mtk-mutex.c | 81 +++++++++++++++++++++++++++++++-
+ 2 files changed, 119 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/soc/mediatek/mtk-mmsys.c b/drivers/soc/mediatek/mtk-mmsys.c
+index 6c02b89874..0ed1906a94 100644
+--- a/drivers/soc/mediatek/mtk-mmsys.c
++++ b/drivers/soc/mediatek/mtk-mmsys.c
+@@ -18,6 +18,7 @@
+ #include <linux/soc/mediatek/mtk-mmsys.h>
+ 
+ #include "mtk-mmsys.h"
++#include "mt6897-mmsys.h"
+ #include "mt8167-mmsys.h"
+ #include "mt8173-mmsys.h"
+ #include "mt8183-mmsys.h"
+@@ -57,6 +58,28 @@ static const struct mtk_mmsys_driver_data mt6797_mmsys_driver_data = {
+ 	.clk_driver = "clk-mt6797-mm",
+ };
+ 
++/*
++ * MT6897: the clock gates of these controllers are provided by separate
++ * clock controller nodes, so no clk_driver here.
++ */
++static const struct mtk_mmsys_driver_data mt6897_dispsys0_driver_data = {
++	.routes = mmsys_mt6897_dispsys0_routing_table,
++	.num_routes = ARRAY_SIZE(mmsys_mt6897_dispsys0_routing_table),
++	.bypass_mux_shadow = MT6897_DISPSYS_BYPASS_MUX_SHADOW,
++};
++
++static const struct mtk_mmsys_driver_data mt6897_dispsys1_driver_data = {
++	.routes = mmsys_mt6897_dispsys1_routing_table,
++	.num_routes = ARRAY_SIZE(mmsys_mt6897_dispsys1_routing_table),
++	.bypass_mux_shadow = MT6897_DISPSYS_BYPASS_MUX_SHADOW,
++};
++
++static const struct mtk_mmsys_driver_data mt6897_ovlsys_driver_data = {
++	.routes = mmsys_mt6897_ovlsys_routing_table,
++	.num_routes = ARRAY_SIZE(mmsys_mt6897_ovlsys_routing_table),
++	.bypass_mux_shadow = MT6897_OVLSYS_BYPASS_MUX_SHADOW,
++};
++
+ static const struct mtk_mmsys_driver_data mt8167_mmsys_driver_data = {
+ 	.clk_driver = "clk-mt8167-mm",
+ 	.routes = mt8167_mmsys_routing_table,
+@@ -228,6 +251,11 @@ void mtk_mmsys_hw_connect(struct device *dev,
+ 	struct mtk_mmsys *mmsys = dev_get_drvdata(dev);
+ 	const struct mtk_mmsys_routes *routes = mmsys->data->routes;
+ 
++	if (mmsys->data->bypass_mux_shadow)
++		mtk_mmsys_update_bits(mmsys, mmsys->data->bypass_mux_shadow,
++				      MT6897_BYPASS_MUX_SHADOW_ALL,
++				      MT6897_BYPASS_MUX_SHADOW_ALL, NULL);
++
+ 	for (int i = 0; i < mmsys->data->num_routes; i++) {
+ 		if (src_type != routes[i].from_comp_type ||
+ 		    src_hw_inst_id != routes[i].from_comp_inst ||
+@@ -484,11 +512,14 @@ static int mtk_mmsys_probe(struct platform_device *pdev)
+ 
+ 	platform_set_drvdata(pdev, mmsys);
+ 
+-	clks = platform_device_register_data(&pdev->dev, mmsys->data->clk_driver,
+-					     PLATFORM_DEVID_AUTO, NULL, 0);
+-	if (IS_ERR(clks))
+-		return PTR_ERR(clks);
+-	mmsys->clks_pdev = clks;
++	/* Controllers whose clocks come from separate controller nodes have none */
++	if (mmsys->data->clk_driver) {
++		clks = platform_device_register_data(&pdev->dev, mmsys->data->clk_driver,
++						     PLATFORM_DEVID_AUTO, NULL, 0);
++		if (IS_ERR(clks))
++			return PTR_ERR(clks);
++		mmsys->clks_pdev = clks;
++	}
+ 
+ 	ret = devm_of_platform_populate(dev);
+ 	if (ret) {
+@@ -529,6 +560,10 @@ static const struct of_device_id of_match_mtk_mmsys[] = {
+ 	{ .compatible = "mediatek,mt8167-mmsys", .data = &mt8167_mmsys_driver_data },
+ 	{ .compatible = "mediatek,mt8173-mmsys", .data = &mt8173_mmsys_driver_data },
+ 	{ .compatible = "mediatek,mt8183-mmsys", .data = &mt8183_mmsys_driver_data },
++	{ .compatible = "mediatek,mt6897-dispsys0", .data = &mt6897_dispsys0_driver_data },
++	{ .compatible = "mediatek,mt6897-dispsys1", .data = &mt6897_dispsys1_driver_data },
++	{ .compatible = "mediatek,mt6897-ovlsys0", .data = &mt6897_ovlsys_driver_data },
++	{ .compatible = "mediatek,mt6897-ovlsys1", .data = &mt6897_ovlsys_driver_data },
+ 	{ .compatible = "mediatek,mt8186-mmsys", .data = &mt8186_mmsys_driver_data },
+ 	{ .compatible = "mediatek,mt8188-vdosys0", .data = &mt8188_vdosys0_driver_data },
+ 	{ .compatible = "mediatek,mt8188-vdosys1", .data = &mt8188_vdosys1_driver_data },
+diff --git a/drivers/soc/mediatek/mtk-mutex.c b/drivers/soc/mediatek/mtk-mutex.c
+index ef8e77f7e2..5a7364ac71 100644
+--- a/drivers/soc/mediatek/mtk-mutex.c
++++ b/drivers/soc/mediatek/mtk-mutex.c
+@@ -330,6 +330,21 @@
+ #define MT8195_MUTEX_EOF_DPI0			(MT8195_MUTEX_SOF_DPI0 << 7)
+ #define MT8195_MUTEX_EOF_DPI1			(MT8195_MUTEX_SOF_DPI1 << 7)
+ 
++/*
++ * MT6897 has one mutex per DISPSYS/OVLSYS controller. The start/end of
++ * frame sources are numbered per controller type, and a DISPSYS numbers
++ * its own DSI first: DSI1 is source 1 in DISPSYS1. EOF = SOF << 6.
++ */
++#define MT6897_MUTEX_SOF_LOCAL_DSI		1
++#define MT6897_MUTEX_SOF_LOCAL_DPI		2
++#define MT6897_MUTEX_SOF_OTHER_DSI		3
++#define MT6897_MUTEX_SOF_OTHER_DPI		4
++#define MT6897_OVLSYS_MUTEX_SOF_DSI0		1
++#define MT6897_OVLSYS_MUTEX_SOF_DSI1		2
++#define MT6897_OVLSYS_MUTEX_SOF_DPI0		3
++#define MT6897_OVLSYS_MUTEX_SOF_DPI1		4
++#define MT6897_MUTEX_SOF_EOF(sof)		((sof) | ((sof) << 6))
++
+ struct mtk_mutex {
+ 	u8 id;
+ 	bool claimed;
+@@ -730,6 +745,55 @@ static const u16 mt8195_mutex_sof[DDP_MUTEX_SOF_MAX] = {
+ 		MT8195_MUTEX_SOF_DP_INTF1 | MT8195_MUTEX_EOF_DP_INTF1,
+ };
+ 
++static const u16 mt6897_dispsys0_mutex_sof[DDP_MUTEX_SOF_MAX] = {
++	[MUTEX_SOF_SINGLE_MODE] = MUTEX_SOF_SINGLE_MODE,
++	[MUTEX_SOF_DSI0] = MT6897_MUTEX_SOF_EOF(MT6897_MUTEX_SOF_LOCAL_DSI),
++	[MUTEX_SOF_DPI0] = MT6897_MUTEX_SOF_EOF(MT6897_MUTEX_SOF_LOCAL_DPI),
++	[MUTEX_SOF_DSI1] = MT6897_MUTEX_SOF_EOF(MT6897_MUTEX_SOF_OTHER_DSI),
++	[MUTEX_SOF_DPI1] = MT6897_MUTEX_SOF_EOF(MT6897_MUTEX_SOF_OTHER_DPI),
++	/* DP_INTF0 is the local DPI */
++	[MUTEX_SOF_DP_INTF0] = MT6897_MUTEX_SOF_EOF(MT6897_MUTEX_SOF_LOCAL_DPI),
++};
++
++static const u16 mt6897_dispsys1_mutex_sof[DDP_MUTEX_SOF_MAX] = {
++	[MUTEX_SOF_SINGLE_MODE] = MUTEX_SOF_SINGLE_MODE,
++	[MUTEX_SOF_DSI1] = MT6897_MUTEX_SOF_EOF(MT6897_MUTEX_SOF_LOCAL_DSI),
++	[MUTEX_SOF_DPI1] = MT6897_MUTEX_SOF_EOF(MT6897_MUTEX_SOF_LOCAL_DPI),
++	[MUTEX_SOF_DSI0] = MT6897_MUTEX_SOF_EOF(MT6897_MUTEX_SOF_OTHER_DSI),
++	[MUTEX_SOF_DPI0] = MT6897_MUTEX_SOF_EOF(MT6897_MUTEX_SOF_OTHER_DPI),
++};
++
++static const u16 mt6897_ovlsys_mutex_sof[DDP_MUTEX_SOF_MAX] = {
++	[MUTEX_SOF_SINGLE_MODE] = MUTEX_SOF_SINGLE_MODE,
++	[MUTEX_SOF_DSI0] = MT6897_MUTEX_SOF_EOF(MT6897_OVLSYS_MUTEX_SOF_DSI0),
++	[MUTEX_SOF_DSI1] = MT6897_MUTEX_SOF_EOF(MT6897_OVLSYS_MUTEX_SOF_DSI1),
++	[MUTEX_SOF_DPI0] = MT6897_MUTEX_SOF_EOF(MT6897_OVLSYS_MUTEX_SOF_DPI0),
++	[MUTEX_SOF_DPI1] = MT6897_MUTEX_SOF_EOF(MT6897_OVLSYS_MUTEX_SOF_DPI1),
++	[MUTEX_SOF_DP_INTF0] = MT6897_MUTEX_SOF_EOF(MT6897_OVLSYS_MUTEX_SOF_DPI0),
++};
++
++/* The module bits come from the trigger-sources of the components. */
++static const struct mtk_mutex_data mt6897_dispsys0_mutex_driver_data = {
++	.mutex_sof = mt6897_dispsys0_mutex_sof,
++	.mutex_mod_reg = MT8183_MUTEX0_MOD0,
++	.mutex_mod1_reg = MT8183_MUTEX0_MOD1,
++	.mutex_sof_reg = MT8183_MUTEX0_SOF0,
++};
++
++static const struct mtk_mutex_data mt6897_dispsys1_mutex_driver_data = {
++	.mutex_sof = mt6897_dispsys1_mutex_sof,
++	.mutex_mod_reg = MT8183_MUTEX0_MOD0,
++	.mutex_mod1_reg = MT8183_MUTEX0_MOD1,
++	.mutex_sof_reg = MT8183_MUTEX0_SOF0,
++};
++
++static const struct mtk_mutex_data mt6897_ovlsys_mutex_driver_data = {
++	.mutex_sof = mt6897_ovlsys_mutex_sof,
++	.mutex_mod_reg = MT8183_MUTEX0_MOD0,
++	.mutex_mod1_reg = MT8183_MUTEX0_MOD1,
++	.mutex_sof_reg = MT8183_MUTEX0_SOF0,
++};
++
+ static const struct mtk_mutex_data mt2701_mutex_driver_data = {
+ 	.mutex_mod = mt2701_mutex_mod,
+ 	.mutex_sof = mt2712_mutex_sof,
+@@ -916,7 +980,15 @@ void mtk_mutex_add_trigger(struct mtk_mutex *mutex, enum mtk_ddp_comp_type type,
+ 		const u32 sof_offset = DISP_REG_MUTEX_SOF(ctx->data->mutex_sof_reg, mutex->id);
+ 
+ 		writel(ctx->data->mutex_sof[sof_id], ctx->regs + sof_offset);
+-		return;
++
++		/*
++		 * Without a module table the module bits come from the
++		 * trigger sources, and an output has one as well (MT6897
++		 * DSI0 20, DP_INTF0 17): without it the output never takes
++		 * the frame.
++		 */
++		if (ctx->data->mutex_mod || !mtx_trig_id)
++			return;
+ 	}
+ 
+ 	val = readl(ctx->regs + offset);
+@@ -937,7 +1009,9 @@ void mtk_mutex_remove_trigger(struct mtk_mutex *mutex, enum mtk_ddp_comp_type ty
+ 
+ 		val = readl(ctx->regs + sof_offset);
+ 		writel(val & ~ctx->data->mutex_sof[sof_id], ctx->regs + sof_offset);
+-		return;
++
++		if (ctx->data->mutex_mod || !mtx_trig_id)
++			return;
+ 	}
+ 
+ 	val = readl(ctx->regs + offset);
+@@ -1194,6 +1268,9 @@ static const struct of_device_id mutex_driver_dt_match[] = {
+ 	{ .compatible = "mediatek,mt2701-disp-mutex", .data = &mt2701_mutex_driver_data },
+ 	{ .compatible = "mediatek,mt2712-disp-mutex", .data = &mt2712_mutex_driver_data },
+ 	{ .compatible = "mediatek,mt6795-disp-mutex", .data = &mt6795_mutex_driver_data },
++	{ .compatible = "mediatek,mt6897-dispsys0-mutex", .data = &mt6897_dispsys0_mutex_driver_data },
++	{ .compatible = "mediatek,mt6897-dispsys1-mutex", .data = &mt6897_dispsys1_mutex_driver_data },
++	{ .compatible = "mediatek,mt6897-ovlsys-mutex", .data = &mt6897_ovlsys_mutex_driver_data },
+ 	{ .compatible = "mediatek,mt8167-disp-mutex", .data = &mt8167_mutex_driver_data },
+ 	{ .compatible = "mediatek,mt8173-disp-mutex", .data = &mt8173_mutex_driver_data },
+ 	{ .compatible = "mediatek,mt8183-disp-mutex", .data = &mt8183_mutex_driver_data },
+-- 
+2.56.0
+

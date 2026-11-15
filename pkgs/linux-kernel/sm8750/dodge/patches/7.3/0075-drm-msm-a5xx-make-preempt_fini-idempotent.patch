@@ -1,0 +1,50 @@
+From 2fd14aadc463e203114b7e19b758619ad8148946 Mon Sep 17 00:00:00 2001
+From: Fan Wu <fanwu01@zju.edu.cn>
+Date: Wed, 17 Jun 2026 13:20:07 +0000
+Subject: [PATCH 080/144] drm/msm/a5xx: make preempt_fini idempotent
+
+a5xx_preempt_fini() is reached from three call sites: a5xx_preempt_init()
+on the ring-init error path, a5xx_ucode_load() when WHERE_AM_I is
+unavailable (which disables preemption at runtime), and a5xx_destroy().
+It releases the per-ring preempt_bo and preempt_counters_bo GEM buffers
+but does not null the pointers afterwards.
+
+If a5xx_ucode_load() disables preemption (or a5xx_preempt_init() fails
+partway), a5xx_preempt_fini() frees the allocated buffers and leaves
+dangling pointers; a later a5xx_destroy() calls a5xx_preempt_fini() again
+and msm_gem_kernel_put()s the already-freed objects -- a double-free.
+
+Null each pointer after msm_gem_kernel_put() so a second invocation is a
+no-op rather than a double-free. msm_gem_kernel_put() is already
+NULL-safe, so unallocated pointers stay harmless.
+
+This bug was found by static analysis.
+
+Fixes: b1fc2839d2f9 ("drm/msm: Implement preemption for A5XX targets")
+Cc: stable@vger.kernel.org
+Signed-off-by: Fan Wu <fanwu01@zju.edu.cn>
+Message-ID: <20260617132007.131079-4-fanwu01@zju.edu.cn>
+Link: https://lore.kernel.org/r/20260617132007.131079-4-fanwu01@zju.edu.cn
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0102-drm-msm-a5xx-make-preempt_fini-idempotent.patch
+Import-SHA256: f5b673757350b9fe7938cdf4d8269d2f0d884bb1f6d2f033a7700f4d160461f6
+Import-Provenance: mail headers
+(cherry picked from commit a390341ce968682bd3a2dedf7cb93766fef260fc)
+---
+ drivers/gpu/drm/msm/adreno/a5xx_preempt.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/gpu/drm/msm/adreno/a5xx_preempt.c b/drivers/gpu/drm/msm/adreno/a5xx_preempt.c
+index 96ade4936e..1186e7a838 100644
+--- a/drivers/gpu/drm/msm/adreno/a5xx_preempt.c
++++ b/drivers/gpu/drm/msm/adreno/a5xx_preempt.c
+@@ -299,7 +299,9 @@ void a5xx_preempt_fini(struct msm_gpu *gpu)
+ 
+ 	for (i = 0; i < gpu->nr_rings; i++) {
+ 		msm_gem_kernel_put(a5xx_gpu->preempt_bo[i], gpu->vm);
++		a5xx_gpu->preempt_bo[i] = NULL;
+ 		msm_gem_kernel_put(a5xx_gpu->preempt_counters_bo[i], gpu->vm);
++		a5xx_gpu->preempt_counters_bo[i] = NULL;
+ 	}
+ }
+ 

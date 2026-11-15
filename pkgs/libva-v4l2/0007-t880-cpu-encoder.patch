@@ -1,0 +1,1183 @@
+diff --git a/meson.build b/meson.build
+index 914c85bf..b916f7b0 100644
+--- a/meson.build
++++ b/meson.build
+@@ -139,3 +139,7 @@ test('T880 replay ownership', t880_replay_test)
+ t880_anchor_test = executable('t880-anchor-test', 'tests/t880/anchors.cpp',
+   dependencies: [va, threads], cpp_args: ['-UNDEBUG'], build_by_default: false)
+ test('T880 AV1 replay anchors', t880_anchor_test)
++
++t880_encoder_test = executable('t880-encoder-test', 'tests/t880/encoder.cpp',
++  dependencies: [va, threads], cpp_args: ['-UNDEBUG'], build_by_default: false)
++test('T880 encoder ownership and controls', t880_encoder_test)
+diff --git a/src/backend.cpp b/src/backend.cpp
+index 4bb6bb43..5b48704b 100644
+--- a/src/backend.cpp
++++ b/src/backend.cpp
+@@ -94,11 +94,13 @@ static bool supported(const Driver &d, VAProfile p) {
+            p == VAProfileH264High || is_hevc(p) || is_vp9(p) || (is_av1(p) && d.av1);
+ }
+ static bool encode_supported(const Driver &d, VAProfile p, VAEntrypoint e) {
++    if (d.t880) return !d.encoder_device.empty() && e == VAEntrypointEncSlice &&
++        ((d.encode_h264 && p == VAProfileH264Main) || (d.encode_hevc && p == VAProfileHEVCMain));
+     return !d.encoder_device.empty() && e == VAEntrypointEncSlice &&
+            (p == VAProfileH264ConstrainedBaseline || p == VAProfileH264Main ||
+             p == VAProfileH264High || p == VAProfileHEVCMain);
+ }
+-static unsigned encode_attribute(VAConfigAttribType type, VAProfile profile) {
++static unsigned encode_attribute(VAConfigAttribType type, VAProfile profile, bool t880 = false) {
+     (void)profile; // HEVC attributes are only available in libva >= 1.13.
+     switch (type) {
+ #if VA_CHECK_VERSION(1, 13, 0)
+@@ -109,8 +111,8 @@ static unsigned encode_attribute(VAConfigAttribType type, VAProfile profile) {
+         VAConfigAttribValEncHEVCFeatures features{};
+         features.bits.sao = VA_FEATURE_REQUIRED;
+         features.bits.temporal_mvp = VA_FEATURE_REQUIRED;
+-        features.bits.cu_qp_delta = VA_FEATURE_SUPPORTED;
+-        features.bits.deblocking_filter_disable = VA_FEATURE_SUPPORTED;
++        features.bits.cu_qp_delta = t880 ? VA_FEATURE_REQUIRED : VA_FEATURE_SUPPORTED;
++        features.bits.deblocking_filter_disable = t880 ? VA_FEATURE_NOT_SUPPORTED : VA_FEATURE_SUPPORTED;
+         return features.value;
+     }
+     case VAConfigAttribEncHEVCBlockSizes: {
+@@ -119,14 +121,23 @@ static unsigned encode_attribute(VAConfigAttribType type, VAProfile profile) {
+         VAConfigAttribValEncHEVCBlockSizes sizes{};
+         sizes.bits.log2_max_coding_tree_block_size_minus3 = 2;
+         sizes.bits.log2_min_coding_tree_block_size_minus3 = 2;
+-        sizes.bits.log2_max_luma_transform_block_size_minus2 = 3;
++        sizes.bits.log2_min_coding_tree_block_size_minus3 = t880 ? 2 : 0;
++        sizes.bits.log2_min_luma_coding_block_size_minus3 = t880 ? 1 : 0;
++        sizes.bits.log2_max_luma_transform_block_size_minus2 = t880 ? 2 : 3;
++        sizes.bits.log2_min_luma_transform_block_size_minus2 = t880 ? 1 : 0;
++        if (t880) {
++            sizes.bits.max_max_transform_hierarchy_depth_inter = 1;
++            sizes.bits.min_max_transform_hierarchy_depth_inter = 1;
++            sizes.bits.max_max_transform_hierarchy_depth_intra = 0;
++            sizes.bits.min_max_transform_hierarchy_depth_intra = 0;
++        }
+         return sizes.value;
+     }
+ #endif
+     case VAConfigAttribRTFormat:
+         return VA_RT_FORMAT_YUV420;
+     case VAConfigAttribRateControl:
+-        return VA_RC_CQP | VA_RC_CBR | VA_RC_VBR;
++        return t880 ? VA_RC_VBR | VA_RC_AVBR : VA_RC_CQP | VA_RC_CBR | VA_RC_VBR;
+     case VAConfigAttribEncPackedHeaders:
+         return VA_ENC_PACKED_HEADER_NONE;
+     case VAConfigAttribEncInterlaced:
+@@ -138,13 +149,13 @@ static unsigned encode_attribute(VAConfigAttribType type, VAProfile profile) {
+     case VAConfigAttribEncSliceStructure:
+         return VA_ENC_SLICE_STRUCTURE_EQUAL_ROWS;
+     case VAConfigAttribEncQualityRange:
+-        return 1;
++        return t880 ? 0 : 1;
+     case VAConfigAttribPredictionDirection:
+         return VA_PREDICTION_DIRECTION_PREVIOUS;
+     case VAConfigAttribMaxPictureWidth:
+-        return 3840;
++        return t880 ? 4096 : 3840;
+     case VAConfigAttribMaxPictureHeight:
+-        return 2160;
++        return t880 ? 4096 : 2160;
+     default:
+         return VA_ATTRIB_NOT_SUPPORTED;
+     }
+@@ -260,7 +271,10 @@ static VAImage create_image(Driver &d, unsigned fourcc, unsigned w, unsigned h)
+     return image;
+ }
+ 
+-static std::shared_ptr<Memory> allocate_undecoded_surface(VADriverContextP ctx, const Surface &s) {
++static std::shared_ptr<Memory> allocate_undecoded_surface(VADriverContextP ctx, const Surface &s,
++                                                          bool pixel_write = false) {
++    check(!s.reconstruction_only || pixel_write, "reconstruction pixels are not available",
++          VA_STATUS_ERROR_UNIMPLEMENTED);
+     // mpv probes GPU import before creating a decoder context. Use an actual
+     // linear MSM GEM allocation for these otherwise unbacked VA surfaces.
+     // The PRIME fd owns the storage after the temporary GEM handle is closed.
+@@ -314,7 +328,7 @@ API(
+             continue;
+         }
+         if (entry == VAEntrypointEncSlice) {
+-            attrs[i].value = encode_attribute(attrs[i].type, profile);
++            attrs[i].value = encode_attribute(attrs[i].type, profile, d.t880);
+             continue;
+         }
+         switch (attrs[i].type) {
+@@ -346,20 +360,20 @@ API(
+     check((supported(d, p) && e == VAEntrypointVLD) || (!d.t880 && vpp_supported(p, e)) ||
+               encode_supported(d, p, e),
+           "unsupported entrypoint", VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT);
+-    Config config{p, e, VA_RC_CQP}; check(id, "null config ID", VA_STATUS_ERROR_INVALID_PARAMETER);
++    Config config{p, e, d.t880 && e == VAEntrypointEncSlice ? VA_RC_VBR : VA_RC_CQP}; check(id, "null config ID", VA_STATUS_ERROR_INVALID_PARAMETER);
+     for (int i = 0; i < count; ++i) {
+         if (e == VAEntrypointEncSlice) {
+             const auto type = attrs[i].type;
+             check(type == VAConfigAttribRTFormat || type == VAConfigAttribRateControl ||
+                       type == VAConfigAttribEncPackedHeaders || type == VAConfigAttribEncInterlaced,
+                   "unsupported encoder config attribute", VA_STATUS_ERROR_ATTR_NOT_SUPPORTED);
+-            auto value = encode_attribute(type, p);
++            auto value = encode_attribute(type, p, d.t880);
+             check(!(attrs[i].value & ~value) &&
+                       (type != VAConfigAttribRTFormat || attrs[i].value == VA_RT_FORMAT_YUV420),
+                   "unsupported encoder attribute", VA_STATUS_ERROR_ATTR_NOT_SUPPORTED);
+             if (attrs[i].type == VAConfigAttribRateControl) {
+                 check(attrs[i].value == VA_RC_CQP || attrs[i].value == VA_RC_CBR ||
+-                          attrs[i].value == VA_RC_VBR,
++                          attrs[i].value == VA_RC_VBR || (d.t880 && attrs[i].value == VA_RC_AVBR),
+                       "select one encoder rate control mode", VA_STATUS_ERROR_ATTR_NOT_SUPPORTED);
+                 config.rate_control = attrs[i].value;
+             }
+@@ -398,11 +412,12 @@ API(
+     unsigned values[] = {profile_fourcc(profile), 128, 128, 8192, 8192,
+                          VA_SURFACE_ATTRIB_MEM_TYPE_VA | VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME |
+                              VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2};
+-    if (d.t880) { values[0] = VA_FOURCC_NV12; values[3] = 4096; values[4] = 2176; }
++    if (d.t880) { values[0] = VA_FOURCC_NV12; values[3] = 4096;
++        values[4] = config.entrypoint == VAEntrypointEncSlice ? 4096 : 2176; }
+     if (config.entrypoint == VAEntrypointVideoProc) {
+         values[1] = 2;
+         values[2] = 2;
+-    } if (config.entrypoint == VAEntrypointEncSlice) {
++    } if (!d.t880 && config.entrypoint == VAEntrypointEncSlice) {
+         values[3] = 3840;
+         values[4] = 2160;
+     } for (unsigned i = 0; i < 6; ++i) {
+@@ -534,7 +549,7 @@ API(
+     (VADriverContextP ctx, unsigned format, unsigned w, unsigned h, VASurfaceID *ids,
+      unsigned count, VASurfaceAttrib *attrs, unsigned nattrs),
+     check(!d.t880 || (format == VA_RT_FORMAT_YUV420 && w && h && !(w & 1) && !(h & 1) &&
+-          w <= 4096 && h <= 2176 && uint64_t(w) * h <= uint64_t(4096) * 2176),
++          w <= 4096 && h <= 4096 && uint64_t(w) * h <= uint64_t(4096) * 2176),
+           "T880 requires bounded even NV12 surfaces", VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+     check(format == VA_RT_FORMAT_YUV420 || format == VA_RT_FORMAT_YUV420_10 ||
+               format == VA_RT_FORMAT_RGB32,
+@@ -626,13 +641,16 @@ API(
+     check(((processing && w >= 0 && h >= 0) || (w >= 128 && h >= 128)) && w <= 8192 && h <= 8192 &&
+               result,
+           "invalid context dimensions", VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
+-    check(!d.t880 || (!(w & 1) && !(h & 1) && w <= 4096 && h <= 2176 &&
++    check(!d.t880 || (!(w & 1) && !(h & 1) && w <= 4096 &&
++          h <= (config.entrypoint == VAEntrypointEncSlice ? 4096 : 2176) &&
+           uint64_t(w) * h <= uint64_t(4096) * 2176), "T880 context geometry",
+           VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
+     auto c = std::make_shared<Context>(); c->profile = config.profile;
+     c->entrypoint = config.entrypoint; c->encode_settings.rate_control = config.rate_control;
++    if (d.t880 && c->entrypoint == VAEntrypointEncSlice)
++        c->encode_settings.min_qp = c->encode_settings.max_qp = 0;
+     c->encode_settings.hevc = is_hevc(c->profile); if (c->entrypoint == VAEntrypointEncSlice)
+-        check(w <= 3840 && h <= 2160 && !(w & 1) && !(h & 1), "unsupported encoder dimensions",
++        check(w <= (d.t880 ? 4096 : 3840) && h <= (d.t880 ? 4096 : 2160) && !(w & 1) && !(h & 1), "unsupported encoder dimensions",
+               VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
+     for (int i = 0; i < count; ++i) surface(d, targets[i]); c->width = w; c->height = h;
+     c->internal_profile = c->profile; c->decode_surfaces = std::max(0, count); if (processing) {
+@@ -705,6 +723,14 @@ API(
+     auto c = context(d, id);
+     check(!c->target, "picture already open", VA_STATUS_ERROR_OPERATION_FAILED);
+     auto s = surface(d, target);
++    if (d.t880 && c->entrypoint != VAEntrypointEncSlice) {
++        check(s->pixel_generation != UINT64_MAX, "surface pixel generation exhausted");
++        // Invalidate a logical reference immediately on another pixel writer.
++        // Keep readback forbidden until that writer publishes valid pixels.
++        ++s->pixel_generation;
++    }
++    check(c->entrypoint != VAEntrypointEncSlice || !s->reconstruction_only,
++          "logical reconstruction cannot be used as pixel input", VA_STATUS_ERROR_INVALID_SURFACE);
+     // Main10 and AV1 permit NV12 and P010. Select the decoder's bit depth
+     // from the first target, including clients that create a context without
+     // render targets. Keep it fixed for the lifetime of the decoder.
+@@ -857,7 +883,7 @@ API(
+             } else if (c->entrypoint == VAEntrypointEncSlice) {
+                 check(b->context_id == id, "encode buffer belongs to another context",
+                       VA_STATUS_ERROR_INVALID_BUFFER);
+-                render_encode_buffer(c->encode_settings, c->encode_picture, *b);
++                render_encode_buffer(c->encode_settings, c->encode_picture, *b, d.t880);
+             } else if (is_av1(c->profile))
+                 render_buffer(c->av1_picture, b);
+             else if (is_vp9(c->profile))
+@@ -906,6 +932,21 @@ API(
+         check(coded->type == VAEncCodedBufferType && coded->context_id == id,
+               "invalid encode output buffer", VA_STATUS_ERROR_INVALID_BUFFER);
+         auto reconstruction = surface(d, c->encode_picture.reconstruction(c->encode_settings.hevc));
++        if (d.t880)
++            validate_reconstruction_surface(*reconstruction, *target, c->width, c->height);
++        c->encode_picture.reconstruction_surface = reconstruction;
++        if (d.t880) {
++            check(c->encode_settings.hevc ? !c->encode_picture.hevc_slices.empty() : !c->encode_picture.slices.empty(),
++                  "encoder slice parameters missing", VA_STATUS_ERROR_INVALID_PARAMETER);
++            bool intra = c->encode_settings.hevc ? c->encode_picture.hevc_slices.front().slice_type == 2
++                                                 : c->encode_picture.slices.front().slice_type % 5 == 2;
++            if (!intra) {
++                VASurfaceID id = c->encode_settings.hevc
++                    ? c->encode_picture.hevc_slices.front().ref_pic_list0[0].picture_id
++                    : c->encode_picture.slices.front().RefPicList0[0].picture_id;
++                c->encode_picture.reference_surface = surface(d, id);
++            }
++        }
+         synchronize_encode(reconstruction->encode_task);
+         if (!c->encoder) {
+             check(ctx->drm_state, "encoding requires a DRM display");
+@@ -914,7 +955,7 @@ API(
+                 c->encode_settings.hevc ? std::min(c->width, target->width) : c->width,
+                 c->encode_settings.hevc ? std::min(c->height, target->height) : c->height,
+                 c->profile, c->encode_settings, c->encode_picture,
+-                static_cast<drm_state *>(ctx->drm_state)->fd);
++                static_cast<drm_state *>(ctx->drm_state)->fd, d.t880);
+         }
+         auto task = c->encoder->encode(c->encode_settings, c->encode_picture, target, coded);
+         task->encoder = c->encoder;
+@@ -1020,7 +1061,8 @@ API(destroy_image, (VADriverContextP ctx, VAImageID id),
+ API(
+     derive_image, (VADriverContextP ctx, VASurfaceID id, VAImage *image),
+     check(image, "null derived image", VA_STATUS_ERROR_INVALID_PARAMETER);
+-    auto s = surface(d, id); synchronize(d, s);
++    auto s = surface(d, id);
++    check(!s->reconstruction_only, "reconstruction pixels are not available", VA_STATUS_ERROR_UNIMPLEMENTED); synchronize(d, s);
+     check(!s->acquired_handles, "surface handle acquired", VA_STATUS_ERROR_SURFACE_BUSY);
+     if (!s->memory) s->memory = allocate_undecoded_surface(ctx, *s); auto m = s->memory;
+     VAImage result{}; result.image_id = d.next_id++; result.buf = d.next_id++;
+@@ -1043,6 +1085,9 @@ API(
+     (VADriverContextP ctx, VASurfaceID id, VAImageID image_id, int sx, int sy, unsigned sw,
+      unsigned sh, int dx, int dy, unsigned dw, unsigned dh),
+     auto s = surface(d, id);
++    check(!d.t880 || s->pixel_generation != UINT64_MAX, "surface pixel generation exhausted");
++    check(!s->reconstruction_only || (!dx && !dy && dw == s->width && dh == s->height),
++          "logical reconstruction requires a complete new pixel upload", VA_STATUS_ERROR_UNIMPLEMENTED);
+     synchronize(d, s); auto image = lookup(d.images, image_id, VA_STATUS_ERROR_INVALID_IMAGE);
+     check(sw == dw && sh == dh, "image scaling unsupported", VA_STATUS_ERROR_UNIMPLEMENTED);
+     check(sw && sh && sx >= 0 && sy >= 0 && dx >= 0 && dy >= 0 &&
+@@ -1056,7 +1101,7 @@ API(
+               ? s->fourcc == image.format.fourcc
+               : (s->fourcc == VA_FOURCC_P010) == (image.format.fourcc == VA_FOURCC_P010),
+           "image bit depth conversion unsupported", VA_STATUS_ERROR_INVALID_IMAGE_FORMAT);
+-    if (!s->memory) s->memory = allocate_undecoded_surface(ctx, *s); auto m = s->memory;
++    if (!s->memory) s->memory = allocate_undecoded_surface(ctx, *s, true); auto m = s->memory;
+     auto source_buffer = buffer(d, image.buf); ImageMapping source(source_buffer);
+     auto destination_buffer = std::make_shared<Buffer>(); destination_buffer->parent = s;
+     destination_buffer->memory = m; ++s->derived_images;
+@@ -1086,7 +1131,9 @@ API(
+                 sw * bytes);
+         }
+     } destination.finish();
+-    source.finish(); return VA_STATUS_SUCCESS;)
++    source.finish(); s->reconstruction_only = false;
++    if (d.t880) ++s->pixel_generation;
++    return VA_STATUS_SUCCESS;)
+ API(acquire_buffer_handle, (VADriverContextP ctx, VABufferID id, VABufferInfo *info),
+     check(info, "null buffer handle info", VA_STATUS_ERROR_INVALID_PARAMETER);
+     auto b = buffer(d, id);
+@@ -1114,6 +1161,7 @@ API(
+     (VADriverContextP ctx, VASurfaceID id, int x, int y, unsigned w, unsigned h,
+      VAImageID image_id),
+     auto s = surface(d, id);
++    check(!s->reconstruction_only, "reconstruction pixels are not available", VA_STATUS_ERROR_UNIMPLEMENTED);
+     synchronize(d, s);
+     check(!s->derived_images, "surface has derived images", VA_STATUS_ERROR_SURFACE_BUSY);
+     auto image = lookup(d.images, image_id, VA_STATUS_ERROR_INVALID_IMAGE);
+@@ -1161,7 +1209,8 @@ API(
+     check(out, "null surface descriptor", VA_STATUS_ERROR_INVALID_PARAMETER);
+     check(type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, "export requires DRM PRIME2",
+           VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE);
+-    auto s = surface(d, id); synchronize(d, s);
++    auto s = surface(d, id);
++    check(!s->reconstruction_only, "reconstruction pixels are not available", VA_STATUS_ERROR_UNIMPLEMENTED); synchronize(d, s);
+     // GPU producers such as Sunshine render into exported encoder input.
+     // Independent storage is writable: Iris CAPTURE allocations
+     // may still be decoder references and have cached CPU aliases.
+@@ -1254,7 +1303,7 @@ extern "C" VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
+     try {
+         auto d = std::make_unique<Driver>();
+         d->device = find_device(d->av1, d->t880, d->h264, d->hevc, d->vp9);
+-        if (!d->t880) d->encoder_device = find_encoder_device();
++        d->encoder_device = find_encoder_device(d->t880, &d->encode_h264, &d->encode_hevc);
+         ctx->version_major = VA_MAJOR_VERSION;
+         ctx->version_minor = VA_MINOR_VERSION;
+         ctx->max_profiles = 9;
+diff --git a/src/encoder.cpp b/src/encoder.cpp
+index d0619d32..5689547c 100644
+--- a/src/encoder.cpp
++++ b/src/encoder.cpp
+@@ -112,7 +112,7 @@ void validate_h264(const EncodeSettings &s, const EncodePicture &p, unsigned wid
+           "unsupported encode cropping", VA_STATUS_ERROR_INVALID_PARAMETER);
+ }
+ void validate_hevc(const EncodeSettings &s, const EncodePicture &p, unsigned width,
+-                   unsigned height) {
++                   unsigned height, bool t880 = false) {
+     check(s.has_sequence && p.has_params && p.hevc_slices.size() == 1,
+           "encoding requires a sequence, picture and one slice", VA_STATUS_ERROR_INVALID_PARAMETER);
+     const auto &seq = s.hevc_sequence;
+@@ -154,7 +154,8 @@ void validate_hevc(const EncodeSettings &s, const EncodePicture &p, unsigned wid
+               pic.pic_fields.bits.coding_type == (slice.slice_type == 2 ? 1u : 2u),
+           "only one full-picture HEVC I or P slice is supported", VA_STATUS_ERROR_UNIMPLEMENTED);
+     check(!pic.pic_fields.bits.tiles_enabled_flag && !pic.num_tile_columns_minus1 &&
+-              !pic.num_tile_rows_minus1 && !pic.pic_fields.bits.entropy_coding_sync_enabled_flag &&
++              !pic.num_tile_rows_minus1 &&
++              (t880 || !pic.pic_fields.bits.entropy_coding_sync_enabled_flag) &&
+               !pic.pic_fields.bits.dependent_slice_segments_enabled_flag &&
+               !pic.pic_fields.bits.weighted_pred_flag &&
+               !pic.pic_fields.bits.weighted_bipred_flag &&
+@@ -172,14 +173,35 @@ void validate_hevc(const EncodeSettings &s, const EncodePicture &p, unsigned wid
+               (!seq.general_tier_flag || seq.general_level_idc >= 120),
+           "invalid HEVC filter or tier", VA_STATUS_ERROR_INVALID_PARAMETER);
+ }
+-void validate(const EncodeSettings &s, const EncodePicture &p, unsigned width, unsigned height) {
++void validate(const EncodeSettings &s, const EncodePicture &p, unsigned width, unsigned height,
++              bool t880 = false) {
+     if (s.hevc)
+-        validate_hevc(s, p, width, height);
++        validate_hevc(s, p, width, height, t880);
+     else
+         validate_h264(s, p, width, height);
+     check(s.fps_num && s.fps_den && s.fps_num >= s.fps_den &&
+               uint64_t(s.fps_num) <= uint64_t(s.fps_den) * 240,
+           "unsupported encode frame rate", VA_STATUS_ERROR_INVALID_PARAMETER);
++    if (t880) {
++        check((s.rate_control == VA_RC_VBR || s.rate_control == VA_RC_AVBR) &&
++              s.bitrate && s.bitrate == s.peak_bitrate &&
++              s.bitrate <= 400000000 && !s.min_qp && !s.max_qp,
++              "T880 supports average-rate control without QP/HRD constraints", VA_STATUS_ERROR_UNIMPLEMENTED);
++        check(s.fps_num % s.fps_den == 0, "T880 requires integer FPS", VA_STATUS_ERROR_UNIMPLEMENTED);
++        unsigned gop = s.hevc ? s.hevc_sequence.intra_period : s.sequence.intra_period;
++        unsigned idr = s.hevc ? s.hevc_sequence.intra_idr_period : s.sequence.intra_idr_period;
++        check(s.rate_control != VA_RC_AVBR || (gop == 30 && s.rc_window_size == 30 &&
++              s.rc_target_percentage == 100), "T880 AVBR candidate requires accuracy parameter100/convergence30frames/GOP30",
++              VA_STATUS_ERROR_UNIMPLEMENTED);
++        check(gop && gop <= 65535 && idr == gop, "T880 requires finite equal GOP/IDR periods",
++              VA_STATUS_ERROR_UNIMPLEMENTED);
++        check(deblocking(p, s.hevc)[0] != 1 && !deblocking(p, s.hevc)[1] && !deblocking(p, s.hevc)[2],
++              "T880 uses enabled deblocking with zero offsets", VA_STATUS_ERROR_UNIMPLEMENTED);
++        check(s.hevc ? !s.hevc_sequence.general_tier_flag
++                     : !p.params.pic_fields.bits.entropy_coding_mode_flag,
++              "T880 requires HEVC Main tier or H264 CAVLC", VA_STATUS_ERROR_UNIMPLEMENTED);
++        return;
++    }
+     check(s.min_qp >= 1 && s.max_qp <= 51 && s.min_qp <= s.max_qp, "invalid encode QP limits",
+           VA_STATUS_ERROR_INVALID_PARAMETER);
+     if (s.rate_control != VA_RC_CQP)
+@@ -188,7 +210,17 @@ void validate(const EncodeSettings &s, const EncodePicture &p, unsigned width, u
+ }
+ } // namespace
+ 
+-std::string find_encoder_device() {
++void validate_reconstruction_surface(const Surface &r, const Surface &input,
++                                     unsigned width, unsigned height) {
++    check(&r != &input && !r.persistent_export && !r.derived_images && !r.mapped_images &&
++          !r.acquired_handles && !r.pending && r.fourcc == VA_FOURCC_NV12 &&
++          r.width >= width && r.height >= height && !input.reconstruction_only &&
++          !input.mapped_images && !input.acquired_handles,
++          "T880 requires separate idle unexported logical reconstruction surfaces",
++          VA_STATUS_ERROR_INVALID_SURFACE);
++}
++
++std::string find_encoder_device(bool t880, bool *h264, bool *hevc) {
+     std::vector<std::string> paths;
+     if (const char *p = std::getenv("IRIS_VAAPI_ENCODER_DEVICE"))
+         paths.emplace_back(p);
+@@ -204,27 +236,38 @@ std::string find_encoder_device() {
+         if (fd < 0)
+             continue;
+         v4l2_capability cap{};
+-        bool match = false;
++        bool match = false, has_h264 = false, has_hevc = false, has_nv12 = false;
+         if (!call(fd, VIDIOC_QUERYCAP, &cap) &&
+-            (!strcmp(reinterpret_cast<char *>(cap.driver), "iris_driver") ||
+-             !strcmp(reinterpret_cast<char *>(cap.driver), "qcom-venus")) &&
+-            (cap.device_caps & V4L2_CAP_VIDEO_M2M_MPLANE)) {
++            (t880 ? !strcmp(reinterpret_cast<char *>(cap.driver), "mtk-vcp-enc")
++                  : (!strcmp(reinterpret_cast<char *>(cap.driver), "iris_driver") ||
++                     !strcmp(reinterpret_cast<char *>(cap.driver), "qcom-venus")))) {
++            unsigned caps = cap.capabilities & V4L2_CAP_DEVICE_CAPS ? cap.device_caps : cap.capabilities;
++            if (!(caps & V4L2_CAP_VIDEO_M2M_MPLANE) || !(caps & V4L2_CAP_STREAMING)) { close(fd); continue; }
+             v4l2_fmtdesc fmt{};
+             fmt.type = CAPTURE;
+             while (!call(fd, VIDIOC_ENUM_FMT, &fmt)) {
+-                if (fmt.pixelformat == V4L2_PIX_FMT_H264)
+-                    match = true;
++                if (fmt.pixelformat == V4L2_PIX_FMT_H264) has_h264 = true;
++                if (fmt.pixelformat == V4L2_PIX_FMT_HEVC) has_hevc = true;
+                 ++fmt.index;
+             }
++            fmt = {}; fmt.type = OUTPUT;
++            while (!call(fd, VIDIOC_ENUM_FMT, &fmt)) {
++                if (fmt.pixelformat == V4L2_PIX_FMT_NV12) has_nv12 = true;
++                ++fmt.index;
++            }
++            match = t880 ? has_nv12 && (has_h264 || has_hevc) : has_h264;
+         }
+         close(fd);
+-        if (match)
++        if (match) {
++            if (h264) *h264 = has_h264;
++            if (hevc) *hevc = has_hevc;
+             return path;
++        }
+     }
+     return {};
+ }
+ 
+-void render_encode_buffer(EncodeSettings &s, EncodePicture &p, const Buffer &b) {
++void render_encode_buffer(EncodeSettings &s, EncodePicture &p, const Buffer &b, bool t880) {
+     switch (b.type) {
+     case VAEncSequenceParameterBufferType:
+         if (s.hevc) {
+@@ -290,12 +333,20 @@ void render_encode_buffer(EncodeSettings &s, EncodePicture &p, const Buffer &b)
+                   "unsupported encode rate control feature", VA_STATUS_ERROR_UNIMPLEMENTED);
+             check(rc.target_percentage <= 100, "invalid target bitrate percentage",
+                   VA_STATUS_ERROR_INVALID_PARAMETER);
++            if (t880)
++                check(rc.bits_per_second && rc.target_percentage == 100 &&
++                      rc.window_size == (s.rate_control == VA_RC_AVBR ? 30u : 1000u) &&
++                      !rc.initial_qp && !rc.min_qp && !rc.max_qp && !rc.basic_unit_size &&
++                      rc.rc_flags.bits.mb_rate_control != 1,
++                      "T880 does not support extra RC/peak/QP constraints", VA_STATUS_ERROR_UNIMPLEMENTED);
++            s.rc_window_size = rc.window_size;
++            s.rc_target_percentage = rc.target_percentage;
+             s.peak_bitrate = rc.bits_per_second;
+             s.bitrate = s.rate_control == VA_RC_VBR && rc.target_percentage
+                             ? uint64_t(rc.bits_per_second) * rc.target_percentage / 100
+                             : rc.bits_per_second;
+-            s.min_qp = rc.min_qp ? rc.min_qp : 1;
+-            s.max_qp = rc.max_qp ? rc.max_qp : 51;
++            s.min_qp = t880 ? rc.min_qp : rc.min_qp ? rc.min_qp : 1;
++            s.max_qp = t880 ? rc.max_qp : rc.max_qp ? rc.max_qp : 51;
+             break;
+         }
+         case VAEncMiscParameterTypeFrameRate: {
+@@ -313,6 +364,7 @@ void render_encode_buffer(EncodeSettings &s, EncodePicture &p, const Buffer &b)
+             break;
+         }
+         case VAEncMiscParameterTypeHRD:
++            check(!t880, "T880 HRD buffering is not implemented", VA_STATUS_ERROR_UNIMPLEMENTED);
+             // Iris has no CPB size/fullness control. The firmware owns the
+             // rate-control buffer; HRD values are advisory for this backend.
+             (void)parameter<VAEncMiscParameterHRD>(b, off);
+@@ -329,12 +381,13 @@ void render_encode_buffer(EncodeSettings &s, EncodePicture &p, const Buffer &b)
+ 
+ struct Encoder::Impl {
+     int fd = -1, render_fd = -1;
+-    bool import = false;
++    bool import = false, t880 = false;
+     struct Job {
+         std::shared_ptr<EncodeTask> task;
+         std::shared_ptr<Buffer> output;
+         std::shared_ptr<Memory> memory;
+         bool input_done = false, frame_done = false;
++        uint64_t token = 0;
+     };
+     std::vector<std::shared_ptr<Memory>> staging;
+     std::vector<std::shared_ptr<Job>> slots;
+@@ -342,9 +395,13 @@ struct Encoder::Impl {
+     int current_qp = -1;
+     std::unique_ptr<SurfaceCopier> copier;
+     unsigned width, height, stride = 0, storage_height = 0, input_size = 0, input_count = 0;
++    unsigned coded_capacity = 0;
+     bool output_on = false, capture_on = false, failed = false;
+     uint64_t token = 0;
+     VASurfaceID last_reference = VA_INVALID_SURFACE;
++    std::weak_ptr<Surface> last_reference_object;
++    std::weak_ptr<EncodeTask> last_reference_task;
++    uint64_t last_reference_generation = 0;
+     EncodeSettings settings;
+     unsigned entropy;
+     std::array<int, 3> filter{};
+@@ -364,8 +421,24 @@ struct Encoder::Impl {
+         v4l2_control ctrl{};
+         ctrl.id = id;
+         ctrl.value = value;
++        v4l2_queryctrl query{}; query.id = id;
++        if (t880) {
++            checked(fd, VIDIOC_QUERYCTRL, &query, "T880 QUERYCTRL");
++            check(!(query.flags & (V4L2_CTRL_FLAG_DISABLED | V4L2_CTRL_FLAG_READ_ONLY)) &&
++                  value >= query.minimum && value <= query.maximum &&
++                  (query.step <= 0 || (value - query.minimum) % query.step == 0),
++                  "T880 encoder control is unsupported or outside bounds");
++            if (query.type == V4L2_CTRL_TYPE_MENU || query.type == V4L2_CTRL_TYPE_INTEGER_MENU) {
++                v4l2_querymenu menu{}; menu.id = id; menu.index = value;
++                checked(fd, VIDIOC_QUERYMENU, &menu, "T880 QUERYMENU");
++            }
++        }
+         trace("encoder control id=%#x value=%d", id, value);
+         checked(fd, VIDIOC_S_CTRL, &ctrl, "encoder S_CTRL");
++        if (t880 && query.type != V4L2_CTRL_TYPE_BUTTON) {
++            checked(fd, VIDIOC_G_CTRL, &ctrl, "T880 G_CTRL");
++            check(ctrl.value == value, "T880 encoder control readback mismatch");
++        }
+     }
+     void configure_deblocking() {
+         const int ids[] = {settings.hevc ? V4L2_CID_MPEG_VIDEO_HEVC_LOOP_FILTER_MODE
+@@ -433,6 +506,7 @@ struct Encoder::Impl {
+             job->output->coded_ready = false;
+         }
+         jobs.clear();
++        if (t880) for (auto &m : raw) m->queued = false;
+         for (auto &slot : slots)
+             slot.reset();
+     }
+@@ -451,7 +525,15 @@ struct Encoder::Impl {
+                           !slots[q.buffer.index]->input_done &&
+                           !(q.buffer.flags & V4L2_BUF_FLAG_ERROR),
+                       "invalid encoder input completion", VA_STATUS_ERROR_ENCODING_ERROR);
++                if (t880) {
++                    const auto &ts = q.buffer.timestamp;
++                    check(ts.tv_sec >= 0 && ts.tv_usec >= 0 && ts.tv_usec < 1000000 &&
++                          uint64_t(ts.tv_sec) <= (UINT64_MAX - uint64_t(ts.tv_usec)) / 1000000 &&
++                          uint64_t(ts.tv_sec) * 1000000 + ts.tv_usec == slots[q.buffer.index]->token,
++                          "T880 OUTPUT timestamp mismatch", VA_STATUS_ERROR_ENCODING_ERROR);
++                }
+                 slots[q.buffer.index]->input_done = true;
++                if (t880) raw[q.buffer.index]->queued = false;
+                 // OUTPUT DQBUF returns ownership of the raw slot even if the
+                 // corresponding coded output is still in the hardware pipeline.
+                 slots[q.buffer.index].reset();
+@@ -550,7 +632,7 @@ struct Encoder::Impl {
+ };
+ 
+ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAProfile profile,
+-                 const EncodeSettings &s, const EncodePicture &p, int render_fd) {
++                 const EncodeSettings &s, const EncodePicture &p, int render_fd, bool t880) {
+     // VA contexts may use macroblock-aligned dimensions (FFmpeg does this).
+     // The sequence crop determines the visible dimensions sent to Iris.
+     if (!s.hevc) {
+@@ -572,26 +654,37 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
+         width = coded_width;
+         height = coded_height;
+     }
+-    check(width >= 128 && height >= 128 && width <= 3840 && height <= 2160 && !(width & 1) &&
++    check(width >= 128 && height >= 128 && width <= (t880 ? 4096u : 3840u) && height <= (t880 ? 4096u : 2160u) &&
++              (!t880 || uint64_t(width) * height <= uint64_t(4096) * 2176) && !(width & 1) &&
+               !(height & 1),
+           "unsupported visible encoder dimensions", VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
+-    validate(s, p, width, height);
++    validate(s, p, width, height, t880);
+     auto impl = std::make_unique<Impl>(
+         width, height, s, s.hevc ? 1 : p.params.pic_fields.bits.entropy_coding_mode_flag);
+     auto &e = *impl;
+     e.filter = deblocking(p, s.hevc);
+     e.render_fd = fcntl(render_fd, F_DUPFD_CLOEXEC, 0);
+     check(e.render_fd >= 0, "duplicate encoder DRM fd");
+-    int coherent = 0;
+-    int probe = irisva_msm_allocate(e.render_fd, 4096, &coherent);
+-    check(probe >= 0, "probe encoder shared memory", VA_STATUS_ERROR_ALLOCATION_FAILED);
+-    close(probe);
+-    e.import = coherent;
++    e.t880 = t880;
+     e.fd = open(device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+-    check(e.fd >= 0, "open Qualcomm encoder");
++    check(e.fd >= 0, "open stateful encoder");
+     v4l2_capability caps{};
+     checked(e.fd, VIDIOC_QUERYCAP, &caps, "encoder QUERYCAP");
+     bool venus = !strcmp(reinterpret_cast<char *>(caps.driver), "qcom-venus");
++    if (t880) {
++        unsigned capabilities = caps.capabilities & V4L2_CAP_DEVICE_CAPS ? caps.device_caps : caps.capabilities;
++        check(!strcmp(reinterpret_cast<char *>(caps.driver), "mtk-vcp-enc") &&
++              (capabilities & V4L2_CAP_VIDEO_M2M_MPLANE) && (capabilities & V4L2_CAP_STREAMING),
++              "T880 encoder identity changed");
++        check(profile == (s.hevc ? VAProfileHEVCMain : VAProfileH264Main),
++              "T880 encode profile unsupported", VA_STATUS_ERROR_UNSUPPORTED_PROFILE);
++    } else {
++        int coherent = 0;
++        int probe = irisva_msm_allocate(e.render_fd, 4096, &coherent);
++        check(probe >= 0, "probe encoder shared memory", VA_STATUS_ERROR_ALLOCATION_FAILED);
++        close(probe);
++        e.import = coherent;
++    }
+     v4l2_format fmt{};
+     fmt.type = CAPTURE;
+     fmt.fmt.pix_mp.width = width;
+@@ -612,12 +705,19 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
+     e.stride = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
+     e.storage_height = fmt.fmt.pix_mp.height;
+     e.input_size = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
++    if (t880)
++        check(e.stride >= width && e.storage_height >= height && !(e.stride & 15) &&
++              !(e.storage_height & 7) && uint64_t(e.stride) * e.storage_height * 3 / 2 <= e.input_size &&
++              e.input_size <= 16u * 1024 * 1024, "T880 input layout bounds");
+     v4l2_selection crop{};
+     crop.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+     crop.target = V4L2_SEL_TGT_CROP;
+     crop.r.width = width;
+     crop.r.height = height;
+     checked(e.fd, VIDIOC_S_SELECTION, &crop, "encoder S_SELECTION");
++    if (t880)
++        check(!crop.r.left && !crop.r.top && crop.r.width == width && crop.r.height == height,
++              "T880 visible crop readback mismatch");
+     if (s.hevc) {
+         e.control(V4L2_CID_MPEG_VIDEO_HEVC_PROFILE, V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
+         e.control(V4L2_CID_MPEG_VIDEO_HEVC_LEVEL,
+@@ -639,32 +739,38 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
+                       ? V4L2_MPEG_VIDEO_H264_PROFILE_MAIN
+                       : V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE);
+         e.control(V4L2_CID_MPEG_VIDEO_H264_LEVEL, level_control(s.sequence.level_idc));
+-        e.control(V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE, e.entropy);
++        if (!t880) e.control(V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE, e.entropy);
+     }
+     e.control(V4L2_CID_MPEG_VIDEO_B_FRAMES, 0);
+     // Keyframes follow VA picture requests; prevent autonomous periodic IDRs.
+-    e.control(V4L2_CID_MPEG_VIDEO_GOP_SIZE, std::numeric_limits<int>::max());
++    e.control(V4L2_CID_MPEG_VIDEO_GOP_SIZE, t880 ? (s.hevc ? s.hevc_sequence.intra_period : s.sequence.intra_period)
++                                                            : std::numeric_limits<int>::max());
+     e.control(V4L2_CID_MPEG_VIDEO_HEADER_MODE, V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME);
+-    if (!venus)
++    if (!venus && !t880)
+         e.control(V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR, 1);
+-    e.control(V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE, s.rate_control != VA_RC_CQP);
++    if (!t880) e.control(V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE, s.rate_control != VA_RC_CQP);
+     if (s.rate_control != VA_RC_CQP) {
+         e.control(V4L2_CID_MPEG_VIDEO_BITRATE_MODE, s.rate_control == VA_RC_CBR
+                                                         ? V4L2_MPEG_VIDEO_BITRATE_MODE_CBR
+                                                         : V4L2_MPEG_VIDEO_BITRATE_MODE_VBR);
+         e.control(V4L2_CID_MPEG_VIDEO_BITRATE, s.bitrate);
+-        e.control(V4L2_CID_MPEG_VIDEO_BITRATE_PEAK, s.peak_bitrate);
++        if (!t880) e.control(V4L2_CID_MPEG_VIDEO_BITRATE_PEAK, s.peak_bitrate);
+     }
+-    e.control(s.hevc ? V4L2_CID_MPEG_VIDEO_HEVC_MIN_QP : V4L2_CID_MPEG_VIDEO_H264_MIN_QP, s.min_qp);
+-    e.control(s.hevc ? V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP : V4L2_CID_MPEG_VIDEO_H264_MAX_QP, s.max_qp);
++    if (!t880) e.control(s.hevc ? V4L2_CID_MPEG_VIDEO_HEVC_MIN_QP : V4L2_CID_MPEG_VIDEO_H264_MIN_QP, s.min_qp);
++    if (!t880) e.control(s.hevc ? V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP : V4L2_CID_MPEG_VIDEO_H264_MAX_QP, s.max_qp);
+     e.configure_deblocking();
+     for (unsigned type : {CAPTURE, OUTPUT}) {
+-        if (venus && type == CAPTURE) continue;
++        if ((venus || t880) && type == CAPTURE) continue;
+         v4l2_streamparm parm{};
+         parm.type = type;
+         parm.parm.output.timeperframe.numerator = s.fps_den;
+         parm.parm.output.timeperframe.denominator = s.fps_num;
+         checked(e.fd, VIDIOC_S_PARM, &parm, "encoder S_PARM");
++        if (t880)
++            check(parm.parm.output.timeperframe.numerator && parm.parm.output.timeperframe.denominator &&
++                  uint64_t(parm.parm.output.timeperframe.numerator) * s.fps_num ==
++                  uint64_t(parm.parm.output.timeperframe.denominator) * s.fps_den,
++                  "T880 encoder frame rate readback mismatch");
+     }
+     // Iris sizes coded buffers differently when rate control is disabled.
+     // Refresh CAPTURE after controls, before allocating either queue.
+@@ -675,9 +781,19 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
+     fmt.fmt.pix_mp.pixelformat = s.hevc ? V4L2_PIX_FMT_HEVC : V4L2_PIX_FMT_H264;
+     if (venus)
+         fmt.fmt.pix_mp.plane_fmt[0].sizeimage = e.stride * e.storage_height;
+-    checked(e.fd, VIDIOC_S_FMT, &fmt, "encoder refresh CAPTURE format");
++    if (!t880) checked(e.fd, VIDIOC_S_FMT, &fmt, "encoder refresh CAPTURE format");
+     if (venus)
+         checked(e.fd, VIDIOC_S_SELECTION, &crop, "encoder restore crop");
++    if (t880) {
++        v4l2_format coded{}; coded.type = CAPTURE;
++        checked(e.fd, VIDIOC_G_FMT, &coded, "T880 G_FMT coded capacity");
++        check(coded.fmt.pix_mp.num_planes == 1 &&
++              coded.fmt.pix_mp.pixelformat == (s.hevc ? V4L2_PIX_FMT_HEVC : V4L2_PIX_FMT_H264),
++              "T880 coded layout mismatch");
++        e.coded_capacity = coded.fmt.pix_mp.plane_fmt[0].sizeimage;
++        check(e.coded_capacity && e.coded_capacity <= 16u * 1024 * 1024,
++              "T880 coded allocation budget");
++    }
+     for (unsigned type : {OUTPUT, CAPTURE}) {
+         v4l2_requestbuffers req{};
+         req.type = type;
+@@ -694,8 +810,12 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
+             QueueBuffer q(type, i);
+             checked(e.fd, VIDIOC_QUERYBUF, &q.buffer, "encoder QUERYBUF");
+             auto m = std::make_shared<Memory>();
+-            m->origin = MemoryOrigin::Iris;
++            m->origin = t880 ? MemoryOrigin::V4l2Mmap : MemoryOrigin::Iris;
+             m->size = q.plane.length;
++            if (t880)
++                check(q.buffer.length == 1 && m->size <= 16u * 1024 * 1024 &&
++                      m->size >= (type == OUTPUT ? e.input_size : e.coded_capacity),
++                      "T880 QUERYBUF plane bounds");
+             void *ptr = mmap(nullptr, m->size, PROT_READ | PROT_WRITE, MAP_SHARED, e.fd,
+                              q.plane.m.mem_offset);
+             check(ptr != MAP_FAILED, "mmap encoder buffer");
+@@ -705,12 +825,16 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
+                 m->storage_height = e.storage_height;
+                 m->width = e.width;
+                 m->height = e.height;
++                m->index = i;
++                check(m->size >= e.input_size, "encoder raw allocation smaller than format");
++                if (!t880) {
+                 v4l2_exportbuffer exp{};
+                 exp.type = OUTPUT;
+                 exp.index = i;
+                 exp.flags = O_CLOEXEC | O_RDWR;
+                 checked(e.fd, VIDIOC_EXPBUF, &exp, "encoder EXPBUF OUTPUT");
+                 m->fd = exp.fd;
++                }
+                 e.raw.push_back(m);
+             } else {
+                 e.capture.push_back(m);
+@@ -740,7 +864,7 @@ std::shared_ptr<EncodeTask> Encoder::encode(const EncodeSettings &s, const Encod
+     auto &e = *impl_;
+     check(!e.failed, "encoder session failed; create a new context",
+           VA_STATUS_ERROR_ENCODING_ERROR);
+-    validate(s, p, e.width, e.height);
++    validate(s, p, e.width, e.height, e.t880);
+     check(deblocking(p, s.hevc) == e.filter, "changing deblocking requires a new context",
+           VA_STATUS_ERROR_UNIMPLEMENTED);
+     check((s.hevc
+@@ -750,13 +874,22 @@ std::shared_ptr<EncodeTask> Encoder::encode(const EncodeSettings &s, const Encod
+                      p.params.pic_fields.bits.entropy_coding_mode_flag == e.entropy) &&
+               s.fps_num == e.settings.fps_num && s.fps_den == e.settings.fps_den &&
+               s.bitrate == e.settings.bitrate && s.peak_bitrate == e.settings.peak_bitrate &&
+-              s.min_qp == e.settings.min_qp && s.max_qp == e.settings.max_qp,
++              s.min_qp == e.settings.min_qp && s.max_qp == e.settings.max_qp &&
++              s.rate_control == e.settings.rate_control && s.rc_window_size == e.settings.rc_window_size &&
++              s.rc_target_percentage == e.settings.rc_target_percentage &&
++              (!e.t880 || (s.hevc
++                  ? s.hevc_sequence.intra_period == e.settings.hevc_sequence.intra_period &&
++                    s.hevc_sequence.intra_idr_period == e.settings.hevc_sequence.intra_idr_period
++                  : s.sequence.intra_period == e.settings.sequence.intra_period &&
++                    s.sequence.intra_idr_period == e.settings.sequence.intra_idr_period)),
+           "changing encoder settings requires a new context", VA_STATUS_ERROR_UNIMPLEMENTED);
+     const bool idr =
+         s.hevc ? p.hevc_params.pic_fields.bits.idr_pic_flag : p.params.pic_fields.bits.idr_pic_flag;
+     const bool intra =
+         s.hevc ? p.hevc_slices.front().slice_type == 2 : p.slices.front().slice_type % 5 == 2;
+     check(e.token || idr, "encoder must start with IDR", VA_STATUS_ERROR_INVALID_PARAMETER);
++    check(!e.t880 || !intra || idr, "T880 does not support non-IDR intra requests",
++          VA_STATUS_ERROR_UNIMPLEMENTED);
+     // Clients with multiple GOPs per IDR (including Sunshine) submit non-IDR
+     // I pictures / HEVC CRA. Iris only exposes FORCE_KEY_FRAME, which emits IDR.
+     // Promote these requests to IDR and drain before changing the control below.
+@@ -778,10 +911,24 @@ std::shared_ptr<EncodeTask> Encoder::encode(const EncodeSettings &s, const Encod
+         check(valid && reference == e.last_reference && e.last_reference != VA_INVALID_SURFACE,
+               "encoder only supports the immediately preceding reference",
+               VA_STATUS_ERROR_UNIMPLEMENTED);
++        if (e.t880) {
++            auto expected = e.last_reference_object.lock();
++            auto task = e.last_reference_task.lock();
++            check(expected && task && p.reference_surface == expected && expected->reconstruction_only &&
++                  expected->pixel_generation == e.last_reference_generation && expected->encode_task == task &&
++                  task->status == VA_STATUS_SUCCESS,
++                  "T880 reference surface was overwritten, deleted or reused by another session",
++                  VA_STATUS_ERROR_INVALID_SURFACE);
++        }
+     }
+     check(s.hevc ? p.hevc_params.pic_fields.bits.reference_pic_flag
+                  : p.params.pic_fields.bits.reference_pic_flag,
+           "non-reference encoding unsupported", VA_STATUS_ERROR_UNIMPLEMENTED);
++    if (e.t880) {
++        check(p.reconstruction_surface && p.reconstruction_surface->pixel_generation != UINT64_MAX,
++              "T880 reconstruction identity is unavailable", VA_STATUS_ERROR_INVALID_SURFACE);
++        validate_reconstruction_surface(*p.reconstruction_surface, *input, e.width, e.height);
++    }
+     auto memory = input->memory;
+     check(memory && memory->fourcc == VA_FOURCC_NV12 && memory->width >= e.width &&
+               memory->height >= e.height,
+@@ -826,7 +973,8 @@ std::shared_ptr<EncodeTask> Encoder::encode(const EncodeSettings &s, const Encod
+             !memory->data_offset && memory->size >= e.input_size;
+         if (!e.import) {
+             auto raw = e.raw[index];
+-            copy_surface(*raw, *memory, e.width, e.height);
++            if (e.t880) copy_to_v4l2_mmap(*raw, *memory, e.width, e.height);
++            else copy_surface(*raw, *memory, e.width, e.height);
+             memory = raw;
+         } else if (!direct) {
+             // Never send write-combined GEM directly to a coherent VPU, or
+@@ -852,7 +1000,7 @@ std::shared_ptr<EncodeTask> Encoder::encode(const EncodeSettings &s, const Encod
+         }
+         // Retain the input through both DQBUFs, and STREAMOFF before releasing
+         // it if a job fails. Cache coherency does not replace lifetime/fences.
+-        wait_surface_access(*memory, POLLIN);
++        if (!e.t880) wait_surface_access(*memory, POLLIN);
+         trace("encoder input path=%s origin=%u",
+               direct     ? "direct"
+               : e.import ? "staging"
+@@ -874,10 +1022,12 @@ std::shared_ptr<EncodeTask> Encoder::encode(const EncodeSettings &s, const Encod
+             q.plane.m.fd = memory->fd;
+         q.plane.length = memory->size;
+         q.plane.bytesused = e.input_size;
++        check(e.token < uint64_t(INT64_MAX), "encoder token space exhausted");
+         const uint64_t token = e.token + 1;
+         q.buffer.timestamp.tv_sec = token / 1000000;
+         q.buffer.timestamp.tv_usec = token % 1000000;
+         auto job = std::make_shared<Impl::Job>();
++        job->token = token;
+         job->task = std::make_shared<EncodeTask>();
+         job->output = coded;
+         job->memory = memory;
+@@ -887,8 +1037,19 @@ std::shared_ptr<EncodeTask> Encoder::encode(const EncodeSettings &s, const Encod
+         output.coded_ready = false;
+         output.coded = {};
+         checked(e.fd, VIDIOC_QBUF, &q.buffer, "encoder QBUF OUTPUT");
++        if (e.t880) memory->queued = true;
+         e.token = token;
+         e.last_reference = p.reconstruction(s.hevc);
++        if (e.t880) {
++            auto &reconstruction = *p.reconstruction_surface;
++            reconstruction.reconstruction_only = true;
++            reconstruction.memory.reset();
++            ++reconstruction.pixel_generation;
++            reconstruction.encode_task = job->task;
++            e.last_reference_object = p.reconstruction_surface;
++            e.last_reference_generation = reconstruction.pixel_generation;
++            e.last_reference_task = job->task;
++        }
+         trace("encoder queued token=%llu depth=%zu", (unsigned long long)token, e.jobs.size());
+         return job->task;
+     } catch (const Error &error) {
+diff --git a/src/internal.hpp b/src/internal.hpp
+index 21def0d0..456854a5 100644
+--- a/src/internal.hpp
++++ b/src/internal.hpp
+@@ -50,7 +50,7 @@ template <class... A> void trace(const char *f, A... a) {
+         std::fprintf(stderr, "\n");
+     }
+ }
+-enum class MemoryOrigin { Unknown, MsmWriteCombined, MsmCoherent, DmaHeap, Imported, Iris };
++enum class MemoryOrigin { Unknown, MsmWriteCombined, MsmCoherent, DmaHeap, Imported, Iris, V4l2Mmap };
+ struct Memory {
+     MemoryOrigin origin = MemoryOrigin::Unknown;
+     int fd = -1;
+@@ -92,6 +92,8 @@ struct Surface {
+     // An export before the first picture may be cached by the consumer for
+     // this surface's whole lifetime (Chromium's NativePixmap frame pool).
+     bool persistent_export = false;
++    bool reconstruction_only = false;
++    uint64_t pixel_generation = 0;
+     std::weak_ptr<Decoder> decoder;
+     uint64_t token = 0;
+     std::atomic<VAStatus> status{VA_STATUS_SUCCESS};
+@@ -237,8 +239,9 @@ class Decoder {
+     void refresh();
+ };
+ std::string find_device(bool &av1, bool &t880, bool &h264, bool &hevc, bool &vp9);
+-std::string find_encoder_device();
++std::string find_encoder_device(bool t880 = false, bool *h264 = nullptr, bool *hevc = nullptr);
+ struct EncodePicture {
++    std::shared_ptr<Surface> reference_surface, reconstruction_surface;
+     VAEncPictureParameterBufferH264 params{};
+     VAEncPictureParameterBufferHEVC hevc_params{};
+     bool has_params = false;
+@@ -259,15 +262,18 @@ struct EncodeSettings {
+     unsigned rate_control = VA_RC_CQP;
+     unsigned bitrate = 0, peak_bitrate = 0, min_qp = 1, max_qp = 51;
+     unsigned fps_num = 30, fps_den = 1;
++    unsigned rc_window_size = 1000, rc_target_percentage = 100;
+ };
+-void render_encode_buffer(EncodeSettings &settings, EncodePicture &picture, const Buffer &buffer);
++void validate_reconstruction_surface(const Surface &reconstruction, const Surface &input,
++                                     unsigned width, unsigned height);
++void render_encode_buffer(EncodeSettings &settings, EncodePicture &picture, const Buffer &buffer, bool t880 = false);
+ class Encoder {
+     struct Impl;
+     std::unique_ptr<Impl> impl_;
+ 
+   public:
+     Encoder(const std::string &device, unsigned width, unsigned height, VAProfile profile,
+-            const EncodeSettings &settings, const EncodePicture &picture, int render_fd);
++            const EncodeSettings &settings, const EncodePicture &picture, int render_fd, bool t880 = false);
+     ~Encoder();
+     std::shared_ptr<EncodeTask> encode(const EncodeSettings &settings, const EncodePicture &picture,
+                                        const std::shared_ptr<Surface> &input,
+@@ -279,6 +285,7 @@ class Encoder {
+ void copy_surface(Memory &destination, Memory &source, unsigned width, unsigned height);
+ std::shared_ptr<Memory> allocate_surface(int render_fd, unsigned width, unsigned height,
+                                          unsigned fourcc);
++void copy_to_v4l2_mmap(Memory &destination, Memory &source, unsigned width, unsigned height);
+ void fill_neutral_surface(Memory &memory, unsigned width, unsigned height);
+ void wait_surface_access(const Memory &memory, short events);
+ bool vpp_supported(VAProfile profile, VAEntrypoint entrypoint);
+@@ -344,6 +351,7 @@ struct Driver {
+     std::string device;
+     bool av1 = false;
+     bool t880 = false, h264 = false, hevc = false, vp9 = false;
++    bool encode_h264 = false, encode_hevc = false;
+     std::string encoder_device;
+     uint32_t next_id = 1;
+     std::map<uint32_t, Config> configs;
+diff --git a/src/surface-copy.cpp b/src/surface-copy.cpp
+index 81839475..70537427 100644
+--- a/src/surface-copy.cpp
++++ b/src/surface-copy.cpp
+@@ -99,6 +99,41 @@ std::shared_ptr<Memory> allocate_surface(int render_fd, unsigned width, unsigned
+           fourcc, m->stride, m->size);
+     return m;
+ }
++// Destination ownership is the V4L2 slot's QUERYBUF/QBUF/DQBUF contract,
++// not a DMA-BUF fence. Never apply this exception to imported/exported memory.
++void copy_to_v4l2_mmap(Memory &dst, Memory &src, unsigned width, unsigned height) {
++    check(dst.origin == MemoryOrigin::V4l2Mmap && dst.fd == -1 && dst.mapping && !dst.queued,
++          "V4L2 MMAP destination is not CPU-owned");
++    check(src.fd >= 0 && src.origin != MemoryOrigin::V4l2Mmap &&
++          dst.fourcc == VA_FOURCC_NV12 && src.fourcc == VA_FOURCC_NV12 &&
++          width && height && !(width & 1) && !(height & 1), "NV12 CPU copy format");
++    auto bounds = [width, height](const Memory &m) {
++        check(width <= m.width && height <= m.height && m.stride >= width &&
++              m.storage_height >= height && m.data_offset <= m.size, "NV12 copy layout");
++        size_t remaining = m.size - m.data_offset;
++        check(m.stride && m.storage_height <= remaining / m.stride, "NV12 copy UV offset");
++        size_t uv = size_t(m.stride) * m.storage_height;
++        check(width <= remaining - uv &&
++              size_t(height / 2 - 1) <= (remaining - uv - width) / m.stride,
++              "NV12 copy UV bounds");
++        return uv;
++    };
++    size_t src_uv = bounds(src), dst_uv = bounds(dst);
++    check(dst.storage_height % 2 == 0 && dst_uv / 2 <= dst.size - dst.data_offset - dst_uv,
++          "V4L2 MMAP padded UV bounds");
++    auto *input = src.map(); auto *output = static_cast<uint8_t *>(dst.mapping);
++    CpuAccess read(src, DMA_BUF_SYNC_READ);
++    memset(output + dst.data_offset, 16, dst_uv);
++    memset(output + dst.data_offset + dst_uv, 128, dst_uv / 2);
++    for (unsigned plane = 0; plane < 2; ++plane) {
++        size_t a = src.data_offset + (plane ? src_uv : 0);
++        size_t b = dst.data_offset + (plane ? dst_uv : 0);
++        for (unsigned y = 0; y < (plane ? height / 2 : height); ++y)
++            memcpy(output + b + size_t(y) * dst.stride,
++                   input + a + size_t(y) * src.stride, width);
++    }
++    read.finish();
++}
+ void fill_neutral_surface(Memory &memory, unsigned width, unsigned height) {
+     check(memory.fourcc == VA_FOURCC_NV12 || memory.fourcc == VA_FOURCC_P010,
+           "unsupported replacement surface format", VA_STATUS_ERROR_INVALID_IMAGE_FORMAT);
+diff --git a/src/t880-decoder.cpp b/src/t880-decoder.cpp
+index 63049327..f2f31edb 100644
+--- a/src/t880-decoder.cpp
++++ b/src/t880-decoder.cpp
+@@ -179,6 +179,7 @@ void T880Decoder::configure_capture() {
+ }
+ void T880Decoder::copy(unsigned index, const v4l2_buffer &, const v4l2_plane *planes,
+                         const std::shared_ptr<Surface> &s) {
++    check(s->pixel_generation != UINT64_MAX, "surface pixel generation exhausted");
+     check(s->width >= width_ && s->height >= height_ && s->fourcc == VA_FOURCC_NV12,
+           "T880 destination mismatch");
+     auto m = s->memory;
+@@ -209,6 +210,8 @@ void T880Decoder::copy(unsigned index, const v4l2_buffer &, const v4l2_plane *pl
+             memcpy(dst + base + size_t(y) * m->stride, src + size_t(y) * stride_[p], width_);
+     }
+     access.finish();
++    s->reconstruction_only = false;
++    ++s->pixel_generation;
+     check_deadline();
+ }
+ void T880Decoder::pump(int timeout) {
+diff --git a/tests/t880/encoder-rc-fixtures.inc b/tests/t880/encoder-rc-fixtures.inc
+new file mode 100644
+index 00000000..735c2fcd
+--- /dev/null
++++ b/tests/t880/encoder-rc-fixtures.inc
+@@ -0,0 +1,3 @@
++// Actual FFmpeg9.0.2 RC blobs from complete-function transport harness.
++static const unsigned char ffmpeg_vbr[] = {0,232,3,0,100,0,0,0,232,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,16,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
++static const unsigned char ffmpeg_avbr[] = {0,232,3,0,100,0,0,0,30,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,16,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+diff --git a/tests/t880/encoder.cpp b/tests/t880/encoder.cpp
+new file mode 100644
+index 00000000..84652df8
+--- /dev/null
++++ b/tests/t880/encoder.cpp
+@@ -0,0 +1,216 @@
++// SPDX-License-Identifier: MIT
++// Actual encoder/copy implementation with deterministic V4L2 and DMA fences.
++#include "../../src/internal.hpp"
++#include <linux/videodev2.h>
++#include <linux/dma-buf.h>
++#include <linux/dma-heap.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <glob.h>
++#include <poll.h>
++#include <cerrno>
++#include <limits>
++#include <array>
++#include <deque>
++#include <cassert>
++#include <iostream>
++using namespace irisva;
++namespace {
++struct Completion {unsigned index;timeval timestamp;};
++struct Fake {
++    unsigned width=160,height=128,stride=160,storage=128,codec=V4L2_PIX_FMT_H264;
++    bool defer_output=false,fail_qbuf=false,clamp=false;
++    unsigned source_sync_begin=0,source_sync_end=0,forces=0,submitted=0;
++    std::map<unsigned,int> controls;
++    std::map<unsigned,uint8_t *> memory;
++    std::deque<unsigned> capture;
++    std::deque<Completion> output,coded;
++} f;
++int fake_open(const char *,int,...) {return 900;}
++int fake_close(int) {return 0;}
++int fake_fcntl(int,int,...) {return 901;}
++void *fake_mmap(void *,size_t n,int,int,int,off_t offset) {
++    auto p=static_cast<uint8_t *>(calloc(1,n));f.memory[unsigned(offset)]=p;return p;
++}
++int fake_poll(pollfd *p,nfds_t n,int) {assert(n==1&&p->fd>=0);p->revents=p->events;return 1;}
++int fake_ioctl(int fd,unsigned long request,void *arg) {
++    if(request==DMA_BUF_IOCTL_SYNC) {
++        assert(fd==1100);auto flags=static_cast<dma_buf_sync *>(arg)->flags;
++        assert(flags==DMA_BUF_SYNC_READ||flags==(DMA_BUF_SYNC_READ|DMA_BUF_SYNC_END));
++        if(flags&DMA_BUF_SYNC_END)++f.source_sync_end;else ++f.source_sync_begin;
++        return 0;
++    }
++    assert(fd==900);
++    if(request==VIDIOC_QUERYCAP) {
++        auto &c=*static_cast<v4l2_capability *>(arg);strcpy(reinterpret_cast<char *>(c.driver),"mtk-vcp-enc");
++        c.capabilities=V4L2_CAP_VIDEO_M2M_MPLANE|V4L2_CAP_STREAMING;return 0;
++    }
++    if(request==VIDIOC_QUERYCTRL) {
++        auto &q=*static_cast<v4l2_queryctrl *>(arg);q.type=V4L2_CTRL_TYPE_INTEGER;q.minimum=0;q.maximum=400000000;q.step=1;
++        switch(q.id) {
++        case V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME:q.type=V4L2_CTRL_TYPE_BUTTON;q.maximum=0;q.step=0;return 0;
++        case V4L2_CID_MPEG_VIDEO_BITRATE:case V4L2_CID_MPEG_VIDEO_GOP_SIZE:case V4L2_CID_MPEG_VIDEO_B_FRAMES:return 0;
++        case V4L2_CID_MPEG_VIDEO_BITRATE_MODE:case V4L2_CID_MPEG_VIDEO_H264_PROFILE:
++        case V4L2_CID_MPEG_VIDEO_H264_LEVEL:case V4L2_CID_MPEG_VIDEO_HEVC_PROFILE:
++        case V4L2_CID_MPEG_VIDEO_HEVC_LEVEL:case V4L2_CID_MPEG_VIDEO_HEVC_TIER:
++        case V4L2_CID_MPEG_VIDEO_HEADER_MODE:q.type=V4L2_CTRL_TYPE_MENU;return 0;
++        default:errno=EINVAL;return -1;
++        }
++    }
++    if(request==VIDIOC_QUERYMENU)return 0;
++    if(request==VIDIOC_S_CTRL) {
++        auto &c=*static_cast<v4l2_control *>(arg);f.controls[c.id]=c.value;
++        if(c.id==V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME)++f.forces;return 0;
++    }
++    if(request==VIDIOC_G_CTRL) {
++        auto &c=*static_cast<v4l2_control *>(arg);c.value=f.controls.at(c.id);
++        if(f.clamp&&c.id==V4L2_CID_MPEG_VIDEO_BITRATE)--c.value;return 0;
++    }
++    if(request==VIDIOC_S_PARM)return 0;
++    if(request==VIDIOC_S_SELECTION)return 0;
++    if(request==VIDIOC_S_FMT||request==VIDIOC_G_FMT) {
++        auto &fmt=*static_cast<v4l2_format *>(arg);auto &p=fmt.fmt.pix_mp;
++        if(request==VIDIOC_S_FMT) {
++            f.width=p.width;f.height=p.height;
++            if(fmt.type==V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)f.codec=p.pixelformat;
++            else {f.stride=(p.width+15)&~15u;f.storage=(p.height+7)&~7u;}
++        }
++        p.num_planes=1;p.field=V4L2_FIELD_NONE;
++        p.width=f.stride;p.height=f.storage;
++        p.plane_fmt[0].bytesperline=fmt.type==V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE?f.stride:0;
++        p.plane_fmt[0].sizeimage=f.stride*f.storage*3/2+(fmt.type==V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE?65536:0);
++        p.pixelformat=fmt.type==V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE?f.codec:V4L2_PIX_FMT_NV12;return 0;
++    }
++    if(request==VIDIOC_REQBUFS)return 0;
++    if(request==VIDIOC_QUERYBUF) {
++        auto &q=*static_cast<v4l2_buffer *>(arg);bool cap=q.type==V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++        q.length=1;q.m.planes[0].length=f.stride*f.storage*3/2+(cap?65536:0);
++        q.m.planes[0].m.mem_offset=(cap?100:0)+q.index;return 0;
++    }
++    if(request==VIDIOC_STREAMON)return 0;
++    if(request==VIDIOC_STREAMOFF) {f.output.clear();f.coded.clear();return 0;}
++    if(request==VIDIOC_QBUF) {
++        auto &q=*static_cast<v4l2_buffer *>(arg);
++        if(q.type==V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {f.capture.push_back(q.index);return 0;}
++        assert(f.source_sync_begin==f.source_sync_end&&f.source_sync_end>0);
++        if(f.fail_qbuf){errno=EIO;return -1;}
++        assert(!f.capture.empty());unsigned cap=f.capture.front();f.capture.pop_front();
++        uint8_t payload[]={0,0,0,1,0x65,uint8_t(q.timestamp.tv_usec)};
++        memcpy(f.memory.at(100+cap)+2,payload,sizeof(payload));
++        f.output.push_back({q.index,q.timestamp});f.coded.push_back({cap,q.timestamp});++f.submitted;return 0;
++    }
++    if(request==VIDIOC_DQBUF) {
++        auto &q=*static_cast<v4l2_buffer *>(arg);bool cap=q.type==V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++        auto &queue=cap?f.coded:f.output;
++        if(queue.empty()||(!cap&&f.defer_output)){errno=EAGAIN;return -1;}
++        auto item=queue.front();queue.pop_front();q.index=item.index;q.timestamp=item.timestamp;
++        if(cap){q.m.planes[0].data_offset=2;q.m.planes[0].bytesused=8;}return 0;
++    }
++    assert(!"unexpected ioctl, including EXPBUF/MSM on CPU path");return -1;
++}
++}
++#define open fake_open
++#define close fake_close
++#define fcntl fake_fcntl
++#define mmap fake_mmap
++#define ioctl fake_ioctl
++#define poll fake_poll
++#include "../../src/encoder.cpp"
++#include "../../src/surface-copy.cpp"
++#include "../../src/cpu-copy.cpp"
++#undef open
++#undef close
++#undef fcntl
++#undef mmap
++#undef ioctl
++#undef poll
++extern "C" int irisva_msm_allocate(int,uint64_t,int *) {assert(!"MSM called for T880");return -1;}
++namespace irisva {
++Memory::~Memory(){free(mapping);}
++uint8_t *Memory::map(){assert(mapping);return static_cast<uint8_t *>(mapping);}
++Buffer::~Buffer()=default;
++}
++#include "encoder-rc-fixtures.inc"
++std::shared_ptr<Surface> input() {
++    auto s=std::make_shared<Surface>();s->width=160;s->height=128;
++    auto m=std::make_shared<Memory>();m->origin=MemoryOrigin::DmaHeap;m->fd=1100;
++    m->width=160;m->height=128;m->stride=192;m->storage_height=128;m->size=192*128*3/2;
++    m->mapping=malloc(m->size);memset(m->mapping,73,m->size);s->memory=m;return s;
++}
++EncodeSettings settings(unsigned mode) {
++    EncodeSettings s{};s.has_sequence=true;s.rate_control=mode;s.min_qp=s.max_qp=0;
++    s.sequence.picture_width_in_mbs=10;s.sequence.picture_height_in_mbs=8;s.sequence.level_idc=30;
++    s.sequence.seq_fields.bits.frame_mbs_only_flag=1;s.sequence.seq_fields.bits.chroma_format_idc=1;
++    s.sequence.max_num_ref_frames=1;s.sequence.intra_period=s.sequence.intra_idr_period=30;s.sequence.ip_period=1;
++    Buffer b{};b.elements=1;b.type=VAEncMiscParameterBufferType;
++    b.data.resize(offsetof(VAEncMiscParameterBuffer,data)+sizeof(VAEncMiscParameterRateControl));
++    auto type=VAEncMiscParameterTypeRateControl;memcpy(b.data.data(),&type,sizeof(type));
++    auto bytes=mode==VA_RC_AVBR?ffmpeg_avbr:ffmpeg_vbr;
++    memcpy(b.data.data()+offsetof(VAEncMiscParameterBuffer,data),bytes,sizeof(VAEncMiscParameterRateControl));
++    EncodePicture p;render_encode_buffer(s,p,b,true);assert(!s.min_qp&&!s.max_qp);return s;
++}
++EncodePicture picture(bool idr,VASurfaceID id,std::shared_ptr<Surface> recon,std::shared_ptr<Surface> reference={}) {
++    EncodePicture p{};p.has_params=true;p.params.pic_init_qp=26;p.params.pic_fields.bits.idr_pic_flag=idr;p.params.pic_fields.bits.reference_pic_flag=1;
++    p.params.CurrPic.picture_id=id;p.slices.resize(1);p.slices[0].num_macroblocks=80;p.slices[0].slice_type=idr?2:0;
++    p.slices[0].RefPicList0[0].picture_id=idr?VA_INVALID_SURFACE:id-1;
++    p.reconstruction_surface=recon;p.reference_surface=reference;return p;
++}
++std::shared_ptr<Buffer> coded(){auto b=std::make_shared<Buffer>();b->data.resize(1024);return b;}
++template<class F>void rejects(F action){bool failed=false;try{action();}catch(const Error&){failed=true;}assert(failed);}
++int main(){
++ for(auto mode:{VA_RC_VBR,VA_RC_AVBR}) {
++    f=Fake{};auto s=settings(mode);auto a=input(),r1=input(),r2=input();r1->memory.reset();r2->memory.reset();
++    auto p=picture(true,100,r1);Encoder e("fake",160,128,VAProfileH264Main,s,p,3,true);
++    assert(f.controls.at(V4L2_CID_MPEG_VIDEO_GOP_SIZE)==30);
++    auto b=coded();f.defer_output=true;auto task=e.encode(s,p,a,b);
++    assert(r1->reconstruction_only&&r1->pixel_generation==1);
++    assert(!e.sync(task,0)&&task->pending&&!b->coded_ready); // CAPTURE alone is not completion.
++    f.defer_output=false;assert(e.sync(task,VA_TIMEOUT_INFINITE)&&b->coded_ready&&b->coded.size==6);
++    assert(static_cast<uint8_t *>(b->coded.buf)[5]==1);
++    auto q=picture(false,101,r2,r1);q.slices[0].RefPicList0[0].picture_id=99;
++    rejects([&]{e.encode(s,q,a,coded());});q.slices[0].RefPicList0[0].picture_id=100;
++    auto changed=s;changed.sequence.intra_period=changed.sequence.intra_idr_period=31;
++    rejects([&]{e.encode(changed,q,a,coded());});
++    if(mode==VA_RC_VBR) {
++        ++r1->pixel_generation;rejects([&]{e.encode(s,q,a,coded());});--r1->pixel_generation;
++        auto expected_task=r1->encode_task;r1->encode_task=std::make_shared<EncodeTask>();
++        rejects([&]{e.encode(s,q,a,coded());});r1->encode_task=expected_task;
++        auto foreign=input();foreign->memory.reset();foreign->reconstruction_only=true;
++        foreign->pixel_generation=r1->pixel_generation;foreign->encode_task=expected_task;
++        q.reference_surface=foreign;rejects([&]{e.encode(s,q,a,coded());});q.reference_surface=r1;
++        r1->reconstruction_only=false;++r1->pixel_generation;
++        rejects([&]{e.encode(s,q,a,coded());});r1->reconstruction_only=true;--r1->pixel_generation;}
++    auto out=coded();std::weak_ptr<Buffer> weak=out;auto next=e.encode(s,q,a,out);out.reset();
++    assert(!weak.expired());assert(e.sync(next,VA_TIMEOUT_INFINITE));assert(weak.expired());
++    auto force=picture(true,102,r1);auto forced=e.encode(s,force,a,coded());assert(f.forces==1);
++    assert(e.sync(forced,VA_TIMEOUT_INFINITE));e.finish();
++ }
++ // The production guard rejects every outstanding foreign-reconstruction use.
++ {auto a=input(),r=input();r->memory.reset();
++  r->pending=true;rejects([&]{validate_reconstruction_surface(*r,*a,160,128);});r->pending=false;
++  r->mapped_images=1;rejects([&]{validate_reconstruction_surface(*r,*a,160,128);});r->mapped_images=0;
++  r->derived_images=1;rejects([&]{validate_reconstruction_surface(*r,*a,160,128);});r->derived_images=0;
++  r->acquired_handles=1;rejects([&]{validate_reconstruction_surface(*r,*a,160,128);});r->acquired_handles=0;
++  r->persistent_export=true;rejects([&]{validate_reconstruction_surface(*r,*a,160,128);});r->persistent_export=false;
++  validate_reconstruction_surface(*r,*a,160,128);
++ }
++ // Different pitches/storage and limited-range padding; no destination fd IO.
++ {Memory src,dst;src.origin=MemoryOrigin::DmaHeap;src.fd=1100;src.width=dst.width=160;
++  src.height=dst.height=130;src.stride=176;src.storage_height=144;src.size=176*144*3/2;
++  src.mapping=malloc(src.size);memset(src.mapping,42,176*144);
++  memset(static_cast<uint8_t *>(src.mapping)+176*144,99,176*144/2);
++  dst.origin=MemoryOrigin::V4l2Mmap;dst.stride=192;dst.storage_height=136;dst.size=192*136*3/2;dst.mapping=malloc(dst.size);
++  copy_to_v4l2_mmap(dst,src,160,130);auto p=static_cast<uint8_t *>(dst.mapping);size_t uv=192*136;
++  assert(p[129*192+159]==42&&p[160]==16&&p[130*192]==16);
++  assert(p[uv+64*192+159]==99&&p[uv+160]==128&&p[uv+65*192]==128);
++  dst.queued=true;rejects([&]{copy_to_v4l2_mmap(dst,src,160,130);});dst.queued=false;
++  src.stride=159;rejects([&]{copy_to_v4l2_mmap(dst,src,160,130);});
++ }
++ f=Fake{};f.clamp=true;auto s=settings(VA_RC_VBR);auto a=input(),r=input();auto p=picture(true,1,r);
++ rejects([&]{Encoder e("fake",160,128,VAProfileH264Main,s,p,3,true);});
++ f=Fake{};{Encoder e("fake",160,128,VAProfileH264Main,s,p,3,true);f.fail_qbuf=true;
++ auto b=coded();rejects([&]{e.encode(s,p,a,b);});assert(b->encode_task&&!b->encode_task->pending&&!b->coded_ready);}
++ std::cout<<"actual T880 encoder: CPU ownership/fences, controls, RC, both DQBUFs, reference generation, GOP, force and failure lifetime passed\n";
++}

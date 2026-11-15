@@ -1,0 +1,95 @@
+From eed4a24447c31356d73443075c1941a2d2380ce6 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 20 Oct 2026 14:10:21 +0800
+Subject: [PATCH] mtk-soc: report the initial attach APN that was set until the
+ modem lists it
+
+The modem lists the attach APN as PDP context 0 only after attaching with
+it, so the reload right after SetInitialEpsBearerSettings failed with
+NotFound and NetworkManager failed the activation.  Keep the settings that
+were set and report them when context 0 is not listed yet.
+---
+ .../mtk-soc/mm-broadband-modem-mtk-soc.c      | 41 ++++++++++++++++++-
+ 1 file changed, 40 insertions(+), 1 deletion(-)
+
+diff --git a/src/plugins/mtk-soc/mm-broadband-modem-mtk-soc.c b/src/plugins/mtk-soc/mm-broadband-modem-mtk-soc.c
+index 12b3432..869d53e 100644
+--- a/src/plugins/mtk-soc/mm-broadband-modem-mtk-soc.c
++++ b/src/plugins/mtk-soc/mm-broadband-modem-mtk-soc.c
+@@ -864,6 +864,28 @@ set_initial_eps_bearer_settings_finish (MMIfaceModem3gpp  *self,
+     return g_task_propagate_boolean (G_TASK (res), error);
+ }
+ 
++#define MTK_SOC_INITIAL_EPS_DATA "mm-mtk-soc-initial-eps-settings"
++
++static void
++set_ia_ready (GObject      *self,
++              GAsyncResult *res,
++              GTask        *task)
++{
++    GError             *error = NULL;
++    MMBearerProperties *requested = g_task_get_task_data (task);
++
++    if (!mm_mtk_mipc_client_transact_finish (self, res, &error)) {
++        g_task_return_error (task, error);
++    } else {
++        /* The modem lists the attach APN as PDP context 0 only after it has
++         * attached with it; remember what was set for the reload. */
++        g_object_set_data_full (self, MTK_SOC_INITIAL_EPS_DATA,
++                                g_object_ref (requested), g_object_unref);
++        g_task_return_boolean (task, TRUE);
++    }
++    g_object_unref (task);
++}
++
+ static void
+ set_initial_eps_bearer_settings (MMIfaceModem3gpp    *self,
+                                  MMBearerProperties  *config,
+@@ -906,10 +928,11 @@ set_initial_eps_bearer_settings (MMIfaceModem3gpp    *self,
+     }
+ 
+     mm_obj_dbg (self, "setting the initial attach APN (MIPC APN_SET_IA_REQ, IPv4v6)");
++    g_task_set_task_data (task, g_object_ref (config), g_object_unref);
+     mm_mtk_mipc_client_transact (self, request, MM_MTK_MIPC_APN_SET_IA_CNF,
+                                  mtk_soc_mipc_ps (self), MTK_SOC_TXID_SET_IA,
+                                  MTK_SOC_MIPC_TIMEOUT_MS,
+-                                 (GAsyncReadyCallback) mipc_transact_ready, task);
++                                 (GAsyncReadyCallback) set_ia_ready, task);
+ }
+ 
+ static MMBearerProperties *
+@@ -941,8 +964,18 @@ cgdcont_initial_ready (MMBaseModem  *self,
+     for (l = contexts; l; l = g_list_next (l)) {
+         MM3gppPdpContext *pdp = l->data;
+ 
++        MMBearerProperties *set;
++
+         if (pdp->cid != 0)
+             continue;
++        /* Report the settings exactly as requested (auth, IP type) when the
++         * listed attach APN is the one that was set. */
++        set = g_object_get_data (G_OBJECT (self), MTK_SOC_INITIAL_EPS_DATA);
++        if (set && pdp->apn &&
++            g_ascii_strcasecmp (mm_bearer_properties_get_apn (set), pdp->apn) == 0) {
++            properties = g_object_ref (set);
++            break;
++        }
+         properties = mm_bearer_properties_new ();
+         mm_bearer_properties_set_apn (properties, pdp->apn);
+         mm_bearer_properties_set_ip_type (properties, pdp->pdp_type);
+@@ -953,6 +986,12 @@ cgdcont_initial_ready (MMBaseModem  *self,
+     if (properties) {
+         g_clear_error (&error);
+         g_task_return_pointer (task, properties, g_object_unref);
++    } else if (g_object_get_data (G_OBJECT (self), MTK_SOC_INITIAL_EPS_DATA)) {
++        g_clear_error (&error);
++        g_task_return_pointer (task,
++                               g_object_ref (g_object_get_data (G_OBJECT (self),
++                                                                MTK_SOC_INITIAL_EPS_DATA)),
++                               g_object_unref);
+     } else if (error) {
+         g_task_return_error (task, error);
+     } else {
+-- 
+2.55.0
+

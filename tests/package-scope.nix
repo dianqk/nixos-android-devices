@@ -102,6 +102,10 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
   assert packages.usb-signaller.stdenv.buildPlatform.system == buildSystem;
   assert packages.usb-signaller.stdenv.hostPlatform.system == "aarch64-linux";
   assert hostPackages.mobile-device.stdenv.hostPlatform.system == buildSystem;
+  assert packages.makeInitrdNGTool.drvPath == env.buildPackages.makeInitrdNGTool.drvPath;
+  assert hostPackages.makeInitrdNGTool.drvPath == packages.makeInitrdNGTool.drvPath;
+  assert packages.makeInitrdNGTool.stdenv.buildPlatform.system == buildSystem;
+  assert packages.makeInitrdNGTool.stdenv.hostPlatform.system == buildSystem;
   assert packages.usb-signaller.drvPath == flake.packages.${buildSystem}.usb-signaller.drvPath;
   assert hostPackages.mobile-device.drvPath == flake.packages.${buildSystem}.mobile-device.drvPath;
   assert plain.config.androidDevices.usb.signaller.package.drvPath == packages.usb-signaller.drvPath;

@@ -1,0 +1,106 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 25 Oct 2026 21:14:10 +0800
+Subject: [PATCH] drm/panel: xiaomi-n1: power the panel off after the
+ bootloader
+
+The bootloader leaves the N1 running with its vddio, vddd and vci
+supplies on. The first .prepare then only added a use count to each
+regulator and reset the panel with the supplies still on, and the panel
+showed full-screen noise after sleep out. The unblank path, which
+switches the supplies off in .unprepare and powers the panel up from
+cold, is clean.
+
+At probe, after asserting reset, enable the three supplies to take the
+ones the bootloader left on into the driver's use count and switch them
+off with the existing power-off sequence. A failed enable undoes the
+supplies already enabled and leaves probing unaffected. Record when the
+supplies were switched off, and keep them off for at least 100 ms before
+.prepare powers the panel up again.
+
+This reduces the boot handoff artifacts from full-screen noise to a few
+horizontal lines but does not remove them; their cause is still open.
+---
+ drivers/gpu/drm/panel/panel-xiaomi-n1.c | 42 +++++++++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+
+diff --git a/drivers/gpu/drm/panel/panel-xiaomi-n1.c b/drivers/gpu/drm/panel/panel-xiaomi-n1.c
+index 53aeee8..1033c9b 100644
+--- a/drivers/gpu/drm/panel/panel-xiaomi-n1.c
++++ b/drivers/gpu/drm/panel/panel-xiaomi-n1.c
+@@ -7,6 +7,7 @@
+ #include <linux/backlight.h>
+ #include <linux/delay.h>
+ #include <linux/gpio/consumer.h>
++#include <linux/ktime.h>
+ #include <linux/module.h>
+ #include <linux/regulator/consumer.h>
+ #include <drm/display/drm_dsc.h>
+@@ -26,6 +27,7 @@ struct n1_panel {
+ 	struct drm_dsc_config dsc;
+ 	struct gpio_desc *reset;
+ 	struct regulator_bulk_data supplies[3];
++	ktime_t powered_off;
+ 	bool prepared;
+ };
+ 
+@@ -323,6 +325,38 @@ static void n1_power_off(struct n1_panel *ctx)
+ 	regulator_disable(ctx->supplies[1].consumer);
+ 	msleep(3);
+ 	regulator_disable(ctx->supplies[0].consumer);
++	ctx->powered_off = ktime_get();
++}
++
++/* Minimum time with the supplies off before the next power-up. */
++#define N1_POWER_OFF_MS 100
++
++/*
++ * The bootloader leaves the panel running with its supplies on. Resetting it
++ * with the supplies still on showed full-screen noise after sleep out, whereas
++ * the unblank path (supplies off, then a cold power-up) is clean. Take the
++ * supplies the bootloader left on into this driver's use count and switch them
++ * off, so the first .prepare also powers the panel up from cold. This reduces
++ * the boot artifacts to a few horizontal lines but does not remove them; their
++ * cause is not yet known.
++ */
++static void n1_boot_power_off(struct n1_panel *ctx)
++{
++	int i, ret;
++
++	for (i = 0; i < ARRAY_SIZE(ctx->supplies); i++) {
++		ret = regulator_enable(ctx->supplies[i].consumer);
++		if (ret) {
++			dev_warn(&ctx->dsi->dev,
++				 "N1 boot power-off skipped: %s enable failed: %d\n",
++				 ctx->supplies[i].supply, ret);
++			while (i--)
++				regulator_disable(ctx->supplies[i].consumer);
++			return;
++		}
++	}
++	n1_power_off(ctx);
++	dev_info(&ctx->dsi->dev, "N1 supplies switched off after the bootloader\n");
+ }
+ 
+ static int n1_prepare(struct drm_panel *panel)
+@@ -337,6 +371,13 @@ static int n1_prepare(struct drm_panel *panel)
+ 	if (mode < 0)
+ 		return dev_err_probe(&dsi->dev, mode, "unsupported N1 mode\n");
+ 
++	if (ctx->powered_off) {
++		s64 off_ms = ktime_ms_delta(ktime_get(), ctx->powered_off);
++
++		if (off_ms < N1_POWER_OFF_MS)
++			msleep(N1_POWER_OFF_MS - off_ms);
++	}
++
+ 	for (i = 0; i < ARRAY_SIZE(ctx->supplies); i++) {
+ 		ret = regulator_enable(ctx->supplies[i].consumer);
+ 		if (ret) {
+@@ -454,6 +495,7 @@ static int n1_probe(struct mipi_dsi_device *dsi)
+ 	ctx->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+ 	if (IS_ERR(ctx->reset))
+ 		return dev_err_probe(dev, PTR_ERR(ctx->reset), "N1 reset unavailable\n");
++	n1_boot_power_off(ctx);
+ 	ctx->panel.prepare_prev_first = true;
+ 	ctx->panel.backlight = devm_backlight_device_register(dev, "n1-panel", dev,
+ 							     ctx, &n1_bl_ops, &props);

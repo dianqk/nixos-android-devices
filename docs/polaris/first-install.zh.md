@@ -66,10 +66,11 @@ recovery 请求要求 `misc` 为 4 MiB。Recovery 会检查型号、控制器、
 nix build .#system -o result-system
 nix build .#bootstrap-info -o result-bootstrap-info
 nix build .#recovery -o result-recovery
+nix build .#boot -o result-u-boot
 nix profile install .#mobile-device
 ```
 
-三个输出须来自同一锁定配置；系统已包含匹配的 U-Boot 镜像。
+系统、bootstrap-info 和 recovery 须来自同一锁定配置；`result-u-boot` 也可复用兼容的 Polaris U-Boot 镜像。
 
 ## 从 RAM recovery 安装
 
@@ -95,6 +96,15 @@ mobile-device recovery --target RECOVERY_HOST prepare-boot
 mobile-device recovery --target RECOVERY_HOST prepare-boot --execute
 ```
 
+若设备尚未安装兼容的 U-Boot，可从已启动的 RAM recovery 单独刷写：
+
+```sh
+mobile-device recovery --target RECOVERY_HOST install-image result-u-boot \
+  --partition /dev/disk/by-partlabel/boot
+mobile-device recovery --target RECOVERY_HOST install-image result-u-boot \
+  --partition /dev/disk/by-partlabel/boot --execute
+```
+
 检查并安装系统：
 
 ```sh
@@ -105,8 +115,8 @@ mobile-device recovery --target RECOVERY_HOST install-initial "$SYSTEM" \
   --bootstrap-info result-bootstrap-info --execute
 ```
 
-[首次安装器](../initial-install.zh.md)校验闭包、安装 EFI 文件，最后将 U-Boot
-写入 `boot`。安装未完成时会阻止重启；留在 recovery，按安装器的失败处理说明修复。
+[首次安装器](../initial-install.zh.md)校验闭包并安装 EFI 文件。安装未完成时会阻止
+正常启动；留在 recovery，按安装器的失败处理说明修复。
 成功后执行：
 
 ```sh

@@ -1,0 +1,270 @@
+From fa45bd49e7b0fd54688a22f728d80501748402d9 Mon Sep 17 00:00:00 2001
+From: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Date: Tue, 14 Jul 2026 13:44:08 +0200
+Subject: [PATCH] drm/mediatek: Support registering disp controller device
+ subnodes
+
+In order to have a correct description of the hardware in the SoC
+devicetree, look for Display Controller Subsystem sub-components
+declared as subnodes of the display controller itself; to retain
+compatibility with the older devicetrees, also keep looking for
+sub-components in the main /soc node like before.
+
+Signed-off-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Link: https://patchwork.kernel.org/project/linux-mediatek/list/?series=1127365
+[dianqk: from the Huge Restructuring v2 series, applied to v7.3-rc6; rc6 drift resolved]
+---
+ drivers/gpu/drm/mediatek/mtk_drm_drv.c | 218 ++++++++++++++-----------
+ 1 file changed, 121 insertions(+), 97 deletions(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_drv.c b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+index 673219681b..2fe5567960 100644
+--- a/drivers/gpu/drm/mediatek/mtk_drm_drv.c
++++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+@@ -1253,6 +1253,107 @@ static int mtk_drm_of_ddp_path_build(struct device *dev, struct device_node *nod
+ 	return 0;
+ }
+ 
++static int mtk_drm_register_sibling(struct device *dev, struct mtk_drm_private *private,
++				    struct device_node *node, struct component_match **match)
++{
++	enum mtk_ddp_comp_type comp_type;
++	int comp_inst_id;
++	bool comp_found;
++	int ret;
++
++	ret = mtk_drm_of_get_ddp_comp_type(node, &comp_type);
++	if (ret)
++		return -EAGAIN;
++
++	ret = of_device_is_available(node);
++	if (!ret) {
++		dev_dbg(dev, "Skipping disabled component %pOF\n", node);
++		return -EAGAIN;
++	}
++
++	if (comp_type == MTK_DISP_MUTEX) {
++		int id;
++
++		id = of_alias_get_id(node, "mutex");
++		if (id < 0 || id == private->data->mmsys_id) {
++			private->mutex_node = of_node_get(node);
++			dev_dbg(dev, "get mutex for mmsys %d", private->data->mmsys_id);
++		}
++		return 0;
++	}
++
++	comp_inst_id = mtk_ddp_comp_get_id(node, NULL, comp_type);
++	if (comp_inst_id < 0) {
++		dev_info(dev, "Skipping unknown component %pOF\n", node);
++		return 0;
++	}
++
++	if (comp_type == MTK_DISP_DIRECT_LINK)
++		comp_found = mtk_drm_find_directlink_comp(private);
++	else
++		comp_found = mtk_drm_find_mmsys_comp(private,
++						     comp_type, comp_inst_id);
++
++	if (!comp_found)
++		return -EAGAIN;
++
++	/*
++	 * Currently only the AAL, CCORR, COLOR, GAMMA, MERGE, OVL, RDMA, DSI, and DPI
++	 * blocks have separate component platform drivers and initialize their own
++	 * DDP component structure. The others are initialized here.
++	 */
++	if (!mtk_ddp_comp_is_internal_comp(comp_type) &&
++	    !mtk_ovl_adaptor_is_comp_present(node)) {
++		dev_info(dev, "Adding component match for %pOF\n",
++			 node);
++		drm_of_component_match_add(dev, match, component_compare_of,
++					   node);
++	}
++
++	if (comp_type == MTK_DISP_DIRECT_LINK) {
++		for_each_of_graph_port(node, port) {
++			u32 port_id;
++
++			of_property_read_u32(port, "reg", &port_id);
++			if (port_id > 1)
++				continue;
++
++			/* Even ports are inputs, odd ports are outputs */
++			if (port_id % 2)
++				comp_type = MTK_DISP_DIRECT_LINK_OUT;
++
++			for_each_of_graph_port_endpoint(port, ep) {
++				struct of_endpoint of_ep;
++
++				ret = of_graph_parse_endpoint(ep, &of_ep);
++				if (ret)
++					break;
++
++				ret = mtk_ddp_comp_init(dev, node, &private->hlist,
++							private->data->mmsys_id,
++							comp_type, of_ep.id);
++				if (ret)
++					break;
++			}
++
++			if (ret) {
++				of_node_put(node);
++				return ret;
++			}
++		}
++	} else {
++		ret = mtk_ddp_comp_init(dev, node, &private->hlist,
++					private->data->mmsys_id,
++					comp_type, comp_inst_id);
++		if (ret) {
++			of_node_put(node);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
+ static int mtk_drm_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -1315,107 +1416,29 @@ static int mtk_drm_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 
+ 	/* Iterate over sibling DISP function blocks */
+-	for_each_child_of_node(phandle->parent, node) {
+-		enum mtk_ddp_comp_type comp_type;
+-		u8 comp_inst_id;
+-		bool comp_found;
+-
+-		ret = mtk_drm_of_get_ddp_comp_type(node, &comp_type);
+-		if (ret)
+-			continue;
+-
+-		if (!of_device_is_available(node)) {
+-			dev_dbg(dev, "Skipping disabled component %pOF\n",
+-				node);
+-			continue;
+-		}
+-
+-		if (comp_type == MTK_DISP_MUTEX) {
+-			int id;
+-
+-			id = of_alias_get_id(node, "mutex");
+-			if (id < 0 || id == private->data->mmsys_id) {
+-				private->mutex_node = of_node_get(node);
+-				dev_dbg(dev, "get mutex for mmsys %d", private->data->mmsys_id);
+-			}
+-			continue;
+-		}
+-
+-		comp_inst_id = mtk_ddp_comp_get_id(node, NULL, comp_type);
+-		if (comp_inst_id < 0) {
+-			dev_warn(dev, "Skipping unknown component %pOF\n",
+-				 node);
+-			continue;
+-		}
+-
+-		if (comp_type == MTK_DISP_DIRECT_LINK)
+-			comp_found = mtk_drm_find_directlink_comp(private);
+-		else
+-			comp_found = mtk_drm_find_mmsys_comp(private,
+-							     comp_type, comp_inst_id);
+-
+-		if (!comp_found)
+-			continue;
+-
+-		/*
+-		 * Currently only the AAL, CCORR, COLOR, GAMMA, MERGE, OVL, RDMA, DSI, and DPI
+-		 * blocks have separate component platform drivers and initialize their own
+-		 * DDP component structure. The others are initialized here.
+-		 */
+-		if (!mtk_ddp_comp_is_internal_comp(comp_type) &&
+-		    !mtk_ovl_adaptor_is_comp_present(node)) {
+-			dev_info(dev, "Adding component match for %pOF\n",
+-				 node);
+-			drm_of_component_match_add(dev, &match, component_compare_of,
+-						   node);
+-		}
+-
+-		if (comp_type == MTK_DISP_DIRECT_LINK) {
+-			for_each_of_graph_port(node, port) {
+-				u32 port_id;
+-
+-				of_property_read_u32(port, "reg", &port_id);
+-				if (port_id > 1)
+-					continue;
+-
+-				/* Even ports are inputs, odd ports are outputs */
+-				if (port_id % 2)
+-					comp_type = MTK_DISP_DIRECT_LINK_OUT;
+-
+-				for_each_of_graph_port_endpoint(port, ep) {
+-					struct of_endpoint of_ep;
+-
+-					ret = of_graph_parse_endpoint(ep, &of_ep);
+-					if (ret)
+-						break;
+-
+-					ret = mtk_ddp_comp_init(dev, node, &private->hlist,
+-								private->data->mmsys_id,
+-								comp_type, of_ep.id);
+-					if (ret)
+-						break;
+-				}
++	for_each_child_of_node(phandle, node) {
++		ret = mtk_drm_register_sibling(dev, private, node, &match);
++		if (ret && ret != -EAGAIN)
++			goto err_node;
++	}
+ 
+-				if (ret) {
+-					of_node_put(node);
+-					goto err_node;
+-				}
+-			}
+-		} else {
+-			ret = mtk_ddp_comp_init(dev, node, &private->hlist,
+-						private->data->mmsys_id,
+-						comp_type, comp_inst_id);
+-			if (ret) {
+-				of_node_put(node);
+-				goto err_node;
+-			}
+-		}
++	/*
++	 * After the previous loop, it is expected to have all of the display
++	 * controller sibling function blocks registered and added to the list.
++	 *
++	 * If nothing got registered this is a legacy devicetree with DISP
++	 * siblings located under the /soc node instead of being children of
++	 * the main Display Controller node.
++	 */
++	for_each_child_of_node(phandle->parent, node) {
++		ret = mtk_drm_register_sibling(dev, private, node, &match);
++		if (ret && ret != -EAGAIN)
++			goto err_node;
+ 	}
+ 
+ 	if (!private->mutex_node) {
+ 		dev_err(dev, "Failed to find disp-mutex node\n");
+-		ret = -ENODEV;
+-		goto err_node;
++		return -ENODEV;
+ 	}
+ 
+ 	/* If mtk-mutex is not a trigger source, this is an old devicetree */
+@@ -1451,7 +1474,8 @@ static int mtk_drm_probe(struct platform_device *pdev)
+ err_node:
+ 	if (ovl_adaptor)
+ 		platform_device_unregister(ovl_adaptor);
+-	of_node_put(private->mutex_node);
++	if (private->mutex_node)
++		of_node_put(private->mutex_node);
+ 	return ret;
+ }
+ 
+-- 
+2.56.0
+

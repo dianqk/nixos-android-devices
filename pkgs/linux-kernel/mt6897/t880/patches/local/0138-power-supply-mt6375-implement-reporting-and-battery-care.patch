@@ -1,0 +1,1129 @@
+From 30dd3148d99ffc8855a002aff08fbd064b30dfe9 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] power: supply: mt6375: implement reporting and battery care
+
+Report battery and USB input state and implement guarded charging,
+termination, charge behavior and the battery-care window.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T15:35:35+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T17:01:01+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T20:29:20+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T20:50:24+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T21:26:56+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T21:53:56+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T06:02:11+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T06:30:30+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Link: https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/power/supply/mt6375-charger.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/power/supply/mt6375-charger.c#L2261
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/power/supply/Kconfig                |   9 +
+ drivers/power/supply/Makefile               |   1 +
+ drivers/power/supply/mt6375-charge-policy.h |  45 +
+ drivers/power/supply/mt6375-power.c         | 991 ++++++++++++++++++++
+ 4 files changed, 1046 insertions(+)
+ create mode 100644 drivers/power/supply/mt6375-charge-policy.h
+ create mode 100644 drivers/power/supply/mt6375-power.c
+
+diff --git a/drivers/power/supply/Kconfig b/drivers/power/supply/Kconfig
+index b89ef40df7..2558afe4ce 100644
+--- a/drivers/power/supply/Kconfig
++++ b/drivers/power/supply/Kconfig
+@@ -716,6 +716,15 @@ config CHARGER_MT6360
+ 	  Average Input Current Regulation, Battery Temperature Sensing,
+ 	  Over-Temperature Protection, DPDM Detection for BC1.2.
+ 
++config BATTERY_MT6375
++	tristate "MediaTek MT6375 read-only battery and USB input reporting"
++	depends on MFD_MT6375
++	help
++	  Report the battery (charge state, voltage, current, temperature,
++	  OCV-based capacity) and the USB input (presence, voltage, current)
++	  of the MediaTek MT6375 sub-PMIC, without changing any charging
++	  setting.
++
+ config CHARGER_MT6370
+ 	tristate "MediaTek MT6370 Charger Driver"
+ 	depends on MFD_MT6370
+diff --git a/drivers/power/supply/Makefile b/drivers/power/supply/Makefile
+index f3c0d1006c..e06ca449e2 100644
+--- a/drivers/power/supply/Makefile
++++ b/drivers/power/supply/Makefile
+@@ -93,6 +93,7 @@ obj-$(CONFIG_CHARGER_MAX8997)	+= max8997_charger.o
+ obj-$(CONFIG_CHARGER_MAX8998)	+= max8998_charger.o
+ obj-$(CONFIG_CHARGER_MP2629)	+= mp2629_charger.o
+ obj-$(CONFIG_CHARGER_MT6360)	+= mt6360_charger.o
++obj-$(CONFIG_BATTERY_MT6375)	+= mt6375-power.o
+ obj-$(CONFIG_CHARGER_MT6370)	+= mt6370-charger.o
+ obj-$(CONFIG_CHARGER_QCOM_SMBB)	+= qcom_smbb.o
+ obj-$(CONFIG_BATTERY_PM8916_BMS_VM)	+= pm8916_bms_vm.o
+diff --git a/drivers/power/supply/mt6375-charge-policy.h b/drivers/power/supply/mt6375-charge-policy.h
+new file mode 100644
+index 0000000000..235a97d93d
+--- /dev/null
++++ b/drivers/power/supply/mt6375-charge-policy.h
+@@ -0,0 +1,45 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _MT6375_CHARGE_POLICY_H
++#define _MT6375_CHARGE_POLICY_H
++/* Pure policy shared with offline boundary/fault tests; units uV/uA/0.1 C. */
++enum mt6375_charge_decision {
++	MT6375_CHARGE_FAULT, MT6375_CHARGE_STOP, MT6375_CHARGE_RUN,
++};
++
++static inline unsigned int mt6375_input_ceiling_ma(unsigned int contract_ma)
++{
++	return contract_ma < 2200 ? contract_ma : 2200;
++}
++
++static inline unsigned int mt6375_input_target_ma(unsigned int contract_ma)
++{
++	unsigned int ceiling = mt6375_input_ceiling_ma(contract_ma);
++
++	/* Keep regulation margin, never round up; hardware minimum is 100 mA. */
++	return ceiling >= 200 ? (ceiling - 100) / 25 * 25 : 100;
++}
++
++static inline unsigned int mt6375_input_aicr_code(unsigned int contract_ma)
++{
++	return 2 + (mt6375_input_target_ma(contract_ma) - 100) / 25;
++}
++
++static inline enum mt6375_charge_decision
++mt6375_charge_decide(int uv, int ua, int temp, int vbus, int ibus,
++		    unsigned int input_ma, unsigned int cutoff_ma,
++		    int *thermal_stop)
++{
++	/* Android regulates at CV; a sample above that target is not BATOV.
++	 * Hardware status supplies the overvoltage/fault decision separately.
++	 */
++	if (uv < 3000000 || ua > (int)cutoff_ma * 1000 ||
++	    vbus > 5800000 || vbus < 4400000 ||
++	    ibus > (int)mt6375_input_ceiling_ma(input_ma) * 1000)
++		return MT6375_CHARGE_FAULT;
++	if (temp < 100 || temp >= 450)
++		*thermal_stop = 1;
++	else if (temp >= 160 && temp <= 390)
++		*thermal_stop = 0;
++	return *thermal_stop ? MT6375_CHARGE_STOP : MT6375_CHARGE_RUN;
++}
++#endif
+diff --git a/drivers/power/supply/mt6375-power.c b/drivers/power/supply/mt6375-power.c
+new file mode 100644
+index 0000000000..7d72f22641
+--- /dev/null
++++ b/drivers/power/supply/mt6375-power.c
+@@ -0,0 +1,991 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek MT6375 battery, USB input and optional bounded charger control
++ *
++ * The MT6375 sub-PMIC holds the charger, its ADC, the coulomb-counter
++ * gauge (BM) and a housekeeping AUXADC behind several I2C addresses. This
++ * driver reports battery and input state. Charge control is opt-in through
++ * mediatek,enable-charge-control; automatic arming requires auto-charge. TCPM passes limits
++ * synchronously through the parent MFD; a worker validates fresh sensors
++ * before enabling. Electrical/readback/sensor faults require explicit rearm.
++ * Hardware termination is enabled; protections, timers and watchdog are preserved.
++ *
++ * Battery care: charge_behaviour "inhibit-charge" keeps CHG_EN off while the
++ * input keeps powering the system (the buck/power path is not touched), and
++ * charge_control_start/end_threshold hold the battery in a window: charging
++ * stops at the end threshold and resumes below the start threshold (end 100,
++ * the default, disables the window). The worker evaluates the OCV-based
++ * capacity of the same validated sample it uses for the safety checks; every
++ * safety stop, fault latch and charging_armed still applies on top.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/bits.h>
++#include <linux/delay.h>
++#include <linux/platform_device.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/mfd/mt6375-charger.h>
++#include <linux/workqueue.h>
++#include <linux/pm.h>
++#include <linux/jiffies.h>
++#include "mt6375-charge-policy.h"
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/power_supply.h>
++#include <linux/regmap.h>
++#include <linux/unaligned.h>
++
++/* Parent (mt6375 MFD) regmap: (bank << 8) | offset; PMU/charger bank 1 */
++/* Keep regulation margin separate from the absolute measured-current stop. */
++static bool auto_charge = true;
++module_param(auto_charge, bool, 0444);
++MODULE_PARM_DESC(auto_charge,
++		"Allow device-tree automatic charging (disable for maintenance)");
++
++static bool mt6375_auto_arm(bool firmware_auto)
++{
++	return auto_charge && firmware_auto;
++}
++
++#define MT6375_CHARGE_TARGET_MA 2100
++#define MT6375_CHARGE_CUTOFF_MA 2200
++
++#define MT6375_REG_DEV_INFO	0x100
++#define MT6375_REG_CHG_STAT	0x134
++#define MT6375_CHG_STAT_MASK	GENMASK(3, 0)
++#define MT6375_REG_ADC_CFG1	0x1a4
++#define MT6375_ADC_EN		BIT(7)
++#define MT6375_REG_ADC_CFG3	0x1a6
++#define MT6375_ADC_ONESHOT	GENMASK(7, 4)
++#define MT6375_REG_ADC_RPT(ch)	(0x1aa + ((ch) - 1) * 2)
++#define MT6375_REG_CHG_STAT0	0x1e0
++#define MT6375_PWR_RDY		BIT(0)
++
++enum {
++	MT6375_ADC_VBUS = 1,	/* 6250 uV */
++	MT6375_ADC_IBUS = 5,	/* 2500 uA */
++};
++
++/* Gauge (bank 2) */
++#define MT6375_BM_FGADC_CON2	0x26f
++#define MT6375_BM_LATCHDATA_ST	BIT(7)
++#define MT6375_BM_FGADC_CON3	0x270
++#define MT6375_BM_SW_READ_PRE	BIT(0)
++#define MT6375_BM_SW_CLEAR	BIT(3)
++#define MT6375_BM_CUR		0x2e7
++#define MT6375_BM_CUR_UA	610352		/* nA per LSB with 2 mOhm */
++
++/* HK1 (bank 3) */
++#define MT6375_HK1_BATON_MON0	0x388
++#define MT6375_BATON_UNDET	BIT(1)
++
++/* HK2 AUXADC (bank 4) */
++#define MT6375_HK2_RQST0	0x438
++#define MT6375_HK2_BATSNS	0x410	/* request bit 0, 15 bit, 7360 mV */
++#define MT6375_HK2_BATON	0x408	/* request bit 3, 12 bit, 2760 mV */
++#define MT6375_HK2_RDY		BIT(15)
++
++/* Battery NTC: 10 kOhm (B 3380) pulled up by 24 kOhm to 1.84 V */
++#define MT6375_NTC_PULLUP_OHM	24000
++#define MT6375_NTC_VPU_UV	1840000
++
++struct mt6375_ntc_point {
++	int temp_c;
++	u32 ohm;
++};
++
++static const struct mt6375_ntc_point mt6375_ntc[] = {
++	{ -40, 195652 }, { -35, 148171 }, { -30, 113347 }, { -25, 87559 },
++	{ -20, 68237 }, { -15, 53650 }, { -10, 42506 }, { -5, 33892 },
++	{ 0, 27219 }, { 5, 22021 }, { 10, 17926 }, { 15, 14674 },
++	{ 20, 12081 }, { 25, 10000 }, { 30, 8315 }, { 35, 6948 },
++	{ 40, 5834 }, { 45, 4917 }, { 50, 4161 }, { 55, 3535 },
++	{ 60, 3014 }, { 65, 2586 }, { 70, 2228 }, { 75, 1925 },
++	{ 80, 1669 }, { 85, 1452 }, { 90, 1268 }, { 95, 1110 },
++	{ 100, 974 },
++};
++
++struct mt6375_power {
++	struct device *dev;
++	struct regmap *map;
++	struct power_supply *usb, *bat;
++	struct power_supply_battery_info *info;
++	struct mutex lock;
++	struct mt6375_charger *charger;
++	struct delayed_work charge_work;
++	bool armed, fault, suspended, stopping, configured;
++	/* Battery care, under charger->lock. */
++	bool inhibit, window_hold;
++	int start_threshold, end_threshold;
++	int thermal_stop;
++	unsigned int charge_target_ma;
++	int fault_reason;
++
++};
++
++static int mt6375_adc_read(struct mt6375_power *mp, unsigned int ch, int *raw)
++{
++	unsigned int val;
++	u8 buf[2];
++	int ret;
++
++	ret = regmap_read(mp->map, MT6375_REG_ADC_CFG1, &val);
++	if (ret)
++		return ret;
++	/* The bootloader leaves the ADC enabled; do not power it up here */
++	if (!(val & MT6375_ADC_EN))
++		return -ENODATA;
++
++	ret = regmap_update_bits(mp->map, MT6375_REG_ADC_CFG3, MT6375_ADC_ONESHOT,
++				 FIELD_PREP(MT6375_ADC_ONESHOT, ch));
++	if (ret)
++		return ret;
++	usleep_range(4400, 6600);
++	ret = regmap_read_poll_timeout(mp->map, MT6375_REG_ADC_CFG3, val,
++				       !(val & MT6375_ADC_ONESHOT), 100, 2000);
++	if (ret)
++		return ret;
++	ret = regmap_raw_read(mp->map, MT6375_REG_ADC_RPT(ch), buf, 2);
++	if (ret)
++		return ret;
++	*raw = get_unaligned_be16(buf);
++	return 0;
++}
++
++static int mt6375_auxadc_read(struct mt6375_power *mp, unsigned int req,
++			      unsigned int reg, u16 mask, int *raw)
++{
++	unsigned int val;
++	u8 buf[2];
++	int ret;
++
++	ret = regmap_write(mp->map, MT6375_HK2_RQST0, req);
++	if (ret)
++		return ret;
++	usleep_range(1000, 1500);
++	ret = regmap_read_poll_timeout(mp->map, reg + 1, val, val & BIT(7),
++				       500, 11000);
++	if (ret)
++		return ret;
++	ret = regmap_raw_read(mp->map, reg, buf, 2);
++	if (ret)
++		return ret;
++	*raw = get_unaligned_le16(buf) & mask;
++	return 0;
++}
++
++/* Battery current in uA, positive while charging */
++static int mt6375_bat_current(struct mt6375_power *mp, int *ua)
++{
++	unsigned int val;
++	u8 buf[2];
++	int ret, err;
++
++	ret = regmap_update_bits(mp->map, MT6375_BM_FGADC_CON3,
++				 MT6375_BM_SW_READ_PRE, MT6375_BM_SW_READ_PRE);
++	if (ret)
++		return ret;
++	ret = regmap_read_poll_timeout(mp->map, MT6375_BM_FGADC_CON2, val,
++				       val & MT6375_BM_LATCHDATA_ST, 1000, 5000);
++	if (!ret)
++		ret = regmap_raw_read(mp->map, MT6375_BM_CUR, buf, 2);
++
++	/* Always release the latch */
++	err = regmap_update_bits(mp->map, MT6375_BM_FGADC_CON3,
++				 MT6375_BM_SW_CLEAR | MT6375_BM_SW_READ_PRE,
++				 MT6375_BM_SW_CLEAR);
++	if (!err)
++		err = regmap_read_poll_timeout(mp->map, MT6375_BM_FGADC_CON2, val,
++					       !(val & MT6375_BM_LATCHDATA_ST),
++					       1000, 5000);
++	regmap_update_bits(mp->map, MT6375_BM_FGADC_CON3, MT6375_BM_SW_CLEAR, 0);
++	if (ret)
++		return ret;
++	if (err)
++		return err;
++
++	*ua = div_s64((s64)(s16)get_unaligned_le16(buf) * MT6375_BM_CUR_UA, 1000);
++	return 0;
++}
++
++static int mt6375_bat_voltage(struct mt6375_power *mp, int *uv)
++{
++	int raw, ret;
++
++	ret = mt6375_auxadc_read(mp, BIT(0), MT6375_HK2_BATSNS, GENMASK(14, 0), &raw);
++	if (ret)
++		return ret;
++	*uv = div_u64((u64)raw * 7360000, 32768);
++	return 0;
++}
++
++static int mt6375_ntc_temp(u32 ohm)
++{
++	int i;
++
++	if (ohm >= mt6375_ntc[0].ohm)
++		return mt6375_ntc[0].temp_c * 10;
++	for (i = 1; i < ARRAY_SIZE(mt6375_ntc); i++) {
++		const struct mt6375_ntc_point *lo = &mt6375_ntc[i - 1];
++		const struct mt6375_ntc_point *hi = &mt6375_ntc[i];
++
++		if (ohm >= hi->ohm)
++			/* linear between the points, in 0.1 C */
++			return lo->temp_c * 10 +
++			       (int)div_s64((s64)(lo->ohm - ohm) * 10 *
++					    (hi->temp_c - lo->temp_c),
++					    lo->ohm - hi->ohm);
++	}
++	return mt6375_ntc[ARRAY_SIZE(mt6375_ntc) - 1].temp_c * 10;
++}
++
++/* Battery temperature in 0.1 C */
++static int mt6375_bat_temp(struct mt6375_power *mp, int *temp)
++{
++	int raw, ret;
++	u64 uv;
++
++	ret = mt6375_auxadc_read(mp, BIT(3), MT6375_HK2_BATON, GENMASK(11, 0), &raw);
++	if (ret)
++		return ret;
++	uv = div_u64((u64)raw * 2760000, 4096);
++	if (uv >= MT6375_NTC_VPU_UV)
++		return -ENODATA;
++	*temp = mt6375_ntc_temp(div64_u64(uv * MT6375_NTC_PULLUP_OHM,
++					  MT6375_NTC_VPU_UV - uv));
++	return 0;
++}
++
++static int mt6375_online(struct mt6375_power *mp)
++{
++	unsigned int val;
++	int ret;
++
++	ret = regmap_read(mp->map, MT6375_REG_CHG_STAT0, &val);
++	return ret ?: !!(val & MT6375_PWR_RDY);
++}
++
++static int mt6375_bat_status(struct mt6375_power *mp)
++{
++	unsigned int val;
++	int online, ret;
++
++	online = mt6375_online(mp);
++	if (online < 0)
++		return online;
++	if (!online)
++		return POWER_SUPPLY_STATUS_DISCHARGING;
++	ret = regmap_read(mp->map, MT6375_REG_CHG_STAT, &val);
++	if (ret)
++		return ret;
++	switch (FIELD_GET(MT6375_CHG_STAT_MASK, val)) {
++	case 2 ... 6:	/* trickle, pre, fast, end of charge, background */
++		return POWER_SUPPLY_STATUS_CHARGING;
++	case 7:		/* done */
++		return POWER_SUPPLY_STATUS_FULL;
++	default:	/* sleep, VBUS ready, fault */
++		return POWER_SUPPLY_STATUS_NOT_CHARGING;
++	}
++}
++
++static int mt6375_capacity_of(struct mt6375_power *mp, int uv, int ua, int *cap)
++{
++	struct power_supply_battery_info *info = mp->info;
++
++	if (!info || !info->ocv_table_size[0])
++		return -ENODATA;
++	/* Open-circuit voltage: remove the drop over the internal resistance */
++	if (info->factory_internal_resistance_uohm > 0)
++		uv -= div_s64((s64)ua * info->factory_internal_resistance_uohm,
++			      1000000);
++	*cap = power_supply_batinfo_ocv2cap(info, uv, 25);
++	return *cap < 0 ? *cap : 0;
++}
++
++static int mt6375_bat_capacity(struct mt6375_power *mp, int *cap)
++{
++	int uv, ua, ret;
++
++	ret = mt6375_bat_voltage(mp, &uv);
++	if (ret)
++		return ret;
++	ret = mt6375_bat_current(mp, &ua);
++	if (ret)
++		return ret;
++	return mt6375_capacity_of(mp, uv, ua, cap);
++}
++
++static int mt6375_bat_get(struct power_supply *psy,
++			  enum power_supply_property psp,
++			  union power_supply_propval *val)
++{
++	struct mt6375_power *mp = power_supply_get_drvdata(psy);
++	struct power_supply_battery_info *info = mp->info;
++	unsigned int reg;
++	int ret = 0;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD: {
++		if (!mp->charger)
++			return -ENODATA;
++		guard(mutex)(&mp->charger->lock);
++		if (psp == POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR)
++			val->intval = mp->inhibit ?
++				POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE :
++				POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
++		else if (psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD)
++			val->intval = mp->start_threshold;
++		else
++			val->intval = mp->end_threshold;
++		return 0;
++	}
++	default:
++		break;
++	}
++
++	guard(mutex)(&mp->lock);
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_PRESENT:
++		ret = regmap_read(mp->map, MT6375_HK1_BATON_MON0, &reg);
++		if (!ret)
++			val->intval = !(reg & MT6375_BATON_UNDET);
++		break;
++	case POWER_SUPPLY_PROP_STATUS:
++		ret = mt6375_bat_status(mp);
++		if (ret >= 0) {
++			val->intval = ret;
++			ret = 0;
++		}
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++		ret = mt6375_bat_voltage(mp, &val->intval);
++		break;
++	case POWER_SUPPLY_PROP_CURRENT_NOW:
++		ret = mt6375_bat_current(mp, &val->intval);
++		break;
++	case POWER_SUPPLY_PROP_TEMP:
++		ret = mt6375_bat_temp(mp, &val->intval);
++		break;
++	case POWER_SUPPLY_PROP_CAPACITY:
++		ret = mt6375_bat_capacity(mp, &val->intval);
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
++		if (!info || info->charge_full_design_uah <= 0)
++			return -ENODATA;
++		val->intval = info->charge_full_design_uah;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN:
++		if (!info || info->voltage_max_design_uv <= 0)
++			return -ENODATA;
++		val->intval = info->voltage_max_design_uv;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN:
++		if (!info || info->voltage_min_design_uv <= 0)
++			return -ENODATA;
++		val->intval = info->voltage_min_design_uv;
++		break;
++	case POWER_SUPPLY_PROP_TECHNOLOGY:
++		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
++		break;
++	default:
++		return -EINVAL;
++	}
++	return ret;
++}
++
++static int mt6375_usb_get(struct power_supply *psy,
++			  enum power_supply_property psp,
++			  union power_supply_propval *val)
++{
++	struct mt6375_power *mp = power_supply_get_drvdata(psy);
++	int ret, raw;
++
++	guard(mutex)(&mp->lock);
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_ONLINE:
++		ret = mt6375_online(mp);
++		if (ret < 0)
++			return ret;
++		val->intval = ret;
++		return 0;
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++		ret = mt6375_adc_read(mp, MT6375_ADC_VBUS, &raw);
++		if (!ret)
++			val->intval = raw * 6250;
++		return ret;
++	case POWER_SUPPLY_PROP_CURRENT_NOW:
++		ret = mt6375_adc_read(mp, MT6375_ADC_IBUS, &raw);
++		if (!ret)
++			val->intval = raw * 2500;
++		return ret;
++	default:
++		return -EINVAL;
++	}
++}
++
++static const enum power_supply_property mt6375_bat_props[] = {
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_CURRENT_NOW,
++	POWER_SUPPLY_PROP_TEMP,
++	POWER_SUPPLY_PROP_CAPACITY,
++	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
++	POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN,
++	POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN,
++	POWER_SUPPLY_PROP_TECHNOLOGY,
++	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
++	POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD,
++	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
++};
++
++static const enum power_supply_property mt6375_usb_props[] = {
++	POWER_SUPPLY_PROP_ONLINE,
++	POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_CURRENT_NOW,
++};
++
++static int mt6375_bat_set(struct power_supply *psy,
++			  enum power_supply_property psp,
++			  const union power_supply_propval *val)
++{
++	struct mt6375_power *mp = power_supply_get_drvdata(psy);
++	int v = val->intval;
++
++	if (!mp->charger)
++		return -ENODEV;
++	guard(mutex)(&mp->charger->lock);
++	switch (psp) {
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
++		if (v != POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO &&
++		    v != POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE)
++			return -EINVAL;
++		mp->inhibit = v == POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
++		/* The start must stay below the end (hysteresis). */
++		if (v < 0 || v >= mp->end_threshold)
++			return -EINVAL;
++		mp->start_threshold = v;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
++		if (v < 1 || v > 100)
++			return -EINVAL;
++		mp->end_threshold = v;
++		if (mp->start_threshold >= v)
++			mp->start_threshold = v - 1;
++		if (v == 100)
++			mp->window_hold = false;
++		break;
++	default:
++		return -EINVAL;
++	}
++	/* Re-evaluate at once; the worker reprograms before charging again. */
++	mp->charger->epoch++;
++	mp->configured = false;
++	if (!mp->stopping && !mp->suspended)
++		mod_delayed_work(system_percpu_wq, &mp->charge_work, 0);
++	return 0;
++}
++
++static int mt6375_bat_writeable(struct power_supply *psy,
++				enum power_supply_property psp)
++{
++	return psp == POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR ||
++	       psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD ||
++	       psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD;
++}
++
++static const struct power_supply_desc mt6375_bat_desc = {
++	.name = "mt6375-battery",
++	.type = POWER_SUPPLY_TYPE_BATTERY,
++	.properties = mt6375_bat_props,
++	.num_properties = ARRAY_SIZE(mt6375_bat_props),
++	.get_property = mt6375_bat_get,
++	.set_property = mt6375_bat_set,
++	.property_is_writeable = mt6375_bat_writeable,
++	.charge_behaviours = BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
++			     BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE),
++};
++
++static const struct power_supply_desc mt6375_usb_desc = {
++	.name = "mt6375-usb",
++	.type = POWER_SUPPLY_TYPE_USB,
++	.properties = mt6375_usb_props,
++	.num_properties = ARRAY_SIZE(mt6375_usb_props),
++	.get_property = mt6375_usb_get,
++};
++
++/* Control writes hold charger->lock; sensor collection only holds mp->lock. */
++static int mt6375_charge_field(struct mt6375_power *mp, unsigned int reg,
++			       unsigned int mask, unsigned int value)
++{
++	unsigned int old, check, outgoing;
++	int ret;
++
++	ret = regmap_read(mp->map, reg, &old);
++	if (ret)
++		return ret;
++	outgoing = (old & ~mask) | value;
++	if (reg == 0x120)
++		outgoing &= ~BIT(7); /* PP_PG_FLAG is W1C */
++	if (reg == 0x128)
++		outgoing &= ~BIT(0); /* Never issue EOC_RST */
++	ret = regmap_write(mp->map, reg, outgoing);
++	if (ret)
++		return ret;
++	ret = regmap_read(mp->map, reg, &check);
++	if (ret)
++		return ret;
++	if ((check & mask) != value)
++		return -EIO;
++	/* Verify preserved bits too, excluding the asynchronous W1C flag. */
++	if ((check ^ outgoing) & ~(mask | (reg == 0x120 ? BIT(7) : 0)))
++		return -EIO;
++	return 0;
++}
++
++static int mt6375_charge_off(struct mt6375_power *mp)
++{
++	return mt6375_charge_field(mp, 0x120, BIT(0), 0);
++}
++
++static void mt6375_charge_fault(struct mt6375_power *mp, int reason)
++{
++	int ret;
++
++	mp->fault = true;
++	mp->fault_reason = reason;
++	ret = mt6375_charge_off(mp);
++	dev_err(mp->dev, "charger fault %d, latched off (disable result %d)\n",
++		reason, ret);
++}
++
++static int mt6375_apply_contract(void *ctx, unsigned int ma, unsigned int mv)
++{
++	struct mt6375_power *mp = ctx;
++	int ret;
++
++	/* TCPM lock held: only bounded register I/O, never sensor conversions. */
++	mp->configured = false;
++	ret = mt6375_charge_off(mp);
++	if (!ret)
++		ret = mt6375_charge_field(mp, 0x122, 0x7f,
++			mt6375_input_aicr_code(ma));
++	if (ret)
++		mt6375_charge_fault(mp, ret);
++	if (!mp->stopping)
++		mod_delayed_work(system_percpu_wq, &mp->charge_work, 0);
++	return ret;
++}
++
++static void mt6375_charge_work(struct work_struct *work)
++{
++	struct mt6375_power *mp = container_of(to_delayed_work(work),
++					     struct mt6375_power, charge_work);
++	struct mt6375_charger *c = mp->charger;
++	unsigned int present, state, chg_status;
++	int uv, ua, temp, vbus, ibus, ret;
++	enum mt6375_charge_decision decision;
++	unsigned int actual;
++
++	unsigned long epoch, sampled_at;
++
++	mutex_lock(&c->lock);
++	if (mp->stopping || mp->suspended)
++		goto out;
++	if (!mp->armed || mp->fault ||
++	    mt6375_input_ceiling_ma(c->ma) < 200 || c->mv != 5000) {
++		/* 9 V stays blocked: TCPM standby can request below AICR minimum. */
++		mp->configured = false;
++		ret = mt6375_charge_off(mp);
++		if (ret && !mp->fault)
++			mt6375_charge_fault(mp, ret);
++		goto again;
++	}
++	epoch = c->epoch;
++	mutex_unlock(&c->lock);
++
++	/* TCPM can reduce input/stop charging throughout sensor conversions. */
++	mutex_lock(&mp->lock);
++	sampled_at = jiffies;
++	ret = mt6375_online(mp);
++	if (ret <= 0)
++		goto sampled;
++	ret = regmap_read(mp->map, MT6375_HK1_BATON_MON0, &present);
++	if (ret)
++		goto sampled;
++	if (present & MT6375_BATON_UNDET) {
++		ret = -ENODEV;
++		goto sampled;
++	}
++	ret = mt6375_bat_voltage(mp, &uv);
++	if (ret)
++		goto sampled;
++	ret = mt6375_bat_current(mp, &ua);
++	if (ret)
++		goto sampled;
++	ret = mt6375_bat_temp(mp, &temp);
++	if (ret)
++		goto sampled;
++	ret = mt6375_adc_read(mp, MT6375_ADC_VBUS, &vbus);
++	if (ret)
++		goto sampled;
++	ret = mt6375_adc_read(mp, MT6375_ADC_IBUS, &ibus);
++	if (!ret)
++		ret = regmap_read(mp->map, 0x134, &state);
++	if (!ret)
++		ret = regmap_read(mp->map, 0x1e1, &chg_status);
++	if (!ret)
++		ret = 1;
++sampled:
++	mutex_unlock(&mp->lock);
++	mutex_lock(&c->lock);
++	if (mp->stopping || mp->suspended)
++		goto out;
++	if (epoch != c->epoch)
++		goto again; /* Contract/arm state changed: discard the whole sample. */
++	if (ret < 0)
++		goto fault;
++	if (!ret) {
++		mp->configured = false;
++		ret = mt6375_charge_off(mp);
++		if (ret)
++			goto fault;
++		goto again;
++	}
++	if (time_after(jiffies, sampled_at + msecs_to_jiffies(250))) {
++		ret = -ETIMEDOUT;
++		goto fault;
++	}
++	/* MT6375 CHG_STAT1 bits 3:0: timeout, SYSOV, BATOV, VBUSOV.
++	 * MIVR/AICR/THREG in bits 7:5 are regulation status, not fatal faults.
++	 */
++	if ((state & 0xf) == 8 || (state & 0xf) == 15 || (chg_status & 0xf)) {
++		dev_err(mp->dev, "hardware charger fault: state=%02x status1=%02x\n",
++			state, chg_status);
++		ret = -EIO; /* Hardware fault or unexpected OTG mode. */
++		goto fault;
++	}
++	decision = mt6375_charge_decide(uv, ua, temp, vbus * 6250,
++			ibus * 2500, c->ma, MT6375_CHARGE_CUTOFF_MA, &mp->thermal_stop);
++	if (decision == MT6375_CHARGE_FAULT) {
++		dev_err(mp->dev, "unsafe sample: VBAT=%d IBAT=%d T=%d VBUS=%d IBUS=%d\n",
++			uv, ua, temp, vbus * 6250, ibus * 2500);
++		ret = -ERANGE;
++		goto fault;
++	}
++	if (decision == MT6375_CHARGE_RUN && mp->end_threshold < 100) {
++		int cap;
++
++		/* Unknown capacity never holds; it only keeps the last state. */
++		if (!mt6375_capacity_of(mp, uv, ua, &cap)) {
++			bool hold = mp->window_hold;
++
++			if (cap >= mp->end_threshold)
++				hold = true;
++			else if (cap < mp->start_threshold)
++				hold = false;
++			if (hold != mp->window_hold) {
++				mp->window_hold = hold;
++				dev_info(mp->dev, "battery care: %s at %d%%\n",
++					 hold ? "holding" : "charging", cap);
++				power_supply_changed(mp->bat);
++			}
++		}
++	}
++	if (decision == MT6375_CHARGE_RUN &&
++	    (mp->inhibit || (mp->end_threshold < 100 && mp->window_hold)))
++		decision = MT6375_CHARGE_STOP;
++	if (decision == MT6375_CHARGE_STOP) {
++		mp->configured = false;
++		ret = mt6375_charge_off(mp);
++		if (ret)
++			goto fault;
++		goto again;
++	}
++	if (mp->configured) {
++		/* Audit all fields without toggling the charger every second. */
++		const unsigned int regs[] = { 0x120, 0x122, 0x123, 0x125, 0x126, 0x128 };
++		const unsigned int masks[] = { 1, 0x7f, 0x7f, 0x7f, 0x3f, 0xf2 };
++		const unsigned int expected[] = { 1,
++			mt6375_input_aicr_code(c->ma), 5, 50,
++			mp->charge_target_ma / 50, 0x22 };
++		int i;
++
++		for (i = 0; i < ARRAY_SIZE(regs); i++) {
++			/* DONE may clear CHG_EN; never restart hardware termination. */
++			if (!i && (state & 0xf) == 7)
++				continue;
++			ret = regmap_read(mp->map, regs[i], &actual);
++			if (ret)
++				goto fault;
++			if ((actual & masks[i]) != expected[i]) {
++				ret = -EIO;
++				goto fault;
++			}
++		}
++		goto again;
++	}
++	/* Do not restart a completed battery merely to configure policy. */
++	if ((state & 0xf) == 7)
++		goto again;
++	/* Disable for every configuration change, read back every field. */
++	ret = mt6375_charge_off(mp);
++	if (!ret)
++		ret = mt6375_charge_field(mp, 0x122, 0x7f,
++			mt6375_input_aicr_code(c->ma));
++	if (!ret)
++		ret = mt6375_charge_field(mp, 0x123, 0x7f, 5); /* 4.4 V MIVR */
++	if (!ret)
++		ret = mt6375_charge_field(mp, 0x125, 0x7f, 50); /* 4.40 V CV */
++	if (!ret)
++		ret = mt6375_charge_field(mp, 0x126, 0x3f, mp->charge_target_ma / 50);
++	if (!ret)
++		ret = mt6375_charge_field(mp, 0x128, 0xf2, 0x22); /* 150 mA IEOC, termination enabled */
++	if (!ret)
++		ret = mt6375_charge_field(mp, 0x120, BIT(0), BIT(0));
++	if (ret)
++		goto fault;
++	mp->configured = true;
++	goto again;
++fault:
++	mt6375_charge_fault(mp, ret);
++again:
++	if (!mp->fault)
++		schedule_delayed_work(&mp->charge_work, HZ);
++out:
++	mutex_unlock(&c->lock);
++}
++
++static ssize_t charging_armed_show(struct device *dev,
++				     struct device_attribute *attr, char *buf)
++{
++	struct mt6375_power *mp = dev_get_drvdata(dev);
++
++	guard(mutex)(&mp->charger->lock);
++	return sysfs_emit(buf, "%u\n", mp->armed);
++}
++
++static ssize_t charging_armed_store(struct device *dev,
++				      struct device_attribute *attr,
++				      const char *buf, size_t count)
++{
++	struct mt6375_power *mp = dev_get_drvdata(dev);
++	bool arm;
++	int ret;
++
++	ret = kstrtobool(buf, &arm);
++	if (ret)
++		return ret;
++	guard(mutex)(&mp->charger->lock);
++	ret = mt6375_charge_off(mp);
++	if (ret) {
++		mt6375_charge_fault(mp, ret);
++		return ret;
++	}
++	mp->charger->epoch++;
++	mp->configured = false;
++	mp->armed = arm;
++	/* Only this explicit write clears an electrical/sensor/readback latch. */
++	mp->fault = false;
++	mp->fault_reason = 0;
++	if (!mp->stopping && !mp->suspended)
++		mod_delayed_work(system_percpu_wq, &mp->charge_work, 0);
++	return count;
++}
++static DEVICE_ATTR_RW(charging_armed);
++
++static ssize_t charging_fault_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	struct mt6375_power *mp = dev_get_drvdata(dev);
++
++	guard(mutex)(&mp->charger->lock);
++	return sysfs_emit(buf, "%d\n", mp->fault_reason);
++}
++static DEVICE_ATTR_RO(charging_fault);
++
++static ssize_t charging_current_target_show(struct device *dev,
++					   struct device_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", MT6375_CHARGE_TARGET_MA * 1000);
++}
++static DEVICE_ATTR_RO(charging_current_target);
++
++static ssize_t charging_current_cutoff_show(struct device *dev,
++					   struct device_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", MT6375_CHARGE_CUTOFF_MA * 1000);
++}
++static DEVICE_ATTR_RO(charging_current_cutoff);
++
++static struct attribute *mt6375_charge_attrs[] = {
++	&dev_attr_charging_armed.attr,
++	&dev_attr_charging_fault.attr,
++	&dev_attr_charging_current_target.attr,
++	&dev_attr_charging_current_cutoff.attr,
++	NULL,
++};
++static const struct attribute_group mt6375_charge_group = {
++	.attrs = mt6375_charge_attrs,
++};
++
++static void mt6375_charge_unregister(void *ctx)
++{
++	struct mt6375_power *mp = ctx;
++
++	mutex_lock(&mp->charger->lock);
++	mp->charger->epoch++;
++	mp->stopping = true;
++	mp->armed = false;
++	if (mt6375_charge_off(mp))
++		dev_err(mp->dev, "could not disable charger on removal\n");
++	mp->charger->contract_changed = NULL;
++	mp->charger->ctx = NULL;
++	mutex_unlock(&mp->charger->lock);
++	cancel_delayed_work_sync(&mp->charge_work);
++}
++
++static int mt6375_power_suspend(struct device *dev)
++{
++	struct mt6375_power *mp = dev_get_drvdata(dev);
++	int ret;
++
++	if (!mp->charger)
++		return 0;
++	mutex_lock(&mp->charger->lock);
++	mp->charger->epoch++;
++	mp->configured = false;
++	mp->suspended = true;
++	ret = mt6375_charge_off(mp);
++	if (ret) {
++		mt6375_charge_fault(mp, ret);
++		mp->suspended = false;
++	}
++	mutex_unlock(&mp->charger->lock);
++	cancel_delayed_work_sync(&mp->charge_work);
++	return ret;
++}
++
++static int mt6375_power_resume(struct device *dev)
++{
++	struct mt6375_power *mp = dev_get_drvdata(dev);
++
++	if (mp->charger) {
++		guard(mutex)(&mp->charger->lock);
++		mp->suspended = false;
++		mod_delayed_work(system_percpu_wq, &mp->charge_work, 0);
++	}
++	return 0;
++}
++static DEFINE_SIMPLE_DEV_PM_OPS(mt6375_power_pm, mt6375_power_suspend,
++			       mt6375_power_resume);
++
++static void mt6375_power_shutdown(struct platform_device *pdev)
++{
++	struct mt6375_power *mp = platform_get_drvdata(pdev);
++
++	if (mp->charger) {
++		mutex_lock(&mp->charger->lock);
++		mp->charger->epoch++;
++		mp->stopping = true;
++		if (mt6375_charge_off(mp))
++			dev_err(mp->dev, "could not disable charger on shutdown\n");
++		mutex_unlock(&mp->charger->lock);
++		cancel_delayed_work_sync(&mp->charge_work);
++	}
++}
++
++static int mt6375_power_probe(struct platform_device *pdev)
++{
++	struct power_supply_config cfg = {};
++	struct device *dev = &pdev->dev;
++	struct mt6375_power *mp;
++	unsigned int id;
++	int ret;
++
++	mp = devm_kzalloc(dev, sizeof(*mp), GFP_KERNEL);
++	if (!mp)
++		return -ENOMEM;
++	mp->dev = dev;
++	platform_set_drvdata(pdev, mp);
++	ret = devm_mutex_init(dev, &mp->lock);
++	if (ret)
++		return ret;
++
++	mp->map = dev_get_regmap(dev->parent, NULL);
++	if (!mp->map)
++		return dev_err_probe(dev, -ENODEV, "no parent regmap\n");
++	ret = regmap_read(mp->map, MT6375_REG_DEV_INFO, &id);
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot read DEV_INFO\n");
++
++	cfg.drv_data = mp;
++	cfg.fwnode = dev_fwnode(dev);
++
++	mp->usb = devm_power_supply_register(dev, &mt6375_usb_desc, &cfg);
++	if (IS_ERR(mp->usb))
++		return PTR_ERR(mp->usb);
++	mp->bat = devm_power_supply_register(dev, &mt6375_bat_desc, &cfg);
++	if (IS_ERR(mp->bat))
++		return PTR_ERR(mp->bat);
++
++	ret = power_supply_get_battery_info(mp->bat, &mp->info);
++	if (ret) {
++		dev_warn(dev, "no monitored battery (%d): capacity unknown\n", ret);
++		mp->info = NULL;
++	}
++
++	mp->charger = mt6375_charger_get(dev->parent);
++	if (mp->charger) {
++		/* Leave nominal regulation margin below the measured-current cutoff. */
++		mp->charge_target_ma = MT6375_CHARGE_TARGET_MA;
++		mp->thermal_stop = true;
++		mp->start_threshold = 0;
++		mp->end_threshold = 100;
++		INIT_DELAYED_WORK(&mp->charge_work, mt6375_charge_work);
++		ret = devm_add_action_or_reset(dev, mt6375_charge_unregister, mp);
++		if (ret)
++			return ret;
++		ret = devm_device_add_group(dev, &mt6375_charge_group);
++		if (ret)
++			return ret;
++		mutex_lock(&mp->charger->lock);
++		mp->charger->ctx = mp;
++		mp->charger->contract_changed = mt6375_apply_contract;
++		mp->armed = mt6375_auto_arm(
++			device_property_read_bool(dev, "mediatek,auto-charge"));
++		mp->charger->epoch++;
++		mod_delayed_work(system_percpu_wq, &mp->charge_work, 0);
++		mutex_unlock(&mp->charger->lock);
++	}
++	dev_info(dev, "MT6375 rev %u, charge control %s\n", id & 0x0f,
++		 mp->charger ? (mp->armed ? "automatic" : "disarmed") : "unavailable");
++	return 0;
++}
++
++static const struct of_device_id mt6375_power_of_match[] = {
++	{ .compatible = "mediatek,mt6375-power" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mt6375_power_of_match);
++
++static struct platform_driver mt6375_power_driver = {
++	.driver = {
++		.name = "mt6375-power",
++		.of_match_table = mt6375_power_of_match,
++		.pm = pm_sleep_ptr(&mt6375_power_pm),
++	},
++	.probe = mt6375_power_probe,
++	.shutdown = mt6375_power_shutdown,
++};
++module_platform_driver(mt6375_power_driver);
++
++MODULE_DESCRIPTION("MediaTek MT6375 battery, USB input and bounded charging");
++MODULE_LICENSE("GPL");
+-- 
+2.56.0
+

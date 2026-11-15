@@ -26,6 +26,12 @@
 | `persistentImage.rootfs.device` | 已安装的 ext4 根 |
 | `usb.signaller.address`、`usb.signaller.controlGroup`、控制器和序列号 | USB 管理模块 |
 | `recovery.targetHostName` 和 `recovery.daemon.*`（槽位模型、compatible、控制器、启动请求、存储角色、UFS 安全模式） | Recovery 守护进程配置 |
+| `power.wakeup.sources`（具名 sysfs 唤醒设备） | 可选唤醒源策略（`power.wakeup.enable`/`keep` 由使用者选择） |
+| `audio.orientation.card` 和 `audio.orientation.routes.*`（按输出变换的混音器设置） | 可选的随屏幕方向切换扬声器声道（`audio.orientation.enable` 由使用者选择） |
+| `clock.rtcOffset.enable` 和 `clock.rtcOffset.rtc`（Linux 无法设置的 RTC） | 系统时钟的用户态 RTC 偏移 |
+| `charging.thermalLimit.{currentFile,sensors,steps,defaultCurrent}`（`enable` 由使用者选择） | 按温度分级的充电电流上限 |
+| `charging.window.{battery,startThreshold,endThreshold}`（`enable` 由使用者选择） | 电池养护充电区间 |
+| `power.rtUtilClampMin`（默认 0） | 实时任务的最小利用率钳制 |
 
 除标准 NixOS 选项外，表中的选项前缀都位于 `androidDevices` 下。
 `hardware.<device>.systemHostName` 等设备专属选项只由该设备模块声明和使用，
@@ -59,6 +65,6 @@ recovery 身份标记，但不得用它选择软件包、分区或硬件策略�
 显式分区、DTB 和固件包。它在两种构建平台上检查标准/厂商 FAT 策略、直接内核选择、
 recovery 输入以及缺少固件时的拒绝。其测试夹具仅用于求值，不是可启动镜像。
 
-`tests/eval-platforms.nix` 覆盖五款受支持设备及其现有产物约定。修改公共选项或在
+`tests/eval-platforms.nix` 覆盖五个 U-Boot/EFI 示例系统及其现有产物约定。修改公共选项或在
 模块之间移动策略时，运行[开发指南](development.zh.md)中的检查。构建和硬件验证
 独立于这些求值检查。

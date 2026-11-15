@@ -1,0 +1,188 @@
+From 2d00c863fd403d79dcdfd32dc0cf30cd405b39aa Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 7 Nov 2026 13:47:01 +0800
+Subject: [PATCH 018/144] Bluetooth: qca: complete WCN7860 firmware and
+ board-supply setup
+
+Keep the named-firmware/transmit follow-up with the shared WCN7860 power sequencing.
+
+Consolidated from local follow-ups:
+  4fdd4ee5bef00fae9cfd238211c96ba2b5714326 Bluetooth: qca: complete WCN7860 named-firmware and transmit setup
+  48408ee9fa10e0ee332a501ea86758a8aa5b049f power: sequencing: describe WCN7860 shared board supplies
+---
+ .../net/bluetooth/qcom,wcn7850-bt.yaml        |  3 ++-
+ .../bindings/net/wireless/qcom,ath12k.yaml    |  1 +
+ .../bindings/regulator/qcom,qca6390-pmu.yaml  | 17 +++++++++++++++
+ drivers/bluetooth/btqca.c                     |  2 +-
+ drivers/bluetooth/hci_qca.c                   |  6 ++++--
+ drivers/pci/pwrctrl/pci-pwrctrl-pwrseq.c      |  5 +++++
+ drivers/power/sequencing/pwrseq-qcom-wcn.c    | 21 +++++++++++++++++++
+ 7 files changed, 51 insertions(+), 4 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/net/bluetooth/qcom,wcn7850-bt.yaml b/Documentation/devicetree/bindings/net/bluetooth/qcom,wcn7850-bt.yaml
+index 8108ef83e9..e9f36e91d9 100644
+--- a/Documentation/devicetree/bindings/net/bluetooth/qcom,wcn7850-bt.yaml
++++ b/Documentation/devicetree/bindings/net/bluetooth/qcom,wcn7850-bt.yaml
+@@ -4,7 +4,7 @@
+ $id: http://devicetree.org/schemas/net/bluetooth/qcom,wcn7850-bt.yaml#
+ $schema: http://devicetree.org/meta-schemas/core.yaml#
+ 
+-title: Qualcomm WCN7850 Bluetooth
++title: Qualcomm WCN7850 and WCN7860 Bluetooth
+ 
+ maintainers:
+   - Bartosz Golaszewski <brgl@bgdev.pl>
+@@ -15,6 +15,7 @@ properties:
+   compatible:
+     enum:
+       - qcom,wcn7850-bt
++      - qcom,wcn7860-bt
+ 
+   enable-gpios:
+     maxItems: 1
+diff --git a/Documentation/devicetree/bindings/net/wireless/qcom,ath12k.yaml b/Documentation/devicetree/bindings/net/wireless/qcom,ath12k.yaml
+index dc68dd5998..27947f1d64 100644
+--- a/Documentation/devicetree/bindings/net/wireless/qcom,ath12k.yaml
++++ b/Documentation/devicetree/bindings/net/wireless/qcom,ath12k.yaml
+@@ -17,6 +17,7 @@ properties:
+   compatible:
+     enum:
+       - pci17cb,1107  # WCN7850
++      - pci17cb,110e  # WCN7860
+ 
+   reg:
+     maxItems: 1
+diff --git a/Documentation/devicetree/bindings/regulator/qcom,qca6390-pmu.yaml b/Documentation/devicetree/bindings/regulator/qcom,qca6390-pmu.yaml
+index 105174df7d..307a91c245 100644
+--- a/Documentation/devicetree/bindings/regulator/qcom,qca6390-pmu.yaml
++++ b/Documentation/devicetree/bindings/regulator/qcom,qca6390-pmu.yaml
+@@ -27,6 +27,7 @@ properties:
+           - qcom,wcn6750-pmu
+           - qcom,wcn6855-pmu
+           - qcom,wcn7850-pmu
++          - qcom,wcn7860-pmu
+ 
+   vdd-supply:
+     description: VDD supply regulator handle
+@@ -183,6 +184,22 @@ allOf:
+         - vddrfa1p2-supply
+         - vddrfa1p8-supply
+ 
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: qcom,wcn7860-pmu
++    then:
++      required:
++        - vddaon-supply
++        - vdddig-supply
++        - vddrfa1p2-supply
++        - vddrfa1p8-supply
++        - vddio1p2-supply
++        - vddio-supply
++      properties:
++        vdd-supply: false
++
+ additionalProperties: false
+ 
+ examples:
+diff --git a/drivers/bluetooth/btqca.c b/drivers/bluetooth/btqca.c
+index c135a0cff7..3bc493648f 100644
+--- a/drivers/bluetooth/btqca.c
++++ b/drivers/bluetooth/btqca.c
+@@ -779,7 +779,7 @@ int qca_uart_setup(struct hci_dev *hdev, uint8_t baudrate,
+ 		qca_send_patch_config_cmd(hdev);
+ 
+ 	/* Download rampatch file */
+-	config.type = TLV_TYPE_PATCH;
++	config.type = soc_type == QCA_WCN7860 ? ELF_TYPE_PATCH : TLV_TYPE_PATCH;
+ 	if (rampatch_name) {
+ 		snprintf(config.fwname, sizeof(config.fwname), "qca/%s", rampatch_name);
+ 	} else {
+diff --git a/drivers/bluetooth/hci_qca.c b/drivers/bluetooth/hci_qca.c
+index da82156d40..eea1c8e6b1 100644
+--- a/drivers/bluetooth/hci_qca.c
++++ b/drivers/bluetooth/hci_qca.c
+@@ -1410,7 +1410,7 @@ static int peri_set_baudrate(struct hci_uart *hu, unsigned int baudrate)
+ 
+ 	cmd[6] = qca_get_baudrate_value(baudrate);
+ 
+-	if(!hu->serdev) {
++	if (!hu->serdev) {
+ 		return -ENODEV;
+ 	}
+ 
+@@ -1426,6 +1426,7 @@ static int peri_set_baudrate(struct hci_uart *hu, unsigned int baudrate)
+ 
+ 	skb_put_data(skb, cmd, sizeof(cmd));
+ 	skb_queue_tail(&qca->txq, skb);
++	hci_uart_tx_wakeup(hu);
+ 
+ 	msleep(100);
+ 
+@@ -2560,7 +2561,8 @@ static int qca_serdev_probe(struct serdev_device *serdev)
+ 		if (!qcadev->bt_en &&
+ 		    (data->soc_type == QCA_WCN6750 ||
+ 		     data->soc_type == QCA_WCN6855 ||
+-		     data->soc_type == QCA_WCN7850))
++		     data->soc_type == QCA_WCN7850 ||
++		     data->soc_type == QCA_WCN7860))
+ 			power_ctrl_enabled = false;
+ 
+ 		qcadev->sw_ctrl = devm_gpiod_get_optional(&serdev->dev, "swctrl",
+diff --git a/drivers/pci/pwrctrl/pci-pwrctrl-pwrseq.c b/drivers/pci/pwrctrl/pci-pwrctrl-pwrseq.c
+index c5ced87944..17fbf29eff 100644
+--- a/drivers/pci/pwrctrl/pci-pwrctrl-pwrseq.c
++++ b/drivers/pci/pwrctrl/pci-pwrctrl-pwrseq.c
+@@ -122,6 +122,11 @@ static const struct of_device_id pwrseq_pwrctrl_of_match[] = {
+ 		.compatible = "pci17cb,1107",
+ 		.data = &pwrseq_pwrctrl_qcom_wcn_pdata,
+ 	},
++	{
++		/* ATH12K in WCN7860 package. */
++		.compatible = "pci17cb,110e",
++		.data = &pwrseq_pwrctrl_qcom_wcn_pdata,
++	},
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(of, pwrseq_pwrctrl_of_match);
+diff --git a/drivers/power/sequencing/pwrseq-qcom-wcn.c b/drivers/power/sequencing/pwrseq-qcom-wcn.c
+index 34146d6372..1398379ff5 100644
+--- a/drivers/power/sequencing/pwrseq-qcom-wcn.c
++++ b/drivers/power/sequencing/pwrseq-qcom-wcn.c
+@@ -401,6 +401,23 @@ static const struct pwrseq_qcom_wcn_pdata pwrseq_wcn7850_of_data = {
+ 	.targets = pwrseq_qcom_wcn_targets,
+ };
+ 
++/* Follow the six documented external supply rails on WCN7860 boards. */
++static const char *const pwrseq_wcn7860_vregs[] = {
++	"vddaon",
++	"vdddig",
++	"vddrfa1p2",
++	"vddrfa1p8",
++	"vddio1p2",
++	"vddio",
++};
++
++static const struct pwrseq_qcom_wcn_pdata pwrseq_wcn7860_of_data = {
++	.vregs = pwrseq_wcn7860_vregs,
++	.num_vregs = ARRAY_SIZE(pwrseq_wcn7860_vregs),
++	.pwup_delay_ms = 50,
++	.targets = pwrseq_qcom_wcn_targets,
++};
++
+ static int pwrseq_qcom_wcn_match_regulator(struct pwrseq_device *pwrseq,
+ 					   struct device *dev,
+ 					   const char *name)
+@@ -562,6 +579,10 @@ static const struct of_device_id pwrseq_qcom_wcn_of_match[] = {
+ 		.compatible = "qcom,wcn7850-pmu",
+ 		.data = &pwrseq_wcn7850_of_data,
+ 	},
++	{
++		.compatible = "qcom,wcn7860-pmu",
++		.data = &pwrseq_wcn7860_of_data,
++	},
+ 	{
+ 		.compatible = "qcom,wcn6750-pmu",
+ 		.data = &pwrseq_wcn6750_of_data,

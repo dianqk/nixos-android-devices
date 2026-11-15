@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Thu, 15 Oct 2026 11:19:10 +0800
+Subject: [PATCH 31/31] board: mediatek-mobile: forward the boot framebuffer as
+ no-map
+
+LK reserves its framebuffer without no-map. Forwarded as is, the OS keeps
+it in its linear map, and arm64 refuses to ioremap that RAM, so a
+simple-framebuffer driver cannot take over the panel. Mark reservations
+that overlap the framebuffer no-map in the OS FDT.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ board/mediatek/mediatek-mobile/mediatek-mobile.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/board/mediatek/mediatek-mobile/mediatek-mobile.c b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+index 1b637e882c1..ae76e966dad 100644
+--- a/board/mediatek/mediatek-mobile/mediatek-mobile.c
++++ b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+@@ -1032,7 +1032,12 @@ int ft_board_setup(void *blob, struct bd_info *bd)
+ 		if (node < 0)
+ 			return node;
+ 		ret = fdt_setprop(blob, node, "reg", reg, sizeof(reg));
+-		if (!ret && r->nomap)
++		/*
++		 * LK keeps its framebuffer mapped; the OS must not, so that a
++		 * simple-framebuffer driver can map the scanout buffer.
++		 */
++		if (!ret && (r->nomap ||
++			     mtk_overlaps(r->start, r->size, mtk_fb_start, mtk_fb_size)))
+ 			ret = fdt_setprop_empty(blob, node, "no-map");
+ 		if (ret)
+ 			return ret;
+-- 
+2.55.0
+

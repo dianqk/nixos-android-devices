@@ -1,0 +1,251 @@
+From: Dian QK <dianqk@dianqk.net>
+Date: Tue, 10 Nov 2026 20:43:53 +0800
+Subject: [PATCH] Bluetooth: MT6897: add bounded ownership snapshots
+
+Add optional observations around firmware/driver ownership transitions,
+including the first normal request and the state before the failure
+diagnostics.
+Use the dedicated IFRBUS_AO protection fields before reading validated
+ON-bank mappings, and record the source value accepted by each poll.
+
+The dynamic-debug function selector btmtk_cif_own_snapshot enables these
+observations. Disabled snapshots perform no additional register access or
+mapping, and enabled output is limited to 32 sequential snapshots per
+module lifetime. Driver request/poll/acknowledgment and recovery operations
+remain unchanged. The records describe non-atomic read windows.
+
+Full snapshots also read the SRC_RC channel7 configuration/status endpoint
+to compare its requests and acknowledgments with the connectivity latches.
+An unavailable SRC_RC mapping is reported separately without losing the
+existing ON-bank observations.
+
+Link: https://github.com/soralis0912-dev/kernel_xiaomi_mt6897-mediatek_modules/blob/307ae6e261d670f49e294e90d0c2dc10b0433cf1/connectivity/conninfra/conn_drv/connv2/platform/mt6897/include/CODA/conn_cfg_on.h
+Link: https://github.com/soralis0912-dev/kernel_xiaomi_mt6897-mediatek_modules/blob/307ae6e261d670f49e294e90d0c2dc10b0433cf1/connectivity/conninfra/conn_drv/connv2/platform/mt6897/include/mt6897_pos_gen.h
+Link: https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_mt6897/blob/76792af3e1fefabd34be6dd684bfc9facc4d5b17/kernel/kernel_device_modules-6.1/drivers/misc/mediatek/clkbuf/src/src-data-v1.c
+Signed-off-by: Dian QK <dianqk@dianqk.net>
+---
+--- a/connectivity/bt/mt66xx/btif/btmtk_btif_main.c
++++ b/connectivity/bt/mt66xx/btif/btmtk_btif_main.c
+@@ -13,6 +13,11 @@
+ #include <linux/timer.h>
+ #include <linux/suspend.h>
+ #include <linux/module.h>
++#include <linux/atomic.h>
++#include <linux/dynamic_debug.h>
++#include <linux/io.h>
++#include <linux/ktime.h>
++#include <linux/sizes.h>
+ 
+ #include "btmtk_define.h"
+ #include "btmtk_chip_if.h"
+@@ -412,6 +417,155 @@
+  * Return Value:
+  *     0 if success, otherwise error code
+  */
++#if CONNAC20_CHIPID == 6897 && CFG_BT_ATF_SUPPORT == 0 && defined(CONFIG_DYNAMIC_DEBUG)
++#define BTMTK_OWN_SNAPSHOT_LIMIT 32
++
++/* These are ON-bank controls/status, not BGF off-domain/debug registers. */
++static const u16 btmtk_own_cfg_offsets[] = {
++	0x02c, 0x108, 0x200, 0x208, 0x210, 0x220,
++	0x300, 0x304, 0x308, 0x30c, 0x340, 0x344, 0x348,
++	0x360, 0x364, 0x450, 0x454, 0x460, 0x464, 0x600, 0x640, 0x644,
++};
++
++static bool btmtk_own_bank_valid(unsigned int index, phys_addr_t physical,
++				  unsigned int last)
++{
++	const struct consys_reg_base_addr *bank = &bt_reg.reg_base_addr[index];
++
++	return bank->vir_addr && bank->phy_addr == physical && bank->size >= last + 4;
++}
++
++/*
++ * No extra access when disabled. Snapshots are bounded, sequential observations;
++ * fields may change during the window and do not form an atomic hardware state.
++ */
++static void btmtk_cif_own_snapshot(const char *phase, int retry,
++				   bool polled_valid, u32 polled, bool full)
++{
++	DEFINE_DYNAMIC_DEBUG_METADATA(snapshot_debug, "BT ownership snapshot");
++	static atomic_t count = ATOMIC_INIT(0);
++	void __iomem *guard, *host, *cfg, *rgu, *src;
++	u32 rx = 0, tx = 0, host_values[6], rgu_values[2];
++	u32 cfg_values[ARRAY_SIZE(btmtk_own_cfg_offsets)], src_values[3];
++	char src_rc[96];
++	u64 begin, end;
++	unsigned int i;
++	const char *skip = NULL;
++	bool guards_valid = false;
++	int id;
++
++	if (!DYNAMIC_DEBUG_BRANCH(snapshot_debug))
++		return;
++	id = atomic_fetch_add_unless(&count, 1, BTMTK_OWN_SNAPSHOT_LIMIT);
++	if (id >= BTMTK_OWN_SNAPSHOT_LIMIT)
++		return;
++	id++;
++	begin = ktime_get_boottime_ns();
++
++	/*
++	 * The legacy DT index also serves other resources. Use the documented
++	 * IFRBUS_AO physical guard, not offsets into its 0x10001000 mapping.
++	 */
++	guard = ioremap(0x1002c000, SZ_4K);
++	if (!guard) {
++		skip = "guard-map-failed";
++		goto skipped;
++	}
++	rx = readl(guard + 0x1cc);
++	tx = readl(guard + 0x00c);
++	iounmap(guard);
++	guards_valid = true;
++	if ((rx & BIT(0)) || (tx & BIT(25))) {
++		skip = "ap2conn-protected";
++		goto skipped;
++	}
++	if (!btmtk_own_bank_valid(SPM_BASE_INDEX, 0x18060000, full ? 0xa10 : 0x3c) ||
++	    (full && (!btmtk_own_bank_valid(CONN_INFRA_CFG_BASE_INDEX, 0x18001000, 0x644) ||
++		      !btmtk_own_bank_valid(CONN_INFRA_RGU_BASE_INDEX, 0x18000000, 0x424)))) {
++		skip = "bank-mapping-invalid";
++		goto skipped;
++	}
++
++	/* Read only host shadows before any dense ON-bank observation. */
++	host = (void __iomem *)CON_REG_SPM_BASE_ADDR;
++	host_values[0] = readl(host + 0x30);
++	host_values[1] = readl(host + 0x34);
++	host_values[2] = readl(host + 0x38);
++	host_values[3] = readl(host + 0x3c);
++	if (full) {
++		host_values[4] = readl(host + 0x1a8);
++		host_values[5] = readl(host + 0xa10);
++		rgu = (void __iomem *)CON_REG_INFRA_RGU_ADDR;
++		rgu_values[0] = readl(rgu + 0x414);
++		rgu_values[1] = readl(rgu + 0x424);
++		cfg = (void __iomem *)CON_REG_INFRA_CFG_ADDR;
++		for (i = 0; i < ARRAY_SIZE(btmtk_own_cfg_offsets); i++)
++			cfg_values[i] = readl(cfg + btmtk_own_cfg_offsets[i]);
++		/* SRC_RC is an independent AO endpoint; preserve ON data if unavailable. */
++		src = ioremap(0x1c00d000, SZ_4K);
++		if (src) {
++			src_values[0] = readl(src + 0x004);
++			src_values[1] = readl(src + 0x03c);
++			src_values[2] = readl(src + 0x130);
++			iounmap(src);
++			scnprintf(src_rc, sizeof(src_rc),
++				  "available 1c00d004=%08x 1c00d03c=%08x 1c00d130=%08x",
++				  src_values[0], src_values[1], src_values[2]);
++		} else {
++			scnprintf(src_rc, sizeof(src_rc), "unavailable(map-failed)");
++		}
++	}
++	end = ktime_get_boottime_ns();
++	if (!full) {
++		__dynamic_pr_debug(&snapshot_debug,
++			"BT own snapshot id=%d phase=%s retry=%d poll_valid=%u poll=%08x begin_ns=%llu "
++			"end_ns=%llu non_atomic=1 full=0 1002c1cc=%08x 1002c00c=%08x 18060030=%08x "
++			"18060034=%08x 18060038=%08x 1806003c=%08x\n",
++			id, phase, retry, polled_valid, polled,
++			(unsigned long long)begin, (unsigned long long)end,
++			rx, tx, host_values[0], host_values[1], host_values[2], host_values[3]);
++		return;
++	}
++	__dynamic_pr_debug(&snapshot_debug,
++		"BT own snapshot id=%d phase=%s retry=%d poll_valid=%u poll=%08x begin_ns=%llu "
++		"end_ns=%llu non_atomic=1 full=1 1002c1cc=%08x 1002c00c=%08x 18060030=%08x "
++		"18060034=%08x 18060038=%08x 1806003c=%08x 180601a8=%08x 18060a10=%08x 18000414=%08x "
++		"18000424=%08x 1800102c=%08x 18001108=%08x 18001200=%08x 18001208=%08x 18001210=%08x "
++		"18001220=%08x 18001300=%08x 18001304=%08x 18001308=%08x 1800130c=%08x 18001340=%08x "
++		"18001344=%08x 18001348=%08x 18001360=%08x 18001364=%08x 18001450=%08x 18001454=%08x "
++		"18001460=%08x 18001464=%08x 18001600=%08x 18001640=%08x 18001644=%08x src_rc=%s\n",
++		id, phase, retry, polled_valid, polled,
++		(unsigned long long)begin, (unsigned long long)end,
++		rx, tx, host_values[0], host_values[1], host_values[2], host_values[3],
++		host_values[4], host_values[5], rgu_values[0], rgu_values[1],
++		cfg_values[0], cfg_values[1], cfg_values[2], cfg_values[3], cfg_values[4],
++		cfg_values[5], cfg_values[6], cfg_values[7], cfg_values[8], cfg_values[9],
++		cfg_values[10], cfg_values[11], cfg_values[12], cfg_values[13], cfg_values[14],
++		cfg_values[15], cfg_values[16], cfg_values[17], cfg_values[18], cfg_values[19],
++		cfg_values[20], cfg_values[21], src_rc);
++	return;
++
++skipped:
++	end = ktime_get_boottime_ns();
++	__dynamic_pr_debug(&snapshot_debug,
++		"BT own snapshot id=%d phase=%s retry=%d poll_valid=%u poll=%08x begin_ns=%llu "
++		"end_ns=%llu non_atomic=1 skipped=%s guards_valid=%u 1002c1cc=%08x 1002c00c=%08x\n",
++		id, phase, retry, polled_valid, polled,
++		(unsigned long long)begin, (unsigned long long)end,
++		skip, guards_valid, rx, tx);
++}
++#else
++static inline void btmtk_cif_own_snapshot(const char *phase, int retry,
++					   bool polled_valid, u32 polled, bool full)
++{
++	(void)phase;
++	(void)retry;
++	(void)polled_valid;
++	(void)polled;
++	(void)full;
++}
++#endif
++
+ static int32_t btmtk_cif_fw_own_clr(void)
+ {
+ 	uint32_t lpctl_cr;
+@@ -419,6 +573,7 @@
+ 
+ 	if (g_bt_trace_pt)
+ 		bt_dbg_tp_evt(TP_ACT_DRVOWN_IN, 0, 0, NULL);
++	btmtk_cif_own_snapshot("drv-pre", retry, false, 0, false);
+ 	do {
+ 		/* assume wait interval 0.5ms each time,
+ 		 * wait maximum total 7ms to query status
+@@ -426,6 +581,9 @@
+ 		if ((retry & 0xF) == 0) { /* retry % 16 == 0 */
+ 			if (((retry < LPCR_POLLING_RTY_LMT && retry >= LPCR_MASS_DUMP_LMT) || (retry == 2048) || (retry == 32)) &&
+ 				((retry & 0x1F) == 0)) {
++				if (retry == LPCR_POLLING_RTY_LMT - 32)
++					btmtk_cif_own_snapshot("drv-first-fail", retry,
++							       true, lpctl_cr, true);
+ 				BTMTK_WARN("[DRV_OWN] failed in %d ms, retry[%d]", (LPCR_POLLING_RTY_LMT - retry) / 2, retry);
+ 				bt_dump_cif_own_cr();
+ #if (CFG_BT_ATF_SUPPORT == 1)
+@@ -445,7 +603,10 @@
+ 		}
+ 
+ 		lpctl_cr = REG_READL(BGF_LPCTL);
++		if (retry == LPCR_POLLING_RTY_LMT)
++			btmtk_cif_own_snapshot("drv-first-poll", retry, true, lpctl_cr, false);
+ 		if (!(lpctl_cr & BGF_OWNER_STATE_SYNC_B)) {
++			btmtk_cif_own_snapshot("drv-ack", retry, true, lpctl_cr, false);
+ #if (CFG_BT_ATF_SUPPORT == 1)
+ 			btmtk_cif_fw_own_clr_smc(SMC_BT_FW_OWN_CLR_SECOND);
+ #else
+@@ -493,6 +654,7 @@
+ 
+ 	if (g_bt_trace_pt)
+ 		bt_dbg_tp_evt(TP_ACT_FWOWN_IN, 0, 0, NULL);
++	btmtk_cif_own_snapshot("fw-pre", retry, false, 0, true);
+ 	do {
+ 		if ((retry & 0xF) == 0) { /* retry % 16 == 0 */
+ 			if (((retry < LPCR_POLLING_RTY_LMT && retry >= LPCR_MASS_DUMP_LMT) || (retry == 2048) || (retry == 32)) &&
+@@ -511,6 +673,9 @@
+                                 btmtk_cif_fw_own_set_smc(SMC_BT_FW_OWN_SET_FIRST);
+ #else
+                                 REG_WRITEL(BGF_LPCTL, BGF_HOST_SET_FW_OWN_B);
++				if (retry == LPCR_POLLING_RTY_LMT)
++					btmtk_cif_own_snapshot("fw-first-write", retry,
++							       false, 0, false);
+ #endif
+ 			}
+ 		}
+@@ -526,6 +691,7 @@
+ 		 */
+ 		irqstat_cr = REG_READL(BGF_IRQ_STAT2);
+ 		if (irqstat_cr & BGF_IRQ_FW_OWN_SET_B) {
++			btmtk_cif_own_snapshot("fw-ack", retry, true, irqstat_cr, true);
+ #if (CFG_BT_ATF_SUPPORT == 1)
+ 			btmtk_cif_fw_own_set_smc(SMC_BT_FW_OWN_SET_SECOND);
+ #else

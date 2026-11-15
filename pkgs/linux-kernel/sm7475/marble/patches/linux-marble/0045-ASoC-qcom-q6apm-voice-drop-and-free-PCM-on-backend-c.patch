@@ -1,0 +1,29 @@
+From a14eab541340ecd637d45d5c2c918e951003c24d Mon Sep 17 00:00:00 2001
+From: Tatsuki Tanaka <tatsuki@tanakatatsuki.dev>
+Date: Thu, 15 Oct 2026 15:20:41 +0800
+Subject: [PATCH 45/46] ASoC: qcom: q6apm-voice: drop and free PCM on backend
+ close
+
+When tearing down hostless voice backend sessions, ensure the underlying
+PCM stream drops pending frames and frees allocated hardware resources
+before releasing the substream reference.
+
+Signed-off-by: Tatsuki Tanaka <tatsuki@tanakatatsuki.dev>
+(cherry picked from commit ed120558cd2c5f970edc44e1273a8d7b6caed825)
+---
+ sound/soc/qcom/qdsp6/q6apm-voice-backend.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/sound/soc/qcom/qdsp6/q6apm-voice-backend.c b/sound/soc/qcom/qdsp6/q6apm-voice-backend.c
+index 9aee99533da4..43b11caf8e99 100644
+--- a/sound/soc/qcom/qdsp6/q6apm-voice-backend.c
++++ b/sound/soc/qcom/qdsp6/q6apm-voice-backend.c
+@@ -24,6 +24,8 @@ void q6apm_voice_backend_close(struct snd_pcm_substream **stream)
+ 
+ 	if (!substream)
+ 		return;
++	snd_pcm_kernel_ioctl(substream, SNDRV_PCM_IOCTL_DROP, NULL);
++	snd_pcm_kernel_ioctl(substream, SNDRV_PCM_IOCTL_HW_FREE, NULL);
+ 	guard(mutex)(&substream->pcm->open_mutex);
+ 	snd_pcm_release_substream(substream);
+ 	*stream = NULL;

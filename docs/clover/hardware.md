@@ -1,6 +1,6 @@
 # Hardware support
 
-[Usage guide](README.md) · [中文](hardware.zh.md)
+[Usage guide](README.md) · [Support status](status.md) · [中文](hardware.zh.md)
 
 ## Hardware adaptation
 
@@ -8,7 +8,7 @@
 
 | Area | Adaptation | Status |
 | --- | --- | --- |
-| Boot and storage | SDM660 kernel/DTB, Android boot/recovery, measured eMMC storage roles, ext4 `userdata` | Configured; not boot-tested |
+| Boot and storage | SDM660 kernel/DTB, Android boot/recovery, eMMC storage roles by stock GPT name, ext4 `userdata` | Works: ABL → U-Boot → systemd-boot → Linux 7.3, generation update and rollback, RAM recovery from `recovery` through the same U-Boot (FIT ramdisk). ABL does not start an image whose ramdisk exceeds 35 MiB, so the recovery FIT uses an LZMA kernel and an xz initrd |
 | Display and input | 8-inch LTE panel, FT5406 touch, recovery keys | Configured |
 | GPU and video | Adreno firmware and kernel drivers | Configured; end-to-end use unverified |
 | USB | NCM/SSH in the system; ACM+NCM/SSH in recovery; optional system ACM | Configured; validate the selected transport on hardware |

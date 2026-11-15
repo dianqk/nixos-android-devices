@@ -1,0 +1,307 @@
+From 597b687dd9c8e29503513c57d5ae743abea115ce Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] misc: mediatek: integrate MT6897 modem module builds
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Enable the implemented MT6897 sources through their Kconfig and
+Makefile entries after the component implementations are present.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T07:23:45+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T08:13:54+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T08:44:42+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T17:36:00+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T18:20:28+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-05T15:20:03+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Link: https://github.com/MiCode/MTK_kernel_device_modules (commit 3c4ccd07d5624879555ec710c11bb8818e5cb5c6, drivers/misc/mediatek/eccci, drivers/misc/mediatek/ccmni)
+Source commit: 3c4ccd07d562 "Kernel: Xiaomi kernel_device_modules changes for
+Redmi K70E Android U" by 何发云 <hefayun@xiaomi.com>, 2024-01-12.
+Link: https://github.com/MT6895-Mainline/linux/tree/qqcandy (the MT6895 port, used as a reference for the sysctl path)
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/misc/mediatek/eccci/fsm/ccci_fsm_scp_c.c
+---
+ drivers/misc/Kconfig                          |  1 +
+ drivers/misc/Makefile                         |  1 +
+ drivers/misc/mediatek/Kconfig                 | 17 +++++
+ drivers/misc/mediatek/Makefile                |  5 ++
+ drivers/misc/mediatek/eccci/Kconfig           | 73 ++++---------------
+ drivers/misc/mediatek/eccci/Makefile          |  8 +-
+ drivers/misc/mediatek/eccci/ccci_auxadc.c     |  7 +-
+ .../misc/mediatek/eccci/ccci_common_config.h  |  2 +-
+ drivers/misc/mediatek/eccci/ccci_core.c       |  4 +-
+ drivers/misc/mediatek/eccci/modem_sys.h       |  3 +-
+ 10 files changed, 55 insertions(+), 66 deletions(-)
+ create mode 100644 drivers/misc/mediatek/Kconfig
+ create mode 100644 drivers/misc/mediatek/Makefile
+
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 7364931dad..3dfc6d16d8 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -586,4 +586,5 @@ source "drivers/misc/keba/Kconfig"
+ source "drivers/misc/amd-sbi/Kconfig"
+ source "drivers/misc/rp1/Kconfig"
+ source "drivers/misc/issei/Kconfig"
++source "drivers/misc/mediatek/Kconfig"
+ endmenu
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index e8d8d5d88c..ea4969a0be 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -69,5 +69,6 @@ lan966x-pci-objs		+= lan966x_pci.dtbo.o
+ obj-$(CONFIG_MCHP_LAN966X_PCI)	+= lan966x-pci.o
+ obj-y				+= keba/
+ obj-y				+= amd-sbi/
++obj-y				+= mediatek/
+ obj-$(CONFIG_MISC_RP1)		+= rp1/
+ obj-$(CONFIG_INTEL_SSEI)	+= issei/
+diff --git a/drivers/misc/mediatek/Kconfig b/drivers/misc/mediatek/Kconfig
+new file mode 100644
+index 0000000000..d4bc6b4582
+--- /dev/null
++++ b/drivers/misc/mediatek/Kconfig
+@@ -0,0 +1,17 @@
++# SPDX-License-Identifier: GPL-2.0-only
++menu "MediaTek modem (CCCI) and SCP support"
++	depends on ARCH_MEDIATEK || COMPILE_TEST
++
++source "drivers/misc/mediatek/ccci_util/Kconfig"
++source "drivers/misc/mediatek/eccci/Kconfig"
++source "drivers/misc/mediatek/ccmni/Kconfig"
++
++config MTK_MT6897_SCP_BRINGUP
++	tristate "MT6897 SCP bring-up helper"
++	depends on ARM64 && OF && IIO
++	help
++	  Reports the state of the MT6897 SCP (sensor hub co-processor)
++	  and releases its reset on request through the vendor TF-A SiP
++	  call, logging the call. Bring-up aid for the sensor hub.
++
++endmenu
+diff --git a/drivers/misc/mediatek/Makefile b/drivers/misc/mediatek/Makefile
+new file mode 100644
+index 0000000000..5bcc1498e5
+--- /dev/null
++++ b/drivers/misc/mediatek/Makefile
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_MTK_CCCI_UTIL) += ccci_util/
++obj-$(CONFIG_MTK_ECCCI_DRIVER) += eccci/
++obj-$(CONFIG_MTK_NET_CCMNI) += ccmni/
++obj-$(CONFIG_MTK_MT6897_SCP_BRINGUP) += scp/
+diff --git a/drivers/misc/mediatek/eccci/Kconfig b/drivers/misc/mediatek/eccci/Kconfig
+index 518a1cd9c6..983cab2644 100644
+--- a/drivers/misc/mediatek/eccci/Kconfig
++++ b/drivers/misc/mediatek/eccci/Kconfig
+@@ -1,63 +1,22 @@
++# SPDX-License-Identifier: GPL-2.0-only
+ config MTK_ECCCI_DRIVER
+-	tristate "Enable Evolved CCCI Driver as interface for modem"
+-	depends on MTK_CCCI_DEVICES
+-	select MTK_NET_CCMNI
++	tristate "MediaTek evolved CCCI modem driver"
++	depends on MTK_CCCI_UTIL
++	depends on OF && ARM64
+ 	select PAGE_POOL
+ 	help
+-	  This option enables ECCCI device driver support, if yes,
+-	  then modem1 is using eccci driver, if no,
+-	  eccci driver is disabled.
+-	  The option default disabled.
++	  The MediaTek Cross Core Communication Interface modem driver
++	  (core, state machine, port layer and character devices) with its
++	  CCIF and DPMAIF host interfaces, as used by the MT6897 modem.
+ 
+-config MTK_ECCCI_CLDMA
+-	tristate "ECCCI driver using CLDMA HW to communicate with LTE modem"
+-	depends on MTK_ECCCI_DRIVER
+-	default y
+-	help
+-	  This option enables ECCCI CLDMA driver, if yes,
+-	  then modem1 is using cldma hardware, if no,
+-	  cldma hardware is disabled.
+-	  The option default disabled.
+-
+-config MTK_ECCCI_CCIF
+-	tristate "ECCCI driver using CCIF HW to communicate with LTE modem"
+-	depends on MTK_ECCCI_DRIVER
+-	help
+-	  This option enables ECCCI CCIF driver, if yes,
+-	  then modem1 is using ccif hardware, if no,
+-	  ccif hardware is disabled,
+-	  The option default disabled.
+-
+-config MTK_ECCCI_C2K
+-	bool "ECCCI driver using CCIF HW to communicate with C2K modem"
+-	depends on MTK_ECCCI_DRIVER
+-	help
+-	  This option enables ECCCI CCIF C2K driver, if yes,
+-	  c2k modem is enabled, if no,
+-	  c2k modem is disabled,
+-	  The option default disabled.
+-
+-config MTK_ECCCI_C2K_USB
+-	tristate "ECCCI USB driver using CCIF HW to communicate with C2K modem"
+-	depends on MTK_ECCCI_DRIVER
+-	help
+-	  This option enables ECCCI CCIF C2K's USB driver, if yes,
+-	  c2k modem is enabled, if no,
+-	  c2k modem is disabled,
+-	  The option default disabled.
+-
+-config MTK_SIM_LOCK_POWER_ON_WRITE_PROTECT
+-	bool "sim lock poweron write protect"
+-	help
+-	  To support SIM lock power on write protect  feature, if yes,
+-	  then it is supported, if no,
+-	  it is disabled.
+-	  The option default disabled.
++	  Build it as modules and load them by hand. Loading does not start
++	  the modem: that needs the modem owner in userspace and the secure
++	  monitor calls of the modem power sequence.
+ 
+-config MTK_ECCCI_DEBUG_LOG
+-	bool "MTK_ECCCI_DEBUG"
++config MTK_MT6897_CCCI_SCP
++	tristate "MT6897 CCCI/SCP shared-memory handshake"
++	depends on MTK_ECCCI_DRIVER && MTK_MT6897_SCP_BRINGUP
+ 	help
+-	  This is used for differentiate between user load and userdebug load.
+-	  Say Y here if you need dump ECID info,
+-	  only be opened on userdebug load, if unsure, say N.
+-	  The option default disabled.
++	  Connect the modem state machine to the existing MT6897 SCP mailbox
++	  transport using the shipping APCCCI protocol. This shares the CCCI
++	  core lifetime; manual unbind and module unload are unsupported.
+diff --git a/drivers/misc/mediatek/eccci/Makefile b/drivers/misc/mediatek/eccci/Makefile
+index 7636c03ba3..d80c37ec7f 100644
+--- a/drivers/misc/mediatek/eccci/Makefile
++++ b/drivers/misc/mediatek/eccci/Makefile
+@@ -2,11 +2,11 @@
+ # The MediaTek evolved CCCI modem driver as modules (vendor CCCI_KMODULE
+ # layout): ccci_md_all (core, ports, state machine), ccci_ccif and
+ # ccci_dpmaif (host interfaces), ccci_auxadc (the modem's AUXADC queries).
+-# Not built: CLDMA, C2K and the SCP handshake module.
++# Not built: CLDMA and C2K.
+ E := $(srctree)/drivers/misc/mediatek/eccci
+ ccflags-y += -DCCCI_KMODULE_ENABLE
+ ccflags-y += -I$(E)/compat -I$(E)/inc -I$(E) -I$(E)/hif -I$(E)/port \
+-	     -I$(E)/fsm -I$(E)/udc -I$(E)/udc/udc_lib_inc \
++	     -I$(E)/fsm -I$(srctree)/drivers/misc/mediatek/ccci_util -I$(E)/udc -I$(E)/udc/udc_lib_inc \
+ 	     -I$(srctree)/drivers/misc/mediatek/ccmni \
+ 	     -I$(srctree)/drivers/misc/mediatek/include
+ ccflags-y += -include $(E)/compat/eccci_compat.h
+@@ -39,3 +39,7 @@ ccci_dpmaif-y := hif/net_pool.o hif/md_spd_dvfs_fn.o hif/md_spd_dvfs_method.o \
+ 		 hif/ccci_dpmaif_drv_v2.o hif/ccci_dpmaif_drv_v3.o \
+ 		 hif/ccci_dpmaif_page_pool.o
+ ccflags-y += -DRX_PAGE_POOL
++
++ifneq ($(CONFIG_MTK_MT6897_CCCI_SCP),)
++ccci_md_all-y += fsm/mt6897_ccci_scp.o
++endif
+diff --git a/drivers/misc/mediatek/eccci/ccci_auxadc.c b/drivers/misc/mediatek/eccci/ccci_auxadc.c
+index 44e11aa833..95e53f1286 100644
+--- a/drivers/misc/mediatek/eccci/ccci_auxadc.c
++++ b/drivers/misc/mediatek/eccci/ccci_auxadc.c
+@@ -14,10 +14,11 @@
+ #include "ccci_common_config.h"
+ #include "ccci_core.h"
+ #include "ccci_debug.h"
++#include "ccci_auxadc.h"
+ 
+ #define TAG "ccci_adc"
+ 
+-static struct device *md_adc_pdev;
++static __maybe_unused struct device *md_adc_pdev;
+ static int adc_num;
+ static int adc_val;
+ static int adc_mV;
+@@ -97,7 +98,7 @@ int ccci_get_adc_mV(void)
+ }
+ EXPORT_SYMBOL(ccci_get_adc_mV);
+ 
+-int get_auxadc_probe(struct platform_device *pdev)
++static int get_auxadc_probe(struct platform_device *pdev)
+ {
+ 	int ret;
+ 
+@@ -141,6 +142,7 @@ static int __init ccci_auxadc_init(void)
+ 
+ static void __exit ccci_auxadc_exit(void)
+ {
++	platform_driver_unregister(&ccci_auxadc_driver);
+ }
+ 
+ 
+@@ -150,3 +152,4 @@ module_exit(ccci_auxadc_exit);
+ MODULE_AUTHOR("ccci");
+ MODULE_DESCRIPTION("ccci auxadc driver");
+ MODULE_LICENSE("GPL");
++MODULE_IMPORT_NS("IIO_CONSUMER");
+diff --git a/drivers/misc/mediatek/eccci/ccci_common_config.h b/drivers/misc/mediatek/eccci/ccci_common_config.h
+index 4e5ffab4ec..7f0c503022 100644
+--- a/drivers/misc/mediatek/eccci/ccci_common_config.h
++++ b/drivers/misc/mediatek/eccci/ccci_common_config.h
+@@ -33,7 +33,7 @@
+ #define IPC_L4C_MSG_ID_LEN   (0x40)
+ 
+ /* feature option, always try using platform info first! */
+-#if IS_ENABLED(CONFIG_MTK_TINYSYS_SCP_SUPPORT)
++#if IS_ENABLED(CONFIG_MTK_TINYSYS_SCP_SUPPORT) || IS_ENABLED(CONFIG_MTK_MT6897_CCCI_SCP)
+ #define FEATURE_SCP_CCCI_SUPPORT
+ #endif
+ /*#define ENABLE_EMI_PROTECTION*/
+diff --git a/drivers/misc/mediatek/eccci/ccci_core.c b/drivers/misc/mediatek/eccci/ccci_core.c
+index e98322ef4a..e5172bd753 100644
+--- a/drivers/misc/mediatek/eccci/ccci_core.c
++++ b/drivers/misc/mediatek/eccci/ccci_core.c
+@@ -111,7 +111,7 @@ int ccci_register_dev_node(const char *name, int major_id, int minor)
+ static int __init ccci_init(void)
+ {
+ 	CCCI_INIT_LOG(-1, CORE, "ccci core init\n");
+-	dev_class = class_create(THIS_MODULE, "ccci_node");
++	dev_class = class_create("ccci_node");
+ 	ccci_subsys_bm_init();
+ 	return 0;
+ }
+@@ -126,7 +126,7 @@ MODULE_LICENSE("GPL");
+ int ccci_init(void)
+ {
+ 	CCCI_INIT_LOG(-1, CORE, "ccci core init\n");
+-	dev_class = class_create(THIS_MODULE, "ccci_node");
++	dev_class = class_create("ccci_node");
+ 	ccci_subsys_bm_init();
+ 	return 0;
+ }
+diff --git a/drivers/misc/mediatek/eccci/modem_sys.h b/drivers/misc/mediatek/eccci/modem_sys.h
+index d0d5a6ed99..d6dde2b388 100644
+--- a/drivers/misc/mediatek/eccci/modem_sys.h
++++ b/drivers/misc/mediatek/eccci/modem_sys.h
+@@ -189,8 +189,7 @@ extern u32 mt_irq_get_pending(unsigned int irq);
+ extern int ccci_modem_init_common(struct platform_device *plat_dev,
+ 	struct ccci_dev_cfg *dev_cfg, struct md_hw_info *md_hw);
+ 
+-extern int mrdump_mini_add_extra_file(unsigned long vaddr, unsigned long paddr,
+-	unsigned long size, const char *name);
++
+ #if IS_ENABLED(CONFIG_MTK_IRQ_DBG)
+ extern void mt_irq_dump_status(unsigned int irq);
+ #endif
+-- 
+2.56.0
+

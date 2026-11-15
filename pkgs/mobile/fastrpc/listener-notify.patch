@@ -1,0 +1,48 @@
+Notify systemd only after the static PD listener and its event FD initialize.
+Source baseline: https://github.com/qualcomm/fastrpc/tree/v1.0.7
+
+--- a/src/adsp_default_listener.c
++++ b/src/adsp_default_listener.c
+@@ -25,6 +25,7 @@
+ #include <sys/inotify.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
++#include <systemd/sd-daemon.h>
+ 
+ #define MAX_DOMAIN_URI_SIZE 12
+ #define ROOTPD_NAME "rootpd"
+@@ -339,6 +340,8 @@
+     free(adsp_default_listener1_URI_domain);
+     adsp_default_listener1_URI_domain = NULL;
+   }
++  /* A handle token alone does not mean the static PD was created. */
++  sd_notify(0, "READY=1");
+   // Poll on listener thread
+   pfd.events = POLLIN;
+   pfd.revents = 0;
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -85,6 +85,7 @@
+ libadsp_default_listener_la_SOURCES = $(LIBDEFAULT_LISTENER_SOURCES)
+ libadsp_default_listener_la_DEPENDENCIES = libadsprpc.la
+ libadsp_default_listener_la_LDFLAGS = libadsprpc.la -shared -module $(USE_LOG) -version-number @LT_VERSION_NUMBER@ $(LIBDSPRPC_LDFLAGS)
++libadsp_default_listener_la_LIBADD = -lsystemd
+ libadsp_default_listener_la_CFLAGS = $(ADSP_CFLAGS) -DUSE_SYSLOG
+ 
+ CDSP_CFLAGS = $(LIBDSPRPC_CFLAGS) -DDEFAULT_DOMAIN_ID=3
+@@ -98,6 +99,7 @@
+ libcdsp_default_listener_la_SOURCES = $(LIBDEFAULT_LISTENER_SOURCES)
+ libcdsp_default_listener_la_DEPENDENCIES = libcdsprpc.la
+ libcdsp_default_listener_la_LDFLAGS = libcdsprpc.la -shared -module $(USE_LOG) -version-number @LT_VERSION_NUMBER@ $(LIBDSPRPC_LDFLAGS)
++libcdsp_default_listener_la_LIBADD = -lsystemd
+ libcdsp_default_listener_la_CFLAGS = $(CDSP_CFLAGS) -DUSE_SYSLOG
+ 
+ SDSP_CFLAGS = $(LIBDSPRPC_CFLAGS) -DDEFAULT_DOMAIN_ID=2
+@@ -111,6 +113,7 @@
+ libsdsp_default_listener_la_SOURCES = $(LIBDEFAULT_LISTENER_SOURCES)
+ libsdsp_default_listener_la_DEPENDENCIES = libsdsprpc.la
+ libsdsp_default_listener_la_LDFLAGS = libsdsprpc.la -shared -module $(USE_LOG) -version-number @LT_VERSION_NUMBER@ $(LIBDSPRPC_LDFLAGS)
++libsdsp_default_listener_la_LIBADD = -lsystemd
+ libsdsp_default_listener_la_CFLAGS = $(SDSP_CFLAGS) -DUSE_SYSLOG
+ 
+ sbin_PROGRAMS = adsprpcd cdsprpcd sdsprpcd gdsprpcd

@@ -15,7 +15,8 @@ enable a device option rather than these modules directly:
 
 | Device | Enable | Notes |
 | --- | --- | --- |
-| Aurora | `hardware.aurora.modem.enable = true;` | Experimental. Registration, mobile data and SMS; requires the Android 14 base and the license services. See [Aurora cellular modem](aurora/connectivity.md#cellular-modem-experimental). |
+| Aurora | `hardware.aurora.modem.enable = true;` | Experimental. Registration, mobile data and SMS; requires the Android 16 base OS3.0.308.0.WNACNXM and the license services. See [Aurora cellular modem](aurora/connectivity.md#cellular-modem-experimental). |
+| Marble | `hardware.marble.modem.enable = true;` | Experimental, not yet verified on hardware. rmtfs on `modemst1`, `modemst2`, `fsg` and `fsc` (read-only by default), tqftpserv, the in-kernel pd-mapper and ModemManager; no QTEE license services. |
 | Polaris | `hardware.polaris.radio.snapshotDirectory = "/path";` | Starts MPSS through `rmtfs -s` from a verified read-only calibration snapshot; no clock wait, SIM provisioning or ModemManager integration. See [Polaris](polaris/README.md). |
 
 ## `androidDevices.modem`
@@ -30,9 +31,10 @@ enable a device option rather than these modules directly:
 | `allowNvWrites` | `false` | Let rmtfs write NV data back. When false, modem writes stay in RAM and the service can only read the block devices. |
 | `startAtBoot` | `false` | Start MPSS during boot; otherwise start `modem-mpss.service` manually. |
 | `crashRecovery` | `false` | Let the kernel restart MPSS after a crash. |
-| `timeSyncTimeout` | `120` | Seconds to wait for NTP synchronization before starting MPSS; `0` disables the wait. |
+| `timeSyncTimeout` | `120` | Seconds to wait for NTP synchronization, or for a clock restored by [`androidDevices.clock.rtcOffset`](configuration.md#system-clock-from-a-read-only-rtc) when enabled, before starting MPSS; `0` disables the wait. |
 | `simProvisioning` | `true` | Activate the primary GW provisioning session for the first USIM if the modem has not. |
-| `modemManager` | `true` | Enable ModemManager and start it with MPSS. The packaged daemon carries two local fixes: the netlink transaction use-after-free that crashed it on the first QMAP data connection, and the `WDS Bind Subscription` needed before `Start Network` on SDM845-and-later firmware (otherwise every data call ends with `cm error: no-service`). |
+| `modemManager` | `true` | Enable ModemManager and start it with MPSS. The packaged daemon carries three local fixes: the netlink transaction use-after-free that crashed it on the first QMAP data connection, the multiplexed-bearer cleanup assert on IPA modems, and the `WDS Bind Subscription` needed before `Start Network` on SDM845-and-later firmware (otherwise every data call ends with `cm error: no-service`). |
+| `ims.enable`, `ims.package` | `false`, `pkgs._81voltd` | Serve modem-requested IMS data connections through 81voltd and ModemManager. Does not change IMS registration settings. |
 | `firmware` | `[ ]` | Modem firmware packages, installed in the root file system only. |
 | `rmtfsPackage`, `tqftpservPackage` | packaged defaults | Replace rmtfs or tqftpserv. |
 | `rmtfsVerbose`, `rmtfsMemoryDevice` | `true`, `/dev/qcom_rmtfs_mem1` | rmtfs logging and shared-memory device. |
@@ -42,6 +44,18 @@ The units are `modem-tqftpserv`, `modem-rmtfs`, `modem-mpss` (with
 their own, and `nixos-rebuild switch` does not restart the modem services;
 reboot to apply their changes. A crashed MPSS is left alone rather than
 stopped.
+
+For modem firmware that requests an AP-provided IMS data service, set
+`androidDevices.modem.ims.enable = true`. `modem-ims.service` starts with MPSS
+after ModemManager and serves QRTR service 770. The modem requests the IMS APN
+and IP family; ordinary data profiles remain separate. This supplies the IMS
+data connection, while registration and SMS availability still depend on the
+modem firmware and carrier.
+
+Stopping 81voltd does not disconnect its existing ModemManager bearers. Before
+manually restarting it, record its IMS bearer paths, stop `modem-ims`, then
+explicitly disconnect and delete only those bearers with `mmcli`; retain normal
+data bearers. Rebooting applies configuration changes with a fresh bearer set.
 
 Back up the NV partitions before setting `allowNvWrites = true`, and never
 restore another handset's NV data.

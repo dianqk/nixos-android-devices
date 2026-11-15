@@ -1,0 +1,714 @@
+From 7f45c7b303e6c0d9a9600998470f7fc205678a8d Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Mon, 9 Nov 2026 21:13:07 +0800
+Subject: [PATCH] drm/mediatek: compose MT6897 command words without SRAM RMW
+
+After display-domain power loss, MT6897 command SRAM reads can return
+stale bytes: a bc 33 03 payload loses the middle byte between the
+existing RMW stores, and the following short command retains a long-
+packet header. The resulting words passed to writel are already wrong
+before completion stalls.
+
+Compose MT6897 queue words from the message in software, without using
+SRAM readbacks as inputs. Preserve the OEM CPU path's payload-before-
+header order, then the existing size, SIZE_SEL and start sequence. Pack
+short commands into one header and zero-pad a partial last payload word,
+as the OEM packed-queue representation does. Enable this through an
+explicit MT6897 capability; legacy and other polled layouts retain their
+existing RMW path.
+
+Reject missing payload buffers and lengths exceeding the six-bit count
+before mode changes or hardware writes. Keep the existing bounded
+completion and first-error latch. Direct-write trace entries explicitly
+mark the old value unavailable rather than adding an SRAM read or
+reporting a synthetic zero.
+
+Exercise actual production functions with the observed stale read
+sequences, known emitted words/order, partial and maximum lengths,
+invalid requests, legacy RMW, and both packed and legacy-polled
+read/error/latch behavior.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_dsi.c#L5548
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_dsi.c#L5766
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/gpu/drm/mediatek/mtk_dsi.c            | 103 ++++++--
+ .../selftests/mtk_clk/dsi_routing_cases.c     | 220 +++++++++++++++---
+ .../selftests/mtk_clk/test_dsi_routing.py     |   6 +
+ 3 files changed, 287 insertions(+), 42 deletions(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_dsi.c b/drivers/gpu/drm/mediatek/mtk_dsi.c
+index e787f9fecc..6870b5ac85 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dsi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dsi.c
+@@ -343,7 +343,8 @@ enum mtk_dsi_cmdq_write_kind {
+  * @offset: target register offset
+  * @mask: write mask
+  * @value: masked write argument
+- * @old: value returned by the existing RMW read
++ * @old_valid: whether old was read from the register
++ * @old: value returned by the existing RMW read, if valid
+  * @new: full word passed to writel
+  */
+ struct mtk_dsi_cmdq_write {
+@@ -354,6 +355,7 @@ struct mtk_dsi_cmdq_write {
+ 	u16 offset;
+ 	u32 mask;
+ 	u32 value;
++	bool old_valid;
+ 	u32 old;
+ 	u32 new;
+ };
+@@ -370,6 +372,7 @@ struct mtk_dsi_driver_data {
+ 
+ 	bool has_size_ctl;
+ 	bool cmdq_long_packet_ctl;
++	bool cmdq_software_pack;
+ 	bool support_per_frame_lp;
+ 	bool has_cphy;
+ 	bool restore_cphy_config;
+@@ -1453,7 +1456,7 @@ static u8 mtk_dsi_msg_tx(const struct mipi_dsi_msg *msg, size_t index)
+ static void mtk_dsi_record_cmdq_write(struct mtk_dsi *dsi,
+ 				      const struct mipi_dsi_msg *msg,
+ 				      u16 offset, u32 mask, u32 value,
+-				      u8 kind, u32 old, u32 new)
++				      u8 kind, bool old_valid, u32 old, u32 new)
+ {
+ 	struct mtk_dsi_cmdq_write *rec =
+ 		&dsi->cmdq_write_ring[dsi->cmdq_write_head];
+@@ -1465,6 +1468,7 @@ static void mtk_dsi_record_cmdq_write(struct mtk_dsi *dsi,
+ 	rec->offset = offset;
+ 	rec->mask = mask;
+ 	rec->value = value;
++	rec->old_valid = old_valid;
+ 	rec->old = old;
+ 	rec->new = new;
+ 	dsi->cmdq_write_head = (dsi->cmdq_write_head + 1) %
+@@ -1488,7 +1492,18 @@ static void mtk_dsi_cmdq_mask(struct mtk_dsi *dsi,
+ 	old = readl(dsi->regs + offset);
+ 	new = (old & ~mask) | (value & mask);
+ 	writel(new, dsi->regs + offset);
+-	mtk_dsi_record_cmdq_write(dsi, msg, offset, mask, value, kind, old, new);
++	mtk_dsi_record_cmdq_write(dsi, msg, offset, mask, value, kind, true, old, new);
++}
++
++/* A direct queue write has no observed old value and needs no SRAM read. */
++static void mtk_dsi_cmdq_write(struct mtk_dsi *dsi,
++			       const struct mipi_dsi_msg *msg,
++			       u16 offset, u32 value, u8 kind)
++{
++	writel(value, dsi->regs + offset);
++	if (dsi->config_clk)
++		mtk_dsi_record_cmdq_write(dsi, msg, offset, ~0U, value,
++					  kind, false, 0, value);
+ }
+ 
+ static void mtk_dsi_record_cmd(struct mtk_dsi *dsi,
+@@ -1550,6 +1565,7 @@ static void mtk_dsi_dump_cmdq_writes(struct mtk_dsi *dsi, const char *phase)
+ 	};
+ 	const struct mtk_dsi_cmdq_write *rec;
+ 	u8 start, count, i;
++	char old[sizeof("unavailable")];
+ 
+ 	if (!dsi->cmdq_write_count)
+ 		return;
+@@ -1561,11 +1577,15 @@ static void mtk_dsi_dump_cmdq_writes(struct mtk_dsi *dsi, const char *phase)
+ 	for (i = 0; i < count; i++) {
+ 		rec = &dsi->cmdq_write_ring[(start + i) %
+ 					    MTK_DSI_CMDQ_WRITE_RING_SIZE];
++		if (rec->old_valid)
++			snprintf(old, sizeof(old), "%08x", rec->old);
++		else
++			memcpy(old, "unavailable", sizeof(old));
+ 		dev_info(dsi->host.dev,
+-			 "C-PHY cmdq-write %s[%u]: cmd=%u type=%u tx_len=%zu kind=%s offset=%04x mask=%08x value=%08x old=%08x new=%08x\n",
++			 "C-PHY cmdq-write %s[%u]: cmd=%u type=%u tx_len=%zu kind=%s offset=%04x mask=%08x value=%08x old=%s new=%08x\n",
+ 			 phase, i, rec->cmd, rec->type, rec->tx_len,
+ 			 kind_name[rec->kind], rec->offset, rec->mask,
+-			 rec->value, rec->old, rec->new);
++			 rec->value, old, rec->new);
+ 	}
+ }
+ 
+@@ -2423,15 +2443,31 @@ static u32 mtk_dsi_recv_cnt(u8 type, u8 *read_data)
+ 	return 0;
+ }
+ 
+-static void mtk_dsi_cmdq(struct mtk_dsi *dsi, const struct mipi_dsi_msg *msg)
++static int mtk_dsi_cmdq_check_msg(const struct mipi_dsi_msg *msg)
++{
++	if (msg->tx_len && !msg->tx_buf)
++		return -EINVAL;
++	/* The six-bit count includes the long packet's header word. */
++	if (msg->tx_len > (CMDQ_SIZE - 1) * 4)
++		return -EMSGSIZE;
++	return 0;
++}
++
++static int mtk_dsi_cmdq(struct mtk_dsi *dsi, const struct mipi_dsi_msg *msg)
+ {
+ 	const struct mtk_dsi_driver_data *data = dsi->driver_data;
+ 	const char *tx_buf = msg->tx_buf;
+-	u32 reg_val, cmdq_mask, i, offset, mask, value;
++	u32 reg_val, cmdq_mask, i, j, offset, mask, value;
++	int ret;
+ 	u8 cmdq_size, cmdq_off;
+ 	u8 type = msg->type;
+ 	u8 config;
+ 
++	if (data->cmdq_software_pack) {
++		ret = mtk_dsi_cmdq_check_msg(msg);
++		if (ret)
++			return ret;
++	}
+ 	dsi->cmdq_write_seq++;
+ 
+ 	if (MTK_DSI_HOST_IS_READ(type))
+@@ -2454,16 +2490,36 @@ static void mtk_dsi_cmdq(struct mtk_dsi *dsi, const struct mipi_dsi_msg *msg)
+ 		reg_val = (type << 8) | config;
+ 	}
+ 
+-	for (i = 0; i < msg->tx_len; i++) {
+-		offset = (data->reg_adv[DSI_CMDQ] + cmdq_off + i) & (~0x3U);
+-		mask = 0xffUL << (((i + cmdq_off) & 3U) * 8U);
+-		value = tx_buf[i] << (((i + cmdq_off) & 3U) * 8U);
+-		mtk_dsi_cmdq_mask(dsi, msg, offset, mask, value,
+-					  MTK_DSI_CMDQ_WRITE_DATA);
+-	}
++	if (data->cmdq_software_pack) {
++		const u8 *payload = msg->tx_buf;
+ 
+-	mtk_dsi_cmdq_mask(dsi, msg, data->reg_adv[DSI_CMDQ], cmdq_mask,
++		/* Preserve the CPU path's payload-before-header order. */
++		if (msg->tx_len > 2) {
++			for (i = 0; i < msg->tx_len; i += 4) {
++				value = 0;
++				for (j = 0; j < 4 && i + j < msg->tx_len; j++)
++					value |= (u32)payload[i + j] << (j * 8);
++				mtk_dsi_cmdq_write(dsi, msg,
++						   data->reg_adv[DSI_CMDQ] + 4 + i,
++						   value, MTK_DSI_CMDQ_WRITE_DATA);
++			}
++		} else {
++			for (i = 0; i < msg->tx_len; i++)
++				reg_val |= (u32)payload[i] << (16 + i * 8);
++		}
++		mtk_dsi_cmdq_write(dsi, msg, data->reg_adv[DSI_CMDQ],
++				   reg_val, MTK_DSI_CMDQ_WRITE_CONFIG);
++	} else {
++		for (i = 0; i < msg->tx_len; i++) {
++			offset = (data->reg_adv[DSI_CMDQ] + cmdq_off + i) & (~0x3U);
++			mask = 0xffUL << (((i + cmdq_off) & 3U) * 8U);
++			value = tx_buf[i] << (((i + cmdq_off) & 3U) * 8U);
++			mtk_dsi_cmdq_mask(dsi, msg, offset, mask, value,
++					  MTK_DSI_CMDQ_WRITE_DATA);
++		}
++		mtk_dsi_cmdq_mask(dsi, msg, data->reg_adv[DSI_CMDQ], cmdq_mask,
+ 				  reg_val, MTK_DSI_CMDQ_WRITE_CONFIG);
++	}
+ 	mtk_dsi_cmdq_mask(dsi, msg, data->reg_main[DSI_CMDQ_SIZE],
+ 				  CMDQ_SIZE, cmdq_size,
+ 				  MTK_DSI_CMDQ_WRITE_SIZE);
+@@ -2474,6 +2530,7 @@ static void mtk_dsi_cmdq(struct mtk_dsi *dsi, const struct mipi_dsi_msg *msg)
+ 					  CMDQ_SIZE_SEL, CMDQ_SIZE_SEL,
+ 					  MTK_DSI_CMDQ_WRITE_SIZE_SEL);
+ 	}
++	return 0;
+ }
+ 
+ static void mtk_dsi_latch_cmd_error(struct mtk_dsi *dsi, int error)
+@@ -2499,6 +2556,11 @@ static ssize_t mtk_dsi_host_send_cmd(struct mtk_dsi *dsi,
+ 	bool poll_failed = false, irq_failed = false;
+ 	int ret;
+ 
++	if (dsi->driver_data->cmdq_software_pack) {
++		ret = mtk_dsi_cmdq_check_msg(msg);
++		if (ret)
++			return ret;
++	}
+ 	if (dsi->driver_data->poll_command_done) {
+ 		ret = mtk_dsi_poll_for_idle(dsi);
+ 		if (ret) {
+@@ -2517,7 +2579,9 @@ static ssize_t mtk_dsi_host_send_cmd(struct mtk_dsi *dsi,
+ 	mtk_dsi_irq_data_clear(dsi, flag);
+ 	pre_intsta = readl(dsi->regs +
+ 			   dsi->driver_data->reg_main[DSI_INTSTA]);
+-	mtk_dsi_cmdq(dsi, msg);
++	ret = mtk_dsi_cmdq(dsi, msg);
++	if (ret)
++		return ret;
+ 	mtk_dsi_start(dsi);
+ 	post_start_intsta = readl(dsi->regs +
+ 				  dsi->driver_data->reg_main[DSI_INTSTA]);
+@@ -2583,6 +2647,12 @@ static ssize_t mtk_dsi_host_transfer(struct mipi_dsi_host *host,
+ 			return -EINVAL;
+ 	}
+ 
++	if (dsi->driver_data->cmdq_software_pack) {
++		ret = mtk_dsi_cmdq_check_msg(msg);
++		if (ret)
++			return ret;
++	}
++
+ 	if (dsi->config_clk && !READ_ONCE(dsi->diag_first_cmd)) {
+ 		WRITE_ONCE(dsi->diag_first_cmd, true);
+ 		mtk_dsi_dump_regs(dsi, "first-command");
+@@ -2821,6 +2891,7 @@ static const struct mtk_dsi_driver_data mt6897_dsi_driver_data = {
+ 	.restore_cphy_config = true,
+ 	.poll_command_done = true,
+ 	.cmdq_long_packet_ctl = true,
++	.cmdq_software_pack = true,
+ 	.reg_qos = mtk_dsi_regs_qos_v1,
+ 	.tx_buf = &mt6897_dsi_tx_buf,
+ };
+diff --git a/tools/testing/selftests/mtk_clk/dsi_routing_cases.c b/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
+index 2071d7a992..4b8d4a6bbf 100644
+--- a/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
++++ b/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
+@@ -3,6 +3,7 @@
+ #include <stdbool.h>
+ #include <stdint.h>
+ #include <stdio.h>
++#include <stdarg.h>
+ #include <errno.h>
+ #include <sys/types.h>
+ #include <string.h>
+@@ -26,8 +27,17 @@ typedef int irqreturn_t;
+ #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+ static int log_count;
+ static int dump_log_count;
++static int unavailable_log_count;
+ static void test_log(const char *fmt, ...)
+ {
++	char line[512];
++	va_list args;
++
++	va_start(args, fmt);
++	vsnprintf(line, sizeof(line), fmt, args);
++	va_end(args);
++	if (strstr(line, "old=unavailable"))
++		unavailable_log_count++;
+ 	if (!strncmp(fmt, "C-PHY cmd failure", 17) ||
+ 	    !strncmp(fmt, "C-PHY cmd ring", 14) ||
+ 	    !strncmp(fmt, "C-PHY cmdq-write", 16) ||
+@@ -77,10 +87,10 @@ static void test_log(const char *fmt, ...)
+ #define DSI_BUSY (1U << 31)
+ #define RACK 1
+ #define MIPI_DSI_MSG_USE_LPM 1
+-#define BTA 0x10
+-#define LONG_PACKET 0x20
++#define BTA 4
++#define LONG_PACKET 2
+ #define SHORT_PACKET 0x00
+-#define HSTX 0x40
++#define HSTX 8
+ #define CONFIG 0xff
+ #define DATA_ID 0xff00
+ #define DATA_0 0xff0000
+@@ -133,6 +143,7 @@ struct mtk_dsi_cmdq_write {
+ 	u16 offset;
+ 	u32 mask;
+ 	u32 value;
++	bool old_valid;
+ 	u32 old, new;
+ };
+ struct mtk_dsi_driver_data {
+@@ -143,6 +154,7 @@ struct mtk_dsi_driver_data {
+ 	bool reg_qos;
+ 	bool poll_command_done;
+ 	bool cmdq_long_packet_ctl;
++	bool cmdq_software_pack;
+ };
+ struct mipi_dsi_host {
+ 	struct device *dev;
+@@ -332,6 +344,9 @@ static int mtk_dsi_switch_to_cmd_mode(struct mtk_dsi *d, int flag, int timeout)
+ }
+ static u32 *stale_address;
+ static u32 stale_value;
++static u32 stale_sequence[3];
++static int stale_count, stale_next, sram_reads;
++static u32 *sram_begin, *sram_end;
+ static int bus_count;
+ static struct { u32 *address; u32 old, value; } bus[512];
+ static u32 last_read;
+@@ -342,7 +357,12 @@ static u32 readl(u32 *p)
+ 		watched_reads++;
+ 	if (p == arrive_on_read)
+ 		*w0c_status |= arrive_bits;
+-	last_read = p == stale_address ? stale_value : *p;
++	if (sram_begin && p >= sram_begin && p < sram_end)
++		sram_reads++;
++	if (p == stale_address && stale_next < stale_count)
++		last_read = stale_sequence[stale_next++];
++	else
++		last_read = p == stale_address ? stale_value : *p;
+ 	return last_read;
+ }
+ #define msecs_to_jiffies(x) (x)
+@@ -433,6 +453,14 @@ static const struct mtk_dsi_driver_data v1_data = {
+ 	.reg_main = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
+ 	.tx_buf = true,
+ };
++
++static const struct mtk_dsi_driver_data pack_data = {
++	.reg_adv = (const u16[]){ 0, 0x10, 2, 3 },
++	.reg_main = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
++	.poll_command_done = true,
++	.cmdq_long_packet_ctl = true,
++	.cmdq_software_pack = true,
++};
+ static void setup(bool dual)
+ {
+ 	calls = writes = n = fail_at = 0;
+@@ -441,8 +469,16 @@ static void setup(bool dual)
+ 	mask_count = 0;
+ 	bus_count = 0;
+ 	stale_address = NULL;
++	sram_begin = NULL;
++	sram_end = NULL;
++	stale_count = 0;
++	stale_next = 0;
++	sram_reads = 0;
+ 	reset_engine_calls = 0;
+-	log_count = dump_log_count = clk_rate_calls = 0;
++	log_count = 0;
++	dump_log_count = 0;
++	unavailable_log_count = 0;
++	clk_rate_calls = 0;
+ 	poll_intsta = 0;
+ 	poll_state_count = 0;
+ 	watched_read = w0c_status = arrive_on_read = NULL;
+@@ -561,13 +597,13 @@ static void test_cmdq_operands(void)
+ }
+ 
+ 
+-static void setup_polled(bool dual)
++static void setup_polled(bool dual, const struct mtk_dsi_driver_data *completion)
+ {
+ 	setup(dual);
+ 	memset(regs, 0, sizeof(regs));
+ 	legacy = true;
+ 	for (int i = 0; i < 2; i++) {
+-		d[i].driver_data = &poll_data;
++		d[i].driver_data = completion;
+ 		d[i].power_ready = true;
+ 		d[i].diag_first_cmd = true;
+ 	}
+@@ -591,14 +627,15 @@ static void read_reply_states(void)
+ 	response[1] = 0x9c;
+ }
+ 
+-static void test_polled_completion(void)
++static void test_polled_completion(bool packed)
+ {
++	const struct mtk_dsi_driver_data *completion = packed ? &pack_data : &poll_data;
+ 	struct mipi_dsi_msg write_msg = { .type = 5, .tx_len = 1,
+ 		.tx_buf = tx_payload };
+ 	u8 reply = 0;
+ 	struct mipi_dsi_msg read_msg = { .type = 1, .tx_len = 1,
+ 		.tx_buf = tx_payload, .rx_buf = &reply, .rx_len = 1 };
+-	struct mtk_dsi_driver_data selected = poll_data;
++	struct mtk_dsi_driver_data selected = *completion;
+ 	int previous_writes;
+ 
+ 	/* Actual target mapping omits c00; existing mt8186 mapping retains it. */
+@@ -626,7 +663,7 @@ static void test_polled_completion(void)
+ 	balanced();
+ 
+ 	/* The target IRQ never RACKs or waits, even with RD_READY and BUSY. */
+-	setup_polled(false);
++	setup_polled(false, completion);
+ 	w0c_status = &regs[0][DSI_INTSTA];
+ 	regs[0][DSI_INTEN] = VM_DONE_INT_FLAG;
+ 	regs[0][DSI_INTSTA] = VM_DONE_INT_FLAG | LPRX_RD_RDY_INT_FLAG | DSI_BUSY;
+@@ -635,16 +672,16 @@ static void test_polled_completion(void)
+ 	assert(regs[0][DSI_INTSTA] == (LPRX_RD_RDY_INT_FLAG | DSI_BUSY));
+ 	assert(!mask_count && !poll_calls && reg_reads == 2);
+ 	assert(bus_count == 1 && bus[0].value == ~(u32)VM_DONE_INT_FLAG);
+-	setup_polled(false);
++	setup_polled(false, completion);
+ 	regs[0][DSI_INTSTA] = LPRX_RD_RDY_INT_FLAG | DSI_BUSY;
+ 	regs[0][DSI_INTEN] = LPRX_RD_RDY_INT_FLAG | VM_DONE_INT_FLAG;
+ 	assert(mtk_dsi_irq(0, &d[0]) == IRQ_NONE);
+ 	assert(!writes && !mask_count && !poll_calls);
+-	setup_polled(false);
++	setup_polled(false, completion);
+ 	regs[0][DSI_INTSTA] = VM_DONE_INT_FLAG;
+ 	assert(mtk_dsi_irq(0, &d[0]) == IRQ_NONE);
+ 	assert(!writes && !d[0].irq_data);
+-	setup_polled(false);
++	setup_polled(false, completion);
+ 	w0c_status = &regs[0][DSI_INTSTA];
+ 	arrive_on_read = &regs[0][DSI_INTEN];
+ 	arrive_bits = LPRX_RD_RDY_INT_FLAG;
+@@ -653,7 +690,7 @@ static void test_polled_completion(void)
+ 	assert(regs[0][DSI_INTSTA] == LPRX_RD_RDY_INT_FLAG);
+ 
+ 	/* Process read owns READY -> W0C -> one RACK -> idle, not an IRQ wait. */
+-	setup_polled(true);
++	setup_polled(true, completion);
+ 	for (int link = 0; link < 2; link++) {
+ 		int first_bus = bus_count;
+ 		int ack = -1, rack = -1;
+@@ -675,13 +712,13 @@ static void test_polled_completion(void)
+ 	}
+ 
+ 	/* READY timeout and post-RACK idle timeout retain their original errors. */
+-	setup_polled(false);
++	setup_polled(false, completion);
+ 	assert(mtk_dsi_host_transfer(&d[0].host, &read_msg) == -ETIMEDOUT);
+ 	assert(poll_calls == 2 && d[0].cmd_error == -ETIMEDOUT);
+ 	assert(regs[0][DSI_START] == 0);
+ 	for (int i = 0; i < mask_count; i++)
+ 		assert(mask_calls[i].reg != DSI_RACK);
+-	setup_polled(false);
++	setup_polled(false, completion);
+ 	read_reply_states();
+ 	poll_states[2] = DSI_BUSY;
+ 	assert(mtk_dsi_host_transfer(&d[0].host, &read_msg) == -ETIMEDOUT);
+@@ -689,21 +726,21 @@ static void test_polled_completion(void)
+ 	assert(d[0].cmd_ring[0].start == 1 && regs[0][DSI_START] == 0);
+ 
+ 	/* Invalid/zero replies cannot become a successful get-power-mode read. */
+-	setup_polled(false);
++	setup_polled(false, completion);
+ 	read_reply_states();
+ 	response[0] = MIPI_DSI_RX_ACKNOWLEDGE_AND_ERROR_REPORT;
+ 	assert(mtk_dsi_host_transfer(&d[0].host, &read_msg) == -EPROTO);
+ 	assert(d[0].cmd_error == -EPROTO && !d[0].enabled);
+-	setup_polled(false);
++	setup_polled(false, completion);
+ 	read_reply_states();
+ 	response[0] = 0xff;
+ 	assert(mtk_dsi_host_transfer(&d[0].host, &read_msg) == -EPROTO);
+-	setup_polled(false);
++	setup_polled(false, completion);
+ 	read_reply_states();
+ 	response[0] = MIPI_DSI_RX_DCS_SHORT_READ_RESPONSE_2BYTE;
+ 	assert(mtk_dsi_host_transfer(&d[0].host, &read_msg) == 1);
+ 	assert(reply == 0x9c && !d[0].cmd_error);
+-	setup_polled(false);
++	setup_polled(false, completion);
+ 	read_msg.rx_buf = NULL;
+ 	assert(mtk_dsi_host_transfer(&d[0].host, &read_msg) == -EINVAL);
+ 	assert(!writes && !poll_calls && !d[0].cmd_error);
+@@ -714,7 +751,7 @@ static void test_polled_completion(void)
+ 	read_msg.rx_len = 1;
+ 
+ 	/* Pre-idle failure snapshots state but neither resets nor writes a queue. */
+-	setup_polled(false);
++	setup_polled(false, completion);
+ 	poll_intsta = regs[0][DSI_INTSTA] = DSI_BUSY;
+ 	regs[0][DSI_START] = 1;
+ 	assert(mtk_dsi_host_transfer(&d[0].host, &write_msg) == -ETIMEDOUT);
+@@ -727,7 +764,7 @@ static void test_polled_completion(void)
+ 	assert(writes == previous_writes);
+ 
+ 	/* Either link's error blocks the pair and atomic video start. */
+-	setup_polled(true);
++	setup_polled(true, completion);
+ 	poll_intsta = DSI_BUSY;
+ 	assert(mtk_dsi_host_transfer(&d[1].host, &write_msg) == -ETIMEDOUT);
+ 	assert(!d[0].cmd_error && d[1].cmd_error == -ETIMEDOUT);
+@@ -747,16 +784,146 @@ static void test_polled_completion(void)
+ 	assert(d[0].enabled);
+ 	mtk_dsi_poweroff(&d[0]);
+ 	balanced();
+-	setup_polled(true);
++	setup_polled(true, completion);
+ 	mtk_dsi_latch_cmd_error(&d[0], -EIO);
+ 	previous_writes = writes;
+ 	assert(mtk_dsi_host_transfer(&d[1].host, &write_msg) == -EIO);
+ 	assert(writes == previous_writes);
+ }
+ 
++static void test_cmdq_packing(void)
++{
++	static const size_t lengths[] = { 0, 1, 2, 3, 4, 5, 8, 9, 248 };
++	u8 payload[249];
++
++	for (size_t i = 0; i < sizeof(payload); i++)
++		payload[i] = (u8)(0xbc + 37 * i);
++	for (size_t n = 0; n < ARRAY_SIZE(lengths); n++) {
++		for (int hs = 0; hs < 2; hs++) {
++			setup(false);
++			d[0].driver_data = &pack_data;
++			struct mipi_dsi_msg msg = {
++				.type = 0x29, .tx_len = lengths[n],
++				.tx_buf = lengths[n] ? payload : NULL,
++				.flags = hs ? 0 : MIPI_DSI_MSG_USE_LPM,
++			};
++			size_t words = msg.tx_len > 2 ? (msg.tx_len + 3) / 4 : 0;
++			u32 header = (0x29 << 8) | (hs ? HSTX : 0);
++
++			/* Every SRAM read would return stale data, including header. */
++			sram_begin = regs[0] + pack_data.reg_adv[DSI_CMDQ];
++			sram_end = sram_begin + 4 * 63;
++			stale_address = sram_begin;
++			stale_value = 0x230020fb;
++			assert(!mtk_dsi_cmdq(&d[0], &msg));
++			assert(!sram_reads && reg_reads == 2 && !log_count);
++			assert(bus_count == (int)words + 3 && mask_count == 2);
++			for (size_t i = 0; i < words; i++) {
++				u32 expected = 0;
++
++				for (size_t j = 0; j < 4 && i * 4 + j < msg.tx_len; j++)
++					expected |= (u32)payload[i * 4 + j] << (8 * j);
++				assert(bus[i].address == sram_begin + 4 + i * 4);
++				assert(bus[i].value == expected);
++			}
++			if (msg.tx_len > 2)
++				header |= (u32)msg.tx_len << 16 | LONG_PACKET;
++			else
++				for (size_t i = 0; i < msg.tx_len; i++)
++					header |= (u32)payload[i] << (16 + 8 * i);
++			assert(bus[words].address == sram_begin);
++			assert(bus[words].value == header);
++			assert(bus[words + 1].address == regs[0] +
++			       pack_data.reg_main[DSI_CMDQ_SIZE]);
++			assert((bus[words + 1].value & CMDQ_SIZE) == words + 1);
++			assert(bus[words + 2].value ==
++			       (bus[words + 1].value | CMDQ_SIZE_SEL));
++			for (int i = 0; i < d[0].cmdq_write_count; i++) {
++				struct mtk_dsi_cmdq_write *w = &d[0].cmdq_write_ring[i];
++				bool rmw = w->kind == MTK_DSI_CMDQ_WRITE_SIZE ||
++					   w->kind == MTK_DSI_CMDQ_WRITE_SIZE_SEL;
++
++				assert(w->old_valid == rmw);
++			}
++		}
++	}
++
++	/* Reproduce the actual d04 stale reads, then remove that dependency. */
++	const u8 long_payload[] = { 0xbc, 0x33, 0x03 };
++	struct mipi_dsi_msg msg = { .type = 0x29, .tx_len = 3,
++		.tx_buf = long_payload, .flags = MIPI_DSI_MSG_USE_LPM };
++	for (int packed = 0; packed < 2; packed++) {
++		setup(false);
++		d[0].driver_data = packed ? &pack_data : &poll_data;
++		stale_address = regs[0] + 0x14;
++		stale_sequence[0] = 0;
++		stale_sequence[1] = 0xbc;
++		stale_sequence[2] = 0xbc;
++		stale_count = 3;
++		assert(!mtk_dsi_cmdq(&d[0], &msg));
++		if (packed) {
++			assert(!stale_next && bus[0].value == 0x000333bc);
++			assert(bus[1].value == 0x00032902);
++		} else {
++			assert(stale_next == 3 && bus[1].value == 0x000033bc);
++			assert(bus[2].value == 0x000300bc);
++		}
++	}
++	const u8 short_payload[] = { 0xfb, 0x01 };
++
++	msg = (struct mipi_dsi_msg){ .type = 0x23, .tx_len = 2,
++		.tx_buf = short_payload, .flags = MIPI_DSI_MSG_USE_LPM };
++	for (int packed = 0; packed < 2; packed++) {
++		setup(false);
++		d[0].driver_data = packed ? &pack_data : &poll_data;
++		stale_address = regs[0] + 0x10;
++		stale_sequence[0] = 0x20ff2902;
++		stale_sequence[1] = 0x20ff2300;
++		stale_sequence[2] = 0x230020fb;
++		stale_count = 3;
++		assert(!mtk_dsi_cmdq(&d[0], &msg));
++		if (packed) {
++			assert(!stale_next && bus[0].value == 0x01fb2300);
++			assert(!d[0].cmdq_write_ring[0].old_valid);
++			mtk_dsi_dump_cmdq_writes(&d[0], "test");
++			assert(unavailable_log_count == 1);
++		} else {
++			assert(stale_next == 3 && bus[0].value == 0x20fb2902);
++			assert(bus[1].value == 0x01ff2300 && bus[2].value == 0x23002300);
++			assert(d[0].cmdq_write_ring[0].old_valid);
++		}
++	}
++	/* Unknown old values are not manufactured when diagnostics are disabled. */
++	setup(false);
++	d[0].driver_data = &pack_data;
++	d[0].config_clk = NULL;
++	assert(!mtk_dsi_cmdq(&d[0], &msg));
++	assert(bus[0].value == 0x01fb2300 && !d[0].cmdq_write_count);
++
++	/* Invalid requests fail before mode changes, SRAM/control writes or start. */
++	for (int invalid = 0; invalid < 3; invalid++) {
++		setup(false);
++		d[0].driver_data = &pack_data;
++		d[0].power_ready = true;
++		msg.tx_len = invalid == 0 ? 1 : invalid == 1 ? 249 : (size_t)-1;
++		msg.tx_buf = invalid == 0 ? NULL : payload;
++		int error = invalid == 0 ? -EINVAL : -EMSGSIZE;
++
++		assert(mtk_dsi_cmdq(&d[0], &msg) == error);
++		assert(mtk_dsi_host_send_cmd(&d[0], &msg, CMD_DONE_INT_FLAG) == error);
++		assert(mtk_dsi_host_transfer(&d[0].host, &msg) == error);
++		assert(!reg_reads && !writes && !mask_count && !poll_calls);
++		assert(!d[0].cmdq_write_seq && !d[0].cmd_error && !log_count);
++		d[0].cmd_error = -ETIMEDOUT;
++		assert(mtk_dsi_host_transfer(&d[0].host, &msg) == -ETIMEDOUT);
++		assert(d[0].cmd_error == -ETIMEDOUT && !writes);
++	}
++}
++
+ int main(void)
+ {
+ 	test_cmdq_operands();
++	test_cmdq_packing();
+ 	setup(true);
+ 	assert(!mtk_dsi_poweron(&d[0]));
+ 	int operations = calls;
+@@ -942,7 +1109,7 @@ int main(void)
+ 	assert(w[1].kind == MTK_DSI_CMDQ_WRITE_DATA && w[1].offset == 0x10 &&
+ 	       w[1].mask == 0xff000000 && w[1].value == 0x01000000);
+ 	assert(w[2].kind == MTK_DSI_CMDQ_WRITE_CONFIG && w[2].offset == 0x10 &&
+-	       w[2].mask == 0xffff && w[2].value == 0x2340);
++	       w[2].mask == 0xffff && w[2].value == 0x2308);
+ 	assert(w[3].kind == MTK_DSI_CMDQ_WRITE_SIZE &&
+ 	       w[3].offset == poll_data.reg_main[DSI_CMDQ_SIZE] &&
+ 	       w[3].mask == CMDQ_SIZE && w[3].value == 1);
+@@ -973,7 +1140,7 @@ int main(void)
+ 	assert(w[2].kind == MTK_DSI_CMDQ_WRITE_DATA && w[2].offset == 0x14 &&
+ 	       w[2].mask == 0x00ff0000 && w[2].value == 0x00330000);
+ 	assert(w[3].kind == MTK_DSI_CMDQ_WRITE_CONFIG && w[3].offset == 0x10 &&
+-	       w[3].mask == 0xffffffff && w[3].value == 0x00032960);
++	       w[3].mask == 0xffffffff && w[3].value == 0x0003290a);
+ 	assert(w[4].kind == MTK_DSI_CMDQ_WRITE_SIZE &&
+ 	       w[4].offset == poll_data.reg_main[DSI_CMDQ_SIZE] &&
+ 	       w[4].mask == CMDQ_SIZE && w[4].value == 2);
+@@ -1084,6 +1251,7 @@ int main(void)
+ 	regs[0][DSI_INTSTA] = CMD_DONE_INT_FLAG;
+ 	assert(mtk_dsi_irq(0, &d[0]) == IRQ_HANDLED);
+ 	assert(d[0].irq_trace_count == 8);
+-	test_polled_completion();
++	test_polled_completion(false);
++	test_polled_completion(true);
+ 	puts("DSI routing: dual-link acquisition failure sweep, ownership, context-loss replay, bounded state capture and polled-idle command completion passed");
+ }
+diff --git a/tools/testing/selftests/mtk_clk/test_dsi_routing.py b/tools/testing/selftests/mtk_clk/test_dsi_routing.py
+index 91e2843607..fbc10c9b7b 100755
+--- a/tools/testing/selftests/mtk_clk/test_dsi_routing.py
++++ b/tools/testing/selftests/mtk_clk/test_dsi_routing.py
+@@ -33,6 +33,7 @@ production = tables + '\n' + '\n'.join(function(name).replace('static void mtk_d
+     'mtk_dsi_irq_data_set', 'mtk_dsi_irq_data_clear',
+     'mtk_dsi_dump_mmsys_state', 'mtk_dsi_dump_regs', 'mtk_dsi_msg_tx',
+     'mtk_dsi_mask', 'mtk_dsi_record_cmdq_write', 'mtk_dsi_cmdq_mask',
++    'mtk_dsi_cmdq_write', 'mtk_dsi_cmdq_check_msg',
+     'mtk_dsi_dump_cmdq_writes',
+     'mtk_dsi_record_cmd', 'mtk_dsi_dump_ring', 'mtk_dsi_dump_cmd_failure',
+     'mtk_dsi_dump_clocks', 'mtk_dsi_wait_for_irq_done', 'mtk_dsi_irq',
+@@ -78,6 +79,11 @@ assert cmdq_mask.index('writel(') < cmdq_mask.index('mtk_dsi_record_cmdq_write')
+ assert 'dev_info' not in cmdq_mask
+ mt6897 = source.split('mt6897_dsi_driver_data = {', 1)[1].split('};', 1)[0]
+ assert '.cmdq_long_packet_ctl = true' in mt6897
++assert '.cmdq_software_pack = true' in mt6897
++assert source.count('.cmdq_software_pack = true') == 1
++direct = function('mtk_dsi_cmdq_write')
++assert 'readl' not in direct and direct.count('writel(') == 1
++assert direct.index('writel(') < direct.index('mtk_dsi_record_cmdq_write')
+ assert '.cmdq_full_word = true' not in mt6897
+ inten = function('mtk_dsi_set_interrupt_enable')
+ assert inten.index('poll_command_done') < inten.index('CMD_DONE_INT_FLAG')
+-- 
+2.56.0
+

@@ -1,0 +1,317 @@
+From 33cf9fee95e21246bc4de50c365479dd86d508e4 Mon Sep 17 00:00:00 2001
+From: Alexander Koskovich <akoskovich@pm.me>
+Date: Thu, 16 Apr 2026 22:41:03 +0000
+Subject: [PATCH 043/144] net: ipa: add new QMI request for HW filter stats
+ info
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Some IPA firmware versions on IPA 5.5 require ipa_filter_stats_info in
+the init_modem_driver QMI request. For example on Eliza, if this is not
+passed then shortly after IPA init the system will halt and reboot
+shortly after.
+
+Downstream this is marked as optional but does not seem to be the case
+on newer IPA firmware versions.
+
+Signed-off-by: Alexander Koskovich <akoskovich@pm.me>
+Link: https://lore.kernel.org/linux-arm-msm/20260416-eliza-ipa-v1-3-f4109a8e43c4@pm.me/
+[mrlund: keep shared v4.5–v5.5 fnr_idx_cnt at 0 so older platforms keep
+the previous QMI layout; Eliza's non-zero count is in its private data]
+Signed-off-by: Martin Lund <mrlund@hotmail.com>
+Assisted-by: Grok Bot
+(cherry picked from commit 3106212b584dace750863841cdc6669fb7a244b2)
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0061-net-ipa-add-new-QMI-request-for-HW-filter-stats-info.patch
+Import-SHA256: c2d6d5163fd87c133749da76f1d0e9fc4abda6355af83ce9ebceff8992f8b535
+Import-Provenance: mail headers
+(cherry picked from commit 125b1e59d80eeecd72fd610072b0981d1040a676)
+---
+ drivers/net/ipa/data/ipa_data-v4.5.c |  1 +
+ drivers/net/ipa/data/ipa_data-v4.7.c |  1 +
+ drivers/net/ipa/data/ipa_data-v4.9.c |  1 +
+ drivers/net/ipa/data/ipa_data-v5.0.c |  1 +
+ drivers/net/ipa/data/ipa_data-v5.5.c |  1 +
+ drivers/net/ipa/ipa.h                |  3 ++
+ drivers/net/ipa/ipa_data.h           |  3 ++
+ drivers/net/ipa/ipa_mem.c            |  2 +
+ drivers/net/ipa/ipa_qmi.c            | 18 +++++++++
+ drivers/net/ipa/ipa_qmi_msg.c        | 58 ++++++++++++++++++++++++++++
+ drivers/net/ipa/ipa_qmi_msg.h        | 15 ++++++-
+ 11 files changed, 103 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ipa/data/ipa_data-v4.5.c b/drivers/net/ipa/data/ipa_data-v4.5.c
+index 730d8c43a4..353fe40645 100644
+--- a/drivers/net/ipa/data/ipa_data-v4.5.c
++++ b/drivers/net/ipa/data/ipa_data-v4.5.c
+@@ -419,6 +419,7 @@ static const struct ipa_mem_data ipa_mem_data = {
+ 	.imem_addr	= 0x14688000,
+ 	.imem_size	= 0x00003000,
+ 	.smem_size	= 0x00009000,
++	.fnr_idx_cnt	= 0,
+ };
+ 
+ /* Interconnect rates are in 1000 byte/second units */
+diff --git a/drivers/net/ipa/data/ipa_data-v4.7.c b/drivers/net/ipa/data/ipa_data-v4.7.c
+index 5e1d9049c6..44d071698d 100644
+--- a/drivers/net/ipa/data/ipa_data-v4.7.c
++++ b/drivers/net/ipa/data/ipa_data-v4.7.c
+@@ -361,6 +361,7 @@ static const struct ipa_mem_data ipa_mem_data = {
+ 	.imem_addr	= 0x146a8000,
+ 	.imem_size	= 0x00002000,
+ 	.smem_size	= 0x00009000,
++	.fnr_idx_cnt	= 0,
+ };
+ 
+ /* Interconnect rates are in 1000 byte/second units */
+diff --git a/drivers/net/ipa/data/ipa_data-v4.9.c b/drivers/net/ipa/data/ipa_data-v4.9.c
+index da472a2a2e..1c710e94a4 100644
+--- a/drivers/net/ipa/data/ipa_data-v4.9.c
++++ b/drivers/net/ipa/data/ipa_data-v4.9.c
+@@ -417,6 +417,7 @@ static const struct ipa_mem_data ipa_mem_data = {
+ 	.imem_addr	= 0x146bd000,
+ 	.imem_size	= 0x00002000,
+ 	.smem_size	= 0x00009000,
++	.fnr_idx_cnt	= 0,
+ };
+ 
+ /* Interconnect rates are in 1000 byte/second units */
+diff --git a/drivers/net/ipa/data/ipa_data-v5.0.c b/drivers/net/ipa/data/ipa_data-v5.0.c
+index bc5722e4b0..77558d1258 100644
+--- a/drivers/net/ipa/data/ipa_data-v5.0.c
++++ b/drivers/net/ipa/data/ipa_data-v5.0.c
+@@ -443,6 +443,7 @@ static const struct ipa_mem_data ipa_mem_data = {
+ 	.imem_addr	= 0x14688000,
+ 	.imem_size	= 0x00003000,
+ 	.smem_size	= 0x00009000,
++	.fnr_idx_cnt	= 0,
+ };
+ 
+ /* Interconnect rates are in 1000 byte/second units */
+diff --git a/drivers/net/ipa/data/ipa_data-v5.5.c b/drivers/net/ipa/data/ipa_data-v5.5.c
+index 741ae21d9d..2f811818b5 100644
+--- a/drivers/net/ipa/data/ipa_data-v5.5.c
++++ b/drivers/net/ipa/data/ipa_data-v5.5.c
+@@ -449,6 +449,7 @@ static const struct ipa_mem_data ipa_mem_data = {
+ 	.imem_addr	= 0x14688000,
+ 	.imem_size	= 0x00002000,
+ 	.smem_size	= 0x0000b000,
++	.fnr_idx_cnt	= 0,
+ };
+ 
+ /* Interconnect rates are in 1000 byte/second units */
+diff --git a/drivers/net/ipa/ipa.h b/drivers/net/ipa/ipa.h
+index 7ef10a4ff3..d2ceaea316 100644
+--- a/drivers/net/ipa/ipa.h
++++ b/drivers/net/ipa/ipa.h
+@@ -69,6 +69,7 @@ struct ipa_smp2p;
+  * @modem_state:	State of modem (stopped, running)
+  * @modem_netdev:	Network device structure used for modem
+  * @qmi:		QMI information
++ * @fnr_idx_cnt:	Number of FnR counters
+  */
+ struct ipa {
+ 	struct gsi gsi;
+@@ -129,6 +130,8 @@ struct ipa {
+ 	atomic_t modem_state;		/* enum ipa_modem_state */
+ 	struct net_device *modem_netdev;
+ 	struct ipa_qmi qmi;
++
++	u8 fnr_idx_cnt;
+ };
+ 
+ /**
+diff --git a/drivers/net/ipa/ipa_data.h b/drivers/net/ipa/ipa_data.h
+index 3eb9dc2ce3..f7566c8eda 100644
+--- a/drivers/net/ipa/ipa_data.h
++++ b/drivers/net/ipa/ipa_data.h
+@@ -181,6 +181,7 @@ struct ipa_resource_data {
+  * @imem_addr:		physical address of IPA region within IMEM
+  * @imem_size:		size in bytes of IPA IMEM region
+  * @smem_size:		size in bytes of the IPA SMEM region
++ * @fnr_idx_cnt:	Number of FnR counters
+  */
+ struct ipa_mem_data {
+ 	u32 local_count;
+@@ -193,6 +194,8 @@ struct ipa_mem_data {
+ 	u32 imem_size; /* DEPRECATED */
+ 
+ 	u32 smem_size;
++
++	u8 fnr_idx_cnt;
+ };
+ 
+ /**
+diff --git a/drivers/net/ipa/ipa_mem.c b/drivers/net/ipa/ipa_mem.c
+index 078d32a18d..fb04f953bf 100644
+--- a/drivers/net/ipa/ipa_mem.c
++++ b/drivers/net/ipa/ipa_mem.c
+@@ -631,6 +631,8 @@ int ipa_mem_init(struct ipa *ipa, struct platform_device *pdev,
+ 	ipa->mem_count = mem_data->local_count;
+ 	ipa->mem = mem_data->local;
+ 
++	ipa->fnr_idx_cnt = mem_data->fnr_idx_cnt;
++
+ 	/* Check the route and filter table memory regions */
+ 	if (!ipa_table_mem_valid(ipa, false))
+ 		return -EINVAL;
+diff --git a/drivers/net/ipa/ipa_qmi.c b/drivers/net/ipa/ipa_qmi.c
+index d771f3a71f..a5a5572c9c 100644
+--- a/drivers/net/ipa/ipa_qmi.c
++++ b/drivers/net/ipa/ipa_qmi.c
+@@ -74,6 +74,8 @@
+ #define IPA_MODEM_SERVICE_INS_ID	2
+ #define IPA_MODEM_SVC_VERS		1
+ 
++#define IPA_MODEM_FNR_IDX_START		128
++
+ #define QMI_INIT_DRIVER_TIMEOUT		60000	/* A minute in milliseconds */
+ 
+ /* Send an INIT_COMPLETE indication message to the modem */
+@@ -394,6 +396,22 @@ init_modem_driver_req(struct ipa_qmi *ipa_qmi)
+ 		}
+ 	}
+ 
++	if (ipa->version >= IPA_VERSION_4_5 && ipa->fnr_idx_cnt) {
++		mem = ipa_mem_find(ipa, IPA_MEM_STATS_FILTER_ROUTE);
++		if (mem && mem->size) {
++			req.hw_stats_filter_info_valid = 1;
++			req.hw_stats_filter_info.start_addr =
++				ipa->mem_offset + mem->offset;
++			req.hw_stats_filter_info.size =
++				ipa->fnr_idx_cnt * 16;
++			req.hw_stats_filter_info.start_index =
++				IPA_MODEM_FNR_IDX_START;
++			req.hw_stats_filter_info.end_index =
++				IPA_MODEM_FNR_IDX_START +
++				ipa->fnr_idx_cnt - 1;
++		}
++	}
++
+ 	return &req;
+ }
+ 
+diff --git a/drivers/net/ipa/ipa_qmi_msg.c b/drivers/net/ipa/ipa_qmi_msg.c
+index 51dc13a577..160c0d2076 100644
+--- a/drivers/net/ipa/ipa_qmi_msg.c
++++ b/drivers/net/ipa/ipa_qmi_msg.c
+@@ -250,6 +250,43 @@ const struct qmi_elem_info ipa_mem_range_ei[] = {
+ 	},
+ };
+ 
++/* QMI message structure definition for struct ipa_stats_filter */
++const struct qmi_elem_info ipa_stats_filter_ei[] = {
++	{
++		.data_type	= QMI_UNSIGNED_4_BYTE,
++		.elem_len	= 1,
++		.elem_size	=
++			sizeof_field(struct ipa_stats_filter, start_addr),
++		.offset		= offsetof(struct ipa_stats_filter,
++					   start_addr),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_4_BYTE,
++		.elem_len	= 1,
++		.elem_size	=
++			sizeof_field(struct ipa_stats_filter, size),
++		.offset		= offsetof(struct ipa_stats_filter, size),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_1_BYTE,
++		.elem_len	= 1,
++		.elem_size	=
++			sizeof_field(struct ipa_stats_filter, start_index),
++		.offset		= offsetof(struct ipa_stats_filter,
++					   start_index),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_1_BYTE,
++		.elem_len	= 1,
++		.elem_size	=
++			sizeof_field(struct ipa_stats_filter, end_index),
++		.offset		= offsetof(struct ipa_stats_filter, end_index),
++	},
++	{
++		.data_type	= QMI_EOTI,
++	},
++};
++
+ /* QMI message structure definition for struct ipa_init_modem_driver_req */
+ const struct qmi_elem_info ipa_init_modem_driver_req_ei[] = {
+ 	{
+@@ -640,6 +677,27 @@ const struct qmi_elem_info ipa_init_modem_driver_req_ei[] = {
+ 		.offset		= offsetof(struct ipa_init_modem_driver_req,
+ 					   hw_stats_drop_size),
+ 	},
++	{
++		.data_type	= QMI_OPT_FLAG,
++		.elem_len	= 1,
++		.elem_size	=
++			sizeof_field(struct ipa_init_modem_driver_req,
++				     hw_stats_filter_info_valid),
++		.tlv_type	= 0x23,
++		.offset		= offsetof(struct ipa_init_modem_driver_req,
++					   hw_stats_filter_info_valid),
++	},
++	{
++		.data_type	= QMI_STRUCT,
++		.elem_len	= 1,
++		.elem_size	=
++			sizeof_field(struct ipa_init_modem_driver_req,
++				     hw_stats_filter_info),
++		.tlv_type	= 0x23,
++		.offset		= offsetof(struct ipa_init_modem_driver_req,
++					   hw_stats_filter_info),
++		.ei_array	= ipa_stats_filter_ei,
++	},
+ 	{
+ 		.data_type	= QMI_EOTI,
+ 	},
+diff --git a/drivers/net/ipa/ipa_qmi_msg.h b/drivers/net/ipa/ipa_qmi_msg.h
+index 644b8c2710..3a2205c213 100644
+--- a/drivers/net/ipa/ipa_qmi_msg.h
++++ b/drivers/net/ipa/ipa_qmi_msg.h
+@@ -27,7 +27,7 @@
+  */
+ #define IPA_QMI_INDICATION_REGISTER_REQ_SZ	20	/* -> server handle */
+ #define IPA_QMI_INDICATION_REGISTER_RSP_SZ	7	/* <- server handle */
+-#define IPA_QMI_INIT_DRIVER_REQ_SZ		162	/* client handle -> */
++#define IPA_QMI_INIT_DRIVER_REQ_SZ		186	/* client handle -> */
+ #define IPA_QMI_INIT_DRIVER_RSP_SZ		25	/* client handle <- */
+ #define IPA_QMI_INIT_COMPLETE_IND_SZ		7	/* <- server handle */
+ #define IPA_QMI_DRIVER_INIT_COMPLETE_REQ_SZ	4	/* -> server handle */
+@@ -119,6 +119,13 @@ struct ipa_mem_range {
+ 	u32 size;
+ };
+ 
++struct ipa_stats_filter {
++	u32 start_addr;
++	u32 size;
++	u8 start_index;
++	u8 end_index;
++};
++
+ /* The message for the IPA_QMI_INIT_DRIVER request contains information
+  * from the AP that affects modem initialization.
+  */
+@@ -216,6 +223,11 @@ struct ipa_init_modem_driver_req {
+ 	u32			hw_stats_drop_base_addr;
+ 	u8			hw_stats_drop_size_valid;
+ 	u32			hw_stats_drop_size;
++
++	/* Hardware filter statistics information. (IPA v4.5 and above)
++	 */
++	u8			hw_stats_filter_info_valid;
++	struct ipa_stats_filter	hw_stats_filter_info;
+ };
+ 
+ /* The response to a IPA_QMI_INIT_DRIVER request begins with a standard
+@@ -256,6 +268,7 @@ extern const struct qmi_elem_info ipa_init_complete_ind_ei[];
+ extern const struct qmi_elem_info ipa_mem_bounds_ei[];
+ extern const struct qmi_elem_info ipa_mem_array_ei[];
+ extern const struct qmi_elem_info ipa_mem_range_ei[];
++extern const struct qmi_elem_info ipa_stats_filter_ei[];
+ extern const struct qmi_elem_info ipa_init_modem_driver_req_ei[];
+ extern const struct qmi_elem_info ipa_init_modem_driver_rsp_ei[];
+ 

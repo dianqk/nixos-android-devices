@@ -83,7 +83,17 @@ flake.inputs.nixpkgs.lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
     assert normal.androidDevices.usb.acm.enable;
     assert normal.systemd.services.usb-signaller.environment.USB_SIGNALLER_ACM == "1";
     assert withoutAcm.systemd.services.usb-signaller.environment.USB_SIGNALLER_ACM == "0";
-    assert lib.hasInfix "serial-getty@ttyGS0.service" normal.services.udev.extraRules;
+    assert !(lib.hasInfix "serial-getty@ttyGS0.service" normal.services.udev.extraRules);
+    assert normal.systemd.services."serial-getty@ttyGS0".partOf == [ "usb-signaller.service" ];
+    assert lib.hasInfix "PartOf=usb-signaller.service"
+      normal.systemd.units."serial-getty@ttyGS0.service".text;
+    assert lib.hasInfix "After=usb-signaller.service"
+      normal.systemd.units."serial-getty@ttyGS0.service".text;
+    assert builtins.elem "usb-signaller.service" normal.systemd.services."serial-getty@ttyGS0".after;
+    assert
+      normal.systemd.services.usb-signaller.environment.USB_SIGNALLER_ACM_SERVICE
+      == "serial-getty@ttyGS0.service";
+    assert !(withoutAcm.systemd.services.usb-signaller.environment ? USB_SIGNALLER_ACM_SERVICE);
     assert !(lib.hasInfix "serial-getty@ttyGS0.service" withoutAcm.services.udev.extraRules);
     assert !(withoutAcm.systemd.services ? "serial-getty@ttyGS0");
     assert normal.systemd.services."serial-getty@ttyGS0".overrideStrategy == "asDropin";
@@ -141,8 +151,7 @@ flake.inputs.nixpkgs.lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
     assert !(normal.systemd.services ? mobile-usb-gadget);
     assert normal.systemd.services.usb-signaller.serviceConfig.Type == "dbus";
     assert normal.systemd.services.usb-signaller.environment.USB_SIGNALLER_UDC == expected.controller;
-    assert
-      normal.systemd.services.usb-signaller.environment.USB_SIGNALLER_SERIAL == "${device}-example";
+    assert normal.systemd.services.usb-signaller.environment.USB_SIGNALLER_SERIAL == lib.toUpper device;
     # Linux gether_set_ifname requires exactly one %d; systemd consumes %%.
     assert normal.systemd.services.usb-signaller.environment.USB_SIGNALLER_IFNAME == "usb%%d";
     assert

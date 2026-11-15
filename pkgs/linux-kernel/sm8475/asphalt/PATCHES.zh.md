@@ -2,11 +2,11 @@
 
 [English](PATCHES.md) · [Y700 2023 指南](../../../../docs/asphalt/README.zh.md)
 
-补丁集已适配当前锁定的 Linux 7.3-rc6。独立补丁重放、解析后的配置检查、
+补丁集已适配当前锁定的 Linux 7.3。独立补丁重放、解析后的配置检查、
 设备 DTB 及补丁涉及的 43 个 C 文件编译均通过。完整内核构建和实机测试仍需
 单独验证。其他设备状态见[共享内核说明](../../README.zh.md)。
 
-`asphalt` 补丁集以 Linux 7.3-rc6 为目标。补丁顺序见
+`asphalt` 补丁集以 Linux 7.3 为目标。补丁顺序见
 [`series.nix`](series.nix)，内核配置见 [`kernel.config`](kernel.config)。
 
 | 补丁 | 适配领域 |
@@ -15,7 +15,7 @@
 | 0002 | 显示、面板与背光 |
 | 0003 | 触摸屏 |
 | [共享 PCIe 修复](../../patches/pcie-qcom-iommu-cells.patch) | 正确解析 PCIe BDF-to-SID 映射的 IOMMU 字段 |
-| 0005 | UFS 时钟 |
+| 0005 | SM8475 850 MHz UFS 时钟父源（GPLL3） |
 | 0006 | Y700 2023 设备树 |
 | 0007 | 视频编解码 |
 | 0008 | USB 与音频连接 |
@@ -35,11 +35,32 @@
 | [共享 GMU 补丁组](../../patches/gmu-sync-state/README.md) | 为 GMU 绑定驱动，使 GCC/GPUCC `sync_state()` 完成 |
 | 0026 | 禁用未使用的 QCE 节点（上游驱动标记为 BROKEN），使 interconnect `sync_state()` 完成 |
 | 0027 | 系统挂起时关闭 UFS 控制器、设备和 PHY（CX collapse 后 PHY 不保持状态） |
+| 0028–0030 | SM8450 GCC GDSC 以 RPMh CX 为父电源域（上游） |
+| 0031 | 已移入共享 Qualcomm 补丁：[仅开关 UFS lane 时钟](../../patches/ufs-qcom-lane-clocks-only.patch)（上游 f07317a8d57f） |
+| 0032 | 为所有 gear 写入完整的 SM8475 UFS PHY 序列 |
+| 0033 | `qcom,sm8475-ufshc` binding |
+| 0034 | SM8475 UFS 300 MHz 以上的 turbo 模式配置 |
+| 0035 | 带 CX 档位的 SM8475 UFS operating points（75 与 850 MHz） |
 
 在 x86_64 或 AArch64 Linux 主机上运行 `nix build .#devices.asphalt.kernel`。在 x86_64
 主机上，derivation 由 x86_64 运行并生成 AArch64 内核。Kbuild 使用
 `ARCH=arm64`、AArch64 target prefix，以及来自 `buildPackages` 的 Clang/LLD；
 不需要 AArch64 主机版 LLVM 工具。Linux 内核补丁遵循上游 GPL-2.0 条款及被修改文件中的 SPDX 声明。
+
+## UFS 时钟与 PHY
+
+0035 以联想原厂频率表的两个 operating point 替代旧的 `freq-table-hz`：75 MHz
+（LOW_SVS，HS-G1）与 850 MHz（TURBO_L1，HS-G4），即 Qualcomm GCC 驱动对这些频率
+要求的 CX 档位。原厂固件在控制器忙碌度低于一半时还会降到 300 MHz 并保持 HS-G4；
+此档位未声明，因此 HS-G4 只在 850 MHz 下运行。`qcom,sm8475-ufshc` 兼容串（0033）
+启用控制器的 turbo 配置（0034），与 Qualcomm 下游驱动一致：高于 300 MHz 时设置
+HCI turbo 时钟通路与 UniPro `ATTR_HW_CGC_EN`，`SYS1CLK_1US` 按核心时钟的一半计数，
+UniPro 1 µs/40 ns 周期数为 213 与 9；不高于 300 MHz 时清除这两个位。主机复位或
+断电恢复后的 link startup 使用最高频率，因此进入 turbo 模式。0005 提供 850 MHz
+的 GPLL3 父时钟。0032 把 SM8475 的 PLL、TX/RX、PCS 配置从仅 HS-G4 生效的 overlay
+移入基础表并补充 `BG_TIMER`，与下游所有 gear 共用的表一致。0031（上游
+f07317a8d57f）现为共享 Qualcomm 补丁。实测结果见
+[UFS 时钟上限](../../../../docs/asphalt/hardware.zh.md#ufs-时钟上限)。
 
 ## 共享 PCIe 修复
 

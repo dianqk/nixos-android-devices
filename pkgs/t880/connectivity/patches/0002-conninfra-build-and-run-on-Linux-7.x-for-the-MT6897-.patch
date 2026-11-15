@@ -1,0 +1,293 @@
+From f454f80fae93fb19b63570398813af3425caf98e Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 16 Oct 2026 12:20:48 +0800
+Subject: [PATCH] conninfra: build and run on Linux 7.x for the MT6897 (T880)
+
+- Build out of tree against a mainline kernel: force-include the compat
+  header, no -Werror, and define CONFIG_MTK_COMBO_CHIP_CONSYS_6897 for
+  the C code, not only for Kbuild, so the mt6897 platform data is
+  compiled in.
+- Kernel API updates: class_create() without the module, void platform
+  remove callbacks, void alarm handlers.
+- T880_CONNINFRA_DBG=y keeps the debug procfs in a user build (off by
+  default).
+- Pre-calibration: unless t880_precal_wait_bt is set, trigger it when
+  Wi-Fi registers and skip BT power-on and calibration when no BT
+  driver is registered. Stock waits for both drivers, and the Wi-Fi
+  driver refuses to power on before the first pre-cal.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ connectivity/conninfra/Kbuild                 |  9 ++-
+ .../conninfra/adaptor/conninfra_dev.c         |  2 +-
+ .../conninfra/adaptor/connsyslog/fw_log_mcu.c |  2 +-
+ .../conn_drv/connv2/core/conninfra_core.c     | 66 +++++++++++++------
+ .../debug_utility/connsyslog/connsyslog.c     |  4 +-
+ .../conn_drv/connv2/src/connv2_drv.c          |  6 +-
+ .../conn_drv/connv3/src/connv3_drv.c          |  6 +-
+ 7 files changed, 67 insertions(+), 28 deletions(-)
+
+diff --git a/connectivity/conninfra/Kbuild b/connectivity/conninfra/Kbuild
+index d9574d9..e758fb3 100644
+--- a/connectivity/conninfra/Kbuild
++++ b/connectivity/conninfra/Kbuild
+@@ -41,7 +41,10 @@ ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/gpu/drm/mediatek/mediatek_v2
+ ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/memory/mediatek/
+ 
+ ###############################################################################
+-ccflags-y += -Werror
++# T880: out-of-tree build on mainline
++ccflags-y += -include $(KO_CODE_PATH)/../../compat/t880_compat.h
++ccflags-y += -I$(KO_CODE_PATH)/../../compat/include
++ccflags-y += -Wno-error -Wno-missing-prototypes -Wno-missing-declarations
+ ccflags-y += -Wno-error=format
+ ccflags-y += -Wno-error=format-extra-args
+ 
+@@ -124,6 +127,7 @@ endif
+ 
+ ifeq ($(CONFIG_MTK_COMBO_CHIP_CONSYS_6897),y)
+ ifneq ($(wildcard $(PATH_TO_CONNINFRA_DRV)/conn_drv/connv2/platform/mt6897),)
++ccflags-y += -DCONFIG_MTK_COMBO_CHIP_CONSYS_6897=1
+ ccflags-y += -I$(KO_CODE_PATH)/conn_drv/connv2/platform/mt6897/include
+ ccflags-y += -I$(KO_CODE_PATH)/conn_drv/connv2/platform/mt6897/include/CODA
+ endif
+@@ -192,7 +196,8 @@ endif
+ endif
+ 
+ 
+-ifneq ($(TARGET_BUILD_VARIANT), user)
++# T880: T880_CONNINFRA_DBG=y keeps the debug procfs in a user build.
++ifneq ($(TARGET_BUILD_VARIANT)$(T880_CONNINFRA_DBG), user)
+     ccflags-y += -D CONNINFRA_DBG_SUPPORT=1
+ else
+     ccflags-y += -D CONNINFRA_DBG_SUPPORT=0
+diff --git a/connectivity/conninfra/adaptor/conninfra_dev.c b/connectivity/conninfra/adaptor/conninfra_dev.c
+index 2a9ae56..f5f7981 100644
+--- a/connectivity/conninfra/adaptor/conninfra_dev.c
++++ b/connectivity/conninfra/adaptor/conninfra_dev.c
+@@ -571,7 +571,7 @@ static int conninfra_dev_init(void)
+ 		goto err1;
+ 	}
+ 
+-	p_conn_adaptor_class = class_create(THIS_MODULE, CONNINFRA_DEVICE_NAME);
++	p_conn_adaptor_class = class_create(CONNINFRA_DEVICE_NAME);
+ 	if (IS_ERR(p_conn_adaptor_class)) {
+ 		pr_err("class create fail, error code(%ld)\n",
+ 						PTR_ERR(p_conn_adaptor_class));
+diff --git a/connectivity/conninfra/adaptor/connsyslog/fw_log_mcu.c b/connectivity/conninfra/adaptor/connsyslog/fw_log_mcu.c
+index b9cf13b..513de03 100644
+--- a/connectivity/conninfra/adaptor/connsyslog/fw_log_mcu.c
++++ b/connectivity/conninfra/adaptor/connsyslog/fw_log_mcu.c
+@@ -46,7 +46,7 @@ int fw_log_mcu_init(struct fw_log_mcu_info *info, const struct file_operations *
+ 		goto error;
+ 	}
+ 
+-	info->mcu_class = class_create(THIS_MODULE, info->driver_name);
++	info->mcu_class = class_create(info->driver_name);
+ 	if (IS_ERR(info->mcu_class)) {
+ 		pr_notice("[%s] class_create fail, conn_type=[%d]\n", __func__, info->conn_type);
+ 		goto error;
+diff --git a/connectivity/conninfra/conn_drv/connv2/core/conninfra_core.c b/connectivity/conninfra/conn_drv/connv2/core/conninfra_core.c
+index a4b7686..e57c150 100644
+--- a/connectivity/conninfra/conn_drv/connv2/core/conninfra_core.c
++++ b/connectivity/conninfra/conn_drv/connv2/core/conninfra_core.c
+@@ -96,6 +96,19 @@ static void _conninfra_core_drv_status_dump(char* tag);
+ */
+ 
+ struct conninfra_ctx g_conninfra_ctx;
++
++/*
++ * T880 port: the BT driver is not ported yet. Unless this is set, pre-cal is
++ * triggered by Wi-Fi registration alone and BT is skipped when it has no
++ * pre-cal callbacks.
++ */
++static bool t880_precal_wait_bt;
++module_param(t880_precal_wait_bt, bool, 0444);
++
++static bool t880_bt_cal_present(void)
++{
++	return g_conninfra_ctx.drv_inst[CONNDRV_TYPE_BT].ops_cb.pre_cal_cb.do_cal_cb != NULL;
++}
+ extern phys_addr_t g_con_emi_phy_base;
+ static struct osal_wake_lock conninfra_wake_lock;
+ 
+@@ -587,6 +600,7 @@ static int opfunc_pre_cal(struct msg_op_data *op)
+ 	int bt_cal_ret, wf_cal_ret;
+ 	struct subsys_drv_inst *drv_inst;
+ 	int pre_cal_done_state = (0x1 << CONNDRV_TYPE_BT) | (0x1 << CONNDRV_TYPE_WIFI);
++	bool bt_cal = true;
+ 	struct timespec64 begin, bt_cal_begin, wf_cal_begin, end, backup_end;
+ 	struct subsys_drv_inst *wifi_drv = &g_conninfra_ctx.drv_inst[CONNDRV_TYPE_WIFI];
+ 	unsigned int cal_result_offset = 0, cal_result_size = 0;
+@@ -614,21 +628,29 @@ static int opfunc_pre_cal(struct msg_op_data *op)
+ 			return 0;
+ 		}
+ 	}
++	bt_cal = t880_bt_cal_present();
++	if (!bt_cal) {
++		pr_info("[pre_cal] T880: no BT pre-cal callbacks, Wi-Fi only");
++		pre_cal_done_state = (0x1 << CONNDRV_TYPE_WIFI);
++	}
+ 	osal_unlock_sleepable_lock(&g_conninfra_ctx.core_lock);
+ 	/* Clean pre-cal backup data */
+ 	ret = conninfra_core_pre_cal_clean_data();
+ 	if (ret)
+ 		pr_info("[pre_cal] clean data fail, ret = %d", ret);
+ 
+-	ret = conninfra_core_power_on(CONNDRV_TYPE_BT);
+-	if (ret) {
+-		pr_err("BT power on fail during pre_cal");
+-		return -1;
++	if (bt_cal) {
++		ret = conninfra_core_power_on(CONNDRV_TYPE_BT);
++		if (ret) {
++			pr_err("BT power on fail during pre_cal");
++			return -1;
++		}
+ 	}
+ 	ret = conninfra_core_power_on(CONNDRV_TYPE_WIFI);
+ 	if (ret) {
+ 		pr_err("WIFI power on fail during pre_cal");
+-		conninfra_core_power_off(CONNDRV_TYPE_BT);
++		if (bt_cal)
++			conninfra_core_power_off(CONNDRV_TYPE_BT);
+ 		return -2;
+ 	}
+ 
+@@ -639,6 +661,8 @@ static int opfunc_pre_cal(struct msg_op_data *op)
+ 	sema_init(&g_conninfra_ctx.pre_cal_sema, 1);
+ 
+ 	for (i = 0; i < CAL_DRV_COUNT; i++) {
++		if (!bt_cal && cal_drvs[i] == CONNDRV_TYPE_BT)
++			continue;
+ 		drv_inst = &g_conninfra_ctx.drv_inst[cal_drvs[i]];
+ 		ret = msg_thread_send_1(&drv_inst->msg_ctx,
+ 				INFRA_SUBDRV_OPID_CAL_PWR_ON, cal_drvs[i]);
+@@ -652,7 +676,7 @@ static int opfunc_pre_cal(struct msg_op_data *op)
+ 			continue;
+ 		cur_state = atomic_read(&g_conninfra_ctx.pre_cal_state);
+ 		pr_info("[pre_cal] cur state =[%d]", cur_state);
+-		if ((cur_state & (0x1 << CONNDRV_TYPE_BT)) == 0) {
++		if (bt_cal && (cur_state & (0x1 << CONNDRV_TYPE_BT)) == 0) {
+ 			pr_info("[pre_cal] BT pwr_on callback is not back");
+ 			drv_inst = &g_conninfra_ctx.drv_inst[CONNDRV_TYPE_BT];
+ 			osal_thread_show_stack(&drv_inst->msg_ctx.thread);
+@@ -668,20 +692,23 @@ static int opfunc_pre_cal(struct msg_op_data *op)
+ 	osal_gettimeofday(&bt_cal_begin);
+ 
+ 	/* Do Calibration */
+-	drv_inst = &g_conninfra_ctx.drv_inst[CONNDRV_TYPE_BT];
+-	bt_cal_ret = msg_thread_send_wait_1(&drv_inst->msg_ctx,
+-			INFRA_SUBDRV_OPID_CAL_DO_CAL, 0, CONNDRV_TYPE_BT);
++	bt_cal_ret = 0;
++	if (bt_cal) {
++		drv_inst = &g_conninfra_ctx.drv_inst[CONNDRV_TYPE_BT];
++		bt_cal_ret = msg_thread_send_wait_1(&drv_inst->msg_ctx,
++				INFRA_SUBDRV_OPID_CAL_DO_CAL, 0, CONNDRV_TYPE_BT);
+ 
+-	pr_info("[pre_cal] driver [%s] calibration %s, ret=[%d]\n", g_drv_name[CONNDRV_TYPE_BT],
+-			(bt_cal_ret == CONNINFRA_CB_RET_CAL_FAIL_POWER_OFF ||
+-			bt_cal_ret == CONNINFRA_CB_RET_CAL_FAIL_POWER_ON) ? "fail" : "success",
+-			bt_cal_ret);
++		pr_info("[pre_cal] driver [%s] calibration %s, ret=[%d]\n", g_drv_name[CONNDRV_TYPE_BT],
++				(bt_cal_ret == CONNINFRA_CB_RET_CAL_FAIL_POWER_OFF ||
++				bt_cal_ret == CONNINFRA_CB_RET_CAL_FAIL_POWER_ON) ? "fail" : "success",
++				bt_cal_ret);
+ 
+-	if (bt_cal_ret == CONNINFRA_CB_RET_CAL_PASS_POWER_OFF ||
+-		bt_cal_ret == CONNINFRA_CB_RET_CAL_FAIL_POWER_OFF)
+-		conninfra_core_power_off(CONNDRV_TYPE_BT);
++		if (bt_cal_ret == CONNINFRA_CB_RET_CAL_PASS_POWER_OFF ||
++			bt_cal_ret == CONNINFRA_CB_RET_CAL_FAIL_POWER_OFF)
++			conninfra_core_power_off(CONNDRV_TYPE_BT);
+ 
+-	pr_info("[pre_cal] >>>>>>>> BT do cal done");
++		pr_info("[pre_cal] >>>>>>>> BT do cal done");
++	}
+ 
+ 	osal_gettimeofday(&wf_cal_begin);
+ 
+@@ -1033,7 +1060,7 @@ static int opfunc_pre_cal_prepare(struct msg_op_data *op)
+ 
+ 	spin_lock_irqsave(&g_conninfra_ctx.infra_lock, flag);
+ 
+-	if (bt_drv->ops_cb.pre_cal_cb.do_cal_cb == NULL ||
++	if ((bt_drv->ops_cb.pre_cal_cb.do_cal_cb == NULL && t880_precal_wait_bt) ||
+ 		wifi_drv->ops_cb.pre_cal_cb.do_cal_cb == NULL) {
+ 		pr_info("[%s] [pre_cal] [%p][%p]", __func__,
+ 			bt_drv->ops_cb.pre_cal_cb.do_cal_cb,
+@@ -1899,7 +1926,8 @@ int conninfra_core_subsys_ops_reg(enum consys_drv_type type,
+ 			infra_ctx->drv_inst[CONNDRV_TYPE_WIFI].ops_cb.pre_cal_cb.pwr_on_cb);
+ 
+ 	/* trigger pre-cal if BT and WIFI are registered */
+-	if (infra_ctx->drv_inst[CONNDRV_TYPE_BT].ops_cb.pre_cal_cb.do_cal_cb != NULL &&
++	if ((infra_ctx->drv_inst[CONNDRV_TYPE_BT].ops_cb.pre_cal_cb.do_cal_cb != NULL ||
++		!t880_precal_wait_bt) &&
+ 		infra_ctx->drv_inst[CONNDRV_TYPE_WIFI].ops_cb.pre_cal_cb.do_cal_cb != NULL)
+ 		trigger_pre_cal = 1;
+ 
+diff --git a/connectivity/conninfra/conn_drv/connv2/debug_utility/connsyslog/connsyslog.c b/connectivity/conninfra/conn_drv/connv2/debug_utility/connsyslog/connsyslog.c
+index fd6ac70..da59965 100644
+--- a/connectivity/conninfra/conn_drv/connv2/debug_utility/connsyslog/connsyslog.c
++++ b/connectivity/conninfra/conn_drv/connv2/debug_utility/connsyslog/connsyslog.c
+@@ -1386,7 +1386,7 @@ static int connlog_cancel_alarm_timer(void)
+ }
+ 
+ 
+-static enum alarmtimer_restart connlog_alarm_timer_handler(struct alarm *alarm,
++static void connlog_alarm_timer_handler(struct alarm *alarm,
+ 	ktime_t now)
+ {
+ 	ktime_t kt;
+@@ -1410,8 +1410,6 @@ static enum alarmtimer_restart connlog_alarm_timer_handler(struct alarm *alarm,
+ 	kt = ktime_set(gLogAlarm.alarm_sec, 0);
+ 	alarm_start_relative(&gLogAlarm.alarm_timer, kt);
+ 	spin_unlock_irqrestore(&gLogAlarm.alarm_lock, gLogAlarm.flags);
+-
+-	return ALARMTIMER_NORESTART;
+ }
+ 
+ static int connlog_alarm_init(void)
+diff --git a/connectivity/conninfra/conn_drv/connv2/src/connv2_drv.c b/connectivity/conninfra/conn_drv/connv2/src/connv2_drv.c
+index fcbdf71..2f1a5af 100644
+--- a/connectivity/conninfra/conn_drv/connv2/src/connv2_drv.c
++++ b/connectivity/conninfra/conn_drv/connv2/src/connv2_drv.c
+@@ -75,10 +75,14 @@ extern const struct of_device_id apconninfra_of_ids[];
+ 
+ static int mtk_conninfra_probe(struct platform_device *pdev);
+ static int mtk_conninfra_remove(struct platform_device *pdev);
++static void mtk_conninfra_remove_void(struct platform_device *pdev)
++{
++	mtk_conninfra_remove(pdev);
++}
+ 
+ static struct platform_driver mtk_conninfra_dev_drv = {
+ 	.probe = mtk_conninfra_probe,
+-	.remove = mtk_conninfra_remove,
++	.remove = mtk_conninfra_remove_void,
+ 	.driver = {
+ 		   .name = "mtk_conninfra",
+ 		   .owner = THIS_MODULE,
+diff --git a/connectivity/conninfra/conn_drv/connv3/src/connv3_drv.c b/connectivity/conninfra/conn_drv/connv3/src/connv3_drv.c
+index a03a422..9969ed4 100644
+--- a/connectivity/conninfra/conn_drv/connv3/src/connv3_drv.c
++++ b/connectivity/conninfra/conn_drv/connv3/src/connv3_drv.c
+@@ -63,10 +63,14 @@ extern const struct of_device_id connv3_of_ids[];
+ 
+ static int mtk_connv3_probe(struct platform_device *pdev);
+ static int mtk_connv3_remove(struct platform_device *pdev);
++static void mtk_connv3_remove_void(struct platform_device *pdev)
++{
++	mtk_connv3_remove(pdev);
++}
+ 
+ static struct platform_driver g_mtk_connv3_dev_drv = {
+ 	.probe = mtk_connv3_probe,
+-	.remove = mtk_connv3_remove,
++	.remove = mtk_connv3_remove_void,
+ 	.driver = {
+ 		   .name = "mtk_connv3",
+ 		   .owner = THIS_MODULE,
+-- 
+2.55.0
+

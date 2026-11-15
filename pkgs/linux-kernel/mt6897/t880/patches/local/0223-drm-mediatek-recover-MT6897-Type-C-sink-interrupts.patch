@@ -1,0 +1,845 @@
+From c20736919acae61b2c61989f14b97a56af48f388 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Mon, 9 Nov 2026 06:40:12 +0800
+Subject: [PATCH] drm/mediatek: recover MT6897 Type-C sink interrupts
+
+Preserve HPD IRQ Attention when the sink keeps HPD high and service only
+supported DPCD requests. Check the trained lane lock and alignment before
+retraining. Keep healthy streams untouched, retrain active links once at
+their exact rate/lane count, and report failed recovery to DRM.
+
+Serialize recovery with stream, AUX-power, diagnostic and sleep paths.
+Track active video separately from a trained link, stop publication before
+IRQ teardown, and keep the DRM device alive until the IRQ drains. Propagate
+AUX failures through training and reject invalid lane counts. Failed
+recovery stays muted until a fresh attachment or explicit idle retrain.
+
+The MT6897 OEM selector forwards HPD IRQ separately, and its sink checker
+validates the trained lanes/alignment before restarting training. This is
+a local implementation using the DRM DP helpers and existing MTK training
+sequence, not an imported vendor commit.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/misc/mediatek/typec/mux/usb_dp_selector.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_dp.c
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/gpu/drm/mediatek/mtk_dp.c | 394 ++++++++++++++++++++++++++----
+ 1 file changed, 342 insertions(+), 52 deletions(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_dp.c b/drivers/gpu/drm/mediatek/mtk_dp.c
+index c322f27bc7..c11d2b2f18 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dp.c
++++ b/drivers/gpu/drm/mediatek/mtk_dp.c
+@@ -11,6 +11,7 @@
+ #include <drm/drm_bridge.h>
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_edid.h>
++#include <drm/drm_drv.h>
+ #include <drm/drm_of.h>
+ #include <drm/drm_panel.h>
+ #include <drm/drm_print.h>
+@@ -104,6 +105,13 @@ struct mtk_dp_efuse_fmt {
+ 
+ struct mtk_dp {
+ 	bool enabled;
++	/* Serialize training/stream changes, AUX power and system sleep. */
++	struct mutex link_lock;
++	bool stream_active;
++	bool suspended;
++	bool stopping;
++	bool irq_recovery_failed;
++	u32 hpd_generation;
+ 	bool need_debounce;
+ 	int irq;
+ 	u8 max_lanes;
+@@ -1719,13 +1727,20 @@ static int mtk_dp_train_setting(struct mtk_dp *mtk_dp, u8 target_link_rate,
+ {
+ 	int ret;
+ 
+-	drm_dp_dpcd_writeb(&mtk_dp->aux, DP_LINK_BW_SET, target_link_rate);
+-	drm_dp_dpcd_writeb(&mtk_dp->aux, DP_LANE_COUNT_SET,
++	ret = drm_dp_dpcd_writeb(&mtk_dp->aux, DP_LINK_BW_SET, target_link_rate);
++	if (ret != 1)
++		return ret < 0 ? ret : -EIO;
++	ret = drm_dp_dpcd_writeb(&mtk_dp->aux, DP_LANE_COUNT_SET,
+ 			   target_lane_count | DP_LANE_COUNT_ENHANCED_FRAME_EN);
++	if (ret != 1)
++		return ret < 0 ? ret : -EIO;
+ 
+-	if (mtk_dp->train_info.sink_ssc)
+-		drm_dp_dpcd_writeb(&mtk_dp->aux, DP_DOWNSPREAD_CTRL,
++	if (mtk_dp->train_info.sink_ssc) {
++		ret = drm_dp_dpcd_writeb(&mtk_dp->aux, DP_DOWNSPREAD_CTRL,
+ 				   DP_SPREAD_AMP_0_5);
++		if (ret != 1)
++			return ret < 0 ? ret : -EIO;
++	}
+ 
+ 	mtk_dp_set_lanes(mtk_dp, target_lane_count / 2);
+ 	ret = mtk_dp_phy_configure(mtk_dp, target_link_rate, target_lane_count);
+@@ -1745,6 +1760,7 @@ static int mtk_dp_train_cr(struct mtk_dp *mtk_dp, u8 target_lane_count)
+ 	u8 link_status[DP_LINK_STATUS_SIZE] = {};
+ 	u8 prev_lane_adjust = 0xff;
+ 	int train_retries = 0;
++	int ret;
+ 	int voltage_retries = 0;
+ 
+ 	mtk_dp_pattern(mtk_dp, true);
+@@ -1757,8 +1773,10 @@ static int mtk_dp_train_cr(struct mtk_dp *mtk_dp, u8 target_lane_count)
+ 			return -ENODEV;
+ 		}
+ 
+-		drm_dp_dpcd_read(&mtk_dp->aux, DP_ADJUST_REQUEST_LANE0_1,
++		ret = drm_dp_dpcd_read(&mtk_dp->aux, DP_ADJUST_REQUEST_LANE0_1,
+ 				 lane_adjust, sizeof(lane_adjust));
++		if (ret != sizeof(lane_adjust))
++			return ret < 0 ? ret : -EIO;
+ 		mtk_dp_train_update_swing_pre(mtk_dp, target_lane_count,
+ 					      lane_adjust);
+ 
+@@ -1766,7 +1784,9 @@ static int mtk_dp_train_cr(struct mtk_dp *mtk_dp, u8 target_lane_count)
+ 						       mtk_dp->rx_cap);
+ 
+ 		/* check link status from sink device */
+-		drm_dp_dpcd_read_link_status(&mtk_dp->aux, link_status);
++		ret = drm_dp_dpcd_read_link_status(&mtk_dp->aux, link_status);
++		if (ret)
++			return ret;
+ 		memcpy(mtk_dp->last_link_status, link_status, sizeof(link_status));
+ 		if (drm_dp_clock_recovery_ok(link_status,
+ 					     target_lane_count)) {
+@@ -1816,6 +1836,7 @@ static int mtk_dp_train_eq(struct mtk_dp *mtk_dp, u8 target_lane_count)
+ 	u8 lane_adjust[2] = {};
+ 	u8 link_status[DP_LINK_STATUS_SIZE] = {};
+ 	int train_retries = 0;
++	int ret;
+ 
+ 	mtk_dp_pattern(mtk_dp, false);
+ 
+@@ -1826,8 +1847,10 @@ static int mtk_dp_train_eq(struct mtk_dp *mtk_dp, u8 target_lane_count)
+ 			return -ENODEV;
+ 		}
+ 
+-		drm_dp_dpcd_read(&mtk_dp->aux, DP_ADJUST_REQUEST_LANE0_1,
++		ret = drm_dp_dpcd_read(&mtk_dp->aux, DP_ADJUST_REQUEST_LANE0_1,
+ 				 lane_adjust, sizeof(lane_adjust));
++		if (ret != sizeof(lane_adjust))
++			return ret < 0 ? ret : -EIO;
+ 		mtk_dp_train_update_swing_pre(mtk_dp, target_lane_count,
+ 					      lane_adjust);
+ 
+@@ -1835,16 +1858,18 @@ static int mtk_dp_train_eq(struct mtk_dp *mtk_dp, u8 target_lane_count)
+ 						   mtk_dp->rx_cap);
+ 
+ 		/* check link status from sink device */
+-		drm_dp_dpcd_read_link_status(&mtk_dp->aux, link_status);
++		ret = drm_dp_dpcd_read_link_status(&mtk_dp->aux, link_status);
++		if (ret)
++			return ret;
+ 		memcpy(mtk_dp->last_link_status, link_status, sizeof(link_status));
+ 		if (drm_dp_channel_eq_ok(link_status, target_lane_count)) {
+ 			dev_dbg(mtk_dp->dev, "Link train EQ pass\n");
+ 
+ 			/* Training done, and disable pattern. */
+-			drm_dp_dpcd_writeb(&mtk_dp->aux, DP_TRAINING_PATTERN_SET,
++			ret = drm_dp_dpcd_writeb(&mtk_dp->aux, DP_TRAINING_PATTERN_SET,
+ 					   DP_TRAINING_PATTERN_DISABLE);
+ 			mtk_dp_train_set_pattern(mtk_dp, 0);
+-			return 0;
++			return ret == 1 ? 0 : (ret < 0 ? ret : -EIO);
+ 		}
+ 		dev_dbg(mtk_dp->dev, "Link train EQ fail\n");
+ 	} while (train_retries < MTK_DP_TRAIN_DOWNSCALE_RETRY);
+@@ -1891,7 +1916,8 @@ static int mtk_dp_parse_capabilities(struct mtk_dp *mtk_dp)
+ 		return ret == 0 ? -EIO : ret;
+ 	}
+ 
+-	if (val & DP_MST_CAP) {
++	/* MT6897 uses SST: do not acknowledge unserviced MST messages. */
++	if ((val & DP_MST_CAP) && !mtk_dp->data->mt6897_phya) {
+ 		/* Clear DP_DEVICE_SERVICE_IRQ_VECTOR_ESI0 */
+ 		ret = drm_dp_dpcd_readb(&mtk_dp->aux,
+ 					DP_DEVICE_SERVICE_IRQ_VECTOR_ESI0,
+@@ -1948,6 +1974,9 @@ static int mtk_dp_training(struct mtk_dp *mtk_dp)
+ 	if (mtk_dp->dbg_max_lanes)
+ 		lane_count = min_t(u8, lane_count, mtk_dp->dbg_max_lanes);
+ 
++	if ((lane_count != 1 && lane_count != 2 && lane_count != 4) || !link_rate)
++		return -EINVAL;
++
+ 	/*
+ 	 * TPS are generated by the hardware pattern generator. From the
+ 	 * hardware setting we need to disable this scramble setting before
+@@ -1960,22 +1989,24 @@ static int mtk_dp_training(struct mtk_dp *mtk_dp)
+ 
+ 		ret = mtk_dp_train_setting(mtk_dp, link_rate, lane_count);
+ 		if (ret)
+-			return ret;
++			goto failed;
+ 
+ 		dev_dbg(mtk_dp->dev, "training: rate 0x%02x, %u lanes\n",
+ 			link_rate, lane_count);
+ 
+ 		ret = mtk_dp_train_cr(mtk_dp, lane_count);
+-		if (ret == -ENODEV) {
+-			return ret;
++		if (ret && ret != -ETIMEDOUT) {
++			goto failed;
+ 		} else if (ret) {
+ 			/* reduce link rate */
+ 			switch (link_rate) {
+ 			case DP_LINK_BW_1_62:
+ 				lane_count = lane_count / 2;
+ 				link_rate = max_link_rate;
+-				if (lane_count == 0)
+-					return -EIO;
++				if (lane_count == 0) {
++					ret = -EIO;
++					goto failed;
++				}
+ 				break;
+ 			case DP_LINK_BW_2_7:
+ 				link_rate = DP_LINK_BW_1_62;
+@@ -1987,18 +2018,21 @@ static int mtk_dp_training(struct mtk_dp *mtk_dp)
+ 				link_rate = DP_LINK_BW_5_4;
+ 				break;
+ 			default:
+-				return -EINVAL;
++				ret = -EINVAL;
++				goto failed;
+ 			}
+ 			continue;
+ 		}
+ 
+ 		ret = mtk_dp_train_eq(mtk_dp, lane_count);
+-		if (ret == -ENODEV) {
+-			return ret;
++		if (ret && ret != -ETIMEDOUT) {
++			goto failed;
+ 		} else if (ret) {
+ 			/* reduce lane count */
+-			if (lane_count == 0)
+-				return -EIO;
++			if (lane_count <= 1) {
++				ret = -EIO;
++				goto failed;
++			}
+ 			lane_count /= 2;
+ 			continue;
+ 		}
+@@ -2007,8 +2041,10 @@ static int mtk_dp_training(struct mtk_dp *mtk_dp)
+ 		break;
+ 	}
+ 
+-	if (train_limit == 0)
+-		return -ETIMEDOUT;
++	if (train_limit == 0) {
++		ret = -ETIMEDOUT;
++		goto failed;
++	}
+ 
+ 	mtk_dp->train_info.link_rate = link_rate;
+ 	mtk_dp->train_info.lane_count = lane_count;
+@@ -2021,6 +2057,12 @@ static int mtk_dp_training(struct mtk_dp *mtk_dp)
+ 	mtk_dp_set_enhanced_frame_mode(mtk_dp);
+ 
+ 	return 0;
++
++failed:
++	drm_dp_dpcd_writeb(&mtk_dp->aux, DP_TRAINING_PATTERN_SET,
++			   DP_TRAINING_PATTERN_DISABLE);
++	mtk_dp_train_set_pattern(mtk_dp, 0);
++	return ret;
+ }
+ 
+ static void mtk_dp_video_enable(struct mtk_dp *mtk_dp, bool enable)
+@@ -2108,28 +2150,188 @@ static void mtk_dp_set_oob_hpd(struct mtk_dp *mtk_dp)
+  * state change as the HPD interrupt would. Before the bridge is attached
+  * only the level is kept.
+  */
+-static void mtk_dp_oob_hpd_update(struct mtk_dp *mtk_dp, bool level)
++static void mtk_dp_oob_hpd_update(struct mtk_dp *mtk_dp, bool level, bool irq)
+ {
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&mtk_dp->irq_thread_lock, flags);
+-	if (level == mtk_dp->oob_hpd_level) {
++	if (mtk_dp->stopping) {
++		spin_unlock_irqrestore(&mtk_dp->irq_thread_lock, flags);
++		return;
++	}
++	if (level != mtk_dp->oob_hpd_level) {
++		mtk_dp->oob_hpd_level = level;
++		WRITE_ONCE(mtk_dp->hpd_generation, mtk_dp->hpd_generation + 1);
++		WRITE_ONCE(mtk_dp->train_info.cable_plugged_in, level);
++		if (mtk_dp->drm_dev)
++			mtk_dp->irq_thread_handle |= MTK_DP_THREAD_CABLE_STATE_CHG;
++	} else if (irq && level && mtk_dp->train_info.cable_plugged_in &&
++		   mtk_dp->drm_dev) {
++		mtk_dp->irq_thread_handle |= MTK_DP_THREAD_HPD_EVENT;
++	} else {
+ 		spin_unlock_irqrestore(&mtk_dp->irq_thread_lock, flags);
+ 		return;
+ 	}
+-	mtk_dp->oob_hpd_level = level;
+ 	if (!mtk_dp->drm_dev) {
+ 		spin_unlock_irqrestore(&mtk_dp->irq_thread_lock, flags);
+ 		return;
+ 	}
+-	mtk_dp->irq_thread_handle |= MTK_DP_THREAD_CABLE_STATE_CHG;
+-	mtk_dp->train_info.cable_plugged_in = level;
+ 	spin_unlock_irqrestore(&mtk_dp->irq_thread_lock, flags);
+ 
+-	mtk_dp_set_oob_hpd(mtk_dp);
++	mutex_lock(&mtk_dp->link_lock);
++	if (!mtk_dp->suspended && !mtk_dp->stopping && mtk_dp->drm_dev)
++		mtk_dp_set_oob_hpd(mtk_dp);
++	mutex_unlock(&mtk_dp->link_lock);
+ 	irq_wake_thread(mtk_dp->irq, mtk_dp);
+ }
+ 
++/* link_lock held; keep the active mode's bandwidth and transport parameters. */
++static int mtk_dp_retrain_active(struct mtk_dp *mtk_dp)
++{
++	int ret, cleanup;
++	u8 lanes = mtk_dp->train_info.lane_count;
++	u8 rate = mtk_dp->train_info.link_rate;
++
++	mtk_dp_training_set_scramble(mtk_dp, false);
++	mtk_dp_train_change_mode(mtk_dp);
++	ret = mtk_dp_train_setting(mtk_dp, rate, lanes);
++	if (!ret)
++		ret = mtk_dp_train_cr(mtk_dp, lanes);
++	if (!ret)
++		ret = mtk_dp_train_eq(mtk_dp, lanes);
++
++	/* Also clean up a failed setting/CR path, not just successful EQ. */
++	cleanup = drm_dp_dpcd_writeb(&mtk_dp->aux, DP_TRAINING_PATTERN_SET,
++			   DP_TRAINING_PATTERN_DISABLE);
++	if (!ret && cleanup != 1)
++		ret = cleanup < 0 ? cleanup : -EIO;
++	mtk_dp_train_set_pattern(mtk_dp, 0);
++	mtk_dp_training_set_scramble(mtk_dp, true);
++	if (!ret)
++		mtk_dp_set_enhanced_frame_mode(mtk_dp);
++	return ret;
++}
++
++/*
++ * MT6897's Type-C Attention carries a sink interrupt even when HPD stays high.
++ * Service supported requests only; an unknown service bit must remain pending.
++ * Return whether DRM needs to reprobe, with no DRM callbacks under link_lock.
++ */
++static bool mtk_dp_service_irq(struct mtk_dp *mtk_dp)
++{
++	u8 status[DP_LINK_STATUS_SIZE], service, ack = 0;
++	u32 generation = READ_ONCE(mtk_dp->hpd_generation);
++	int lanes = mtk_dp->train_info.lane_count;
++	bool active = mtk_dp->stream_active;
++	int ret;
++
++	if (!mtk_dp->data->mt6897_phya || !mtk_dp->typec_mux ||
++	    mtk_dp->suspended || READ_ONCE(mtk_dp->stopping) || !mtk_dp->drm_dev ||
++	    !READ_ONCE(mtk_dp->train_info.cable_plugged_in) ||
++	    !READ_ONCE(mtk_dp->typec_lanes) || mtk_dp->irq_recovery_failed)
++		return false;
++
++	if (!active && mtk_dp->link_failed)
++		mtk_dp_aux_panel_poweron(mtk_dp, true);
++
++	ret = drm_dp_dpcd_readb(&mtk_dp->aux, DP_DEVICE_SERVICE_IRQ_VECTOR,
++				&service);
++	if (ret != 1) {
++		ret = ret < 0 ? ret : -EIO;
++		goto failed;
++	}
++	if (service & DP_AUTOMATED_TEST_REQUEST) {
++		/* Compliance tests are unsupported: explicitly reject, then ack. */
++		ret = drm_dp_dpcd_writeb(&mtk_dp->aux, DP_TEST_RESPONSE, DP_TEST_NAK);
++		if (ret != 1) {
++			ret = ret < 0 ? ret : -EIO;
++			goto failed;
++		}
++		ack = DP_AUTOMATED_TEST_REQUEST;
++	}
++	if (ack) {
++		ret = drm_dp_dpcd_writeb(&mtk_dp->aux, DP_DEVICE_SERVICE_IRQ_VECTOR, ack);
++		if (ret != 1) {
++			ret = ret < 0 ? ret : -EIO;
++			goto failed;
++		}
++	}
++	if (service & ~ack)
++		dev_dbg(mtk_dp->dev, "Unhandled sink service IRQ %#x\n", service & ~ack);
++
++	/* A failed initial plug has no valid trained parameters or active mode. */
++	if (!active && mtk_dp->link_failed) {
++		ret = mtk_dp_parse_capabilities(mtk_dp);
++		if (!ret)
++			ret = mtk_dp_training(mtk_dp);
++		goto recovered;
++	}
++	if (lanes != 1 && lanes != 2 && lanes != 4) {
++		ret = -EINVAL;
++		goto failed;
++	}
++	ret = drm_dp_dpcd_read_link_status(&mtk_dp->aux, status);
++	if (ret)
++		goto failed;
++	memcpy(mtk_dp->last_link_status, status, sizeof(status));
++	if (drm_dp_clock_recovery_ok(status, lanes) &&
++	    drm_dp_channel_eq_ok(status, lanes))
++		return false;
++
++	if (lanes > READ_ONCE(mtk_dp->typec_lanes)) {
++		ret = -ENOLINK;
++		goto failed;
++	}
++	dev_info(mtk_dp->dev, "Sink lost link lock, retraining %#x x%u\n",
++		 mtk_dp->train_info.link_rate, lanes);
++	if (active)
++		mtk_dp_video_mute(mtk_dp, true);
++	ret = mtk_dp_retrain_active(mtk_dp);
++recovered:
++	if (READ_ONCE(mtk_dp->stopping) ||
++	    !READ_ONCE(mtk_dp->train_info.cable_plugged_in) ||
++	    generation != READ_ONCE(mtk_dp->hpd_generation))
++		return false;
++	if (ret)
++		goto failed;
++	ret = drm_dp_dpcd_read_link_status(&mtk_dp->aux, status);
++	if (ret)
++		goto failed;
++	lanes = mtk_dp->train_info.lane_count;
++	if ((lanes != 1 && lanes != 2 && lanes != 4) ||
++	    lanes > READ_ONCE(mtk_dp->typec_lanes) ||
++	    !drm_dp_clock_recovery_ok(status, lanes) ||
++	    !drm_dp_channel_eq_ok(status, lanes)) {
++		ret = -ENOLINK;
++		goto failed;
++	}
++	memcpy(mtk_dp->last_link_status, status, sizeof(status));
++	if (READ_ONCE(mtk_dp->stopping) ||
++	    !READ_ONCE(mtk_dp->train_info.cable_plugged_in) ||
++	    generation != READ_ONCE(mtk_dp->hpd_generation))
++		return false;
++	mtk_dp->link_failed = false;
++	mtk_dp->enabled = true;
++	/* Exact retraining leaves the live MSA/TU intact; atomic_check may stage info. */
++	if (active)
++		mtk_dp_video_mute(mtk_dp, false);
++	dev_info(mtk_dp->dev, "Sink link recovered\n");
++	return !active;
++
++failed:
++	/* Latch failure until a new attachment; repeated IRQs cannot train forever. */
++	if (READ_ONCE(mtk_dp->stopping) ||
++	    !READ_ONCE(mtk_dp->train_info.cable_plugged_in) ||
++	    generation != READ_ONCE(mtk_dp->hpd_generation))
++		return false;
++	if (active)
++		mtk_dp_video_mute(mtk_dp, true);
++	mtk_dp->link_failed = true;
++	mtk_dp->irq_recovery_failed = true;
++	dev_warn(mtk_dp->dev, "Sink link recovery failed: %d\n", ret);
++	return true;
++}
++
+ static void mtk_dp_init_port(struct mtk_dp *mtk_dp)
+ {
+ 	mtk_dp_set_idle_pattern(mtk_dp, true);
+@@ -2153,7 +2355,8 @@ static irqreturn_t mtk_dp_hpd_event_thread(int hpd, void *dev)
+ 	struct mtk_dp *mtk_dp = dev;
+ 	unsigned long flags;
+ 	u32 status;
+-	int ret;
++	bool notify = false;
++	int ret = -ENODEV;
+ 
+ 	if (mtk_dp->need_debounce && mtk_dp->train_info.cable_plugged_in)
+ 		msleep(100);
+@@ -2163,17 +2366,23 @@ static irqreturn_t mtk_dp_hpd_event_thread(int hpd, void *dev)
+ 	mtk_dp->irq_thread_handle = 0;
+ 	spin_unlock_irqrestore(&mtk_dp->irq_thread_lock, flags);
+ 
++	mutex_lock(&mtk_dp->link_lock);
++	if (mtk_dp->suspended || mtk_dp->stopping || !mtk_dp->drm_dev)
++		goto unlock;
++
+ 	if (status & MTK_DP_THREAD_CABLE_STATE_CHG) {
++		mtk_dp->irq_recovery_failed = false;
+ 		/*
+ 		 * Without an HPD pin, train first: a sink whose link does not
+ 		 * train is reported disconnected instead of offering modes.
+ 		 */
+ 		if (mtk_dp->bridge.dev &&
+ 		    !(mtk_dp->oob_hpd && mtk_dp->train_info.cable_plugged_in))
+-			drm_helper_hpd_irq_event(mtk_dp->bridge.dev);
++			notify = true;
+ 
+ 		if (!mtk_dp->train_info.cable_plugged_in) {
+ 			mtk_dp->link_failed = false;
++			mtk_dp->stream_active = false;
+ 			mtk_dp_disable_sdp_aui(mtk_dp);
+ 			memset(&mtk_dp->info.audio_cur_cfg, 0,
+ 			       sizeof(mtk_dp->info.audio_cur_cfg));
+@@ -2230,12 +2439,19 @@ static irqreturn_t mtk_dp_hpd_event_thread(int hpd, void *dev)
+ 			mtk_dp->enabled = true;
+ 
+ 			if (mtk_dp->oob_hpd && mtk_dp->bridge.dev)
+-				drm_helper_hpd_irq_event(mtk_dp->bridge.dev);
++				notify = true;
+ 		}
+ 	}
+ 
+-	if (status & MTK_DP_THREAD_HPD_EVENT)
+-		dev_dbg(mtk_dp->dev, "Receive IRQ from sink devices\n");
++	/* A cable change already trained the new link; do not train it twice. */
++	if ((status & MTK_DP_THREAD_HPD_EVENT) &&
++	    !(status & MTK_DP_THREAD_CABLE_STATE_CHG))
++		notify |= mtk_dp_service_irq(mtk_dp);
++
++unlock:
++	mutex_unlock(&mtk_dp->link_lock);
++	if (notify && mtk_dp->bridge.dev)
++		drm_helper_hpd_irq_event(mtk_dp->bridge.dev);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -2374,6 +2590,12 @@ mtk_dp_bdg_detect(struct drm_bridge *bridge, struct drm_connector *connector)
+ 	if (!mtk_dp->train_info.cable_plugged_in)
+ 		return ret;
+ 
++	mutex_lock(&mtk_dp->link_lock);
++	if (mtk_dp->suspended) {
++		mutex_unlock(&mtk_dp->link_lock);
++		return connector_status_disconnected;
++	}
++	enabled = mtk_dp->enabled;
+ 	if (!enabled)
+ 		mtk_dp_aux_panel_poweron(mtk_dp, true);
+ 
+@@ -2391,6 +2613,7 @@ mtk_dp_bdg_detect(struct drm_bridge *bridge, struct drm_connector *connector)
+ 	if (!enabled)
+ 		mtk_dp_aux_panel_poweron(mtk_dp, false);
+ 
++	mutex_unlock(&mtk_dp->link_lock);
+ 	return ret;
+ }
+ 
+@@ -2398,14 +2621,21 @@ static const struct drm_edid *mtk_dp_edid_read(struct drm_bridge *bridge,
+ 					       struct drm_connector *connector)
+ {
+ 	struct mtk_dp *mtk_dp = mtk_dp_from_bridge(bridge);
+-	bool enabled = mtk_dp->enabled;
++	bool chain_enable = !READ_ONCE(mtk_dp->enabled);
++	bool enabled;
+ 	const struct drm_edid *drm_edid;
+ 	struct mtk_dp_audio_cfg *audio_caps = &mtk_dp->info.audio_cur_cfg;
+ 
+-	if (!enabled) {
++	if (chain_enable)
+ 		drm_atomic_bridge_chain_pre_enable(bridge, connector->state->state);
+-		mtk_dp_aux_panel_poweron(mtk_dp, true);
++	mutex_lock(&mtk_dp->link_lock);
++	if (mtk_dp->suspended) {
++		drm_edid = NULL;
++		goto unlock;
+ 	}
++	enabled = mtk_dp->enabled;
++	if (!enabled)
++		mtk_dp_aux_panel_poweron(mtk_dp, true);
+ 
+ 	drm_edid = drm_edid_read_ddc(connector, &mtk_dp->aux.ddc);
+ 
+@@ -2444,10 +2674,12 @@ static const struct drm_edid *mtk_dp_edid_read(struct drm_bridge *bridge,
+ 		audio_caps->detect_monitor = drm_detect_monitor_audio(edid);
+ 	}
+ 
+-	if (!enabled) {
++	if (!enabled)
+ 		mtk_dp_aux_panel_poweron(mtk_dp, false);
++unlock:
++	mutex_unlock(&mtk_dp->link_lock);
++	if (chain_enable)
+ 		drm_atomic_bridge_chain_post_disable(bridge, connector->state->state);
+-	}
+ 
+ 	return drm_edid;
+ }
+@@ -2578,7 +2810,8 @@ static int mtk_dp_bridge_attach(struct drm_bridge *bridge,
+ 		}
+ 	}
+ 
+-	mtk_dp->drm_dev = bridge->dev;
++	WRITE_ONCE(mtk_dp->stopping, false);
++	WRITE_ONCE(mtk_dp->drm_dev, bridge->dev);
+ 
+ 	if (mtk_dp->bridge.type != DRM_MODE_CONNECTOR_eDP) {
+ 		irq_clear_status_flags(mtk_dp->irq, IRQ_NOAUTOEN);
+@@ -2614,13 +2847,21 @@ static int mtk_dp_bridge_attach(struct drm_bridge *bridge,
+ static void mtk_dp_bridge_detach(struct drm_bridge *bridge)
+ {
+ 	struct mtk_dp *mtk_dp = mtk_dp_from_bridge(bridge);
++	unsigned long flags;
+ 
+-	if (mtk_dp->bridge.type != DRM_MODE_CONNECTOR_eDP) {
+-		mtk_dp_hwirq_enable(mtk_dp, false);
++	spin_lock_irqsave(&mtk_dp->irq_thread_lock, flags);
++	mtk_dp->stopping = true;
++	spin_unlock_irqrestore(&mtk_dp->irq_thread_lock, flags);
++
++	if (mtk_dp->bridge.type != DRM_MODE_CONNECTOR_eDP)
+ 		disable_irq(mtk_dp->irq);
+-	}
++	mutex_lock(&mtk_dp->link_lock);
+ 	mtk_dp->drm_dev = NULL;
++	if (mtk_dp->bridge.type != DRM_MODE_CONNECTOR_eDP)
++		mtk_dp_hwirq_enable(mtk_dp, false);
++	mtk_dp->stream_active = false;
+ 	mtk_dp_poweroff(mtk_dp);
++	mutex_unlock(&mtk_dp->link_lock);
+ 	drm_dp_aux_unregister(&mtk_dp->aux);
+ 	if (mtk_dp->oob_hpd) {
+ 		drm_bridge_put(mtk_dp->next_bridge);
+@@ -2641,7 +2882,7 @@ static void mtk_dp_bridge_hpd_notify(struct drm_bridge *bridge,
+ 	 */
+ 	if (mtk_dp->oob_hpd && !mtk_dp->typec_mux)
+ 		mtk_dp_oob_hpd_update(mtk_dp,
+-				      status == connector_status_connected);
++				      status == connector_status_connected, false);
+ }
+ 
+ static void mtk_dp_bridge_atomic_enable(struct drm_bridge *bridge,
+@@ -2650,11 +2891,13 @@ static void mtk_dp_bridge_atomic_enable(struct drm_bridge *bridge,
+ 	struct mtk_dp *mtk_dp = mtk_dp_from_bridge(bridge);
+ 	int ret;
+ 
++	mutex_lock(&mtk_dp->link_lock);
+ 	mtk_dp->conn = drm_atomic_get_new_connector_for_encoder(state,
+ 								bridge->encoder);
+ 	if (!mtk_dp->conn) {
+ 		drm_err(mtk_dp->drm_dev,
+ 			"Can't enable bridge as connector is missing\n");
++		mutex_unlock(&mtk_dp->link_lock);
+ 		return;
+ 	}
+ 
+@@ -2673,7 +2916,11 @@ static void mtk_dp_bridge_atomic_enable(struct drm_bridge *bridge,
+ 	if (ret)
+ 		goto power_off_aux;
+ 
++	if (mtk_dp->data->mt6897_phya &&
++	    (!READ_ONCE(mtk_dp->train_info.cable_plugged_in) || mtk_dp->link_failed))
++		goto power_off_aux;
+ 	mtk_dp_video_enable(mtk_dp, true);
++	mtk_dp->stream_active = true;
+ 
+ 	mtk_dp->audio_enable =
+ 		mtk_dp_edid_parse_audio_capabilities(mtk_dp,
+@@ -2691,11 +2938,13 @@ static void mtk_dp_bridge_atomic_enable(struct drm_bridge *bridge,
+ 
+ 	mtk_dp_update_plugged_status(mtk_dp);
+ 
++	mutex_unlock(&mtk_dp->link_lock);
+ 	return;
+ power_off_aux:
+ 	mtk_dp_update_bits(mtk_dp, MTK_DP_TOP_PWR_STATE,
+ 			   DP_PWR_STATE_BANDGAP_TPLL,
+ 			   DP_PWR_STATE_MASK);
++	mutex_unlock(&mtk_dp->link_lock);
+ }
+ 
+ static void mtk_dp_bridge_atomic_disable(struct drm_bridge *bridge,
+@@ -2703,6 +2952,8 @@ static void mtk_dp_bridge_atomic_disable(struct drm_bridge *bridge,
+ {
+ 	struct mtk_dp *mtk_dp = mtk_dp_from_bridge(bridge);
+ 
++	mutex_lock(&mtk_dp->link_lock);
++	mtk_dp->stream_active = false;
+ 	if (mtk_dp->data->bridge_type == DRM_MODE_CONNECTOR_eDP) {
+ 		mtk_dp->enabled = false;
+ 		mtk_dp_aux_panel_poweron(mtk_dp, false);
+@@ -2717,6 +2968,7 @@ static void mtk_dp_bridge_atomic_disable(struct drm_bridge *bridge,
+ 
+ 	/* Ensure the sink is muted */
+ 	msleep(20);
++	mutex_unlock(&mtk_dp->link_lock);
+ }
+ 
+ static enum drm_mode_status
+@@ -3022,6 +3274,7 @@ static ssize_t mtk_dp_debugfs_retrain(struct file *file,
+ 				      loff_t *ppos)
+ {
+ 	struct mtk_dp *mtk_dp = file->private_data;
++	struct drm_device *drm;
+ 	int ret;
+ 
+ 	if (!mtk_dp->drm_dev || !mtk_dp->train_info.cable_plugged_in)
+@@ -3029,17 +3282,34 @@ static ssize_t mtk_dp_debugfs_retrain(struct file *file,
+ 
+ 	/* serialize with the HPD thread */
+ 	disable_irq(mtk_dp->irq);
++	mutex_lock(&mtk_dp->link_lock);
++	drm = mtk_dp->drm_dev;
++	if (!drm || mtk_dp->stopping) {
++		mutex_unlock(&mtk_dp->link_lock);
++		enable_irq(mtk_dp->irq);
++		return -ENODEV;
++	}
++	drm_dev_get(drm);
++	if (mtk_dp->stream_active || mtk_dp->suspended) {
++		ret = -EBUSY;
++		goto unlock;
++	}
+ 	mtk_dp_aux_panel_poweron(mtk_dp, true);
+ 	ret = mtk_dp_parse_capabilities(mtk_dp);
+ 	if (!ret)
+ 		ret = mtk_dp_training(mtk_dp);
+ 	mtk_dp->link_failed = ret;
++	if (!ret)
++		mtk_dp->irq_recovery_failed = false;
+ 	dev_info(mtk_dp->dev, "retrain: %d, rate 0x%02x, %u lanes, link status %*ph\n",
+ 		 ret, mtk_dp->train_info.link_rate, mtk_dp->train_info.lane_count,
+ 		 DP_LINK_STATUS_SIZE, mtk_dp->last_link_status);
++unlock:
++	mutex_unlock(&mtk_dp->link_lock);
+ 	enable_irq(mtk_dp->irq);
+ 
+-	drm_helper_hpd_irq_event(mtk_dp->drm_dev);
++	drm_helper_hpd_irq_event(drm);
++	drm_dev_put(drm);
+ 
+ 	return ret ? ret : count;
+ }
+@@ -3060,20 +3330,23 @@ static int mtk_dp_debugfs_link_status_show(struct seq_file *m, void *unused)
+ 	u8 status[DP_LINK_STATUS_SIZE];
+ 	int i;
+ 
++	mutex_lock(&mtk_dp->link_lock);
+ 	seq_printf(m, "plugged %d oob_hpd %d link_failed %d typec_lanes %u aux_pn_swap %d\n",
+ 		   mtk_dp->train_info.cable_plugged_in, mtk_dp->oob_hpd_level,
+ 		   mtk_dp->link_failed, mtk_dp->typec_lanes, mtk_dp->aux_pn_swap);
+ 	seq_printf(m, "trained rate 0x%02x lanes %u; last link status %*ph\n",
+ 		   mtk_dp->train_info.link_rate, mtk_dp->train_info.lane_count,
+ 		   DP_LINK_STATUS_SIZE, mtk_dp->last_link_status);
+-	if (mtk_dp->train_info.cable_plugged_in &&
++	if (!mtk_dp->suspended && mtk_dp->train_info.cable_plugged_in &&
+ 	    drm_dp_dpcd_read_link_status(&mtk_dp->aux, status) == 0)
+ 		seq_printf(m, "sink link status %*ph\n", DP_LINK_STATUS_SIZE, status);
+-	if (!pm_runtime_active(mtk_dp->dev))
+-		return 0;
++	if (mtk_dp->suspended || !pm_runtime_active(mtk_dp->dev))
++		goto unlock;
+ 	for (i = 0; i < ARRAY_SIZE(regs); i++)
+ 		seq_printf(m, "0x%04x: 0x%08x\n", regs[i], mtk_dp_read(mtk_dp, regs[i]));
+ 
++unlock:
++	mutex_unlock(&mtk_dp->link_lock);
+ 	return 0;
+ }
+ DEFINE_SHOW_ATTRIBUTE(mtk_dp_debugfs_link_status);
+@@ -3094,8 +3367,11 @@ static int mtk_dp_typec_switch_set(struct typec_switch_dev *sw,
+ {
+ 	struct mtk_dp *mtk_dp = typec_switch_get_drvdata(sw);
+ 
++	mutex_lock(&mtk_dp->link_lock);
+ 	mtk_dp->aux_pn_swap = orientation == TYPEC_ORIENTATION_REVERSE;
+-	mtk_dp_set_aux_pn_swap(mtk_dp);
++	if (!mtk_dp->suspended)
++		mtk_dp_set_aux_pn_swap(mtk_dp);
++	mutex_unlock(&mtk_dp->link_lock);
+ 
+ 	return 0;
+ }
+@@ -3105,7 +3381,7 @@ static int mtk_dp_typec_mux_set(struct typec_mux_dev *mux,
+ {
+ 	struct mtk_dp *mtk_dp = typec_mux_get_drvdata(mux);
+ 	struct typec_displayport_data *dp_data = state->data;
+-	bool hpd = false;
++	bool hpd = false, irq = false;
+ 
+ 	if (!state->alt || state->alt->svid != USB_TYPEC_DP_SID) {
+ 		mtk_dp->typec_lanes = 0;
+@@ -3122,15 +3398,17 @@ static int mtk_dp_typec_mux_set(struct typec_mux_dev *mux,
+ 		mtk_dp->typec_lanes = 2;
+ 		break;
+ 	default:
++		mtk_dp->typec_lanes = 0;
+ 		goto out;
+ 	}
+ 
+ 	/* The DisplayPort status carries the HPD of the sink */
+ 	hpd = dp_data && (dp_data->status & DP_STATUS_HPD_STATE);
++	irq = hpd && (dp_data->status & DP_STATUS_IRQ_HPD);
+ 
+ out:
+ 	if (mtk_dp->oob_hpd)
+-		mtk_dp_oob_hpd_update(mtk_dp, hpd);
++		mtk_dp_oob_hpd_update(mtk_dp, hpd, irq);
+ 
+ 	return 0;
+ }
+@@ -3194,6 +3472,8 @@ static int mtk_dp_probe(struct platform_device *pdev)
+ 	if (IS_ERR(mtk_dp))
+ 		return PTR_ERR(mtk_dp);
+ 
++	mutex_init(&mtk_dp->link_lock);
++	spin_lock_init(&mtk_dp->irq_thread_lock);
+ 	mtk_dp->dev = dev;
+ 	mtk_dp->data = (struct mtk_dp_data *)of_device_get_match_data(dev);
+ 
+@@ -3214,7 +3494,6 @@ static int mtk_dp_probe(struct platform_device *pdev)
+ 			return dev_err_probe(dev, mtk_dp->irq,
+ 					     "failed to request dp irq resource\n");
+ 
+-		spin_lock_init(&mtk_dp->irq_thread_lock);
+ 
+ 		irq_set_status_flags(mtk_dp->irq, IRQ_NOAUTOEN);
+ 		ret = devm_request_threaded_irq(dev, mtk_dp->irq, mtk_dp_hpd_event,
+@@ -3327,8 +3606,13 @@ static void mtk_dp_remove(struct platform_device *pdev)
+ 	struct mtk_dp *mtk_dp = platform_get_drvdata(pdev);
+ 
+ 	debugfs_remove_recursive(mtk_dp->debugfs);
++	if (mtk_dp->data->bridge_type != DRM_MODE_CONNECTOR_eDP)
++		disable_irq(mtk_dp->irq);
++	mutex_lock(&mtk_dp->link_lock);
++	mtk_dp->suspended = true;
+ 	pm_runtime_put(&pdev->dev);
+ 	pm_runtime_disable(&pdev->dev);
++	mutex_unlock(&mtk_dp->link_lock);
+ 	if (mtk_dp->data->bridge_type != DRM_MODE_CONNECTOR_eDP)
+ 		timer_delete_sync(&mtk_dp->debounce_timer);
+ 	platform_device_unregister(mtk_dp->phy_dev);
+@@ -3341,10 +3625,13 @@ static int mtk_dp_suspend(struct device *dev)
+ {
+ 	struct mtk_dp *mtk_dp = dev_get_drvdata(dev);
+ 
++	mutex_lock(&mtk_dp->link_lock);
++	mtk_dp->suspended = true;
+ 	mtk_dp_power_disable(mtk_dp);
+ 	if (mtk_dp->bridge.type != DRM_MODE_CONNECTOR_eDP)
+ 		mtk_dp_hwirq_enable(mtk_dp, false);
+ 	pm_runtime_put_sync(dev);
++	mutex_unlock(&mtk_dp->link_lock);
+ 
+ 	return 0;
+ }
+@@ -3353,11 +3640,14 @@ static int mtk_dp_resume(struct device *dev)
+ {
+ 	struct mtk_dp *mtk_dp = dev_get_drvdata(dev);
+ 
++	mutex_lock(&mtk_dp->link_lock);
+ 	pm_runtime_get_sync(dev);
+ 	mtk_dp_init_port(mtk_dp);
+ 	if (mtk_dp->bridge.type != DRM_MODE_CONNECTOR_eDP)
+ 		mtk_dp_hwirq_enable(mtk_dp, true);
+ 	mtk_dp_power_enable(mtk_dp);
++	mtk_dp->suspended = false;
++	mutex_unlock(&mtk_dp->link_lock);
+ 
+ 	return 0;
+ }
+-- 
+2.56.0
+

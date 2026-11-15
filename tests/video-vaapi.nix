@@ -27,7 +27,7 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
   assert driver.drvPath == native.androidDevicePackages.libva-v4l2.drvPath;
   {
     package = driver.drvPath;
-    devices = lib.genAttrs [ "aurora" "asphalt" "sheng" "polaris" "clover" ] (
+    devices = lib.genAttrs [ "aurora" "asphalt" "sheng" "polaris" "clover" "marble" ] (
       device:
       let
         plain = (make device { }).config;
@@ -49,11 +49,18 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
           }).config;
       in
       assert !plain.androidDevices.video.vaapi.enable;
+      assert !(plain.environment.variables ? GST_VA_ALL_DRIVERS);
+      assert enabled.environment.variables.GST_VA_ALL_DRIVERS == "1";
+      assert builtins.elem "GST_VA_ALL_DRIVERS=1" (
+        lib.toList enabled.systemd.user.settings.Manager.DefaultEnvironment
+      );
+      assert !(recovery.environment.variables ? GST_VA_ALL_DRIVERS);
       assert !(builtins.elem driver plain.hardware.graphics.extraPackages);
       assert enabled.hardware.graphics.enable;
       assert builtins.elem driver enabled.hardware.graphics.extraPackages;
       assert enabled.androidDevices.video.ffmpegPackage.drvPath == env.pkgs.ffmpeg.drvPath;
       assert !(enabled.environment.variables ? LIBVA_DRIVER_NAME);
+      assert !(enabled.environment.variables ? LIBVA_DRIVERS_PATH);
       assert !enabled.programs.niri.enable && !enabled.programs.sway.enable;
       assert builtins.elem replacement replaced.hardware.graphics.extraPackages;
       assert !(builtins.elem driver replaced.hardware.graphics.extraPackages);

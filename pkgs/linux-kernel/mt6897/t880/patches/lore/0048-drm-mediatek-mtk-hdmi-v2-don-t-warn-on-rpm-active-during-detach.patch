@@ -1,0 +1,49 @@
+From 36c5e31c67b4d29a731b23acf295c0f3d2123381 Mon Sep 17 00:00:00 2001
+From: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Date: Tue, 14 Jul 2026 13:43:44 +0200
+Subject: [PATCH] drm/mediatek: mtk_hdmi_v2: Don't warn on RPM active during
+ detach
+
+The Runtime PM may be active during bridge .detach() and this
+happens especially at boot, when probe deferrals in the display
+controller driver happen.
+
+Even though it looks safe to assume that RPM has to be inactive
+at that time, this happens to be true only if the DDC was to be
+handled internally (like before .hpd_{en,dis}able() existed).
+
+At this point in time, this driver uses HPD callbacks, and for
+HPD to actually work it is necessary to raise the RPM refcount
+to wake up the entire HDMI IP: since it's not granted that the
+HPD or other children of the HDMI node are disabled during the
+display controller probe sequence, the WARN at bridge .detach()
+time may trigger (and will do that when mediatek-drm defers),
+unnecessarily bloating the kernel log, as the RPM refcount will
+be decreased anyway when removing the driver.
+
+This is why the WARN(pm_runtime_active()) check during detach
+is simply a development stage leftover: remove it!
+
+Signed-off-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Link: https://patchwork.kernel.org/project/linux-mediatek/list/?series=1127365
+[dianqk: from the Huge Restructuring v2 series, applied to v7.3-rc6; rc6 drift resolved]
+---
+ drivers/gpu/drm/mediatek/mtk_hdmi_v2.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_hdmi_v2.c b/drivers/gpu/drm/mediatek/mtk_hdmi_v2.c
+index f0277fcf33..acc2f1d695 100644
+--- a/drivers/gpu/drm/mediatek/mtk_hdmi_v2.c
++++ b/drivers/gpu/drm/mediatek/mtk_hdmi_v2.c
+@@ -995,8 +995,6 @@ static void mtk_hdmi_v2_bridge_detach(struct drm_bridge *bridge)
+ {
+ 	struct mtk_hdmi *hdmi = hdmi_ctx_from_bridge(bridge);
+ 
+-	WARN_ON(pm_runtime_active(hdmi->dev));
+-
+ 	/* The controller is already powered off, just disable irq here */
+ 	disable_irq(hdmi->irq);
+ }
+-- 
+2.56.0
+

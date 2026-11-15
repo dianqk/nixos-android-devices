@@ -17,5 +17,12 @@
     ./ssc-sensors.nix
     ./qtee.nix
     ./modem.nix
+    ./wakeup.nix
+    ./audio-orientation.nix
+    ./rtc-offset.nix
+    ./charge-thermal-limit.nix
+    ./charge-window.nix
+    ./rt-util-clamp.nix
+    ./reboot-param.nix
   ];
 }

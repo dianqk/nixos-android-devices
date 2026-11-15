@@ -1,0 +1,106 @@
+From: dianqk <dianqk@dianqk.net>
+Subject: [PATCH] t880: bound HEVC encoding to supported frame sizes
+
+Limit HEVC to 1920 pixels on either axis and 1920x1080 pixels per frame,
+including portrait input. Larger HEVC frames can trigger firmware SMI timeout;
+reject them before hardware submission. Keep H264 and decode limits unchanged.
+
+--- a/src/internal.hpp
++++ b/src/internal.hpp
+@@ -29,6 +29,22 @@
+ extern "C" int irisva_msm_allocate_coherent(int drm_fd, uint64_t size);
+ 
+ namespace irisva {
++inline bool t880_encode_geometry(bool hevc, unsigned width, unsigned height) {
++    const unsigned axis = hevc ? 1920 : 4096;
++    const uint64_t pixels = hevc ? uint64_t(1920) * 1080 : uint64_t(4096) * 2176;
++    return width >= 160 && height >= 128 && !(width & 1) && !(height & 1) &&
++           width <= axis && height <= axis && uint64_t(width) * height <= pixels;
++}
++
++// Contexts may include coding-block padding; visible pictures are checked separately.
++inline bool t880_encode_context_geometry(bool hevc, unsigned width, unsigned height) {
++    if (!hevc)
++        return t880_encode_geometry(false, width, height);
++    return width >= 160 && height >= 128 && !(width & 1) && !(height & 1) &&
++           width <= 1920 && height <= 1920 &&
++           uint64_t(width) * height <= uint64_t(1920) * 1088;
++}
++
+ inline bool is_rgb(unsigned fourcc) {
+     return fourcc == VA_FOURCC_BGRA || fourcc == VA_FOURCC_RGBA;
+ }
+--- a/src/backend.cpp
++++ b/src/backend.cpp
+@@ -153,9 +153,9 @@
+     case VAConfigAttribPredictionDirection:
+         return VA_PREDICTION_DIRECTION_PREVIOUS;
+     case VAConfigAttribMaxPictureWidth:
+-        return t880 ? 4096 : 3840;
++        return t880 ? (is_hevc(profile) ? 1920 : 4096) : 3840;
+     case VAConfigAttribMaxPictureHeight:
+-        return t880 ? 4096 : 2160;
++        return t880 ? (is_hevc(profile) ? 1920 : 4096) : 2160;
+     default:
+         return VA_ATTRIB_NOT_SUPPORTED;
+     }
+@@ -413,7 +413,11 @@
+                          VA_SURFACE_ATTRIB_MEM_TYPE_VA | VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME |
+                              VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2};
+     if (d.t880) { values[0] = VA_FOURCC_NV12; values[3] = 4096;
+-        values[4] = config.entrypoint == VAEntrypointEncSlice ? 4096 : 2176; }
++        values[4] = config.entrypoint == VAEntrypointEncSlice ? 4096 : 2176;
++        if (config.entrypoint == VAEntrypointEncSlice) values[1] = 160;
++        if (config.entrypoint == VAEntrypointEncSlice && is_hevc(profile))
++            values[3] = values[4] = 1920;
++    }
+     if (config.entrypoint == VAEntrypointVideoProc) {
+         values[1] = 2;
+         values[2] = 2;
+@@ -650,7 +654,9 @@
+     if (d.t880 && c->entrypoint == VAEntrypointEncSlice)
+         c->encode_settings.min_qp = c->encode_settings.max_qp = 0;
+     c->encode_settings.hevc = is_hevc(c->profile); if (c->entrypoint == VAEntrypointEncSlice)
+-        check(w <= (d.t880 ? 4096 : 3840) && h <= (d.t880 ? 4096 : 2160) && !(w & 1) && !(h & 1), "unsupported encoder dimensions",
++        check(w <= (d.t880 ? 4096 : 3840) && h <= (d.t880 ? 4096 : 2160) &&
++              (!d.t880 || t880_encode_context_geometry(is_hevc(c->profile), w, h)) &&
++              !(w & 1) && !(h & 1), "unsupported encoder dimensions",
+               VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
+     for (int i = 0; i < count; ++i) surface(d, targets[i]); c->width = w; c->height = h;
+     c->internal_profile = c->profile; c->decode_surfaces = std::max(0, count); if (processing) {
+--- a/src/encoder.cpp
++++ b/src/encoder.cpp
+@@ -655,7 +655,7 @@
+         height = coded_height;
+     }
+     check(width >= 128 && height >= 128 && width <= (t880 ? 4096u : 3840u) && height <= (t880 ? 4096u : 2160u) &&
+-              (!t880 || uint64_t(width) * height <= uint64_t(4096) * 2176) && !(width & 1) &&
++              (!t880 || t880_encode_geometry(s.hevc, width, height)) && !(width & 1) &&
+               !(height & 1),
+           "unsupported visible encoder dimensions", VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
+     validate(s, p, width, height, t880);
+--- a/tests/t880/encoder.cpp
++++ b/tests/t880/encoder.cpp
+@@ -160,6 +160,22 @@
+ std::shared_ptr<Buffer> coded(){auto b=std::make_shared<Buffer>();b->data.resize(1024);return b;}
+ template<class F>void rejects(F action){bool failed=false;try{action();}catch(const Error&){failed=true;}assert(failed);}
+ int main(){
++ assert(t880_encode_context_geometry(true,1920,1088));
++ assert(t880_encode_context_geometry(true,1088,1920));
++ assert(!t880_encode_context_geometry(true,1920,1920));
++ assert(!t880_encode_context_geometry(true,4096,2176));
++ assert(!t880_encode_geometry(true,1920,1088));
++ assert(!t880_encode_geometry(true,1088,1920));
++ assert(!t880_encode_geometry(true,128,128));
++ assert(!t880_encode_geometry(true,161,128));
++ assert(t880_encode_geometry(true,1920,1080));
++ assert(t880_encode_geometry(true,1080,1920));
++ assert(!t880_encode_geometry(true,1920,1920));
++ assert(!t880_encode_geometry(true,1922,1080));
++ assert(!t880_encode_geometry(true,4096,2176));
++ assert(t880_encode_geometry(false,4096,2176));
++ assert(t880_encode_geometry(false,2176,4096));
++ assert(!t880_encode_geometry(false,4096,2178));
+  for(auto mode:{VA_RC_VBR,VA_RC_AVBR}) {
+     f=Fake{};auto s=settings(mode);auto a=input(),r1=input(),r2=input();r1->memory.reset();r2->memory.reset();
+     auto p=picture(true,100,r1);Encoder e("fake",160,128,VAProfileH264Main,s,p,3,true);

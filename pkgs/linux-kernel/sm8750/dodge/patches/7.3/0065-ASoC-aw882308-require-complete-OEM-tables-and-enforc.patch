@@ -1,0 +1,606 @@
+From 3056cebc6d31a2db61bfd8792a35d1effdeae97c Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 8 Nov 2026 20:04:28 +0800
+Subject: [PATCH 070/144] ASoC: aw882308: require complete OEM tables and
+ enforce a fixed gain ceiling
+
+Reject missing, truncated, duplicate, wrong-channel or non-operational register tables before writes. Keep OTP and test registers inaccessible. Check every I2C transaction and assert reset permanently on bus/start failure. Serialize PCM and mixer operations; start at 700 attenuation with an immutable minimum of 320 (30.1 dB). Remove unverified Receiver switching and register-default fallback. The initial playback graph does not provide OEM DSP speaker protection.
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0091-ASoC-aw882308-require-complete-OEM-tables-and-enforc.patch
+Import-SHA256: 2732ba7cb2d80dec22d5ad43e7c4bcf034b1bf4388038c845e860283c6fcc953
+Import-Provenance: mail headers
+(cherry picked from commit 93a9d59d71ab2eb3a0921877d78f89a8f7599e66)
+---
+ sound/soc/codecs/aw882308.c | 395 ++++++++++++++++++++----------------
+ 1 file changed, 221 insertions(+), 174 deletions(-)
+
+diff --git a/sound/soc/codecs/aw882308.c b/sound/soc/codecs/aw882308.c
+index b0c4d910ba..e3fc59fee7 100644
+--- a/sound/soc/codecs/aw882308.c
++++ b/sound/soc/codecs/aw882308.c
+@@ -5,8 +5,8 @@
+  *
+  * Register layout per the GPL-2.0 aw882xx driver OnePlus publishes for this
+  * phone (aw882xx_pid_2308_reg.h). This driver does no speaker protection:
+- * it applies an optional register table from firmware, runs the amplifier
+- * from register defaults otherwise, and caps the volume.
++ * it requires a board register table from firmware and caps the volume.
++ * Firmware tables do not replace the OEM DSP speaker-protection service.
+  *
+  * Described in DT as "awinic,aw882308" (provisional) with reset-gpios and
+  * sound-name-prefix.
+@@ -16,6 +16,8 @@
+ #include <linux/gpio/consumer.h>
+ #include <linux/i2c.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/bitmap.h>
+ #include <linux/of.h>
+ #include <linux/regmap.h>
+ #include <linux/unaligned.h>
+@@ -56,104 +58,136 @@
+ #define I2SCTRL1_I2SBCK	GENMASK(5, 4)	/* 0 32fs, 1 48fs, 2 64fs */
+ #define I2SCTRL1_I2SSR	GENMASK(3, 0)	/* 8 = 48 kHz */
+ 
+-/* Attenuation floor: 0 would be full scale. 320 steps is about -30 dB. */
+-static unsigned int min_atten = 320;
+-module_param(min_atten, uint, 0444);
+-MODULE_PARM_DESC(min_atten, "Lowest attenuation the volume control allows (0..1023)");
+-
+-static bool use_fw = true;
+-module_param(use_fw, bool, 0444);
+-MODULE_PARM_DESC(use_fw, "Apply aw882308-<addr>.bin register table if present");
++/* Fixed ceiling: 320 * 0.0940625 dB = 30.1 dB attenuation. */
++#define AW_MIN_ATTEN 320U
++#define AW_INITIAL_ATTEN 700U
+ 
+ struct aw882308 {
+ 	struct device *dev;
+ 	struct regmap *regmap;
+ 	struct gpio_desc *reset;
+-	unsigned int atten;	/* user attenuation, >= min_atten */
++	unsigned int atten;	/* user attenuation, >= AW_MIN_ATTEN */
+ 	unsigned int chsel;
+-	unsigned int profile;	/* table loaded: 0 Speaker, 1 Receiver */
+-	unsigned int want;	/* profile for the next start */
++	struct mutex lock;
++	bool faulted;
+ 	bool running;
+ };
+ 
++static bool aw882308_table_reg(unsigned int reg);
++
++static bool aw882308_writeable_reg(struct device *dev, unsigned int reg)
++{
++	return reg == AW_ID || aw882308_table_reg(reg);
++}
++
+ static const struct regmap_config aw882308_regmap = {
+ 	.reg_bits = 8,
+ 	.val_bits = 16,
+ 	.max_register = AW_REG_MAX - 1,
++	.writeable_reg = aw882308_writeable_reg,
+ 	.cache_type = REGCACHE_NONE,
+ 	.val_format_endian = REGMAP_ENDIAN_BIG,
+ };
+ 
++static void aw882308_fault(struct aw882308 *aw)
++{
++	/* Reset is independent of the I2C bus and restores the mute/power defaults. */
++	gpiod_set_value_cansleep(aw->reset, 1);
++	aw->running = false;
++	aw->faulted = true;
++}
++
+ static int aw882308_wait_sysst(struct aw882308 *aw, unsigned int want)
+ {
+-	unsigned int st = 0;
+-	int i;
++	unsigned int st;
++	int ret, i;
+ 
+ 	for (i = 0; i < 50; i++) {
+-		regmap_read(aw->regmap, AW_SYSST, &st);
++		ret = regmap_read(aw->regmap, AW_SYSST, &st);
++		if (ret)
++			return ret;
++		/* Over-temperature/over-current status must remain clear. */
++		if (st & (BIT(1) | BIT(3)))
++			return -EIO;
+ 		if ((st & want) == want)
+ 			return 0;
+ 		usleep_range(2000, 2100);
+ 	}
+-	dev_err(aw->dev, "SYSST 0x%04x, wanted 0x%04x\n", st, want);
+ 	return -ETIMEDOUT;
+ }
+ 
+-static int aw882308_apply_fw(struct aw882308 *aw, unsigned int profile);
+-
+-static void aw882308_set_vol(struct aw882308 *aw, unsigned int v)
++static int aw882308_set_vol(struct aw882308 *aw, unsigned int v)
+ {
+-	regmap_update_bits(aw->regmap, AW_SYSCTRL2, SYSCTRL2_VOL, v);
++	return regmap_update_bits(aw->regmap, AW_SYSCTRL2, SYSCTRL2_VOL,
++				 max(v, AW_MIN_ATTEN));
+ }
+ 
+-static void aw882308_stop(struct aw882308 *aw)
++static int aw882308_stop(struct aw882308 *aw)
+ {
+-	aw882308_set_vol(aw, AW_MUTE_VOL);
+-	regmap_update_bits(aw->regmap, AW_SYSCTRL, SYSCTRL_ULS_HMUTE | SYSCTRL_HMUTE,
+-			   SYSCTRL_ULS_HMUTE | SYSCTRL_HMUTE);
++	int ret;
++
++	if (aw->faulted)
++		return -EIO;
++	ret = aw882308_set_vol(aw, AW_MUTE_VOL);
++	if (ret)
++		goto fail;
++	ret = regmap_update_bits(aw->regmap, AW_SYSCTRL,
++			SYSCTRL_ULS_HMUTE | SYSCTRL_HMUTE,
++			SYSCTRL_ULS_HMUTE | SYSCTRL_HMUTE);
++	if (ret)
++		goto fail;
+ 	usleep_range(5000, 5100);
+-	regmap_update_bits(aw->regmap, AW_SYSCTRL, SYSCTRL_I2STXEN, 0);
+-	regmap_update_bits(aw->regmap, AW_SYSCTRL, SYSCTRL_AMPPD, SYSCTRL_AMPPD);
+-	regmap_update_bits(aw->regmap, AW_SYSCTRL, SYSCTRL_PWDN, SYSCTRL_PWDN);
++	ret = regmap_update_bits(aw->regmap, AW_SYSCTRL,
++			SYSCTRL_I2STXEN | SYSCTRL_AMPPD | SYSCTRL_PWDN,
++			SYSCTRL_AMPPD | SYSCTRL_PWDN);
++	if (ret)
++		goto fail;
+ 	aw->running = false;
++	return 0;
++fail:
++	aw882308_fault(aw);
++	return ret;
+ }
+ 
+ static int aw882308_start(struct aw882308 *aw)
+ {
+-	unsigned int st, ctrl, ngcheck;
++	unsigned int st;
+ 	int ret;
+ 
+-	regmap_update_bits(aw->regmap, AW_SYSCTRL, SYSCTRL_PWDN, 0);
++	if (aw->faulted)
++		return -EIO;
++	ret = regmap_update_bits(aw->regmap, AW_SYSCTRL, SYSCTRL_PWDN, 0);
++	if (ret)
++		goto fail;
+ 	usleep_range(2000, 2100);
+ 	ret = aw882308_wait_sysst(aw, SYSST_PLLS | SYSST_CLKS);
+ 	if (ret)
+ 		goto fail;
+-
+-	regmap_update_bits(aw->regmap, AW_SYSCTRL, SYSCTRL_AMPPD, 0);
++	ret = regmap_update_bits(aw->regmap, AW_SYSCTRL, SYSCTRL_AMPPD, 0);
++	if (ret)
++		goto fail;
+ 	usleep_range(1000, 1100);
+-	/* Boost finished, clocks stable, PLL locked. */
+-	ngcheck = SYSST_BSTS | SYSST_CLKS | SYSST_PLLS;
+-	ret = aw882308_wait_sysst(aw, ngcheck);
++	ret = aw882308_wait_sysst(aw, SYSST_BSTS | SYSST_CLKS | SYSST_PLLS);
++	if (ret)
++		goto fail;
++	/* SYSINT is read-to-clear; never write the read-only status register. */
++	ret = regmap_read(aw->regmap, AW_SYSINT, &st);
++	if (ret)
++		goto fail;
++	ret = aw882308_set_vol(aw, AW_MUTE_VOL);
++	if (ret)
++		goto fail;
++	ret = regmap_update_bits(aw->regmap, AW_SYSCTRL,
++			SYSCTRL_ULS_HMUTE | SYSCTRL_HMUTE, 0);
++	if (ret)
++		goto fail;
++	ret = aw882308_set_vol(aw, aw->atten);
+ 	if (ret)
+ 		goto fail;
+-
+-	regmap_write(aw->regmap, AW_SYSINT, 0xffff);	/* read-clear status */
+-	regmap_read(aw->regmap, AW_SYSINT, &st);
+-	regmap_update_bits(aw->regmap, AW_SYSCTRL, SYSCTRL_ULS_HMUTE, 0);
+-	aw882308_set_vol(aw, AW_MUTE_VOL);
+-	regmap_update_bits(aw->regmap, AW_SYSCTRL, SYSCTRL_HMUTE, 0);
+-	aw882308_set_vol(aw, aw->atten);
+ 	aw->running = true;
+-
+-	regmap_read(aw->regmap, AW_SYSST, &st);
+-	regmap_read(aw->regmap, AW_SYSCTRL, &ctrl);
+-	dev_dbg(aw->dev, "running: SYSST 0x%04x SYSCTRL 0x%04x atten %u\n",
+-		 st, ctrl, aw->atten);
+ 	return 0;
+ fail:
+-	regmap_read(aw->regmap, AW_SYSCTRL, &ctrl);
+-	dev_err(aw->dev, "start failed, SYSCTRL 0x%04x\n", ctrl);
+-	aw882308_stop(aw);
++	aw882308_fault(aw);
+ 	return ret;
+ }
+ 
+@@ -161,16 +195,17 @@ static int aw882308_mute(struct snd_soc_dai *dai, int mute, int stream)
+ {
+ 	struct aw882308 *aw = snd_soc_component_get_drvdata(dai->component);
+ 
++	int ret;
++
+ 	if (stream != SNDRV_PCM_STREAM_PLAYBACK)
+ 		return 0;
+-	if (mute) {
+-		if (aw->running)
+-			aw882308_stop(aw);
+-		return 0;
+-	}
+-	if (aw->running)
+-		return 0;
+-	return aw882308_start(aw);
++	mutex_lock(&aw->lock);
++	if (mute)
++		ret = aw882308_stop(aw);
++	else
++		ret = aw->running ? 0 : aw882308_start(aw);
++	mutex_unlock(&aw->lock);
++	return ret;
+ }
+ 
+ static int aw882308_hw_params(struct snd_pcm_substream *substream,
+@@ -180,18 +215,7 @@ static int aw882308_hw_params(struct snd_pcm_substream *substream,
+ 	struct aw882308 *aw = snd_soc_component_get_drvdata(dai->component);
+ 	unsigned int width = params_physical_width(params);
+ 	unsigned int fs, bck, val;
+-
+-	/*
+-	 * A profile picked while playing takes effect here, powered down and
+-	 * before the I2S setup below, which the table would otherwise undo.
+-	 */
+-	if (!aw->running && aw->want != aw->profile) {
+-		if (aw882308_apply_fw(aw, aw->want))
+-			aw->want = aw->profile;
+-		else
+-			aw->profile = aw->want;
+-		aw882308_stop(aw);
+-	}
++	int ret;
+ 
+ 	if (params_rate(params) != 48000) {
+ 		dev_err(aw->dev, "only 48 kHz for now, got %u\n", params_rate(params));
+@@ -230,12 +254,18 @@ static int aw882308_hw_params(struct snd_pcm_substream *substream,
+ 	      FIELD_PREP(I2SCTRL1_I2SFS, fs) |
+ 	      FIELD_PREP(I2SCTRL1_I2SBCK, bck) |
+ 	      FIELD_PREP(I2SCTRL1_I2SSR, 8);
+-	regmap_update_bits(aw->regmap, AW_I2SCTRL1,
+-			   I2SCTRL1_CHSEL | I2SCTRL1_I2SMD | I2SCTRL1_I2SFS |
+-			   I2SCTRL1_I2SBCK | I2SCTRL1_I2SSR, val);
+-	regmap_read(aw->regmap, AW_I2SCTRL1, &val);
+-	dev_dbg(aw->dev, "I2SCTRL1 0x%04x\n", val);
+-	return 0;
++	mutex_lock(&aw->lock);
++	if (aw->faulted || aw->running) {
++		ret = -EIO;
++	} else {
++		ret = regmap_update_bits(aw->regmap, AW_I2SCTRL1,
++			I2SCTRL1_CHSEL | I2SCTRL1_I2SMD | I2SCTRL1_I2SFS |
++			I2SCTRL1_I2SBCK | I2SCTRL1_I2SSR, val);
++		if (ret)
++			aw882308_fault(aw);
++	}
++	mutex_unlock(&aw->lock);
++	return ret;
+ }
+ 
+ static int aw882308_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
+@@ -273,13 +303,13 @@ static struct snd_soc_dai_driver aw882308_dai = {
+ 	.ops = &aw882308_dai_ops,
+ };
+ 
+-/* The control is a gain: 0 is the quietest allowed, max is min_atten. */
++/* The control is a gain: 0 is the quietest allowed, max is AW_MIN_ATTEN. */
+ static int aw882308_vol_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
+ {
+ 	ui->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+ 	ui->count = 1;
+ 	ui->value.integer.min = 0;
+-	ui->value.integer.max = AW_MUTE_VOL - min_atten;
++	ui->value.integer.max = AW_MUTE_VOL - AW_MIN_ATTEN;
+ 	return 0;
+ }
+ 
+@@ -288,7 +318,9 @@ static int aw882308_vol_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *
+ 	struct snd_soc_component *c = snd_kcontrol_chip(kc);
+ 	struct aw882308 *aw = snd_soc_component_get_drvdata(c);
+ 
++	mutex_lock(&aw->lock);
+ 	uc->value.integer.value[0] = AW_MUTE_VOL - aw->atten;
++	mutex_unlock(&aw->lock);
+ 	return 0;
+ }
+ 
+@@ -297,52 +329,28 @@ static int aw882308_vol_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *
+ 	struct snd_soc_component *c = snd_kcontrol_chip(kc);
+ 	struct aw882308 *aw = snd_soc_component_get_drvdata(c);
+ 	long v = uc->value.integer.value[0];
++	int ret = 0;
+ 
+-	if (v < 0 || v > AW_MUTE_VOL - min_atten)
+-		return -EINVAL;
+-	if (aw->atten == AW_MUTE_VOL - v)
+-		return 0;
+-	aw->atten = AW_MUTE_VOL - v;
+-	if (aw->running)
+-		aw882308_set_vol(aw, aw->atten);
+-	return 1;
+-}
+-
+-/*
+- * Stock profiles: 0 (Speaker) for music, 10 (Receiver) when the top
+- * speaker is the earpiece. Each has its own table, loaded only while the
+- * amplifier is powered down, in hw_params: a change takes effect when the
+- * next stream is set up. The volume floor applies to both.
+- */
+-static const char * const aw882308_profiles[] = { "Speaker", "Receiver" };
+-static SOC_ENUM_SINGLE_EXT_DECL(aw882308_profile_enum, aw882308_profiles);
+-
+-static int aw882308_profile_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uc)
+-{
+-	struct snd_soc_component *c = snd_kcontrol_chip(kc);
+-	struct aw882308 *aw = snd_soc_component_get_drvdata(c);
+-
+-	uc->value.enumerated.item[0] = aw->want;
+-	return 0;
+-}
+-
+-static int aw882308_profile_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uc)
+-{
+-	struct snd_soc_component *c = snd_kcontrol_chip(kc);
+-	struct aw882308 *aw = snd_soc_component_get_drvdata(c);
+-	unsigned int p = uc->value.enumerated.item[0];
+-
+-	if (p >= ARRAY_SIZE(aw882308_profiles))
++	if (v < 0 || v > AW_MUTE_VOL - AW_MIN_ATTEN)
+ 		return -EINVAL;
+-	if (p == aw->want)
+-		return 0;
+-	aw->want = p;
+-	return 1;
++	mutex_lock(&aw->lock);
++	if (aw->faulted) {
++		ret = -EIO;
++	} else if (aw->atten != AW_MUTE_VOL - v) {
++		if (aw->running)
++			ret = aw882308_set_vol(aw, AW_MUTE_VOL - v);
++		if (ret) {
++			aw882308_fault(aw);
++		} else {
++			aw->atten = AW_MUTE_VOL - v;
++			ret = 1;
++		}
++	}
++	mutex_unlock(&aw->lock);
++	return ret;
+ }
+ 
+ static const struct snd_kcontrol_new aw882308_controls[] = {
+-	SOC_ENUM_EXT("Amp Profile", aw882308_profile_enum,
+-		     aw882308_profile_get, aw882308_profile_put),
+ 	{
+ 		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+ 		.name = "Amp Volume",
+@@ -369,54 +377,89 @@ static const struct snd_soc_component_driver aw882308_component = {
+ 	.num_dapm_routes = ARRAY_SIZE(aw882308_routes),
+ };
+ 
+-/*
+- * Optional register tables, firmware "aw882308-<i2c addr>.bin" (Speaker)
+- * and "aw882308-<i2c addr>-receiver.bin": little-endian u16 (reg, value)
+- * pairs, e.g. made from the phone's own ACF by tools/aw-acf-regs.py.
+- * Never shipped in the repo.
+- */
+-static int aw882308_apply_fw(struct aw882308 *aw, unsigned int profile)
++/* Only operational registers are accepted; test/OTP/efuse writes are forbidden. */
++static bool aw882308_table_reg(unsigned int reg)
++{
++	return (reg >= 0x03 && reg <= 0x1f) ||
++	       (reg >= 0x30 && reg <= 0x38) ||
++	       (reg >= 0x3a && reg <= 0x3f) ||
++	       (reg >= 0x50 && reg <= 0x6d);
++}
++
++/* Required, complete OEM Music table: little-endian u16 (register, value). */
++static int aw882308_apply_fw(struct aw882308 *aw)
+ {
+ 	struct i2c_client *i2c = to_i2c_client(aw->dev);
+ 	const struct firmware *fw;
+-	char name[40];
+-	unsigned int cur;
++	DECLARE_BITMAP(seen, AW_REG_MAX) = {};
++	char name[80];
++	unsigned int reg, val;
+ 	size_t i;
+-	int n = 0;
++	int ret;
+ 
+-	snprintf(name, sizeof(name), "aw882308-%02x%s.bin", i2c->addr,
+-		 profile ? "-receiver" : "");
+-	if (firmware_request_nowarn(&fw, name, aw->dev)) {
+-		dev_info(aw->dev, "no %s, register table unchanged\n", name);
+-		return -ENOENT;
++	snprintf(name, sizeof(name),
++		 "qcom/sm8750/oneplus/dodge/aw882308-%02x.bin", i2c->addr);
++	ret = request_firmware(&fw, name, aw->dev);
++	if (ret)
++		return ret;
++	if (fw->size != 74 * 4) {
++		ret = -EINVAL;
++		goto out;
+ 	}
+-	for (i = 0; i + 4 <= fw->size; i += 4) {
+-		unsigned int reg = get_unaligned_le16(fw->data + i);
+-		unsigned int val = get_unaligned_le16(fw->data + i + 2);
+-
+-		if (reg >= AW_REG_MAX || reg == AW_ID || reg == AW_SYSST ||
+-		    reg == AW_SYSINT)
+-			continue;
++	/* Validate the whole file before writing any table values. */
++	for (i = 0; i < fw->size; i += 4) {
++		reg = get_unaligned_le16(fw->data + i);
++		val = get_unaligned_le16(fw->data + i + 2);
++		if (reg == AW_I2SCTRL1 &&
++		    FIELD_GET(I2SCTRL1_CHSEL, val) != ((i2c->addr & 1) ? 2 : 1)) {
++			ret = -EINVAL;
++			goto out;
++		}
++		if (!aw882308_table_reg(reg) || test_and_set_bit(reg, seen)) {
++			ret = -EINVAL;
++			goto out;
++		}
++	}
++	if (!test_bit(AW_SYSCTRL, seen) || !test_bit(AW_SYSCTRL2, seen) ||
++	    !test_bit(AW_I2SCTRL1, seen)) {
++		ret = -EINVAL;
++		goto out;
++	}
++	for (i = 0; i < fw->size; i += 4) {
++		reg = get_unaligned_le16(fw->data + i);
++		val = get_unaligned_le16(fw->data + i + 2);
+ 		if (reg == AW_SYSINTM)
+ 			val = 0xffff;
+ 		if (reg == AW_SYSCTRL) {
+-			/* Stay powered down and muted; no I/V feedback. */
+ 			val |= SYSCTRL_PWDN | SYSCTRL_AMPPD | SYSCTRL_HMUTE |
+ 			       SYSCTRL_ULS_HMUTE;
++			/* The initial playback graph has no feedback/protection path. */
+ 			val &= ~SYSCTRL_I2STXEN;
+ 		}
+ 		if (reg == AW_SYSCTRL2)
+ 			val = (val & ~SYSCTRL2_VOL) | AW_MUTE_VOL;
+-		if (reg == AW_I2SCTRL1)
++		if (reg == AW_I2SCTRL1) {
+ 			aw->chsel = FIELD_GET(I2SCTRL1_CHSEL, val);
+-		regmap_write(aw->regmap, reg, val);
+-		n++;
++			if (aw->chsel != ((i2c->addr & 1) ? 2 : 1)) {
++				ret = -EINVAL;
++				goto out;
++			}
++		}
++		ret = regmap_write(aw->regmap, reg, val);
++		if (ret)
++			goto out;
+ 	}
++	ret = 0;
++out:
+ 	release_firmware(fw);
+-	regmap_read(aw->regmap, AW_SYSCTRL, &cur);
+-	dev_info(aw->dev, "applied %d registers from %s, SYSCTRL 0x%04x chsel %u\n",
+-		 n, name, cur, aw->chsel);
+-	return 0;
++	return ret;
++}
++
++static void aw882308_reset(void *data)
++{
++	struct aw882308 *aw = data;
++
++	aw882308_fault(aw);
+ }
+ 
+ static int aw882308_probe(struct i2c_client *i2c)
+@@ -430,6 +473,7 @@ static int aw882308_probe(struct i2c_client *i2c)
+ 	if (!aw)
+ 		return -ENOMEM;
+ 	aw->dev = dev;
++	mutex_init(&aw->lock);
+ 	aw->atten = AW_MUTE_VOL;
+ 	/* Stock: 0x34 plays the left channel, 0x35 the right. */
+ 	aw->chsel = (i2c->addr & 1) ? 2 : 1;
+@@ -440,16 +484,15 @@ static int aw882308_probe(struct i2c_client *i2c)
+ 		return PTR_ERR(aw->regmap);
+ 
+ 	/* Active-low reset: request asserted, then release. */
+-	aw->reset = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
++	aw->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+ 	if (IS_ERR(aw->reset))
+ 		return dev_err_probe(dev, PTR_ERR(aw->reset), "reset gpio\n");
+-	if (aw->reset) {
+-		usleep_range(1000, 1100);
+-		gpiod_set_value_cansleep(aw->reset, 0);
+-		usleep_range(2000, 2100);
+-	} else {
+-		dev_warn(dev, "no reset gpio\n");
+-	}
++	ret = devm_add_action_or_reset(dev, aw882308_reset, aw);
++	if (ret)
++		return ret;
++	usleep_range(1000, 1100);
++	gpiod_set_value_cansleep(aw->reset, 0);
++	usleep_range(2000, 2100);
+ 
+ 	ret = regmap_read(aw->regmap, AW_ID, &id);
+ 	if (ret)
+@@ -457,32 +500,35 @@ static int aw882308_probe(struct i2c_client *i2c)
+ 	if (id != AW_CHIP_ID)
+ 		return dev_err_probe(dev, -ENODEV, "chip id 0x%04x\n", id);
+ 
+-	regmap_write(aw->regmap, AW_ID, AW_SOFT_RESET);
++	ret = regmap_write(aw->regmap, AW_ID, AW_SOFT_RESET);
++	if (ret)
++		return ret;
+ 	usleep_range(2000, 2100);
+-	if (use_fw)
+-		aw882308_apply_fw(aw, 0);
+-	aw882308_stop(aw);
+-
+-	/*
+-	 * min_atten is a module parameter; keep it inside the volume field
+-	 * so the control range cannot underflow.
+-	 */
+-	min_atten = min(min_atten, AW_MUTE_VOL);
+-
+-	/* Start quiet: attenuation 700 of 1023, or min_atten if higher. */
+-	aw->atten = max(min_atten, 700u);
+-	dev_info(dev, "chip 0x%04x, chsel %u, atten floor %u\n", id, aw->chsel,
+-		 min_atten);
++	ret = aw882308_apply_fw(aw);
++	if (ret)
++		return dev_err_probe(dev, ret, "required OEM Music table failed\n");
++	ret = aw882308_stop(aw);
++	if (ret)
++		return ret;
++	aw->atten = AW_INITIAL_ATTEN;
++	ret = regmap_read(aw->regmap, 0x7a, &id);
++	if (ret)
++		return ret;
++	dev_info(dev, "OEM table loaded; voltage offset %d; attenuation ceiling %u\n",
++		 (int)(s8)(id & 0xff) * 2, AW_MIN_ATTEN);
+ 
+ 	return devm_snd_soc_register_component(dev, &aw882308_component,
+ 					       &aw882308_dai, 1);
+ }
+ 
+-static void aw882308_remove(struct i2c_client *i2c)
++static void aw882308_shutdown(struct i2c_client *i2c)
+ {
+ 	struct aw882308 *aw = i2c_get_clientdata(i2c);
+ 
++	mutex_lock(&aw->lock);
+ 	aw882308_stop(aw);
++	aw882308_fault(aw);
++	mutex_unlock(&aw->lock);
+ }
+ 
+ static const struct i2c_device_id aw882308_id[] = {
+@@ -503,7 +549,8 @@ static struct i2c_driver aw882308_driver = {
+ 		.of_match_table = aw882308_of_match,
+ 	},
+ 	.probe = aw882308_probe,
+-	.remove = aw882308_remove,
++	.remove = aw882308_shutdown,
++	.shutdown = aw882308_shutdown,
+ 	.id_table = aw882308_id,
+ };
+ 

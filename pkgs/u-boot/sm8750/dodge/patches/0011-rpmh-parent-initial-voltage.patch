@@ -1,0 +1,119 @@
+From 81a6fe0e55d0a45ff648455d6145c40884bf0dc2 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 7 Nov 2026 04:28:57 +0800
+Subject: [PATCH] regulator: qcom-rpmh: initialize unset disabled parent
+ supplies
+
+Honor an explicit regulator-init-microvolt only when a parent read reports no configured voltage and the parent is disabled. Retain existing valid setpoints, reject enabled parents with unknown voltage, check board bounds and the child request, and propagate actual read/set/enable errors. Identify a failing parent by its resource name.
+
+Describe the shipped Dodge startup requests for BOB1, S1D, S3G and S7I using the existing U-Boot regulator property. These values come from the OnePlus PJZ110 shipped DT qcom,init-voltage cells; no boot-on flags or guessed headroom are added. Hardware selector rounding and upper-voltage checks remain unchanged.
+
+Link: https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8750/tree/d50b305f7da9e14715a25120a4ac7b1a4b8b97c3
+
+Link: https://source.denx.de/u-boot/u-boot/-/blob/v2026.10/drivers/power/regulator/regulator-uclass.c
+---
+ drivers/power/regulator/qcom-rpmh-regulator.c | 42 ++++++++++++++-----
+ .../src/arm64/qcom/sm8750-oneplus-dodge.dts   |  4 ++
+ 2 files changed, 36 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/power/regulator/qcom-rpmh-regulator.c b/drivers/power/regulator/qcom-rpmh-regulator.c
+index 99ac7e59..48b0a3a9 100644
+--- a/drivers/power/regulator/qcom-rpmh-regulator.c
++++ b/drivers/power/regulator/qcom-rpmh-regulator.c
+@@ -420,6 +420,7 @@ static int rpmh_regulator_set_enable_state(struct udevice *rdev,
+ 
+ 	if (enable && vreg->supply) {
+ 		struct dm_regulator_uclass_plat *supply_plat;
++		bool initialize = false;
+ 		int supply_uv, enabled;
+ 
+ 		if (vreg->enabling_supply)
+@@ -428,21 +429,42 @@ static int rpmh_regulator_set_enable_state(struct udevice *rdev,
+ 		supply_plat = dev_get_uclass_plat(vreg->supply);
+ 		supply_uv = regulator_get_value(vreg->supply);
+ 		ret = supply_uv < 0 ? supply_uv : 0;
++		if (ret && ret != -ENODATA)
++			goto out_parent;
++		enabled = regulator_get_enable(vreg->supply);
++		if (enabled < 0) {
++			ret = enabled;
++			goto out_parent;
++		}
++		if (supply_uv == -ENODATA) {
++			/* Only an unset, disabled parent may use a board startup vote. */
++			if (enabled || supply_plat->init_uV <= 0)
++				goto out_parent;
++			supply_uv = supply_plat->init_uV;
++			initialize = true;
++			ret = 0;
++		}
+ 		/* Preserve an established parent setpoint, never invent headroom. */
+-		if (!ret && ((supply_plat->min_uV > 0 &&
+-			      supply_uv < supply_plat->min_uV) ||
+-			     (supply_plat->max_uV > 0 &&
+-			      supply_uv > supply_plat->max_uV) || supply_uv < vreg->uv))
++		if ((supply_plat->min_uV > 0 && supply_uv < supply_plat->min_uV) ||
++		    (supply_plat->max_uV > 0 && supply_uv > supply_plat->max_uV) ||
++		    supply_uv < vreg->uv) {
+ 			ret = -EINVAL;
+-		if (!ret) {
+-			enabled = regulator_get_enable(vreg->supply);
+-			ret = enabled < 0 ? enabled : 0;
+-			if (!ret && !enabled)
+-				ret = regulator_set_enable(vreg->supply, true);
++			goto out_parent;
++		}
++		if (initialize) {
++			ret = regulator_set_value(vreg->supply, supply_uv);
++			if (ret)
++				goto out_parent;
+ 		}
++		if (!enabled)
++			ret = regulator_set_enable(vreg->supply, true);
++out_parent:
+ 		vreg->enabling_supply = false;
+-		if (ret)
++		if (ret) {
++			dev_err(rdev, "Failed to enable parent %s: %d\n",
++				vreg->supply->name, ret);
+ 			return ret;
++		}
+ 	}
+ 	/* Keep shared parent votes enabled when a consumer is disabled. */
+ 
+diff --git a/dts/upstream/src/arm64/qcom/sm8750-oneplus-dodge.dts b/dts/upstream/src/arm64/qcom/sm8750-oneplus-dodge.dts
+index 7928c5ab..0767868a 100644
+--- a/dts/upstream/src/arm64/qcom/sm8750-oneplus-dodge.dts
++++ b/dts/upstream/src/arm64/qcom/sm8750-oneplus-dodge.dts
+@@ -146,6 +146,7 @@
+ 
+ 				vreg_bob1: bob1 {
+ 					regulator-name = "vreg_bob1";
++					regulator-init-microvolt = <3296000>;
+ 					regulator-min-microvolt = <3008000>;
+ 					regulator-max-microvolt = <3960000>;
+ 					regulator-initial-mode = <RPMH_REGULATOR_MODE_AUTO>;
+@@ -179,6 +180,7 @@
+ 
+ 				vreg_s1d_0p97: smps1 {
+ 					regulator-name = "vreg_s1d_0p97";
++					regulator-init-microvolt = <976000>;
+ 					regulator-min-microvolt = <880000>;
+ 					regulator-max-microvolt = <1100000>;
+ 					regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+@@ -202,6 +204,7 @@
+ 
+ 				vreg_s3g_1p8: smps3 {
+ 					regulator-name = "vreg_s3g_1p8";
++					regulator-init-microvolt = <1856000>;
+ 					regulator-min-microvolt = <1856000>;
+ 					regulator-max-microvolt = <2000000>;
+ 					regulator-initial-mode = <RPMH_REGULATOR_MODE_LPM>;
+@@ -227,6 +230,7 @@
+ 
+ 				vreg_s7i_1p2: smps7 {
+ 					regulator-name = "vreg_s7i_1p2";
++					regulator-init-microvolt = <1256000>;
+ 					regulator-min-microvolt = <1224000>;
+ 					regulator-max-microvolt = <1340000>;
+ 					regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;

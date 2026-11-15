@@ -1,0 +1,57 @@
+From 8d1c94b44b0fe3b1d1dcd68fec484faea02e3aa6 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 8 Nov 2026 07:49:37 +0800
+Subject: [PATCH 036/144] soc: qcom: enable Dodge Type-C firmware clients
+
+The OEM UCSI v1 and Alt Mode transports match the standard clients. Keep the Dodge battery descriptor while enabling both Type-C clients. The OEM core reads device and partner PDOs; use an explicit zero-quirks UCSI match instead of inheriting the battery fallback compatible.
+
+Link: https://github.com/OnePlusOSS/android_kernel_oneplus_sm8750/blob/6028f47faddaa27700f8dd3a1d83906ea8f27170/drivers/usb/typec/ucsi/ucsi_qti_glink.c
+Link: https://github.com/OnePlusOSS/android_kernel_oneplus_sm8750/blob/6028f47faddaa27700f8dd3a1d83906ea8f27170/drivers/soc/qcom/altmode-glink.c
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0054-soc-qcom-enable-Dodge-Type-C-firmware-clients.patch
+Import-SHA256: b32ca956eddeeecc5d280c9666524a3d83a3ec30112f695ed1566db0503c26b2
+Import-Provenance: mail headers
+(cherry picked from commit aa2c01c93b3b2e4e1847216bd75c2dffcbb251e0)
+---
+ drivers/soc/qcom/pmic_glink.c       | 6 ++++--
+ drivers/usb/typec/ucsi/ucsi_glink.c | 3 +++
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/soc/qcom/pmic_glink.c b/drivers/soc/qcom/pmic_glink.c
+index d49a9da326..c8c9b27a26 100644
+--- a/drivers/soc/qcom/pmic_glink.c
++++ b/drivers/soc/qcom/pmic_glink.c
+@@ -397,9 +397,11 @@ static const struct pmic_glink_data pmic_glink_adsp_data = {
+ 	.charger_pdr_service_path = "msm/adsp/charger_pd",
+ };
+ 
+-/* Dodge uses the OEM property protocol, without the SM8550 charge controls. */
++/* Dodge retains its OEM battery protocol alongside standard Type-C clients. */
+ static const struct pmic_glink_data pmic_glink_dodge_data = {
+-	.client_mask = BIT(PMIC_GLINK_CLIENT_BATT),
++	.client_mask = BIT(PMIC_GLINK_CLIENT_BATT) |
++		       BIT(PMIC_GLINK_CLIENT_ALTMODE) |
++		       BIT(PMIC_GLINK_CLIENT_UCSI),
+ 	.charger_pdr_service_name = "tms/servreg",
+ 	.charger_pdr_service_path = "msm/adsp/charger_pd",
+ };
+diff --git a/drivers/usb/typec/ucsi/ucsi_glink.c b/drivers/usb/typec/ucsi/ucsi_glink.c
+index 1db0c88d81..26bdfda39b 100644
+--- a/drivers/usb/typec/ucsi/ucsi_glink.c
++++ b/drivers/usb/typec/ucsi/ucsi_glink.c
+@@ -372,12 +372,15 @@ static void pmic_glink_ucsi_destroy(void *data)
+ 	mutex_unlock(&ucsi->lock);
+ }
+ 
++/* Dodge OEM firmware implements both device and partner PDO queries. */
++static unsigned long quirk_dodge;
+ static unsigned long quirk_sc8180x = UCSI_NO_PARTNER_PDOS;
+ static unsigned long quirk_sc8280xp = UCSI_NO_PARTNER_PDOS | UCSI_DELAY_DEVICE_PDOS;
+ static unsigned long quirk_sm8450 = UCSI_DELAY_DEVICE_PDOS;
+ static unsigned long quirk_x1e80100 = UCSI_DELAY_DEVICE_PDOS | UCSI_USB4_IMPLIES_USB;
+ 
+ static const struct of_device_id pmic_glink_ucsi_of_quirks[] = {
++	{ .compatible = "oneplus,dodge-pmic-glink", .data = &quirk_dodge, },
+ 	{ .compatible = "qcom,glymur-pmic-glink", .data = &quirk_sm8450, },
+ 	{ .compatible = "qcom,kaanapali-pmic-glink", .data = &quirk_sm8450, },
+ 	{ .compatible = "qcom,qcm6490-pmic-glink", .data = &quirk_sc8280xp, },

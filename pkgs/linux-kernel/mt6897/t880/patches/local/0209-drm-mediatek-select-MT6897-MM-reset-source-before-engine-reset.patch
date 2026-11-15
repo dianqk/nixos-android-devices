@@ -1,0 +1,258 @@
+From 42ec1059391f99386bd71371e4338ff783221ea0 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 7 Nov 2026 11:24:45 +0800
+Subject: [PATCH] drm/mediatek: select MT6897 MM reset source before engine
+ reset
+
+Boot-time first-command dumps show the bootloader-initialized engine state
+(start=0, cmdq=0x00013700/0x00290500, cmdq_size=0x8002/0x8001). After a
+physical display-domain reset the first command instead reads uninitialized
+CMDQ SRAM (start=0, cmdq=0x9eaa4e71/0xd35e1f99, cmdq_size=0), and the
+long-packet sequence later stalls with DSI_BUSY never clearing.
+
+The vendor MT6897 C-PHY path selects the MM reset source by setting
+DSI_DEBUG_SEL (0x170) bit10 MM_RST_SEL (mtk_dsi.c:1921-1924, new_rst_dsi
+C-PHY branch). Mainline sets the same bit in mtk_dsi_config_tx_buf_v1(),
+but mtk_dsi_poweron() calls mtk_dsi_reset_engine() before that function.
+After a domain reset MM_RST_SEL is therefore clear when the engine is reset,
+so the reset uses the local rather than the MM source and may leave command
+queue/engine state that corrupts the post-long-packet sequence.
+
+Select the MM reset source immediately before the power-on engine reset for
+the MT6897 v1 TX-buffer layout; the later TX-buffer write remains and is
+idempotent. Extend the read-only first-command and timeout engine dumps, and
+the command ring, with DSI_DEBUG_SEL so a trial can confirm the reset-adjacent
+bit state. Other SoC data are untouched.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_dsi.c
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/gpu/drm/mediatek/mtk_dsi.c            | 34 ++++++++++++---
+ .../selftests/mtk_clk/dsi_routing_cases.c     | 43 ++++++++++++++++++-
+ .../selftests/mtk_clk/test_dsi_routing.py     | 12 +++++-
+ 3 files changed, 81 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_dsi.c b/drivers/gpu/drm/mediatek/mtk_dsi.c
+index 51e0ba5ec3..7fb85a83b2 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dsi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dsi.c
+@@ -319,6 +319,7 @@ struct mtk_dsi_cmd_record {
+ 	u32 start;
+ 	u32 cmdq;
+ 	u32 cmdq_size;
++	u32 debug_sel;
+ 	int result;
+ };
+ 
+@@ -1171,6 +1172,21 @@ static void mtk_dsi_config_hw_buffers(struct mtk_dsi *dsi)
+ #define DSI_V1_DEBUG_SEL		0x170
+ #  define DSI_V1_MM_RST_SEL		BIT(10)
+ 
++/*
++ * Select the MM reset source before the power-on engine reset. A domain
++ * reset clears DSI_DEBUG_SEL, and a local reset leaves the command queue
++ * state that later stalls the long-packet sequence; the vendor selects the
++ * MM source for the MT6897 C-PHY reset path.
++ */
++static void mtk_dsi_select_mm_reset(struct mtk_dsi *dsi)
++{
++	if (!dsi->driver_data->tx_buf)
++		return;
++
++	mtk_dsi_mask(dsi, DSI_V1_DEBUG_SEL, DSI_V1_MM_RST_SEL,
++		     DSI_V1_MM_RST_SEL);
++}
++
+ /*
+  * TX buffer of the stock driver's v1 layout, in video mode, with its
+  * formulas (mtk_dsi_tx_buf_rw): the thresholds are microseconds of link
+@@ -1193,7 +1209,7 @@ static void mtk_dsi_config_tx_buf_v1(struct mtk_dsi *dsi)
+ 	rw_times = DIV_ROUND_UP_ULL((u64)ps_wc * dsi->vm.vactive, buf->in_width);
+ 
+ 	mtk_dsi_mask(dsi, reg_qos[DSI_QOS_BUF_CON1], BUF_OUT_VALID_THRESH, 0);
+-	mtk_dsi_mask(dsi, DSI_V1_DEBUG_SEL, DSI_V1_MM_RST_SEL, DSI_V1_MM_RST_SEL);
++	mtk_dsi_select_mm_reset(dsi);
+ 	/* ULTRA between SOF and VACT */
+ 	mtk_dsi_mask(dsi, DSI_V1_RESERVED, VDE_BLOCK_ULTRA, 0);
+ 
+@@ -1337,7 +1353,10 @@ static void mtk_dsi_dump_mmsys_state(struct mtk_dsi *dsi, const char *phase)
+ static void mtk_dsi_dump_regs(struct mtk_dsi *dsi, const char *phase)
+ {
+ 	const struct mtk_dsi_driver_data *data = dsi->driver_data;
++	u32 debug_sel = 0;
+ 
++	if (data->tx_buf)
++		debug_sel = readl(dsi->regs + DSI_V1_DEBUG_SEL);
+ 	dev_info(dsi->host.dev,
+ 		 "C-PHY regs %s: inten=%08x intsta=%08x con=%08x mode=%08x\n",
+ 		 phase, readl(dsi->regs + data->reg_main[DSI_INTEN]),
+@@ -1345,12 +1364,12 @@ static void mtk_dsi_dump_regs(struct mtk_dsi *dsi, const char *phase)
+ 		 readl(dsi->regs + data->reg_main[DSI_CON_CTRL]),
+ 		 readl(dsi->regs + data->reg_main[DSI_MODE_CTRL]));
+ 	dev_info(dsi->host.dev,
+-		 "C-PHY engine %s: start=%08x cmdq=%08x cmdq_size=%08x txrx=%08x ps=%08x\n",
++		 "C-PHY engine %s: start=%08x cmdq=%08x cmdq_size=%08x txrx=%08x ps=%08x debug_sel=%08x\n",
+ 		 phase, readl(dsi->regs + data->reg_main[DSI_START]),
+ 		 readl(dsi->regs + data->reg_adv[DSI_CMDQ]),
+ 		 readl(dsi->regs + data->reg_main[DSI_CMDQ_SIZE]),
+ 		 readl(dsi->regs + data->reg_main[DSI_TXRX_CTRL]),
+-		 readl(dsi->regs + data->reg_main[DSI_PSCTRL]));
++		 readl(dsi->regs + data->reg_main[DSI_PSCTRL]), debug_sel);
+ 	dev_info(dsi->host.dev,
+ 		 "C-PHY phy %s: lccon=%08x lcpat=%08x timecon0=%08x timecon1=%08x cphy=%08x\n",
+ 		 phase, readl(dsi->regs + data->reg_main[DSI_PHY_LCCON]),
+@@ -1386,6 +1405,8 @@ static void mtk_dsi_record_cmd(struct mtk_dsi *dsi,
+ 	rec->start = readl(dsi->regs + data->reg_main[DSI_START]);
+ 	rec->cmdq = readl(dsi->regs + data->reg_adv[DSI_CMDQ]);
+ 	rec->cmdq_size = readl(dsi->regs + data->reg_main[DSI_CMDQ_SIZE]);
++	rec->debug_sel = data->tx_buf ?
++		readl(dsi->regs + DSI_V1_DEBUG_SEL) : 0;
+ 	rec->result = result;
+ 	dsi->cmd_ring_head = (dsi->cmd_ring_head + 1) % MTK_DSI_CMD_RING_SIZE;
+ 	if (dsi->cmd_ring_count < MTK_DSI_CMD_RING_SIZE)
+@@ -1406,11 +1427,12 @@ static void mtk_dsi_dump_ring(struct mtk_dsi *dsi, const char *phase)
+ 	for (i = 0; i < count; i++) {
+ 		rec = &dsi->cmd_ring[(start + i) % MTK_DSI_CMD_RING_SIZE];
+ 		dev_info(dsi->host.dev,
+-			 "C-PHY ring %s[%u]: type=%u tx_len=%zu tx=%02x%02x%02x%02x pre=%08x startsta=%08x donesta=%08x start=%08x cmdq=%08x cmdq_size=%08x result=%d\n",
++			 "C-PHY ring %s[%u]: type=%u tx_len=%zu tx=%02x%02x%02x%02x pre=%08x startsta=%08x donesta=%08x start=%08x cmdq=%08x cmdq_size=%08x debug_sel=%08x result=%d\n",
+ 			 phase, i, rec->type, rec->tx_len, rec->tx[0],
+ 			 rec->tx[1], rec->tx[2], rec->tx[3], rec->pre_intsta,
+ 			 rec->post_start_intsta, rec->post_done_intsta,
+-			 rec->start, rec->cmdq, rec->cmdq_size, rec->result);
++			 rec->start, rec->cmdq, rec->cmdq_size, rec->debug_sel,
++			 rec->result);
+ 	}
+ }
+ 
+@@ -1620,6 +1642,8 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
+ 		writel(FORCE_COMMIT | BYPASS_SHADOW,
+ 		       dsi->regs + data->reg_adv[DSI_SHADOW_DEBUG]);
+ 
++	/* The engine reset must use the MM reset source on this layout. */
++	mtk_dsi_select_mm_reset(dsi);
+ 	mtk_dsi_reset_engine(dsi);
+ 	/*
+ 	 * A bootloader may have left the link running in video mode, which
+diff --git a/tools/testing/selftests/mtk_clk/dsi_routing_cases.c b/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
+index 2644b21d8d..49921f6b29 100644
+--- a/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
++++ b/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
+@@ -70,6 +70,8 @@ static void test_log(const char *fmt, ...)
+ #define DATA_1 0xff000000
+ #define CMDQ_SIZE 0x3f
+ #define CMDQ_SIZE_SEL (1U << 15)
++#define DSI_V1_DEBUG_SEL 0x170
++#define DSI_V1_MM_RST_SEL (1U << 10)
+ struct clk {
+ 	int refs, id;
+ };
+@@ -97,7 +99,7 @@ struct mtk_dsi_cmd_record {
+ 	size_t tx_len;
+ 	u8 tx[4];
+ 	u32 pre_intsta, post_start_intsta, post_done_intsta;
+-	u32 start, cmdq, cmdq_size;
++	u32 start, cmdq, cmdq_size, debug_sel;
+ 	int result;
+ };
+ struct mtk_dsi_driver_data {
+@@ -250,7 +252,16 @@ NOOP(mtk_dsi_set_mode)
+ NOOP(mtk_dsi_start)
+ NOOP(mtk_dsi_enable)
+ NOOP(mtk_dsi_disable)
+-NOOP(mtk_dsi_reset_engine)
++static int reset_engine_calls;
++static int reset_engine_marks[64];
++static void mtk_dsi_reset_engine(struct mtk_dsi *d)
++{
++	assert(legacy || d->mmsys_dev->pm > 0);
++	writes++;
++	if (reset_engine_calls < (int)ARRAY_SIZE(reset_engine_marks))
++		reset_engine_marks[reset_engine_calls] = mask_count;
++	reset_engine_calls++;
++}
+ NOOP(mtk_dsi_stop)
+ NOOP(mtk_dsi_set_cmd_mode)
+ NOOP(mtk_dsi_phy_timconfig)
+@@ -341,12 +352,18 @@ static const struct mtk_dsi_driver_data poll_data = {
+ 	.poll_command_done = true,
+ 	.cmdq_long_packet_ctl = true,
+ };
++static const struct mtk_dsi_driver_data v1_data = {
++	.reg_adv = { 0, 1, 2, 3 },
++	.reg_main = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
++	.tx_buf = true,
++};
+ static void setup(bool dual)
+ {
+ 	calls = writes = n = fail_at = 0;
+ 	state_reads = reg_reads = timeout_ret = 0;
+ 	poll_calls = idle_waits = irq_waits = 0;
+ 	mask_count = 0;
++	reset_engine_calls = 0;
+ 	log_count = clk_rate_calls = 0;
+ 	poll_intsta = 0;
+ 	legacy = false;
+@@ -558,6 +575,28 @@ int main(void)
+ 	mtk_dsi_poweroff(&d[0]);
+ 	balanced();
+ 	setup(false);
++	d[0].driver_data = &v1_data;
++	mask_count = reset_engine_calls = 0;
++	assert(!mtk_dsi_poweron(&d[0]));
++	assert(reset_engine_calls >= 1);
++	int mm_rst = -1;
++	for (int i = 0; i < mask_count; i++)
++		if (mask_calls[i].reg == DSI_V1_DEBUG_SEL &&
++		    mask_calls[i].mask == DSI_V1_MM_RST_SEL &&
++		    mask_calls[i].value == DSI_V1_MM_RST_SEL)
++			mm_rst = i;
++	assert(mm_rst >= 0 && mm_rst < reset_engine_marks[0]);
++	mtk_dsi_poweroff(&d[0]);
++	balanced();
++	setup(false);
++	mask_count = reset_engine_calls = 0;
++	assert(!mtk_dsi_poweron(&d[0]));
++	assert(reset_engine_calls >= 1);
++	for (int i = 0; i < mask_count; i++)
++		assert(mask_calls[i].reg != DSI_V1_DEBUG_SEL);
++	mtk_dsi_poweroff(&d[0]);
++	balanced();
++	setup(false);
+ 	d[0].driver_data = &poll_data;
+ 	mtk_dsi_set_interrupt_enable(&d[0]);
+ 	assert(regs[0][DSI_INTEN] ==
+diff --git a/tools/testing/selftests/mtk_clk/test_dsi_routing.py b/tools/testing/selftests/mtk_clk/test_dsi_routing.py
+index 09055c5329..88faeaeeb0 100755
+--- a/tools/testing/selftests/mtk_clk/test_dsi_routing.py
++++ b/tools/testing/selftests/mtk_clk/test_dsi_routing.py
+@@ -29,7 +29,7 @@ production = '\n'.join(function(name) for name in [
+     'mtk_dsi_record_cmd', 'mtk_dsi_dump_ring', 'mtk_dsi_dump_cmd_failure',
+     'mtk_dsi_dump_clocks', 'mtk_dsi_wait_for_irq_done', 'mtk_dsi_irq',
+     'mtk_dsi_poll_for_idle', 'mtk_dsi_cmdq', 'mtk_dsi_host_send_cmd',
+-    'mtk_dsi_set_interrupt_enable',
++    'mtk_dsi_set_interrupt_enable', 'mtk_dsi_select_mm_reset',
+     'mtk_dsi_poweron', 'mtk_dsi_poweroff', 'mtk_dsi_bridge_atomic_disable',
+     'mtk_dsi_bridge_atomic_enable', 'mtk_dsi_bridge_atomic_pre_enable',
+     'mtk_dsi_bridge_atomic_post_disable', 'mtk_dsi_ddp_start', 'mtk_dsi_ddp_stop',
+@@ -61,7 +61,17 @@ assert transfer.index('!READ_ONCE(dsi->power_ready)') < transfer.index('readl(')
+ assert transfer.index('!READ_ONCE(lead->power_ready)') < transfer.index('readl(')
+ assert transfer.index('!READ_ONCE(dsi->power_ready)') < \
+     transfer.index('mtk_dsi_dump_regs') < transfer.index('readl(')
++select_reset = function('mtk_dsi_select_mm_reset')
++assert 'tx_buf' in select_reset
++assert 'DSI_V1_DEBUG_SEL' in select_reset
++assert 'DSI_V1_MM_RST_SEL' in select_reset
++assert 'mtk_dsi_select_mm_reset' in function('mtk_dsi_config_tx_buf_v1')
+ poweron = function('mtk_dsi_poweron')
++assert poweron.index('mtk_dsi_select_mm_reset') < \
++    poweron.index('mtk_dsi_reset_engine')
++assert 'DSI_V1_DEBUG_SEL' in function('mtk_dsi_dump_regs')
++assert 'debug_sel' in function('mtk_dsi_record_cmd')
++assert 'debug_sel' in function('mtk_dsi_dump_ring')
+ assert poweron.index('pm_runtime_resume_and_get') < \
+     poweron.index('clk_prepare_enable(dsi->config_clk)') < \
+     poweron.index('mtk_dsi_dump_mmsys_state(dsi, "pre-26m")') < \
+-- 
+2.56.0
+

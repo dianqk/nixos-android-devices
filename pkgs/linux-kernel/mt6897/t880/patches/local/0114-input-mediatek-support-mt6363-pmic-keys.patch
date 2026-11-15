@@ -1,0 +1,202 @@
+From 518f33469b60368d23e081b82fc72f4fae63069f Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] input: mediatek: support MT6363 PMIC keys
+
+Use the parent SPMI regmap and the MT6363 register/interrupt layout for
+the board power key.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-15T19:09:13+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/input/keyboard/Kconfig         |  2 +-
+ drivers/input/keyboard/mtk-pmic-keys.c | 88 +++++++++++++++++++++++---
+ 2 files changed, 81 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/input/keyboard/Kconfig b/drivers/input/keyboard/Kconfig
+index d8c64f3334..4fec852107 100644
+--- a/drivers/input/keyboard/Kconfig
++++ b/drivers/input/keyboard/Kconfig
+@@ -751,7 +751,7 @@ config KEYBOARD_MT6779
+ 
+ config KEYBOARD_MTK_PMIC
+ 	tristate "MediaTek PMIC keys support"
+-	depends on MFD_MT6397 || COMPILE_TEST
++	depends on MFD_MT6397 || MFD_MTK_SPMI_PMIC || COMPILE_TEST
+ 	help
+ 	  Say Y here if you want to use the pmic keys (powerkey/homekey).
+ 
+diff --git a/drivers/input/keyboard/mtk-pmic-keys.c b/drivers/input/keyboard/mtk-pmic-keys.c
+index c78d9f6d97..4984212128 100644
+--- a/drivers/input/keyboard/mtk-pmic-keys.c
++++ b/drivers/input/keyboard/mtk-pmic-keys.c
+@@ -18,6 +18,7 @@
+ #include <linux/module.h>
+ #include <linux/of_device.h>
+ #include <linux/of.h>
++#include <linux/of_irq.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
+ 
+@@ -29,6 +30,14 @@
+ #define MTK_PMIC_MT6331_PWRKEY_RST	BIT(9)
+ #define MTK_PMIC_MT6331_HOMEKEY_RST	BIT(8)
+ 
++#define MTK_PMIC_MT6363_TOPSTATUS	0x1e
++#define MTK_PMIC_MT6363_PSC_TOP_INT_CON0	0x90f
++#define MTK_PMIC_MT6363_TOP_RST_MISC0	0xa0e
++#define MTK_PMIC_MT6363_TOP_RST_MISC1	0xa0f
++#define MTK_PMIC_MT6363_RST_DU_MASK	GENMASK(7, 6)
++#define MTK_PMIC_MT6363_PWRKEY_RST	BIT(2)
++#define MTK_PMIC_MT6363_HOMEKEY_RST	BIT(4)
++
+ #define MTK_PMIC_PWRKEY_INDEX	0
+ #define MTK_PMIC_HOMEKEY_INDEX	1
+ #define MTK_PMIC_MAX_KEY_COUNT	2
+@@ -54,6 +63,7 @@ struct mtk_pmic_keys_regs {
+ struct mtk_pmic_regs {
+ 	const struct mtk_pmic_keys_regs keys_regs[MTK_PMIC_MAX_KEY_COUNT];
+ 	u32 pmic_rst_reg;
++	u32 pmic_lprst_reg; /* Long-press timeout register, if not pmic_rst_reg */
+ 	u32 rst_lprst_mask; /* Long-press reset timeout bitmask */
+ 	bool key_release_irq;
+ };
+@@ -134,6 +144,27 @@ static const struct mtk_pmic_regs mt6359_regs = {
+ 	.key_release_irq = true,
+ };
+ 
++/*
++ * MT6363 is an SPMI PMIC with 8-bit registers: the long-press timeout is
++ * in the register after the reset enable bits. Key press and release
++ * are separate interrupts in the PSC group (PWRKEY, HOMEKEY, HOMEKEY_2,
++ * PWRKEY_R, HOMEKEY_R): enable both for each key.
++ */
++static const struct mtk_pmic_regs mt6363_regs = {
++	.keys_regs[MTK_PMIC_PWRKEY_INDEX] =
++		MTK_PMIC_KEYS_REGS(MTK_PMIC_MT6363_TOPSTATUS, 0x2,
++				   MTK_PMIC_MT6363_PSC_TOP_INT_CON0, 0x9,
++				   MTK_PMIC_MT6363_PWRKEY_RST),
++	.keys_regs[MTK_PMIC_HOMEKEY_INDEX] =
++		MTK_PMIC_KEYS_REGS(MTK_PMIC_MT6363_TOPSTATUS, 0x8,
++				   MTK_PMIC_MT6363_PSC_TOP_INT_CON0, 0x12,
++				   MTK_PMIC_MT6363_HOMEKEY_RST),
++	.pmic_rst_reg = MTK_PMIC_MT6363_TOP_RST_MISC0,
++	.pmic_lprst_reg = MTK_PMIC_MT6363_TOP_RST_MISC1,
++	.rst_lprst_mask = MTK_PMIC_MT6363_RST_DU_MASK,
++	.key_release_irq = true,
++};
++
+ struct mtk_pmic_keys_info {
+ 	struct mtk_pmic_keys *keys;
+ 	const struct mtk_pmic_keys_regs *regs;
+@@ -161,7 +192,7 @@ static void mtk_pmic_keys_lp_reset_setup(struct mtk_pmic_keys *keys,
+ {
+ 	const struct mtk_pmic_keys_regs *kregs_home, *kregs_pwr;
+ 	u32 long_press_mode, long_press_debounce;
+-	u32 value, mask;
++	u32 value, mask, du_value;
+ 	int error;
+ 
+ 	kregs_home = &regs->keys_regs[MTK_PMIC_HOMEKEY_INDEX];
+@@ -172,8 +203,16 @@ static void mtk_pmic_keys_lp_reset_setup(struct mtk_pmic_keys *keys,
+ 	if (error)
+ 		long_press_debounce = 0;
+ 
+-	mask = regs->rst_lprst_mask;
+-	value = long_press_debounce << (ffs(regs->rst_lprst_mask) - 1);
++	du_value = long_press_debounce << (ffs(regs->rst_lprst_mask) - 1);
++	if (regs->pmic_lprst_reg) {
++		regmap_update_bits(keys->regmap, regs->pmic_lprst_reg,
++				   regs->rst_lprst_mask, du_value);
++		mask = 0;
++		value = 0;
++	} else {
++		mask = regs->rst_lprst_mask;
++		value = du_value;
++	}
+ 
+ 	error  = of_property_read_u32(keys->dev->of_node,
+ 				      "mediatek,long-press-mode",
+@@ -316,17 +355,41 @@ static const struct of_device_id of_mtk_pmic_keys_match_tbl[] = {
+ 	}, {
+ 		.compatible = "mediatek,mt6359-keys",
+ 		.data = &mt6359_regs,
++	}, {
++		.compatible = "mediatek,mt6363-keys",
++		.data = &mt6363_regs,
+ 	}, {
+ 		/* sentinel */
+ 	}
+ };
+ MODULE_DEVICE_TABLE(of, of_mtk_pmic_keys_match_tbl);
+ 
++/*
++ * MFD cells pass the key interrupts as named resources of the keys device;
++ * device trees describe them in each key node, as documented in the binding.
++ */
++static int mtk_pmic_keys_get_irq(struct platform_device *pdev,
++				 struct device_node *child, const char *name)
++{
++	int irq;
++
++	irq = platform_get_irq_byname_optional(pdev, name);
++	if (irq != -ENXIO)
++		return irq;
++
++	irq = of_irq_get_byname(child, name);
++	if (irq == 0)
++		return -ENXIO;
++	if (irq < 0 && irq != -EPROBE_DEFER)
++		dev_err(&pdev->dev, "IRQ %s not found\n", name);
++
++	return irq;
++}
++
+ static int mtk_pmic_keys_probe(struct platform_device *pdev)
+ {
+ 	int error, index = 0;
+ 	unsigned int keycount;
+-	struct mt6397_chip *pmic_chip = dev_get_drvdata(pdev->dev.parent);
+ 	struct device_node *node = pdev->dev.of_node;
+ 	static const char *const irqnames[] = { "powerkey", "homekey" };
+ 	static const char *const irqnames_r[] = { "powerkey_r", "homekey_r" };
+@@ -341,7 +404,16 @@ static int mtk_pmic_keys_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 
+ 	keys->dev = &pdev->dev;
+-	keys->regmap = pmic_chip->regmap;
++	/*
++	 * The MT6397 MFD keeps its regmap in its driver data; SPMI PMICs
++	 * register theirs with the parent device.
++	 */
++	keys->regmap = dev_get_regmap(pdev->dev.parent, NULL);
++	if (!keys->regmap) {
++		struct mt6397_chip *pmic_chip = dev_get_drvdata(pdev->dev.parent);
++
++		keys->regmap = pmic_chip->regmap;
++	}
+ 	mtk_pmic_regs = of_id->data;
+ 
+ 	keys->input_dev = input_dev = devm_input_allocate_device(keys->dev);
+@@ -367,13 +439,13 @@ static int mtk_pmic_keys_probe(struct platform_device *pdev)
+ 		keys->keys[index].regs = &mtk_pmic_regs->keys_regs[index];
+ 
+ 		keys->keys[index].irq =
+-			platform_get_irq_byname(pdev, irqnames[index]);
++			mtk_pmic_keys_get_irq(pdev, child, irqnames[index]);
+ 		if (keys->keys[index].irq < 0)
+ 			return keys->keys[index].irq;
+ 
+ 		if (mtk_pmic_regs->key_release_irq) {
+-			keys->keys[index].irq_r = platform_get_irq_byname(pdev,
+-									  irqnames_r[index]);
++			keys->keys[index].irq_r =
++				mtk_pmic_keys_get_irq(pdev, child, irqnames_r[index]);
+ 
+ 			if (keys->keys[index].irq_r < 0)
+ 				return keys->keys[index].irq_r;
+-- 
+2.56.0
+

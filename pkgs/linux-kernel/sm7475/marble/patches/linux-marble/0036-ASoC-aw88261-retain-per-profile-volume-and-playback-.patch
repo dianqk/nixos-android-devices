@@ -1,0 +1,352 @@
+From 3d39da5d7b2b39f18ef8c0a28f9a67991b359096 Mon Sep 17 00:00:00 2001
+From: Halhadus <eneshakans45@proton.me>
+Date: Wed, 14 Oct 2026 12:23:22 +0300
+Subject: [PATCH 36/46] ASoC: aw88261: retain per-profile volume and playback
+ mute
+
+Expose Playback Switch and per-firmware-profile volume controls. Keep
+independent attenuation across profile changes and forward legacy PCM
+volume writes through the active profile control. Serialize state with
+the codec lock and retry startup only while playback remains active.
+
+Preserve register-table I/O errors, reject incomplete register pairs and
+stop startup when a profile update fails.
+
+Signed-off-by: Halhadus <eneshakans45@proton.me>
+(cherry picked from commit 4c23e87f2772e1398fe70e0c3565de3f4bb9cdc8)
+
+Conflict resolution for Linux 7.3: 7.3 converted aw88261_profile_set() to guard(mutex); the commit unlocks explicitly before snd_soc_component_notify_control(), so the explicit mutex_lock()/mutex_unlock() pairing is kept.
+---
+ sound/soc/codecs/aw88261.c | 208 +++++++++++++++++++++++++++++++++----
+ sound/soc/codecs/aw88261.h |   1 +
+ 2 files changed, 189 insertions(+), 20 deletions(-)
+
+diff --git a/sound/soc/codecs/aw88261.c b/sound/soc/codecs/aw88261.c
+index 79b339e65fa1..16b2a1c6dbbb 100644
+--- a/sound/soc/codecs/aw88261.c
++++ b/sound/soc/codecs/aw88261.c
+@@ -23,6 +23,12 @@
+ #include "aw88395/aw88395_data_type.h"
+ #include "aw88395/aw88395_device.h"
+ 
++struct aw88261_profile_volume {
++	struct soc_mixer_control mixer;
++	const char *name;
++	unsigned int attenuation;
++};
++
+ static const struct regmap_config aw88261_remap_config = {
+ 	.val_bits = 16,
+ 	.reg_bits = 8,
+@@ -448,7 +454,7 @@ static int aw88261_dev_reg_update(struct aw88261 *aw88261,
+ 	struct aw_device *aw_dev = aw88261->aw_pa;
+ 	struct aw_volume_desc *vol_desc = &aw_dev->volume_desc;
+ 	unsigned int read_val, efcheck_val, read_vol;
+-	int data_len, i, ret;
++	int data_len, i, ret = 0;
+ 	int16_t *reg_data;
+ 	u16 reg_val;
+ 	u8 reg_addr;
+@@ -461,7 +467,7 @@ static int aw88261_dev_reg_update(struct aw88261 *aw88261,
+ 	reg_data = (int16_t *)data;
+ 	data_len = len >> 1;
+ 
+-	if (data_len & 0x1) {
++	if (len % (2 * sizeof(*reg_data))) {
+ 		dev_err(aw_dev->dev, "data len:%d unsupported",	data_len);
+ 		return -EINVAL;
+ 	}
+@@ -531,13 +537,12 @@ static int aw88261_dev_reg_update(struct aw88261 *aw88261,
+ 			break;
+ 	}
+ 
++	if (ret)
++		return ret;
+ 	ret = aw88261_dev_set_vcalb(aw_dev);
+ 	if (ret)
+ 		return ret;
+ 
+-	if (aw_dev->prof_cur != aw_dev->prof_index)
+-		vol_desc->ctl_volume = 0;
+-
+ 	/* keep min volume and mute */
+ 	aw88261_dev_set_volume(aw_dev, vol_desc->mute_volume);
+ 	aw88261_dev_mute(aw_dev, true);
+@@ -749,9 +754,11 @@ static void aw88261_start_pa(struct aw88261 *aw88261)
+ 
+ 	if (aw88261->aw_pa->prof_cur != aw88261->aw_pa->prof_index) {
+ 		ret = aw88261_reg_update(aw88261, false);
+-		if (ret)
++		if (ret) {
+ 			dev_dbg(aw88261->aw_pa->dev,
+ 				"aw88261_reg_update failed: %d\n", ret);
++			return;
++		}
+ 	}
+ 
+ 	for (i = 0; i < AW88261_START_RETRIES; i++) {
+@@ -1079,26 +1086,90 @@ static int aw88261_profile_get(struct snd_kcontrol *kcontrol,
+ 	return 0;
+ }
+ 
++static void aw88261_retry_start(struct aw88261 *aw88261)
++{
++	if (aw88261->playback_active && aw88261->aw_pa->status != AW88261_DEV_PW_ON) {
++		aw88261->start_attempts = 0;
++		queue_delayed_work(system_dfl_wq, &aw88261->start_work,
++				   msecs_to_jiffies(AW88261_START_WORK_RETRY_MS));
++	}
++}
++
+ static int aw88261_profile_set(struct snd_kcontrol *kcontrol,
+ 		struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct snd_soc_component *codec = snd_kcontrol_chip(kcontrol);
+ 	struct aw88261 *aw88261 = snd_soc_component_get_drvdata(codec);
++	struct aw_device *aw_dev = aw88261->aw_pa;
++	bool restart;
+ 	int ret;
+ 
++	if (ucontrol->value.integer.value[0] < 0 ||
++	    ucontrol->value.integer.value[0] >= aw_dev->prof_info.count)
++		return -EINVAL;
++
+ 	/* pa stop or stopping just set profile */
+-	guard(mutex)(&aw88261->lock);
++	mutex_lock(&aw88261->lock);
+ 	ret = aw88261_dev_set_profile_index(aw88261->aw_pa, ucontrol->value.integer.value[0]);
+ 	if (ret) {
+ 		dev_dbg(codec->dev, "profile index does not change");
++		aw88261_retry_start(aw88261);
++		mutex_unlock(&aw88261->lock);
+ 		return 0;
+ 	}
+ 
+-	if (aw88261->aw_pa->status) {
+-		aw88261_dev_stop(aw88261->aw_pa);
++	restart = aw_dev->status == AW88261_DEV_PW_ON;
++	if (restart)
++		aw88261_dev_stop(aw_dev);
++	aw_dev->volume_desc.ctl_volume =
++		aw88261->profile_volumes[aw_dev->prof_index].attenuation;
++	if (restart)
+ 		aw88261_start(aw88261);
+-	}
++	aw88261_retry_start(aw88261);
++
++	mutex_unlock(&aw88261->lock);
++	snd_soc_component_notify_control(codec, "PCM Playback Volume");
++
++	return 1;
++}
++
++static int aw88261_playback_switch_get(struct snd_kcontrol *kcontrol,
++				       struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	struct aw88261 *aw88261 = snd_soc_component_get_drvdata(component);
++
++	mutex_lock(&aw88261->lock);
++	ucontrol->value.integer.value[0] = !aw88261->mute_st;
++	mutex_unlock(&aw88261->lock);
++	return 0;
++}
++
++static int aw88261_playback_switch_put(struct snd_kcontrol *kcontrol,
++				       struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	struct aw88261 *aw88261 = snd_soc_component_get_drvdata(component);
++	long enabled = ucontrol->value.integer.value[0];
++	bool mute;
++
++	if (enabled != 0 && enabled != 1)
++		return -EINVAL;
++	mute = !enabled;
+ 
++	mutex_lock(&aw88261->lock);
++	if (aw88261->mute_st == mute) {
++		if (enabled)
++			aw88261_retry_start(aw88261);
++		mutex_unlock(&aw88261->lock);
++		return 0;
++	}
++	aw88261->mute_st = mute;
++	if (aw88261->aw_pa->status == AW88261_DEV_PW_ON)
++		aw88261_dev_mute(aw88261->aw_pa, mute);
++	if (enabled)
++		aw88261_retry_start(aw88261);
++	mutex_unlock(&aw88261->lock);
+ 	return 1;
+ }
+ 
+@@ -1109,8 +1180,10 @@ static int aw88261_volume_get(struct snd_kcontrol *kcontrol,
+ 	struct aw88261 *aw88261 = snd_soc_component_get_drvdata(codec);
+ 	struct aw_volume_desc *vol_desc = &aw88261->aw_pa->volume_desc;
+ 
++	mutex_lock(&aw88261->lock);
+ 	ucontrol->value.integer.value[0] =
+ 		(AW88261_MUTE_VOL - vol_desc->ctl_volume) / 2;
++	mutex_unlock(&aw88261->lock);
+ 
+ 	return 0;
+ }
+@@ -1120,24 +1193,71 @@ static int aw88261_volume_set(struct snd_kcontrol *kcontrol,
+ {
+ 	struct snd_soc_component *codec = snd_kcontrol_chip(kcontrol);
+ 	struct aw88261 *aw88261 = snd_soc_component_get_drvdata(codec);
+-	struct aw_volume_desc *vol_desc = &aw88261->aw_pa->volume_desc;
+ 	struct soc_mixer_control *mc =
+ 		(struct soc_mixer_control *)kcontrol->private_value;
+-	int value = ucontrol->value.integer.value[0];
++	long value = ucontrol->value.integer.value[0];
++	struct snd_kcontrol *profile_control;
++	struct aw88261_profile_volume *profile;
+ 
+ 	if (value < mc->min || value > mc->max)
+ 		return -EINVAL;
+ 
+-	value = AW88261_MUTE_VOL - (value * 2);
++	mutex_lock(&aw88261->lock);
++	profile = &aw88261->profile_volumes[aw88261->aw_pa->prof_index];
++	ucontrol->value.integer.value[0] = min_t(long, value, profile->mixer.platform_max);
++	mutex_unlock(&aw88261->lock);
++	profile_control = snd_soc_component_get_kcontrol(codec, profile->name);
++	if (!profile_control)
++		return -ENODEV;
++	return profile_control->put(profile_control, ucontrol);
++}
++
++static int aw88261_profile_volume_get(struct snd_kcontrol *kcontrol,
++				      struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *codec = snd_kcontrol_chip(kcontrol);
++	struct aw88261 *aw88261 = snd_soc_component_get_drvdata(codec);
++	struct soc_mixer_control *mc = (void *)kcontrol->private_value;
++
++	mutex_lock(&aw88261->lock);
++	ucontrol->value.integer.value[0] = (AW88261_MUTE_VOL -
++		aw88261->profile_volumes[mc->reg].attenuation) / 2;
++	mutex_unlock(&aw88261->lock);
++	return 0;
++}
+ 
+-	if (vol_desc->ctl_volume != value) {
+-		vol_desc->ctl_volume = value;
+-		aw88261_dev_set_volume(aw88261->aw_pa, vol_desc->ctl_volume);
++static int aw88261_profile_volume_set(struct snd_kcontrol *kcontrol,
++				      struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *codec = snd_kcontrol_chip(kcontrol);
++	struct aw88261 *aw88261 = snd_soc_component_get_drvdata(codec);
++	struct aw_device *aw_dev = aw88261->aw_pa;
++	struct soc_mixer_control *mc = (void *)kcontrol->private_value;
++	struct aw88261_profile_volume *profile = &aw88261->profile_volumes[mc->reg];
++	long value = ucontrol->value.integer.value[0];
++	bool active;
++	int ret = 0;
+ 
+-		return 1;
++	if (value < mc->min || value > mc->platform_max)
++		return -EINVAL;
++	value = AW88261_MUTE_VOL - value * 2;
++	mutex_lock(&aw88261->lock);
++	active = aw_dev->prof_index == mc->reg;
++	if (profile->attenuation != value) {
++		profile->attenuation = value;
++		if (active) {
++			aw_dev->volume_desc.ctl_volume = value;
++			if (aw_dev->status == AW88261_DEV_PW_ON && !aw88261->mute_st &&
++			    aw_dev->prof_cur == aw_dev->prof_index)
++				aw88261_dev_set_volume(aw_dev, value);
++		}
++		ret = 1;
+ 	}
++	mutex_unlock(&aw88261->lock);
++	if (ret && active)
++		snd_soc_component_notify_control(codec, "PCM Playback Volume");
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ /*
+@@ -1148,7 +1268,54 @@ static int aw88261_volume_set(struct snd_kcontrol *kcontrol,
+  */
+ static const DECLARE_TLV_DB_SCALE(volume_tlv, -9000, 25, 0);
+ 
++static int aw88261_add_profile_volumes(struct snd_soc_component *component)
++{
++	struct aw88261 *aw88261 = snd_soc_component_get_drvdata(component);
++	struct aw_device *aw_dev = aw88261->aw_pa;
++	struct snd_kcontrol_new control = {
++		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
++		.access = SNDRV_CTL_ELEM_ACCESS_READWRITE | SNDRV_CTL_ELEM_ACCESS_TLV_READ,
++		.info = snd_soc_info_volsw,
++		.get = aw88261_profile_volume_get,
++		.put = aw88261_profile_volume_set,
++		.tlv.p = volume_tlv,
++	};
++	char *name;
++	int i, ret;
++
++	if (aw_dev->prof_info.count <= 0)
++		return -EINVAL;
++	aw88261->profile_volumes = devm_kcalloc(component->dev, aw_dev->prof_info.count,
++						sizeof(*aw88261->profile_volumes), GFP_KERNEL);
++	if (!aw88261->profile_volumes)
++		return -ENOMEM;
++	for (i = 0; i < aw_dev->prof_info.count; i++) {
++		struct aw88261_profile_volume *profile = &aw88261->profile_volumes[i];
++
++		ret = aw88261_dev_get_prof_name(aw_dev, i, &name);
++		if (ret)
++			return ret;
++		profile->name = devm_kasprintf(component->dev, GFP_KERNEL,
++					       "%s Playback Volume", name);
++		if (!profile->name)
++			return -ENOMEM;
++		profile->attenuation = aw_dev->volume_desc.ctl_volume;
++		profile->mixer = (struct soc_mixer_control) {
++			.reg = i, .rreg = i, .max = AW88261_CTL_MAX_VOL,
++			.platform_max = AW88261_CTL_MAX_VOL,
++		};
++		control.name = profile->name;
++		control.private_value = (unsigned long)&profile->mixer;
++		ret = snd_soc_add_component_controls(component, &control, 1);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
+ static const struct snd_kcontrol_new aw88261_controls[] = {
++	SOC_SINGLE_EXT("Playback Switch", 0, 0, 1, 0,
++		       aw88261_playback_switch_get, aw88261_playback_switch_put),
+ 	SOC_SINGLE_EXT_TLV("PCM Playback Volume", AW88261_SYSCTRL2_REG,
+ 		6, AW88261_CTL_MAX_VOL, 1,
+ 		aw88261_volume_get, aw88261_volume_set, volume_tlv),
+@@ -1385,8 +1552,9 @@ static int aw88261_codec_probe(struct snd_soc_component *component)
+ 
+ 	ret = snd_soc_add_component_controls(component, aw88261_controls,
+ 							ARRAY_SIZE(aw88261_controls));
+-
+-	return ret;
++	if (ret)
++		return ret;
++	return aw88261_add_profile_volumes(component);
+ }
+ 
+ static const struct snd_soc_component_driver soc_codec_dev_aw88261 = {
+diff --git a/sound/soc/codecs/aw88261.h b/sound/soc/codecs/aw88261.h
+index 185c0a30baf5..d39fe054786b 100644
+--- a/sound/soc/codecs/aw88261.h
++++ b/sound/soc/codecs/aw88261.h
+@@ -626,6 +626,7 @@ struct aw88261 {
+ 	struct gpio_desc *reset_gpio;
+ 	struct regmap *regmap;
+ 	struct aw_container *aw_cfg;
++	struct aw88261_profile_volume *profile_volumes;
+ 
+ 	int efuse_check;
+ 	int frcset_en;

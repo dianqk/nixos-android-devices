@@ -1,0 +1,72 @@
+From be394f03edb5f3ec440ae46ed9c9260313fe8012 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 1 Nov 2026 04:11:30 +0800
+Subject: [PATCH] soc: qcom: cpr3: Show the CPRh state in debugfs
+
+The CPRh applies the voltage of the corner the OSM selects on its own, so
+the driver has no record of it. Add the CPRh status (current corner and
+last voltage field), control, margin adjustment control and RO mask
+registers, and the programmed corner registers decoded into open-loop
+and floor voltage, quotient delta, RO and closed-loop state, to the
+thread files in debugfs. All of them are read only.
+
+Scope: SDM630/660 common
+Porting notes: Local addition to the CPR3 driver (not upstream).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/pmdomain/qcom/cpr3.c | 34 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/drivers/pmdomain/qcom/cpr3.c b/drivers/pmdomain/qcom/cpr3.c
+index 2a51a6e884..bfc66d4629 100644
+--- a/drivers/pmdomain/qcom/cpr3.c
++++ b/drivers/pmdomain/qcom/cpr3.c
+@@ -148,6 +148,9 @@
+ #define CPRH_CTL_VOLTAGE_MULTIPLIER_MASK	GENMASK(28, 25)
+ #define CPRH_CTL_VOLTAGE_MULTIPLIER_SHIFT	25
+ 
++#define CPRH_STATUS_CORNER_MASK			GENMASK(5, 0)
++#define CPRH_STATUS_LAST_VOLTAGE_MASK		GENMASK(17, 6)
++
+ #define CPRH_CORNER_INIT_VOLTAGE_MASK		GENMASK(7, 0)
+ #define CPRH_CORNER_FLOOR_VOLTAGE_MASK		GENMASK(15, 8)
+ #define CPRH_CORNER_QUOT_DELTA_MASK		GENMASK(24, 16)
+@@ -2869,6 +2872,37 @@ static int cpr3_debug_info_show(struct seq_file *s, void *unused)
+ 
+ 	seq_printf(s, "thread %d - hw tid: %u - enabled: %d:\n",
+ 		   thread->id, thread->desc->hw_tid, thread->enabled);
++
++	if (thread->drv->desc->cpr_type == CTRL_TYPE_CPRH) {
++		struct cpr_drv *drv = thread->drv;
++		int n = thread->num_corners;
++
++		reg = cpr_read(thread, drv->reg_status);
++		seq_printf(s, "cprh_status = 0x%x [corner = %lu, last_voltage = %lu]\n",
++			   reg, FIELD_GET(CPRH_STATUS_CORNER_MASK, reg),
++			   FIELD_GET(CPRH_STATUS_LAST_VOLTAGE_MASK, reg));
++		seq_printf(s, "cprh_ctl = 0x%x\n", cpr_read(thread, drv->reg_ctl));
++		seq_printf(s, "margin_adj_ctl = 0x%x\n",
++			   cpr_read(thread, CPR4_REG_MARGIN_ADJ_CTL));
++		seq_printf(s, "ro_mask = 0x%x\n",
++			   cpr_read(thread, CPR3_REG_RO_MASK(tid)));
++
++		/* Programmed corners plus the APM/MEM-ACC crossover corners */
++		if (n)
++			n += drv->extra_corners;
++		for (i = 0; i < n; i++) {
++			reg = cpr_read(thread, CPRH_REG_CORNER(drv, tid, i));
++			seq_printf(s, "cprh_corner %u = 0x%08x [open-loop %lu uV, floor %lu uV, delta quot %lu, ro %lu%s]\n",
++				   i, reg,
++				   drv->desc->cpr_base_voltage +
++				   FIELD_GET(CPRH_CORNER_INIT_VOLTAGE_MASK, reg) * drv->vreg_step,
++				   drv->desc->cpr_base_voltage +
++				   FIELD_GET(CPRH_CORNER_FLOOR_VOLTAGE_MASK, reg) * drv->vreg_step,
++				   FIELD_GET(CPRH_CORNER_QUOT_DELTA_MASK, reg),
++				   FIELD_GET(CPRH_CORNER_RO_SEL_MASK, reg),
++				   reg & CPRH_CORNER_CPR_CL_DISABLE ? ", closed loop off" : "");
++		}
++	}
+ 	seq_printf(s, "%d corners, derived from %d fuse corners\n",
+ 		   thread->num_corners, thread->desc->num_fuse_corners);
+ 

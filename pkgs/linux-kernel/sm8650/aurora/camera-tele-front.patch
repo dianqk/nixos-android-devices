@@ -1,0 +1,217 @@
+From c92aa089c13b44641def0d373fd28db2cda4efe0 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 1 Nov 2026 22:58:08 +0800
+Subject: [PATCH] arm64: dts: qcom: aurora: wire the tele 3.2x and front
+ cameras
+
+Tele 3.2x: Sony IMX858 (OFilm module, its own mode table variant) at
+0x29 on CCI1 bus 0, CSIPHY5 with four D-PHY lanes at 1249.92 MHz;
+MCLK2 on gpio102, reset gpio110, AVDD from the external LDO enabled by
+gpio125 (fed from BOB2), DVDD from PM8010 L2M, DOVDD from L5N.
+
+Front: OmniVision OV32B40 at 0x10 on QUPv3 SE9 I2C, CSIPHY4 with four
+D-PHY lanes at 842.4 MHz; MCLK4 on gpio104, reset gpio7, AVDD PM8010
+L3N, DVDD PM8550VS L2C, DOVDD L5N; front-facing, rotation 270.
+
+Both follow the stock Aurora camera description; the sensors sit in the
+camera top GDSC domain.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ .../boot/dts/qcom/sm8650-xiaomi-aurora.dts    | 179 ++++++++++++++++++
+ 1 file changed, 179 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts b/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
+index 3ade6d55c5..5b2d96a107 100644
+--- a/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
++++ b/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
+@@ -943,6 +943,10 @@ vreg_l5n: ldo5 {
+ &camss {
+ 	vdd-csiphy01-0p9-supply = <&vreg_l2i>;
+ 	vdd-csiphy01-1p2-supply = <&vreg_l3i>;
++	vdd-csiphy24-0p9-supply = <&vreg_l2i>;
++	vdd-csiphy24-1p2-supply = <&vreg_l3i>;
++	vdd-csiphy35-0p9-supply = <&vreg_l2i>;
++	vdd-csiphy35-1p2-supply = <&vreg_l3i>;
+ 	status = "okay";
+ 
+ 	ports {
+@@ -1009,3 +1013,178 @@ cam_ultra_reset_default: cam-ultra-reset-default-state {
+ 		bias-disable;
+ 	};
+ };
++
++/*
++ * Tele 3.2x camera: Sony IMX858 (OFilm module) at 0x29 on CCI1 bus 0,
++ * CSIPHY5 with four D-PHY lanes. AVDD is the external LDO enabled by
++ * gpio125; DVDD comes from PM8010 L2M.
++ */
++/ {
++	vreg_cam_tele3x_avdd: regulator-cam-tele3x-avdd {
++		compatible = "regulator-fixed";
++		regulator-name = "cam_tele3x_avdd";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&tlmm 125 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <100>;
++		vin-supply = <&vreg_bob2>;
++		pinctrl-0 = <&cam_tele3x_avdd_default>;
++		pinctrl-names = "default";
++	};
++};
++
++&apps_rsc {
++	regulators-6 {
++		vreg_l2m: ldo2 {
++			regulator-name = "vreg_l2m";
++			regulator-min-microvolt = <1104000>;
++			regulator-max-microvolt = <1104000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++};
++
++&camss {
++	ports {
++		port@5 {
++			csiphy5_ep: endpoint {
++				data-lanes = <0 1 2 3>;
++				remote-endpoint = <&cam_tele3x_ep>;
++			};
++		};
++	};
++};
++
++&cci1 {
++	status = "okay";
++};
++
++&cci1_i2c0 {
++	clock-frequency = <400000>;
++
++	camera@29 {
++		compatible = "xiaomi,aurora-imx858-tele3x", "sony,imx858";
++		reg = <0x29>;
++		clocks = <&camcc CAM_CC_MCLK2_CLK>;
++		assigned-clocks = <&camcc CAM_CC_MCLK2_CLK>;
++		assigned-clock-rates = <19200000>;
++		power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>;
++		reset-gpios = <&tlmm 110 GPIO_ACTIVE_LOW>;
++		pinctrl-0 = <&cam2_default>, <&cam_tele3x_reset_default>;
++		pinctrl-names = "default";
++		dovdd-supply = <&vreg_l5n>;
++		avdd-supply = <&vreg_cam_tele3x_avdd>;
++		dvdd-supply = <&vreg_l2m>;
++		orientation = <1>;	/* rear */
++		rotation = <90>;
++
++		port {
++			cam_tele3x_ep: endpoint {
++				data-lanes = <1 2 3 4>;
++				link-frequencies = /bits/ 64 <1249920000>;
++				remote-endpoint = <&csiphy5_ep>;
++			};
++		};
++	};
++};
++
++/* Stock MCLK2 drive strength. */
++&cam2_default {
++	drive-strength = <4>;
++};
++
++&tlmm {
++	cam_tele3x_avdd_default: cam-tele3x-avdd-default-state {
++		pins = "gpio125";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++
++	cam_tele3x_reset_default: cam-tele3x-reset-default-state {
++		pins = "gpio110";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++};
++
++/*
++ * Front camera: OmniVision OV32B40 at 0x10 on QUPv3 SE9 I2C, CSIPHY4 with
++ * four D-PHY lanes. The CPAS camera/MCLK selection for CSIPHY4 is left at
++ * its reset value (main camera path).
++ */
++&apps_rsc {
++	regulators-3 {
++		vreg_l2c: ldo2 {
++			regulator-name = "vreg_l2c";
++			regulator-min-microvolt = <1104000>;
++			regulator-max-microvolt = <1104000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++	regulators-7 {
++		vreg_l3n: ldo3 {
++			regulator-name = "vreg_l3n";
++			regulator-min-microvolt = <2800000>;
++			regulator-max-microvolt = <2800000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++};
++
++&camss {
++	ports {
++		port@4 {
++			csiphy4_ep: endpoint {
++				data-lanes = <0 1 2 3>;
++				remote-endpoint = <&cam_front_ep>;
++			};
++		};
++	};
++};
++
++&i2c9 {
++	clock-frequency = <400000>;
++	status = "okay";
++
++	camera@10 {
++		compatible = "ovti,ov32b40";
++		reg = <0x10>;
++		clocks = <&camcc CAM_CC_MCLK4_CLK>;
++		assigned-clocks = <&camcc CAM_CC_MCLK4_CLK>;
++		assigned-clock-rates = <19200000>;
++		power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>;
++		reset-gpios = <&tlmm 7 GPIO_ACTIVE_LOW>;
++		pinctrl-0 = <&cam4_default>, <&cam_front_reset_default>;
++		pinctrl-names = "default";
++		dovdd-supply = <&vreg_l5n>;
++		avdd-supply = <&vreg_l3n>;
++		dvdd-supply = <&vreg_l2c>;
++		orientation = <0>;	/* front */
++		rotation = <270>;
++
++		port {
++			cam_front_ep: endpoint {
++				data-lanes = <1 2 3 4>;
++				link-frequencies = /bits/ 64 <842400000>;
++				remote-endpoint = <&csiphy4_ep>;
++			};
++		};
++	};
++};
++
++/* Stock MCLK4 drive strength. */
++&cam4_default {
++	drive-strength = <4>;
++};
++
++&tlmm {
++	cam_front_reset_default: cam-front-reset-default-state {
++		pins = "gpio7";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++};

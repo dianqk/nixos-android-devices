@@ -1,0 +1,255 @@
+From 34e315ac8d61e89c4dcaade51ae2087e09f70680 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 8 Nov 2026 03:02:02 +0800
+Subject: [PATCH 024/144] power: supply: qcom_battmgr: read and isolate Dodge
+ OEM gauge data
+
+Consolidate OEM gauge snapshots, conversion validation, ambiguity handling and reply isolation.
+
+Consolidated from local follow-ups:
+  296364c03462a22261b20f356cdf451e04540672 power: supply: qcom_battmgr: read Dodge OEM gauge snapshots
+  cd3c5961fbd608c7c041da636dbd14f604d47344 power: supply: qcom_battmgr: validate Dodge gauge conversion bounds
+  c75cea82b620317f7f6b0bf99d60b5a3027106f7 power: supply: qcom_battmgr: omit ambiguous Dodge pack quantities
+  18275cd1d17df2fe54e34b0631f270e7af955a41 power: supply: qcom_battmgr: isolate Dodge gauge replies and restarts
+---
+ drivers/power/supply/qcom_battmgr.c | 174 +++++++++++++++++++++++++++-
+ 1 file changed, 171 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 8f1532ac49..9c1a584780 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -23,6 +23,7 @@
+ enum qcom_battmgr_variant {
+ 	QCOM_BATTMGR_SC8280XP,
+ 	QCOM_BATTMGR_SM8350,
++	QCOM_BATTMGR_DODGE,
+ 	QCOM_BATTMGR_SM8550,
+ 	QCOM_BATTMGR_X1E80100,
+ };
+@@ -332,6 +333,14 @@ struct qcom_battmgr {
+ 	struct qcom_battmgr_usb usb;
+ 	struct qcom_battmgr_wireless wireless;
+ 
++	/* OnePlus ADSP gauge snapshot: temperature through state of health. */
++	u32 dodge_gauge[9];
++	unsigned long dodge_gauge_updated;
++	u32 dodge_gauge_generation;
++	u32 dodge_service_generation;
++	bool dodge_gauge_valid;
++	bool dodge_gauge_pending;
++
+ 	struct work_struct enable_work;
+ 
+ 	/*
+@@ -659,6 +668,120 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
+ 	return 0;
+ }
+ 
++#define DODGE_GAUGE_OPCODE	0x10000
++#define DODGE_GAUGE_WORDS	128
++
++struct qcom_battmgr_dodge_request {
++	struct pmic_glink_hdr hdr;
++	__le32 data_size;
++};
++
++struct qcom_battmgr_dodge_response {
++	struct pmic_glink_hdr hdr;
++	__le32 data[DODGE_GAUGE_WORDS];
++	__le32 data_size;
++};
++
++static int qcom_battmgr_dodge_decode(const void *data, size_t len, u32 gauge[9])
++{
++	const struct qcom_battmgr_dodge_response *response = data;
++	u32 bytes;
++	int i;
++
++	if (len != sizeof(*response))
++		return -EPROTO;
++	if (le32_to_cpu(response->hdr.owner) != PMIC_GLINK_OWNER_BATTMGR ||
++	    le32_to_cpu(response->hdr.type) != PMIC_GLINK_REQ_RESP ||
++	    le32_to_cpu(response->hdr.opcode) != DODGE_GAUGE_OPCODE)
++		return -EPROTO;
++	bytes = le32_to_cpu(response->data_size);
++	if (bytes < 9 * sizeof(__le32) || bytes > sizeof(response->data) ||
++	    bytes % sizeof(__le32))
++		return -EPROTO;
++	/* Bound values that are converted to signed sysfs integers below. */
++	if (le32_to_cpu(response->data[1]) == 0x80000000 ||
++	    le32_to_cpu(response->data[3]) > 10000 ||
++	    le32_to_cpu(response->data[7]) > S32_MAX ||
++	    le32_to_cpu(response->data[8]) > 100)
++		return -ERANGE;
++	for (i = 0; i < 9; i++)
++		gauge[i] = le32_to_cpu(response->data[i]);
++	return 0;
++}
++
++static int qcom_battmgr_dodge_get_property(struct power_supply *psy,
++					 enum power_supply_property psp,
++					 union power_supply_propval *val)
++{
++	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
++	struct qcom_battmgr_dodge_request request = {
++		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
++		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
++		.hdr.opcode = cpu_to_le32(DODGE_GAUGE_OPCODE),
++		.data_size = cpu_to_le32(DODGE_GAUGE_WORDS * sizeof(__le32)),
++	};
++	u32 generation;
++	int ret = 0;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_STATUS:
++	case POWER_SUPPLY_PROP_HEALTH:
++	case POWER_SUPPLY_PROP_PRESENT:
++	case POWER_SUPPLY_PROP_TECHNOLOGY:
++		return qcom_battmgr_bat_get_property(psy, psp, val);
++	default:
++		break;
++	}
++	if (!battmgr->service_up)
++		return -EAGAIN;
++
++	mutex_lock(&battmgr->lock);
++	generation = READ_ONCE(battmgr->dodge_service_generation);
++	if (!READ_ONCE(battmgr->dodge_gauge_valid) ||
++	    battmgr->dodge_gauge_generation != generation ||
++	    time_after_eq(jiffies, battmgr->dodge_gauge_updated + HZ)) {
++		WRITE_ONCE(battmgr->dodge_gauge_pending, true);
++		ret = qcom_battmgr_request(battmgr, &request, sizeof(request));
++		WRITE_ONCE(battmgr->dodge_gauge_pending, false);
++		if (ret)
++			goto out;
++		if (!battmgr->service_up ||
++		    generation != READ_ONCE(battmgr->dodge_service_generation)) {
++			ret = -ENOTCONN;
++			goto out;
++		}
++		battmgr->dodge_gauge_generation = generation;
++		WRITE_ONCE(battmgr->dodge_gauge_valid, true);
++		battmgr->dodge_gauge_updated = jiffies;
++	}
++
++	/* Units follow the OEM ADSP gauge API, not the generic property table. */
++	switch (psp) {
++	case POWER_SUPPLY_PROP_TEMP:
++		val->intval = (s32)battmgr->dodge_gauge[0];
++		break;
++	case POWER_SUPPLY_PROP_CURRENT_NOW:
++		/* OEM current is positive during discharge. */
++		val->intval = -(s32)battmgr->dodge_gauge[1];
++		break;
++	case POWER_SUPPLY_PROP_CAPACITY:
++		val->intval = DIV_ROUND_CLOSEST(battmgr->dodge_gauge[3], 100);
++		break;
++	case POWER_SUPPLY_PROP_CYCLE_COUNT:
++		val->intval = battmgr->dodge_gauge[7];
++		break;
++	case POWER_SUPPLY_PROP_STATE_OF_HEALTH:
++		val->intval = battmgr->dodge_gauge[8];
++		break;
++	default:
++		ret = -EINVAL;
++		break;
++	}
++out:
++	mutex_unlock(&battmgr->lock);
++	return ret;
++}
++
+ static int qcom_battmgr_set_charge_control(struct qcom_battmgr *battmgr,
+ 					   u32 target_soc, u32 delta_soc)
+ {
+@@ -895,6 +1018,26 @@ static const struct power_supply_desc sm8350_bat_psy_desc = {
+ 	.get_property = qcom_battmgr_bat_get_property,
+ };
+ 
++static const enum power_supply_property dodge_bat_props[] = {
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_HEALTH,
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_TECHNOLOGY,
++	POWER_SUPPLY_PROP_CAPACITY,
++	POWER_SUPPLY_PROP_CURRENT_NOW,
++	POWER_SUPPLY_PROP_TEMP,
++	POWER_SUPPLY_PROP_CYCLE_COUNT,
++	POWER_SUPPLY_PROP_STATE_OF_HEALTH,
++};
++
++static const struct power_supply_desc dodge_bat_psy_desc = {
++	.name = "qcom-battmgr-bat",
++	.type = POWER_SUPPLY_TYPE_BATTERY,
++	.properties = dodge_bat_props,
++	.num_properties = ARRAY_SIZE(dodge_bat_props),
++	.get_property = qcom_battmgr_dodge_get_property,
++};
++
+ static const enum power_supply_property sm8550_bat_props[] = {
+ 	POWER_SUPPLY_PROP_STATUS,
+ 	POWER_SUPPLY_PROP_HEALTH,
+@@ -1218,7 +1361,10 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
+ 		power_supply_changed(battmgr->wls_psy);
+ 		break;
+ 	default:
+-		dev_err(battmgr->dev, "unknown notification: %#x\n", notification);
++		if (battmgr->variant == QCOM_BATTMGR_DODGE)
++			dev_dbg_ratelimited(battmgr->dev, "vendor notification: %#x\n", notification);
++		else
++			dev_err(battmgr->dev, "unknown notification: %#x\n", notification);
+ 		break;
+ 	}
+ }
+@@ -1593,7 +1739,23 @@ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
+ {
+ 	const struct pmic_glink_hdr *hdr = data;
+ 	struct qcom_battmgr *battmgr = priv;
+-	unsigned int opcode = le32_to_cpu(hdr->opcode);
++	unsigned int opcode;
++
++	if (len < sizeof(*hdr))
++		return;
++	opcode = le32_to_cpu(hdr->opcode);
++	if (battmgr->variant == QCOM_BATTMGR_DODGE &&
++	    READ_ONCE(battmgr->dodge_gauge_pending) &&
++	    opcode != DODGE_GAUGE_OPCODE && opcode != BATTMGR_NOTIFICATION)
++		return;
++
++	if (battmgr->variant == QCOM_BATTMGR_DODGE && opcode == DODGE_GAUGE_OPCODE) {
++		if (!xchg(&battmgr->dodge_gauge_pending, false))
++			return;
++		battmgr->error = qcom_battmgr_dodge_decode(data, len, battmgr->dodge_gauge);
++		complete(&battmgr->ack);
++		return;
++	}
+ 
+ 	if (opcode == BATTMGR_NOTIFICATION)
+ 		qcom_battmgr_notification(battmgr, data, len);
+@@ -1630,10 +1792,14 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
+ 		schedule_work(&battmgr->enable_work);
+ 	} else {
+ 		battmgr->service_up = false;
++		WRITE_ONCE(battmgr->dodge_gauge_valid, false);
++		WRITE_ONCE(battmgr->dodge_service_generation,
++			   READ_ONCE(battmgr->dodge_service_generation) + 1);
+ 	}
+ }
+ 
+ static const struct of_device_id qcom_battmgr_of_variants[] = {
++	{ .compatible = "oneplus,dodge-pmic-glink", .data = (void *)QCOM_BATTMGR_DODGE },
+ 	{ .compatible = "qcom,glymur-pmic-glink", .data = (void *)QCOM_BATTMGR_X1E80100 },
+ 	{ .compatible = "qcom,kaanapali-pmic-glink", .data = (void *)QCOM_BATTMGR_SM8550 },
+ 	{ .compatible = "qcom,sc8180x-pmic-glink", .data = (void *)QCOM_BATTMGR_SC8280XP },
+@@ -1715,7 +1881,9 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 			return dev_err_probe(dev, PTR_ERR(battmgr->wls_psy),
+ 					     "failed to register wireless charing power supply\n");
+ 	} else {
+-		if (battmgr->variant == QCOM_BATTMGR_SM8550)
++		if (battmgr->variant == QCOM_BATTMGR_DODGE)
++			psy_desc = &dodge_bat_psy_desc;
++		else if (battmgr->variant == QCOM_BATTMGR_SM8550)
+ 			psy_desc = &sm8550_bat_psy_desc;
+ 		else
+ 			psy_desc = &sm8350_bat_psy_desc;

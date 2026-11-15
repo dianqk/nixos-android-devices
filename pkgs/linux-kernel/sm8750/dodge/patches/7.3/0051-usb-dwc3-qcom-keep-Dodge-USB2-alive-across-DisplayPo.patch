@@ -1,0 +1,262 @@
+From 3543121259a318dfd271128e9ca9c65ccc52e5ae Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 8 Nov 2026 13:59:52 +0800
+Subject: [PATCH 056/144] usb: dwc3: qcom: keep Dodge USB2 alive across
+ DisplayPort role changes
+
+Consolidate DP clock/suspend serialization and the USB2/WCD939x role follow-ups.
+
+Consolidated from local follow-ups:
+  0555ad980c65b0c331d2d4ecd65bdf65880bd8b9 usb: dwc3: qcom: serialize DP clock selection with complete PM transitions
+  5e2914a6f4bbdae00ca7ff36c989e489f7cab37b arm64: dts: qcom: keep Dodge USB2 alive in four-lane DisplayPort mode
+  7a3c649147bbe622a57f3de6a1a30b5b30e99c91 usb: dwc3: qcom: drain runtime PM before locking system transitions
+  59fda6bf1e47f5bc4b18b92ebe46833d6180cfdd usb: typec: mux: wcd939x: keep USB2 switches enabled in DP-only modes
+---
+ .../qcom/sm8750-oneplus-dodge-recovery.dts    |   1 +
+ .../boot/dts/qcom/sm8750-oneplus-dodge.dts    |   1 +
+ drivers/usb/dwc3/dwc3-qcom.c                  | 135 ++++++++++++------
+ drivers/usb/typec/mux/wcd939x-usbss.c         |   3 +-
+ 4 files changed, 94 insertions(+), 46 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge-recovery.dts b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge-recovery.dts
+index e330d8c015..fe6a19274f 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge-recovery.dts
++++ b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge-recovery.dts
+@@ -13,6 +13,7 @@ &remoteproc_adsp {
+ };
+ 
+ &usb {
++	/delete-property/ mode-switch;
+ 	dr_mode = "peripheral";
+ 	maximum-speed = "high-speed";
+ 	phys = <&usb_hsphy>;
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+index 7ab31667c1..72e7b34906 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
++++ b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+@@ -589,6 +589,7 @@ mdp_vsync_suspend: mdp-vsync-suspend-state {
+ };
+ 
+ &usb {
++	mode-switch;
+ 	dr_mode = "otg";
+ 	maximum-speed = "super-speed";
+ 	status = "okay";
+diff --git a/drivers/usb/dwc3/dwc3-qcom.c b/drivers/usb/dwc3/dwc3-qcom.c
+index 71b0402f0a..482ab87fa9 100644
+--- a/drivers/usb/dwc3/dwc3-qcom.c
++++ b/drivers/usb/dwc3/dwc3-qcom.c
+@@ -451,30 +451,53 @@ static void dwc3_qcom_select_utmi_clk(struct dwc3_qcom *qcom, bool utmi)
+ 	qcom->utmi_pipe_clk = utmi;
+ }
+ 
++static void dwc3_qcom_update_pipe_clk(struct dwc3_qcom *qcom)
++{
++	if (!qcom->ignore_pipe_clk && qcom->dp_only != qcom->utmi_pipe_clk)
++		dwc3_qcom_select_utmi_clk(qcom, qcom->dp_only);
++}
++
+ static int dwc3_qcom_mux_set(struct typec_mux_dev *mux,
+ 			     struct typec_mux_state *state)
+ {
+ 	struct dwc3_qcom *qcom = typec_mux_get_drvdata(mux);
++	int ret;
+ 
+-	guard(mutex)(&qcom->pipe_clk_lock);
+-
+-	if (state->alt && state->alt->svid == USB_TYPEC_DP_SID) {
+-		if (!qcom->dp_active)
+-			qcom->dp_only = state->mode == TYPEC_DP_STATE_C ||
+-					state->mode == TYPEC_DP_STATE_E;
+-		qcom->dp_active = true;
+-	} else if (state->mode == TYPEC_STATE_SAFE) {
+-		qcom->dp_active = false;
+-	} else if (!qcom->dp_active) {
+-		qcom->dp_only = false;
++	scoped_guard(mutex, &qcom->pipe_clk_lock) {
++		/* SAFE and USB can carry the departing DisplayPort altmode. */
++		if (state->mode == TYPEC_STATE_SAFE) {
++			qcom->dp_active = false;
++		} else if (state->mode == TYPEC_STATE_USB) {
++			if (!qcom->dp_active)
++				qcom->dp_only = false;
++		} else if (state->alt && state->alt->svid == USB_TYPEC_DP_SID) {
++			/* Enter UTMI before the PHY can withdraw its PIPE clock. */
++			if (state->mode == TYPEC_DP_STATE_C ||
++			    state->mode == TYPEC_DP_STATE_E)
++				qcom->dp_only = true;
++			else if (!qcom->dp_active)
++				qcom->dp_only = false;
++			qcom->dp_active = true;
++		} else if (!qcom->dp_active) {
++			qcom->dp_only = false;
++		}
++
++		if (qcom->ignore_pipe_clk || qcom->pm_suspended ||
++		    qcom->dp_only == qcom->utmi_pipe_clk)
++			return 0;
+ 	}
+ 
+-	if (qcom->ignore_pipe_clk || qcom->pm_suspended ||
+-	    qcom->dp_only == qcom->utmi_pipe_clk ||
+-	    pm_runtime_resume_and_get(qcom->dev))
+-		return 0;
++	/* Runtime resume takes pipe_clk_lock and applies the pending state. */
++	ret = pm_runtime_resume_and_get(qcom->dev);
++	if (ret < 0) {
++		guard(mutex)(&qcom->pipe_clk_lock);
++		return qcom->pm_suspended ? 0 : ret;
++	}
+ 
+-	dwc3_qcom_select_utmi_clk(qcom, qcom->dp_only);
++	scoped_guard(mutex, &qcom->pipe_clk_lock) {
++		if (!qcom->pm_suspended)
++			dwc3_qcom_update_pipe_clk(qcom);
++	}
+ 	pm_runtime_put_autosuspend(qcom->dev);
+ 
+ 	return 0;
+@@ -821,19 +844,23 @@ static int dwc3_qcom_pm_suspend(struct device *dev)
+ 	bool wakeup = device_may_wakeup(dev);
+ 	int ret;
+ 
++	/* Drain runtime callbacks before taking the lock they also acquire. */
++	if (qcom->mux)
++		pm_runtime_disable(dev);
++
++	mutex_lock(&qcom->pipe_clk_lock);
+ 	ret = dwc3_pm_suspend(&qcom->dwc);
+ 	if (ret)
+-		return ret;
+-
+-	guard(mutex)(&qcom->pipe_clk_lock);
++		goto out;
+ 
+ 	ret = dwc3_qcom_suspend(qcom, wakeup);
+-	if (ret)
+-		return ret;
+-
+-	qcom->pm_suspended = true;
+-
+-	return 0;
++	if (!ret)
++		qcom->pm_suspended = true;
++out:
++	mutex_unlock(&qcom->pipe_clk_lock);
++	if (ret && qcom->mux)
++		pm_runtime_enable(dev);
++	return ret;
+ }
+ 
+ static int dwc3_qcom_pm_resume(struct device *dev)
+@@ -843,23 +870,21 @@ static int dwc3_qcom_pm_resume(struct device *dev)
+ 	bool wakeup = device_may_wakeup(dev);
+ 	int ret;
+ 
+-	scoped_guard(mutex, &qcom->pipe_clk_lock) {
+-		ret = dwc3_qcom_resume(qcom, wakeup);
+-		if (ret)
+-			return ret;
+-
+-		if (!qcom->ignore_pipe_clk &&
+-		    qcom->dp_only != qcom->utmi_pipe_clk)
+-			dwc3_qcom_select_utmi_clk(qcom, qcom->dp_only);
+-
+-		qcom->pm_suspended = false;
+-	}
+-
+-	ret = dwc3_pm_resume(&qcom->dwc);
++	/* The extra disable from suspend covers the core's nested RPM barrier. */
++	mutex_lock(&qcom->pipe_clk_lock);
++	ret = dwc3_qcom_resume(qcom, wakeup);
+ 	if (ret)
+-		return ret;
++		goto out;
+ 
+-	return 0;
++	dwc3_qcom_update_pipe_clk(qcom);
++	ret = dwc3_pm_resume(&qcom->dwc);
++	if (!ret)
++		qcom->pm_suspended = false;
++out:
++	mutex_unlock(&qcom->pipe_clk_lock);
++	if (qcom->mux)
++		pm_runtime_enable(dev);
++	return ret;
+ }
+ 
+ static void dwc3_qcom_complete(struct device *dev)
+@@ -872,8 +897,12 @@ static void dwc3_qcom_complete(struct device *dev)
+ static int dwc3_qcom_prepare(struct device *dev)
+ {
+ 	struct dwc3 *dwc = dev_get_drvdata(dev);
++	struct dwc3_qcom *qcom = to_dwc3_qcom(dwc);
++	int ret;
+ 
+-	return dwc3_pm_prepare(dwc);
++	ret = dwc3_pm_prepare(dwc);
++	/* A mux update during sleep needs the serialized resume callback. */
++	return ret > 0 && qcom->mux ? 0 : ret;
+ }
+ 
+ static int dwc3_qcom_runtime_suspend(struct device *dev)
+@@ -882,11 +911,18 @@ static int dwc3_qcom_runtime_suspend(struct device *dev)
+ 	struct dwc3_qcom *qcom = to_dwc3_qcom(dwc);
+ 	int ret;
+ 
++	if (qcom->mux)
++		mutex_lock(&qcom->pipe_clk_lock);
++
+ 	ret = dwc3_runtime_suspend(&qcom->dwc);
+ 	if (ret)
+-		return ret;
++		goto out;
+ 
+-	return dwc3_qcom_suspend(qcom, true);
++	ret = dwc3_qcom_suspend(qcom, true);
++out:
++	if (qcom->mux)
++		mutex_unlock(&qcom->pipe_clk_lock);
++	return ret;
+ }
+ 
+ static int dwc3_qcom_runtime_resume(struct device *dev)
+@@ -895,11 +931,20 @@ static int dwc3_qcom_runtime_resume(struct device *dev)
+ 	struct dwc3_qcom *qcom = to_dwc3_qcom(dwc);
+ 	int ret;
+ 
++	if (qcom->mux)
++		mutex_lock(&qcom->pipe_clk_lock);
++
+ 	ret = dwc3_qcom_resume(qcom, true);
+ 	if (ret)
+-		return ret;
++		goto out;
++
++	dwc3_qcom_update_pipe_clk(qcom);
+ 
+-	return dwc3_runtime_resume(&qcom->dwc);
++	ret = dwc3_runtime_resume(&qcom->dwc);
++out:
++	if (qcom->mux)
++		mutex_unlock(&qcom->pipe_clk_lock);
++	return ret;
+ }
+ 
+ static int dwc3_qcom_runtime_idle(struct device *dev)
+diff --git a/drivers/usb/typec/mux/wcd939x-usbss.c b/drivers/usb/typec/mux/wcd939x-usbss.c
+index 73db3aa3ce..14317f3c0d 100644
+--- a/drivers/usb/typec/mux/wcd939x-usbss.c
++++ b/drivers/usb/typec/mux/wcd939x-usbss.c
+@@ -252,9 +252,10 @@ static int wcd939x_usbss_set(struct wcd939x_usbss *usbss)
+ 		enable_usb = true;
+ 	} else if (usbss->svid) {
+ 		switch (usbss->mode) {
+-		/* DP Only */
++		/* Four DP lanes still leave the separate USB2 pair available. */
+ 		case TYPEC_DP_STATE_C:
+ 		case TYPEC_DP_STATE_E:
++			enable_usb = true;
+ 			enable_dp = true;
+ 			break;
+ 

@@ -1,0 +1,981 @@
+From 04d3bf84b5d0402631c3ae9d9bce6f71b89d6a9c Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 13 Nov 2026 05:51:14 +0800
+Subject: [PATCH 142/144] power: supply: qcom_battmgr: add automatic normal BPP
+ charging and hard guards
+
+Keep BPP preparation, automatic charging, board enablement, helper ordering, calibration guards and care-hold fencing together.
+
+Consolidated from local follow-ups:
+  b9974f763ac95f000060c5d1201add02fe251b60 power: supply: nu1669: add board-qualified normal BPP preparation
+  120110c938c4eeaa8dfcdfc98409caccba0c101c power: supply: qcom_battmgr: manage constrained automatic BPP charging
+  fd195a8e81188802065d381b67b1aa00ad5a204f arm64: dts: qcom: dodge: enable calibrated automatic normal BPP charging
+  e324775d2c2616ae111e8b25d948129f89b05e83 power: supply: qcom_battmgr: order automatic helpers after request primitives
+  b751084a2d2deaaa212a385c0160830d668a8994 power: supply: guard automatic BPP calibration and battery hold transitions
+  788cc6aba3302ab57d2bf22cde352b0526a79422 power: supply: qcom_battmgr: validate exact care hold writes
+  725208c1522d8f39e6b2d70a8a083a667639f05e power: supply: qcom_battmgr: fence battery changes with automatic hard guards
+---
+ .../sysfs-class-power-qcom-battmgr-bpp        |  31 ++
+ .../bindings/power/supply/nuvolta,nu1669.yaml |   9 +
+ .../bindings/soc/qcom/qcom,pmic-glink.yaml    |  19 +
+ .../boot/dts/qcom/sm8750-oneplus-dodge.dts    |   6 +
+ drivers/power/supply/nu1669.c                 | 212 ++++++++++-
+ drivers/power/supply/qcom_battmgr.c           | 360 +++++++++++++++++-
+ include/linux/power/nu1669.h                  |  12 +
+ 7 files changed, 641 insertions(+), 8 deletions(-)
+ create mode 100644 Documentation/ABI/testing/sysfs-class-power-qcom-battmgr-bpp
+
+diff --git a/Documentation/ABI/testing/sysfs-class-power-qcom-battmgr-bpp b/Documentation/ABI/testing/sysfs-class-power-qcom-battmgr-bpp
+new file mode 100644
+index 0000000000..604dd8305f
+--- /dev/null
++++ b/Documentation/ABI/testing/sysfs-class-power-qcom-battmgr-bpp
+@@ -0,0 +1,31 @@
++What:           /sys/class/power_supply/qcom-battmgr-bat/wireless_care_hold
++Date:           November 2026
++Contact:        dianqk <dianqk@dianqk.net>
++Description:
++                Root-only read/write boolean, exactly 0 or 1, optionally newline.
++                Available with qcom,automatic-bpp-charging. Requests an independent
++                battery hold while retaining normal wireless input. Does not clear
++                the manual charge_behaviour or kernel safety hold. Remains asserted
++                if userspace exits. A successful write records requested policy;
++                inspect wireless_charge_state and measured battery current for
++                physical confirmation. No foreign disabled permission is enabled.
++
++What:           /sys/class/power_supply/qcom-battmgr-bat/wireless_charge_state
++Date:           November 2026
++Contact:        dianqk <dianqk@dianqk.net>
++Description:
++                Read-only key=value diagnostic of automatic input phase, ownership,
++                requested manual/care/safety holds, pending/frozen battery ownership,
++                error stage and service/receiver generations. UNKNOWN or frozen
++                ownership is not a verified off state. Firmware ACKs describe
++                requests, not an applied current limit or measured charging.
++
++What:           /sys/class/power_supply/qcom-battmgr-bat/wireless_voltage_max
++Date:           November 2026
++Contact:        dianqk <dianqk@dianqk.net>
++Description:
++                Read-only qualified normal ADSP maximum voltage sample in microvolts
++                for conservative care policy. Uses a fresh same-response maximum/
++                minimum pair with source, health, temperature and generation guards.
++                Returns an error instead of stale data on unavailable/unsafe input.
++                Does not change battery votes. Not a pack-voltage or Full indicator.
+diff --git a/Documentation/devicetree/bindings/power/supply/nuvolta,nu1669.yaml b/Documentation/devicetree/bindings/power/supply/nuvolta,nu1669.yaml
+index d661bfacb7..52bab1aa89 100644
+--- a/Documentation/devicetree/bindings/power/supply/nuvolta,nu1669.yaml
++++ b/Documentation/devicetree/bindings/power/supply/nuvolta,nu1669.yaml
+@@ -21,6 +21,15 @@ properties:
+   reg:
+     maxItems: 1
+ 
++  nuvolta,bpp-fod-parameters:
++    $ref: /schemas/types.yaml#/definitions/uint8-array
++    minItems: 40
++    maxItems: 40
++    description: |
++      Board-calibrated nonmagnetic BPP FOD parameters. Enables only the typed
++      normal BPP setup on chip 1669, hardware 0, customer 4, firmware 0x6b.
++      No automatic queries, authentication or high-voltage modes are enabled.
++
+   connected-gpios:
+     maxItems: 1
+     description: Receiver connection indication, asserted while attached.
+diff --git a/Documentation/devicetree/bindings/soc/qcom/qcom,pmic-glink.yaml b/Documentation/devicetree/bindings/soc/qcom/qcom,pmic-glink.yaml
+index 1c4c5fadd9..0d7df42a10 100644
+--- a/Documentation/devicetree/bindings/soc/qcom/qcom,pmic-glink.yaml
++++ b/Documentation/devicetree/bindings/soc/qcom/qcom,pmic-glink.yaml
+@@ -57,6 +57,13 @@ properties:
+           - const: qcom,sm8550-pmic-glink
+           - const: qcom,pmic-glink
+ 
++  qcom,automatic-bpp-charging:
++    type: boolean
++    description: |
++      Enable constrained normal BPP charging on Dodge with a calibrated NU1669
++      receiver. Uses fixed 750mA AP input requests and independent battery holds.
++      This requires the receiver's board FOD parameters and built-in drivers.
++
+   qcom,wireless-receiver:
+     $ref: /schemas/types.yaml#/definitions/phandle
+     description:
+@@ -89,6 +96,18 @@ properties:
+       - const: charge_limit_end
+       - const: charge_limit_delta
+ 
++allOf:
++  - if:
++      required:
++        - qcom,automatic-bpp-charging
++    then:
++      properties:
++        compatible:
++          contains:
++            const: oneplus,dodge-pmic-glink
++      required:
++        - qcom,wireless-receiver
++
+ patternProperties:
+   '^connector@\d$':
+     $ref: /schemas/connector/usb-connector.yaml#
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+index 680934dde3..ee5a5680c8 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
++++ b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+@@ -133,6 +133,7 @@ pmic-glink {
+ 		#size-cells = <0>;
+ 		orientation-gpios = <&tlmm 61 GPIO_ACTIVE_HIGH>;
+ 		qcom,wireless-receiver = <&wireless_receiver>;
++		qcom,automatic-bpp-charging;
+ 
+ 		connector@0 {
+ 			compatible = "usb-c-connector";
+@@ -1199,6 +1200,11 @@ &i2c_hub_3 {
+ 	wireless_receiver: wireless-charger@36 {
+ 		compatible = "nuvolta,nu1669";
+ 		reg = <0x36>;
++		nuvolta,bpp-fod-parameters = /bits/ 8 <
++			0x48 0x32 0x48 0x2d 0x48 0x32 0x48 0x30 0x48 0x37
++			0x48 0x53 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff
++			0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff
++			0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff>;
+ 		connected-gpios = <&tlmm 172 GPIO_ACTIVE_HIGH>;
+ 		event-gpios = <&tlmm 108 GPIO_ACTIVE_LOW>;
+ 		pinctrl-names = "default";
+diff --git a/drivers/power/supply/nu1669.c b/drivers/power/supply/nu1669.c
+index e83d8b7c9f..1b6ee016d7 100644
+--- a/drivers/power/supply/nu1669.c
++++ b/drivers/power/supply/nu1669.c
+@@ -5,7 +5,7 @@
+  *
+  * NU1669 firmware shadow layout derived from the Oplus NU1669 driver.
+  * Passive telemetry plus an explicit root-only GET_TX_ID diagnostic.
+- * No power, mode, protection, authentication or voltage commands are provided.
++ * Optional board-qualified BPP FOD setup; no authentication or voltage commands.
+  */
+ 
+ #include <linux/atomic.h>
+@@ -20,6 +20,7 @@
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/power_supply.h>
++#include <linux/property.h>
+ #include <linux/power/nu1669.h>
+ #include <linux/regmap.h>
+ #include <linux/seq_file.h>
+@@ -39,6 +40,9 @@
+ #define NU1669_QUERY_FAULTS	(GENMASK(6, 0) | BIT(11) | GENMASK(18, 14) | \
+ 				 BIT(20) | GENMASK(31, 24))
+ 
++/* Retain uncertain calibration across driver reprobe; a reboot requires fresh review. */
++static atomic_t nu1669_bpp_uncertain = ATOMIC_INIT(0);
++
+ struct nu1669 {
+ 	struct regmap *regmap;
+ 	struct gpio_desc *connected;
+@@ -48,6 +52,10 @@ struct nu1669 {
+ 	/* Serializes complete diagnostic transactions and every shadow/mailbox I/O. */
+ 	struct mutex lock;
+ 	struct dentry *debugfs;
++	bool bpp_profile;
++	bool bpp_prepared;
++	bool bpp_quarantined;
++	u8 bpp_parameters[40];
+ 	bool physical_absent;
+ 	bool physical_verified;
+ 	bool query_rearm;
+@@ -87,7 +95,7 @@ static const struct regmap_access_table nu1669_read_table = {
+ static bool nu1669_writeable_reg(struct device *dev, unsigned int reg)
+ {
+ 	/* No public register API: fixed typed helpers alone can reach these addresses. */
+-	return reg <= 5 || reg == 0x0060 || reg == NU1669_BUSY;
++	return reg <= 10 || reg == 0x0060 || reg == NU1669_BUSY;
+ }
+ 
+ static const struct regmap_config nu1669_regmap_config = {
+@@ -177,8 +185,10 @@ static void nu1669_observe_presence(struct nu1669 *rx, int present)
+ {
+ 	if (present <= 0)
+ 		rx->result_valid = false;
+-	if (!present)
++	if (!present) {
+ 		rx->physical_absent = true;
++		rx->bpp_prepared = false;
++	}
+ 	else if (present > 0 && rx->physical_absent) {
+ 		rx->physical_absent = false;
+ 		rx->physical_verified = true;
+@@ -213,6 +223,33 @@ static int nu1669_read_info(struct nu1669 *rx, u32 generation, u8 *info)
+ 	return ret ?: nu1669_live(rx, generation);
+ }
+ 
++/* Fresh post-setup evidence; a reset without a GPIO edge must stop the consumer. */
++static int nu1669_bpp_verify(struct nu1669 *rx, u32 generation, u8 *before)
++{
++	u8 first[NU1669_FOD_SHADOW_SIZE], second[NU1669_FOD_SHADOW_SIZE];
++	u8 after[NU1669_INFO_SIZE];
++	int ret;
++
++	ret = regmap_bulk_read(rx->regmap, NU1669_FOD_SHADOW, first, sizeof(first));
++	if (!ret)
++		ret = nu1669_live(rx, generation);
++	if (!ret)
++		ret = regmap_bulk_read(rx->regmap, NU1669_FOD_SHADOW, second, sizeof(second));
++	if (!ret)
++		ret = nu1669_read_info(rx, generation, after);
++	if (!ret && (memcmp(first, second, sizeof(first)) || memcmp(before, after, 5) ||
++		     before[0x18] || after[0x18] || second[0] != 1 || second[1] != 12 ||
++		     memcmp(second + 3, rx->bpp_parameters, 40)))
++		ret = -EUCLEAN;
++	if (ret == -EUCLEAN) {
++		rx->bpp_quarantined = true;
++		atomic_set(&nu1669_bpp_uncertain, 1);
++	}
++	if (!ret)
++		memcpy(before, after, sizeof(after));
++	return ret;
++}
++
+ int nu1669_get_snapshot(struct power_supply *psy, struct nu1669_snapshot *snapshot)
+ {
+ 	struct nu1669 *rx;
+@@ -228,8 +265,13 @@ int nu1669_get_snapshot(struct power_supply *psy, struct nu1669_snapshot *snapsh
+ 	ret = nu1669_read_info(rx, generation, info);
+ 	if (ret == -ECANCELED)
+ 		ret = READ_ONCE(rx->suspended) || READ_ONCE(rx->stopped) ? -EBUSY : -EAGAIN;
++	if (!ret && rx->bpp_prepared)
++		ret = nu1669_bpp_verify(rx, generation, info);
+ 	if (!ret) {
+ 		*snapshot = (struct nu1669_snapshot) {
++			.bpp_valid = rx->bpp_prepared && !rx->bpp_quarantined,
++			.flags = get_unaligned_le32(info + 0x20),
++			.iout_ma = get_unaligned_le16(info + 0x36),
+ 			.generation = generation,
+ 			.chip_id = get_unaligned_le16(info),
+ 			.vout_mv = get_unaligned_le16(info + 0x34),
+@@ -246,6 +288,143 @@ int nu1669_get_snapshot(struct power_supply *psy, struct nu1669_snapshot *snapsh
+ }
+ EXPORT_SYMBOL_GPL(nu1669_get_snapshot);
+ 
++/* Caller holds lock. A partial setup stays quarantined for this driver lifetime. */
++static int nu1669_bpp_context(struct nu1669 *rx, u32 generation)
++{
++	u8 info[NU1669_INFO_SIZE];
++	u32 flags;
++	u16 mv;
++	int ret;
++
++	ret = nu1669_read_info(rx, generation, info);
++	if (ret)
++		return ret;
++	flags = get_unaligned_le32(info + 0x20);
++	mv = get_unaligned_le16(info + 0x34);
++	if (get_unaligned_le16(info) != 0x1669 || info[2] || info[3] != 4 ||
++	    info[4] != 0x6b || info[0x11] != 4 || info[0x44] ||
++	    (info[0x46] & BIT(0)) || mv < 4500 || mv > 6000)
++		return -EOPNOTSUPP;
++	return flags & NU1669_BPP_POWER_FAULTS ? -EIO : 0;
++}
++
++static int nu1669_bpp_idle(struct nu1669 *rx, u32 generation)
++{
++	unsigned int busy;
++	int i, ret;
++
++	for (i = 0; i < 30; i++) {
++		ret = nu1669_live(rx, generation);
++		if (ret)
++			return ret;
++		ret = regmap_read(rx->regmap, NU1669_BUSY, &busy);
++		if (ret)
++			return ret;
++		ret = nu1669_live(rx, generation);
++		if (ret || !busy)
++			return ret;
++		usleep_range(1000, 2000);
++	}
++	return -EBUSY;
++}
++
++/* Private whitelist: mag=0, length=40, four board-owned chunks, mode=1. */
++static int nu1669_bpp_write(struct nu1669 *rx, u32 generation, unsigned int step)
++{
++	static const u8 objects[] = { 0x18, 0xa1, 0xa3, 0xad, 0xb7, 0xc1, 0xa0 };
++	u8 value = step == 0 ? 0 : step == 1 ? 40 : 1;
++	const u8 *data;
++	size_t length;
++	int ret;
++
++	if (step >= ARRAY_SIZE(objects))
++		return -EINVAL;
++	data = step >= 2 && step <= 5 ? rx->bpp_parameters + (step - 2) * 10 : &value;
++	length = step >= 2 && step <= 5 ? 10 : 1;
++	ret = nu1669_bpp_context(rx, generation);
++	if (ret)
++		return ret;
++	ret = nu1669_bpp_idle(rx, generation);
++	if (ret)
++		return ret;
++	/* Even a failed reservation may have reached firmware. Never force-release. */
++	rx->bpp_quarantined = true;
++	atomic_set(&nu1669_bpp_uncertain, 1);
++	ret = regmap_write(rx->regmap, NU1669_BUSY, 1);
++	if (ret)
++		return ret;
++	ret = nu1669_live(rx, generation);
++	if (ret)
++		return ret;
++	ret = regmap_write(rx->regmap, 0, length);
++	if (ret)
++		return ret;
++	ret = nu1669_live(rx, generation);
++	if (ret)
++		return ret;
++	ret = regmap_bulk_write(rx->regmap, 1, data, length);
++	if (ret)
++		return ret;
++	ret = nu1669_bpp_context(rx, generation);
++	if (ret)
++		return ret;
++	ret = regmap_write(rx->regmap, 0x60, objects[step]);
++	return ret ?: nu1669_bpp_idle(rx, generation);
++}
++
++int nu1669_prepare_bpp(struct power_supply *psy, u32 generation)
++{
++	struct nu1669 *rx;
++	u8 first[NU1669_FOD_SHADOW_SIZE], second[NU1669_FOD_SHADOW_SIZE];
++	u8 info[NU1669_INFO_SIZE];
++	int ret, i;
++
++	if (!psy || psy->desc != &nu1669_psy_desc)
++		return -EOPNOTSUPP;
++	rx = power_supply_get_drvdata(psy);
++	mutex_lock(&rx->lock);
++	if (!rx->bpp_profile || rx->bpp_quarantined || atomic_read(&nu1669_bpp_uncertain)) {
++		ret = rx->bpp_profile ? -EUCLEAN : -EOPNOTSUPP;
++		goto out;
++	}
++	ret = nu1669_bpp_context(rx, generation);
++	if (ret)
++		goto out;
++	for (i = 0; i < 7; i++) {
++		ret = nu1669_bpp_write(rx, generation, i);
++		if (ret)
++			goto out;
++	}
++	ret = regmap_bulk_read(rx->regmap, NU1669_FOD_SHADOW, first, sizeof(first));
++	if (ret)
++		goto out;
++	ret = nu1669_bpp_context(rx, generation);
++	if (ret)
++		goto out;
++	ret = regmap_bulk_read(rx->regmap, NU1669_FOD_SHADOW, second, sizeof(second));
++	if (ret)
++		goto out;
++	ret = nu1669_read_info(rx, generation, info);
++	if (ret)
++		goto out;
++	/* Known firmware normalizes length 40 to shadow 12. These are shadows. */
++	if (memcmp(first, second, sizeof(first)) || second[0] != 1 || second[1] != 12 ||
++	    info[0x18] || memcmp(second + 3, rx->bpp_parameters, 40)) {
++		ret = -EPROTO;
++		goto out;
++	}
++	ret = nu1669_bpp_context(rx, generation);
++	if (!ret) {
++		rx->bpp_quarantined = false;
++		rx->bpp_prepared = true;
++		atomic_set(&nu1669_bpp_uncertain, 0);
++	}
++out:
++	mutex_unlock(&rx->lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(nu1669_prepare_bpp);
++
+ /* Read-only diagnostics: raw firmware values, not charging-state claims. */
+ static ssize_t firmware_state_show(struct device *dev,
+ 				   struct device_attribute *attr, char *buf)
+@@ -395,6 +574,8 @@ static int nu1669_query_context(struct nu1669 *rx, bool initial)
+ 	u16 mv;
+ 	int ret;
+ 
++	if (rx->bpp_profile)
++		return -EOPNOTSUPP;
+ 	ret = nu1669_query_live(rx);
+ 	if (ret)
+ 		return ret;
+@@ -787,8 +968,21 @@ static int nu1669_debugfs_init(struct nu1669 *rx, struct device *dev)
+ 	return devm_add_action_or_reset(dev, nu1669_debugfs_remove, rx);
+ }
+ 
++static bool nu1669_bpp_profile_valid(const u8 *parameters)
++{
++	static const u8 dodge_bpp[] = {
++		0x48, 0x32, 0x48, 0x2d, 0x48, 0x32, 0x48, 0x30, 0x48, 0x37,
++		0x48, 0x53, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++	};
++
++	return !memcmp(parameters, dodge_bpp, sizeof(dodge_bpp));
++}
++
+ static int nu1669_probe(struct i2c_client *client)
+ {
++
+ 	struct power_supply_config psy_cfg = {};
+ 	struct device *dev = &client->dev;
+ 	struct nu1669 *rx;
+@@ -798,6 +992,18 @@ static int nu1669_probe(struct i2c_client *client)
+ 	if (!rx)
+ 		return -ENOMEM;
+ 
++	if (device_property_present(dev, "nuvolta,bpp-fod-parameters")) {
++		ret = device_property_count_u8(dev, "nuvolta,bpp-fod-parameters");
++		if (ret != sizeof(rx->bpp_parameters))
++			return -EINVAL;
++		ret = device_property_read_u8_array(dev, "nuvolta,bpp-fod-parameters",
++						 rx->bpp_parameters, sizeof(rx->bpp_parameters));
++		if (ret)
++			return ret;
++		if (!nu1669_bpp_profile_valid(rx->bpp_parameters))
++			return dev_err_probe(dev, -EINVAL, "unsupported board BPP calibration\n");
++		rx->bpp_profile = true;
++	}
+ 	mutex_init(&rx->lock);
+ 	INIT_DELAYED_WORK(&rx->poll, nu1669_poll);
+ 	i2c_set_clientdata(client, rx);
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 265ccf068d..2eda3ccede 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -405,6 +405,17 @@ struct qcom_battmgr {
+ 	struct nu1669_snapshot charge_receiver;
+ 	u32 charge_generation;
+ 	u32 charge_session_epoch;
++	bool automatic_bpp;
++	bool manual_hold;
++	bool care_hold;
++	bool safety_hold;
++	bool automatic_veto;
++	bool automatic_qualified;
++	bool automatic_prepared;
++	unsigned long safety_hold_since;
++	unsigned long automatic_good_at;
++	unsigned int automatic_good;
++	unsigned long charge_hold_since;
+ 	bool charge_owned;
+ 	bool charge_pending;
+ 	bool charge_frozen;
+@@ -592,7 +603,8 @@ static int qcom_battmgr_dodge_pd_decode(const void *data, size_t len,
+ /* Notification side only queues validation; generic WLS data is not a detach. */
+ static void qcom_battmgr_input_probe_event(struct qcom_battmgr *battmgr)
+ {
+-	if (READ_ONCE(battmgr->input_owned) && !READ_ONCE(battmgr->input_frozen) &&
++	if ((READ_ONCE(battmgr->input_owned) || READ_ONCE(battmgr->automatic_bpp)) &&
++	    !READ_ONCE(battmgr->input_frozen) &&
+ 	    !battmgr->charge_closing && !battmgr->charge_suspending &&
+ 	    !battmgr->dodge_otg_stopping)
+ 		mod_delayed_work(system_percpu_wq, &battmgr->input_work, 0);
+@@ -1111,7 +1123,9 @@ static int qcom_battmgr_charge_get_behaviour(struct qcom_battmgr *battmgr,
+ 	if (battmgr->charge_owned && (battmgr->charge_pending || battmgr->charge_frozen))
+ 		ret = -EIO;
+ 	else
+-		val->intval = battmgr->charge_owned ? POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE :
++		val->intval = (battmgr->automatic_bpp ? battmgr->manual_hold :
++			       battmgr->charge_owned) ?
++			POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE :
+ 			POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
+ 	mutex_unlock(&battmgr->lock);
+ 	return ret;
+@@ -2503,6 +2517,10 @@ static bool qcom_battmgr_charge_same_receiver(const struct nu1669_snapshot *a,
+ 		a->fw_version == b->fw_version;
+ }
+ 
++static int qcom_battmgr_bpp_samples(struct qcom_battmgr *battmgr, bool restart);
++static void qcom_battmgr_bpp_voltage_vote(struct qcom_battmgr *battmgr);
++static bool qcom_battmgr_bpp_hold(struct qcom_battmgr *battmgr);
++
+ static int qcom_battmgr_charge_source(struct qcom_battmgr *battmgr, u32 generation,
+ 				    u32 epoch, struct nu1669_snapshot *snapshot)
+ {
+@@ -2526,6 +2544,12 @@ static int qcom_battmgr_charge_source(struct qcom_battmgr *battmgr, u32 generati
+ 	ret = qcom_battmgr_charge_healthy(battmgr, generation);
+ 	if (ret)
+ 		return ret;
++	if (battmgr->automatic_bpp) {
++		ret = qcom_battmgr_bpp_samples(battmgr, false);
++		if (ret)
++			return ret;
++		qcom_battmgr_bpp_voltage_vote(battmgr);
++	}
+ 	/* Finish with a fresh receiver read after all potentially blocking GLINK queries. */
+ 	ret = nu1669_get_snapshot(battmgr->wireless_receiver, snapshot);
+ 	if (ret)
+@@ -2619,7 +2643,8 @@ static int qcom_battmgr_input_probe_current(struct qcom_battmgr *battmgr)
+ 			"usb-state-event" : "service-lifecycle-or-otg";
+ 		return -EAGAIN;
+ 	}
+-	if (battmgr->input_owned && time_after_eq(jiffies, battmgr->input_deadline)) {
++	if (!battmgr->automatic_bpp && battmgr->input_owned &&
++	    time_after_eq(jiffies, battmgr->input_deadline)) {
+ 		battmgr->input_stage = "deadline";
+ 		return -ETIME;
+ 	}
+@@ -2701,6 +2726,8 @@ static void qcom_battmgr_input_probe_schedule(struct qcom_battmgr *battmgr)
+ 	mod_delayed_work(system_percpu_wq, &battmgr->input_work, delay);
+ }
+ 
++static void qcom_battmgr_automatic_step(struct qcom_battmgr *battmgr);
++
+ static void qcom_battmgr_input_probe_worker(struct work_struct *work)
+ {
+ 	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
+@@ -2708,6 +2735,10 @@ static void qcom_battmgr_input_probe_worker(struct work_struct *work)
+ 	int ret;
+ 
+ 	mutex_lock(&battmgr->lock);
++	if (battmgr->automatic_bpp) {
++		qcom_battmgr_automatic_step(battmgr);
++		goto out;
++	}
+ 	if (!battmgr->input_owned || battmgr->input_frozen ||
+ 	    READ_ONCE(battmgr->charge_closing) || READ_ONCE(battmgr->charge_suspending))
+ 		goto out;
+@@ -2733,6 +2764,8 @@ static int qcom_battmgr_input_probe_control(struct qcom_battmgr *battmgr, bool s
+ 	unsigned long flags;
+ 	int ret;
+ 
++	if (battmgr->automatic_bpp)
++		return -EOPNOTSUPP;
+ 	if (start) {
+ 		if (!mutex_trylock(&battmgr->lock))
+ 			return -EBUSY;
+@@ -2895,6 +2928,16 @@ static int qcom_battmgr_charge_restore(struct qcom_battmgr *battmgr)
+ 		ret = qcom_battmgr_charge_healthy(battmgr, generation);
+ 		if (ret)
+ 			return ret;
++		if (battmgr->automatic_bpp && battmgr->input_owned) {
++			ret = qcom_battmgr_bpp_samples(battmgr, false);
++			if (ret)
++				return ret;
++			qcom_battmgr_bpp_voltage_vote(battmgr);
++			if (qcom_battmgr_bpp_hold(battmgr)) {
++				battmgr->charge_pending = false;
++				return 0;
++			}
++		}
+ 		/* Only a session acquired from a confirmed 1 can reach this SET1. */
+ 		ret = qcom_battmgr_charge_request(battmgr, BATTMGR_BAT_PROPERTY_SET,
+ 						BATT_CHG_CTRL_EN, 1, generation);
+@@ -2944,7 +2987,8 @@ static int qcom_battmgr_charge_inhibit(struct qcom_battmgr *battmgr)
+ 		goto cleanup;
+ 	}
+ 	if (atomic_read(&dodge_input_boot_state) == INPUT_BOOT_MAYBE_OWNED) {
+-		if (!battmgr->input_owned || battmgr->input_frozen || battmgr->input_start_ack) {
++		if (!battmgr->input_owned || battmgr->input_frozen ||
++		    (battmgr->input_start_ack && !battmgr->automatic_qualified)) {
+ 			ret = -EBUSY;
+ 			goto cleanup;
+ 		}
+@@ -2982,6 +3026,7 @@ static int qcom_battmgr_charge_inhibit(struct qcom_battmgr *battmgr)
+ 	battmgr->charge_receiver = after;
+ 	/* Record possible ownership before firmware can apply an unacknowledged SET0. */
+ 	battmgr->charge_owned = true;
++	battmgr->charge_hold_since = jiffies;
+ 	battmgr->charge_pending = true;
+ 	ret = qcom_battmgr_charge_request(battmgr, BATTMGR_BAT_PROPERTY_SET,
+ 					BATT_CHG_CTRL_EN, 0, generation);
+@@ -3009,6 +3054,9 @@ static int qcom_battmgr_charge_inhibit(struct qcom_battmgr *battmgr)
+ 	qcom_battmgr_charge_schedule(battmgr);
+ 	return 0;
+ cleanup:
++	/* Automatic actor must remove input before resolving a failed battery session. */
++	if (battmgr->automatic_bpp)
++		return ret;
+ 	if (battmgr->charge_owned) {
+ 		int restore_ret = qcom_battmgr_charge_restore(battmgr);
+ 
+@@ -3020,6 +3068,285 @@ static int qcom_battmgr_charge_inhibit(struct qcom_battmgr *battmgr)
+ 	return ret;
+ }
+ 
++/* Automatic input is persistent; only unresolved ownership consumes the boot. */
++static bool qcom_battmgr_bpp_hold(struct qcom_battmgr *battmgr)
++{
++	return battmgr->manual_hold || battmgr->care_hold || battmgr->safety_hold;
++}
++
++/* One fresh OEM response supplies temperature, signed current and both voltages. */
++static int qcom_battmgr_bpp_samples(struct qcom_battmgr *battmgr, bool restart)
++{
++	u64 low;
++	u32 high;
++	s32 temp, battery_ua;
++	int ret;
++
++	ret = qcom_battmgr_charge_healthy(battmgr, battmgr->input_generation);
++	if (ret)
++		return ret;
++	if (battmgr->dodge_voltage_error)
++		return battmgr->dodge_voltage_error;
++	high = battmgr->dodge_voltage_word2;
++	low = (u64)battmgr->dodge_voltage_word13 * 1000;
++	temp = (s32)battmgr->dodge_gauge[0];
++	battery_ua = -(s32)battmgr->dodge_gauge[1];
++	/* Board policy, not a claim that the OEM 50mV resampling rule is a cutoff. */
++	if (high < 3000000 || high >= 4400000 || low < 3000000 || low >= 4400000 ||
++	    low > high + 1000ULL || high > low + 50000 || battery_ua > 1200000 ||
++	    battery_ua < -5000000 || temp < (restart ? 170 : 160) ||
++	    temp > (restart ? 330 : 350))
++		return -ERANGE;
++	if (battmgr->charge_owned && !battmgr->charge_pending &&
++	    time_after_eq(jiffies, battmgr->charge_hold_since + 5 * HZ) && battery_ua > 50000)
++		return -EOVERFLOW;
++
++	return 0;
++}
++
++static void qcom_battmgr_bpp_voltage_vote(struct qcom_battmgr *battmgr)
++{
++	u32 high = battmgr->dodge_voltage_word2;
++	u64 low = (u64)battmgr->dodge_voltage_word13 * 1000;
++
++	if (high >= 4350000 || low >= 4350000) {
++		if (!battmgr->safety_hold)
++			battmgr->safety_hold_since = jiffies;
++		battmgr->safety_hold = true;
++		battmgr->automatic_good = 0;
++	} else if (battmgr->safety_hold) {
++		if (high <= 4300000 && low <= 4300000 &&
++		    time_after_eq(jiffies, battmgr->safety_hold_since + 30 * HZ)) {
++			if (!battmgr->automatic_good ||
++			    time_after_eq(jiffies, battmgr->automatic_good_at + HZ)) {
++				battmgr->automatic_good++;
++				battmgr->automatic_good_at = jiffies;
++			}
++			if (battmgr->automatic_good >= 3) {
++				battmgr->safety_hold = false;
++				battmgr->automatic_good = 0;
++			}
++		} else {
++			battmgr->automatic_good = 0;
++		}
++	}
++}
++
++static int qcom_battmgr_bpp_source(struct qcom_battmgr *battmgr, bool initial)
++{
++	struct nu1669_snapshot snapshot;
++	int ret;
++
++	ret = qcom_battmgr_input_probe_source(battmgr, initial);
++	if (ret)
++		return ret;
++	ret = qcom_battmgr_bpp_samples(battmgr, battmgr->automatic_veto);
++	if (ret)
++		return ret;
++	/* Finish after gauge/USB traffic with a fresh identity, fault and current read. */
++	ret = nu1669_get_snapshot(battmgr->wireless_receiver, &snapshot);
++	if (ret)
++		return ret;
++	if (battmgr->automatic_prepared && !snapshot.bpp_valid)
++		return -EUCLEAN;
++	if (!qcom_battmgr_charge_same_receiver(&snapshot, &battmgr->input_receiver))
++		return -ESTALE;
++	if (snapshot.hw_version || snapshot.customer_id != 4 || snapshot.fw_version != 0x6b ||
++	    snapshot.protocol != 4 || snapshot.b2b_on || (snapshot.b2b_state & BIT(0)) ||
++	    snapshot.vout_mv < 4500 || snapshot.vout_mv > 6000 || snapshot.iout_ma > 900 ||
++	    (snapshot.flags & NU1669_BPP_POWER_FAULTS))
++		return -EOPNOTSUPP;
++	return qcom_battmgr_input_probe_current(battmgr);
++}
++
++static int qcom_battmgr_bpp_votes(struct qcom_battmgr *battmgr)
++{
++	if (qcom_battmgr_bpp_hold(battmgr))
++		return qcom_battmgr_charge_inhibit(battmgr);
++	return qcom_battmgr_charge_restore(battmgr);
++}
++
++/* lock serializes every request, policy write, watchdog and lifecycle cleanup. */
++static void qcom_battmgr_automatic_step(struct qcom_battmgr *battmgr)
++{
++	unsigned long flags;
++	bool initial = !battmgr->input_owned;
++	int ret;
++
++	if (battmgr->input_frozen || battmgr->charge_frozen ||
++	    READ_ONCE(battmgr->charge_closing) || READ_ONCE(battmgr->charge_suspending))
++		return;
++	if (initial) {
++		if (battmgr->charge_pending) {
++			ret = qcom_battmgr_charge_restore(battmgr);
++			if (ret)
++				goto veto;
++		}
++		battmgr->automatic_prepared = false;
++		if (atomic_read(&dodge_input_boot_state) == INPUT_BOOT_MAYBE_OWNED) {
++			battmgr->input_phase = "UNKNOWN_OWNER_UNAVAILABLE";
++			return;
++		}
++		spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++		battmgr->input_generation = battmgr->dodge_service_generation;
++		battmgr->input_session_usb_epoch = battmgr->input_usb_epoch;
++		spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	}
++	battmgr->input_stage = "automatic-qualification";
++	ret = qcom_battmgr_bpp_source(battmgr, initial);
++	if (ret)
++		goto veto;
++	qcom_battmgr_bpp_voltage_vote(battmgr);
++	if (initial) {
++		/* Claim before SET0, too: its timeout must not be mistaken for no request. */
++		battmgr->input_stage = "automatic-baseline-set0";
++		battmgr->input_owned = true;
++		atomic_set(&dodge_input_boot_state, INPUT_BOOT_MAYBE_OWNED);
++		ret = qcom_battmgr_input_probe_send(battmgr, false);
++		battmgr->input_cleanup_ack = ret;
++		if (ret)
++			goto veto;
++		battmgr->input_stage = "automatic-board-fod";
++		ret = nu1669_prepare_bpp(battmgr->wireless_receiver,
++					 battmgr->input_receiver.generation);
++		if (ret) {
++			/* No automatic calibration retries, even across logical generations. */
++			battmgr->input_error = ret;
++			qcom_battmgr_input_probe_cleanup(battmgr, "board-setup-failed");
++			battmgr->input_frozen = true;
++			battmgr->input_phase = "FOD_QUARANTINED";
++			return;
++		}
++		battmgr->automatic_prepared = true;
++		ret = qcom_battmgr_bpp_source(battmgr, false);
++		if (ret)
++			goto veto;
++		qcom_battmgr_bpp_voltage_vote(battmgr);
++		battmgr->automatic_qualified = true;
++		/* Establish battery holds before providing the normal input request. */
++		ret = qcom_battmgr_bpp_votes(battmgr);
++		if (ret)
++			goto veto;
++		ret = qcom_battmgr_bpp_source(battmgr, false);
++		if (ret)
++			goto veto;
++		qcom_battmgr_bpp_voltage_vote(battmgr);
++		ret = qcom_battmgr_bpp_votes(battmgr);
++		if (ret)
++			goto veto;
++		battmgr->input_stage = "automatic-set750000";
++		ret = qcom_battmgr_input_probe_send(battmgr, true);
++		battmgr->input_start_ack = ret;
++		if (ret)
++			goto veto;
++	}
++	ret = qcom_battmgr_bpp_votes(battmgr);
++	if (ret)
++		goto veto;
++	battmgr->automatic_veto = false;
++	battmgr->input_phase = qcom_battmgr_bpp_hold(battmgr) ? "BATTERY_HELD" : "ACTIVE";
++	battmgr->input_stage = "automatic-monitor";
++	goto schedule;
++veto:
++	battmgr->automatic_prepared = false;
++	battmgr->automatic_qualified = false;
++	battmgr->automatic_veto = true;
++	battmgr->automatic_good = 0;
++	battmgr->input_error = ret;
++	battmgr->input_failure_stage = battmgr->input_stage;
++	ret = qcom_battmgr_input_probe_cleanup(battmgr, "automatic-safety-or-source-veto");
++	if (!ret) {
++		/* Input is off before releasing stale physical ownership; votes survive. */
++		ret = qcom_battmgr_charge_restore(battmgr);
++		battmgr->input_phase = "INPUT_OFF_VETO";
++	}
++	if (ret && (battmgr->charge_frozen || battmgr->input_frozen))
++		return;
++schedule:
++	if (!battmgr->input_frozen && !battmgr->charge_closing && !battmgr->charge_suspending)
++		mod_delayed_work(system_percpu_wq, &battmgr->input_work, HZ);
++}
++
++/* Stable attributes live directly on /sys/class/power_supply/qcom-battmgr-bat/. */
++static ssize_t wireless_care_hold_show(struct device *dev,
++				      struct device_attribute *attr, char *buf)
++{
++	struct qcom_battmgr *battmgr = power_supply_get_drvdata(dev_get_drvdata(dev));
++
++	return sysfs_emit(buf, "%u\n", READ_ONCE(battmgr->care_hold));
++}
++
++static ssize_t wireless_care_hold_store(struct device *dev,
++				       struct device_attribute *attr,
++				       const char *buf, size_t count)
++{
++	struct qcom_battmgr *battmgr = power_supply_get_drvdata(dev_get_drvdata(dev));
++	bool hold;
++	int ret = 0;
++
++	if ((count != 1 && count != 2) || (buf[0] != '0' && buf[0] != '1') ||
++	    (count == 2 && buf[1] != '\n'))
++		return -EINVAL;
++	hold = buf[0] == '1';
++	mutex_lock(&battmgr->lock);
++	if (!battmgr->automatic_bpp || battmgr->charge_closing || battmgr->charge_suspending) {
++		ret = -EBUSY;
++	} else {
++		battmgr->care_hold = hold;
++		qcom_battmgr_automatic_step(battmgr);
++		if (battmgr->input_frozen || battmgr->charge_frozen)
++			ret = -EIO;
++	}
++	mutex_unlock(&battmgr->lock);
++	return ret ? ret : (ssize_t)count;
++}
++static DEVICE_ATTR(wireless_care_hold, 0600, wireless_care_hold_show, wireless_care_hold_store);
++
++static ssize_t wireless_charge_state_show(struct device *dev,
++					 struct device_attribute *attr, char *buf)
++{
++	struct qcom_battmgr *battmgr = power_supply_get_drvdata(dev_get_drvdata(dev));
++	ssize_t ret;
++
++	mutex_lock(&battmgr->lock);
++	ret = sysfs_emit(buf,
++		"phase=%s input_owned=%u input_unknown=%u manual=%u care=%u safety=%u battery_owned=%u pending=%u frozen=%u error=%d stage=%s generation=%u receiver_generation=%u\n",
++		battmgr->input_phase ?: "WAITING", battmgr->input_owned, battmgr->input_frozen,
++		battmgr->manual_hold, battmgr->care_hold, battmgr->safety_hold,
++		battmgr->charge_owned, battmgr->charge_pending, battmgr->charge_frozen,
++		battmgr->input_error, battmgr->input_stage ?: "none",
++		battmgr->input_generation, battmgr->input_receiver.generation);
++	mutex_unlock(&battmgr->lock);
++	return ret;
++}
++static DEVICE_ATTR_RO(wireless_charge_state);
++
++/* Qualified same-response maximum, for care policy; errors never return cached data. */
++static ssize_t wireless_voltage_max_show(struct device *dev,
++					struct device_attribute *attr, char *buf)
++{
++	struct qcom_battmgr *battmgr = power_supply_get_drvdata(dev_get_drvdata(dev));
++	int ret;
++
++	mutex_lock(&battmgr->lock);
++	ret = qcom_battmgr_bpp_source(battmgr, false);
++	if (!ret)
++		ret = sysfs_emit(buf, "%u\n", battmgr->dodge_voltage_word2);
++	mutex_unlock(&battmgr->lock);
++	return ret;
++}
++static DEVICE_ATTR_RO(wireless_voltage_max);
++
++static struct attribute *qcom_battmgr_bpp_attrs[] = {
++	&dev_attr_wireless_care_hold.attr,
++	&dev_attr_wireless_charge_state.attr,
++	&dev_attr_wireless_voltage_max.attr,
++	NULL,
++};
++static const struct attribute_group qcom_battmgr_bpp_group = {
++	.attrs = qcom_battmgr_bpp_attrs,
++};
++
+ static int qcom_battmgr_charge_set_property(struct power_supply *psy,
+ 					  enum power_supply_property prop,
+ 					  const union power_supply_propval *val)
+@@ -3034,6 +3361,11 @@ static int qcom_battmgr_charge_set_property(struct power_supply *psy,
+ 	mutex_lock(&battmgr->lock);
+ 	if (READ_ONCE(battmgr->charge_closing) || READ_ONCE(battmgr->charge_suspending)) {
+ 		ret = -EBUSY;
++	} else if (battmgr->automatic_bpp) {
++		battmgr->manual_hold = val->intval == POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
++		qcom_battmgr_automatic_step(battmgr);
++		ret = battmgr->input_frozen || battmgr->charge_frozen ? -EIO :
++			(battmgr->manual_hold && !battmgr->charge_owned ? -EAGAIN : 0);
+ 	} else if (val->intval == POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) {
+ 		ret = qcom_battmgr_charge_restore(battmgr);
+ 		qcom_battmgr_charge_schedule(battmgr);
+@@ -3060,6 +3392,10 @@ static void qcom_battmgr_charge_worker(struct work_struct *work)
+ 	u32 value;
+ 
+ 	mutex_lock(&battmgr->lock);
++	if (battmgr->automatic_bpp) {
++		qcom_battmgr_automatic_step(battmgr);
++		goto out;
++	}
+ 	if (!battmgr->charge_owned || READ_ONCE(battmgr->charge_closing) ||
+ 	    READ_ONCE(battmgr->charge_suspending))
+ 		goto out;
+@@ -3114,8 +3450,11 @@ static int qcom_battmgr_charge_resume(struct device *dev)
+ {
+ 	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+ 
+-	if (battmgr->variant == QCOM_BATTMGR_DODGE)
++	if (battmgr->variant == QCOM_BATTMGR_DODGE) {
+ 		WRITE_ONCE(battmgr->charge_suspending, false);
++		if (battmgr->automatic_bpp)
++			mod_delayed_work(system_percpu_wq, &battmgr->input_work, 0);
++	}
+ 	return 0;
+ }
+ 
+@@ -4469,6 +4808,10 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	if (ret)
+ 		return ret;
+ 
++	battmgr->automatic_bpp = device_property_read_bool(dev, "qcom,automatic-bpp-charging");
++	if (battmgr->automatic_bpp && (battmgr->variant != QCOM_BATTMGR_DODGE ||
++	    !battmgr->wireless_receiver || !IS_BUILTIN(CONFIG_BATTERY_QCOM_BATTMGR)))
++		return -EINVAL;
+ 	if (battmgr->variant == QCOM_BATTMGR_DODGE) {
+ 		ret = devm_delayed_work_autocancel(dev, &battmgr->input_work,
+ 						 qcom_battmgr_input_probe_worker);
+@@ -4508,7 +4851,14 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	ret = qcom_battmgr_dodge_debugfs_init(battmgr);
+ 	if (ret)
+ 		return ret;
++	if (battmgr->automatic_bpp) {
++		ret = devm_device_add_group(&battmgr->bat_psy->dev, &qcom_battmgr_bpp_group);
++		if (ret)
++			return ret;
++	}
+ 	pmic_glink_client_register(battmgr->client);
++	if (battmgr->automatic_bpp)
++		mod_delayed_work(system_percpu_wq, &battmgr->input_work, HZ);
+ 
+ 	return 0;
+ }
+diff --git a/include/linux/power/nu1669.h b/include/linux/power/nu1669.h
+index 0f82482d52..faba88aedf 100644
+--- a/include/linux/power/nu1669.h
++++ b/include/linux/power/nu1669.h
+@@ -9,7 +9,13 @@
+ struct power_supply;
+ 
+ /* Firmware values from one fresh read, guarded against connection edges. */
++/* RX power faults; packet-send timeout and LDO notifications are not faults. */
++#define NU1669_BPP_POWER_FAULTS (0x7fU | (3U << 14) | (3U << 17) | (1U << 20))
++
+ struct nu1669_snapshot {
++	bool bpp_valid;
++	u32 flags;
++	u16 iout_ma;
+ 	u32 generation;
+ 	u16 chip_id;
+ 	u16 vout_mv;
+@@ -23,7 +29,13 @@ struct nu1669_snapshot {
+ 
+ #if IS_REACHABLE(CONFIG_CHARGER_NU1669)
+ int nu1669_get_snapshot(struct power_supply *psy, struct nu1669_snapshot *snapshot);
++int nu1669_prepare_bpp(struct power_supply *psy, u32 generation);
+ #else
++static inline int nu1669_prepare_bpp(struct power_supply *psy, u32 generation)
++{
++	return -EOPNOTSUPP;
++}
++
+ static inline int nu1669_get_snapshot(struct power_supply *psy,
+ 				      struct nu1669_snapshot *snapshot)
+ {

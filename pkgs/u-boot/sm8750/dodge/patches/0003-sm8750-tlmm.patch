@@ -1,0 +1,98 @@
+From: Melody Olvera <quic_molvera@quicinc.com>
+Date: Mon, 11 Nov 2024 16:28:43 -0800
+Subject: [PATCH] pinctrl: qcom: Add sm8750 pinctrl driver
+
+Add TLMM pinctrl driver to support pin configuration with pinctrl
+framework for sm8750 SoC.
+
+Signed-off-by: Melody Olvera <quic_molvera@quicinc.com>
+Reviewed-by: Bjorn Andersson <andersson@kernel.org>
+Link: https://lore.kernel.org/20241112002843.2804490-3-quic_molvera@quicinc.com
+Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+(cherry picked from commit afe9803e3b82f0d05b6848a854604dcaaeb5ded0)
+
+
+Local U-Boot adaptation: use driver-model APIs and existing generic helpers.
+SM8750 PHY sequences configure every block, including PCS gear and HS-B
+overlays; other PHYs retain their current sequence. TLMM is GPIO-only with
+the source-defined special UFS reset line. ABL retains regulator votes.
+---
+diff --git a/drivers/pinctrl/qcom/Kconfig b/drivers/pinctrl/qcom/Kconfig
+index 0bea461f..7609e2f9 100644
+--- a/drivers/pinctrl/qcom/Kconfig
++++ b/drivers/pinctrl/qcom/Kconfig
+@@ -199,3 +199,7 @@ config PINCTRL_QCOM_X1E80100
+ endmenu
+ 
+ endif
++
++config PINCTRL_QCOM_SM8750
++	bool "SM8750 GPIO and UFS reset"
++	depends on PINCTRL_QCOM_GENERIC
+diff --git a/drivers/pinctrl/qcom/Makefile b/drivers/pinctrl/qcom/Makefile
+index 87cb128c..59f6081e 100644
+--- a/drivers/pinctrl/qcom/Makefile
++++ b/drivers/pinctrl/qcom/Makefile
+@@ -26,3 +26,5 @@ obj-$(CONFIG_PINCTRL_QCOM_SM8250) += pinctrl-sm8250.o
+ obj-$(CONFIG_PINCTRL_QCOM_SM8550) += pinctrl-sm8550.o
+ obj-$(CONFIG_PINCTRL_QCOM_SM8650) += pinctrl-sm8650.o
+ obj-$(CONFIG_PINCTRL_QCOM_X1E80100) += pinctrl-x1e80100.o
++
++obj-$(CONFIG_PINCTRL_QCOM_SM8750) += pinctrl-sm8750.o
+diff --git a/drivers/pinctrl/qcom/pinctrl-sm8750.c b/drivers/pinctrl/qcom/pinctrl-sm8750.c
+new file mode 100644
+index 00000000..93a3912b
+--- /dev/null
++++ b/drivers/pinctrl/qcom/pinctrl-sm8750.c
+@@ -0,0 +1,51 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* SM8750 GPIO/UFS reset geometry from Melody Olvera's Linux TLMM driver. */
++#include <dm.h>
++#include "pinctrl-qcom.h"
++static char pin_name[32] __section(".data");
++static const struct msm_special_pin_data special[] = {
++	{ .name = "ufs_reset",
++	  .ctl_reg = 0xe2004,
++	  .io_reg = 0xe3000,
++	  .pull_bit = 3,
++	  .drv_bit = 0,
++	  .oe_bit = -1,
++	  .in_bit = -1,
++	  .out_bit = 0 },
++};
++static const char *sm8750_pin_name(struct udevice *dev, unsigned int pin)
++{
++	if (pin == 215)
++		return "ufs_reset";
++	snprintf(pin_name, sizeof(pin_name), "gpio%u", pin);
++	return pin_name;
++}
++static const char *sm8750_function_name(struct udevice *dev,
++					unsigned int selector)
++{
++	return "gpio";
++}
++static int sm8750_function_mux(unsigned int pin, unsigned int selector)
++{
++	return 0;
++}
++static struct msm_pinctrl_data sm8750_data = {
++	.pin_data = { .pin_count = 216,
++		      .special_pins_start = 215,
++		      .special_pins_data = special },
++	.functions_count = 1,
++	.get_function_name = sm8750_function_name,
++	.get_function_mux = sm8750_function_mux,
++	.get_pin_name = sm8750_pin_name,
++};
++static const struct udevice_id sm8750_ids[] = {
++	{ .compatible = "qcom,sm8750-tlmm", .data = (ulong)&sm8750_data },
++	{}
++};
++U_BOOT_DRIVER(pinctrl_sm8750) = {
++	.name = "pinctrl_sm8750",
++	.id = UCLASS_NOP,
++	.of_match = sm8750_ids,
++	.ops = &msm_pinctrl_ops,
++	.bind = msm_pinctrl_bind,
++};

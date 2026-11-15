@@ -1,24 +1,47 @@
 # Aurora touch runtime
 
-The exported Aurora module enables this service for an installed Android 14
-configuration. Recovery does not include the processor or Android library.
-To disable it, set `hardware.aurora.touch.enable = false`.
-Build independently with `nix build .#devices.aurora.touch`.
+[中文](README.zh.md)
 
-The S3910P controller sends sensor frames over SPI. The kernel exposes those
-frames through `/dev/aurora-touch-raw`; this single-threaded adapter executes
-only the core calculation path of the OEM library, then creates
-`Xiaomi 14 Ultra Touchscreen` through uinput. The input axes are 0..143999 and
-0..319999, matching Android's 100-fold coordinate precision. Desktop libinput
-normalizes these coordinates; they are not a screen resolution.
+By default the S3910P controller firmware computes the contacts (TouchCom
+touch report 0x11) and the `aurora-tcm` kernel driver reports them as the
+`Xiaomi 14 Ultra Touchscreen` multitouch device: type-B slots for 10
+contacts, axes 0..1439 and 0..3199, touch major/minor from the reported
+widths and pressure from the reported Z. No OEM library, firmware archive
+input or userspace service is needed, and any controller firmware with the
+expected TouchCom protocol, part and geometry is accepted; the driver logs
+its build and configuration ID. The report selection is runtime state,
+reapplied after every reset, power-on and panel wake; the driver never
+writes the controller's flash or configuration. Recovery does not load the
+driver. To disable touch, set `hardware.aurora.touch.enable = false`.
+
+```sh
+sudo evtest /dev/input/aurora-touch
+sudo libinput debug-events --device /dev/input/aurora-touch
+```
+
+## Userspace host processor (experimental)
+
+Set `hardware.aurora.touch.hostProcessor.enable = true` to compute contacts
+in userspace from raw frames instead. Build independently with
+`nix build .#devices.aurora.touch`. The kernel then enables the vendor raw
+frame (0xc0, module options `primary_report=0xc0 disable_report=0`) and
+exposes it through `/dev/aurora-touch-raw` without registering its own input
+device; this single-threaded adapter executes only the core calculation path
+of the OEM library, then creates `Xiaomi 14 Ultra Touchscreen` through
+uinput. The input axes are 0..143999 and 0..319999, matching Android's
+100-fold coordinate precision. Desktop libinput normalizes these
+coordinates; they are not a screen resolution.
 
 This is an experimental compatibility adapter, not a reimplementation of the
 proprietary algorithm or a complete Android runtime. It requires ARM64 with
 4 KiB pages and the exact China OS1.0.3.0.UNACNXM Android 14 controller firmware
-(packrat 4337601, config N1CTE022). It does not flash the controller.
-The OEM inputs are fetched from the pinned
-[firmware repository](https://github.com/dianqk/firmware-xiaomi-aurora/tree/60febc4751f8b939468bd57879d6831635d520d7/android14/touch)
-and installed unchanged:
+(packrat 4337601, config N1CTE022) and library. The required Android 16 base
+ships controller build 4360960 (config N1CTE034) and a different library, so
+the adapter does not work there; it is kept for the former base and needs a
+`firmwareSource` from that release. It does not flash the controller.
+The OEM inputs come from `touch/` of the
+[Aurora firmware release archive](../../../docs/aurora/firmware.md#firmware-source)
+and are installed unchanged:
 
 | File | Android path | SHA-256 |
 | --- | --- | --- |
@@ -29,7 +52,31 @@ Both hashes are checked before execution. The OEM files are proprietary, retain
 all rights of their owners, and are not covered by the source-code license.
 No handset calibration or identity data is bundled. See [source provenance](ORIGINS.md).
 
-## Diagnostics
+## Screen-off touch
+
+Compositors such as Niri wake a DPMS-off display on any touch. To keep the
+screen off until another input (power, volume or keyboard) wakes it, set:
+
+```nix
+hardware.aurora.touch.wakeDisplay = false;
+# hardware.aurora.touch.displayConnector = "DSI-1"; # default panel connector
+```
+
+The kernel driver then powers the controller off while the panel is off
+(`aurora-tcm` follows the DRM panel; with `wakeDisplay = true` the module
+option `follow_panel=0` keeps it running so a touch can wake the display)
+and lifts all contacts. The rest of this section applies to the host
+processor. The raw stream carries a pause record at panel-off; the adapter releases
+contacts, waits without its 2-second stall limit, and after the wake skips the
+OEM core's startup frames again before reporting. The service also passes
+`--display-dpms DSI-1` as a fallback gate. The adapter polls
+`/sys/class/drm/card*-DSI-1/dpms` about every 100 ms and keeps decoding frames,
+but reports no contacts while it is not `On`. Contacts reported before the
+transition are released; contacts present while off stay hidden until lifted,
+so a finger held during wake does not tap. If the attribute is missing,
+ambiguous or unreadable, touches are reported and one warning is logged.
+
+## Host processor diagnostics
 
 ```sh
 systemctl status aurora-touch
@@ -40,7 +87,7 @@ sudo libinput record /dev/input/aurora-touch > touch.yml
 ```
 
 Install the upstream `evtest` and `libinput` tools in the consuming configuration.
-The input symlink exists only while the service is running. Validate movement,
+With the host processor, the input symlink exists only while the service is running. Validate movement,
 multiple contacts, individual releases, edges, rotation, screen-off wake, and
 absence of spontaneous contacts. Successful idle replay alone does not validate
 physical touch accuracy, gestures, palm rejection, suspend or stylus support.

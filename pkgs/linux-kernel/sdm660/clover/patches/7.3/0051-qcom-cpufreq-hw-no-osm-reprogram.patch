@@ -1,0 +1,115 @@
+From be6305bcf8784e980c979607734fc41e8db64f3f Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 31 Oct 2026 19:43:00 +0800
+Subject: [PATCH] cpufreq: qcom-hw: Don't reprogram an enabled OSM
+
+The OSM programming path runs on every policy initialisation, so a
+cluster that comes back online after all of its CPUs went offline gets
+its lookup table and sequencer rewritten while the OSM is running, and
+the CPU is attached to the CPR power domain once more. Program the OSM
+only while it is disabled, and otherwise read the table it already uses.
+
+Also fix the error paths of the programming code: return -ENODEV instead
+of 0 when the CPU has no power domain, drop the power domain node and
+device references, record why probing is deferred, check the parameter
+table allocation itself rather than the pointer to it, bound the table
+walk by the allocated size and release the OPP on early returns.
+
+Scope: SDM630/660 common
+Porting notes: Local fixes for the SoMainline OSM programming code (not upstream).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/cpufreq/qcom-cpufreq-hw.c | 38 +++++++++++++++++++++----------
+ 1 file changed, 26 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/cpufreq/qcom-cpufreq-hw.c b/drivers/cpufreq/qcom-cpufreq-hw.c
+index c7672c3736..578d911ebe 100644
+--- a/drivers/cpufreq/qcom-cpufreq-hw.c
++++ b/drivers/cpufreq/qcom-cpufreq-hw.c
+@@ -577,10 +577,10 @@ static int qcom_cpufreq_gen_params(struct device *cpu_dev,
+ 
+ 	*hw_tbl = devm_kmalloc_array(&pdev->dev, gpd_opp_cnt,
+ 				     sizeof(**hw_tbl), GFP_KERNEL);
+-	if (!hw_tbl)
++	if (!*hw_tbl)
+ 		return -ENOMEM;
+ 
+-	for (i = 0, rate = 1000; i <= gpd_opp_cnt ; rate++, i++) {
++	for (i = 0, rate = 1000; i < gpd_opp_cnt; rate++, i++) {
+ 		struct qcom_cpufreq_hw_params *entry = *hw_tbl + i;
+ 		struct device_node *np;
+ 		u32 pll_div, millivolts, f_src;
+@@ -598,12 +598,15 @@ static int qcom_cpufreq_gen_params(struct device *cpu_dev,
+ 
+ 		/* Get mandatory and optional properties from the OPP DT */
+ 		np = dev_pm_opp_get_of_node(genpd_opp);
+-		if (!np)
++		if (!np) {
++			dev_pm_opp_put(genpd_opp);
+ 			return dev_err_probe(dev, -ENOENT, "Couldn't get OPP table");
++		}
+ 
+ 		if (of_property_read_u32(np, "qcom,pll-override",
+ 					 &entry->override_val)) {
+ 			of_node_put(np);
++			dev_pm_opp_put(genpd_opp);
+ 			return dev_err_probe(dev, -EINVAL, "Couldn't get qcom,pll-override\n");
+ 		}
+ 
+@@ -628,6 +631,7 @@ static int qcom_cpufreq_gen_params(struct device *cpu_dev,
+ 		if (millivolts < 150 || millivolts > 1400) {
+ 			dev_err(&pdev->dev,
+ 				"Read invalid voltage: %u.\n", millivolts);
++			dev_pm_opp_put(genpd_opp);
+ 			return -EINVAL;
+ 		}
+ 
+@@ -1612,7 +1616,13 @@ static int qcom_cpufreq_hw_cpu_init(struct cpufreq_policy *policy)
+ 
+ 	policy->dvfs_possible_from_any_cpu = true;
+ 
+-	if (!qcom_cpufreq.soc_data->uses_tz) {
++	/*
++	 * Program the OSM only once: never rewrite the tables of an OSM that
++	 * is running, e.g. when a cluster comes back online after all of its
++	 * CPUs went offline.
++	 */
++	if (!qcom_cpufreq.soc_data->uses_tz &&
++	    !(readl_relaxed(data->base + qcom_cpufreq.soc_data->reg_enable) & 0x1)) {
+ 		ret = qcom_cpufreq_hw_osm_setup(cpu_dev, policy, cpu_count, index);
+ 		if (ret) {
+ 			dev_err(dev, "Cannot setup the OSM for CPU%d: %d\n", policy->cpu, ret);
+@@ -1738,20 +1748,24 @@ static int qcom_cpufreq_hw_driver_probe(struct platform_device *pdev)
+ 		 * the params from...
+ 		 */
+ 		pd_node = of_parse_phandle(cpu_dev->of_node, "power-domains", 0);
+-		if (!pd_node) {
+-			ret = PTR_ERR(pd_node);
+-			dev_err(cpu_dev, "power domain not found: %d\n", ret);
+-			return ret;
+-		}
++		if (!pd_node)
++			return dev_err_probe(dev, -ENODEV, "CPU power domain not found\n");
+ 
+ 		/*
+ 		 * If the power domain device is not registered yet, then
+ 		 * defer probing this driver until that is available.
+ 		 */
+ 		pd_dev = of_find_device_by_node(pd_node);
+-		if (!pd_dev || !pd_dev->dev.driver ||
+-		    !device_is_bound(&pd_dev->dev))
+-			return -EPROBE_DEFER;
++		of_node_put(pd_node);
++		if (!pd_dev)
++			return dev_err_probe(dev, -EPROBE_DEFER,
++					     "waiting for the CPU power domain\n");
++
++		ret = device_is_bound(&pd_dev->dev);
++		put_device(&pd_dev->dev);
++		if (!ret)
++			return dev_err_probe(dev, -EPROBE_DEFER,
++					     "waiting for the CPU power domain\n");
+ 	}
+ 
+ 	clk = clk_get(dev, "xo");

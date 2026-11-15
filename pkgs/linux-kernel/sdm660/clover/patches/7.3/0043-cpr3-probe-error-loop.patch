@@ -1,0 +1,32 @@
+From 642a4b97a115febf3694d3ef94397f061e2917ec Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 31 Oct 2026 19:52:08 +0800
+Subject: [PATCH] soc: qcom: cpr3: Fix the probe error path loop
+
+The genpd cleanup loop of cpr_probe() counts down an unsigned index
+while it is not negative, so any error after the threads are initialised
+(for example a deferred reference clock) never ends the loop and removes
+domains past the start of the thread array. Use a signed index.
+
+Scope: SDM630/660 common
+Porting notes: Local fix for the CPR3 driver (not upstream).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/pmdomain/qcom/cpr3.c | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/drivers/pmdomain/qcom/cpr3.c b/drivers/pmdomain/qcom/cpr3.c
+index fdfe13bbbd..65e0be9b42 100644
+--- a/drivers/pmdomain/qcom/cpr3.c
++++ b/drivers/pmdomain/qcom/cpr3.c
+@@ -2531,8 +2531,7 @@ static int cpr_probe(struct platform_device *pdev)
+ 	const struct cpr_desc *desc;
+ 	const struct cpr_acc_desc *data;
+ 	struct device_node *np;
+-	unsigned int i;
+-	int ret;
++	int i, ret;
+ 
+ 	data = of_device_get_match_data(dev);
+ 	if (!data || !data->cpr_desc)

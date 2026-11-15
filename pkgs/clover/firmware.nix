@@ -1,17 +1,12 @@
 {
   fetchFromGitHub,
+  firmware-source,
   linux-firmware,
   python3,
   runCommand,
   wireless-regdb,
 }:
 let
-  cloverBoard = fetchFromGitHub {
-    owner = "setotau";
-    repo = "firmware-xiaomi-clover";
-    rev = "c850ad5d11315e690df8244670241e3d5a8436dc";
-    hash = "sha256-SaxbtTOV/r3Sm2al3qg9Iue0iaCK/p9pn6TVHCTGEnY=";
-  };
   qcaSwissArmyKnife = fetchFromGitHub {
     owner = "qca";
     repo = "qca-swiss-army-knife";
@@ -23,7 +18,7 @@ runCommand "clover-public-firmware" { nativeBuildInputs = [ python3 ]; } ''
   ath10k=$out/lib/firmware/ath10k/WCN3990/hw1.0
   mkdir -p "$ath10k" $out/lib/firmware/qca $out/lib/firmware/qcom $out/share
 
-  cp ${cloverBoard}/board-2.bin "$ath10k/board-2.bin"
+  cp ${firmware-source}/board-2.bin "$ath10k/board-2.bin"
   cp ${linux-firmware}/lib/firmware/ath10k/WCN3990/hw1.0/wlanmdsp.mbn "$ath10k/"
   cd "$ath10k"
   python3 ${qcaSwissArmyKnife}/tools/scripts/ath10k/ath10k-fwencoder \

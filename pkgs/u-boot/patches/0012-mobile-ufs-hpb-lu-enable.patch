@@ -1,0 +1,47 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 24 Oct 2026 17:37:11 +0800
+Subject: [PATCH] ufs: accept HPB-enabled logical units in the boot-LUN check
+
+ufs_mobile_lun_info() treated any bLUEnable other than 00h/01h as an
+unexpected layout. The JEDEC HPB extension (JESD220-3) defines 02h as
+"logical unit enabled with the HPB function"; Linux tested exactly that
+value as LU_ENABLED_HPB_FUNC from f02bc9754a68 ("scsi: ufs: ufshpb:
+Introduce Host Performance Buffer feature") until HPB support was removed
+in 7e9609d2daea. The Xiaomi Marble's Samsung KLUEG8UHGC (UFS 3.1) reports
+02h for its user LU 0 (both in the configuration descriptor here and in
+Linux's unit_descriptor/lu_enable), so every slot confirmation stopped
+with "LUN 0 bLUEnable 0x2" and -EINVAL.
+
+Count 01h and 02h as enabled. Reserved values (03h and above) are still
+refused, as are all boot-LUN-ID checks: a boot ID on a disabled LU, IDs
+above 2, and (in the caller) missing or duplicate boot-LU IDs.
+
+Local fix of 8bdfaba7801f ("ufs: expose narrow boot-LUN selection for
+EFI slot actions"). Baseline: U-Boot v2026.10-rc5,
+a06e89ab05eaa2b8344d521319399333cd760ae5.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/ufs/ufs-uclass.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/ufs/ufs-uclass.c b/drivers/ufs/ufs-uclass.c
+index 96eda0e773..b4960a4908 100644
+--- a/drivers/ufs/ufs-uclass.c
++++ b/drivers/ufs/ufs-uclass.c
+@@ -2423,10 +2423,14 @@ int ufs_mobile_lun_info(struct udevice *dev, unsigned int *mask,
+ 		printf("UFS boot-LUN check: bBootEnable is %u\n", config_desc[3]);
+ 		return -EINVAL; /* Boot feature must be enabled for slot switching. */
+ 	}
++	/* bLUEnable: 00h disabled, 01h enabled, 02h enabled with the HPB
++	 * function (JEDEC JESD220-3 HPB extension; Samsung UFS 3.1 parts ship
++	 * the user LU this way). Both enabled forms are ordinary LUs here;
++	 * reserved values remain an unexpected layout. */
+ 	for (i = 0; i < 8; i++) {
+ 		u8 enabled = config_desc[offset + i * stride];
+ 		u8 id = config_desc[offset + i * stride + 1];
+-		if (enabled > 1 || (boot_ids && (id > 2 || (!enabled && id)))) {
++		if (enabled > 2 || (boot_ids && (id > 2 || (!enabled && id)))) {
+ 			printf("UFS boot-LUN check: LUN %u bLUEnable 0x%x, bBootLunID 0x%x\n",
+ 			       i, enabled, id);
+ 			return -EINVAL;

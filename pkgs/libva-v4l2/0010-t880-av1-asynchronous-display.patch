@@ -1,0 +1,191 @@
+From: dianqk <dianqk@dianqk.net>
+Subject: [PATCH] t880: wait for AV1 display without flushing references
+
+AV1 pictures can complete asynchronously after their compressed buffer is
+returned. Wait for the requested CAPTURE completion within the fixed operation
+deadline instead of flushing the DPB and replaying the prefix. Preserve the
+existing stable output storage and sticky failure ownership. Other codecs keep
+their current completion policy.
+
+diff --git a/src/t880-decoder.cpp b/src/t880-decoder.cpp
+index f2f31ed..ebc0380 100644
+--- a/src/t880-decoder.cpp
++++ b/src/t880-decoder.cpp
+@@ -65,7 +65,8 @@ T880Decoder::Plane::Plane(Plane &&p) noexcept : address(p.address), size(p.size)
+ T880Decoder::Plane::~Plane() { if (address) munmap(address, size); }
+ T880Decoder::T880Decoder(const std::string &device, unsigned width, unsigned height,
+                          VAProfile profile, unsigned rt_format, int render_fd)
+-    : render_fd_(render_fd), width_(width), height_(height) {
++    : render_fd_(render_fd), width_(width), height_(height),
++      display_without_lookahead_(is_av1(profile)) {
+     check(rt_format == VA_RT_FORMAT_YUV420 && width >= 128 && height >= 128 && !(width & 1) &&
+           !(height & 1) && width <= 4096 && height <= 2176 &&
+           uint64_t(width) * height <= uint64_t(4096) * 2176,
+@@ -392,7 +393,13 @@ void T880Decoder::sync(const std::shared_ptr<Surface> &s) {
+         pump(0);
+         if (s->pending) {
+             wait_inputs(); pump(0);
+-            if (s->pending) drain();
++            // AV1 DISPLAY arrives asynchronously after compressed ownership
++            // returns. Wait for that completion; STOP would flush the DPB and
++            // force prefix replay on the next picture. The operation deadline
++            // stays fixed even if unrelated outputs arrive while pumping.
++            if (display_without_lookahead_) {
++                while (s->pending) pump(10);
++            } else if (s->pending) drain();
+         }
+         check(!s->pending && s->status == VA_STATUS_SUCCESS, "T880 sync failed");
+     } catch (const Error &e) { fail(e.status); throw; }
+diff --git a/src/t880-decoder.hpp b/src/t880-decoder.hpp
+index 5c5d7a0..a0e36d2 100644
+--- a/src/t880-decoder.hpp
++++ b/src/t880-decoder.hpp
+@@ -32,10 +32,15 @@ class T880Decoder {
+         bool displayed = false;
+         bool returned = false;
+     };
++#ifdef T880_TEST_CLOCK
++    using Clock = T880_TEST_CLOCK;
++#else
+     using Clock = std::chrono::steady_clock;
++#endif
+     int fd_ = -1, render_fd_;
+     unsigned width_, height_, stride_[2]{}, storage_height_ = 0;
+     std::mutex mutex_;
++    bool display_without_lookahead_;
+     bool output_on_ = false, capture_on_ = false, drained_ = false, last_ = false;
+     VAStatus failure_ = VA_STATUS_SUCCESS;
+     uint64_t next_client_ = 1, next_wire_ = 1;
+diff --git a/tests/t880/replay.cpp b/tests/t880/replay.cpp
+index 71668fd..2653b75 100644
+--- a/tests/t880/replay.cpp
++++ b/tests/t880/replay.cpp
+@@ -1,5 +1,14 @@
+ // SPDX-License-Identifier: MIT
+ // Exercise the production class against a deterministic stateful V4L2 model.
++#include "../../src/internal.hpp"
++// Advance the real production deadline deterministically without a 30s sleep.
++namespace t880_test {
++struct Clock : std::chrono::steady_clock {
++    static inline std::chrono::seconds offset{};
++    static time_point now() { return std::chrono::steady_clock::now() + offset; }
++};
++}
++#define T880_TEST_CLOCK t880_test::Clock
+ #include "../../src/t880-decoder.hpp"
+ #include <linux/dma-buf.h>
+ #include <sys/ioctl.h>
+@@ -17,7 +26,8 @@ namespace {
+ struct Fake {
+     bool event = false, configured = false, last = false;
+     bool duplicate = false, wrong_output = false, bad_alloc = false, bad_payload = false;
+-    unsigned resets = 0, stops = 0, accepted = 0;
++    unsigned resets = 0, stops = 0, accepted = 0, display_after_polls = 0, polls = 0;
++    bool expire = false;
+     std::deque<std::pair<unsigned, timeval>> output;
+     std::deque<timeval> decoded, display;
+     std::deque<unsigned> capture;
+@@ -31,7 +41,14 @@ void *fake_mmap(void *, size_t n, int, int, int, off_t offset) {
+     f.mapped[unsigned(offset)] = p; return p;
+ }
+ int fake_munmap(void *p, size_t) { free(p); return 0; }
+-int fake_poll(pollfd *, nfds_t, int) { if (f.bad_alloc) throw std::bad_alloc(); return 0; }
++int fake_poll(pollfd *, nfds_t, int) { if (f.bad_alloc) throw std::bad_alloc();
++    ++f.polls;
++    if (f.expire) t880_test::Clock::offset += std::chrono::seconds(10);
++    if (f.display_after_polls && f.polls >= f.display_after_polls) {
++        f.display.insert(f.display.end(), f.decoded.begin(), f.decoded.end());
++        f.decoded.clear();
++    }
++    return 0; }
+ int fake_ioctl(int fd, unsigned long request, void *arg) {
+     if (fd != 900) { assert(request == DMA_BUF_IOCTL_SYNC); return 0; }
+     if (request == VIDIOC_QUERYCAP) {
+@@ -153,8 +170,8 @@ std::shared_ptr<Surface> surface() {
+ template<class F> void rejects(F action) { bool rejected = false;
+     try { action(); } catch (const Error &) { rejected = true; } if (!rejected) std::cerr << "missing rejection\n"; assert(rejected); }
+ int main() {
+-    for (auto profile : {VAProfileH264Main, VAProfileHEVCMain, VAProfileVP9Profile0, VAProfileAV1Profile0}) {
+-        f = Fake{};
++    for (auto profile : {VAProfileH264Main, VAProfileHEVCMain, VAProfileVP9Profile0}) {
++        f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
+         T880Decoder d("fake", 160, 128, profile, VA_RT_FORMAT_YUV420, -1);
+         auto a = surface(), b = surface(), c = surface();
+         rejects([&] { d.submit({1}, a, {}); }); assert(f.accepted == 0);
+@@ -173,20 +190,20 @@ int main() {
+         assert(f.accepted == count + 1 && a->memory->map()[0] == 1);
+         d.finish();
+     }
+-    f = Fake{};
++    f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
+     {
+         T880Decoder d("fake", 160, 128, VAProfileHEVCMain, VA_RT_FORMAT_YUV420, -1);
+         auto s = surface(); d.submit({1}, s, {1}); f.duplicate = true;
+         rejects([&] { d.sync(s); });
+         rejects([&] { d.submit({2}, surface(), {}); });
+     }
+-    f = Fake{};
++    f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
+     {
+         T880Decoder d("fake", 160, 128, VAProfileH264Main, VA_RT_FORMAT_YUV420, -1);
+         auto s = surface(); f.wrong_output = true;
+         rejects([&] { d.submit({1}, s, {1}); }); assert(!s->pending && s->status != VA_STATUS_SUCCESS);
+     }
+-    f = Fake{};
++    f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
+     {
+         T880Decoder d("fake", 160, 128, VAProfileH264Main, VA_RT_FORMAT_YUV420, -1);
+         auto s = surface(); d.submit({1}, s, {1}); f.bad_alloc = true;
+@@ -195,13 +212,13 @@ int main() {
+         assert(failed && !s->pending && s->status == VA_STATUS_ERROR_ALLOCATION_FAILED);
+         f.bad_alloc = false; rejects([&] { d.submit({2}, surface(), {}); });
+     }
+-    f = Fake{};
++    f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
+     {
+         T880Decoder d("fake", 160, 128, VAProfileH264Main, VA_RT_FORMAT_YUV420, -1);
+         auto s = surface(); d.submit({1}, s, {1}); f.bad_payload = true;
+         rejects([&] { d.sync(s); }); assert(!s->pending && s->status != VA_STATUS_SUCCESS);
+     }
+-    f = Fake{};
++    f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
+     {
+         T880Decoder d("fake", 160, 128, VAProfileH264Main, VA_RT_FORMAT_YUV420, -1);
+         std::vector<uint8_t> megabyte(1024 * 1024, 1);
+@@ -211,7 +228,7 @@ int main() {
+         rejects([&] { d.submit({1}, surface(), {}); });
+         assert(f.accepted == accepted && f.resets == 0);
+     }
+-    f = Fake{};
++    f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
+     {
+         T880Decoder d("fake", 160, 128, VAProfileH264Main, VA_RT_FORMAT_YUV420, -1);
+         d.submit({1}, surface(), {1});
+@@ -220,6 +237,27 @@ int main() {
+         rejects([&] { d.submit({1}, surface(), {}); });
+         assert(f.accepted == accepted && f.resets == 0);
+     }
++    f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
++    {
++        T880Decoder d("fake", 160, 128, VAProfileAV1Profile0, VA_RT_FORMAT_YUV420, -1);
++        auto a = surface(), b = surface();
++        d.submit({1}, a, {1}); f.display_after_polls = f.polls + 3; d.sync(a);
++        assert(!a->pending && a->memory->map()[0] == 1 && f.stops == 0);
++        d.submit({2}, b, {}); f.display_after_polls = f.polls + 3; d.sync(b);
++        assert(!b->pending && b->memory->map()[0] == 2);
++        assert(f.accepted == 2 && f.stops == 0 && f.resets == 0);
++        d.finish(); assert(f.stops == 1);
++    }
++    f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
++    {
++        T880Decoder d("fake", 160, 128, VAProfileAV1Profile0, VA_RT_FORMAT_YUV420, -1);
++        auto a = surface(); d.submit({1}, a, {1}); unsigned before = f.polls; f.expire = true;
++        bool timed_out = false;
++        try { d.sync(a); } catch (const Error &e) { timed_out = e.status == VA_STATUS_ERROR_TIMEDOUT; }
++        assert(timed_out && f.polls - before <= 4 && f.stops == 0);
++        assert(!a->pending && a->status == VA_STATUS_ERROR_TIMEDOUT);
++        rejects([&] { d.submit({2}, surface(), {}); });
++    }
+     rejects([] { token(timeval{std::numeric_limits<long>::max(), 999999}); });
+     std::cout << "T880 replay ownership, stable pixels, fresh anchor, limits and sticky faults passed\n";
+ }

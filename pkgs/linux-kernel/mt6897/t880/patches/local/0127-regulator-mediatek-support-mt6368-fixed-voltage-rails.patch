@@ -1,0 +1,344 @@
+From 3caaea5373acafa6e923cfd086cccb4fd2059963 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] regulator: mediatek: support MT6368 fixed voltage rails
+
+Expose the supported MT6368 connectivity, vibration and microSD rails
+with the retained vendor voltage choices.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-16T08:02:55+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-16T14:05:36+08:00
+Link: https://github.com/u0n0u/tb375fc-linux/commit/dfcba64529f973830a8bf435e823510f4e9491c6
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/regulator/Kconfig            |   8 +
+ drivers/regulator/Makefile           |   1 +
+ drivers/regulator/mt6368-regulator.c | 281 +++++++++++++++++++++++++++
+ 3 files changed, 290 insertions(+)
+ create mode 100644 drivers/regulator/mt6368-regulator.c
+
+diff --git a/drivers/regulator/Kconfig b/drivers/regulator/Kconfig
+index 89789ac7a7..3d204ac04c 100644
+--- a/drivers/regulator/Kconfig
++++ b/drivers/regulator/Kconfig
+@@ -984,6 +984,14 @@ config REGULATOR_MT6363
+ 	  This driver supports the control of different power rails of device
+ 	  through regulator interface.
+ 
++config REGULATOR_MT6368
++	tristate "MT6368 SPMI PMIC LDO regulators"
++	depends on MFD_MTK_SPMI_PMIC || COMPILE_TEST
++	help
++	  Say Y here to control the on/off state and the low-power mode of
++	  the MT6368 PMIC LDOs used for connectivity (VCN33_1, VCN33_2,
++	  VANT18). Their voltages are not changed by the driver.
++
+ config REGULATOR_MT6370
+ 	tristate "MT6370 SubPMIC Regulator"
+ 	depends on MFD_MT6370
+diff --git a/drivers/regulator/Makefile b/drivers/regulator/Makefile
+index 5a764cec8d..495e31fe07 100644
+--- a/drivers/regulator/Makefile
++++ b/drivers/regulator/Makefile
+@@ -116,6 +116,7 @@ obj-$(CONFIG_REGULATOR_MT6358)	+= mt6358-regulator.o
+ obj-$(CONFIG_REGULATOR_MT6359)	+= mt6359-regulator.o
+ obj-$(CONFIG_REGULATOR_MT6360) += mt6360-regulator.o
+ obj-$(CONFIG_REGULATOR_MT6363) += mt6363-regulator.o
++obj-$(CONFIG_REGULATOR_MT6368) += mt6368-regulator.o
+ obj-$(CONFIG_REGULATOR_MT6370) += mt6370-regulator.o
+ obj-$(CONFIG_REGULATOR_MT6380)	+= mt6380-regulator.o
+ obj-$(CONFIG_REGULATOR_MT6397)	+= mt6397-regulator.o
+diff --git a/drivers/regulator/mt6368-regulator.c b/drivers/regulator/mt6368-regulator.c
+new file mode 100644
+index 0000000000..71954a46ba
+--- /dev/null
++++ b/drivers/regulator/mt6368-regulator.c
+@@ -0,0 +1,281 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek MT6368 SPMI PMIC LDO regulators.
++ *
++ * Only on/off and the normal/low-power mode are controlled. The voltage
++ * selection is read back but never changed by this driver: the rails keep
++ * the voltage the PMIC was trimmed and set to, and board constraints must
++ * match it exactly.
++ *
++ * The exceptions are VIBR and VMC: their voltage can only be set to the
++ * values the vendor software uses on the Alldocube T880 (VIBR 3.0 V for
++ * the vibrator; VMC 3.0 V and 1.8 V for SD card signalling). They expose
++ * a fixed list with exactly those entries; any other selector value read
++ * back is reported as unknown. The factory VOCAL trim is never written. Register layout from the MediaTek MT6368 vendor
++ * driver (MT6895-Mainline/linux dfcba64529f9, 2021 MediaTek).
++ */
++
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/regulator/driver.h>
++#include <linux/regulator/of_regulator.h>
++
++struct mt6368_ldo {
++	struct regulator_desc desc;
++	u32 lp_mode_reg;
++	u32 lp_mode_mask;
++	/* fixed-list rails: VOSEL value for each entry of desc.volt_table */
++	const u8 *vosel;
++	/* the board may lack the rail's consumers: do not fail the others */
++	bool optional;
++};
++
++/* Voltage selector tables (VOSEL), before the 10 mV VOCAL trim */
++static const unsigned int mt6368_ldo_volt_table3[] = {
++	600000, 700000, 800000, 900000, 1000000, 1100000, 1200000, 1300000,
++	1400000, 1500000, 1600000, 1700000, 1800000, 1900000, 2000000, 2100000,
++};
++
++static const unsigned int mt6368_ldo_volt_table4[] = {
++	1200000, 1300000, 1500000, 1700000, 1800000, 2000000, 2500000, 2600000,
++	2700000, 2800000, 2900000, 3000000, 3100000, 3300000, 3400000, 3500000,
++};
++
++static unsigned int mt6368_map_mode(unsigned int mode)
++{
++	switch (mode) {
++	case REGULATOR_MODE_NORMAL:
++	case REGULATOR_MODE_IDLE:
++		return mode;
++	default:
++		return REGULATOR_MODE_INVALID;
++	}
++}
++
++static unsigned int mt6368_ldo_get_mode(struct regulator_dev *rdev)
++{
++	const struct mt6368_ldo *ldo = rdev_get_drvdata(rdev);
++	unsigned int val;
++	int ret;
++
++	ret = regmap_read(rdev->regmap, ldo->lp_mode_reg, &val);
++	if (ret)
++		return REGULATOR_MODE_INVALID;
++
++	return (val & ldo->lp_mode_mask) ? REGULATOR_MODE_IDLE :
++					   REGULATOR_MODE_NORMAL;
++}
++
++static int mt6368_ldo_set_mode(struct regulator_dev *rdev, unsigned int mode)
++{
++	const struct mt6368_ldo *ldo = rdev_get_drvdata(rdev);
++
++	switch (mode) {
++	case REGULATOR_MODE_NORMAL:
++		return regmap_update_bits(rdev->regmap, ldo->lp_mode_reg,
++					  ldo->lp_mode_mask, 0);
++	case REGULATOR_MODE_IDLE:
++		return regmap_update_bits(rdev->regmap, ldo->lp_mode_reg,
++					  ldo->lp_mode_mask, ldo->lp_mode_mask);
++	default:
++		return -EINVAL;
++	}
++}
++
++/* VOSEL tables (table1 for VIBR/VMC, table4 for VMCH) and their entries */
++static const unsigned int mt6368_vibr_volts[] = { 3000000 };
++static const u8 mt6368_vibr_vosel[] = { 0xb };	/* table1[11] */
++static const unsigned int mt6368_vmc_volts[] = { 1800000, 3000000 };
++static const u8 mt6368_vmc_vosel[] = { 0x4, 0xb };	/* table1[4], [11] */
++static const unsigned int mt6368_vmch_volts[] = { 3000000 };
++static const u8 mt6368_vmch_vosel[] = { 0xb };	/* table4[11] */
++
++static int mt6368_list_get_voltage_sel(struct regulator_dev *rdev)
++{
++	const struct mt6368_ldo *ldo = rdev_get_drvdata(rdev);
++	unsigned int val;
++	int ret, i;
++
++	ret = regmap_read(rdev->regmap, rdev->desc->vsel_reg, &val);
++	if (ret)
++		return ret;
++
++	val &= rdev->desc->vsel_mask;
++	for (i = 0; i < rdev->desc->n_voltages; i++)
++		if (ldo->vosel[i] == val)
++			return i;
++
++	/* Not one of the allowed values: the core sets the constraint */
++	return -ENOTRECOVERABLE;
++}
++
++static int mt6368_list_set_voltage_sel(struct regulator_dev *rdev,
++				       unsigned int sel)
++{
++	const struct mt6368_ldo *ldo = rdev_get_drvdata(rdev);
++
++	if (sel >= rdev->desc->n_voltages)
++		return -EINVAL;
++
++	return regmap_update_bits(rdev->regmap, rdev->desc->vsel_reg,
++				  rdev->desc->vsel_mask, ldo->vosel[sel]);
++}
++
++/* No set_voltage: the voltage is fixed by the board constraints */
++static const struct regulator_ops mt6368_ldo_ops = {
++	.list_voltage = regulator_list_voltage_table,
++	.get_voltage_sel = regulator_get_voltage_sel_regmap,
++	.enable = regulator_enable_regmap,
++	.disable = regulator_disable_regmap,
++	.is_enabled = regulator_is_enabled_regmap,
++	.set_mode = mt6368_ldo_set_mode,
++	.get_mode = mt6368_ldo_get_mode,
++};
++
++/* Fixed-list rails that may be switched between their listed values */
++static const struct regulator_ops mt6368_ldo_list_ops = {
++	.list_voltage = regulator_list_voltage_table,
++	.map_voltage = regulator_map_voltage_ascend,
++	.get_voltage_sel = mt6368_list_get_voltage_sel,
++	.set_voltage_sel = mt6368_list_set_voltage_sel,
++	.enable = regulator_enable_regmap,
++	.disable = regulator_disable_regmap,
++	.is_enabled = regulator_is_enabled_regmap,
++	.set_mode = mt6368_ldo_set_mode,
++	.get_mode = mt6368_ldo_get_mode,
++};
++
++/* Fixed-list rail whose voltage is only read back (on/off only) */
++static const struct regulator_ops mt6368_ldo_list_ro_ops = {
++	.list_voltage = regulator_list_voltage_table,
++	.get_voltage_sel = mt6368_list_get_voltage_sel,
++	.enable = regulator_enable_regmap,
++	.disable = regulator_disable_regmap,
++	.is_enabled = regulator_is_enabled_regmap,
++	.set_mode = mt6368_ldo_set_mode,
++	.get_mode = mt6368_ldo_get_mode,
++};
++
++#define MT6368_LDO(_match, _id, _table, _en_reg, _vosel_reg)		\
++{									\
++	.desc = {							\
++		.name = _match,						\
++		.of_match = of_match_ptr(_match),			\
++		.ops = &mt6368_ldo_ops,					\
++		.type = REGULATOR_VOLTAGE,				\
++		.id = _id,						\
++		.owner = THIS_MODULE,					\
++		.n_voltages = ARRAY_SIZE(_table),			\
++		.volt_table = _table,					\
++		.enable_reg = _en_reg,					\
++		.enable_mask = BIT(0),					\
++		.vsel_reg = _vosel_reg,					\
++		.vsel_mask = 0xf,					\
++		.of_map_mode = mt6368_map_mode,				\
++	},								\
++	.lp_mode_reg = _en_reg,						\
++	.lp_mode_mask = BIT(1),						\
++}
++
++#define MT6368_LDO_LIST(_match, _id, _ops, _volts, _vosel, _en_reg,	\
++			_vosel_reg, _off_on_us)					\
++{									\
++	.desc = {							\
++		.name = _match,						\
++		.of_match = of_match_ptr(_match),			\
++		.ops = &_ops,						\
++		.type = REGULATOR_VOLTAGE,				\
++		.id = _id,						\
++		.owner = THIS_MODULE,					\
++		.n_voltages = ARRAY_SIZE(_volts),			\
++		.volt_table = _volts,					\
++		.enable_reg = _en_reg,					\
++		.enable_mask = BIT(0),					\
++		.vsel_reg = _vosel_reg,					\
++		.vsel_mask = 0xf,					\
++		.off_on_delay = _off_on_us,				\
++		.of_map_mode = mt6368_map_mode,				\
++	},								\
++	.lp_mode_reg = _en_reg,						\
++	.lp_mode_mask = BIT(1),						\
++	.vosel = _vosel,						\
++	.optional = true,						\
++}
++
++enum {
++	MT6368_ID_VANT18,
++	MT6368_ID_VCN33_1,
++	MT6368_ID_VCN33_2,
++	MT6368_ID_VIBR,
++	MT6368_ID_VMCH,
++	MT6368_ID_VMC,
++};
++
++static const struct mt6368_ldo mt6368_ldos[] = {
++	MT6368_LDO("vant18", MT6368_ID_VANT18, mt6368_ldo_volt_table3,
++		   0x1c23, 0x1e09),
++	MT6368_LDO("vcn33-1", MT6368_ID_VCN33_1, mt6368_ldo_volt_table4,
++		   0x1cc0, 0x1db1),
++	MT6368_LDO("vcn33-2", MT6368_ID_VCN33_2, mt6368_ldo_volt_table4,
++		   0x1cce, 0x1db5),
++	MT6368_LDO_LIST("vibr", MT6368_ID_VIBR, mt6368_ldo_list_ops,
++			mt6368_vibr_volts, mt6368_vibr_vosel, 0x1c31, 0x1d99, 0),
++	/* The vendor driver waits 1.5 ms for VMCH to discharge after off */
++	MT6368_LDO_LIST("vmch", MT6368_ID_VMCH, mt6368_ldo_list_ro_ops,
++			mt6368_vmch_volts, mt6368_vmch_vosel, 0x1c95, 0x1da9,
++			1500),
++	MT6368_LDO_LIST("vmc", MT6368_ID_VMC, mt6368_ldo_list_ops,
++			mt6368_vmc_volts, mt6368_vmc_vosel, 0x1ca4, 0x1dad, 0),
++};
++
++static int mt6368_regulator_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct regulator_config config = {};
++	struct regulator_dev *rdev;
++	int i;
++
++	config.dev = dev;
++	config.regmap = dev_get_regmap(dev->parent, NULL);
++	if (!config.regmap)
++		return dev_err_probe(dev, -ENODEV, "Cannot get parent regmap\n");
++
++	for (i = 0; i < ARRAY_SIZE(mt6368_ldos); i++) {
++		config.driver_data = (void *)&mt6368_ldos[i];
++		rdev = devm_regulator_register(dev, &mt6368_ldos[i].desc, &config);
++		if (IS_ERR(rdev) && mt6368_ldos[i].optional &&
++		    PTR_ERR(rdev) != -EPROBE_DEFER) {
++			/* Keep the other rails (e.g. connectivity) working */
++			dev_warn(dev, "%s not registered: %pe\n",
++				 mt6368_ldos[i].desc.name, rdev);
++			continue;
++		}
++		if (IS_ERR(rdev))
++			return dev_err_probe(dev, PTR_ERR(rdev),
++					     "Failed to register %s\n",
++					     mt6368_ldos[i].desc.name);
++	}
++
++	return 0;
++}
++
++static const struct of_device_id mt6368_regulator_match[] = {
++	{ .compatible = "mediatek,mt6368-regulator" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, mt6368_regulator_match);
++
++static struct platform_driver mt6368_regulator_driver = {
++	.driver = {
++		.name = "mt6368-regulator",
++		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
++		.of_match_table = mt6368_regulator_match,
++	},
++	.probe = mt6368_regulator_probe,
++};
++module_platform_driver(mt6368_regulator_driver);
++
++MODULE_DESCRIPTION("MediaTek MT6368 PMIC LDO regulators");
++MODULE_LICENSE("GPL");
+-- 
+2.56.0
+

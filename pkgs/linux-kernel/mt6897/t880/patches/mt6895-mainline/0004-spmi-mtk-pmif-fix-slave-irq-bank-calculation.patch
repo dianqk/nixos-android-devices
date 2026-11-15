@@ -1,0 +1,33 @@
+From 0bca1416eb89e9d96112832aea2f4eeb4b908dab Mon Sep 17 00:00:00 2001
+From: Hecheng Yu <kde-yyds@qq.com>
+Date: Sat, 29 Aug 2026 21:01:24 +0800
+Subject: [PATCH] spmi: mtk-pmif: fix slave IRQ bank calculation
+
+The status registers pack one 8-bit field per SID, so the bank must be
+bit / 8, not bit / 7.  With bit / 7, a status bit in the second byte
+(e.g. 0x8000 for SID 5) was never cleared, causing an infinite loop in
+mtk_spmi_handle_chained_irq() and a system hang on headphone jack
+insert.
+
+(cherry picked from commit bfc28ee6effe7e49c76006493eaa0f8956355b78)
+Link: https://github.com/MT6895-Mainline/linux/commit/bfc28ee6effe7e49c76006493eaa0f8956355b78
+---
+ drivers/spmi/spmi-mtk-pmif.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/spmi/spmi-mtk-pmif.c b/drivers/spmi/spmi-mtk-pmif.c
+index 7967eafe2e..22085c0f7a 100644
+--- a/drivers/spmi/spmi-mtk-pmif.c
++++ b/drivers/spmi/spmi-mtk-pmif.c
+@@ -504,7 +504,7 @@ static void mtk_spmi_handle_chained_irq(struct irq_desc *desc)
+ 
+ 		while (val) {
+ 			u8 bit = __ffs(val);
+-			u8 bank = bit / 7;
++			u8 bank = bit / 8;
+ 			u8 sid = ((i - SPMI_SLV_3_0_EINT) * 4) + bank;
+ 
+ 			val &= ~(PMIF_RCS_IRQ_MASK << (8 * bank));
+-- 
+2.56.0
+

@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Thu, 15 Oct 2026 10:24:56 +0800
+Subject: [PATCH 27/29] board: mediatek-mobile: keep the previous console
+ record
+
+Continue a valid pstore console ring at entry instead of restarting it,
+with an entry marker, so a handoff that fails after the consoles are gone
+(for example right after "Starting kernel") stays readable from the next
+U-Boot. "pstoreprev [bytes]" prints the end of the previous boot's
+record.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../mediatek-mobile/mediatek-mobile.c         | 43 ++++++++++++++++++-
+ 1 file changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/board/mediatek/mediatek-mobile/mediatek-mobile.c b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+index e7ca42dda96..2f83d51f91d 100644
+--- a/board/mediatek/mediatek-mobile/mediatek-mobile.c
++++ b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+@@ -309,13 +309,54 @@ static void mtk_pstore_begin(void)
+ 	struct mtk_pstore *p = (void *)CONFIG_MEDIATEK_MOBILE_PSTORE_CONSOLE;
+ 
+ 	mtk_wdt_kick();
+-	if (CONFIG_MEDIATEK_MOBILE_PSTORE_CONSOLE) {
++	if (!CONFIG_MEDIATEK_MOBILE_PSTORE_CONSOLE)
++		return;
++	/*
++	 * Keep the previous record (a handoff that failed before the OS took
++	 * over the zone stays readable); a valid ring is continued.
++	 */
++	if (p->sig != 0x43474244) {
+ 		p->sig = 0x43474244;
+ 		p->start = 0;
+ 		p->size = 0;
+ 	}
++	mtk_pstore_write("\n=== U-Boot entry ===\n", 22);
++}
++
++/* Bring-up: print the end of the previous boot's record ("pstoreprev [n]"). */
++static int do_pstoreprev(struct cmd_tbl *cmdtp, int flag, int argc,
++			 char *const argv[])
++{
++	static const char mark[] = "\n=== U-Boot entry ===\n";
++	struct mtk_pstore *p = (void *)CONFIG_MEDIATEK_MOBILE_PSTORE_CONSOLE;
++	u32 cap = CONFIG_MEDIATEK_MOBILE_PSTORE_CONSOLE_SIZE - sizeof(*p);
++	u32 n = argc > 1 ? simple_strtoul(argv[1], NULL, 0) : 2048;
++	u32 first = p->size < cap ? 0 : p->start;
++	u32 len = p->size, i, k, end = len;
++	int seen = 0;
++
++	if (p->sig != 0x43474244 || len > cap)
++		return CMD_RET_FAILURE;
++	/* Find the second-to-last entry mark: the previous boot ends there. */
++	for (i = len; i >= sizeof(mark) - 1 && seen < 1; i--) {
++		for (k = 0; k < sizeof(mark) - 1; k++)
++			if (p->data[(first + i - (sizeof(mark) - 1) + k) % cap] !=
++			    mark[k])
++				break;
++		if (k == sizeof(mark) - 1) {
++			end = i - (sizeof(mark) - 1);
++			seen++;
++		}
++	}
++	for (i = end > n ? end - n : 0; i < end; i++)
++		putc(p->data[(first + i) % cap]);
++	putc('\n');
++	return CMD_RET_SUCCESS;
+ }
+ 
++U_BOOT_CMD(pstoreprev, 2, 0, do_pstoreprev,
++	   "print the end of the previous boot's console record", "[bytes]");
++
+ /* See MEDIATEK_MOBILE_PROBE_STAGE: prove progress by rebooting to fastboot. */
+ static void mtk_probe(int stage)
+ {
+-- 
+2.55.0
+

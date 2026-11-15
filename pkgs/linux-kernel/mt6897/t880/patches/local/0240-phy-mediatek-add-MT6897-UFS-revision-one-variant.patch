@@ -1,0 +1,174 @@
+From 3a85839a1e220f5768f31525a0a27e75c88f4115 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 11 Nov 2026 04:41:13 +0800
+Subject: [PATCH] phy: mediatek: ufs: add the MT6897 revision-one variant
+
+The MT6897 revision-one PHY does not run the MT8183 AP clock and power
+sequence. Select separate match data and empty PHY operations while
+keeping the provider and host attachment. Remove the fixed clock inputs
+and describe the standalone MT6897 compatible in the binding and SoC DT.
+
+This follows the MediaTek mphy-ver=1 path, which skips clock setup and
+both power callbacks independently of host MTCMOS policy. Keep the old
+MT8183/MT8195 path unchanged and retain the UFS host's clocks and reference-
+clock protocol. This does not add a new firmware call or power policy.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/phy/mediatek/phy-mtk-ufs.c#L150-L177
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/phy/mediatek/phy-mtk-ufs.c#L250-L260
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ .../bindings/phy/mediatek,ufs-phy.yaml        | 21 ++++++++--
+ arch/arm64/boot/dts/mediatek/mt6897.dtsi      |  6 +--
+ drivers/phy/mediatek/phy-mtk-ufs.c            | 38 ++++++++++++++++---
+ 3 files changed, 53 insertions(+), 12 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/phy/mediatek,ufs-phy.yaml b/Documentation/devicetree/bindings/phy/mediatek,ufs-phy.yaml
+index 6e2edd43fc..fecfa128e0 100644
+--- a/Documentation/devicetree/bindings/phy/mediatek,ufs-phy.yaml
++++ b/Documentation/devicetree/bindings/phy/mediatek,ufs-phy.yaml
+@@ -28,7 +28,9 @@ properties:
+           - enum:
+               - mediatek,mt8195-ufsphy
+           - const: mediatek,mt8183-ufsphy
+-      - const: mediatek,mt8183-ufsphy
++      - enum:
++          - mediatek,mt8183-ufsphy
++          - mediatek,mt6897-ufsphy
+ 
+   reg:
+     maxItems: 1
+@@ -46,12 +48,25 @@ properties:
+   "#phy-cells":
+     const: 0
+ 
++allOf:
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: mediatek,mt6897-ufsphy
++    then:
++      properties:
++        clocks: false
++        clock-names: false
++    else:
++      required:
++        - clocks
++        - clock-names
++
+ required:
+   - compatible
+   - reg
+   - "#phy-cells"
+-  - clocks
+-  - clock-names
+ 
+ additionalProperties: false
+ 
+diff --git a/arch/arm64/boot/dts/mediatek/mt6897.dtsi b/arch/arm64/boot/dts/mediatek/mt6897.dtsi
+index 073cbe8e60..c84c9c12ce 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6897.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6897.dtsi
+@@ -1184,11 +1184,9 @@ mmc1: mmc@11240000 {
+ 			status = "disabled";
+ 		};
+ 
+-		ufsphy: phy@112a0000 {
+-			compatible = "mediatek,mt8183-ufsphy";
++		ufsphy: ufs-phy@112a0000 {
++			compatible = "mediatek,mt6897-ufsphy";
+ 			reg = <0x0 0x112a0000 0x0 0x10000>;
+-			clocks = <&clk26m>, <&clk26m>;
+-			clock-names = "unipro", "mp";
+ 			#phy-cells = <0>;
+ 			status = "disabled";
+ 		};
+diff --git a/drivers/phy/mediatek/phy-mtk-ufs.c b/drivers/phy/mediatek/phy-mtk-ufs.c
+index fc19e0fa8e..00bcaf6850 100644
+--- a/drivers/phy/mediatek/phy-mtk-ufs.c
++++ b/drivers/phy/mediatek/phy-mtk-ufs.c
+@@ -10,6 +10,7 @@
+ #include <linux/module.h>
+ #include <linux/phy/phy.h>
+ #include <linux/platform_device.h>
++#include <linux/property.h>
+ 
+ #include "phy-mtk-io.h"
+ 
+@@ -35,6 +36,11 @@
+ 
+ #define UFSPHY_CLKS_CNT    2
+ 
++struct ufs_mtk_phy_data {
++	const struct phy_ops *ops;
++	bool no_clocks;
++};
++
+ struct ufs_mtk_phy {
+ 	struct device *dev;
+ 	void __iomem *mmio;
+@@ -146,14 +152,33 @@ static const struct phy_ops ufs_mtk_phy_ops = {
+ 	.owner          = THIS_MODULE,
+ };
+ 
++/* MT6897 PHY revision 1 has no legacy AP power/clock sequence. */
++static const struct phy_ops ufs_mt6897_phy_ops = {
++	.owner = THIS_MODULE,
++};
++
++static const struct ufs_mtk_phy_data mt8183_ufs_phy_data = {
++	.ops = &ufs_mtk_phy_ops,
++};
++
++static const struct ufs_mtk_phy_data mt6897_ufs_phy_data = {
++	.ops = &ufs_mt6897_phy_ops,
++	.no_clocks = true,
++};
++
+ static int ufs_mtk_phy_probe(struct platform_device *pdev)
+ {
++	const struct ufs_mtk_phy_data *data;
+ 	struct device *dev = &pdev->dev;
+ 	struct phy *generic_phy;
+ 	struct phy_provider *phy_provider;
+ 	struct ufs_mtk_phy *phy;
+ 	int ret;
+ 
++	data = device_get_match_data(dev);
++	if (!data)
++		return -ENODEV;
++
+ 	phy = devm_kzalloc(dev, sizeof(*phy), GFP_KERNEL);
+ 	if (!phy)
+ 		return -ENOMEM;
+@@ -164,11 +189,13 @@ static int ufs_mtk_phy_probe(struct platform_device *pdev)
+ 
+ 	phy->dev = dev;
+ 
+-	ret = ufs_mtk_phy_clk_init(phy);
+-	if (ret)
+-		return ret;
++	if (!data->no_clocks) {
++		ret = ufs_mtk_phy_clk_init(phy);
++		if (ret)
++			return ret;
++	}
+ 
+-	generic_phy = devm_phy_create(dev, NULL, &ufs_mtk_phy_ops);
++	generic_phy = devm_phy_create(dev, NULL, data->ops);
+ 	if (IS_ERR(generic_phy))
+ 		return PTR_ERR(generic_phy);
+ 
+@@ -180,7 +207,8 @@ static int ufs_mtk_phy_probe(struct platform_device *pdev)
+ }
+ 
+ static const struct of_device_id ufs_mtk_phy_of_match[] = {
+-	{.compatible = "mediatek,mt8183-ufsphy"},
++	{ .compatible = "mediatek,mt8183-ufsphy", .data = &mt8183_ufs_phy_data },
++	{ .compatible = "mediatek,mt6897-ufsphy", .data = &mt6897_ufs_phy_data },
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(of, ufs_mtk_phy_of_match);
+-- 
+2.56.0
+

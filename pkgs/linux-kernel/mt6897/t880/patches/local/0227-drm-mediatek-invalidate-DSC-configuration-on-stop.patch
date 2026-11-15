@@ -1,0 +1,301 @@
+From e2e54a859bda37081145370c1814bce71c44b281 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 10 Nov 2026 09:02:41 +0800
+Subject: [PATCH] drm/mediatek: Forget DSC configuration when stopping
+
+The CRTC starts DSC before DSI performs its late DSC setup. Retaining
+dsc_config_done after stop allows the next start to enable compression
+with geometry and PPS registers lost through display-domain power loss.
+
+Invalidate the configured state when stopping the core and its resolved
+twin. The next start follows the initial bypass path until setup programs
+the hardware and marks both cores configured again.
+
+Exercise the production start/setup wrapper/stop sequence across simulated
+register loss, including single-core, dual-core and legacy layouts. The
+same regression detects an unsafe enable with the previous stop function.
+
+Fixes: 07ccea463e39 ("drm/mediatek: Implement Display Stream Compression support")
+Link: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=07ccea463e39649c26fe244ab836d536cafbe348
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/gpu/drm/mediatek/mtk_disp_dsc.c       |   6 +-
+ tools/testing/selftests/mtk_clk/Makefile      |   4 +-
+ .../selftests/mtk_clk/dsc_epoch_cases.c       | 185 ++++++++++++++++++
+ .../selftests/mtk_clk/test_dsc_epoch.py       |  42 ++++
+ 4 files changed, 234 insertions(+), 3 deletions(-)
+ create mode 100644 tools/testing/selftests/mtk_clk/dsc_epoch_cases.c
+ create mode 100755 tools/testing/selftests/mtk_clk/test_dsc_epoch.py
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_dsc.c b/drivers/gpu/drm/mediatek/mtk_disp_dsc.c
+index 765624a9c1..0729f06807 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_dsc.c
++++ b/drivers/gpu/drm/mediatek/mtk_disp_dsc.c
+@@ -493,9 +493,13 @@ void mtk_dsc_stop(struct device *dev)
+ {
+ 	struct mtk_dsc *disp_dsc = dev_get_drvdata(dev);
+ 
++	/* Configuration may be lost while stopped; start in bypass until setup. */
++	disp_dsc->dsc_config_done = false;
+ 	writel(0, disp_dsc->reg + DISP_REG_DSC_CON);
+-	if (mtk_dsc_twin(disp_dsc))
++	if (mtk_dsc_twin(disp_dsc)) {
++		disp_dsc->twin->dsc_config_done = false;
+ 		writel(0, disp_dsc->twin->reg + DISP_REG_DSC_CON);
++	}
+ }
+ 
+ static int mtk_dsc_bind(struct device *dev, struct device *master, void *data)
+diff --git a/tools/testing/selftests/mtk_clk/Makefile b/tools/testing/selftests/mtk_clk/Makefile
+index 0f9d612a6f..35b752a3df 100644
+--- a/tools/testing/selftests/mtk_clk/Makefile
++++ b/tools/testing/selftests/mtk_clk/Makefile
+@@ -1,4 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-TEST_PROGS := test_tinysys_mailbox.py test_dram_bootstrap.py test_mt6897.py test_domains.py test_boot_owner.py test_directlink.py test_display_pm.py test_dpintf_pm.py test_cmdq_stop.py test_crtc_stop.py test_dsi_routing.py
+-TEST_FILES := tinysys_mailbox_cases.c mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c ven_cases.c boot_stubs.h boot_cases.c directlink_cases.c display_pm_cases.c mmsys_pm_cases.c dpintf_pm_cases.c cmdq_stop_cases.c crtc_stop_cases.c dsi_routing_cases.c dsi_mmsys_cases.c
++TEST_PROGS := test_tinysys_mailbox.py test_dram_bootstrap.py test_mt6897.py test_domains.py test_boot_owner.py test_directlink.py test_display_pm.py test_dpintf_pm.py test_cmdq_stop.py test_crtc_stop.py test_dsi_routing.py test_dsc_epoch.py
++TEST_FILES := tinysys_mailbox_cases.c mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c ven_cases.c boot_stubs.h boot_cases.c directlink_cases.c display_pm_cases.c mmsys_pm_cases.c dpintf_pm_cases.c cmdq_stop_cases.c crtc_stop_cases.c dsi_routing_cases.c dsi_mmsys_cases.c dsc_epoch_cases.c
+ include ../lib.mk
+diff --git a/tools/testing/selftests/mtk_clk/dsc_epoch_cases.c b/tools/testing/selftests/mtk_clk/dsc_epoch_cases.c
+new file mode 100644
+index 0000000000..fcf2b9e3cb
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/dsc_epoch_cases.c
+@@ -0,0 +1,185 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++#define __iomem
++#define BIT(n) (1U << (n))
++typedef uint32_t u32;
++struct clk;
++struct device { void *data; };
++struct platform_device { struct device dev; };
++struct device_node { struct platform_device *device; };
++struct mtk_dsc_data { bool dsi_buffer; };
++struct drm_dsc_config { int cookie; };
++/* DECLARATIONS */
++
++static u32 registers[2][4];
++static bool programmed[2];
++static int unsafe_enables, setup_calls, gets, put_count;
++static bool setup_dual[2];
++static struct mtk_dsc *cores[2];
++static struct mtk_dsc *source_core;
++
++static void *dev_get_drvdata(struct device *dev)
++{
++	return dev->data;
++}
++
++static void *platform_get_drvdata(struct platform_device *pdev)
++{
++	return pdev->dev.data;
++}
++
++static struct platform_device *of_find_device_by_node(struct device_node *node)
++{
++	if (node->device)
++		gets++;
++	return node->device;
++}
++
++static void put_device(struct device *dev)
++{
++	put_count++;
++}
++
++static u32 readl(void *reg)
++{
++	return *(u32 *)reg;
++}
++
++static void writel(u32 value, void *reg)
++{
++	int id = reg == registers[0] ? 0 : 1;
++
++	assert(reg == registers[id]);
++	if ((value & DSC_EN) && !(value & DSC_BYPASS) && !programmed[id])
++		unsafe_enables++;
++	*(u32 *)reg = value;
++}
++
++/* Only the arithmetic/PPS backend is mocked; setup's flag/twin wrapper is real. */
++static void mtk_dsc_setup_core(struct mtk_dsc *dsc, void *reg,
++			       struct drm_dsc_config *cfg, bool dual_inout)
++{
++	int id = dsc == cores[0] ? 0 : 1;
++
++	assert(dsc == cores[id] && reg == registers[id] && cfg->cookie == 42);
++	assert(source_core->data->dsi_buffer == dsc->data->dsi_buffer);
++	setup_calls++;
++	setup_dual[id] = dual_inout;
++	programmed[id] = true;
++	writel(DSC_EN | DSC_UFOE_SEL | (dual_inout ? DSC_DUAL_INOUT : 0), reg);
++}
++
++/* PRODUCTION */
++
++static void power_loss(void)
++{
++	memset(registers, 0, sizeof(registers));
++	memset(programmed, 0, sizeof(programmed));
++}
++
++static void check_bypass(bool dual)
++{
++	assert(unsafe_enables == 0);
++	assert(registers[0][0] == (DSC_EN | DSC_BYPASS | DSC_UFOE_SEL | DSC_DUAL_INOUT));
++	if (dual)
++		assert(registers[1][0] == (DSC_EN | DSC_BYPASS | DSC_UFOE_SEL));
++}
++
++static void run_epochs(bool dual, bool v1)
++{
++	struct mtk_dsc_data data = { .dsi_buffer = v1 };
++	struct mtk_dsc master = { .reg = registers[0], .data = &data };
++	struct mtk_dsc twin = { .reg = registers[1], .data = &data };
++	struct platform_device twin_device = { .dev.data = &twin };
++	struct device_node node = { .device = &twin_device };
++	struct device dev = { .data = &master };
++	struct drm_dsc_config config = { .cookie = 42 };
++	int calls;
++
++	cores[0] = &master;
++	cores[1] = &twin;
++	source_core = &master;
++	master.twin_np = dual ? &node : NULL;
++	unsafe_enables = 0;
++	setup_calls = 0;
++	gets = 0;
++	put_count = 0;
++	power_loss();
++
++	/* The real CRTC order starts components before the DSI's late DSC setup. */
++	mtk_dsc_start(&dev);
++	check_bypass(dual);
++	assert(gets == put_count && gets == (dual ? 1 : 0));
++	mtk_dsc_setup(&dev, &config);
++	assert(setup_calls == (dual ? 2 : 1));
++	assert(setup_dual[0] == dual);
++	assert(!dual || !setup_dual[1]);
++	assert(master.dsc_config_done && (!dual || twin.dsc_config_done));
++
++	/* Already-configured start without stop retains compressed operation. */
++	mtk_dsc_start(&dev);
++	assert(!(registers[0][0] & DSC_BYPASS));
++	assert(!dual || !(registers[1][0] & DSC_BYPASS));
++	assert(unsafe_enables == 0);
++
++	for (int epoch = 0; epoch < 3; epoch++) {
++		calls = setup_calls;
++		mtk_dsc_stop(&dev);
++		assert(registers[0][0] == 0 && (!dual || registers[1][0] == 0));
++		power_loss();
++		mtk_dsc_start(&dev);
++		check_bypass(dual);
++		assert(setup_calls == calls);
++		mtk_dsc_setup(&dev, &config);
++		assert(setup_calls == calls + (dual ? 2 : 1));
++		assert(!(registers[0][0] & DSC_BYPASS));
++		assert(!dual || !(registers[1][0] & DSC_BYPASS));
++		assert(unsafe_enables == 0);
++	}
++
++	/* Stop resolves an uncached twin and invalidates both configured cores. */
++	if (dual)
++		master.twin = NULL;
++	mtk_dsc_stop(&dev);
++	power_loss();
++	mtk_dsc_start(&dev);
++	check_bypass(dual);
++	mtk_dsc_stop(&dev);
++	mtk_dsc_stop(&dev);
++	assert(registers[0][0] == 0 && (!dual || registers[1][0] == 0));
++	assert(gets == put_count);
++	if (!dual)
++		assert(!twin.dsc_config_done && registers[1][0] == 0);
++}
++
++static void test_unresolved_twin(void)
++{
++	struct mtk_dsc_data data = {};
++	struct mtk_dsc master = { .reg = registers[0], .data = &data,
++				  .dsc_config_done = true };
++	struct device_node missing = {};
++	struct device dev = { .data = &master };
++
++	master.twin_np = &missing;
++	unsafe_enables = 0;
++	power_loss();
++	mtk_dsc_stop(&dev);
++	mtk_dsc_start(&dev);
++	check_bypass(false);
++}
++
++int main(void)
++{
++	run_epochs(false, false);
++	run_epochs(true, false);
++	run_epochs(false, true);
++	run_epochs(true, true);
++	test_unresolved_twin();
++	puts("DSC production epoch regression: PASS");
++	return 0;
++}
+diff --git a/tools/testing/selftests/mtk_clk/test_dsc_epoch.py b/tools/testing/selftests/mtk_clk/test_dsc_epoch.py
+new file mode 100755
+index 0000000000..fbd3e442d1
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/test_dsc_epoch.py
+@@ -0,0 +1,42 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Exercise production DSC start/setup/stop across register power loss."""
++from pathlib import Path
++import os
++import re
++import subprocess
++import tempfile
++
++assets = Path(__file__).resolve().parent
++repo = Path(os.environ.get('KERNEL_SRC', str(assets.parents[3])))
++source = (repo / 'drivers/gpu/drm/mediatek/mtk_disp_dsc.c').read_text()
++
++
++def function(name):
++    match = re.search(r'^(?:static )?(?:void|struct mtk_dsc \*)\s*' + name + r'\(', source, re.M)
++    start = match.start()
++    end = source.index('{', start) + 1
++    depth = 1
++    while depth:
++        depth += (source[end] == '{') - (source[end] == '}')
++        end += 1
++    return source[start:end]
++
++
++constants = '\n'.join(re.search(r'^#\s*define ' + name + r'\s+.*$', source, re.M)[0]
++                      for name in ['DISP_REG_DSC_CON', 'DSC_EN', 'DSC_DUAL_INOUT',
++                                   'DSC_BYPASS', 'DSC_UFOE_SEL'])
++structure = re.search(r'^struct mtk_dsc \{.*?^};', source, re.M | re.S)[0]
++production = '\n'.join(function(name) for name in [
++    'mtk_dsc_twin', 'mtk_dsc_setup', 'mtk_dsc_start', 'mtk_dsc_stop'])
++cases = (assets / 'dsc_epoch_cases.c').read_text()
++with tempfile.TemporaryDirectory(prefix='mtk-dsc-epoch-') as tmp:
++    tmp = Path(tmp)
++    c = tmp / 'test.c'
++    c.write_text(cases.replace('/* DECLARATIONS */', constants + '\n' + structure)
++                 .replace('/* PRODUCTION */', production))
++    binary = tmp / 'test'
++    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
++                    '-Wno-unused-parameter', '-Werror', '-g', '-fsanitize=address,undefined',
++                    str(c), '-o', str(binary)], check=True)
++    subprocess.run([str(binary)], check=True)
+-- 
+2.56.0
+

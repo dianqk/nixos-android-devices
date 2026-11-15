@@ -1,0 +1,51 @@
+From 68730232649ac565fb43e87cd8e7395d21848da9 Mon Sep 17 00:00:00 2001
+From: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Date: Tue, 20 Oct 2026 14:47:02 +0200
+Subject: [PATCH 034/144] crypto: qce - Use a fallback for CCM with a partial
+ final block
+
+CCM builds on AES-CTR for encryption, and the crypto engine stalls on a
+partial final block just as it does for plain ctr(aes): a payload whose
+length is not a multiple of the AES block size leaves the operation
+incomplete and fails with a hardware operation error. This was caught by
+the ccm(aes) crypto self-tests.
+
+Force the software fallback for CCM requests whose message length is not
+block aligned, reusing the driver's existing need_fallback mechanism.
+
+Cc: stable@vger.kernel.org
+Fixes: 9363efb4181c ("crypto: qce - Add support for AEAD algorithms")
+Tested-by: Kuldeep Singh <kuldeep.singh@oss.qualcomm.com>
+Tested-by: Pankaj Patil <pankaj.patil@oss.qualcomm.com>
+Signed-off-by: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Message-ID: <20261020-qce-fixes-aead-v12-2-77a2e09abd0c@oss.qualcomm.com>
+Link: https://lore.kernel.org/r/20261020-qce-fixes-aead-v12-2-77a2e09abd0c@oss.qualcomm.com
+(cherry picked from commit 55f08e690d6ba6ad2ccc93c0680cce220f9ba0e8)
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0052-crypto-qce-Use-a-fallback-for-CCM-with-a-partial-fin.patch
+Import-SHA256: 0ced6558a9dce13ad655aa8344dff9cfd9b771bf1522b0682806657854ab2b0d
+Import-Provenance: mail headers
+(cherry picked from commit 2f17163480c793566ebf2a6d82636af542fe9bc0)
+---
+ drivers/crypto/qce/aead.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/drivers/crypto/qce/aead.c b/drivers/crypto/qce/aead.c
+index 09be3f745f..d072dc5ba1 100644
+--- a/drivers/crypto/qce/aead.c
++++ b/drivers/crypto/qce/aead.c
+@@ -515,6 +515,14 @@ static int qce_aead_crypt(struct aead_request *req, int encrypt)
+ 			fallback = true;
+ 	}
+ 
++	/*
++	 * CCM uses AES-CTR internally and the CE stalls on a partial final
++	 * block, so a payload that is not a multiple of the block size has to
++	 * be handled by the fallback.
++	 */
++	if (IS_CCM(rctx->flags) && !IS_ALIGNED(rctx->cryptlen, AES_BLOCK_SIZE))
++		fallback = true;
++
+ 	/* If fallback is needed, schedule and exit */
+ 	if (fallback) {
+ 		aead_request_set_tfm(&rctx->fallback_req, ctx->fallback);

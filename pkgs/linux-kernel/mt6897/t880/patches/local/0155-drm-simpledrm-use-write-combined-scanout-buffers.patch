@@ -1,0 +1,62 @@
+From 0fc2cf0fa07a276164401daf6af24d65bced3e27 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] drm/simpledrm: use write-combined scanout buffers
+
+drm/simpledrm: use write-combined scanout buffers.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-15T18:28:21+08:00
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/gpu/drm/sysfb/simpledrm.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/drivers/gpu/drm/sysfb/simpledrm.c b/drivers/gpu/drm/sysfb/simpledrm.c
+index 21ddf4502e..2ba264fbc5 100644
+--- a/drivers/gpu/drm/sysfb/simpledrm.c
++++ b/drivers/gpu/drm/sysfb/simpledrm.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ 
+ #include <linux/aperture.h>
++#include <linux/slab.h>
+ #include <linux/clk.h>
+ #include <linux/minmax.h>
+ #include <linux/of_address.h>
+@@ -887,9 +888,30 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
+ 
+ DEFINE_DRM_GEM_FOPS(simpledrm_fops);
+ 
++/*
++ * Buffers may be rendered by a non-coherent GPU (through kmsro/PRIME) and
++ * are then copied to the framebuffer by the CPU. drm_gem_fb_begin_cpu_access()
++ * does no cache maintenance for buffers this driver allocated itself, so map
++ * them write-combined: the copy then reads what the GPU wrote instead of
++ * stale cache lines.
++ */
++static struct drm_gem_object *simpledrm_gem_create_object(struct drm_device *dev,
++							  size_t size)
++{
++	struct drm_gem_shmem_object *shmem;
++
++	shmem = kzalloc(sizeof(*shmem), GFP_KERNEL);
++	if (!shmem)
++		return ERR_PTR(-ENOMEM);
++	shmem->map_wc = true;
++
++	return &shmem->base;
++}
++
+ static struct drm_driver simpledrm_driver = {
+ 	DRM_GEM_SHMEM_DRIVER_OPS,
+ 	DRM_FBDEV_SHMEM_DRIVER_OPS,
++	.gem_create_object	= simpledrm_gem_create_object,
+ 	.name			= DRIVER_NAME,
+ 	.desc			= DRIVER_DESC,
+ 	.major			= DRIVER_MAJOR,
+-- 
+2.56.0
+

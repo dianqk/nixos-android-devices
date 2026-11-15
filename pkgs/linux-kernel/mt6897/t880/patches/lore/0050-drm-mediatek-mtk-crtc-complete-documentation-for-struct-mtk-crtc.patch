@@ -1,0 +1,79 @@
+From ebe490162237fc11e603f1904be5de5af47313ab Mon Sep 17 00:00:00 2001
+From: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Date: Tue, 14 Jul 2026 13:43:46 +0200
+Subject: [PATCH] drm/mediatek: mtk_crtc: Complete documentation for struct
+ mtk_crtc
+
+The mtk_crtc structure was missing many member descriptions, for
+which reason, a while ago it was demoted from kerneldoc to code
+comment.
+
+Add documentation for all of the missing structure members and
+promote it back to kerneldoc.
+
+Signed-off-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Link: https://patchwork.kernel.org/project/linux-mediatek/list/?series=1127365
+[dianqk: from the Huge Restructuring v2 series, applied to v7.3-rc6; rc6 drift resolved]
+---
+ drivers/gpu/drm/mediatek/mtk_crtc.c | 33 +++++++++++++++++++----------
+ 1 file changed, 22 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_crtc.c b/drivers/gpu/drm/mediatek/mtk_crtc.c
+index 151bc50e29..128acc5a24 100644
+--- a/drivers/gpu/drm/mediatek/mtk_crtc.c
++++ b/drivers/gpu/drm/mediatek/mtk_crtc.c
+@@ -41,18 +41,31 @@ struct mtk_crtc_hw_layer {
+ 	u8 layer_stages_nr;
+ };
+ 
+-/*
++/**
+  * struct mtk_crtc - MediaTek specific crtc structure.
+- * @base: crtc object.
+- * @enabled: records whether crtc_enable succeeded
++ * @base:            CRTC object
++ * @enabled:         Records whether crtc_enable succeeded
++ * @pending_needs_vblank: Records whether pending config operation needs a VBlank to finish
++ * @event:           VBlank event to signal upon completion of state update
+  * @hwlayers:        Array of mtk_crtc_hw_layer structures, one for each overlay plane
+  * @hwlayer_nr:      Number of hwlayers
+- * @mmsys_dev: pointer to the mmsys device for configuration registers
+- * @mutex: handle to one of the ten disp_mutex streams
+- * @ddp_comp_nr: number of components in ddp_comp
+- * @ddp_comp: array of pointers the mtk_ddp_comp structures used by this crtc
+- *
+- * TODO: Needs update: this header is missing a bunch of member descriptions.
++ * @pending_planes:  Planes pending atomic configuration operation
++ * @pending_async_planes: Planes pending asynchronous configuration operation
++ * @cmdq_client:     CMDQ Mailbox Client structure
++ * @cmdq_handle:     Handle to CMDQ Packet structure, used to send a packet
++ * @cmdq_event:      Bitmask of GCE Events that CMDQ listens to (to send packets on event)
++ * @cmdq_vblank_cnt: Number of VBlanks after which CMDQ packet sending operation times out
++ * @cb_blocking_queue: Wait queue for sending blocking command packet through CMDQ Mailbox
++ * @mmsys_dev:       Pointer to the MMSYS device for configuration registers
++ * @dma_dev:         Pointer to the DMA device (usually linked to an IOMMU)
++ * @mutex:           Pointer to the MediaTek MuteX device for HW triggers mute/unmuting
++ * @ddp_comp_nr:     Number of HW components in ddp_comp structure
++ * @num_conn_routes: Number of alternative connection routes for a pipeline
++ * @conn_routes:     Array of HW components usable as alternative connection route
++ * @hw_lock:         Display HW access mutex lock
++ * @config_updating: Tracks whether an asynchronous config update operation is in progress
++ * @config_lock:     Spinlock to protect config_updating variable
++ * @ddp_comp:        Array of HW components used in one Display Controller pipeline
+  */
+ struct mtk_crtc {
+ 	struct drm_crtc			base;
+@@ -81,10 +94,8 @@ struct mtk_crtc {
+ 	unsigned int			num_conn_routes;
+ 	const struct mtk_drm_route	*conn_routes;
+ 
+-	/* lock for display hardware access */
+ 	struct mutex			hw_lock;
+ 	bool				config_updating;
+-	/* lock for config_updating to cmd buffer */
+ 	spinlock_t			config_lock;
+ 
+ 	struct mtk_ddp_comp		*ddp_comp[];
+-- 
+2.56.0
+

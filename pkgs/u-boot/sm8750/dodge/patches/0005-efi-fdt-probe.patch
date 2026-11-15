@@ -1,0 +1,255 @@
+From 1cb2fa0e33c66dcda3a981ae7cb671b1afad1be7 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Thu, 5 Nov 2026 21:37:09 +0800
+Subject: [PATCH] efi: add read-only FDT and RAM initrd inspection app
+
+Report the installed OS device tree, bank and reservation tuples, usable-memory range and boot arguments. Inspect all EFI memory descriptors and read the RAM initrd through LoadFile2 to report its length and CRC32. Return to the caller without media or variable writes.
+---
+ lib/efi_loader/Makefile    |   2 +-
+ lib/efi_loader/fdt_probe.c | 224 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 225 insertions(+), 1 deletion(-)
+ create mode 100644 lib/efi_loader/fdt_probe.c
+
+diff --git a/lib/efi_loader/Makefile b/lib/efi_loader/Makefile
+index dd8720ab..05739d72 100644
+--- a/lib/efi_loader/Makefile
++++ b/lib/efi_loader/Makefile
+@@ -15,7 +15,7 @@ CFLAGS_efi_boottime.o += \
+ # These are the apps that are built
+ apps-$(CONFIG_RISCV) += boothart
+ apps-$(CONFIG_BOOTEFI_HELLO_COMPILE) += helloworld
+-apps-$(CONFIG_EFI_DODGE_PROBE_COMPILE) += dodge_probe
++apps-$(CONFIG_EFI_DODGE_PROBE_COMPILE) += dodge_probe fdt_probe
+ apps-$(CONFIG_GENERATE_SMBIOS_TABLE) += smbiosdump
+ apps-$(CONFIG_EFI_LOAD_FILE2_INITRD) += initrddump
+ ifeq ($(CONFIG_GENERATE_ACPI_TABLE),)
+diff --git a/lib/efi_loader/fdt_probe.c b/lib/efi_loader/fdt_probe.c
+new file mode 100644
+index 00000000..40c99c3a
+--- /dev/null
++++ b/lib/efi_loader/fdt_probe.c
+@@ -0,0 +1,224 @@
++// SPDX-License-Identifier: GPL-2.0+
++/* Return-to-caller EFI FDT, memory-map and RAM-initrd inspection; no media I/O. */
++#include <efi_api.h>
++#include <efi_load_initrd.h>
++#include <linux/libfdt.h>
++
++static struct efi_system_table *st;
++static const efi_guid_t fdt_guid = EFI_FDT_GUID;
++static const efi_guid_t image_guid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
++static const efi_guid_t load_guid = EFI_LOAD_FILE2_PROTOCOL_GUID;
++static const struct efi_lo_dp_prefix initrd_dp = {
++	.vendor = {
++		{ DEVICE_PATH_TYPE_MEDIA_DEVICE, DEVICE_PATH_SUB_TYPE_VENDOR_PATH,
++		  sizeof(initrd_dp.vendor) }, EFI_INITRD_MEDIA_GUID,
++	},
++	.end = { DEVICE_PATH_TYPE_END, DEVICE_PATH_SUB_TYPE_END, sizeof(initrd_dp.end) },
++};
++
++static void field(const u16 *name, u64 value)
++{
++	u16 text[19];
++	unsigned int i;
++
++	text[0] = '0'; text[1] = 'x';
++	for (i = 0; i < 16; i++) {
++		u32 n = (value >> (60 - i * 4)) & 15;
++		text[i + 2] = n < 10 ? '0' + n : 'a' + n - 10;
++	}
++	text[18] = 0;
++	st->con_out->output_string(st->con_out, name);
++	st->con_out->output_string(st->con_out, text);
++	st->con_out->output_string(st->con_out, u"\r\n");
++}
++
++static bool equal(const char *a, const char *b)
++{
++	while (*a && *a == *b) { a++; b++; }
++	return *a == *b;
++}
++
++static void text(const u16 *name, const char *value, u32 len)
++{
++	u16 c[2] = { 0, 0 };
++	u32 i;
++
++	st->con_out->output_string(st->con_out, name);
++	for (i = 0; i < len; i++) {
++		c[0] = !value[i] ? '|' : value[i] >= 32 && value[i] < 127 ? value[i] : '?';
++		st->con_out->output_string(st->con_out, c);
++	}
++	st->con_out->output_string(st->con_out, u"\r\n");
++}
++
++static u32 be32(const void *ptr)
++{
++	const u8 *p = ptr;
++	return (u32)p[0] << 24 | (u32)p[1] << 16 | (u32)p[2] << 8 | p[3];
++}
++
++static u64 be64(const void *ptr)
++{
++	return (u64)be32(ptr) << 32 | be32((const u8 *)ptr + 4);
++}
++
++static efi_status_t report_fdt(const u8 *fdt)
++{
++	const struct fdt_header *h = (const void *)fdt;
++	u32 total = be32(&h->totalsize), so = be32(&h->off_dt_struct);
++	u32 ss = be32(&h->size_dt_struct), to = be32(&h->off_dt_strings);
++	u32 ts = be32(&h->size_dt_strings), pos = so, depth = 0, types[64] = { 0 };
++	u32 ac = 2, sc = 2, rac = 2, rsc = 2;
++
++	if (be32(&h->magic) != FDT_MAGIC || total < sizeof(*h) || total > 0x200000 ||
++	    so > total || ss < 4 || ss > total - so || to > total || ts > total - to)
++		return EFI_LOAD_ERROR;
++	field(u"fdt_address=", (uintptr_t)fdt);
++	field(u"fdt_bytes=", total);
++	{
++		u32 offset = be32(&h->off_mem_rsvmap);
++		bool ended = false;
++		while (offset <= total && total - offset >= 16) {
++			u64 start = be64(fdt + offset), size = be64(fdt + offset + 8);
++			if (!size) { ended = true; break; }
++			field(u"memreserve_start=", start); field(u"memreserve_size=", size);
++			offset += 16;
++		}
++		if (!ended) return EFI_LOAD_ERROR;
++	}
++
++	while (pos <= so + ss - 4) {
++		u32 token = be32(fdt + pos);
++		pos += 4;
++		if (token == FDT_BEGIN_NODE) {
++			u32 len = 0, type = 0;
++			while (pos + len < so + ss && fdt[pos + len]) len++;
++			if (pos + len >= so + ss || depth == 64) return EFI_LOAD_ERROR;
++			if (!depth) type = 1;
++			else if (depth == 1 && equal((const char *)fdt + pos, "chosen")) type = 2;
++			else if (depth == 1 && (len >= 6) &&
++				 fdt[pos] == 'm' && fdt[pos + 1] == 'e' && fdt[pos + 2] == 'm' &&
++				 fdt[pos + 3] == 'o' && fdt[pos + 4] == 'r' && fdt[pos + 5] == 'y' &&
++				 (len == 6 || fdt[pos + 6] == '@')) type = 3;
++			else if (depth == 1 && equal((const char *)fdt + pos, "reserved-memory")) type = 4;
++			else if (types[depth - 1] == 4) type = 5;
++			types[depth++] = type;
++			if (type == 5) text(u"reserved_node=", (const char *)fdt + pos, len);
++			pos += (len + 4) & ~3;
++		} else if (token == FDT_END_NODE) {
++			if (!depth) return EFI_LOAD_ERROR;
++			depth--;
++		} else if (token == FDT_PROP) {
++			u32 len, no, name_len = 0, type, i;
++			const char *name;
++			const u8 *value;
++			if (!depth || pos > so + ss - 8) return EFI_LOAD_ERROR;
++			len = be32(fdt + pos); no = be32(fdt + pos + 4); pos += 8;
++			if (len > so + ss - pos || no >= ts) return EFI_LOAD_ERROR;
++			name = (const char *)fdt + to + no; value = fdt + pos;
++			while (no + name_len < ts && name[name_len]) name_len++;
++			if (no + name_len >= ts) return EFI_LOAD_ERROR;
++			type = types[depth - 1];
++			if (type == 1 && len == 4 && equal(name, "#address-cells")) ac = be32(value);
++			if (type == 1 && len == 4 && equal(name, "#size-cells")) sc = be32(value);
++			if (type == 4 && equal(name, "#address-cells")) {
++				if (len != 4) return EFI_LOAD_ERROR;
++				rac = be32(value);
++			}
++			if (type == 4 && equal(name, "#size-cells")) {
++				if (len != 4) return EFI_LOAD_ERROR;
++				rsc = be32(value);
++			}
++			if (type == 1 && equal(name, "compatible")) text(u"compatible=", (const char *)value, len);
++			if (type == 2 && equal(name, "bootargs")) text(u"bootargs=", (const char *)value, len);
++			if (type == 2 && equal(name, "linux,usable-memory-range")) {
++				if (len != 16 || ac != 2 || sc != 2) return EFI_UNSUPPORTED;
++				field(u"usable_start=", be64(value)); field(u"usable_size=", be64(value + 8));
++			}
++			if (type == 2 && equal(name, "linux,initrd-start")) field(u"chosen_initrd_start_present=", 1);
++			if (type == 2 && equal(name, "linux,initrd-end")) field(u"chosen_initrd_end_present=", 1);
++			if ((type == 3 || type == 5) && equal(name, "reg")) {
++				if ((type == 3 && (ac != 2 || sc != 2)) ||
++				    (type == 5 && (rac != 2 || rsc != 2)) || len % 16)
++					return EFI_UNSUPPORTED;
++				for (i = 0; i < len; i += 16) {
++					field(type == 3 ? u"memory_start=" : u"reserved_start=", be64(value + i));
++					field(type == 3 ? u"memory_size=" : u"reserved_size=", be64(value + i + 8));
++				}
++			}
++			pos += (len + 3) & ~3;
++		} else if (token == FDT_END) {
++			return depth ? EFI_LOAD_ERROR : EFI_SUCCESS;
++		} else if (token != FDT_NOP) return EFI_LOAD_ERROR;
++	}
++	return EFI_LOAD_ERROR;
++}
++
++efi_status_t EFIAPI efi_main(efi_handle_t image, struct efi_system_table *table)
++{
++	struct efi_boot_services *bs = table->boottime;
++	struct efi_mem_desc *map = NULL, *desc;
++	struct efi_load_file_protocol *load;
++	struct efi_loaded_image *loaded;
++	struct efi_device_path *dp = (void *)&initrd_dp;
++	efi_uintn_t size = 0, key, stride = 0, i, initrd_size = 0, pages = 0;
++	efi_handle_t handle;
++	efi_physical_addr_t buffer = 0;
++	efi_status_t ret = EFI_NOT_FOUND;
++	u32 version, crc;
++	const u8 *fdt = NULL;
++
++	st = table;
++	st->con_out->output_string(st->con_out, u"EFI-FDT-PROBE v1\r\n");
++	ret = bs->open_protocol(image, &image_guid, (void **)&loaded, image, NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL);
++	if (ret != EFI_SUCCESS) goto out;
++	field(u"image_base=", (uintptr_t)loaded->image_base);
++	field(u"image_size=", loaded->image_size);
++	for (i = 0; i < st->nr_tables; i++) {
++		const u8 *a = (const void *)&st->tables[i].guid, *b = (const void *)&fdt_guid;
++		u32 j;
++		for (j = 0; j < sizeof(fdt_guid) && a[j] == b[j]; j++);
++		if (j == sizeof(fdt_guid)) fdt = st->tables[i].table;
++	}
++	if (!fdt) goto out;
++	ret = report_fdt(fdt);
++	if (ret != EFI_SUCCESS) goto out;
++	ret = bs->get_memory_map(&size, NULL, &key, &stride, &version);
++	if (ret != EFI_BUFFER_TOO_SMALL || stride < sizeof(*map) || stride > 4096 ||
++	    size % stride || size / stride > 504) { ret = EFI_LOAD_ERROR; goto out; }
++	size += 8 * stride;
++	ret = bs->allocate_pool(EFI_LOADER_DATA, size, (void **)&map);
++	if (ret != EFI_SUCCESS) goto out;
++	ret = bs->get_memory_map(&size, map, &key, &stride, &version);
++	if (ret != EFI_SUCCESS) goto out;
++	if (stride < sizeof(*map) || size % stride || size / stride > 512) { ret = EFI_ABORTED; goto out; }
++	field(u"memory_descriptors=", size / stride);
++	for (i = 0; i < size / stride; i++) {
++		desc = (void *)((u8 *)map + i * stride);
++		field(u"efi_type=", desc->type); field(u"efi_start=", desc->physical_start);
++		field(u"efi_pages=", desc->num_pages); field(u"efi_attributes=", desc->attribute);
++	}
++	ret = bs->locate_device_path(&load_guid, &dp, &handle);
++	if (ret != EFI_SUCCESS) goto out;
++	ret = bs->open_protocol(handle, &load_guid, (void **)&load, image, NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL);
++	if (ret != EFI_SUCCESS) goto out;
++	ret = load->load_file(load, dp, false, &initrd_size, NULL);
++	if (ret != EFI_BUFFER_TOO_SMALL || !initrd_size || initrd_size > 0x4000000) { ret = EFI_LOAD_ERROR; goto out; }
++	field(u"initrd_bytes=", initrd_size);
++	pages = (initrd_size + EFI_PAGE_MASK) >> EFI_PAGE_SHIFT;
++	ret = bs->allocate_pages(EFI_ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, pages, &buffer);
++	if (ret != EFI_SUCCESS) goto out;
++	ret = load->load_file(load, dp, false, &initrd_size, (void *)(uintptr_t)buffer);
++	if (ret != EFI_SUCCESS) goto out;
++	if (initrd_size > pages * EFI_PAGE_SIZE) { ret = EFI_LOAD_ERROR; goto out; }
++	field(u"initrd_loaded_bytes=", initrd_size);
++	field(u"initrd_buffer=", buffer);
++	ret = bs->calculate_crc32((void *)(uintptr_t)buffer, initrd_size, &crc);
++	if (ret == EFI_SUCCESS) field(u"initrd_crc32=", crc);
++out:
++	field(u"status=", ret);
++	if (map) bs->free_pool(map);
++	if (buffer) bs->free_pages(buffer, pages);
++	st->con_out->output_string(st->con_out, ret == EFI_SUCCESS ? u"EFI-FDT-PROBE PASS\r\n" : u"EFI-FDT-PROBE FAIL\r\n");
++	return ret;
++}

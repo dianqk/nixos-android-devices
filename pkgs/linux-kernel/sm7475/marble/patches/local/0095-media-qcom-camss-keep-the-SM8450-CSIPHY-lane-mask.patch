@@ -1,0 +1,35 @@
+From b999be51fc212d8ea64b89c3c89992825393b5c5 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Mon, 2 Nov 2026 07:42:35 +0800
+Subject: [PATCH 116/135] media: qcom: camss: keep the SM8450 CSIPHY lane mask
+
+The SM8450 lane table shared with X1E80100 starts with a four-lane
+constant for CSI_COMMON_CTRL5 (0x1014). Writing it after
+csiphy_lanes_enable() replaces the lane mask computed from the endpoint,
+so a sensor with fewer lanes is left with lanes it does not drive. Skip
+that entry on SM8450-class CSIPHYs.
+
+This is the driver part of the Lenovo TB320FC (Asphalt) camera wiring
+patch in the nixos-android-devices queue
+(pkgs/linux-kernel/sm8475/asphalt/patches/local/0016-asphalt-camera-wiring.patch),
+without its board DT.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c b/drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c
+index 03db8473c0..7164a94536 100644
+--- a/drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c
++++ b/drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c
+@@ -1092,6 +1092,9 @@ static void csiphy_gen2_config_lanes(struct csiphy_device *csiphy,
+ 	u32 val;
+ 
+ 	for (i = 0; i < array_size; i++, r++) {
++		/* Preserve the lane mask selected above for one-lane SM8450 sensors. */
++		if (csiphy->camss->res->version == CAMSS_8450 && r->reg_addr == 0x1014)
++			continue;
+ 		switch (r->csiphy_param_type) {
+ 		case CSIPHY_SETTLE_CNT_LOWER_BYTE:
+ 			val = settle_cnt & 0xff;

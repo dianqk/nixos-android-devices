@@ -1,0 +1,349 @@
+From dcee2605958a31d177af78f166f72877184f3c22 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Mon, 2 Nov 2026 07:54:37 +0800
+Subject: [PATCH 135/135] arm64: dts: qcom: sm8475-xiaomi-marble: wire the
+ cameras
+
+Describe the four cameras from the stock module data: the wide
+OmniVision OV64B40 on CCI0 bus 1 and CSIPHY2 (three C-PHY trios), the
+front Samsung S5K3P9 and the ultra-wide Sony IMX355 on CCI0 bus 0
+(CSIPHY3 and CSIPHY0, four D-PHY lanes), and the macro GalaxyCore GC02M1
+on CCI1 bus 0 and CSIPHY1 (one lane). Every sensor takes a 19.2 MHz MCLK
+and the TITAN_TOP GDSC.
+
+The wide AVDD (2.8 V) and DVDD (1.1 V) are LDOs switched by TLMM GPIO 64
+and GPIO 2; the other analogue and core supplies are PM8008 (J) LDOs and
+the I/O supply of the CCI0 sensors is PM8450 L4. The CSIPHYs take PM8350
+L5 and PM8350C L10. The stock mounting is roll 90 for the rear cameras
+and 270 for the front; the rotation properties follow the V4L2
+convention (270 and 90).
+
+The IMX355 reset pin no longer drives the line high from pinctrl before
+the sensor is powered.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ .../boot/dts/qcom/sm8475-xiaomi-marble.dts    | 269 ++++++++++++++++--
+ 1 file changed, 252 insertions(+), 17 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-marble.dts b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-marble.dts
+index 7576ded318..e94e12d11c 100644
+--- a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-marble.dts
++++ b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-marble.dts
+@@ -8,6 +8,7 @@
+ #include <dt-bindings/gpio/gpio.h>
+ #include <dt-bindings/interrupt-controller/irq.h>
+ #include <dt-bindings/input/input.h>
++#include <dt-bindings/media/video-interfaces.h>
+ #include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
+ #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
+ 
+@@ -1339,27 +1340,100 @@ cam_mclk1_default: cam-mclk1-default-state {
+ 		bias-disable;
+ 	};
+ 
+-	cam_mclk1_suspend: cam-mclk1-suspend-state {
+-		pins = "gpio101";
+-		function = "cam_mclk";
+-		drive-strength = <4>;
+-		bias-pull-down;
+-	};
+-
+ 	cam_reset2_default: cam-reset2-default-state {
+ 		pins = "gpio24";
+ 		function = "gpio";
+ 		drive-strength = <2>;
+ 		bias-disable;
+-		output-high;
+ 	};
++};
+ 
+-	cam_reset2_suspend: cam-reset2-suspend-state {
+-		pins = "gpio24";
+-		function = "gpio";
+-		drive-strength = <2>;
+-		bias-pull-down;
+-		output-low;
++/*
++ * Cameras, from the stock module data: wide OmniVision OV64B40 (CCI0
++ * bus 1, CSIPHY2, three C-PHY trios), front Samsung S5K3P9 (CCI0 bus 0,
++ * CSIPHY3), ultra-wide Sony IMX355 (CCI0 bus 0, CSIPHY0) and macro
++ * GalaxyCore GC02M1 (CCI1 bus 0, CSIPHY1, one lane). All take a
++ * 19.2 MHz MCLK. The wide AVDD and DVDD are TLMM-switched LDOs; the
++ * other analogue and core supplies are PM8008 (J) LDOs, the I/O supply
++ * of the three CCI0 sensors is PM8450 L4.
++ */
++/ {
++	vreg_cam_wide_avdd: regulator-cam-wide-avdd {
++		compatible = "regulator-fixed";
++		regulator-name = "cam_wide_avdd";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&tlmm 64 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <100>;
++		vin-supply = <&pm8350c_bob>;
++		pinctrl-0 = <&cam_wide_avdd_default>;
++		pinctrl-names = "default";
++	};
++
++	vreg_cam_wide_dvdd: regulator-cam-wide-dvdd {
++		compatible = "regulator-fixed";
++		regulator-name = "cam_wide_dvdd";
++		regulator-min-microvolt = <1100000>;
++		regulator-max-microvolt = <1100000>;
++		gpio = <&tlmm 2 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <100>;
++		vin-supply = <&pm8350_s12>;
++		pinctrl-0 = <&cam_wide_dvdd_default>;
++		pinctrl-names = "default";
++	};
++};
++
++&camss {
++	vdda-phy-supply = <&pm8350_l5>;
++	vdda-pll-supply = <&pm8350c_l10>;
++
++	status = "okay";
++
++	ports {
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		port@0 {
++			reg = <0>;
++
++			csiphy0_ep: endpoint {
++				clock-lanes = <7>;
++				data-lanes = <0 1 2 3>;
++				remote-endpoint = <&cam_ultra_ep>;
++			};
++		};
++
++		port@1 {
++			reg = <1>;
++
++			csiphy1_ep: endpoint {
++				clock-lanes = <7>;
++				data-lanes = <0>;
++				remote-endpoint = <&cam_macro_ep>;
++			};
++		};
++
++		port@2 {
++			reg = <2>;
++
++			csiphy2_ep: endpoint {
++				bus-type = <MEDIA_BUS_TYPE_CSI2_CPHY>;
++				data-lanes = <0 1 2>;
++				remote-endpoint = <&cam_wide_ep>;
++			};
++		};
++
++		port@3 {
++			reg = <3>;
++
++			csiphy3_ep: endpoint {
++				clock-lanes = <7>;
++				data-lanes = <0 1 2 3>;
++				remote-endpoint = <&cam_front_ep>;
++			};
++		};
+ 	};
+ };
+ 
+@@ -1368,6 +1442,38 @@ &cci0 {
+ };
+ 
+ &cci0_i2c0 {
++	clock-frequency = <400000>;
++
++	camera@10 {
++		compatible = "samsung,s5k3p9";
++		reg = <0x10>;
++
++		power-domains = <&camcc TITAN_TOP_GDSC>;
++
++		clocks = <&camcc CAM_CC_MCLK5_CLK>;
++		assigned-clocks = <&camcc CAM_CC_MCLK5_CLK>;
++		assigned-clock-rates = <19200000>;
++
++		reset-gpios = <&tlmm 127 GPIO_ACTIVE_LOW>;
++		pinctrl-0 = <&cam_mclk5_default &cam_front_reset_default>;
++		pinctrl-names = "default";
++
++		avdd-supply = <&pm8008j_l7>;
++		dvdd-supply = <&pm8008j_l1>;
++		dovdd-supply = <&pm8450_l4>;
++
++		orientation = <0>;	/* front */
++		rotation = <90>;
++
++		port {
++			cam_front_ep: endpoint {
++				data-lanes = <1 2 3 4>;
++				link-frequencies = /bits/ 64 <272000000>;
++				remote-endpoint = <&csiphy3_ep>;
++			};
++		};
++	};
++
+ 	camera@1a {
+ 		compatible = "sony,imx355";
+ 		reg = <0x1a>;
+@@ -1379,18 +1485,56 @@ camera@1a {
+ 		assigned-clock-rates = <19200000>;
+ 
+ 		reset-gpios = <&tlmm 24 GPIO_ACTIVE_LOW>;
+-		pinctrl-names = "default", "suspend";
+ 		pinctrl-0 = <&cam_mclk1_default &cam_reset2_default>;
+-		pinctrl-1 = <&cam_mclk1_suspend &cam_reset2_suspend>;
++		pinctrl-names = "default";
+ 
+ 		avdd-supply = <&pm8008j_l3>;
+ 		dvdd-supply = <&pm8008j_l2>;
+ 		dovdd-supply = <&pm8450_l4>;
+ 
++		orientation = <1>;	/* rear */
++		rotation = <270>;
++
+ 		port {
+-			imx355_ep: endpoint {
++			cam_ultra_ep: endpoint {
+ 				data-lanes = <1 2 3 4>;
+ 				link-frequencies = /bits/ 64 <360000000>;
++				remote-endpoint = <&csiphy0_ep>;
++			};
++		};
++	};
++};
++
++&cci0_i2c1 {
++	clock-frequency = <400000>;
++
++	camera@10 {
++		compatible = "ovti,ov64b40";
++		reg = <0x10>;
++
++		power-domains = <&camcc TITAN_TOP_GDSC>;
++
++		clocks = <&camcc CAM_CC_MCLK2_CLK>;
++		assigned-clocks = <&camcc CAM_CC_MCLK2_CLK>;
++		assigned-clock-rates = <19200000>;
++
++		reset-gpios = <&tlmm 126 GPIO_ACTIVE_LOW>;
++		pinctrl-0 = <&cam_mclk2_default &cam_wide_reset_default>;
++		pinctrl-names = "default";
++
++		avdd-supply = <&vreg_cam_wide_avdd>;
++		dvdd-supply = <&vreg_cam_wide_dvdd>;
++		dovdd-supply = <&pm8450_l4>;
++
++		orientation = <1>;	/* rear */
++		rotation = <270>;
++
++		port {
++			cam_wide_ep: endpoint {
++				bus-type = <MEDIA_BUS_TYPE_CSI2_CPHY>;
++				data-lanes = <1 2 3>;
++				link-frequencies = /bits/ 64 <842000000>;
++				remote-endpoint = <&csiphy2_ep>;
+ 			};
+ 		};
+ 	};
+@@ -1399,3 +1543,94 @@ imx355_ep: endpoint {
+ &cci1 {
+ 	status = "okay";
+ };
++
++&cci1_i2c0 {
++	clock-frequency = <400000>;
++
++	camera@37 {
++		compatible = "galaxycore,gc02m1";
++		reg = <0x37>;
++
++		power-domains = <&camcc TITAN_TOP_GDSC>;
++
++		clocks = <&camcc CAM_CC_MCLK0_CLK>;
++		assigned-clocks = <&camcc CAM_CC_MCLK0_CLK>;
++		assigned-clock-rates = <19200000>;
++
++		reset-gpios = <&tlmm 128 GPIO_ACTIVE_LOW>;
++		pinctrl-0 = <&cam_mclk0_default &cam_macro_reset_default>;
++		pinctrl-names = "default";
++
++		avdd-supply = <&pm8008j_l4>;
++		dovdd-supply = <&pm8008j_l5>;
++
++		orientation = <1>;	/* rear */
++		rotation = <270>;
++
++		port {
++			cam_macro_ep: endpoint {
++				data-lanes = <1>;
++				link-frequencies = /bits/ 64 <336000000>;
++				remote-endpoint = <&csiphy1_ep>;
++			};
++		};
++	};
++};
++
++&tlmm {
++	cam_mclk0_default: cam-mclk0-default-state {
++		pins = "gpio100";
++		function = "cam_mclk";
++		drive-strength = <4>;
++		bias-disable;
++	};
++
++	cam_mclk2_default: cam-mclk2-default-state {
++		pins = "gpio102";
++		function = "cam_mclk";
++		drive-strength = <4>;
++		bias-disable;
++	};
++
++	cam_mclk5_default: cam-mclk5-default-state {
++		pins = "gpio105";
++		function = "cam_mclk";
++		drive-strength = <4>;
++		bias-disable;
++	};
++
++	cam_wide_reset_default: cam-wide-reset-default-state {
++		pins = "gpio126";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++
++	cam_front_reset_default: cam-front-reset-default-state {
++		pins = "gpio127";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++
++	cam_macro_reset_default: cam-macro-reset-default-state {
++		pins = "gpio128";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++
++	cam_wide_avdd_default: cam-wide-avdd-default-state {
++		pins = "gpio64";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++
++	cam_wide_dvdd_default: cam-wide-dvdd-default-state {
++		pins = "gpio2";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++};

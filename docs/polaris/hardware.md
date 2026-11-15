@@ -2,7 +2,7 @@
 
 [Usage guide](README.md) · [中文](hardware.zh.md)
 
-The packaged kernel is Linux 7.3-rc6. The hardware results below were obtained
+The packaged kernel is Linux 7.3. The hardware results below were obtained
 with earlier 7.x kernels.
 
 ## Hardware adaptation

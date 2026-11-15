@@ -1,0 +1,377 @@
+From 09be1e99b663733b251d291b4f8f655a59593d4c Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] workaround: clk: mediatek: preserve unmanaged MT6897 PLL
+ rates
+
+Support TVDPLL programming while reporting the remaining firmware-owned
+PLLs at their bootloader rates. Full rate control for those PLLs is not
+implemented; retain the read-only restriction and its controller scaffold.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-16T16:22:00+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T02:41:23+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/clk/mediatek/clk-mt6897-apmixedsys.c | 345 +++++++++++++++++++
+ 1 file changed, 345 insertions(+)
+ create mode 100644 drivers/clk/mediatek/clk-mt6897-apmixedsys.c
+
+diff --git a/drivers/clk/mediatek/clk-mt6897-apmixedsys.c b/drivers/clk/mediatek/clk-mt6897-apmixedsys.c
+new file mode 100644
+index 0000000000..ea55c4fc45
+--- /dev/null
++++ b/drivers/clk/mediatek/clk-mt6897-apmixedsys.c
+@@ -0,0 +1,345 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek MT6897 apmixedsys PLLs.
++ *
++ * Five of the PLLs (mainpll, univpll, mmpll, tvdpll, imgpll) are switched
++ * through the hardware voter and the others run as the bootloader left
++ * them. Most are registered as a fixed rate read from their PCW/postdiv at
++ * probe, and nothing of theirs is ever written. TVDPLL, the DisplayPort
++ * pixel clock source, is a real PLL when the node has a hardware voter:
++ * prepare/unprepare vote for it through the voter's AP bank (the AP vote
++ * only; other masters' votes are untouched) and set_rate writes its
++ * postdiv/PCW, as the vendor driver does. Register layout and sequences from
++ * the MediaTek vendor driver (MiCode MTK_kernel_device_modules 3c4ccd07,
++ * drivers/clk/mediatek/clk-mt6897.c and clk-pll.c).
++ */
++
++#include <dt-bindings/clock/mediatek,mt6897-clock.h>
++#include <linux/bits.h>
++#include <linux/clk-provider.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/math64.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++
++#define MT6897_PLL_FIN		26000000ULL
++#define MT6897_PLL_EN		BIT(0)
++#define MT6897_PCW_INT_BITS	8
++#define MT6897_PLL_FMIN		(1500UL * 1000000)
++#define MT6897_PLL_FMAX		(3800UL * 1000000)
++#define MT6897_PCW_CHG		BIT(31)
++#define MT6897_POSTDIV_SHIFT	24
++#define MT6897_POSTDIV_MASK	GENMASK(26, 24)
++
++/* Hardware voter (infra HW_CCF) PLL bank of the AP */
++#define HWV_PLL_SET		0x0190
++#define HWV_PLL_CLR		0x0194
++#define HWV_PLL_DONE		0x140c
++#define HWV_PLL_SET_STA		0x1464
++#define HWV_PLL_CLR_STA		0x1468
++#define HWV_PLL_TVDPLL_BIT	3
++
++struct mt6897_pll {
++	int id;
++	const char *name;
++	u16 con0;
++	u16 pd_reg;
++	u16 pcw_reg;
++	u8 pcw_bits;
++};
++
++#define PLL(_id, _name, _con0, _pd_reg, _pcw_reg, _bits) {		\
++		.id = _id, .name = _name, .con0 = _con0,		\
++		.pd_reg = _pd_reg, .pcw_reg = _pcw_reg, .pcw_bits = _bits }
++
++static const struct mt6897_pll mt6897_plls[] = {
++	PLL(CLK_APMIXED_MAINPLL, "mainpll", 0x350, 0x354, 0x354, 22),
++	PLL(CLK_APMIXED_UNIVPLL, "univpll", 0x308, 0x30c, 0x30c, 22),
++	PLL(CLK_APMIXED_MSDCPLL, "msdcpll", 0x360, 0x364, 0x364, 22),
++	PLL(CLK_APMIXED_MMPLL, "mmpll", 0x3a0, 0x3a4, 0x3a4, 22),
++	PLL(CLK_APMIXED_ADSPPLL, "adsppll", 0x380, 0x384, 0x384, 22),
++	PLL(CLK_APMIXED_TVDPLL, "tvdpll", 0x248, 0x24c, 0x24c, 22),
++	PLL(CLK_APMIXED_APLL1, "apll1", 0x328, 0x32c, 0x330, 32),
++	PLL(CLK_APMIXED_APLL2, "apll2", 0x33c, 0x340, 0x344, 32),
++	PLL(CLK_APMIXED_MPLL, "mpll", 0x390, 0x394, 0x394, 22),
++	PLL(CLK_APMIXED_EMIPLL, "emipll", 0x3b0, 0x3b4, 0x3b4, 22),
++	PLL(CLK_APMIXED_IMGPLL, "imgpll", 0x370, 0x374, 0x374, 22),
++};
++
++static unsigned long mt6897_pll_rate(void __iomem *base,
++				     const struct mt6897_pll *pll)
++{
++	u32 pcw, pd;
++
++	if (!(readl(base + pll->con0) & MT6897_PLL_EN))
++		return 0;
++
++	pcw = readl(base + pll->pcw_reg);
++	if (pll->pcw_bits < 32)
++		pcw &= GENMASK(pll->pcw_bits - 1, 0);
++	pd = (readl(base + pll->pd_reg) >> 24) & 0x7;
++
++	return div_u64(MT6897_PLL_FIN * pcw,
++		       1ULL << (pll->pcw_bits - MT6897_PCW_INT_BITS)) >> pd;
++}
++
++struct mt6897_hwv_pll {
++	struct clk_hw hw;
++	void __iomem *base;
++	struct regmap *hwv;
++	const struct mt6897_pll *pll;
++	u32 bit;
++};
++
++static struct mt6897_hwv_pll *to_hwv_pll(struct clk_hw *hw)
++{
++	return container_of(hw, struct mt6897_hwv_pll, hw);
++}
++
++/*
++ * The vote is complete once the voter is done and its set (clear) request
++ * has drained; when voting on, the PLL enable bit must also be set (the
++ * vendor's HWV_CHK_FULL_STA).
++ */
++static bool mt6897_hwv_pll_done(struct mt6897_hwv_pll *p, bool on)
++{
++	u32 done, sta;
++
++	regmap_read(p->hwv, HWV_PLL_DONE, &done);
++	if (!(done & p->bit))
++		return false;
++
++	regmap_read(p->hwv, on ? HWV_PLL_SET_STA : HWV_PLL_CLR_STA, &sta);
++	if (sta & p->bit)
++		return false;
++
++	return !on || (readl(p->base + p->pll->con0) & MT6897_PLL_EN);
++}
++
++static int mt6897_hwv_pll_vote(struct mt6897_hwv_pll *p, u32 ofs, bool on)
++{
++	bool done;
++	u32 val;
++	int ret;
++
++	/* the voter is idle */
++	ret = regmap_read_poll_timeout_atomic(p->hwv, HWV_PLL_DONE, val,
++					      val & p->bit, 1, 500);
++	if (ret)
++		return ret;
++
++	/* a dummy read clears the idle signal of the voter bus */
++	regmap_read(p->hwv, ofs, &val);
++	regmap_write(p->hwv, ofs, p->bit);
++
++	/* the vote is registered */
++	ret = regmap_read_poll_timeout_atomic(p->hwv, ofs, val,
++					      on ? (val & p->bit) : !(val & p->bit),
++					      2, 200);
++	if (ret)
++		return ret;
++
++	/* against a false acknowledgement */
++	if (!on)
++		udelay(100);
++
++	/* and done */
++	return read_poll_timeout_atomic(mt6897_hwv_pll_done, done, done,
++					1, 100000, false, p, on);
++}
++
++static int mt6897_hwv_pll_prepare(struct clk_hw *hw)
++{
++	struct mt6897_hwv_pll *p = to_hwv_pll(hw);
++	int ret = mt6897_hwv_pll_vote(p, HWV_PLL_SET, true);
++
++	if (ret)
++		pr_err("%s: vote timeout\n", clk_hw_get_name(hw));
++	return ret;
++}
++
++static void mt6897_hwv_pll_unprepare(struct clk_hw *hw)
++{
++	struct mt6897_hwv_pll *p = to_hwv_pll(hw);
++
++	if (mt6897_hwv_pll_vote(p, HWV_PLL_CLR, false))
++		pr_err("%s: unvote timeout\n", clk_hw_get_name(hw));
++}
++
++/* Only the AP's own vote; other masters may keep the PLL running */
++static int mt6897_hwv_pll_is_prepared(struct clk_hw *hw)
++{
++	struct mt6897_hwv_pll *p = to_hwv_pll(hw);
++	u32 val;
++
++	regmap_read(p->hwv, HWV_PLL_SET, &val);
++	return !!(val & p->bit);
++}
++
++static unsigned long mt6897_hwv_pll_recalc_rate(struct clk_hw *hw,
++						unsigned long parent_rate)
++{
++	struct mt6897_hwv_pll *p = to_hwv_pll(hw);
++	const struct mt6897_pll *pll = p->pll;
++	u32 pcw, pd;
++
++	pcw = readl(p->base + pll->pcw_reg) & GENMASK(pll->pcw_bits - 1, 0);
++	pd = (readl(p->base + pll->pd_reg) & MT6897_POSTDIV_MASK) >>
++	     MT6897_POSTDIV_SHIFT;
++
++	return div_u64(MT6897_PLL_FIN * pcw,
++		       1ULL << (pll->pcw_bits - MT6897_PCW_INT_BITS)) >> pd;
++}
++
++static void mt6897_hwv_pll_calc(const struct mt6897_pll *pll, unsigned long rate,
++				u32 *pcw, u32 *pd)
++{
++	u64 val;
++
++	if (rate > MT6897_PLL_FMAX)
++		rate = MT6897_PLL_FMAX;
++
++	/* the smallest postdiv (1-16) that keeps the VCO in range */
++	for (*pd = 0; *pd < 4; (*pd)++)
++		if ((u64)rate << *pd >= MT6897_PLL_FMIN)
++			break;
++
++	val = ((u64)rate << *pd) << (pll->pcw_bits - MT6897_PCW_INT_BITS);
++	*pcw = div_u64(val, MT6897_PLL_FIN);
++}
++
++static int mt6897_hwv_pll_determine_rate(struct clk_hw *hw,
++					 struct clk_rate_request *req)
++{
++	struct mt6897_hwv_pll *p = to_hwv_pll(hw);
++	u32 pcw, pd;
++
++	mt6897_hwv_pll_calc(p->pll, req->rate, &pcw, &pd);
++	req->rate = div_u64(MT6897_PLL_FIN * pcw,
++			    1ULL << (p->pll->pcw_bits - MT6897_PCW_INT_BITS)) >> pd;
++	return 0;
++}
++
++static int mt6897_hwv_pll_set_rate(struct clk_hw *hw, unsigned long rate,
++				   unsigned long parent_rate)
++{
++	struct mt6897_hwv_pll *p = to_hwv_pll(hw);
++	const struct mt6897_pll *pll = p->pll;
++	u32 pcw, pd, val;
++
++	mt6897_hwv_pll_calc(pll, rate, &pcw, &pd);
++
++	/* postdiv and PCW share CON1: write them together, then PCW_CHG */
++	val = readl(p->base + pll->pcw_reg);
++	val &= ~(MT6897_POSTDIV_MASK | GENMASK(pll->pcw_bits - 1, 0));
++	val |= (pd << MT6897_POSTDIV_SHIFT) | pcw;
++	writel(val, p->base + pll->pcw_reg);
++	writel(val | MT6897_PCW_CHG, p->base + pll->pcw_reg);
++	udelay(20);
++
++	return 0;
++}
++
++static const struct clk_ops mt6897_hwv_pll_ops = {
++	.prepare = mt6897_hwv_pll_prepare,
++	.unprepare = mt6897_hwv_pll_unprepare,
++	.is_prepared = mt6897_hwv_pll_is_prepared,
++	.recalc_rate = mt6897_hwv_pll_recalc_rate,
++	.determine_rate = mt6897_hwv_pll_determine_rate,
++	.set_rate = mt6897_hwv_pll_set_rate,
++};
++
++static struct clk_hw *mt6897_hwv_pll_register(struct device *dev,
++					      void __iomem *base,
++					      struct regmap *hwv,
++					      const struct mt6897_pll *pll,
++					      u32 bit)
++{
++	struct clk_init_data init = { };
++	struct mt6897_hwv_pll *p;
++	int ret;
++
++	p = devm_kzalloc(dev, sizeof(*p), GFP_KERNEL);
++	if (!p)
++		return ERR_PTR(-ENOMEM);
++
++	p->base = base;
++	p->hwv = hwv;
++	p->pll = pll;
++	p->bit = BIT(bit);
++
++	init.name = pll->name;
++	init.ops = &mt6897_hwv_pll_ops;
++	/* running or not, it belongs to the voter: never "unused" here */
++	init.flags = CLK_IGNORE_UNUSED;
++	p->hw.init = &init;
++
++	ret = devm_clk_hw_register(dev, &p->hw);
++	if (ret)
++		return ERR_PTR(ret);
++	return &p->hw;
++}
++
++static int clk_mt6897_apmixed_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct clk_hw_onecell_data *clk_data;
++	struct regmap *hwv;
++	void __iomem *base;
++	int i;
++
++	base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(base))
++		return PTR_ERR(base);
++
++	clk_data = devm_kzalloc(dev, struct_size(clk_data, hws,
++						 CLK_APMIXED_NR_CLK),
++				GFP_KERNEL);
++	if (!clk_data)
++		return -ENOMEM;
++	clk_data->num = CLK_APMIXED_NR_CLK;
++
++	hwv = syscon_regmap_lookup_by_phandle_optional(dev->of_node,
++						       "mediatek,hardware-voter");
++	if (IS_ERR(hwv))
++		return dev_err_probe(dev, PTR_ERR(hwv), "no hardware voter\n");
++
++	for (i = 0; i < ARRAY_SIZE(mt6897_plls); i++) {
++		const struct mt6897_pll *pll = &mt6897_plls[i];
++		struct clk_hw *hw;
++
++		if (hwv && pll->id == CLK_APMIXED_TVDPLL)
++			hw = mt6897_hwv_pll_register(dev, base, hwv, pll,
++						     HWV_PLL_TVDPLL_BIT);
++		else
++			hw = devm_clk_hw_register_fixed_rate(dev, pll->name, NULL, 0,
++							     mt6897_pll_rate(base, pll));
++		if (IS_ERR(hw))
++			return PTR_ERR(hw);
++		clk_data->hws[pll->id] = hw;
++	}
++
++	return devm_of_clk_add_hw_provider(dev, of_clk_hw_onecell_get, clk_data);
++}
++
++static const struct of_device_id of_match_clk_mt6897_apmixed[] = {
++	{ .compatible = "mediatek,mt6897-apmixedsys" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, of_match_clk_mt6897_apmixed);
++
++static struct platform_driver clk_mt6897_apmixed_drv = {
++	.probe = clk_mt6897_apmixed_probe,
++	.driver = {
++		.name = "clk-mt6897-apmixedsys",
++		.of_match_table = of_match_clk_mt6897_apmixed,
++	},
++};
++module_platform_driver(clk_mt6897_apmixed_drv);
++
++MODULE_DESCRIPTION("MediaTek MT6897 apmixedsys PLLs");
++MODULE_LICENSE("GPL");
+-- 
+2.56.0
+

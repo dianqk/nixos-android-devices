@@ -1,0 +1,186 @@
+From 7a10ec590c2627c3e574c0332c11a7469afc0576 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 7 Nov 2026 22:41:06 +0800
+Subject: [PATCH 217/217] pmdomain: mediatek: sample OVL0 physical state on HWV
+ off failure
+
+Use the existing non-sleeping SPM mapping to read the OVL0 PWR_CON metadata offset once in the HWV off-failure dump, while the complete ordinary root references remain held. Distinguish skipped, failed and successful reads without interpreting the value or recording a boot-off epoch.
+
+Keep vote operations, timeouts, return values, quarantine and on-failure log text unchanged. HWV and SPM samples are sequential rather than atomic. Extracted production tests cover eligibility, read failure, metadata offset, unchanged roots/epochs and original success behavior.
+---
+ drivers/pmdomain/mediatek/mtk-pm-domains.c    | 24 +++++-
+ .../testing/selftests/mtk_clk/domain_cases.c  | 86 +++++++++++++++++++
+ .../testing/selftests/mtk_clk/domain_stubs.h  |  3 +-
+ 3 files changed, 110 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/pmdomain/mediatek/mtk-pm-domains.c b/drivers/pmdomain/mediatek/mtk-pm-domains.c
+index 82b61e6f3f..046480f271 100644
+--- a/drivers/pmdomain/mediatek/mtk-pm-domains.c
++++ b/drivers/pmdomain/mediatek/mtk-pm-domains.c
+@@ -754,6 +754,12 @@ static void scpsys_hwv_root_vote_dump(struct scpsys_domain *pd, bool on,
+ {
+ 	const struct scpsys_hwv_domain_data *hwv = pd->hwv_data;
+ 	struct scpsys_root_clocks *roots = pd->roots;
++	struct scpsys *scpsys = pd->scpsys;
++	const char *spm_state = "skipped";
++	char spm_status[96] = "";
++	u32 spm_ofs = roots->data ? roots->data->spm_pwr_con : 0;
++	u32 spm_raw = 0;
++	int spm_ret = -ENODATA;
+ 	u32 regs[6] = { hwv->done, hwv->set, hwv->clr, hwv->en,
+ 			hwv->set_sta, hwv->clr_sta };
+ 	u32 val[6] = { 0 };
+@@ -761,16 +767,30 @@ static void scpsys_hwv_root_vote_dump(struct scpsys_domain *pd, bool on,
+ 
+ 	ret = regmap_multi_reg_read(pd->scpsys->base, regs, val,
+ 				    ARRAY_SIZE(regs));
++	/* Failure-only OVL0 observation, while ordinary roots remain held.
++	 * This sample is sequential with the HWV reads, not an atomic snapshot.
++	 * Never record a boot-off epoch or change ownership from this read.
++	 */
++	if (!on && scpsys->boot_owner && scpsys->spm && roots->data &&
++	    roots->data->ovl_epoch && !roots->data->boot_bank && spm_ofs &&
++	    roots->num_clks > 0 && roots->enabled_count == roots->num_clks) {
++		spm_ret = regmap_read(scpsys->spm, spm_ofs, &spm_raw);
++		spm_state = spm_ret ? "error" : "read";
++	}
++	if (!on)
++		snprintf(spm_status, sizeof(spm_status),
++			 " spm=%s spm_ofs=%#x spm_ret=%d spm_raw=%08x",
++			 spm_state, spm_ofs, spm_ret, spm_raw);
+ 	dev_err(pd->scpsys->dev,
+ 		"%s: HWV root vote %s: step=%s ret=%d regs_ret=%d "
+ 		"done=%08x set=%08x clr=%08x en=%08x set_sta=%08x "
+ 		"clr_sta=%08x enabled=%u/%d roots_failed=%d faulted=%d "
+-		"children_pending=%d\n",
++		"children_pending=%d%s\n",
+ 		pd->genpd.name, on ? "on" : "off", step, err, ret, val[0],
+ 		val[1], val[2], val[3], val[4], val[5], roots->enabled_count,
+ 		roots->num_clks, roots->failed,
+ 		scpsys_root_faulted(pd->scpsys),
+-		scpsys_root_children_pending(pd));
++		scpsys_root_children_pending(pd), spm_status);
+ }
+ 
+ static int scpsys_hwv_root_vote(struct scpsys_domain *pd, bool on)
+diff --git a/tools/testing/selftests/mtk_clk/domain_cases.c b/tools/testing/selftests/mtk_clk/domain_cases.c
+index a8fe81ae97..f645322ba9 100644
+--- a/tools/testing/selftests/mtk_clk/domain_cases.c
++++ b/tools/testing/selftests/mtk_clk/domain_cases.c
+@@ -456,9 +456,95 @@ static void test_off_vote_diagnostics(void)
+ 		"enabled=1/1 roots_failed=0 faulted=0 children_pending=0"));
+ }
+ 
++static void test_off_failure_physical_sample(void)
++{
++	struct scpsys_domain a;
++	const char *line;
++
++	/* Off failures sample once only with the complete eligible owner set. */
++	for (int mode = 0; mode < 13; mode++) {
++		reset();
++		parent.spm = true;
++		assert(!scpsys_prepare_root_clocks(&controller, &parent));
++		assert(!scpsys_get_boot_owner(&controller));
++		a = domain(mode == 2 ? 1 : 0);
++		assert(!scpsys_hwv_root_power_on(&a.genpd));
++		if (mode == 3)
++			controller.spm = NULL;
++		if (mode == 4)
++			controller.boot_owner = NULL;
++		if (mode == 5)
++			a.roots->enabled_count = 0;
++		if (mode == 6)
++			spm_map.fail = 1;
++		struct scpsys_root_data metadata = *a.roots->data;
++
++		if (mode == 9) {
++			metadata.ovl_epoch = false;
++			a.roots->data = &metadata;
++		}
++		if (mode == 10) {
++			a.roots->num_clks = 0;
++			a.roots->enabled_count = 0;
++		}
++		if (mode == 11) {
++			metadata.spm_pwr_con = 0;
++			a.roots->data = &metadata;
++		}
++		if (mode == 12)
++			a.roots->data = NULL;
++		spm_map.physical = mode == 7 ? 0xc000000d : 0x2003332;
++		num_logs = 0;
++		map.calls = map.writes = 0;
++		spm_map.calls = 0;
++		int prepared = shared.prepared, enabled = shared.enabled;
++		unsigned int held = a.roots->enabled_count;
++
++		if (mode != 0)
++			map.drop_done = 1;
++		if (mode == 1) {
++			/* On-failure dump must not touch SPM. */
++			map.done = 0;
++			scpsys_hwv_root_vote_dump(&a, true, "done-wait", -ETIMEDOUT);
++			assert(!spm_map.calls && !map.writes && !boot_handle.calls);
++			assert(!find_log("spm=") && !a.roots->failed);
++			continue;
++		}
++		int ret = scpsys_hwv_root_power_off(&a.genpd);
++
++		if (mode == 0) {
++			/* Success retains its original epoch observation; no failure dump. */
++			assert(!ret && spm_map.calls == 1 && boot_handle.calls == 1);
++			assert(!find_log("spm=") && !shared.enabled);
++			continue;
++		}
++		assert(ret == -ETIMEDOUT && a.roots->failed && scpsys_root_faulted(&controller));
++		assert(shared.prepared == prepared && shared.enabled == enabled &&
++		       a.roots->enabled_count == held && !boot_handle.calls &&
++		       !a.roots->off_reported && !a.roots->ineligible_reported);
++		assert(map.writes == 1 && !spm_map.writes);
++		line = find_log("step=done-state-wait ret=-110");
++		assert(line);
++		if ((mode >= 2 && mode <= 5) || mode >= 9) {
++			assert(!spm_map.calls && strstr(line, "spm=skipped"));
++		} else {
++			assert(spm_map.calls == 1 && spm_map.last_read == 0xea4);
++			assert(strstr(line, "spm_ofs=0xea4"));
++			if (mode == 6)
++				assert(strstr(line, "spm=error") &&
++				       strstr(line, "spm_ret=-5 spm_raw=00000000"));
++			else
++				assert(strstr(line, "spm=read") &&
++				       strstr(line, mode == 7 ? "spm_raw=c000000d" :
++							 "spm_raw=02003332"));
++		}
++	}
++}
++
+ static void test_existing_domains(void)
+ {
+ 	test_off_vote_diagnostics();
++	test_off_failure_physical_sample();
+ 	test_spm_preflight_and_observation();
+ 	test_preflight_failures();
+ 	test_invalid_roots();
+diff --git a/tools/testing/selftests/mtk_clk/domain_stubs.h b/tools/testing/selftests/mtk_clk/domain_stubs.h
+index 8ec1f57c55..26c4e05fb3 100644
+--- a/tools/testing/selftests/mtk_clk/domain_stubs.h
++++ b/tools/testing/selftests/mtk_clk/domain_stubs.h
+@@ -139,7 +139,7 @@ struct regmap {
+ 	bool controlled, bus, drop_first_ack, keep_first_ack, keep_second_ack,
+ 	    reappear_first_ack, stuck_sram;
+ 	int calls, fail, stuck, writes, drop_done;
+-	u32 pending_clr;
++	u32 pending_clr, last_read;
+ };
+ struct scpsys_root_clocks {
+ 	const struct scpsys_root_data *data;
+@@ -315,6 +315,7 @@ static int regmap_access(struct regmap *m, bool write)
+ }
+ static int regmap_read(struct regmap *m, u32 r, u32 *v)
+ {
++	m->last_read = r;
+ 	int ret = regmap_access(m, false);
+ 	if (ret)
+ 		return ret;

@@ -1,0 +1,587 @@
+From 71fd9738661de0c5842ddf9072bca6cd80de3e23 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] misc: mediatek: integrate vendor modem ports and tty
+ lifecycle
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adapt vendor modem ports and ttyCCCI0 lifecycle to the MT6897 source
+layout while retaining the legacy char-port interface.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T08:13:54+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T08:44:42+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T11:15:34+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-05T15:20:03+08:00
+Link: https://github.com/MiCode/MTK_kernel_device_modules (commit 3c4ccd07d5624879555ec710c11bb8818e5cb5c6, drivers/misc/mediatek/eccci, drivers/misc/mediatek/ccmni)
+Source commit: 3c4ccd07d562 "Kernel: Xiaomi kernel_device_modules changes for
+Redmi K70E Android U" by 何发云 <hefayun@xiaomi.com>, 2024-01-12.
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Link: https://github.com/MT6895-Mainline/linux/tree/qqcandy (the MT6895 port, used as a reference for the sysctl path)
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/misc/mediatek/eccci/fsm/ccci_fsm_scp_c.c
+---
+ drivers/misc/mediatek/eccci/port/Makefile     | 48 -------------------
+ drivers/misc/mediatek/eccci/port/ccci_swtp.c  |  2 +-
+ drivers/misc/mediatek/eccci/port/port_cfg.c   |  1 +
+ drivers/misc/mediatek/eccci/port/port_char.c  |  6 +--
+ drivers/misc/mediatek/eccci/port/port_ipc.c   | 13 ++---
+ .../eccci/port/port_kernel_interface.c        |  1 +
+ drivers/misc/mediatek/eccci/port/port_net.c   |  6 ++-
+ drivers/misc/mediatek/eccci/port/port_proxy.c |  3 +-
+ drivers/misc/mediatek/eccci/port/port_rpc.c   |  8 ++--
+ drivers/misc/mediatek/eccci/port/port_smem.c  | 19 ++++----
+ .../misc/mediatek/eccci/port/port_sysmsg.c    | 11 +++--
+ drivers/misc/mediatek/eccci/port/port_tty.c   | 16 +++----
+ drivers/misc/mediatek/eccci/port/port_udc.c   | 14 +++---
+ 13 files changed, 55 insertions(+), 93 deletions(-)
+ delete mode 100644 drivers/misc/mediatek/eccci/port/Makefile
+
+diff --git a/drivers/misc/mediatek/eccci/port/Makefile b/drivers/misc/mediatek/eccci/port/Makefile
+deleted file mode 100644
+index 8afbbe2b2f..0000000000
+--- a/drivers/misc/mediatek/eccci/port/Makefile
++++ /dev/null
+@@ -1,48 +0,0 @@
+-#
+-# Copyright (C) 2016 MediaTek Inc.
+-#
+-# This program is free software; you can redistribute it and/or modify
+-# it under the terms of the GNU General Public License version 2 as
+-# published by the Free Software Foundation.
+-#
+-# This program is distributed in the hope that it will be useful,
+-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+-# See http://www.gnu.org/licenses/gpl-2.0.html for more details.
+-#
+-
+-ifeq ($(CONFIG_MTK_ECCCI_DRIVER), y)
+-
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/inc
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/port
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/platform
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/conn_md/include/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/ccmni
+-#ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/base/power/mt6873
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/base/power/mt6873
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/base/power/include
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/udc
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/udc/udc_lib_inc
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/include/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/base/power/clkbuf_v1
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/hif
+-
+-# port objects
+-obj-$(CONFIG_MTK_ECCCI_DRIVER) := ccci_port.o
+-ccci_port-y := port_cfg.o \
+-		port_char.o \
+-		port_ctlmsg.o \
+-		port_udc.o \
+-		port_ipc.o \
+-		port_net.o \
+-		port_poller.o \
+-		port_proxy.o \
+-		port_rpc.o \
+-		port_smem.o \
+-		port_sysmsg.o \
+-		ccci_swtp.o
+-
+-endif
+-
+diff --git a/drivers/misc/mediatek/eccci/port/ccci_swtp.c b/drivers/misc/mediatek/eccci/port/ccci_swtp.c
+index 84017648e7..1d02eae473 100644
+--- a/drivers/misc/mediatek/eccci/port/ccci_swtp.c
++++ b/drivers/misc/mediatek/eccci/port/ccci_swtp.c
+@@ -168,7 +168,7 @@ static void swtp_tx_delayed_work(struct work_struct *work)
+ 	}
+ }
+ 
+-int swtp_md_tx_power_req_hdlr(int data)
++static int swtp_md_tx_power_req_hdlr(int data)
+ {
+ 	struct swtp_t *swtp = NULL;
+ 
+diff --git a/drivers/misc/mediatek/eccci/port/port_cfg.c b/drivers/misc/mediatek/eccci/port/port_cfg.c
+index 553db89487..0099406320 100644
+--- a/drivers/misc/mediatek/eccci/port/port_cfg.c
++++ b/drivers/misc/mediatek/eccci/port/port_cfg.c
+@@ -586,6 +586,7 @@ static struct port_t md_ccci_ports[] = {
+ 
+ };
+ 
++int port_get_cfg(struct port_t **ports);
+ int port_get_cfg(struct port_t **ports)
+ {
+ 	int port_number = 0;
+diff --git a/drivers/misc/mediatek/eccci/port/port_char.c b/drivers/misc/mediatek/eccci/port/port_char.c
+index 0b8743924e..8869464756 100644
+--- a/drivers/misc/mediatek/eccci/port/port_char.c
++++ b/drivers/misc/mediatek/eccci/port/port_char.c
+@@ -23,7 +23,7 @@
+ 
+ #define MAX_QUEUE_LENGTH 32
+ 
+-unsigned int port_char_dev_poll(struct file *fp,
++static unsigned int port_char_dev_poll(struct file *fp,
+ 	struct poll_table_struct *poll)
+ {
+ 	struct port_t *port = fp->private_data;
+@@ -122,7 +122,7 @@ static int port_char_init(struct port_t *port)
+ 		 */
+ 		tty_ret = ccci_tty_port_register(port);
+ 		if (tty_ret)
+-			CCCI_ERROR_LOG(port->md_id, CHAR,
++			CCCI_ERROR_LOG(0, CHAR,
+ 				"register tty front-end for %s fail, ret=%d\n",
+ 				port->name, tty_ret);
+ 	}
+@@ -222,7 +222,7 @@ static int port_char_recv_skb(struct port_t *port, struct sk_buff *skb)
+ 	return port_recv_skb(port, skb);
+ }
+ 
+-void port_char_dump_info(struct port_t *port, unsigned int flag)
++static void port_char_dump_info(struct port_t *port, unsigned int flag)
+ {
+ 	if (port == NULL) {
+ 		CCCI_ERROR_LOG(0, CHAR, "%s: port==NULL\n", __func__);
+diff --git a/drivers/misc/mediatek/eccci/port/port_ipc.c b/drivers/misc/mediatek/eccci/port/port_ipc.c
+index 7938ac0d4e..ce04655393 100644
+--- a/drivers/misc/mediatek/eccci/port/port_ipc.c
++++ b/drivers/misc/mediatek/eccci/port/port_ipc.c
+@@ -72,7 +72,7 @@ static struct ipc_task_id_map *unify_xx_id_2_local_id(u32 unify_id, int AP)
+ 	return NULL;
+ }
+ 
+-int port_ipc_recv_match(struct port_t *port, struct sk_buff *skb)
++static int port_ipc_recv_match(struct port_t *port, struct sk_buff *skb)
+ {
+ 	struct ccci_header *ccci_h = (struct ccci_header *)skb->data;
+ 	struct ccci_ipc_ctrl *ipc_ctrl =
+@@ -96,7 +96,7 @@ int port_ipc_recv_match(struct port_t *port, struct sk_buff *skb)
+ int current_time_zone;
+ static int send_new_time_to_md(int tz);
+ 
+-long port_ipc_ioctl(struct file *file, unsigned int cmd,
++static long port_ipc_ioctl(struct file *file, unsigned int cmd,
+ 	unsigned long arg)
+ {
+ 	long ret = 0;
+@@ -155,7 +155,7 @@ long port_ipc_ioctl(struct file *file, unsigned int cmd,
+ 	return ret;
+ }
+ 
+-void port_ipc_md_state_notify(struct port_t *port, unsigned int state)
++static void port_ipc_md_state_notify(struct port_t *port, unsigned int state)
+ {
+ 	struct ccci_ipc_ctrl *ipc_ctrl =
+ 		(struct ccci_ipc_ctrl *)port->private_data;
+@@ -170,6 +170,7 @@ void port_ipc_md_state_notify(struct port_t *port, unsigned int state)
+ 	};
+ }
+ 
++int port_ipc_write_check_id(struct port_t *port, struct sk_buff *skb);
+ int port_ipc_write_check_id(struct port_t *port, struct sk_buff *skb)
+ {
+ 	struct ccci_ipc_ilm *ilm =
+@@ -186,7 +187,7 @@ int port_ipc_write_check_id(struct port_t *port, struct sk_buff *skb)
+ 	return id_map->extq_id;
+ }
+ 
+-unsigned int port_ipc_poll(struct file *fp, struct poll_table_struct *poll)
++static unsigned int port_ipc_poll(struct file *fp, struct poll_table_struct *poll)
+ {
+ 	struct port_t *port = fp->private_data;
+ 	struct ccci_ipc_ctrl *ipc_ctrl =
+@@ -384,10 +385,10 @@ static int port_ipc_kernel_thread(void *arg)
+ 	}
+ 	return 0;
+ }
+-int port_ipc_init(struct port_t *port)
++static int port_ipc_init(struct port_t *port)
+ {
+ 	struct cdev *dev = NULL;
+-	int ret = 0;
++	__maybe_unused int ret = 0;
+ 	struct ccci_ipc_ctrl *ipc_ctrl =
+ 		kmalloc(sizeof(struct ccci_ipc_ctrl), GFP_KERNEL);
+ 
+diff --git a/drivers/misc/mediatek/eccci/port/port_kernel_interface.c b/drivers/misc/mediatek/eccci/port/port_kernel_interface.c
+index 09c44fec93..1b304a5f52 100644
+--- a/drivers/misc/mediatek/eccci/port/port_kernel_interface.c
++++ b/drivers/misc/mediatek/eccci/port/port_kernel_interface.c
+@@ -197,6 +197,7 @@ void test_code_for_call_slbc(unsigned int id)
+ #endif
+ 
+ /* linux kernel user communicate with modem interface */
++void port_kernel_user_interface_init(struct device_node *mddriver_node);
+ void port_kernel_user_interface_init(struct device_node *mddriver_node)
+ {
+ 	/* modem and kernel slbc interface */
+diff --git a/drivers/misc/mediatek/eccci/port/port_net.c b/drivers/misc/mediatek/eccci/port/port_net.c
+index 1d76869175..346343a281 100644
+--- a/drivers/misc/mediatek/eccci/port/port_net.c
++++ b/drivers/misc/mediatek/eccci/port/port_net.c
+@@ -31,6 +31,7 @@
+ #define NET_ACK_TXQ_INDEX(p) ((p)->txq_exp_index&0x0F)
+ #define GET_CCMNI_IDX(p) ((p)->minor - CCCI_NET_MINOR_BASE)
+ 
++int ccci_get_ccmni_channel(int ccmni_idx, struct ccmni_ch *channel);
+ int ccci_get_ccmni_channel(int ccmni_idx, struct ccmni_ch *channel)
+ {
+ 	int ret = 0;
+@@ -198,7 +199,7 @@ static struct port_t *find_net_port_by_ccmni_idx(int ccmni_idx)
+ 	return port_get_by_minor(ccmni_idx + CCCI_NET_MINOR_BASE);
+ }
+ 
+-int ccmni_send_pkt(int ccmni_idx, void *data, int priority_level)
++static int ccmni_send_pkt(int ccmni_idx, void *data, int priority_level)
+ {
+ 	struct port_t *port = NULL;
+ 	/* struct ccci_request *req = NULL; */
+@@ -269,6 +270,7 @@ int ccmni_send_pkt(int ccmni_idx, void *data, int priority_level)
+ 	return ret;
+ }
+ 
++int ccmni_napi_poll(int ccmni_idx, struct napi_struct *napi, int weight);
+ int ccmni_napi_poll(int ccmni_idx, struct napi_struct *napi, int weight)
+ {
+ 	CCCI_ERROR_LOG(0, NET,
+@@ -470,7 +472,7 @@ static void port_net_md_state_notify(struct port_t *port, unsigned int state)
+ 	ccmni_ops.md_state_callback(GET_CCMNI_IDX(port), state);
+ }
+ 
+-void port_net_md_dump_info(struct port_t *port, unsigned int flag)
++static void port_net_md_dump_info(struct port_t *port, unsigned int flag)
+ {
+ 	if (port == NULL) {
+ 		CCCI_ERROR_LOG(0, NET, "%s: port==NULL\n", __func__);
+diff --git a/drivers/misc/mediatek/eccci/port/port_proxy.c b/drivers/misc/mediatek/eccci/port/port_proxy.c
+index f443ea86af..cb958011df 100644
+--- a/drivers/misc/mediatek/eccci/port/port_proxy.c
++++ b/drivers/misc/mediatek/eccci/port/port_proxy.c
+@@ -60,6 +60,7 @@ static struct port_t *ccci_port_get_port_by_user_id(unsigned int user_id)
+ 	return NULL;
+ }
+ 
++char *ccci_port_get_dev_name(unsigned int rx_user_id);
+ char *ccci_port_get_dev_name(unsigned int rx_user_id)
+ {
+ 	struct port_t *port = ccci_port_get_port_by_user_id(rx_user_id);
+@@ -111,7 +112,7 @@ int send_new_time_to_new_md(int tz)
+ 	return ret;
+ }
+ 
+-int port_dev_kernel_read(struct port_t *port, char *buf, int size)
++static int port_dev_kernel_read(struct port_t *port, char *buf, int size)
+ {
+ 	int read_done = 0, ret = 0, read_len = 0, md_state;
+ 	struct sk_buff *skb = NULL;
+diff --git a/drivers/misc/mediatek/eccci/port/port_rpc.c b/drivers/misc/mediatek/eccci/port/port_rpc.c
+index 835b9e1ff4..6546389180 100644
+--- a/drivers/misc/mediatek/eccci/port/port_rpc.c
++++ b/drivers/misc/mediatek/eccci/port/port_rpc.c
+@@ -291,7 +291,7 @@ static int get_eint_attr_val(struct device_node *node, int index)
+ 	return ret;
+ }
+ 
+-void get_dtsi_eint_node(void)
++static void get_dtsi_eint_node(void)
+ {
+ 	static int init; /*default is 0*/
+ 	int i;
+@@ -317,7 +317,7 @@ void get_dtsi_eint_node(void)
+ 	}
+ }
+ 
+-int get_eint_attr_DTSVal(const char *name, unsigned int name_len,
++static int get_eint_attr_DTSVal(const char *name, unsigned int name_len,
+ 			unsigned int type, char *result, unsigned int *len)
+ {
+ 	int i, sim_value;
+@@ -1489,7 +1489,7 @@ static const struct file_operations rpc_dev_fops = {
+ static int port_rpc_init(struct port_t *port)
+ {
+ 	struct cdev *dev = NULL;
+-	int ret = 0;
++	__maybe_unused int ret = 0;
+ 	static int first_init = 1;
+ 
+ 	CCCI_DEBUG_LOG(0, RPC,
+@@ -1529,7 +1529,7 @@ static int port_rpc_init(struct port_t *port)
+ 	return 0;
+ }
+ 
+-int port_rpc_recv_match(struct port_t *port, struct sk_buff *skb)
++static int port_rpc_recv_match(struct port_t *port, struct sk_buff *skb)
+ {
+ 	int is_userspace_msg = 0;
+ 	struct ccci_header *ccci_h = (struct ccci_header *)skb->data;
+diff --git a/drivers/misc/mediatek/eccci/port/port_smem.c b/drivers/misc/mediatek/eccci/port/port_smem.c
+index a5502ac38d..ef1ce78889 100644
+--- a/drivers/misc/mediatek/eccci/port/port_smem.c
++++ b/drivers/misc/mediatek/eccci/port/port_smem.c
+@@ -182,9 +182,8 @@ static void collect_ccb_info(struct ccci_smem_port *smem_port)
+ 			smem_port->wakeup = 0;
+ 			smem_port->type = TYPE_CCB;
+ 			init_waitqueue_head(&smem_port->rx_wq);
+-			hrtimer_init(&smem_port->notify_timer,
+-			CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+-			smem_port->notify_timer.function = smem_tx_timer_func;
++			hrtimer_setup(&smem_port->notify_timer, smem_tx_timer_func,
++				      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 			break;
+ 		}
+ 	}
+@@ -214,7 +213,7 @@ static void collect_ccb_info(struct ccci_smem_port *smem_port)
+ 		}
+ }
+ 
+-int port_smem_tx_nofity(struct port_t *port, unsigned int user_data)
++static int port_smem_tx_nofity(struct port_t *port, unsigned int user_data)
+ {
+ 	struct ccci_smem_port *smem_port =
+ 		(struct ccci_smem_port *)port->private_data;
+@@ -232,7 +231,7 @@ int port_smem_tx_nofity(struct port_t *port, unsigned int user_data)
+ 	return 0;
+ }
+ 
+-int port_smem_rx_poll(struct port_t *port, unsigned int user_data)
++static int port_smem_rx_poll(struct port_t *port, unsigned int user_data)
+ {
+ 	struct ccci_smem_port *smem_port =
+ 		(struct ccci_smem_port *)port->private_data;
+@@ -323,7 +322,7 @@ int port_smem_rx_poll(struct port_t *port, unsigned int user_data)
+ 	return ret;
+ }
+ 
+-int port_smem_rx_wakeup(struct port_t *port)
++static int port_smem_rx_wakeup(struct port_t *port)
+ {
+ 	struct ccci_smem_port *smem_port =
+ 		(struct ccci_smem_port *)port->private_data;
+@@ -400,7 +399,7 @@ static struct port_t *find_smem_port_by_user_id(int user_id)
+ 	return port_get_by_minor(user_id + CCCI_SMEM_MINOR_BASE);
+ }
+ 
+-long port_ccb_ioctl(struct port_t *port, unsigned int cmd, unsigned long arg)
++static long port_ccb_ioctl(struct port_t *port, unsigned int cmd, unsigned long arg)
+ {
+ 	long ret = 0;
+ 	struct ccci_ccb_config in_ccb, out_ccb;
+@@ -510,7 +509,7 @@ long port_ccb_ioctl(struct port_t *port, unsigned int cmd, unsigned long arg)
+ 	return ret;
+ }
+ 
+-long port_smem_ioctl(struct port_t *port, unsigned int cmd, unsigned long arg)
++static long port_smem_ioctl(struct port_t *port, unsigned int cmd, unsigned long arg)
+ {
+ 	long ret = 0;
+ 	unsigned int data;
+@@ -722,10 +721,10 @@ static const struct file_operations smem_dev_fops = {
+ 
+ };
+ 
+-int port_smem_init(struct port_t *port)
++static int port_smem_init(struct port_t *port)
+ {
+ 	struct cdev *dev = NULL;
+-	int ret = 0;
++	__maybe_unused int ret = 0;
+ 	struct ccci_smem_port *smem_port = NULL;
+ 	struct ccci_smem_region *smem_region =
+ 		ccci_md_get_smem_by_user_id(port->minor);
+diff --git a/drivers/misc/mediatek/eccci/port/port_sysmsg.c b/drivers/misc/mediatek/eccci/port/port_sysmsg.c
+index 0f2179a515..b25b56204d 100644
+--- a/drivers/misc/mediatek/eccci/port/port_sysmsg.c
++++ b/drivers/misc/mediatek/eccci/port/port_sysmsg.c
+@@ -2,6 +2,7 @@
+ /*
+  * Copyright (C) 2016 MediaTek Inc.
+  */
++#include "mt6897_ccci_scp.h"
+ #include <linux/device.h>
+ #include <linux/wait.h>
+ #include <linux/module.h>
+@@ -121,7 +122,7 @@ int register_ccci_sys_call_back(unsigned int id, ccci_sys_cb_func_t func)
+ }
+ EXPORT_SYMBOL(register_ccci_sys_call_back);
+ 
+-void exec_ccci_sys_call_back(int cb_id, int data)
++static void exec_ccci_sys_call_back(int cb_id, int data)
+ {
+ 	ccci_sys_cb_func_t func;
+ 	int id;
+@@ -218,9 +219,13 @@ static void sys_msg_handler(struct port_t *port, struct sk_buff *skb)
+ 	case SIM_LOCK_RANDOM_PATTERN:
+ 		fsm_monitor_send_message(CCCI_MD_MSG_RANDOM_PATTERN, 0);
+ 		break;
+-#ifdef FEATURE_SCP_CCCI_SUPPORT
++#if IS_ENABLED(CONFIG_MTK_MT6897_CCCI_SCP)
+ 	case CCISM_SHM_INIT_ACK:
+-		/* Fall through */
++		mt6897_ccci_scp_init_ack();
++		break;
++#elif defined(FEATURE_SCP_CCCI_SUPPORT)
++	case CCISM_SHM_INIT_ACK:
++		fallthrough;
+ #endif
+ 	case MD_SIM_TYPE:
+ 		/* Fall through */
+diff --git a/drivers/misc/mediatek/eccci/port/port_tty.c b/drivers/misc/mediatek/eccci/port/port_tty.c
+index d9859f0f0a..1aa640ed74 100644
+--- a/drivers/misc/mediatek/eccci/port/port_tty.c
++++ b/drivers/misc/mediatek/eccci/port/port_tty.c
+@@ -236,7 +236,7 @@ static int ccci_tty_activate(struct tty_port *tport, struct tty_struct *tty)
+ 	WRITE_ONCE(ccci_tty_open_tty, tty);
+ 	spin_unlock_irqrestore(&ccci_tty_rx_lock, flags);
+ 
+-	CCCI_NORMAL_LOG(port->md_id, CHAR,
++	CCCI_NORMAL_LOG(0, CHAR,
+ 		"tty %s open by %s, usage_cnt=%d\n", port->name,
+ 		current->comm, atomic_read(&port->usage_cnt));
+ 
+@@ -253,7 +253,7 @@ static void ccci_tty_shutdown(struct tty_port *tport)
+ 
+ 	if (unlikely(!port))
+ 		return;
+-	md_id = port->md_id;
++	md_id = 0;	/* one modem; no md_id in this copy */
+ 
+ 	spin_lock_irqsave(&ccci_tty_rx_lock, flags);
+ 	WRITE_ONCE(ccci_tty_open_tty, NULL);
+@@ -363,7 +363,7 @@ int ccci_tty_port_register(struct port_t *port)
+ 
+ 	ret = platform_driver_register(&ccci_tty_platform_driver);
+ 	if (ret) {
+-		CCCI_ERROR_LOG(port->md_id, CHAR,
++		CCCI_ERROR_LOG(0, CHAR,
+ 			"register platform driver %s fail, ret=%d\n",
+ 			CCCI_TTY_DRIVER_NAME, ret);
+ 		goto out_unlock;
+@@ -373,7 +373,7 @@ int ccci_tty_port_register(struct port_t *port)
+ 		NULL, 0);
+ 	if (IS_ERR(pdev)) {
+ 		ret = PTR_ERR(pdev);
+-		CCCI_ERROR_LOG(port->md_id, CHAR,
++		CCCI_ERROR_LOG(0, CHAR,
+ 			"register platform device %s fail, ret=%d\n",
+ 			CCCI_TTY_DRIVER_NAME, ret);
+ 		pdev = NULL;
+@@ -385,7 +385,7 @@ int ccci_tty_port_register(struct port_t *port)
+ 	if (IS_ERR(driver)) {
+ 		ret = PTR_ERR(driver);
+ 		driver = NULL;
+-		CCCI_ERROR_LOG(port->md_id, CHAR,
++		CCCI_ERROR_LOG(0, CHAR,
+ 			"alloc tty driver %s fail, ret=%d\n",
+ 			CCCI_TTY_DRIVER_NAME, ret);
+ 		goto out_unlock;
+@@ -404,7 +404,7 @@ int ccci_tty_port_register(struct port_t *port)
+ 
+ 	ret = tty_register_driver(driver);
+ 	if (ret) {
+-		CCCI_ERROR_LOG(port->md_id, CHAR,
++		CCCI_ERROR_LOG(0, CHAR,
+ 			"register tty driver %s fail, ret=%d\n",
+ 			CCCI_TTY_DRIVER_NAME, ret);
+ 		goto out_free_driver;
+@@ -414,7 +414,7 @@ int ccci_tty_port_register(struct port_t *port)
+ 		CCCI_TTY_INDEX, &pdev->dev, NULL, NULL);
+ 	if (IS_ERR(dev)) {
+ 		ret = PTR_ERR(dev);
+-		CCCI_ERROR_LOG(port->md_id, CHAR,
++		CCCI_ERROR_LOG(0, CHAR,
+ 			"register tty device %s%d fail, ret=%d\n",
+ 			CCCI_TTY_NAME, CCCI_TTY_INDEX, ret);
+ 		goto out_unreg_driver;
+@@ -425,7 +425,7 @@ int ccci_tty_port_register(struct port_t *port)
+ 	ccci_tty.pdev = pdev;
+ 	mutex_unlock(&ccci_tty_mutex);
+ 
+-	CCCI_NORMAL_LOG(port->md_id, CHAR,
++	CCCI_NORMAL_LOG(0, CHAR,
+ 		"tty front-end /dev/%s%d registered for %s (ch %d/%d)\n",
+ 		CCCI_TTY_NAME, CCCI_TTY_INDEX, port->name, port->rx_ch,
+ 		port->tx_ch);
+diff --git a/drivers/misc/mediatek/eccci/port/port_udc.c b/drivers/misc/mediatek/eccci/port/port_udc.c
+index 0dd36265f8..175f65a600 100644
+--- a/drivers/misc/mediatek/eccci/port/port_udc.c
++++ b/drivers/misc/mediatek/eccci/port/port_udc.c
+@@ -36,7 +36,7 @@ void set_udc_status(struct sk_buff *skb)
+ 		atomic_set(&udc_status, UDC_DISCARD);
+ }
+ 
+-int udc_resp_msg_to_md(struct port_t *port,
++static int udc_resp_msg_to_md(struct port_t *port,
+ 	struct sk_buff *skb, int handle_udc_ret)
+ {
+ 	int data_len, ret;
+@@ -82,7 +82,7 @@ int udc_resp_msg_to_md(struct port_t *port,
+ 	return ret;
+ }
+ 
+-void udc_cmd_check(struct port_t *port,
++static void udc_cmd_check(struct port_t *port,
+ 	struct sk_buff **skb_tmp, struct sk_buff **skb,
+ 	u32 inst_id, struct udc_state_ctl *ctl)
+ {
+@@ -264,7 +264,7 @@ void udc_cmd_check(struct port_t *port,
+ 	ctl->curr_state = UDC_IDLE;
+ }
+ 
+-int udc_actv_handler(struct z_stream_s *zcpr, enum udc_dict_opt_e dic_option,
++static int udc_actv_handler(struct z_stream_s *zcpr, enum udc_dict_opt_e dic_option,
+ 	unsigned int buffer_size, u32 inst_id)
+ {
+ 	int ret = 0;
+@@ -298,7 +298,7 @@ int udc_actv_handler(struct z_stream_s *zcpr, enum udc_dict_opt_e dic_option,
+ }
+ 
+ /* phase out:when ap recevice deflateEnd cmd, call deflateEnd_cb directly */
+-int udc_deactv_handler(struct z_stream_s *zcpr, u32 inst_id)
++static int __maybe_unused udc_deactv_handler(struct z_stream_s *zcpr, u32 inst_id)
+ {
+ 	int deflate_end_flag = 0;
+ 	struct udc_comp_req_t *req_des;
+@@ -567,7 +567,7 @@ static int cal_udc_param(struct z_stream_s *zcpr, u32 inst_id,
+ 	return 0;
+ }
+ 
+-int udc_deflate(struct z_stream_s *zcpr, u32 inst_id, u32 con,
++static int udc_deflate(struct z_stream_s *zcpr, u32 inst_id, u32 con,
+ 	unsigned char *uncomp_data, unsigned int uncomp_len,
+ 	unsigned char *comp_data, unsigned int remain_len)
+ {
+@@ -610,7 +610,7 @@ int udc_deflate(struct z_stream_s *zcpr, u32 inst_id, u32 con,
+ 	return comp_len;
+ }
+ 
+-int udc_kick_handler(struct port_t *port, struct z_stream_s *zcpr,
++static int udc_kick_handler(struct port_t *port, struct z_stream_s *zcpr,
+ 	u32 inst_id, unsigned char **comp_data)
+ {
+ 	int ret = 0;
+@@ -757,7 +757,7 @@ int udc_kick_handler(struct port_t *port, struct z_stream_s *zcpr,
+ 	return ret;
+ }
+ 
+-int udc_restore_skb(struct port_t *port,
++static int udc_restore_skb(struct port_t *port,
+ 	struct udc_state_ctl *ctl,
+ 	struct sk_buff **skb_tmp, struct sk_buff **skb)
+ {
+-- 
+2.56.0
+

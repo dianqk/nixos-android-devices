@@ -1,0 +1,292 @@
+From 6b6958e798bfabad321535defbe38cda243d7b82 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Mon, 2 Nov 2026 00:11:25 +0800
+Subject: [PATCH] arm64: dts: qcom: aurora: wire the wide and tele 5x
+ cameras
+
+Wide: Sony LYT-900 at 0x10 on CCI0 bus 1, CSIPHY0 with three C-PHY
+trios (link frequency 1.7 GHz); MCLK0 on gpio100, reset gpio108,
+AVDD 2.8 V (gpio208) and AVDD2 1.8 V (gpio128) LDOs, DVDD 0.856 V from
+PM8010 L1N, DOVDD L5N.
+
+Tele 5x: Sony IMX858 (Semco module, its own mode variant) at 0x33 on
+CCI2 bus 1, CSIPHY3 with three C-PHY trios (1249.92 MHz); MCLK3 on
+gpio103, reset gpio209, AVDD 2.8 V (gpio127), DVDD 1.104 V from PM8010
+L1M, DOVDD L5N.
+
+gpio14 selects the MIPI path of the wide and tele 3.2x modules: low
+connects them to CSIPHY0 and CSIPHY5, high to the unused companion
+ISP. Hog it low, as stock keeps it.
+
+The front OV32B40 stays disabled and unconnected from CAMSS: its
+frames do not arrive reliably yet and a failed start leaves CSID0
+unusable.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ .../boot/dts/qcom/sm8650-xiaomi-aurora.dts    | 228 +++++++++++++++++-
+ 1 file changed, 216 insertions(+), 12 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts b/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
+index 5b2d96a107..bdd08586e1 100644
+--- a/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
++++ b/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
+@@ -7,6 +7,7 @@
+ #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
+ #include <dt-bindings/gpio/gpio.h>
+ #include <dt-bindings/input/input.h>
++#include <dt-bindings/media/video-interfaces.h>
+ #include "sm8650.dtsi"
+ #include "pm8550.dtsi"
+ #include "pm8550b.dtsi"
+@@ -1134,23 +1135,18 @@ vreg_l3n: ldo3 {
+ 	};
+ };
+ 
+-&camss {
+-	ports {
+-		port@4 {
+-			csiphy4_ep: endpoint {
+-				data-lanes = <0 1 2 3>;
+-				remote-endpoint = <&cam_front_ep>;
+-			};
+-		};
+-	};
+-};
+-
+ &i2c9 {
+ 	clock-frequency = <400000>;
+ 	status = "okay";
+ 
++	/*
++	 * Disabled: frames from CSIPHY4 do not arrive reliably yet and a
++	 * failed start leaves CSID0 unusable. Add a CAMSS port@4 endpoint
++	 * when enabling it.
++	 */
+ 	camera@10 {
+ 		compatible = "ovti,ov32b40";
++		status = "disabled";
+ 		reg = <0x10>;
+ 		clocks = <&camcc CAM_CC_MCLK4_CLK>;
+ 		assigned-clocks = <&camcc CAM_CC_MCLK4_CLK>;
+@@ -1169,7 +1165,6 @@ port {
+ 			cam_front_ep: endpoint {
+ 				data-lanes = <1 2 3 4>;
+ 				link-frequencies = /bits/ 64 <842400000>;
+-				remote-endpoint = <&csiphy4_ep>;
+ 			};
+ 		};
+ 	};
+@@ -1188,3 +1183,212 @@ cam_front_reset_default: cam-front-reset-default-state {
+ 		bias-disable;
+ 	};
+ };
++
++/*
++ * Wide camera: Sony LYT-900 at 0x10 on CCI0 bus 1, CSIPHY0 with three
++ * C-PHY trios. Tele 5x camera: Sony IMX858 (its own mode variant) at 0x33
++ * on CCI2 bus 1, CSIPHY3 with three C-PHY trios. AVDD (and the wide
++ * AVDD2) are external LDOs switched by TLMM GPIOs.
++ */
++/ {
++	vreg_cam_wide_avdd: regulator-cam-wide-avdd {
++		compatible = "regulator-fixed";
++		regulator-name = "cam_wide_avdd";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&tlmm 208 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <100>;
++		vin-supply = <&vreg_bob2>;
++		pinctrl-0 = <&cam_wide_avdd_default>;
++		pinctrl-names = "default";
++	};
++
++	vreg_cam_wide_avdd2: regulator-cam-wide-avdd2 {
++		compatible = "regulator-fixed";
++		regulator-name = "cam_wide_avdd2";
++		regulator-min-microvolt = <1800000>;
++		regulator-max-microvolt = <1800000>;
++		gpio = <&tlmm 128 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <100>;
++		vin-supply = <&vreg_bob2>;
++		pinctrl-0 = <&cam_wide_avdd2_default>;
++		pinctrl-names = "default";
++	};
++
++	vreg_cam_tele5x_avdd: regulator-cam-tele5x-avdd {
++		compatible = "regulator-fixed";
++		regulator-name = "cam_tele5x_avdd";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&tlmm 127 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <100>;
++		vin-supply = <&vreg_bob2>;
++		pinctrl-0 = <&cam_tele5x_avdd_default>;
++		pinctrl-names = "default";
++	};
++};
++
++&apps_rsc {
++	regulators-6 {
++		vreg_l1m: ldo1 {
++			regulator-name = "vreg_l1m";
++			regulator-min-microvolt = <1104000>;
++			regulator-max-microvolt = <1104000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++	regulators-7 {
++		vreg_l1n: ldo1 {
++			regulator-name = "vreg_l1n";
++			regulator-min-microvolt = <856000>;
++			regulator-max-microvolt = <856000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++};
++
++&camss {
++	ports {
++		port@0 {
++			csiphy0_ep: endpoint {
++				bus-type = <MEDIA_BUS_TYPE_CSI2_CPHY>;
++				data-lanes = <0 1 2>;
++				remote-endpoint = <&cam_wide_ep>;
++			};
++		};
++
++		port@3 {
++			csiphy3_ep: endpoint {
++				bus-type = <MEDIA_BUS_TYPE_CSI2_CPHY>;
++				data-lanes = <0 1 2>;
++				remote-endpoint = <&cam_tele5x_ep>;
++			};
++		};
++	};
++};
++
++&cci0_i2c1 {
++	clock-frequency = <400000>;
++
++	camera@10 {
++		compatible = "sony,lyt900";
++		reg = <0x10>;
++		clocks = <&camcc CAM_CC_MCLK0_CLK>;
++		assigned-clocks = <&camcc CAM_CC_MCLK0_CLK>;
++		assigned-clock-rates = <19200000>;
++		power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>;
++		reset-gpios = <&tlmm 108 GPIO_ACTIVE_LOW>;
++		pinctrl-0 = <&cam0_default>, <&cam_wide_reset_default>;
++		pinctrl-names = "default";
++		avdd-supply = <&vreg_cam_wide_avdd>;
++		avdd2-supply = <&vreg_cam_wide_avdd2>;
++		dovdd-supply = <&vreg_l5n>;
++		dvdd-supply = <&vreg_l1n>;
++		orientation = <1>;	/* rear */
++		rotation = <90>;
++
++		port {
++			cam_wide_ep: endpoint {
++				bus-type = <MEDIA_BUS_TYPE_CSI2_CPHY>;
++				data-lanes = <1 2 3>;
++				link-frequencies = /bits/ 64 <1700000000>;
++				remote-endpoint = <&csiphy0_ep>;
++			};
++		};
++	};
++};
++
++&cci2 {
++	status = "okay";
++};
++
++&cci2_i2c1 {
++	clock-frequency = <400000>;
++
++	camera@33 {
++		compatible = "xiaomi,aurora-imx858-tele5x", "sony,imx858";
++		reg = <0x33>;
++		clocks = <&camcc CAM_CC_MCLK3_CLK>;
++		assigned-clocks = <&camcc CAM_CC_MCLK3_CLK>;
++		assigned-clock-rates = <19200000>;
++		power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>;
++		reset-gpios = <&tlmm 209 GPIO_ACTIVE_LOW>;
++		pinctrl-0 = <&cam3_default>, <&cam_tele5x_reset_default>;
++		pinctrl-names = "default";
++		dovdd-supply = <&vreg_l5n>;
++		avdd-supply = <&vreg_cam_tele5x_avdd>;
++		dvdd-supply = <&vreg_l1m>;
++		orientation = <1>;	/* rear */
++		rotation = <90>;
++
++		port {
++			cam_tele5x_ep: endpoint {
++				bus-type = <MEDIA_BUS_TYPE_CSI2_CPHY>;
++				data-lanes = <1 2 3>;
++				link-frequencies = /bits/ 64 <1249920000>;
++				remote-endpoint = <&csiphy3_ep>;
++			};
++		};
++	};
++};
++
++/* Stock MCLK0 and MCLK3 drive strength. */
++&cam0_default {
++	drive-strength = <4>;
++};
++
++&cam3_default {
++	drive-strength = <4>;
++};
++
++&tlmm {
++	/*
++	 * gpio14 selects the MIPI path of the wide and tele 3.2x modules;
++	 * low connects them to CSIPHY0/CSIPHY5 (high routes them to the
++	 * unused companion ISP). Stock keeps it low.
++	 */
++	cam-mipi-sel-hog {
++		gpio-hog;
++		gpios = <14 GPIO_ACTIVE_HIGH>;
++		output-low;
++		line-name = "cam-mipi-sel";
++	};
++
++	cam_wide_avdd_default: cam-wide-avdd-default-state {
++		pins = "gpio208";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++
++	cam_wide_avdd2_default: cam-wide-avdd2-default-state {
++		pins = "gpio128";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++
++	cam_wide_reset_default: cam-wide-reset-default-state {
++		pins = "gpio108";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++
++	cam_tele5x_avdd_default: cam-tele5x-avdd-default-state {
++		pins = "gpio127";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++
++	cam_tele5x_reset_default: cam-tele5x-reset-default-state {
++		pins = "gpio209";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++};

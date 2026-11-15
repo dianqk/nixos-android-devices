@@ -1,0 +1,58 @@
+From a2b6d57ec718b80b31b9b2c79318e0f2b2a1907a Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 11 Nov 2026 04:00:41 +0800
+Subject: [PATCH 096/144] media: camss: retain endpoint cleanup with Linux 7.3
+ iterator
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0128-media-camss-retain-endpoint-cleanup-with-Linux-7.3-i.patch
+Import-SHA256: bb87868dda42a3daca1d7be326765770322511cb14219bfd27a18d31b2be6dec
+Import-Provenance: mail headers
+(cherry picked from commit b790918a4076b029242021cd041548ffa6d5ef7d)
+---
+ drivers/media/platform/qcom/camss/camss.c | 16 +++++++++++-----
+ 1 file changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/platform/qcom/camss/camss.c b/drivers/media/platform/qcom/camss/camss.c
+index 8decec7aa1..818ad47208 100644
+--- a/drivers/media/platform/qcom/camss/camss.c
++++ b/drivers/media/platform/qcom/camss/camss.c
+@@ -4806,11 +4806,11 @@ static int camss_parse_endpoint_node(struct device *dev,
+ static int camss_parse_ports(struct camss *camss)
+ {
+ 	struct device *dev = camss->dev;
+-	struct fwnode_handle *fwnode = dev_fwnode(dev);
++	struct fwnode_handle *fwnode = dev_fwnode(dev), *ep;
+ 	u8 lane_base = camss->legacy_phy ? 0 : 1;
+ 	int ret;
+ 
+-	fwnode_graph_for_each_endpoint_scoped(fwnode, ep) {
++	fwnode_graph_for_each_endpoint(fwnode, ep) {
+ 		struct camss_async_subdev *csd;
+ 
+ 		if (!fwnode_device_is_available(ep))
+@@ -4846,16 +4846,22 @@ static int camss_parse_ports(struct camss *camss)
+ 			fwnode_handle_put(sensor_ep);
+ 		}
+ 
+-		if (IS_ERR(csd))
+-			return PTR_ERR(csd);
++		if (IS_ERR(csd)) {
++			ret = PTR_ERR(csd);
++			goto err_cleanup;
++		}
+ 
+ 		ret = camss_parse_endpoint_node(dev, ep, csd, lane_base);
+ 		if (ret < 0)
+-			return ret;
++			goto err_cleanup;
+ 	}
+ 
+ 	return 0;
+ 
++
++err_cleanup:
++	fwnode_handle_put(ep);
++	return ret;
+ }
+ 
+ static void camss_detect_legacy_phy(struct camss *camss)

@@ -40,4 +40,4 @@ mobile-device recovery --target RECOVERY_HOST prepare-boot
 mobile-device recovery --target RECOVERY_HOST prepare-boot --execute
 ```
 
-`format-root` 将 `userdata` 格式化为带配置标签的 ext4，并在设置时使用 `storageRoles.root.fsUuid`。`prepare-boot` 仅在 `system` 尚不是 FAT 时将其格式化为 FAT32（标签 `NIXOS_BOOT`）；它要求根分区已格式化且为空或其中的 store 能通过校验，并在首次安装完成前保留待处理标记。格式化本身不会安装 Nix 闭包、EFI 文件或 U-Boot；完成整套首装应使用[受检查的 `install-initial` 流程](first-install.zh.md#从-ram-recovery-安装)。
+`format-root` 将 `userdata` 格式化为带配置标签的 ext4，并在设置时使用 `storageRoles.root.fsUuid`。`prepare-boot` 仅在 `system` 尚不是 FAT 时将其格式化为 FAT32（配置的启动标签，默认 `BOOT`，`androidDevices.boot.uefi.label`）；它要求根分区已格式化且为空或其中的 store 能通过校验，并在首次安装完成前保留待处理标记。格式化本身不会安装 Nix 闭包、EFI 文件或 U-Boot；完成整套首装应使用[受检查的 `install-initial` 流程](first-install.zh.md#从-ram-recovery-安装)。

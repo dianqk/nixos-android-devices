@@ -1,0 +1,35 @@
+From: Dian QK <dianqk@dianqk.net>
+Date: Wed, 4 Nov 2026 20:35:00 +0800
+Subject: [PATCH] Bluetooth: preserve the initial management power transition
+
+Do not clear HCI_AUTO_OFF from the controller setup callback. The HCI core
+uses this flag to complete the management power-on transition after setup,
+including registering the SMP channels. Clearing it leaves LE connections
+without a Security Manager until the adapter is toggled off and on, so
+keyboard passkey pairing fails with "security requested but not available".
+
+The existing t880_no_sleep close callback still keeps the physical BGF
+powered; the core must retain ownership of its logical power-state flags.
+
+Link: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/bluetooth/hci_sync.c?id=a091755fa00cc93bd01bf1ead191374550eb9b94
+---
+--- a/connectivity/bt/mt66xx/btmtk_main.c
++++ b/connectivity/bt/mt66xx/btmtk_main.c
+@@ -3579,15 +3579,14 @@
+ 		}
+ 		/*
+ 		 * T880: program the nvdata address before the core reads it,
+-		 * and stay powered after setup (a BGF power cycle does not come
+-		 * back yet; xaga likewise avoids the auto power-off).
++		 * keeping the core management power transition and SMP registration.
++		 * t880_no_sleep keeps the physical BGF powered in bt_close.
+ 		 */
+ 		if (btmtk_t880_get_bdaddr(&addr)) {
+ 			ret = btmtk_t880_set_bdaddr(hdev, &addr);
+ 			if (ret)
+ 				return ret;
+ 		}
+-		hci_dev_clear_flag(hdev, HCI_AUTO_OFF);
+ 		return ret;
+ 	}
+ 	return 0;

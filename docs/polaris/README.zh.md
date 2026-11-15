@@ -1,8 +1,8 @@
 # 小米 MIX 2S（polaris）
 
-[English](README.md) · [全部设备](../README.zh.md) · [硬件支持](hardware.zh.md)
+[English](README.md) · [全部设备](../README.zh.md) · [支持状态](status.zh.md) · [硬件支持](hardware.zh.md)
 
-支持等级：Tier 2。具体含义见[支持范围](../README.zh.md#支持等级)。
+状态：见[硬件页](hardware.zh.md)和[支持状态](status.zh.md)。
 
 ## 配置与安装
 
@@ -18,7 +18,6 @@
 
 ```nix
 {
-  androidDevices.usbSerial = "my-polaris-01";
   androidDevices.usb.ssh.enable = true;
   users.users.root.openssh.authorizedKeys.keys = [ "ssh-ed25519 REPLACE_WITH_YOUR_PUBLIC_KEY" ];
 }
@@ -55,7 +54,7 @@ Polaris 默认使用 U-Boot/EFI，物理 `system` 为 FAT `/boot`，`userdata` �
 
 设备专用固件从固定的上游提交获取，本仓库不保存其二进制副本。
 
-- 来源：[MollySophia/firmware-xiaomi-polaris 的 `d88ffb2` 提交](https://github.com/MollySophia/firmware-xiaomi-polaris/tree/d88ffb2ee182d07567bf280fc4a8493f975ae977)。
+- 归档：[`polaris-firmware-d88ffb2-20261115.tar.zst`](https://github.com/dianqk/nixos-android-devices/releases/download/firmware/polaris-firmware-d88ffb2-20261115.tar.zst)，由 [MollySophia/firmware-xiaomi-polaris 的 `d88ffb2` 提交](https://github.com/MollySophia/firmware-xiaomi-polaris/tree/d88ffb2ee182d07567bf280fc4a8493f975ae977)汇总。
 - 用途：设备专用 modem、Wi-Fi、蓝牙、GPU、IPA 与多媒体固件。
 
 通用固件来源及许可证说明见[文档索引](../README.zh.md#固件来源与许可证)。

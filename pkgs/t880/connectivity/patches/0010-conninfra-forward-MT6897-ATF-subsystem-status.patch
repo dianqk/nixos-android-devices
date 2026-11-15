@@ -1,0 +1,242 @@
+From 581b111f07d4368776397388737bc84312d921b7 Mon Sep 17 00:00:00 2001
+From: pswbuild <pswbuild@oppo.com>
+Date: Fri, 20 Mar 2026 03:11:53 +0000
+Subject: [PATCH] Synchronize code for OnePlus OPD2407_16.0.2.400(CN01)
+
+Based on MTK release TAG:
+alps/kernel/build/bazel_mgk_rules:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/bt/linux_v2_mt6653:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/bt/mt66xx:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/bt/mt76xx/sdio:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/common:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/connfem:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/conninfra:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/conninfra_mt6653:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/fmradio:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/gps:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/wlan/adaptor:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/wlan/adaptor_mt6653:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/wlan/core/gen2:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/wlan/core/gen3:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4-mt7663:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4-mt7668:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4-mt79xx:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m_mt6653:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/gpu:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/hbt_driver:t-alps-release-v0.mp1.rc-V14.10
+alps/vendor/mediatek/kernel_modules/hbt_driver_cus:t-alps-release-v0.mp1.rc-V14.10
+alps/vendor/mediatek/kernel_modules/met_drv_v2:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/met_drv_v3:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/sched_cus:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/udc:t-alps-release-u0.mp1.rc-V10.29
+kernel/build:t-alps-release-u0.mp1.rc-V10.29
+neptune/bt_driver/linux_v2:t-alps-release-u0.mp1.rc-V10.29
+neptune/wlan_driver/gen4m:t-alps-release-u0.mp1.rc-V10.29
+quark/kernel_device_modules-6.1:t-alps-release-u0.mp1.rc-V10.29
+quark/mtkcam-kernel_device_modules:t-alps-release-u0.mp1.rc-V10.29
+
+Local partial backport: forward current/next subsystem masks to the
+MT6897 ATF SPI-master and A-die operations. The status-aware A-die callback
+also runs before adding a radio to an already powered conninfra instance.
+
+Local adaptations: optional status-aware ops preserve existing platform
+callbacks and first-on-only legacy A-die setup. Add dynamic-debug inputs
+and results for MT6897 ATF initialization, SPI-master, A-die and low-power
+calls.
+
+Link: https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_mt6897/commit/581b111f07d4368776397388737bc84312d921b7
+Link: https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_mt6897/blob/76792af3e1fefabd34be6dd684bfc9facc4d5b17/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2/platform/mt6897/mt6897_atf.c
+Signed-off-by: Dian QK <dianqk@dianqk.net>
+---
+--- a/connectivity/conninfra/conn_drv/connv2/platform/consys_hw.c
++++ b/connectivity/conninfra/conn_drv/connv2/platform/consys_hw.c
+@@ -171,6 +171,28 @@
+ 				   unsigned long interval_us)
+ {
+ 	return consys_reg_mng_dump_cpupcr(dump_type, times, interval_us);
++}
++
++static int consys_hw_spi_master_cfg(unsigned int curr_status,
++				    unsigned int next_status)
++{
++	if (consys_hw_ops->consys_plt_spi_master_cfg_status)
++		return consys_hw_ops->consys_plt_spi_master_cfg_status(curr_status,
++			next_status);
++	if (consys_hw_ops->consys_plt_spi_master_cfg)
++		return consys_hw_ops->consys_plt_spi_master_cfg(next_status);
++	return 0;
++}
++
++static int consys_hw_a_die_cfg(unsigned int curr_status,
++			       unsigned int next_status)
++{
++	if (consys_hw_ops->consys_plt_a_die_cfg_status)
++		return consys_hw_ops->consys_plt_a_die_cfg_status(curr_status,
++			next_status);
++	if (consys_hw_ops->consys_plt_a_die_cfg)
++		return consys_hw_ops->consys_plt_a_die_cfg();
++	return 0;
+ }
+ 
+ int consys_hw_pwr_off(unsigned int curr_status, unsigned int off_radio)
+@@ -201,8 +223,7 @@
+ 		if (consys_hw_ops->consys_plt_subsys_status_update)
+ 			consys_hw_ops->consys_plt_subsys_status_update(false, off_radio);
+ 		_consys_hw_raise_voltage(off_radio, false, true);
+-		if (consys_hw_ops->consys_plt_spi_master_cfg)
+-			consys_hw_ops->consys_plt_spi_master_cfg(next_status);
++		consys_hw_spi_master_cfg(curr_status, next_status);
+ 		if (consys_hw_ops->consys_plt_low_power_setting)
+ 			consys_hw_ops->consys_plt_low_power_setting(curr_status, next_status);
+ 		if (ret == 0)
+@@ -351,10 +372,10 @@
+ 		emi_mng_set_remapping_reg();
+ 		if (consys_hw_ops->consys_plt_d_die_cfg)
+ 			consys_hw_ops->consys_plt_d_die_cfg();
+-		if (consys_hw_ops->consys_plt_spi_master_cfg)
+-			consys_hw_ops->consys_plt_spi_master_cfg(next_status);
+-		if (consys_hw_ops->consys_plt_a_die_cfg)
+-			ret = consys_hw_ops->consys_plt_a_die_cfg();
++		consys_hw_spi_master_cfg(curr_status, next_status);
++		if (consys_hw_ops->consys_plt_a_die_cfg_status ||
++		    consys_hw_ops->consys_plt_a_die_cfg)
++			ret = consys_hw_a_die_cfg(curr_status, next_status);
+ 		if (ret) {
+ 			pr_err("[%s] a-die config error, ret=%d\n", __func__, ret);
+ 			_consys_hw_pwr_on_rollback(CONNINFRA_PWR_ON_A_DIE_FAIL);
+@@ -380,11 +401,12 @@
+ 			pr_err("[%s] wakeup conninfra fail, ret=%d\n", __func__, ret);
+ 			return CONNINFRA_POWER_ON_CONFIG_FAIL;
+ 		}
++		if (consys_hw_ops->consys_plt_a_die_cfg_status)
++			consys_hw_a_die_cfg(curr_status, next_status);
+ 		/* Record SW status on shared sysram */
+ 		if (consys_hw_ops->consys_plt_subsys_status_update)
+ 			consys_hw_ops->consys_plt_subsys_status_update(true, on_radio);
+-		if (consys_hw_ops->consys_plt_spi_master_cfg)
+-			consys_hw_ops->consys_plt_spi_master_cfg(next_status);
++		consys_hw_spi_master_cfg(curr_status, next_status);
+ 		_consys_hw_raise_voltage(on_radio, true, true);
+ 		if (consys_hw_ops->consys_plt_low_power_setting)
+ 			consys_hw_ops->consys_plt_low_power_setting(curr_status, next_status);
+--- a/connectivity/conninfra/conn_drv/connv2/platform/mt6897/mt6897_atf.c
++++ b/connectivity/conninfra/conn_drv/connv2/platform/mt6897/mt6897_atf.c
+@@ -20,13 +20,17 @@
+ 	static bool initialized = 0;
+ 	int ret;
+ 
+-	if (initialized == 1)
++	if (initialized == 1) {
++		pr_debug("MT6897 ATF init cached ret=0\n");
+ 		return 0;
++	}
+ 
+ 	platform_config = consys_hw_get_platform_config();
+ 	arm_smccc_smc(MTK_SIP_KERNEL_CONNSYS_CONTROL, SMC_CONNSYS_INIT_ATF_DATA_OPID,
+ 		platform_config, conn_hw_env.clock_type, 0, 0, 0, 0, &res);
+ 	ret = res.a0;
++	pr_debug("MT6897 ATF init config=0x%x clock=%u ret=%d\n",
++		 platform_config, conn_hw_env.clock_type, ret);
+ 	initialized = 1;
+ 	return ret;
+ }
+@@ -45,21 +49,29 @@
+ 	return ret;
+ }
+ 
+-int connsys_spi_master_cfg_mt6897_atf(unsigned int next_status)
+-{
+-	int ret = 0;
+-	CONNSYS_SMC_CALL_RET(SMC_CONNSYS_SPI_MASTER_CFG_OPID, 0, 0, 0, 0, 0, 0, ret);
+-	return ret;
+-}
+-
+-int connsys_a_die_cfg_mt6897_atf(void)
++int connsys_spi_master_cfg_mt6897_atf(unsigned int curr_status,
++				      unsigned int next_status)
++{
++	int ret = 0;
++
++	CONNSYS_SMC_CALL_RET(SMC_CONNSYS_SPI_MASTER_CFG_OPID,
++			     curr_status, next_status, 0, 0, 0, 0, ret);
++	pr_debug("MT6897 ATF spi_master curr=0x%x next=0x%x ret=%d\n",
++		 curr_status, next_status, ret);
++	return ret;
++}
++
++int connsys_a_die_cfg_mt6897_atf(unsigned int curr_status,
++				 unsigned int next_status)
+ {
+ 	int ret = 0;
+ 	struct arm_smccc_res res;
+ 
+ 	arm_smccc_smc(MTK_SIP_KERNEL_CONNSYS_CONTROL, SMC_CONNSYS_A_DIE_CFG_OPID,
+-		      0, 0, 0, 0, 0, 0, &res);
++		      curr_status, next_status, 0, 0, 0, 0, &res);
+ 	ret = res.a0;
++	pr_debug("MT6897 ATF a_die curr=0x%x next=0x%x ret=%d adie=0x%lx\n",
++		 curr_status, next_status, ret, res.a1);
+ 	conn_hw_env.adie_hw_version = res.a1;
+ 
+ 	return ret;
+@@ -89,6 +101,8 @@
+ 	int ret = 0;
+ 	CONNSYS_SMC_CALL_RET(SMC_CONNSYS_LOW_POWER_SETTING_OPID,
+ 			     curr_status, next_status, 0, 0, 0, 0, ret);
++	pr_debug("MT6897 ATF low_power curr=0x%x next=0x%x ret=%d\n",
++		 curr_status, next_status, ret);
+ 	return ret;
+ }
+ 
+--- a/connectivity/conninfra/conn_drv/connv2/platform/mt6897/mt6897_ops.c
++++ b/connectivity/conninfra/conn_drv/connv2/platform/mt6897/mt6897_ops.c
+@@ -112,8 +112,8 @@
+ 
+ 	.consys_plt_polling_consys_chipid = consys_polling_chipid_mt6897_atf,
+ 	.consys_plt_d_die_cfg = connsys_d_die_cfg_mt6897_atf,
+-	.consys_plt_spi_master_cfg = connsys_spi_master_cfg_mt6897_atf,
+-	.consys_plt_a_die_cfg = connsys_a_die_cfg_mt6897_atf,
++	.consys_plt_spi_master_cfg_status = connsys_spi_master_cfg_mt6897_atf,
++	.consys_plt_a_die_cfg_status = connsys_a_die_cfg_mt6897_atf,
+ 	.consys_plt_afe_wbg_cal = connsys_afe_wbg_cal_mt6897_atf,
+ 	.consys_plt_afe_sw_patch = connsys_afe_sw_patch_mt6897_atf,
+ 	.consys_plt_subsys_pll_initial = connsys_subsys_pll_initial_mt6897_atf,
+--- a/connectivity/conninfra/conn_drv/connv2/platform/include/consys_hw.h
++++ b/connectivity/conninfra/conn_drv/connv2/platform/include/consys_hw.h
+@@ -52,6 +52,10 @@
+ typedef int(*CONSYS_PLT_D_DIE_CFG) (void);
+ typedef int(*CONSYS_PLT_SPI_MASTER_CFG) (unsigned int next_status);
+ typedef int(*CONSYS_PLT_A_DIE_CFG) (void);
++typedef int(*CONSYS_PLT_SPI_MASTER_CFG_STATUS) (unsigned int curr_status,
++	unsigned int next_status);
++typedef int(*CONSYS_PLT_A_DIE_CFG_STATUS) (unsigned int curr_status,
++	unsigned int next_status);
+ typedef void(*CONSYS_PLT_AFE_SW_PATCH) (void);
+ typedef int(*CONSYS_PLT_AFE_WBG_CAL) (void);
+ typedef int(*CONSYS_PLT_SUBSYS_PLL_INITIAL) (void);
+@@ -182,6 +186,10 @@
+ 
+ 	CONSYS_PLT_REGISTER_IRQ consys_plt_register_irq;
+ 	CONSYS_PLT_UNREGISTER_IRQ consys_plt_unregister_irq;
++
++	/* Optional radio-mask callbacks; retain the legacy signatures above. */
++	CONSYS_PLT_SPI_MASTER_CFG_STATUS consys_plt_spi_master_cfg_status;
++	CONSYS_PLT_A_DIE_CFG_STATUS consys_plt_a_die_cfg_status;
+ };
+ 
+ struct conninfra_dev_cb {
+--- a/connectivity/conninfra/conn_drv/connv2/platform/mt6897/include/mt6897_atf.h
++++ b/connectivity/conninfra/conn_drv/connv2/platform/mt6897/include/mt6897_atf.h
+@@ -11,8 +11,10 @@
+ int consys_init_atf_data_mt6897_atf(void);
+ int consys_polling_chipid_mt6897_atf(void);
+ int connsys_d_die_cfg_mt6897_atf(void);
+-int connsys_spi_master_cfg_mt6897_atf(unsigned int next_status);
+-int connsys_a_die_cfg_mt6897_atf(void);
++int connsys_spi_master_cfg_mt6897_atf(unsigned int curr_status,
++				      unsigned int next_status);
++int connsys_a_die_cfg_mt6897_atf(unsigned int curr_status,
++				 unsigned int next_status);
+ int connsys_afe_wbg_cal_mt6897_atf(void);
+ void connsys_afe_sw_patch_mt6897_atf(void);
+ int connsys_subsys_pll_initial_mt6897_atf(void);

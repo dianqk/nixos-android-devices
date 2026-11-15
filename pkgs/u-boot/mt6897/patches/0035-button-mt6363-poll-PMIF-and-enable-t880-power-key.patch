@@ -1,0 +1,94 @@
+From: Dian QK <dianqk@dianqk.net>
+Date: Wed, 4 Nov 2026 21:00:00 +0800
+Subject: [PATCH] button: mt6363: wait for PMIF reads and decode key bits
+
+Wait for IDLE before sending a request and WFVLDCLR before sampling data,
+matching the Linux MediaTek PMIF transaction protocol. TOPSTATUS keys are
+active low and must be decoded independently. Enable the power key on T880.
+
+Link: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/spmi/spmi-mtk-pmif.c?id=a091755fa00cc93bd01bf1ead191374550eb9b94
+---
+--- a/drivers/button/button-mt6363-HACK.c
++++ b/drivers/button/button-mt6363-HACK.c
+@@ -14,9 +14,16 @@
+ #include <asm/io.h>
+ 
+ #include <linux/input.h>
++#include <linux/iopoll.h>
+ 
+-#define PRESSED_VOLUP 0x16
+-#define PRESSED_POWER 0x1c
++#define PMIF_SWINF_ACC 0x1cc04800
++#define PMIF_SWINF_RDATA 0x1cc04814
++#define PMIF_SWINF_VLD_CLR 0x1cc04824
++#define PMIF_SWINF_STA 0x1cc04828
++#define PMIF_FSM(state) (((state) >> 1) & 7)
++#define PMIF_TIMEOUT_US 10000
++#define MT6363_POWER_RELEASED BIT(1)
++#define MT6363_HOME_RELEASED BIT(3)
+ 
+ struct button_mt6363_priv {
+ 	int linux_code;
+@@ -26,24 +33,36 @@
+ static enum button_state_t button_mt6363_get_state(struct udevice *dev)
+ {
+ 	struct button_mt6363_priv *priv = dev_get_priv(dev);
++	u32 status, data;
+ 	int ret;
+ 
+ 	if (!priv)
+ 		return -ENODATA;
+ 
+-	// SPMI send read cmd
+-	writel(0xC400001e, 0x1cc04800);
++	/* Wait until the channel is idle before issuing an extended read. */
++	ret = readl_poll_timeout((void __iomem *)PMIF_SWINF_STA, status,
++				PMIF_FSM(status) == 0, PMIF_TIMEOUT_US);
++	if (ret) {
++		if (PMIF_FSM(status) == 6)
++			writel(1, PMIF_SWINF_VLD_CLR);
++		return ret;
++	}
+ 
+-	// Read data
+-	ret = readl(0x1cc04814);
++	/* MT6363 SID 4, one-byte TOPSTATUS register 0x1e. */
++	writel(0xc400001e, PMIF_SWINF_ACC);
++	ret = readl_poll_timeout((void __iomem *)PMIF_SWINF_STA, status,
++				PMIF_FSM(status) == 6, PMIF_TIMEOUT_US);
++	if (ret)
++		return ret;
+ 
+-	// Set clear PMIC buffer bit
+-	writel(0x1, 0x1cc04824);
++	data = readl(PMIF_SWINF_RDATA);
++	writel(1, PMIF_SWINF_VLD_CLR);
+ 
+-	if (priv->linux_code == KEY_POWER && ret == PRESSED_POWER)
+-		return BUTTON_ON;
+-	else if (priv->linux_code == KEY_VOLUMEUP && ret == PRESSED_VOLUP)
+-		return BUTTON_ON;
++	/* Individual active-low bits also handle simultaneous key presses. */
++	if (priv->linux_code == KEY_POWER)
++		return data & MT6363_POWER_RELEASED ? BUTTON_OFF : BUTTON_ON;
++	if (priv->linux_code == KEY_VOLUMEUP)
++		return data & MT6363_HOME_RELEASED ? BUTTON_OFF : BUTTON_ON;
+ 
+ 	return BUTTON_OFF;
+ }
+--- a/arch/arm/dts/mt6897-alldocube-t880.dts
++++ b/arch/arm/dts/mt6897-alldocube-t880.dts
+@@ -38,6 +38,14 @@
+ 	};
+ 
++	pmic-keys {
++		compatible = "mediatek,mt6363-buttons-raw";
++		power-key {
++			label = "Power";
++			linux,code = <KEY_POWER>;
++		};
++	};
++
+ 	/* Keypad matrix positions from the vendor mediatek,hw-init-map. */
+ 	kp_keys: kp-keys {
+ 		compatible = "mediatek,kp-raw";

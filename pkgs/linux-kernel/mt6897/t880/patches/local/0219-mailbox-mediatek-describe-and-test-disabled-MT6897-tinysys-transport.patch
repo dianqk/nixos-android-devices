@@ -1,0 +1,432 @@
+From a0d248d171776d288137a01b59a7ee577855c2b7 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 8 Nov 2026 03:10:21 +0800
+Subject: [PATCH 220/220] mailbox: mediatek: describe and test disabled MT6897
+ tinysys transport
+
+Add the mailbox binding and build support, disabled stock-address SCMI mailbox and SRAM nodes, and extracted-production MMIO, SiP, IRQ and resource error tests. Leave the generic SCMI transport unchanged and include no vendor protocol or policy client.
+---
+ .../mediatek,mt6897-tinysys-mailbox.yaml      |  69 +++++++
+ arch/arm64/boot/dts/mediatek/mt6897.dtsi      |  51 ++++++
+ drivers/mailbox/Kconfig                       |   9 +
+ drivers/mailbox/Makefile                      |   2 +
+ tools/testing/selftests/mtk_clk/Makefile      |   4 +-
+ .../selftests/mtk_clk/test_tinysys_mailbox.py |  40 +++++
+ .../selftests/mtk_clk/tinysys_mailbox_cases.c | 169 ++++++++++++++++++
+ 7 files changed, 342 insertions(+), 2 deletions(-)
+ create mode 100644 Documentation/devicetree/bindings/mailbox/mediatek,mt6897-tinysys-mailbox.yaml
+ create mode 100755 tools/testing/selftests/mtk_clk/test_tinysys_mailbox.py
+ create mode 100644 tools/testing/selftests/mtk_clk/tinysys_mailbox_cases.c
+
+diff --git a/Documentation/devicetree/bindings/mailbox/mediatek,mt6897-tinysys-mailbox.yaml b/Documentation/devicetree/bindings/mailbox/mediatek,mt6897-tinysys-mailbox.yaml
+new file mode 100644
+index 0000000000..c7b5fbd4da
+--- /dev/null
++++ b/Documentation/devicetree/bindings/mailbox/mediatek,mt6897-tinysys-mailbox.yaml
+@@ -0,0 +1,69 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/mailbox/mediatek,mt6897-tinysys-mailbox.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: MediaTek MT6897 tinysys mailbox
++
++maintainers:
++  - dianqk <dianqk@dianqk.net>
++
++description:
++  Two bidirectional doorbells connect the application processor to the SSPM.
++  Each channel has an interrupt SET register at offset 0 and a pending/clear
++  register at offset 4. SCMI payloads live in separate shared-memory regions.
++
++properties:
++  compatible:
++    const: mediatek,mt6897-tinysys-mailbox
++
++  reg:
++    items:
++      - description: Channel 0 doorbell registers
++      - description: Channel 1 doorbell registers
++
++  reg-names:
++    items:
++      - const: channel0
++      - const: channel1
++
++  interrupts:
++    items:
++      - description: Channel 0 receive interrupt
++      - description: Channel 1 receive interrupt
++
++  "#mbox-cells":
++    const: 1
++    description: Channel index, 0 or 1.
++
++  mediatek,secure-clear:
++    type: boolean
++    description:
++      Receive interrupts must be acknowledged through the SSPM SiP mailbox
++      clear operation instead of writing the clear register. This is a
++      platform firmware contract, not an optional runtime fallback.
++
++required:
++  - compatible
++  - reg
++  - reg-names
++  - interrupts
++  - "#mbox-cells"
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/interrupt-controller/arm-gic.h>
++    #include <dt-bindings/interrupt-controller/irq.h>
++
++    mailbox@1c351000 {
++        compatible = "mediatek,mt6897-tinysys-mailbox";
++        reg = <0x1c351000 0x1000>, <0x1c361000 0x1000>;
++        reg-names = "channel0", "channel1";
++        interrupts = <GIC_SPI 341 IRQ_TYPE_LEVEL_HIGH>,
++                     <GIC_SPI 342 IRQ_TYPE_LEVEL_HIGH>;
++        #mbox-cells = <1>;
++        mediatek,secure-clear;
++    };
+diff --git a/arch/arm64/boot/dts/mediatek/mt6897.dtsi b/arch/arm64/boot/dts/mediatek/mt6897.dtsi
+index 782b2a8a02..dbc7c46b8a 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6897.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6897.dtsi
+@@ -31,6 +31,17 @@ / {
+ 
+ 	interrupt-parent = <&gic>;
+ 
++	firmware {
++		tinysys_scmi: scmi {
++			compatible = "arm,scmi";
++			mboxes = <&tinysys_mbox 0>, <&tinysys_mbox 1>;
++			shmem = <&tinysys_tx_shmem>, <&tinysys_rx_shmem>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			status = "disabled";
++		};
++	};
++
+ 	vdec_lat_dma: vdec-lat-dma {
+ 		compatible = "mediatek,mt6897-vdec-lat-dma";
+ 		iommus = <&disp_iommu MTK_M4U_ID(5, 0)>,
+@@ -305,12 +316,52 @@ gpueb_shared_memory: memory@7fe70000 {
+ 		};
+ 	};
+ 
++	tinysys_tx_sram: sram@1c350000 {
++		compatible = "mmio-sram";
++		reg = <0 0x1c350000 0 0x80>;
++		#address-cells = <1>;
++		#size-cells = <1>;
++		ranges = <0 0 0x1c350000 0x80>;
++		status = "disabled";
++
++		tinysys_tx_shmem: scmi-sram@0 {
++			compatible = "arm,scmi-shmem";
++			reg = <0 0x80>;
++		};
++	};
++
++	tinysys_rx_sram: sram@1c360000 {
++		compatible = "mmio-sram";
++		reg = <0 0x1c360000 0 0x80>;
++		#address-cells = <1>;
++		#size-cells = <1>;
++		ranges = <0 0 0x1c360000 0x80>;
++		status = "disabled";
++
++		tinysys_rx_shmem: scmi-sram@0 {
++			compatible = "arm,scmi-shmem";
++			reg = <0 0x80>;
++		};
++	};
++
+ 	soc {
+ 		compatible = "simple-bus";
+ 		#address-cells = <2>;
+ 		#size-cells = <2>;
+ 		ranges;
+ 
++		tinysys_mbox: mailbox@1c351000 {
++			compatible = "mediatek,mt6897-tinysys-mailbox";
++			reg = <0 0x1c351000 0 0x1000>,
++			      <0 0x1c361000 0 0x1000>;
++			reg-names = "channel0", "channel1";
++			interrupts = <GIC_SPI 341 IRQ_TYPE_LEVEL_HIGH 0>,
++				     <GIC_SPI 342 IRQ_TYPE_LEVEL_HIGH 0>;
++			#mbox-cells = <1>;
++			mediatek,secure-clear;
++			status = "disabled";
++		};
++
+ 		/*
+ 		 * CPU DVFS in hardware: MCUPM firmware (started by the bootloader)
+ 		 * fills the frequency tables in CSRAM and follows the requested
+diff --git a/drivers/mailbox/Kconfig b/drivers/mailbox/Kconfig
+index ab869769e2..cccf2fc35d 100644
+--- a/drivers/mailbox/Kconfig
++++ b/drivers/mailbox/Kconfig
+@@ -284,6 +284,15 @@ config MTK_ADSP_MBOX
+           between processors with ADSP. It will place the message to share
+ 	  buffer and will access the ipc control.
+ 
++config MTK_TINYSYS_MBOX
++	tristate "MediaTek MT6897 tinysys mailbox"
++	depends on ARM64 || COMPILE_TEST
++	depends on OF
++	help
++	  Mailbox transport for the MT6897 SSPM tinysys SCMI shared-memory
++	  interface. The mailbox uses two bidirectional doorbells and supports
++	  secure firmware acknowledgement of receive interrupts.
++
+ config MTK_CMDQ_MBOX
+ 	tristate "MediaTek CMDQ Mailbox Support"
+ 	depends on ARCH_MEDIATEK || COMPILE_TEST
+diff --git a/drivers/mailbox/Makefile b/drivers/mailbox/Makefile
+index 45dc59bb3e..c195ab4697 100644
+--- a/drivers/mailbox/Makefile
++++ b/drivers/mailbox/Makefile
+@@ -86,3 +86,5 @@ obj-$(CONFIG_BCM74110_MAILBOX)	+= bcm74110-mailbox.o
+ obj-$(CONFIG_RISCV_SBI_MPXY_MBOX)	+= riscv-sbi-mpxy-mbox.o
+ 
+ obj-$(CONFIG_AXIADO_MAILBOX)	+= axiado-mailbox.o
++
++obj-$(CONFIG_MTK_TINYSYS_MBOX) += mtk-tinysys-mailbox.o
+diff --git a/tools/testing/selftests/mtk_clk/Makefile b/tools/testing/selftests/mtk_clk/Makefile
+index 405d35b988..0f9d612a6f 100644
+--- a/tools/testing/selftests/mtk_clk/Makefile
++++ b/tools/testing/selftests/mtk_clk/Makefile
+@@ -1,4 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-TEST_PROGS := test_dram_bootstrap.py test_mt6897.py test_domains.py test_boot_owner.py test_directlink.py test_display_pm.py test_dpintf_pm.py test_cmdq_stop.py test_crtc_stop.py test_dsi_routing.py
+-TEST_FILES := mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c ven_cases.c boot_stubs.h boot_cases.c directlink_cases.c display_pm_cases.c mmsys_pm_cases.c dpintf_pm_cases.c cmdq_stop_cases.c crtc_stop_cases.c dsi_routing_cases.c dsi_mmsys_cases.c
++TEST_PROGS := test_tinysys_mailbox.py test_dram_bootstrap.py test_mt6897.py test_domains.py test_boot_owner.py test_directlink.py test_display_pm.py test_dpintf_pm.py test_cmdq_stop.py test_crtc_stop.py test_dsi_routing.py
++TEST_FILES := tinysys_mailbox_cases.c mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c ven_cases.c boot_stubs.h boot_cases.c directlink_cases.c display_pm_cases.c mmsys_pm_cases.c dpintf_pm_cases.c cmdq_stop_cases.c crtc_stop_cases.c dsi_routing_cases.c dsi_mmsys_cases.c
+ include ../lib.mk
+diff --git a/tools/testing/selftests/mtk_clk/test_tinysys_mailbox.py b/tools/testing/selftests/mtk_clk/test_tinysys_mailbox.py
+new file mode 100755
+index 0000000000..a9256c6d6f
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/test_tinysys_mailbox.py
+@@ -0,0 +1,40 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Run production tinysys mailbox functions against IRQ/MMIO/SMC mocks."""
++from pathlib import Path
++import os
++import subprocess
++import tempfile
++
++assets = Path(__file__).resolve().parent
++repo = Path(os.environ.get('KERNEL_SRC', str(assets.parents[3])))
++source = (repo / 'drivers/mailbox/mtk-tinysys-mailbox.c').read_text()
++
++def function(name):
++    pos = source.index(name + '(')
++    start = source.rfind('\nstatic ', 0, pos) + 1
++    end = source.index('{', pos) + 1
++    depth = 1
++    while depth:
++        depth += (source[end] == '{') - (source[end] == '}')
++        end += 1
++    return source[start:end]
++
++structs = source[source.index('struct tinysys_link {'):source.index('static unsigned long')]
++production = structs + '\n'.join(function(name) for name in [
++    'tinysys_secure_clear', 'tinysys_rx', 'tinysys_send',
++    'tinysys_last_tx_done', 'tinysys_startup', 'tinysys_shutdown', 'tinysys_probe'])
++defines = '\n'.join(line for line in source.splitlines() if line.startswith('#define '))
++sip = (repo / 'include/linux/soc/mediatek/mtk_sip_svc.h').read_text()
++sip = next(line for line in sip.splitlines() if line.startswith('#define MTK_SIP_TINYSYS_SSPM_CONTROL'))
++with tempfile.TemporaryDirectory(prefix='mtk-tinysys-mailbox-') as tmp:
++    tmp = Path(tmp)
++    c = tmp / 'test.c'
++    c.write_text((assets / 'tinysys_mailbox_cases.c').read_text()
++                 .replace('/* DEFINES */', defines + '\n' + sip)
++                 .replace('/* PRODUCTION */', production))
++    binary = tmp / 'test'
++    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
++                    '-Wno-unused-parameter', '-Werror', '-fsanitize=address,undefined',
++                    str(c), '-o', str(binary)], check=True)
++    subprocess.run([str(binary)], check=True)
+diff --git a/tools/testing/selftests/mtk_clk/tinysys_mailbox_cases.c b/tools/testing/selftests/mtk_clk/tinysys_mailbox_cases.c
+new file mode 100644
+index 0000000000..822d52114b
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/tinysys_mailbox_cases.c
+@@ -0,0 +1,169 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++typedef uint32_t u32;
++typedef int spinlock_t;
++typedef int irqreturn_t;
++#define __iomem
++#define IRQ_NONE 0
++#define IRQ_HANDLED 1
++#define IRQF_NO_SUSPEND 1
++#define GFP_KERNEL 0
++#define IORESOURCE_MEM 0
++#define SIP_SVC_E_SUCCESS 0
++#define MTK_SIP_SMC_CMD(id) (0xc2000000UL | (id))
++#define READ_ONCE(x) (x)
++#define IS_ERR(x) ((intptr_t)(x) < 0)
++#define PTR_ERR(x) ((int)(intptr_t)(x))
++#define dev_err_probe(dev, error, ...) (error)
++#define dev_err(...) ((void)0)
++/* DEFINES */
++struct resource { size_t size; void *base; };
++struct device { bool *of_node; };
++struct platform_device { struct device dev; struct resource res[2]; int irq[2]; };
++struct mbox_controller;
++struct mbox_chan { void *con_priv; struct mbox_controller *mbox; };
++struct mbox_controller { struct device *dev; struct mbox_chan *chans;
++    unsigned int num_chans, txpoll_period; const void *ops; bool txdone_poll; };
++struct arm_smccc_res { unsigned long a0; };
++static const int tinysys_ops;
++static int lock_depth, barriers, writes, reads, callbacks, smcs, disables, frees;
++static int request_result, register_result, map_fail_index, map_calls, fail_alloc;
++static unsigned long smc_status;
++static unsigned int smc_index;
++static bool irq_requested[2], irq_masked[2];
++static void *allocation;
++#define spin_lock_init(lock) (*(lock) = 0)
++#define spin_lock_irqsave(lock, flags) do { assert(!lock_depth); lock_depth++; (flags)=0; } while (0)
++#define spin_unlock_irqrestore(lock, flags) do { assert(lock_depth == 1); (void)(flags); lock_depth--; } while (0)
++static void smp_mb(void) { assert(lock_depth); barriers++; }
++static u32 readl_relaxed(void *p) { assert(lock_depth); reads++; return *(u32 *)p; }
++static void writel_relaxed(u32 v, void *p) { assert(lock_depth && v == 1); writes++; *(u32 *)p = v; }
++static void arm_smccc_smc(unsigned long fn, unsigned long op, unsigned long index,
++                         unsigned long a3, unsigned long a4, unsigned long a5,
++                         unsigned long a6, unsigned long a7, struct arm_smccc_res *r) {
++    assert(fn == 0xc200053cUL && op == 0 && index < 2);
++    assert(!a3 && !a4 && !a5 && !a6 && !a7 && lock_depth);
++    smcs++; smc_index = index; r->a0 = smc_status;
++}
++static void disable_irq_nosync(int irq) {
++    assert(irq >= 10 && irq <= 11 && !irq_masked[irq-10]);
++    irq_masked[irq-10] = true; disables++;
++}
++static void mbox_chan_received_data(struct mbox_chan *c, void *p) {
++    assert(!lock_depth && *(u32 *)p); callbacks++;
++}
++static const char *dev_name(struct device *d) { return "tinysys-test"; }
++static int request_irq(int irq, irqreturn_t (*fn)(int, void *), unsigned long flags,
++                       const char *name, void *p) {
++    assert(irq >= 10 && irq <= 11 && flags == IRQF_NO_SUSPEND);
++    if (request_result) return request_result;
++    assert(!irq_requested[irq-10]); irq_requested[irq-10] = true;
++    irq_masked[irq-10] = false; return 0;
++}
++static void free_irq(int irq, void *p) {
++    assert(!lock_depth && irq_requested[irq-10]);
++    irq_requested[irq-10] = false; frees++;
++}
++static void *devm_kzalloc(struct device *dev, size_t size, int flags) {
++    if (fail_alloc) return NULL;
++    assert(!allocation); allocation = calloc(1, size); return allocation;
++}
++static bool of_property_read_bool(bool *np, const char *property) {
++    assert(!strcmp(property, "mediatek,secure-clear")); return *np;
++}
++static struct resource *platform_get_resource(struct platform_device *p, int type, int i) {
++    return p->res[i].size ? &p->res[i] : NULL;
++}
++static size_t resource_size(struct resource *r) { return r->size; }
++static void *devm_ioremap_resource(struct device *dev, struct resource *r) {
++    return ++map_calls == map_fail_index ? (void *)(intptr_t)-ENOMEM : r->base;
++}
++static int platform_get_irq(struct platform_device *p, int i) { return p->irq[i]; }
++static int devm_mbox_controller_register(struct device *dev, struct mbox_controller *m) {
++    assert(m->num_chans == 2 && m->txdone_poll && m->txpoll_period == 1);
++    for (int i=0; i<2; i++) m->chans[i].mbox = m;
++    return register_result;
++}
++/* PRODUCTION */
++static void reset(void) {
++    free(allocation); allocation = NULL;
++    lock_depth=barriers=writes=reads=callbacks=smcs=disables=frees=0;
++    request_result=register_result=map_fail_index=map_calls=fail_alloc=0;
++    smc_status=smc_index=0;
++    memset(irq_requested,0,sizeof(irq_requested)); memset(irq_masked,0,sizeof(irq_masked));
++}
++int main(void) {
++    u32 regs[2][2] = {{0}}; bool secure = true;
++    struct platform_device p = {.dev.of_node=&secure,
++        .res={{8, regs[0]}, {8, regs[1]}}, .irq={10,11}};
++    /* Every resource/IRQ/allocation/controller error returns without MMIO/SMC. */
++    for (int n=0;n<8;n++) {
++        reset(); struct platform_device bad=p;
++        switch(n) {
++        case 0: fail_alloc=1; break;
++        case 1: bad.res[0].size=0; break;
++        case 2: bad.res[1].size=4; break;
++        case 3: map_fail_index=1; break;
++        case 4: map_fail_index=2; break;
++        case 5: bad.irq[0]=-517; break;
++        case 6: bad.irq[1]=-EINVAL; break;
++        case 7: register_result=-EBUSY; break;
++        }
++        int expected[]={-ENOMEM,-EINVAL,-EINVAL,-ENOMEM,-ENOMEM,-517,-EINVAL,-EBUSY};
++        assert(tinysys_probe(&bad)==expected[n]);
++        assert(!writes && !reads && !smcs && !callbacks);
++    }
++    reset(); assert(!tinysys_probe(&p));
++    struct tinysys_mbox *m=allocation;
++    for (int i=0;i<2;i++) {
++        struct mbox_chan *c=&m->channels[i];
++        assert(!tinysys_startup(c));
++        assert(tinysys_rx(10+i,c)==IRQ_NONE && smcs==i && callbacks==i);
++        assert(!tinysys_send(c,NULL) && barriers==i+1 && regs[i][0]==1);
++        assert(!tinysys_last_tx_done(c)); regs[i][0]=0;
++        assert(tinysys_last_tx_done(c)); regs[i][1]=0x10;
++        assert(tinysys_rx(10+i,c)==IRQ_HANDLED && smc_index==(unsigned int)i);
++        assert(callbacks==i+1 && regs[i][1]==0x10); /* No protected CLR write. */
++    }
++    /* Unexpected status: mask once, no completion/fallback, persistent rejection. */
++    smc_status=(unsigned long)-4;
++    int prior_writes=writes, prior_callbacks=callbacks;
++    assert(tinysys_rx(10,&m->channels[0])==IRQ_HANDLED);
++    assert(disables==1 && irq_masked[0] && !irq_masked[1]);
++    assert(writes==prior_writes && callbacks==prior_callbacks);
++    int prior_reads=reads, prior_smcs=smcs;
++    assert(tinysys_rx(10,&m->channels[0])==IRQ_HANDLED);
++    assert(tinysys_send(&m->channels[0],NULL)==-EIO);
++    assert(!tinysys_last_tx_done(&m->channels[0]));
++    assert(disables==1 && reads==prior_reads && smcs==prior_smcs);
++    tinysys_shutdown(&m->channels[0]);
++    assert(tinysys_startup(&m->channels[0])==-EIO); /* No IRQ reacquire/retry. */
++    smc_status=0; assert(!tinysys_send(&m->channels[1],NULL));
++    tinysys_shutdown(&m->channels[1]); assert(frees==2);
++    /* Generic errors and unknown positive status all fail closed, without retry. */
++    const unsigned long statuses[] = {(unsigned long)-1, (unsigned long)-2,
++        (unsigned long)-3, (unsigned long)-4, 1};
++    for (unsigned int i=0; i<sizeof(statuses)/sizeof(statuses[0]); i++) {
++        reset(); memset(regs,0,sizeof(regs)); assert(!tinysys_probe(&p)); m=allocation;
++        assert(!tinysys_startup(&m->channels[0])); regs[0][1]=1;
++        smc_status=statuses[i]; assert(tinysys_rx(10,&m->channels[0])==IRQ_HANDLED);
++        assert(disables==1 && smcs==1 && !writes && !callbacks);
++        assert(!tinysys_last_tx_done(&m->channels[0]));
++        tinysys_shutdown(&m->channels[0]);
++    }
++    /* Reprobe creates fresh state; explicit nonsecure mode is per instance. */
++    reset(); secure=false; memset(regs,0,sizeof(regs));
++    assert(!tinysys_probe(&p)); m=allocation;
++    request_result=-EBUSY; assert(tinysys_startup(&m->channels[0])==-EBUSY);
++    request_result=0; assert(!tinysys_startup(&m->channels[0]));
++    regs[0][1]=4; assert(tinysys_rx(10,&m->channels[0])==IRQ_HANDLED);
++    assert(!smcs && regs[0][1]==1 && writes==1 && callbacks==1);
++    tinysys_shutdown(&m->channels[0]); reset();
++    puts("tinysys: production MMIO/SMC/IRQ/error/lifetime cases passed");
++}

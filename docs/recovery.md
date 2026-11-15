@@ -14,11 +14,24 @@ the Android bootloader transport.
 androidDevices.recovery.enable = true;
 ```
 
-Use the exported device module and a unique `androidDevices.usbSerial`.
+Use the exported device module. The published `devices.<device>.recovery`
+artifact is exactly that module with only `recovery.enable` set; a consumer
+configuration without further recovery options builds the same derivation.
+The USB serial defaults to `RECOVERY_<DEVICE>` (for example `RECOVERY_POLARIS`).
 `androidDevices.initrdUsb.address` defaults to `172.16.43.1/24` for Asphalt,
-`.42.1` for Polaris, `.45.1` for Sheng and `.44.1` for Clover. Choose different
-subnets for simultaneous devices. The Linux host needs cdc_ncm and DHCP on the
+`.42.1` for Polaris, `.45.1` for Sheng, `.44.1` for Clover, `.46.1` for Aurora
+and `.47.1` for the T880, `.48.1` for Marble and `.49.1` for Dodge. Choose different subnets for simultaneous devices. The Linux host needs cdc_ncm and DHCP on the
 resulting Ethernet interface. Recovery offers DHCP without default route/DNS.
+
+For full recovery without a display menu, set
+`androidDevices.recovery.screen.enable = false`. The Rust daemon, CLI,
+ACM/NCM and SSH remain available. Dodge uses this headless configuration and
+RAM-only SSH host keys by default.
+
+In the screen menu, volume keys navigate and a short power-key press selects.
+When the VT is blanked, the first short power press only wakes/redraws it,
+including during an operation; it cannot confirm a menu action. VT wake does
+not restore a manually zeroed backlight or override its power setting.
 
 ACM and NCM are independent functions of one composite USB gadget, not competing
 backends. Both are enabled by default. Use a serial terminal on
@@ -92,6 +105,36 @@ Use `recovery --ssh-config FILE --target HOST` for a separate SSH config, or set
 `target` and `ssh_config` in the optional device TOML. `serial` selects fastboot
 only. SFTP and ordinary SSH TCP/Unix socket forwarding are also available.
 
+### Dodge host-supplied FIT
+
+```sh
+nix build "git+file://$(pwd)#devices.dodge.recovery" --out-link result-dodge-recovery.itb
+```
+
+`devices.dodge.recovery` is a raw FIT with a 64 MiB USB download limit.
+The current same-slot product no longer exports a standalone flashable U-Boot
+image. Keep a separately retained **boot-verified RAM bootstrap** from your
+existing recovery setup; current `devices.dodge.boot-firmware` raw/ELF inputs
+are not a replacement OEM image. From OEM fastboot, upload that retained RAM
+bootstrap first, then the raw FIT through its `DODGE` fastboot device:
+
+```sh
+fastboot -s OEM_SERIAL boot VERIFIED_RAM_BOOTSTRAP.img
+fastboot -s DODGE boot result-dodge-recovery.itb
+```
+
+This retained two-step RAM route boots without depending on installed boot_b. No recovery
+partition is flashed. Installed B U-Boot and raw RAM recovery have booted with
+systemd PID1, ACM/NCM, SSH, uncapped memory and UFS enumeration.
+
+A retained older RAM bootstrap may try `/EFI/BOOT/BOOTAA64.EFI` on `linux-boot`
+before USB recovery. The current embedding firmware instead requires the early
+owned context and `/EFI/android-devices/boot-choice.efi`; it has no direct
+BOOTAA64 bypass. Do not substitute that raw component for the retained bootstrap.
+ESP boot/recovery interoperability with the new product remains unverified.
+On the tested OEM firmware, putting the FIT in an Android v4 boot ramdisk did
+not load that payload; use the two-step upload above.
+
 ## Recovery operations
 
 Every device's full recovery uses the Rust daemon, screen and `recovery shell`
@@ -121,7 +164,7 @@ leading `recovery`.
 For destructive first preparation, see [Asphalt](asphalt/first-install.md),
 [Sheng](sheng/first-install.md), [Aurora](aurora/README.md),
 [Polaris](polaris/first-install.md) or [Clover](clover/first-install.md).
-Existing installations retain their root/ESP layout. See the [daemon reference](../pkgs/mobile-recovery-screen/daemon.md)
+Existing installations retain their root/ESP layout. See the [recovery screen package](../pkgs/mobile-recovery-screen/README.md)
 for transfer, cancellation and failure semantics. The daemon storage and
 first-install operations have not been hardware-validated on every board.
 
@@ -152,11 +195,19 @@ Only exit codes 0 (clean) and 1 (corrected) are accepted; other results stop the
 operation for investigation. Both filesystems must pass a separate read-only
 check afterward. It does not format partitions or touch Android userdata.
 
+The read-only FAT check accepts one finding: a wrong FSInfo free-cluster
+count ("Free cluster summary wrong"). That count is only a hint, which
+U-Boot's FAT writes (systemd-boot's random seed, EFI variables) leave stale
+and Linux recounts; the check logs it and repairs nothing. Any other FAT
+finding still stops the operation.
+
 ### Stale backup GPT after an OEM slot change
 
-If a deployment refuses a GPT CRC or copy mismatch, preserve the metadata and
-inspect the two copies before changing anything. A/B recovery provides an
-explicit, narrowly scoped repair for the disk containing `linux`:
+If a deployment refuses a GPT CRC or copy mismatch (the error then names the
+disk and points here when the backup is within the repair scope), preserve the
+metadata and inspect the two copies before changing anything. A/B recovery
+provides an explicit, narrowly scoped repair for the disks containing the
+firmware slot (`boot_b`; MediaTek `boot_a`) and `userdata`:
 
 ```sh
 recovery repair-backup-gpt --check
@@ -164,13 +215,69 @@ recovery repair-backup-gpt --confirm
 ```
 
 This requires RAM recovery, no mounted block filesystems, independently verified
-active B, a valid primary GPT and matching primary/backup geometry. Differences
-must be limited to paired A/B type GUID swaps or Qualcomm slot attribute bits;
-partition locations, sizes, unique GUIDs and names must match. It does not repair
-a damaged primary/header or choose between different layouts. Confirmation saves
-both metadata copies in RAM, writes only the backup array/header at their existing
-locations, and verifies both copies. Download the reported snapshot before reboot.
+active B (on the primary GPT), a CRC-valid primary header and array, a CRC-valid
+backup header and identical geometry (header locations, usable range, disk GUID,
+entry count and size). The backup array's CRC may be stale. Each differing
+backup entry must:
+
+- belong to a partition named `<name>_a` or `<name>_b` whose partner exists;
+- keep its unique GUID, first/last LBA and name;
+- differ only in the type GUID (any non-zero type: Qualcomm firmware swaps the
+  types of a pair, Xiaomi firmware also gives the inactive slot a placeholder
+  type) and in attribute bits 48-55 (Qualcomm slot flags) and 60.
+
+Unused entries and all other partitions must be identical. It does not repair a
+damaged primary/header or choose between different layouts. `--check` lists,
+per disk, how many entries differ and whether the backup CRC is stale.
+Confirmation saves both metadata copies of each disk in RAM, writes only the
+backup array/header from the primary at their existing locations, and verifies
+the readback and both copies. Download the reported snapshots before reboot.
 Normal installation/update operations remain strict and never repair implicitly.
+
+## A/B devices: preparing Linux storage
+
+On A/B devices (Asphalt, Sheng, Aurora, Marble and the T880) Linux lives in the
+userdata allocation, which must be the trailing allocation of its disk.
+`prepare-install` keeps a size you choose for Android userdata and creates
+`linux-boot` (FAT ESP, label `BOOT`) and `linux` (ext4 root, label `NIXOS`)
+from the rest. Nothing outside the
+userdata allocation changes: slot A, `super`, `misc`, `metadata`, `dtbo_*` and
+calibration partitions are preserved.
+
+The offered Android sizes are 32, 64, 128, 256 and 512 GiB. A size is offered only
+when, after rounding the Android part up to 1 MiB, the Linux ESP and root keep
+at least 64 GiB of the userdata allocation. For example a 256 GB phone
+(about 224 GiB of userdata) offers 32G, 64G and 128G. When no size qualifies the split is refused.
+
+```sh
+recovery prepare-install --check                              # lists the offered sizes
+recovery prepare-install --android-userdata 64G --check       # shows the exact plan
+recovery prepare-install --android-userdata 64G --confirm-erase-userdata
+```
+
+There is no default size: confirmation requires `--android-userdata`. The kept
+Android userdata is erased (its first 8 MiB are zeroed); Android on slot A needs
+a factory data reset before use. The recovery screen offers the same choice
+under "Prepare Linux storage": pick the size, review the plan, then confirm.
+No host is needed.
+
+Before writing, the split saves the original GPT (both copies) in recovery RAM
+at `/run/mobile-recovery/gpt-original`, unless the check already saved it. A
+saved copy that no longer matches the disk refuses the write. Until the
+recovery restarts, `recovery restore-gpt --check` and then `--confirm` undo
+the split with that copy (Linux partitions and their data become
+unreachable). The RAM copy is lost on restart; for a permanent copy, use the
+host flow, which downloads it before the write:
+
+```sh
+mobile-device recovery --target … prepare-install --android-userdata 64G \
+  --gpt-backup DIR --execute
+mobile-device recovery --target … restore-gpt --gpt-backup DIR --execute   # undo later
+```
+
+Without `--gpt-backup`, `mobile-device … prepare-install --execute` and
+`restore-gpt` use the RAM copy. Existing installations are not re-partitioned;
+this applies to new splits only.
 
 ## Single-slot devices: Clover and Polaris
 
@@ -189,9 +296,9 @@ hardware.polaris.storageRoles.root = {
 };
 ```
 
-Polaris works with GPT names alone. Clover refuses root, firmware, recovery and
-misc operations until they are measured; its ESP is the unique `system` on the
-eMMC within a plausible size range. The installed system carries the same roles,
+Both work with GPT names alone. Clover also checks the stock 64 MiB `boot` and
+`recovery` and 1 MiB `misc` sizes; its ESP is the unique `system` on the eMMC
+within a plausible size range. The installed system carries the same roles,
 and recovery refuses a system whose roles differ.
 
 ```sh
@@ -206,9 +313,15 @@ verifies, and leaves a pending marker until the first installation completes.
 Polaris applies its UFS clock safe mode before every storage operation
 (`recovery safe-ufs` applies it alone). `reboot-recovery` writes `boot-recovery`
 to the misc BCB transactionally; `reboot-system` and `reboot-bootloader` clear
-it. `prepare-install` and backup GPT repair are A/B-only.
+it. Where no BCB is written (A/B boards and `poweroff`), `reboot-recovery`,
+`reboot-bootloader` and `poweroff` only require that no UFS filesystem is
+mounted; they never read the partition tables or slot metadata, so a damaged
+GPT does not keep you in recovery. `reboot-system` still checks the installed
+system first, which reads the partition tables. `prepare-install` and
+backup GPT repair are A/B-only.
 
 Formatting, EFI deployment, supported recovery-image installation and reboot
 commands are available through SSH. All supported boards provide the
 [shared `install-initial` flow](initial-install.md) for a prepared empty root and
-FAT boot partition. It installs EFI and matching U-Boot without automatic reboot.
+FAT boot partition. It installs the EFI generation. Use the
+[separate U-Boot procedure](u-boot-install.md) for firmware and reboot explicitly.

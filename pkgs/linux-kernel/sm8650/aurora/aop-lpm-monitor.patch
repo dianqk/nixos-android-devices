@@ -1,0 +1,348 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 25 Oct 2026 12:00:00 +0800
+Subject: [PATCH] soc: qcom: add a debugfs reader for the AOP low-power monitor
+
+Aurora's CX and DDR collapse in s2idle, but AOSS sleep is never reached
+(qcom_stats aosd 0 %). The AOP can report which RPMh requestors (DRVs)
+keep CX collapse or AOSS sleep from happening: a "{class: lpm_mon, ...}"
+QMP message arms its low-power monitor, which logs per-DRV votes to a
+0x400-byte region at 0x0c320000. Add a debug driver, as downstream
+sys_pm_vx.c does: debugfs qcom_pm_vx/{send,monitor,log,raw} sends a raw
+QMP message, arms a message for every system suspend, and decodes or
+dumps the log with the SM8650 DRV names. The region is only read.
+
+Log layout, message format and DRV names: Qualcomm downstream
+drivers/soc/qcom/sys_pm_vx.c (GPL-2.0-only), as in
+https://github.com/OnePlusOSS/android_kernel_oneplus_sm8650/blob/b2696d4a2bda11cb74de35f839ef0cf6ccc1b9cb/drivers/soc/qcom/sys_pm_vx.c
+and its pineapple node (sys-pm-vx@c320000, reg 0x400, qcom,qmp).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/drivers/soc/qcom/Kconfig b/drivers/soc/qcom/Kconfig
+--- a/drivers/soc/qcom/Kconfig
++++ b/drivers/soc/qcom/Kconfig
+@@ -231,6 +231,16 @@
+ 	  to manage cores, L2 low power modes and to configure the internal
+ 	  Adaptive Voltage Scaler parameters, where supported.
+ 
++config QCOM_PM_VX
++	tristate "Qualcomm AOP low-power monitor log (debug)"
++	depends on DEBUG_FS
++	depends on QCOM_AOSS_QMP
++	help
++	  Debugfs reader for the AOP low-power monitor log ("sys-pm
++	  violators"): which RPMh requestors keep CX power collapse or AOSS
++	  sleep from happening. Also allows sending raw QMP messages to the
++	  AOSS. For debugging only.
++
+ config QCOM_STATS
+ 	tristate "Qualcomm Sleep stats driver"
+ 	depends on DEBUG_FS || COMPILE_TEST
+diff --git a/drivers/soc/qcom/Makefile b/drivers/soc/qcom/Makefile
+--- a/drivers/soc/qcom/Makefile
++++ b/drivers/soc/qcom/Makefile
+@@ -32,6 +32,7 @@
+ obj-$(CONFIG_QCOM_SOCINFO)	+= socinfo.o
+ obj-$(CONFIG_QCOM_SPM)		+= spm.o
+ obj-$(CONFIG_QCOM_STATS)	+= qcom_stats.o
++obj-$(CONFIG_QCOM_PM_VX)	+= qcom_pm_vx.o
+ obj-$(CONFIG_QCOM_WCNSS_CTRL) += wcnss_ctrl.o
+ obj-$(CONFIG_QCOM_APR) += apr.o
+ obj-$(CONFIG_QCOM_LLCC) += llcc-qcom.o
+diff --git a/drivers/soc/qcom/qcom_pm_vx.c b/drivers/soc/qcom/qcom_pm_vx.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/soc/qcom/qcom_pm_vx.c
+@@ -0,0 +1,275 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Debug reader for the AOP low-power monitor ("sys-pm violators") log.
++ *
++ * The AOP records, per sample, which RPMh DRVs (requestors) keep CX power
++ * collapse or AOSS sleep from happening once a "{class: lpm_mon, ...}" QMP
++ * message arms the monitor. Log layout, message format and the SM8650 DRV
++ * names follow Qualcomm's downstream drivers/soc/qcom/sys_pm_vx.c
++ * (GPL-2.0-only; OnePlusOSS/android_kernel_oneplus_sm8650 b2696d4a2bda).
++ *
++ * debugfs qcom_pm_vx/:
++ *   send     raw QMP message, sent immediately (root only)
++ *   monitor  QMP message sent at every system suspend; empty disables it
++ *   log      decoded log;  raw  the log region as read
++ * The log region is only read; nothing outside QMP is written.
++ */
++#include <linux/debugfs.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/soc/qcom/qcom_aoss.h>
++#include <linux/string.h>
++#include <linux/uaccess.h>
++
++#define PM_VX_MSG_LEN	96
++#define MODE_AOSS	0xaa
++#define MODE_CXPC	0xcc
++#define MODE_DDR	0xdd
++
++static const char * const cxpc_drvs[] = {
++	"TZ", "L3", "HLOS", "HYP", "SECPROC", "AUDIO", "AOP", "DEBUG",
++	"GPU", "DISPLAY", "COMPUTE_DSP", "TME_HW", "TME_SW", "MDM SW",
++	"MDM HW", "MDM Q6 CESTA", "WLAN RF", "WLAN BB", "CAM_IFE0 CESTA",
++	"CAM_IFE1", "CAM_IFE2", "PCI0 CESTA", "PCI1 CESTA", "DDR AUX",
++	"ARC CPRF",
++};
++
++static const char * const aoss_drvs[] = {
++	"APPS", "SP", "AUDIO", "AOP", "DEBUG", "GPU", "DISPLAY", "COMPUTE",
++	"TME", "MODEM", "WLAN RF", "WLAN BB", "CAM", "PCIE",
++};
++
++struct pm_vx {
++	void __iomem *base;
++	size_t size;
++	struct qmp *qmp;
++	struct dentry *dir;
++	struct mutex lock;
++	char monitor[PM_VX_MSG_LEN];
++};
++
++static u32 pm_vx_word(struct pm_vx *vx, u32 *off)
++{
++	u32 v = 0;
++
++	if (*off + sizeof(u32) <= vx->size)
++		v = readl_relaxed(vx->base + *off);
++	*off += sizeof(u32);
++	return v;
++}
++
++static int pm_vx_log_show(struct seq_file *s, void *unused)
++{
++	struct pm_vx *vx = s->private;
++	const char * const *drvs;
++	unsigned int i, j, k, n, logsize;
++	u32 off = 0, mode, flags, ts, w;
++	u8 vote[32];
++	u8 type;
++
++	mode = pm_vx_word(vx, &off);
++	flags = pm_vx_word(vx, &off);
++	type = mode & 0xff;
++	logsize = (mode >> 8) & 0xff;
++	switch (type) {
++	case MODE_CXPC:
++	case MODE_DDR:
++		drvs = cxpc_drvs;
++		n = ARRAY_SIZE(cxpc_drvs);
++		break;
++	case MODE_AOSS:
++		drvs = aoss_drvs;
++		n = ARRAY_SIZE(aoss_drvs);
++		break;
++	default:
++		seq_printf(s, "no log (mode word %#x, flags %#x)\n", mode, flags);
++		return 0;
++	}
++	seq_printf(s, "mode %s dur_ms %u ts_shift %u flush %u entries %u\n",
++		   type == MODE_AOSS ? "AOSS" : type == MODE_DDR ? "DDR" : "CXPC",
++		   flags & 0xffff, (flags >> 16) & 0xff, flags >> 24, logsize);
++	for (i = 0; i < logsize; i++) {
++		ts = pm_vx_word(vx, &off);
++		if (!ts)
++			break;
++		for (j = 0; j < n;) {
++			w = pm_vx_word(vx, &off);
++			for (k = 0; k < 4; k++, j++)
++				vote[j] = (w >> (8 * k)) & 0xff;
++		}
++		seq_printf(s, "%08x", ts << ((flags >> 16) & 0xff));
++		for (j = 0, w = 0; j < n; j++)
++			if (vote[j]) {
++				seq_printf(s, " %s=%u", drvs[j], vote[j]);
++				w = 1;
++			}
++		seq_puts(s, w ? "\n" : " (all idle)\n");
++	}
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(pm_vx_log);
++
++static int pm_vx_raw_show(struct seq_file *s, void *unused)
++{
++	struct pm_vx *vx = s->private;
++	u32 off;
++
++	for (off = 0; off < vx->size; off += 16)
++		seq_printf(s, "%03x: %08x %08x %08x %08x\n", off,
++			   readl_relaxed(vx->base + off), readl_relaxed(vx->base + off + 4),
++			   readl_relaxed(vx->base + off + 8), readl_relaxed(vx->base + off + 12));
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(pm_vx_raw);
++
++static ssize_t pm_vx_copy_msg(char *dst, const char __user *ubuf, size_t len)
++{
++	if (len >= PM_VX_MSG_LEN)
++		return -EINVAL;
++	if (copy_from_user(dst, ubuf, len))
++		return -EFAULT;
++	dst[len] = '\0';
++	strim(dst);
++	return len;
++}
++
++static ssize_t pm_vx_send_write(struct file *file, const char __user *ubuf,
++				size_t len, loff_t *ppos)
++{
++	struct pm_vx *vx = file->private_data;
++	char msg[PM_VX_MSG_LEN];
++	ssize_t ret = pm_vx_copy_msg(msg, ubuf, len);
++
++	if (ret < 0)
++		return ret;
++	if (!msg[0])
++		return -EINVAL;
++	mutex_lock(&vx->lock);
++	ret = qmp_send(vx->qmp, "%s", msg);
++	mutex_unlock(&vx->lock);
++	return ret ? ret : len;
++}
++
++static const struct file_operations pm_vx_send_fops = {
++	.open = simple_open,
++	.write = pm_vx_send_write,
++	.llseek = noop_llseek,
++};
++
++static ssize_t pm_vx_monitor_write(struct file *file, const char __user *ubuf,
++				   size_t len, loff_t *ppos)
++{
++	struct pm_vx *vx = file->private_data;
++	char msg[PM_VX_MSG_LEN];
++	ssize_t ret = pm_vx_copy_msg(msg, ubuf, len);
++
++	if (ret < 0)
++		return ret;
++	mutex_lock(&vx->lock);
++	strscpy(vx->monitor, msg);
++	mutex_unlock(&vx->lock);
++	return len;
++}
++
++static ssize_t pm_vx_monitor_read(struct file *file, char __user *ubuf,
++				  size_t len, loff_t *ppos)
++{
++	struct pm_vx *vx = file->private_data;
++	char msg[PM_VX_MSG_LEN + 1];
++	int n;
++
++	mutex_lock(&vx->lock);
++	n = scnprintf(msg, sizeof(msg), "%s\n", vx->monitor);
++	mutex_unlock(&vx->lock);
++	return simple_read_from_buffer(ubuf, len, ppos, msg, n);
++}
++
++static const struct file_operations pm_vx_monitor_fops = {
++	.open = simple_open,
++	.read = pm_vx_monitor_read,
++	.write = pm_vx_monitor_write,
++	.llseek = noop_llseek,
++};
++
++static int pm_vx_suspend(struct device *dev)
++{
++	struct pm_vx *vx = dev_get_drvdata(dev);
++	int ret = 0;
++
++	mutex_lock(&vx->lock);
++	if (vx->monitor[0])
++		ret = qmp_send(vx->qmp, "%s", vx->monitor);
++	mutex_unlock(&vx->lock);
++	if (ret)
++		dev_warn(dev, "lpm monitor message failed: %d\n", ret);
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(pm_vx_pm_ops, pm_vx_suspend, NULL);
++
++static int pm_vx_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct resource *res;
++	struct pm_vx *vx;
++
++	vx = devm_kzalloc(dev, sizeof(*vx), GFP_KERNEL);
++	if (!vx)
++		return -ENOMEM;
++	mutex_init(&vx->lock);
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res)
++		return -EINVAL;
++	vx->size = resource_size(res);
++	/* Read-only window into AOP memory; not claimed exclusively. */
++	vx->base = devm_ioremap(dev, res->start, vx->size);
++	if (!vx->base)
++		return -ENOMEM;
++
++	vx->qmp = qmp_get(dev);
++	if (IS_ERR(vx->qmp))
++		return dev_err_probe(dev, PTR_ERR(vx->qmp), "QMP\n");
++
++	platform_set_drvdata(pdev, vx);
++	vx->dir = debugfs_create_dir("qcom_pm_vx", NULL);
++	debugfs_create_file("send", 0200, vx->dir, vx, &pm_vx_send_fops);
++	debugfs_create_file("monitor", 0600, vx->dir, vx, &pm_vx_monitor_fops);
++	debugfs_create_file("log", 0400, vx->dir, vx, &pm_vx_log_fops);
++	debugfs_create_file("raw", 0400, vx->dir, vx, &pm_vx_raw_fops);
++	return 0;
++}
++
++static void pm_vx_remove(struct platform_device *pdev)
++{
++	struct pm_vx *vx = platform_get_drvdata(pdev);
++
++	debugfs_remove_recursive(vx->dir);
++	qmp_put(vx->qmp);
++}
++
++static const struct of_device_id pm_vx_of_match[] = {
++	{ .compatible = "qcom,sm8650-pm-vx" },
++	{}
++};
++MODULE_DEVICE_TABLE(of, pm_vx_of_match);
++
++static struct platform_driver pm_vx_driver = {
++	.probe = pm_vx_probe,
++	.remove = pm_vx_remove,
++	.driver = {
++		.name = "qcom-pm-vx",
++		.of_match_table = pm_vx_of_match,
++		.pm = pm_sleep_ptr(&pm_vx_pm_ops),
++	},
++};
++module_platform_driver(pm_vx_driver);
++
++MODULE_DESCRIPTION("Qualcomm AOP low-power monitor log reader (debug)");
++MODULE_LICENSE("GPL");
+diff --git a/arch/arm64/boot/dts/qcom/sm8650.dtsi b/arch/arm64/boot/dts/qcom/sm8650.dtsi
+--- a/arch/arm64/boot/dts/qcom/sm8650.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8650.dtsi
+@@ -6158,6 +6158,13 @@
+ 			#clock-cells = <0>;
+ 		};
+ 
++		/* AOP low-power monitor log (debug reader, qcom_pm_vx) */
++		pm-vx@c320000 {
++			compatible = "qcom,sm8650-pm-vx";
++			reg = <0 0x0c320000 0 0x400>;
++			qcom,qmp = <&aoss_qmp>;
++		};
++
+ 		sram@c3f0000 {
+ 			compatible = "qcom,rpmh-stats";
+ 			reg = <0 0x0c3f0000 0 0x400>;

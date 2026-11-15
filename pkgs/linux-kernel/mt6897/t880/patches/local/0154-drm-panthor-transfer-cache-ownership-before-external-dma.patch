@@ -1,0 +1,38 @@
+From aaaf965c31ac486830237725d159247e11bd9e13 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] drm/panthor: transfer cache ownership before external DMA
+
+drm/panthor: transfer cache ownership before external DMA.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-05T08:48:09+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/gpu/drm/panthor/panthor_gem.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/panthor/panthor_gem.c b/drivers/gpu/drm/panthor/panthor_gem.c
+index 72908be5e1..9de9669ef2 100644
+--- a/drivers/gpu/drm/panthor/panthor_gem.c
++++ b/drivers/gpu/drm/panthor/panthor_gem.c
+@@ -477,8 +477,14 @@ panthor_gem_prime_map_dma_buf(struct dma_buf_attachment *attach,
+ {
+ 	struct sg_table *sgt = drm_gem_map_dma_buf(attach, dir);
+ 
+-	if (!IS_ERR(sgt))
++	if (!IS_ERR(sgt)) {
++		/* The PRIME helper maps with SKIP_CPU_SYNC. Fresh shmem pages
++		 * may still have dirty zeroing cache lines, so transfer initial
++		 * ownership before an external noncoherent device can write them.
++		 */
++		dma_sync_sgtable_for_device(attach->dev, sgt, dir);
+ 		attach->priv = sgt;
++	}
+ 
+ 	return sgt;
+ }
+-- 
+2.56.0
+

@@ -1,0 +1,644 @@
+From 8a3892da2910379632ae264bf3929ed1238dacbf Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 31 Oct 2026 19:41:37 +0800
+Subject: [PATCH] soc: qcom: cpr3: Add SDM660 CPRh support in open-loop mode
+
+Add the SDM660 KBSS CPRh controllers, one per CPU cluster, with the
+values of the vendor CPRh driver and device tree:
+
+- Fuse reference voltages, open-loop fuse adjustments, RO scaling factors,
+  sensor counts (6 power, 9 performance) and controller timings, with the
+  1760 ns settling time and 1042 ns corner switch delay converted to
+  register counts at 19.2 MHz (33 and 5).
+- The speed bin 1 corner plan of both clusters, with the vendor per-corner
+  floor, ceiling and floor-to-ceiling range voltages. The open-loop,
+  floor and ceiling voltage of each corner are computed as the vendor
+  driver does: the fused voltages are interpolated by frequency before
+  rounding to the 4 mV step, limited to the corner floor and ceiling,
+  kept clear of the 872 mV APM threshold (20 mV hysteresis), used as the
+  corner ceiling, and the floor is raised to the ceiling minus the range.
+  The common CPR3 code rounds each fuse voltage first, which gives up to
+  4 mV more on some interpolated corners.
+- Closed-loop operation stays off: the hardware closed loop is disabled
+  and every corner has CL_DISABLE set, so the CPRh applies the open-loop
+  voltage of the corner OSM selects. The closed-loop fuse adjustments are
+  kept for the target quotients.
+- The vendor RESET_STEP_QUOT_LOOP_EN bit and fixed step quotient field.
+- The corner and control registers stay at 0x3a00 and 0x3aa0 as in the
+  vendor driver, whatever the hardware revision reads.
+
+Only speed bin 1 with CPR fusing revision 2 is supported. On any other
+part the driver refuses to probe before touching the hardware, so the
+CPU clocks and voltages stay as the bootloader set them.
+
+The computed corner table is logged at probe. Also fix an out-of-bounds
+read of the frequency ordering check at the first corner, check the
+reference clock enable, and name the threads in the log messages.
+
+Scope: SDM630/660 common
+Porting notes: Local addition to the CPR3 driver (not upstream). Values from the vendor crDroid 4.19 tree: drivers/regulator/cprh-kbss-regulator.c and arch/arm64/boot/dts/vendor/qcom/sdm660-regulator.dtsi.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/pmdomain/qcom/cpr3.c | 441 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 433 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/pmdomain/qcom/cpr3.c b/drivers/pmdomain/qcom/cpr3.c
+index b5fb6c0a67..980392bf87 100644
+--- a/drivers/pmdomain/qcom/cpr3.c
++++ b/drivers/pmdomain/qcom/cpr3.c
+@@ -130,6 +130,7 @@
+ #define CPR4_MARGIN_ADJ_PER_RO_KV_MARGIN_EN		BIT(7)
+ #define CPR4_MARGIN_ADJ_PMIC_STEP_SIZE_MASK		GENMASK(16, 12)
+ #define CPR4_MARGIN_ADJ_PMIC_STEP_SIZE_SHIFT		12
++#define CPR4_MARGIN_ADJ_KV_MARGIN_ADJ_STEP_QUOT_MASK	GENMASK(31, 26)
+ 
+ #define CPR4_REG_CPR_MASK_THREAD(thread)		(0x80C + 0x440 * (thread))
+ #define CPR4_CPR_MASK_THREAD_DISABLE_THREAD		BIT(31)
+@@ -157,12 +158,29 @@
+ #define CPRH_CORNER_FLOOR_VOLTAGE_MAX_VALUE	255
+ #define CPRH_CORNER_QUOT_DELTA_MAX_VALUE	511
+ 
++#define CPRH_MAX_FUSE_CORNERS			5
++
+ enum cpr_type {
+ 	CTRL_TYPE_CPR4,
+ 	CTRL_TYPE_CPRH,
+ 	CTRL_TYPE_MAX,
+ };
+ 
++/*
++ * struct cprh_corner_limits - Fixed per-corner limits of a vendor corner plan
++ *
++ * @freq:       Corner frequency in Hz that the CPU OPP table must use
++ * @floor_uV:   Floor voltage of the corner
++ * @ceiling_uV: Ceiling voltage of the corner
++ * @range_uV:   Maximum floor to ceiling voltage range of the corner
++ */
++struct cprh_corner_limits {
++	u64	freq;
++	int	floor_uV;
++	int	ceiling_uV;
++	int	range_uV;
++};
++
+ /*
+  * struct cpr_thread_desc - CPR Thread-specific parameters
+  *
+@@ -178,6 +196,11 @@ enum cpr_type {
+  * @step_quot_init_max: Maximum achievable step quotient for this corner
+  * @num_fuse_corners:   Number of valid entries in fuse_corner_data
+  * @fuse_corner_data:   Parameters for calculation of each fuse corner
++ * @name:               Thread name used in log messages
++ * @corner_limits:      Optional vendor corner plan. When set, the open-loop,
++ *                      floor and ceiling voltage of each corner are computed
++ *                      the way the vendor CPRh driver does it
++ * @num_corner_limits:  Number of entries in corner_limits
+  */
+ struct cpr_thread_desc {
+ 	u8		controller_id;
+@@ -192,6 +215,9 @@ struct cpr_thread_desc {
+ 	u8		step_quot_init_max;
+ 	unsigned int	num_fuse_corners;
+ 	struct fuse_corner_data *fuse_corner_data;
++	const char	*name;
++	const struct cprh_corner_limits *corner_limits;
++	unsigned int	num_corner_limits;
+ };
+ 
+ /*
+@@ -225,6 +251,14 @@ struct cpr_thread_desc {
+  * @reduce_to_fuse_uV:     Reduce corner max volts (if higher) to fuse ceiling
+  * @reduce_to_corner_uV:   Reduce corner max volts (if higher) to corner ceil.
+  * @hw_closed_loop_en:     Enable CPR HW Closed-Loop voltage auto-adjustment
++ * @open_loop_only:        Disable closed-loop operation on every CPRh corner
++ * @reset_step_quot_loop_en: Set the CPR4 RESET_STEP_QUOT_LOOP_EN bit
++ * @cprh_fixed_layout:     CPRh corner/control registers are at 0x3a00/0x3aa0
++ *                         regardless of the hardware revision
++ * @fuse_check:            Refuse to probe unless the speed bin and the CPR
++ *                         fusing revision match the values below
++ * @speed_bin:             Supported speed bin
++ * @fusing_rev:            Supported CPR fusing revision
+  */
+ struct cpr_desc {
+ 	enum cpr_type		cpr_type;
+@@ -256,6 +290,12 @@ struct cpr_desc {
+ 	bool reduce_to_fuse_uV;
+ 	bool reduce_to_corner_uV;
+ 	bool hw_closed_loop_en;
++	bool open_loop_only;
++	bool reset_step_quot_loop_en;
++	bool cprh_fixed_layout;
++	bool fuse_check;
++	u32 speed_bin;
++	u32 fusing_rev;
+ };
+ 
+ struct cpr_drv;
+@@ -922,6 +962,10 @@ static int cpr_configure(struct cpr_thread *thread)
+ 				 CPR4_MISC_THREAD_HAS_ALWAYS_VOTE_EN,
+ 				 CPR4_MISC_RESET_STEP_QUOT_LOOP_EN |
+ 				 CPR4_MISC_THREAD_HAS_ALWAYS_VOTE_EN);
++	else if (desc->reset_step_quot_loop_en)
++		cpr_masked_write(thread, CPR4_REG_MISC,
++				 CPR4_MISC_RESET_STEP_QUOT_LOOP_EN,
++				 CPR4_MISC_RESET_STEP_QUOT_LOOP_EN);
+ 
+ 	val = drv->vreg_step;
+ 	do_div(val, 1000);
+@@ -939,6 +983,10 @@ static int cpr_configure(struct cpr_thread *thread)
+ 			 desc->vreg_step_up_limit <<
+ 			 CPR4_SAW_ERROR_STEP_LIMIT_UP_SHIFT);
+ 
++	/* No fixed step quotient: use the dynamic per-RO one */
++	cpr_masked_write(thread, CPR4_REG_MARGIN_ADJ_CTL,
++			 CPR4_MARGIN_ADJ_KV_MARGIN_ADJ_STEP_QUOT_MASK, 0);
++
+ 	cpr_masked_write(thread, CPR4_REG_MARGIN_ADJ_CTL,
+ 			 CPR4_MARGIN_ADJ_PER_RO_KV_MARGIN_EN,
+ 			 CPR4_MARGIN_ADJ_PER_RO_KV_MARGIN_EN);
+@@ -1171,6 +1219,184 @@ static int cprh_corner_adjust_opps(struct cpr_thread *thread)
+ 	return ret;
+ }
+ 
++/**
++ * cprh_read_open_loop_fuse() - Read a fused open-loop voltage without rounding
++ * @thread: Structure holding CPR thread-specific parameters
++ * @fnum:   Fuse corner index
++ * @uV:     Returned voltage, including the fixed open-loop fuse adjustment
++ *
++ * Return: Zero for success, negative number on error
++ */
++static int cprh_read_open_loop_fuse(struct cpr_thread *thread, int fnum,
++				    int *uV)
++{
++	const struct cpr_thread_desc *tdesc = thread->desc;
++	const struct fuse_corner_data *fdata = &tdesc->fuse_corner_data[fnum];
++	int width = tdesc->init_voltage_width;
++	int steps, ret;
++	u32 bits;
++
++	ret = nvmem_cell_read_variable_le_u32(thread->drv->dev,
++					      thread->cpr_fuses[fnum].init_voltage,
++					      &bits);
++	if (ret)
++		return ret;
++
++	/* Sign and magnitude, not two's complement */
++	steps = bits & (BIT(width - 1) - 1);
++	if (bits & BIT(width - 1))
++		steps = -steps;
++
++	*uV = fdata->ref_uV + steps * tdesc->init_voltage_step +
++	      fdata->volt_oloop_adjust;
++
++	return 0;
++}
++
++/* Linear interpolation, rounding like cpr3_interpolate() of the vendor driver */
++static int cprh_interpolate(u64 f_low, int uV_low, u64 f_high, int uV_high,
++			    u64 freq)
++{
++	u64 temp;
++
++	if (f_low >= f_high || uV_low > uV_high || f_low > freq || freq > f_high)
++		return uV_high;
++
++	temp = (f_high - freq) * (u64)(uV_high - uV_low);
++	temp = div64_u64(temp, f_high - f_low);
++
++	return uV_high - (int)temp;
++}
++
++/**
++ * cprh_vendor_corner_voltages() - Compute corner voltages like the vendor driver
++ * @thread: Structure holding CPR thread-specific parameters
++ * @cdata:  Fuse corner and frequency of each corner, read from the OPP tables
++ *
++ * This follows cprh_kbss_init_regulator() of the vendor CPRh driver: the fused
++ * open-loop voltages plus their fixed adjustment are interpolated by frequency
++ * without intermediate rounding, rounded up to the regulator step, limited to
++ * the floor and ceiling of each corner, kept clear of the APM threshold, used
++ * as the corner ceiling, and the floor is raised to the floor to ceiling range.
++ *
++ * Return: Zero for success, negative number on error
++ */
++static int cprh_vendor_corner_voltages(struct cpr_thread *thread,
++				       const struct corner_data *cdata)
++{
++	const struct cpr_thread_desc *tdesc = thread->desc;
++	const struct cprh_corner_limits *lim = tdesc->corner_limits;
++	struct cpr_drv *drv = thread->drv;
++	const struct cpr_desc *desc = drv->desc;
++	int nfc = tdesc->num_fuse_corners, n = thread->num_corners;
++	int step = drv->vreg_step;
++	int fuse_uV[CPRH_MAX_FUSE_CORNERS], fmax[CPRH_MAX_FUSE_CORNERS];
++	int i, j, ret;
++
++	if (nfc > CPRH_MAX_FUSE_CORNERS)
++		return -EINVAL;
++
++	if (n != tdesc->num_corner_limits) {
++		dev_err(drv->dev, "%s: %d corners in the OPP tables, %u expected\n",
++			tdesc->name, n, tdesc->num_corner_limits);
++		return -EINVAL;
++	}
++
++	for (i = 0; i < n; i++) {
++		if (cdata[i].freq != lim[i].freq) {
++			dev_err(drv->dev, "%s: corner %d is %llu Hz, %llu Hz expected\n",
++				tdesc->name, i + 1, cdata[i].freq, lim[i].freq);
++			return -EINVAL;
++		}
++	}
++
++	for (i = 0; i < nfc; i++) {
++		ret = cprh_read_open_loop_fuse(thread, i, &fuse_uV[i]);
++		if (ret)
++			return ret;
++		if (i && fuse_uV[i] < fuse_uV[i - 1])
++			fuse_uV[i] = fuse_uV[i - 1];
++	}
++
++	/* Highest corner mapped to each fuse corner */
++	j = nfc - 1;
++	for (i = n - 1; i >= 0 && j >= 0; i--) {
++		if (cdata[i].fuse_corner == j) {
++			fmax[j] = i;
++			j--;
++		}
++	}
++	if (j >= 0) {
++		dev_err(drv->dev, "%s: invalid fuse corner mapping\n", tdesc->name);
++		return -EINVAL;
++	}
++
++	for (i = 0; i < n; i++) {
++		struct corner *corner = &thread->corners[i];
++		int fc = cdata[i].fuse_corner;
++		int uV, floor, ceiling, floor_new;
++
++		if (fc >= nfc)
++			return -EINVAL;
++
++		if (i <= fmax[0])
++			uV = fuse_uV[0];
++		else if (fc == 0 || i <= fmax[fc - 1])
++			return -EINVAL;
++		else
++			uV = cprh_interpolate(cdata[fmax[fc - 1]].freq,
++					      fuse_uV[fc - 1],
++					      cdata[fmax[fc]].freq,
++					      fuse_uV[fc], cdata[i].freq);
++
++		floor = lim[i].floor_uV;
++		ceiling = lim[i].ceiling_uV;
++
++		/* cpr3_limit_open_loop_voltages() */
++		uV = roundup(uV, step);
++		if (uV < floor)
++			uV = floor;
++		else if (uV > ceiling)
++			uV = ceiling;
++
++		/* cprh_adjust_voltages_for_apm() */
++		if (desc->apm_threshold) {
++			int threshold = roundup(desc->apm_threshold, step);
++			int adj = roundup(desc->apm_hysteresis, step);
++
++			if (threshold > floor && threshold <= ceiling) {
++				if (uV >= threshold) {
++					floor = max(floor, threshold - adj);
++					uV = max(uV, floor);
++				} else {
++					ceiling = threshold - step;
++				}
++			}
++		}
++
++		/* cpr3_open_loop_voltage_as_ceiling() */
++		ceiling = uV;
++
++		/* cpr3_limit_floor_voltages() */
++		floor_new = roundup(ceiling - lim[i].range_uV, step);
++		floor = max(floor, floor_new);
++		uV = max(uV, floor);
++
++		if (i && floor < thread->corners[i - 1].min_uV) {
++			floor = thread->corners[i - 1].min_uV;
++			uV = max(uV, floor);
++			ceiling = max(ceiling, floor);
++		}
++
++		corner->uV = uV;
++		corner->last_uV = uV;
++		corner->min_uV = floor;
++		corner->max_uV = ceiling;
++	}
++
++	return 0;
++}
++
+ /**
+  * cpr3_corner_init() - Calculate and set-up corners for the CPR HW
+  * @thread: Structure holding CPR thread-specific parameters
+@@ -1255,7 +1481,7 @@ static int cpr3_corner_init(struct cpr_thread *thread)
+ 		 * Make sure that the frequencies in the table are in ascending
+ 		 * order, as this is critical for the algorithm to work.
+ 		 */
+-		if (cdata[level - 2].freq > freq) {
++		if (level > 1 && cdata[level - 2].freq > freq) {
+ 			dev_err(drv->dev, "Frequency table not in ascending order.\n");
+ 			return -EINVAL;
+ 		}
+@@ -1420,6 +1646,24 @@ static int cpr3_corner_init(struct cpr_thread *thread)
+ 	if (desc->cpr_type != CTRL_TYPE_CPRH)
+ 		return 0;
+ 
++	if (tdesc->corner_limits) {
++		ret = cprh_vendor_corner_voltages(thread, cdata);
++		if (ret)
++			return ret;
++	}
++
++	if (desc->open_loop_only)
++		for (i = 0; i < thread->num_corners; i++)
++			thread->corners[i].is_open_loop = true;
++
++	for (i = 0; i < thread->num_corners; i++)
++		dev_info(drv->dev, "%s corner %d: %llu kHz open-loop %d mV floor %d mV ceiling %d mV%s\n",
++			 tdesc->name, i + 1, div_u64(thread->corners[i].freq, 1000),
++			 thread->corners[i].uV / 1000,
++			 thread->corners[i].min_uV / 1000,
++			 thread->corners[i].max_uV / 1000,
++			 thread->corners[i].is_open_loop ? ", closed loop off" : "");
++
+ 	/* If the OPPs can't be adjusted, programming the CPRh is useless */
+ 	ret = cprh_corner_adjust_opps(thread);
+ 	if (ret) {
+@@ -1445,9 +1689,9 @@ static int cpr3_corner_init(struct cpr_thread *thread)
+ 		 */
+ 		thread->ext_data.apm_threshold_uV = desc->apm_threshold;
+ 
+-		dev_dbg(drv->dev, "corner %d (APM): [%d %d %d] Open-Loop\n",
+-			total_corners, desc->apm_crossover,
+-			desc->apm_crossover, desc->apm_crossover);
++		dev_info(drv->dev, "%s corner %d: APM crossover %d mV, closed loop off\n",
++			 tdesc->name, total_corners + 1,
++			 desc->apm_crossover / 1000);
+ 
+ 		total_corners++;
+ 		extra_corners--;
+@@ -1638,10 +1882,16 @@ static int cpr3_init_parameters(struct cpr_drv *drv)
+ 	do_div(drv->ref_clk_khz, 1000);
+ 
+ 	/* On CPRh this clock is not always-on... */
+-	if (desc->cpr_type == CTRL_TYPE_CPRH)
+-		clk_prepare_enable(clk);
+-	else
++	if (desc->cpr_type == CTRL_TYPE_CPRH) {
++		int ret = clk_prepare_enable(clk);
++
++		if (ret) {
++			dev_err(drv->dev, "Couldn't enable the reference clock: %d\n", ret);
++			return ret;
++		}
++	} else {
+ 		devm_clk_put(drv->dev, clk);
++	}
+ 
+ 	/*
+ 	 * Read the CPR version register only from CPR3 onwards:
+@@ -1655,7 +1905,7 @@ static int cpr3_init_parameters(struct cpr_drv *drv)
+ 	drv->cpr_hw_rev = cpr_read(&drv->threads[0], CPR3_REG_CPR_VERSION);
+ 	dev_dbg(drv->dev, "CPR hardware revision: 0x%x\n", drv->cpr_hw_rev);
+ 
+-	if (drv->cpr_hw_rev >= CPRH_CPR_VERSION_4P5) {
++	if (drv->cpr_hw_rev >= CPRH_CPR_VERSION_4P5 && !desc->cprh_fixed_layout) {
+ 		drv->reg_corner = 0x3500;
+ 		drv->reg_corner_tid = 0xa0;
+ 		drv->reg_ctl = 0x3a80;
+@@ -1755,6 +2005,7 @@ static const int msm8998_silver_scaling_factor[][CPR3_RO_COUNT] = {
+ };
+ 
+ static const struct cpr_thread_desc msm8998_thread_gold = {
++	.name = "gold",
+ 	.controller_id = 1,
+ 	.hw_tid = 0,
+ 	.ro_scaling_factor = msm8998_gold_scaling_factor,
+@@ -1830,6 +2081,7 @@ static const struct cpr_thread_desc msm8998_thread_gold = {
+ };
+ 
+ static const struct cpr_thread_desc msm8998_thread_silver = {
++	.name = "silver",
+ 	.controller_id = 0,
+ 	.hw_tid = 0,
+ 	.ro_scaling_factor = msm8998_silver_scaling_factor,
+@@ -1957,6 +2209,7 @@ static const int sdm630_silver_scaling_factor[][CPR3_RO_COUNT] = {
+ };
+ 
+ static const struct cpr_thread_desc sdm630_thread_gold = {
++	.name = "gold",
+ 	.controller_id = 0,
+ 	.hw_tid = 0,
+ 	.ro_scaling_factor = sdm630_gold_scaling_factor,
+@@ -2048,6 +2301,7 @@ static const struct cpr_thread_desc sdm630_thread_gold = {
+ };
+ 
+ static const struct cpr_thread_desc sdm630_thread_silver = {
++	.name = "silver",
+ 	.controller_id = 1,
+ 	.hw_tid = 0,
+ 	.ro_scaling_factor = sdm630_silver_scaling_factor,
+@@ -2142,6 +2396,164 @@ static const struct cpr_acc_desc sdm630_cpr_acc_desc = {
+ 	.cpr_desc = &sdm630_cpr_desc,
+ };
+ 
++/*
++ * SDM660 KBSS CPRh, from the vendor cprh-kbss-regulator.c (fuse reference
++ * voltages, sensor counts) and the apc0/apc1 CPRh nodes of sdm660-regulator.dtsi
++ * (RO scaling factors, fuse adjustments, per-corner floors, ceilings and
++ * ranges, controller timings).
++ */
++static const int sdm660_gold_scaling_factor[][CPR3_RO_COUNT] = {
++	/* Same RO factors for all fuse corners */
++	{
++		4040, 4230,    0, 2210, 2560, 2450, 2230, 2220,
++		2410, 2300, 2560, 2470, 1600, 3120, 2620, 2280
++	}
++};
++
++static const int sdm660_silver_scaling_factor[][CPR3_RO_COUNT] = {
++	/* Same RO factors for all fuse corners */
++	{
++		3600, 3600, 3830, 2430, 2520, 2700, 1790, 1760,
++		1970, 1880, 2110, 2010, 2510, 4900, 4370, 4780
++	}
++};
++
++/* Speed bin 1 corner plan of the power (silver) cluster */
++static const struct cprh_corner_limits sdm660_silver_bin1_corners[] = {
++	{  300000000, 588000,  724000, 32000 },
++	{  633600000, 588000,  724000, 32000 },
++	{  902400000, 596000,  724000, 32000 },
++	{ 1113600000, 652000,  788000, 40000 },
++	{ 1401600000, 712000,  868000, 44000 },
++	{ 1536000000, 744000, 1068000, 40000 },
++	{ 1747200000, 784000, 1068000, 40000 },
++	{ 1843200000, 844000, 1068000, 40000 },
++};
++
++/* Speed bin 1 corner plan of the performance (gold) cluster */
++static const struct cprh_corner_limits sdm660_gold_bin1_corners[] = {
++	{  300000000, 588000,  724000, 40000 },
++	{ 1113600000, 596000,  724000, 40000 },
++	{ 1401600000, 652000,  788000, 40000 },
++	{ 1747200000, 712000,  868000, 40000 },
++	{ 1958400000, 744000,  988000, 66000 },
++	{ 2150400000, 784000,  988000, 66000 },
++	{ 2208000000, 844000, 1068000, 40000 },
++};
++
++/*
++ * Fuse corner limits are the widest floor/ceiling of the corners mapped to
++ * each fuse corner; the per-corner plan above sets the programmed values.
++ * The volt_cloop_adjust values only shape the target quotients, which are
++ * unused while closed-loop operation is disabled.
++ */
++#define SDM660_FUSE_CORNER(_ref, _min, _max, _range, _cl, _ol) {	\
++	.ref_uV = _ref,							\
++	.max_uV = _max,							\
++	.min_uV = _min,							\
++	.range_uV = _range,						\
++	.volt_cloop_adjust = _cl,					\
++	.volt_oloop_adjust = _ol,					\
++	.max_volt_scale = 2000,						\
++	.max_quot_scale = 1000,						\
++	.quot_offset = 0,						\
++	.quot_scale = 1,						\
++	.quot_adjust = 0,						\
++	.quot_offset_scale = 5,						\
++	.quot_offset_adjust = 0,					\
++}
++
++static const struct cpr_thread_desc sdm660_thread_silver = {
++	.controller_id = 0,
++	.hw_tid = 0,
++	.name = "silver",
++	.ro_scaling_factor = sdm660_silver_scaling_factor,
++	.ro_scaling_factor_common = true,
++	.sensor_range_start = 0,
++	.sensor_range_end = 6,
++	.init_voltage_step = 10000,
++	.init_voltage_width = 6,
++	.step_quot_init_min = 12,
++	.step_quot_init_max = 14,
++	.num_fuse_corners = 5,
++	.fuse_corner_data = (struct fuse_corner_data[]){
++		/* LowSVS, SVS, SVS+, NOM, TURBO_L1 */
++		SDM660_FUSE_CORNER( 644000, 588000,  724000, 32000, -32000, -4000),
++		SDM660_FUSE_CORNER( 724000, 596000,  724000, 32000, -30000,  4000),
++		SDM660_FUSE_CORNER( 788000, 652000,  788000, 40000, -29000,  7000),
++		SDM660_FUSE_CORNER( 868000, 712000,  868000, 44000, -23000, 19000),
++		SDM660_FUSE_CORNER(1068000, 744000, 1068000, 40000, -21000, -8000),
++	},
++	.corner_limits = sdm660_silver_bin1_corners,
++	.num_corner_limits = ARRAY_SIZE(sdm660_silver_bin1_corners),
++};
++
++static const struct cpr_thread_desc sdm660_thread_gold = {
++	.controller_id = 1,
++	.hw_tid = 0,
++	.name = "gold",
++	.ro_scaling_factor = sdm660_gold_scaling_factor,
++	.ro_scaling_factor_common = true,
++	.sensor_range_start = 0,
++	.sensor_range_end = 9,
++	.init_voltage_step = 10000,
++	.init_voltage_width = 6,
++	.step_quot_init_min = 12,
++	.step_quot_init_max = 14,
++	.num_fuse_corners = 5,
++	.fuse_corner_data = (struct fuse_corner_data[]){
++		/* SVS, SVS+, NOM, TURBO, TURBO_L2 */
++		SDM660_FUSE_CORNER( 724000, 588000,  724000, 40000, -22000, 16000),
++		SDM660_FUSE_CORNER( 788000, 652000,  788000, 40000,  -9000, 27000),
++		SDM660_FUSE_CORNER( 868000, 712000,  868000, 40000,  -7000, 39000),
++		SDM660_FUSE_CORNER( 988000, 744000,  988000, 66000,  -2000, 39000),
++		SDM660_FUSE_CORNER(1068000, 844000, 1068000, 40000,  11000, 20000),
++	},
++	.corner_limits = sdm660_gold_bin1_corners,
++	.num_corner_limits = ARRAY_SIZE(sdm660_gold_bin1_corners),
++};
++
++static const struct cpr_desc sdm660_cpr_desc = {
++	.cpr_type = CTRL_TYPE_CPRH,
++	.num_threads = 2,
++	.apm_threshold = 872000,
++	.apm_crossover = 872000,
++	.apm_hysteresis = 20000,
++	.cpr_base_voltage = 400000,
++	.cpr_max_voltage = 1068000,
++	.timer_delay_us = 5000,
++	.timer_cons_up = 0,
++	.timer_cons_down = 2,
++	.up_threshold = 2,
++	.down_threshold = 2,
++	.idle_clocks = 15,
++	.count_mode = CPR3_CPR_CTL_COUNT_MODE_ALL_AT_ONCE_MIN,
++	.count_repeat = 14,
++	.gcnt_us = 1,
++	.vreg_step_fixed = 4000,
++	.vreg_step_up_limit = 1,
++	.vreg_step_down_limit = 1,
++	/* Register counts at 19.2 MHz: 1760 ns settling, 1042 ns / 4 switch delay */
++	.vdd_settle_time_us = 33,
++	.corner_settle_time_us = 5,
++	.reduce_to_corner_uV = true,
++	.hw_closed_loop_en = false,
++	.open_loop_only = true,
++	.reset_step_quot_loop_en = true,
++	.cprh_fixed_layout = true,
++	.fuse_check = true,
++	.speed_bin = 1,
++	.fusing_rev = 2,
++	.threads = (const struct cpr_thread_desc *[]) {
++		&sdm660_thread_silver,
++		&sdm660_thread_gold,
++	},
++};
++
++static const struct cpr_acc_desc sdm660_cpr_acc_desc = {
++	.cpr_desc = &sdm660_cpr_desc,
++};
++
+ static int cpr_power_off(struct generic_pm_domain *domain)
+ {
+ 	struct cpr_thread *thread = container_of(domain, struct cpr_thread, pd);
+@@ -2653,6 +3065,18 @@ static int cpr_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "Couldn't get speedbin fuse\n");
+ 
++	if (desc->fuse_check) {
++		if (drv->speed_bin != desc->speed_bin ||
++		    drv->fusing_rev != desc->fusing_rev) {
++			dev_err(dev, "speed bin %u, CPR fusing revision %u: unsupported (only bin %u revision %u); CPU clocks stay as set by the bootloader\n",
++				drv->speed_bin, drv->fusing_rev,
++				desc->speed_bin, desc->fusing_rev);
++			return -ENODEV;
++		}
++		dev_info(dev, "speed bin %u, CPR fusing revision %u\n",
++			 drv->speed_bin, drv->fusing_rev);
++	}
++
+ 	/*
+ 	 * Some SoCs require extra corners for MEM-ACC or APM: if
+ 	 * the related parameters have been specified, then reserve
+@@ -2723,6 +3147,7 @@ static void cpr_remove(struct platform_device *pdev)
+ static const struct of_device_id cpr3_match_table[] = {
+ 	{ .compatible = "qcom,msm8998-cprh", .data = &msm8998_cpr_acc_desc },
+ 	{ .compatible = "qcom,sdm630-cprh", .data = &sdm630_cpr_acc_desc },
++	{ .compatible = "qcom,sdm660-cprh", .data = &sdm660_cpr_acc_desc },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(of, cpr3_match_table);

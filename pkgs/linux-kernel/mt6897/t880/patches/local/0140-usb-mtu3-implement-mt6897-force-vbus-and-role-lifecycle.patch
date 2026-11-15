@@ -1,0 +1,515 @@
+From 9fa7badb112b0179fe174bface12ca7ee564fae9 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] usb: mtu3: implement MT6897 force-VBUS and role lifecycle
+
+Honor the board force-VBUS property and implement dual-role resource
+ownership, host startup and device teardown for MT6897.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-15T11:04:17+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T06:16:18+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-19T21:31:58+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-19T22:54:42+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T07:47:24+08:00
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: dianqk <dianqk@dianqk.net>
+(cherry picked from commit 7fb4fcebc5b3031b0d89be23c175e2ecb0cf7309)
+---
+ drivers/usb/mtu3/Kconfig     |   1 +
+ drivers/usb/mtu3/mtu3.h      |   9 +++
+ drivers/usb/mtu3/mtu3_core.c |  31 +++++++-
+ drivers/usb/mtu3/mtu3_dr.c   | 136 +++++++++++++++++++++++++++++++++--
+ drivers/usb/mtu3/mtu3_dr.h   |  16 +++++
+ drivers/usb/mtu3/mtu3_host.c |  50 +++++++++++--
+ drivers/usb/mtu3/mtu3_plat.c |  11 ++-
+ 7 files changed, 239 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/usb/mtu3/Kconfig b/drivers/usb/mtu3/Kconfig
+index d281da1cdb..cac98bbb1d 100644
+--- a/drivers/usb/mtu3/Kconfig
++++ b/drivers/usb/mtu3/Kconfig
+@@ -7,6 +7,7 @@ config USB_MTU3
+ 	depends on USB || USB_GADGET
+ 	depends on ARCH_MEDIATEK || COMPILE_TEST
+ 	depends on EXTCON || !EXTCON
++	depends on TYPEC || !TYPEC
+ 	select USB_XHCI_MTK if USB_SUPPORT && USB_XHCI_HCD
+ 	help
+ 	  Say Y or M here if your system runs on MediaTek SoCs with
+diff --git a/drivers/usb/mtu3/mtu3.h b/drivers/usb/mtu3/mtu3.h
+index ba5a63669e..2549ebefd6 100644
+--- a/drivers/usb/mtu3/mtu3.h
++++ b/drivers/usb/mtu3/mtu3.h
+@@ -28,6 +28,7 @@
+ struct mtu3;
+ struct mtu3_ep;
+ struct mtu3_request;
++struct typec_mux_dev;
+ 
+ #include "mtu3_hw_regs.h"
+ #include "mtu3_qmu.h"
+@@ -222,6 +223,9 @@ struct otg_switch_mtk {
+ 	enum usb_role desired_role;
+ 	enum usb_role default_role;
+ 	struct usb_role_switch *role_sw;
++	struct typec_mux_dev *typec_mux;
++	/* the SuperSpeed lanes carry 4-lane DisplayPort: no USB3 port */
++	bool dp_4lane;
+ 	bool role_sw_used;
+ 	bool is_u3_drd;
+ 	bool manual_drd_enabled;
+@@ -266,6 +270,8 @@ struct ssusb_mtk {
+ 	int u3_ports;
+ 	int u2p_dis_msk;
+ 	int u3p_dis_msk;
++	bool force_vbus;
++	bool host_populated;
+ 	struct dentry *dbgfs_root;
+ 	/* usb wakeup for host mode */
+ 	bool uwk_en;
+@@ -423,6 +429,8 @@ static inline void mtu3_clrbits(void __iomem *base, u32 offset, u32 bits)
+ }
+ 
+ int ssusb_check_clocks(struct ssusb_mtk *ssusb, u32 ex_clks);
++void ssusb_phy_set_mode(struct ssusb_mtk *ssusb, enum phy_mode mode);
++void ssusb_ip_sw_reset(struct ssusb_mtk *ssusb);
+ struct usb_request *mtu3_alloc_request(struct usb_ep *ep, gfp_t gfp_flags);
+ void mtu3_free_request(struct usb_ep *ep, struct usb_request *req);
+ void mtu3_req_complete(struct mtu3_ep *mep,
+@@ -433,6 +441,7 @@ int mtu3_config_ep(struct mtu3 *mtu, struct mtu3_ep *mep,
+ void mtu3_deconfig_ep(struct mtu3 *mtu, struct mtu3_ep *mep);
+ void mtu3_ep_stall_set(struct mtu3_ep *mep, bool set);
+ void mtu3_start(struct mtu3 *mtu);
++int mtu3_hw_reinit(struct mtu3 *mtu);
+ void mtu3_stop(struct mtu3 *mtu);
+ void mtu3_dev_on_off(struct mtu3 *mtu, int is_on);
+ 
+diff --git a/drivers/usb/mtu3/mtu3_core.c b/drivers/usb/mtu3/mtu3_core.c
+index a40bf5bad2..dc16c1ddbe 100644
+--- a/drivers/usb/mtu3/mtu3_core.c
++++ b/drivers/usb/mtu3/mtu3_core.c
+@@ -111,7 +111,15 @@ static int mtu3_device_enable(struct mtu3 *mtu)
+ 		SSUSB_U2_PORT_HOST_SEL));
+ 
+ 	if (mtu->ssusb->dr_mode == USB_DR_MODE_OTG) {
+-		mtu3_setbits(ibase, SSUSB_U2_CTRL(0), SSUSB_U2_PORT_OTG_SEL);
++		/*
++		 * OTG_SEL takes the device session from the PHY's VBUS
++		 * detection. With mediatek,force-vbus the board does not route
++		 * VBUS to the controller, and the session comes from the
++		 * forced VBUS in MISC_CTRL instead, which only works with
++		 * OTG_SEL clear (as the vendor driver does).
++		 */
++		if (!mtu->ssusb->force_vbus)
++			mtu3_setbits(ibase, SSUSB_U2_CTRL(0), SSUSB_U2_PORT_OTG_SEL);
+ 		if (mtu->u3_capable)
+ 			mtu3_setbits(ibase, SSUSB_U3_CTRL(0),
+ 				     SSUSB_U3_PORT_DUAL_MODE);
+@@ -659,8 +667,11 @@ static void mtu3_regs_init(struct mtu3 *mtu)
+ 
+ 	/* U2/U3 detected by HW */
+ 	mtu3_writel(mbase, U3D_DEVICE_CONF, 0);
+-	/* vbus detected by HW */
+-	mtu3_clrbits(mbase, U3D_MISC_CTRL, VBUS_FRC_EN | VBUS_ON);
++	if (mtu->ssusb->force_vbus)
++		/* the board does not route VBUS to the controller */
++		mtu3_setbits(mbase, U3D_MISC_CTRL, VBUS_FRC_EN | VBUS_ON);
++	else	/* vbus detected by HW */
++		mtu3_clrbits(mbase, U3D_MISC_CTRL, VBUS_FRC_EN | VBUS_ON);
+ 	/* use new QMU format when HW version >= 0x1003 */
+ 	if (mtu->gen2cp)
+ 		mtu3_writel(mbase, U3D_QFCR, ~0x0);
+@@ -887,6 +898,20 @@ static int mtu3_hw_init(struct mtu3 *mtu)
+ 	return 0;
+ }
+ 
++/* Device MAC setup again after a soft reset of the whole IP */
++int mtu3_hw_reinit(struct mtu3 *mtu)
++{
++	int ret;
++
++	ret = mtu3_device_enable(mtu);
++	if (ret)
++		return ret;
++
++	mtu3_regs_init(mtu);
++
++	return 0;
++}
++
+ static void mtu3_hw_exit(struct mtu3 *mtu)
+ {
+ 	mtu3_device_disable(mtu);
+diff --git a/drivers/usb/mtu3/mtu3_dr.c b/drivers/usb/mtu3/mtu3_dr.c
+index ffa5b9401d..c4ac21a6f9 100644
+--- a/drivers/usb/mtu3/mtu3_dr.c
++++ b/drivers/usb/mtu3/mtu3_dr.c
+@@ -8,6 +8,8 @@
+  */
+ 
+ #include <linux/string_choices.h>
++#include <linux/usb/typec_dp.h>
++#include <linux/usb/typec_mux.h>
+ #include "mtu3.h"
+ #include "mtu3_dr.h"
+ #include "mtu3_debug.h"
+@@ -125,6 +127,60 @@ int ssusb_set_vbus(struct otg_switch_mtk *otg_sx, int is_on)
+ 	return 0;
+ }
+ 
++/*
++ * With mediatek,force-vbus the board routes VBUS only to the charger. As the
++ * vendor driver does, the device role then uses a fixed device port
++ * (OTG_SEL clear) with the VBUS forced in MISC_CTRL, and the host role sets
++ * OTG_SEL and drops the force.
++ */
++static void ssusb_set_force_vbus(struct ssusb_mtk *ssusb, bool on)
++{
++	if (!ssusb->force_vbus)
++		return;
++
++	if (on) {
++		mtu3_clrbits(ssusb->ippc_base, SSUSB_U2_CTRL(0), SSUSB_U2_PORT_OTG_SEL);
++		mtu3_setbits(ssusb->mac_base, U3D_MISC_CTRL, VBUS_FRC_EN | VBUS_ON);
++	} else {
++		mtu3_setbits(ssusb->ippc_base, SSUSB_U2_CTRL(0), SSUSB_U2_PORT_OTG_SEL);
++		mtu3_clrbits(ssusb->mac_base, U3D_MISC_CTRL, VBUS_FRC_EN | VBUS_ON);
++	}
++}
++
++/*
++ * A 4-lane DisplayPort pin assignment takes the SuperSpeed lanes: the USB3
++ * host ports stay powered down meanwhile (as the MediaTek vendor driver,
++ * which starts the host without USB3 ports while its lane selector is in
++ * 4-lane DisplayPort mode).
++ */
++static void ssusb_host_update_u3_ports(struct ssusb_mtk *ssusb)
++{
++	void __iomem *ibase = ssusb->ippc_base;
++	bool off = ssusb->otg_switch.dp_4lane;
++	u32 value;
++	int i;
++
++	if (!ssusb->is_host)
++		return;
++
++	pm_runtime_get_sync(ssusb->dev);
++	for (i = 0; i < ssusb->u3_ports; i++) {
++		if ((0x1 << i) & ssusb->u3p_dis_msk)
++			continue;
++
++		value = mtu3_readl(ibase, SSUSB_U3_CTRL(i));
++		if (off)
++			value |= SSUSB_U3_PORT_PDN | SSUSB_U3_PORT_DIS;
++		else
++			value = (value & ~(SSUSB_U3_PORT_PDN | SSUSB_U3_PORT_DIS)) |
++				SSUSB_U3_PORT_HOST_SEL;
++		mtu3_writel(ibase, SSUSB_U3_CTRL(i), value);
++	}
++	pm_runtime_put(ssusb->dev);
++
++	dev_dbg(ssusb->dev, "USB3 host ports %s\n", off ? "off (4-lane DP)" : "on");
++}
++
+ static void ssusb_mode_sw_work(struct work_struct *work)
+ {
+ 	struct otg_switch_mtk *otg_sx =
+@@ -143,8 +199,10 @@ static void ssusb_mode_sw_work(struct work_struct *work)
+ 			desired_role = USB_ROLE_DEVICE;
+ 	}
+ 
+-	if (current_role == desired_role)
++	if (current_role == desired_role) {
++		ssusb_host_update_u3_ports(ssusb);
+ 		return;
++	}
+ 
+ 	dev_dbg(ssusb->dev, "set role : %s\n", usb_role_string(desired_role));
+ 	mtu3_dbg_trace(ssusb->dev, "set role : %s", usb_role_string(desired_role));
+@@ -152,18 +210,41 @@ static void ssusb_mode_sw_work(struct work_struct *work)
+ 
+ 	switch (desired_role) {
+ 	case USB_ROLE_HOST:
+-		ssusb_set_force_mode(ssusb, MTU3_DR_FORCE_HOST);
+ 		mtu3_stop(mtu);
++		/*
++		 * As the vendor driver: the PHY in host mode and a soft reset
++		 * of the whole IP before the host side is set up again.
++		 */
++		ssusb_phy_set_mode(ssusb, PHY_MODE_USB_HOST);
++		ssusb_ip_sw_reset(ssusb);
++		ssusb_host_enable(ssusb);
++		ssusb_set_force_mode(ssusb, MTU3_DR_FORCE_HOST);
+ 		switch_port_to_host(ssusb);
++		ssusb_set_force_vbus(ssusb, false);
+ 		ssusb_set_vbus(otg_sx, 1);
+ 		ssusb->is_host = true;
++		if (ssusb_host_populate(ssusb))
++			dev_err(ssusb->dev, "failed to create the xHCI\n");
+ 		break;
+ 	case USB_ROLE_DEVICE:
+-		ssusb_set_force_mode(ssusb, MTU3_DR_FORCE_DEVICE);
+-		ssusb->is_host = false;
++		/* the xHCI goes before the port is handed back */
++		ssusb_host_depopulate(ssusb);
+ 		ssusb_set_vbus(otg_sx, 0);
++		ssusb->is_host = false;
++		/*
++		 * The PHY in device mode and a soft reset of the whole IP, then
++		 * the device MAC set up again, before the device side starts;
++		 * without them a host PC does not enumerate the gadget after a
++		 * host session.
++		 */
++		ssusb_phy_set_mode(ssusb, PHY_MODE_USB_DEVICE);
++		ssusb_ip_sw_reset(ssusb);
++		if (mtu3_hw_reinit(mtu))
++			dev_err(ssusb->dev, "device re-init failed\n");
++		ssusb_set_force_mode(ssusb, MTU3_DR_FORCE_DEVICE);
+ 		switch_port_to_device(ssusb);
+ 		mtu3_start(mtu);
++		ssusb_set_force_vbus(ssusb, true);
+ 		break;
+ 	case USB_ROLE_NONE:
+ 	default:
+@@ -305,6 +386,45 @@ static int ssusb_role_sw_register(struct otg_switch_mtk *otg_sx)
+ 	return 0;
+ }
+ 
++static int ssusb_typec_mux_set(struct typec_mux_dev *mux,
++			       struct typec_mux_state *state)
++{
++	struct ssusb_mtk *ssusb = typec_mux_get_drvdata(mux);
++	struct otg_switch_mtk *otg_sx = &ssusb->otg_switch;
++	bool dp_4lane = state->alt && state->alt->svid == USB_TYPEC_DP_SID &&
++			(state->mode == TYPEC_DP_STATE_C ||
++			 state->mode == TYPEC_DP_STATE_E);
++
++	if (dp_4lane != otg_sx->dp_4lane) {
++		otg_sx->dp_4lane = dp_4lane;
++		queue_work(system_freezable_wq, &otg_sx->dr_work);
++	}
++
++	return 0;
++}
++
++static int ssusb_typec_mux_register(struct ssusb_mtk *ssusb)
++{
++	struct typec_mux_desc mux_desc = {
++		.drvdata = ssusb,
++		.fwnode = dev_fwnode(ssusb->dev),
++		.set = ssusb_typec_mux_set,
++	};
++	struct typec_mux_dev *mux;
++
++	if (!IS_ENABLED(CONFIG_TYPEC) ||
++	    !device_property_present(ssusb->dev, "mode-switch"))
++		return 0;
++
++	mux = typec_mux_register(ssusb->dev, &mux_desc);
++	if (IS_ERR(mux))
++		return dev_err_probe(ssusb->dev, PTR_ERR(mux),
++				     "failed to register typec mux\n");
++
++	ssusb->otg_switch.typec_mux = mux;
++	return 0;
++}
++
+ int ssusb_otg_switch_init(struct ssusb_mtk *ssusb)
+ {
+ 	struct otg_switch_mtk *otg_sx = &ssusb->otg_switch;
+@@ -312,6 +432,10 @@ int ssusb_otg_switch_init(struct ssusb_mtk *ssusb)
+ 
+ 	INIT_WORK(&otg_sx->dr_work, ssusb_mode_sw_work);
+ 
++	ret = ssusb_typec_mux_register(ssusb);
++	if (ret)
++		return ret;
++
+ 	if (otg_sx->manual_drd_enabled)
+ 		ssusb_dr_debugfs_init(ssusb);
+ 	else if (otg_sx->role_sw_used)
+@@ -319,6 +443,9 @@ int ssusb_otg_switch_init(struct ssusb_mtk *ssusb)
+ 	else
+ 		ret = ssusb_extcon_register(otg_sx);
+ 
++	if (ret)
++		typec_mux_unregister(otg_sx->typec_mux);
++
+ 	return ret;
+ }
+ 
+@@ -326,6 +453,7 @@ void ssusb_otg_switch_exit(struct ssusb_mtk *ssusb)
+ {
+ 	struct otg_switch_mtk *otg_sx = &ssusb->otg_switch;
+ 
++	typec_mux_unregister(otg_sx->typec_mux);
+ 	cancel_work_sync(&otg_sx->dr_work);
+ 	usb_role_switch_unregister(otg_sx->role_sw);
+ }
+diff --git a/drivers/usb/mtu3/mtu3_dr.h b/drivers/usb/mtu3/mtu3_dr.h
+index e325508bdd..7a4011941a 100644
+--- a/drivers/usb/mtu3/mtu3_dr.h
++++ b/drivers/usb/mtu3/mtu3_dr.h
+@@ -14,6 +14,9 @@
+ 
+ int ssusb_host_init(struct ssusb_mtk *ssusb, struct device_node *parent_dn);
+ void ssusb_host_exit(struct ssusb_mtk *ssusb);
++int ssusb_host_enable(struct ssusb_mtk *ssusb);
++int ssusb_host_populate(struct ssusb_mtk *ssusb);
++void ssusb_host_depopulate(struct ssusb_mtk *ssusb);
+ int ssusb_wakeup_of_property_parse(struct ssusb_mtk *ssusb,
+ 				struct device_node *dn);
+ int ssusb_host_resume(struct ssusb_mtk *ssusb, bool p0_skipped);
+@@ -32,6 +35,19 @@ static inline int ssusb_host_init(struct ssusb_mtk *ssusb,
+ static inline void ssusb_host_exit(struct ssusb_mtk *ssusb)
+ {}
+ 
++static inline int ssusb_host_enable(struct ssusb_mtk *ssusb)
++{
++	return 0;
++}
++
++static inline int ssusb_host_populate(struct ssusb_mtk *ssusb)
++{
++	return 0;
++}
++
++static inline void ssusb_host_depopulate(struct ssusb_mtk *ssusb)
++{}
++
+ static inline int ssusb_wakeup_of_property_parse(
+ 	struct ssusb_mtk *ssusb, struct device_node *dn)
+ {
+diff --git a/drivers/usb/mtu3/mtu3_host.c b/drivers/usb/mtu3/mtu3_host.c
+index 8138b3f309..a416ca93fe 100644
+--- a/drivers/usb/mtu3/mtu3_host.c
++++ b/drivers/usb/mtu3/mtu3_host.c
+@@ -182,7 +182,7 @@ static void host_ports_num_get(struct ssusb_mtk *ssusb)
+ }
+ 
+ /* only configure ports will be used later */
+-static int ssusb_host_enable(struct ssusb_mtk *ssusb)
++int ssusb_host_enable(struct ssusb_mtk *ssusb)
+ {
+ 	void __iomem *ibase = ssusb->ippc_base;
+ 	int num_u3p = ssusb->u3_ports;
+@@ -198,7 +198,8 @@ static int ssusb_host_enable(struct ssusb_mtk *ssusb)
+ 	/* power on and enable u3 ports except skipped ones */
+ 	u3_ports_disabled = 0;
+ 	for (i = 0; i < num_u3p; i++) {
+-		if ((0x1 << i) & ssusb->u3p_dis_msk) {
++		if (((0x1 << i) & ssusb->u3p_dis_msk) ||
++		    ssusb->otg_switch.dp_4lane) {
+ 			u3_ports_disabled++;
+ 			continue;
+ 		}
+@@ -367,27 +368,62 @@ static void ssusb_host_cleanup(struct ssusb_mtk *ssusb)
+  * Because the host driver will keep link with devices attached when system
+  * enters suspend mode, so no need to control VBUSes after initialization.
+  */
+-int ssusb_host_init(struct ssusb_mtk *ssusb, struct device_node *parent_dn)
++int ssusb_host_populate(struct ssusb_mtk *ssusb)
+ {
+ 	struct device *parent_dev = ssusb->dev;
+ 	int ret;
+ 
+-	ssusb_host_setup(ssusb);
++	if (ssusb->host_populated)
++		return 0;
+ 
+-	ret = of_platform_populate(parent_dn, NULL, NULL, parent_dev);
++	ret = of_platform_populate(parent_dev->of_node, NULL, NULL, parent_dev);
+ 	if (ret) {
+ 		dev_dbg(parent_dev, "failed to create child devices at %pOF\n",
+-				parent_dn);
++				parent_dev->of_node);
+ 		return ret;
+ 	}
+ 
++	ssusb->host_populated = true;
+ 	dev_info(parent_dev, "xHCI platform device register success...\n");
+ 
+ 	return 0;
+ }
+ 
+-void ssusb_host_exit(struct ssusb_mtk *ssusb)
++void ssusb_host_depopulate(struct ssusb_mtk *ssusb)
+ {
++	if (!ssusb->host_populated)
++		return;
++
+ 	of_platform_depopulate(ssusb->dev);
++	ssusb->host_populated = false;
++}
++
++/*
++ * A dual-role controller whose role switch starts in the device role gets
++ * its xHCI only when it switches to host: the xHCI cannot complete its
++ * reset while port 0 belongs to the device MAC.
++ */
++static bool ssusb_host_deferred(struct ssusb_mtk *ssusb)
++{
++	return ssusb->dr_mode == USB_DR_MODE_OTG &&
++	       ssusb->otg_switch.role_sw_used &&
++	       usb_get_role_switch_default_mode(ssusb->dev) == USB_DR_MODE_PERIPHERAL;
++}
++
++int ssusb_host_init(struct ssusb_mtk *ssusb, struct device_node *parent_dn)
++{
++	ssusb_host_setup(ssusb);
++
++	if (ssusb_host_deferred(ssusb)) {
++		dev_info(ssusb->dev, "xHCI created in the host role\n");
++		return 0;
++	}
++
++	return ssusb_host_populate(ssusb);
++}
++
++void ssusb_host_exit(struct ssusb_mtk *ssusb)
++{
++	ssusb_host_depopulate(ssusb);
+ 	ssusb_host_cleanup(ssusb);
+ }
+diff --git a/drivers/usb/mtu3/mtu3_plat.c b/drivers/usb/mtu3/mtu3_plat.c
+index b4f4c776ad..58ad3ca9a4 100644
+--- a/drivers/usb/mtu3/mtu3_plat.c
++++ b/drivers/usb/mtu3/mtu3_plat.c
+@@ -174,7 +174,15 @@ static void ssusb_rscs_exit(struct ssusb_mtk *ssusb)
+ 	ssusb_phy_exit(ssusb);
+ }
+ 
+-static void ssusb_ip_sw_reset(struct ssusb_mtk *ssusb)
++void ssusb_phy_set_mode(struct ssusb_mtk *ssusb, enum phy_mode mode)
++{
++	int i;
++
++	for (i = 0; i < ssusb->num_phys; i++)
++		phy_set_mode(ssusb->phys[i], mode);
++}
++
++void ssusb_ip_sw_reset(struct ssusb_mtk *ssusb)
+ {
+ 	/* reset whole ip (xhci & u3d) */
+ 	mtu3_setbits(ssusb->ippc_base, U3D_SSUSB_IP_PW_CTRL0, SSUSB_IP_SW_RST);
+@@ -272,6 +280,7 @@ static int get_ssusb_rscs(struct platform_device *pdev, struct ssusb_mtk *ssusb)
+ 		ssusb->dr_mode = USB_DR_MODE_OTG;
+ 
+ 	of_property_read_u32(node, "mediatek,u3p-dis-msk", &ssusb->u3p_dis_msk);
++	ssusb->force_vbus = of_property_read_bool(node, "mediatek,force-vbus");
+ 
+ 	if (ssusb->dr_mode == USB_DR_MODE_PERIPHERAL)
+ 		goto out;
+-- 
+2.56.0
+

@@ -1,12 +1,12 @@
 # 配置自己的系统
 
-设备专属选项统一使用 `hardware.{asphalt,polaris,sheng,aurora,clover}.*`；
+设备专属选项统一使用 `hardware.<device>.*`，设备为 `asphalt`、`polaris`、`sheng`、`aurora`、`clover`、`marble`、`t880` 和 `dodge`；
 共享的启动、USB、recovery 等选项使用 `androidDevices.*`。
 
 [English](configuration.md) · [安装指南](README.zh.md) · [USB 连接](usb-signaller.zh.md)
 
 构建电脑需要 Linux 和启用 flakes 的 Nix。`buildSystem` 填电脑的架构：
-`x86_64-linux` 或 `aarch64-linux`；五款设备的目标架构都是 AArch64。
+`x86_64-linux` 或 `aarch64-linux`；所有受支持设备的目标架构都是 AArch64。
 x86_64 电脑对本仓库定义或修改的编译包使用交叉工具链；普通上游系统包保持
 AArch64 原生，以复用其二进制缓存。
 
@@ -58,7 +58,8 @@ Nix 优先下载可用的 ARM 原生缓存，缺失的上游任务和 NixOS 生�
 安装前修改以下内容：
 
 1. 将 `buildSystem` 设为构建电脑架构。
-2. 为每台设备设置独有且稳定的 `androidDevices.usbSerial`。
+2. 可选设置 `androidDevices.usbSerial`。每个型号默认使用固定名称（`POLARIS`、
+   `ASPHALT` 等；RAM recovery 中为 `RECOVERY_POLARIS` 等），仅在需要区分同型号的多台设备时覆盖。
 3. 将自己的 SSH 公钥填入 `users.users.root.openssh.authorizedKeys.keys`。
    不填公钥时，默认控制台系统没有配置可用的登录凭据。
 4. 对 Polaris，按[设备识别步骤](polaris/first-install.zh.md)核对原厂 GPT 分区名。
@@ -114,7 +115,7 @@ system profile 变化。启动前须将完整 closure 部署到现有 ext4 根�
 ## 选择设备和系统角色
 
 `lib.mkSystem { device; buildSystem; modules; }` 返回标准 NixOS 配置。
-`device` 支持 `asphalt`、`polaris`、`sheng`、`aurora`、`clover`；`modules` 中放自己的
+`device` 支持 `asphalt`、`polaris`、`sheng`、`aurora`、`clover`、`marble`、`t880` 和 `dodge`；`modules` 中放自己的
 NixOS 模块。可选参数 `specialArgs`、`overlays`、`nixpkgsConfig` 分别传递模块参数、
 包覆盖和 Nixpkgs 配置。
 
@@ -123,7 +124,7 @@ NixOS 模块。可选参数 `specialArgs`、`overlays`、`nixpkgsConfig` 分别�
 | 安装系统启动方式 | U-Boot/EFI | U-Boot/EFI | U-Boot/EFI | U-Boot/EFI | U-Boot/EFI |
 | 根 GPT 分区 | `linux` | `userdata` | `linux` | `linux` | `userdata` |
 | ext4 默认标签 | `NIXOS` | `NIXOS` | `NIXOS` | `NIXOS` | `NIXOS` |
-| 选择 NCM 后的 USB 地址 | `172.16.43.1/24` | `172.16.42.1/24` | `172.16.45.1/24` | `172.16.42.1/24`（共享默认值） | `172.16.44.1/24` |
+| 选择 NCM 后的 USB 地址 | `172.16.43.1/24` | `172.16.42.1/24` | `172.16.45.1/24` | `172.16.46.1/24` | `172.16.44.1/24` |
 
 五台设备的 ext4 默认标签统一为 `NIXOS`。已有安装应保留与实际文件系统一致的
 配置标签和 recovery 存储契约；修改默认值不会自动重命名文件系统。
@@ -148,10 +149,9 @@ recovery 使用 [ACM/NCM 和 OpenSSH](recovery.zh.md)，不启动磁盘中的系
 
 ```nix
 imports = [ inputs.androidDevices.nixosModules.polaris ];
-androidDevices.usbSerial = "my-polaris-01";
 ```
 
-其他设备将 `polaris` 替换为 `asphalt`、`sheng`、`aurora` 或 `clover`。无需额外导入
+其他设备将 `polaris` 替换为 `asphalt`、`sheng`、`aurora`、`clover`、`marble`、`t880` 或 `dodge`。无需额外导入
 通用模块，也无需设置 `androidDevices.enable = true`。
 桌面策略及逐机身份由使用者提供。
 
@@ -180,6 +180,8 @@ androidDevices.usbSerial = "my-polaris-01";
 以及始终显示在底部并预留屏幕空间的 wvkbd 虚拟键盘。
 复制需要的部分并自行修改，不把它作为上游模块接口导入。示例通过 `NIRI_CONFIG`
 选择 `/etc/niri/config.kdl`，由 demo 的 tty1 登录启动 `niri-session`。
+`demo` 使用 UID 1001，让全新安装的个人用户可使用 UID 1000。从旧版示例安装
+切换时，需要单独检查现有账户 UID 和文件所有权。
 示例文件中的 `example.desktop.scale` 设置内屏缩放，它不是导出的硬件模块选项。
 Niri 使用默认屏幕方向；示例不添加输出 transform、旋转 metadata 覆盖或自动旋转
 客户端。传感器支持仍可用于诊断或显式配置的旋转策略。触摸屏映射到 `DSI-1`，
@@ -204,6 +206,121 @@ PipeWire 等服务即可，无需禁用或重新导入内部文件。音频与�
 需要相机 CLI 时，在接收 `config` 的模块中设置
 `environment.systemPackages = [ config.androidDevices.camera.package ];`，得到包含设备传感器
 适配的 libcamera。运行 `cam --list` 查看摄像头；拍摄参数及限制见对应板的硬件参考。
+
+## 挂起唤醒源
+
+设备模块可在 `androidDevices.power.wakeup.sources` 中声明具名唤醒源（每个源是一组
+sysfs 设备路径）；名称与已验证的唤醒行为见各设备的硬件说明。该策略默认关闭。
+使用时启用并列出要保留的源：
+
+```nix
+androidDevices.power.wakeup = {
+  enable = true;
+  keep = [ "powerKey" ];
+};
+```
+
+此后其他所有设备的唤醒（`power/wakeup`）会在启动时、设备出现或绑定驱动时以及每次
+系统休眠前被禁用；保留的源维持驱动自身的设置。可用
+`grep -l enabled $(find /sys/devices -path '*/power/wakeup')` 和
+`android-devices-wakeup-policy` 服务日志检查结果。系统是否以及何时挂起（systemd
+休眠设置、空闲守护进程、菜单）仍由你自己的配置决定。
+
+## 随屏幕方向切换扬声器声道
+
+应用把左右声道发送到扬声器 sink，sink 总是在相同的物理扬声器上播放。旋转屏幕后，
+左右声道可能来自错误的一侧。有多个扬声器的设备模块可在
+`androidDevices.audio.orientation.routes.{normal,"90","180","270"}` 中按输出变换
+描述 ALSA 混音器设置，使左右声道保持在对应的一侧。该策略默认关闭：
+
+```nix
+androidDevices.audio.orientation.enable = true;
+```
+
+启用后会安装 `/etc/android-audio-orientation.json`、`android-audio-orientation`
+命令和同名用户服务。切换由你的合成器集成触发：在旋转处理程序中以桌面用户身份
+用新的输出变换调用该命令：
+
+```sh
+android-audio-orientation apply 90
+android-audio-orientation status
+```
+
+`apply` 先确认每个控件存在，然后只设置列出的控件，并将方向记录在
+`$XDG_RUNTIME_DIR` 中。激活音频配置会重写这些控件，因此 WirePlumber 每次启动或
+重启时，用户服务都会重新应用记录的方向（没有记录时为 `normal`）。翻转变换会镜像
+画面，命令会拒绝它们，不应用任何声道设置。没有数据的方向保持当前声道不变。各方向
+是否已验证见设备的硬件说明。
+
+## 只读 RTC 的系统时钟
+
+部分 PMIC RTC 在关机时持续计数，但 Linux 无法设置它，因此每次启动时钟都从 RTC 的
+原始计数开始（例如 1970-01-10）。这类板的设备模块会启用
+`androidDevices.clock.rtcOffset`（Aurora、Clover 和 Polaris；仅已安装系统），
+像 Android 的时间守护进程一样在用户态保存偏移：
+
+| 选项 | 默认值 | 含义 |
+| --- | --- | --- |
+| `enable` | `false` | 启动时用 RTC + 已保存偏移恢复时钟，并保存偏移。 |
+| `rtc` | `"rtc0"` | RTC 类设备（`/sys/class/rtc/<rtc>`）。 |
+
+`rtc-offset-restore.service` 在 `time-set.target` 和 systemd-timesyncd 之前运行：
+把时钟设为 RTC 计数加已保存偏移，只向前调整，并创建 `/run/rtc-offset/restored`。
+若保存时的 RTC 计数大于当前计数，说明 RTC 已复位，此时丢弃已保存的偏移，时钟等待
+NTP。早于 2026-01-01 的结果会被拒绝。偏移（`/var/lib/rtc-offset/offset`：RTC
+秒数和偏移秒数）在每次 systemd-timesyncd 同步后（`rtc-offset-save.path`）和关机时
+（`rtc-offset-shutdown.service`）保存，且仅当本次启动的时钟已同步或已恢复时才保存。
+安装后或 RTC 复位后的第一次启动仍需一次 NTP。可用
+`journalctl -b -u rtc-offset-restore -u rtc-offset-save -u rtc-offset-shutdown`
+检查。
+
+Linux 能设置的 RTC（设备树节点带 `allow-set-time` 或 `offset` nvmem cell）不要
+启用此功能；内核会自行保持时间。
+
+## 实时任务的频率钳制
+
+`androidDevices.power.rtUtilClampMin`（默认 `0`）在已安装系统中设置
+`kernel.sched_util_clamp_min_rt_default`。内核默认值（1024）会让每次实时任务唤醒（例如线程化
+的触摸中断）都运行在最高 CPU 频率，并通过 CPU 带宽投票在空闲时抬高 DDR 频率。Pixel 设备的
+init 文件使用 0。设为 `null` 可保留内核默认值。
+
+## 按温度限制充电电流
+
+有些充电固件像 Android 的温控守护进程那样，把充电温控留给操作系统。
+`androidDevices.charging.thermalLimit` 按温度写入充电电流上限。输入由设备模块提供；
+Aurora 按原厂温控配置设置分级，以电池温度为传感器。该服务默认关闭：
+
+| 选项 | 含义 |
+| --- | --- |
+| `enable` | 运行 `charge-thermal-limit.service`（默认 `false`）。 |
+| `currentFile` | 以 µA 为单位的可写上限，例如 `constant_charge_current`。 |
+| `sensors` | 温度文件及换算到 m°C 的系数；读数最高者决定上限。 |
+| `steps` | `{ trip; clear; current; }`，trip 按 m°C 递增，上限单位为 µA。 |
+| `defaultCurrent` | 低于第一级时以及服务停止后的上限。 |
+| `interval`、`refreshPolls` | 轮询周期（5 秒）和未变化上限的重写周期（12 次轮询）。 |
+
+某一级从其 trip 温度开始生效，直到温度低于其 clear 温度。没有可读传感器时使用最后
+（最低）一级上限。可用 `journalctl -b -u charge-thermal-limit` 检查；依赖它之前，
+先在充电时对比 `current_now` 与上限。
+
+
+## 电池养护充电区间
+
+`androidDevices.charging.window` 在插电时让电池保持在部分电量：充到上限后停止充电，低于下限
+时恢复充电，期间设备由充电器供电。它使用电池标准的 `charge_control_start_threshold` 与
+`charge_control_end_threshold`，由充电驱动执行。该策略默认关闭；T880 模块提供电池路径和
+75/80 % 示例：
+
+| 选项 | 含义 |
+| --- | --- |
+| `enable` | 运行 `charge-window.service`。 |
+| `battery` | 电池的 power_supply 目录。 |
+| `startThreshold`、`endThreshold` | 低于下限恢复充电、达到上限停止（默认 75 与 80 %）。 |
+| `requestGroup` | 可请求一次性充满的用户组（默认 `users`）。 |
+
+需要充满时（例如出行前）创建 `/run/charge-window/full-charge`（示例会话中为
+`nexusctl battery full-charge`）。区间暂时取消，直到充电器报告充满或拔下充电器后恢复。
+`/run/charge-window/state` 为 `window START END`、`full-charge` 或 `off`。停止该服务会取消区间（0/100 %）。
 
 ## 选择构建产物
 
@@ -238,7 +355,7 @@ ssh root@172.16.42.1 systemctl reboot
 | 问题 | 检查方法 |
 | --- | --- |
 | 未知 `androidDevices.*` 选项 | 使用 `mkSystem` 或导入设备模块；新选项需要更新锁定的输入版本 |
-| 未设置 USB serial | 在共享设备配置中填写 `androidDevices.usbSerial` |
+| 同型号多台设备的 USB serial 和 MAC 相同 | 为每台设备设置不同的 `androidDevices.usbSerial` |
 | 其他设备构建 rootfs 缺少 UUID | 设置 `androidDevices.persistentImage.rootfs.uuid` |
 | 启动后没有桌面 | 设备模块不启动桌面；在自己的配置中设置并启动所选会话 |
 | USB 可见但 SSH 失败 | 检查电脑 DHCP/地址、公钥及 `journalctl -u sshd -u usb-signaller`；见 USB 指南 |

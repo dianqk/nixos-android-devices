@@ -1,0 +1,101 @@
+From b4dd293f0446623d973eb0dc0b9894b626c5dcea Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 22:48:13 +0800
+Subject: [PATCH] regulator: qcom-rpmh: support the FTSMPS525 upper range
+
+The existing PM8550VE SMPS3 assignment uses FTSMPS525, whose Linux hardware data describes both 300000..1368000 uV in 4000 uV steps and 1376000..2736000 uV in 8000 uV steps. Omitting the second range rejects the documented 1856000 uV Dodge S3G setting.
+
+Add the optional upper range without changing other provider tables. Respect each range selector offset in voltage selection and read validation, including the gap and upper bound. This is a local U-Boot adaptation of the pinned Linux hardware data.
+
+Link: https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/drivers/regulator/qcom-rpmh-regulator.c#L1038-L1048
+---
+ drivers/power/regulator/qcom-rpmh-regulator.c | 35 ++++++++++++++-----
+ 1 file changed, 26 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/power/regulator/qcom-rpmh-regulator.c b/drivers/power/regulator/qcom-rpmh-regulator.c
+index a3a6009d..99ac7e59 100644
+--- a/drivers/power/regulator/qcom-rpmh-regulator.c
++++ b/drivers/power/regulator/qcom-rpmh-regulator.c
+@@ -107,8 +107,9 @@ struct linear_range {
+  * @regulator_type:		RPMh accelerator type used to manage this
+  *				regulator
+  * @ops:			Pointer to regulator ops callback structure
+- * @voltage_range:		The single range of voltages supported by this
++ * @voltage_range:		The lower range of voltages supported by this
+  *				PMIC regulator type
++ * @voltage_range_hi:		Optional upper voltage range
+  * @n_voltages:			The number of unique voltage set points defined
+  *				by voltage_range
+  * @hpm_min_load_uA:		Minimum load current in microamps that requires
+@@ -125,6 +126,7 @@ struct rpmh_vreg_hw_data {
+ 	enum rpmh_regulator_type		regulator_type;
+ 	const struct dm_regulator_ops		*ops;
+ 	struct linear_range			voltage_range;
++	struct linear_range			voltage_range_hi;
+ 	int					n_voltages;
+ 	int					hpm_min_load_uA;
+ 	struct dm_regulator_mode		*pmic_mode_map;
+@@ -224,7 +226,8 @@ static int rpmh_regulator_vrm_get_voltage(struct udevice *rdev, int *uV)
+ 	};
+ 	const struct linear_range *uv_range = &vreg->hw_data->voltage_range;
+ 	int min_uV = uv_range->min;
+-	int max_uV = uv_range->min + uv_range->max_sel * uv_range->step;
++	int max_uV = uv_range->min +
++		(uv_range->max_sel - uv_range->min_sel) * uv_range->step;
+ 
+ 	int ret, _uV = 0;
+ 
+@@ -234,6 +237,13 @@ static int rpmh_regulator_vrm_get_voltage(struct udevice *rdev, int *uV)
+ 	else
+ 		dev_err(vreg->dev, "failed to read VOLTAGE ret = %d\n", ret);
+ 
++	if (_uV > max_uV && vreg->hw_data->voltage_range_hi.step) {
++		uv_range = &vreg->hw_data->voltage_range_hi;
++		min_uV = uv_range->min;
++		max_uV = uv_range->min +
++			(uv_range->max_sel - uv_range->min_sel) * uv_range->step;
++	}
++
+ 	if (!_uV || (_uV >= min_uV && _uV <= max_uV))
+ 		*uV = _uV;
+ 	else {
+@@ -254,17 +264,23 @@ static int _rpmh_regulator_vrm_set_value(struct udevice *rdev,
+ 	};
+ 	struct dm_regulator_uclass_plat *plat = dev_get_uclass_plat(rdev);
+ 	int ret;
++	const struct linear_range *range = &vreg->hw_data->voltage_range;
+ 	unsigned int selector;
++	unsigned int range_max;
+ 
+-	if (uv < vreg->hw_data->voltage_range.min)
++	if (uv < 0 || uv < range->min)
+ 		return -EINVAL;
++	range_max = range->min + (range->max_sel - range->min_sel) * range->step;
++	if (uv > range_max && vreg->hw_data->voltage_range_hi.step) {
++		range = &vreg->hw_data->voltage_range_hi;
++		uv = max(uv, (int)range->min);
++	}
+ 
+-	selector = DIV_ROUND_UP(uv - vreg->hw_data->voltage_range.min,
+-				vreg->hw_data->voltage_range.step);
+-	if (selector >= vreg->hw_data->n_voltages)
++	selector = range->min_sel + DIV_ROUND_UP(uv - range->min, range->step);
++	if (selector > range->max_sel || selector >= vreg->hw_data->n_voltages)
+ 		return -EINVAL;
+-	cmd.data = DIV_ROUND_UP(vreg->hw_data->voltage_range.min +
+-				selector * vreg->hw_data->voltage_range.step, 1000);
++	cmd.data = DIV_ROUND_UP(range->min +
++				(selector - range->min_sel) * range->step, 1000);
+ 
+ 	/* Quantization must not exceed the board's upper voltage constraint. */
+ 	if (plat->max_uV > 0 && cmd.data * 1000 > plat->max_uV)
+@@ -581,7 +597,8 @@ static const struct rpmh_vreg_hw_data pmic5_ftsmps525_lv = {
+ 	.regulator_type = VRM,
+ 	.ops = &rpmh_regulator_vrm_drms_ops,
+ 	.voltage_range = REGULATOR_LINEAR_RANGE(300000, 0, 267, 4000),
+-	.n_voltages = 268,
++	.voltage_range_hi = REGULATOR_LINEAR_RANGE(1376000, 268, 438, 8000),
++	.n_voltages = 439,
+ 	.pmic_mode_map = pmic_mode_map_pmic5_smps,
+ 	.n_modes = ARRAY_SIZE(pmic_mode_map_pmic5_smps),
+ };

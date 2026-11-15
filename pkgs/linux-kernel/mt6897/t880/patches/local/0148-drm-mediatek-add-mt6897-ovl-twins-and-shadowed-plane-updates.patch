@@ -1,0 +1,469 @@
+From 17d61f0a5b82e8bab5b32dc95385738a2c100bb5 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] drm/mediatek: add MT6897 OVL twins and shadowed plane updates
+
+Support MT6897 OVL_2L and its twin, runtime ownership and shared DMA
+reservation. Preserve EN state while clearing shadow bypass so plane
+geometry updates latch together at SOF.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T14:13:46+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T04:46:11+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T07:05:07+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T08:40:58+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T17:01:59+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-06T07:34:55+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Link: https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/iommu/mtk_iommu.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_disp_ovl.c
+---
+ drivers/gpu/drm/mediatek/mtk_disp_ovl.c | 271 ++++++++++++++++++++++--
+ 1 file changed, 258 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_ovl.c b/drivers/gpu/drm/mediatek/mtk_disp_ovl.c
+index b2d7e148ae..18cca834ac 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_ovl.c
++++ b/drivers/gpu/drm/mediatek/mtk_disp_ovl.c
+@@ -8,8 +8,10 @@
+ 
+ #include <linux/clk.h>
+ #include <linux/component.h>
++#include <linux/dma-mapping.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/soc/mediatek/mtk-cmdq.h>
+@@ -24,6 +26,7 @@
+ #define OVL_FME_CPL_INT					BIT(1)
+ #define DISP_REG_OVL_INTSTA			0x0008
+ #define DISP_REG_OVL_EN				0x000c
++#  define OVL_EN_BYPASS_SHADOW			BIT(22)
+ #define DISP_REG_OVL_RST			0x0014
+ #define DISP_REG_OVL_ROI_SIZE			0x0020
+ #define DISP_REG_OVL_DATAPATH_CON		0x0024
+@@ -49,6 +52,8 @@
+ #define OVL_CON_CLRFMT_10_BIT				(1)
+ #define DISP_REG_OVL_ADDR_MT8173		0x0f40
+ #define DISP_REG_OVL_ADDR(ovl, n)		((ovl)->data->addr + 0x20 * (n))
++#define DISP_REG_OVL_ADDR_MSB(n)		(0x0f4c + 0x20 * (n))
++#define OVL_ADDR_MSB_MASK			GENMASK(3, 0)
+ #define DISP_REG_OVL_HDR_ADDR(ovl, n)		((ovl)->data->addr + 0x20 * (n) + 0x04)
+ #define DISP_REG_OVL_HDR_PITCH(ovl, n)		((ovl)->data->addr + 0x20 * (n) + 0x08)
+ 
+@@ -133,6 +138,13 @@ struct mtk_disp_ovl_data {
+ 	const u32 *formats;
+ 	size_t num_formats;
+ 	bool supports_clrfmt_ext;
++	/** @addr_msb: buffer addresses above 4 GiB, bits 35:32 in ADDR_MSB */
++	bool addr_msb;
++	/**
++	 * @en_keep: preserve the undocumented EN bits, enable the engine,
++	 * and clear shadow bypass so plane updates latch together at SOF.
++	 */
++	bool en_keep;
+ };
+ 
+ /*
+@@ -148,8 +160,34 @@ struct mtk_disp_ovl {
+ 	const struct mtk_disp_ovl_data	*data;
+ 	void				(*vblank_cb)(void *data);
+ 	void				*vblank_cb_data;
++	/*
++	 * Dual pipe: the OVL of the other pipe, which composes the right half
++	 * of the screen. The left OVL owns it and forwards every operation,
++	 * so the CRTC sees one OVL with a full-width ROI.
++	 */
++	struct device_node		*twin_np;
++	struct device			*twin;
++	unsigned int			half_w;
+ };
+ 
++static struct mtk_disp_ovl *mtk_ovl_twin(struct mtk_disp_ovl *ovl)
++{
++	struct platform_device *pdev;
++
++	if (!ovl->twin_np)
++		return NULL;
++
++	if (!ovl->twin) {
++		pdev = of_find_device_by_node(ovl->twin_np);
++		if (!pdev)
++			return NULL;
++		/* The reference is dropped in remove */
++		ovl->twin = &pdev->dev;
++	}
++
++	return dev_get_drvdata(ovl->twin);
++}
++
+ bool mtk_ovl_is_10bit_rgb(unsigned int fmt)
+ {
+ 	switch (fmt) {
+@@ -259,23 +297,99 @@ bool mtk_ovl_is_afbc_supported(struct device *dev)
+ 	return ovl->data->supports_afbc;
+ }
+ 
++/*
++ * An OVL fetches memory while its CRTC is on, so it must be runtime-active
++ * itself, not only clocked: with an IOMMU its device links to the larbs keep
++ * the larbs (and through them the SMI common and the IOMMU) running. Every
++ * OVL of an enabled path takes this reference, including the blend-chain
++ * OVLs after the first one and the dual-pipe twin.
++ */
+ int mtk_ovl_clk_enable(struct mtk_ddp_comp *comp)
+ {
+ 	struct mtk_disp_ovl *ovl = dev_get_drvdata(comp->dev);
++	struct mtk_disp_ovl *twin = mtk_ovl_twin(ovl);
++	int ret;
+ 
+-	return clk_prepare_enable(ovl->clk);
++	ret = pm_runtime_resume_and_get(comp->dev);
++	if (ret)
++		return ret;
++
++	ret = clk_prepare_enable(ovl->clk);
++	if (ret)
++		goto err_put;
++
++	if (!ovl->twin_np)
++		return 0;
++
++	if (!twin) {
++		ret = -EPROBE_DEFER;
++		goto err;
++	}
++
++	ret = pm_runtime_resume_and_get(ovl->twin);
++	if (ret)
++		goto err;
++
++	ret = clk_prepare_enable(twin->clk);
++	if (ret) {
++		pm_runtime_put(ovl->twin);
++		goto err;
++	}
++
++	return 0;
++err:
++	clk_disable_unprepare(ovl->clk);
++err_put:
++	pm_runtime_put(comp->dev);
++	return ret;
+ }
+ 
+ void mtk_ovl_clk_disable(struct mtk_ddp_comp *comp)
+ {
+ 	struct mtk_disp_ovl *ovl = dev_get_drvdata(comp->dev);
++	struct mtk_disp_ovl *twin = mtk_ovl_twin(ovl);
+ 
++	if (twin) {
++		clk_disable_unprepare(twin->clk);
++		pm_runtime_put(ovl->twin);
++	}
+ 	clk_disable_unprepare(ovl->clk);
++	pm_runtime_put(comp->dev);
++}
++
++/* The other pipe's OVL in a dual-pipe setup, if any */
++struct device *mtk_ovl_get_twin(struct device *dev)
++{
++	struct mtk_disp_ovl *ovl = dev_get_drvdata(dev);
++
++	return mtk_ovl_twin(ovl) ? ovl->twin : NULL;
+ }
+ 
++static void mtk_ovl_start_one(struct mtk_disp_ovl *ovl);
++static void mtk_ovl_stop_one(struct mtk_disp_ovl *ovl);
++
+ void mtk_ovl_start(struct device *dev)
+ {
+ 	struct mtk_disp_ovl *ovl = dev_get_drvdata(dev);
++	struct mtk_disp_ovl *twin = mtk_ovl_twin(ovl);
++
++	mtk_ovl_start_one(ovl);
++	if (twin)
++		mtk_ovl_start_one(twin);
++}
++
++void mtk_ovl_stop(struct device *dev)
++{
++	struct mtk_disp_ovl *ovl = dev_get_drvdata(dev);
++	struct mtk_disp_ovl *twin = mtk_ovl_twin(ovl);
++
++	if (twin)
++		mtk_ovl_stop_one(twin);
++	mtk_ovl_stop_one(ovl);
++}
++
++static void mtk_ovl_start_one(struct mtk_disp_ovl *ovl)
++{
+ 
+ 	if (ovl->data->smi_id_en) {
+ 		unsigned int reg;
+@@ -284,14 +398,21 @@ void mtk_ovl_start(struct device *dev)
+ 		reg = reg | OVL_LAYER_SMI_ID_EN;
+ 		writel_relaxed(reg, ovl->regs + DISP_REG_OVL_DATAPATH_CON);
+ 	}
+-	writel_relaxed(0x1, ovl->regs + DISP_REG_OVL_EN);
++	if (ovl->data->en_keep)
++		writel_relaxed((readl(ovl->regs + DISP_REG_OVL_EN) &
++				~OVL_EN_BYPASS_SHADOW) | 0x1,
++			       ovl->regs + DISP_REG_OVL_EN);
++	else
++		writel_relaxed(0x1, ovl->regs + DISP_REG_OVL_EN);
+ }
+ 
+-void mtk_ovl_stop(struct device *dev)
++static void mtk_ovl_stop_one(struct mtk_disp_ovl *ovl)
+ {
+-	struct mtk_disp_ovl *ovl = dev_get_drvdata(dev);
+-
+-	writel_relaxed(0x0, ovl->regs + DISP_REG_OVL_EN);
++	if (ovl->data->en_keep)
++		writel_relaxed(readl(ovl->regs + DISP_REG_OVL_EN) & ~0x1,
++			       ovl->regs + DISP_REG_OVL_EN);
++	else
++		writel_relaxed(0x0, ovl->regs + DISP_REG_OVL_EN);
+ 	if (ovl->data->smi_id_en) {
+ 		unsigned int reg;
+ 
+@@ -326,11 +447,30 @@ static void mtk_ovl_set_bit_depth(struct device *dev, int idx, u32 format,
+ 			   OVL_CON_CLRFMT_BIT_DEPTH_MASK(idx));
+ }
+ 
++static void mtk_ovl_config_one(struct mtk_disp_ovl *ovl, unsigned int w,
++			       unsigned int h, struct cmdq_pkt *cmdq_pkt);
++
+ void mtk_ovl_config(struct mtk_ddp_comp *comp, unsigned int w,
+ 		    unsigned int h, unsigned int vrefresh,
+ 		    unsigned int bpc, struct cmdq_pkt *cmdq_pkt)
+ {
+ 	struct mtk_disp_ovl *ovl = dev_get_drvdata(comp->dev);
++	struct mtk_disp_ovl *twin = mtk_ovl_twin(ovl);
++
++	if (!twin) {
++		mtk_ovl_config_one(ovl, w, h, cmdq_pkt);
++		return;
++	}
++
++	/* Each pipe composes one half of the screen */
++	ovl->half_w = w / 2;
++	mtk_ovl_config_one(ovl, ovl->half_w, h, cmdq_pkt);
++	mtk_ovl_config_one(twin, w - ovl->half_w, h, cmdq_pkt);
++}
++
++static void mtk_ovl_config_one(struct mtk_disp_ovl *ovl, unsigned int w,
++			       unsigned int h, struct cmdq_pkt *cmdq_pkt)
++{
+ 
+ 	if (w != 0 && h != 0)
+ 		mtk_ddp_write_relaxed(cmdq_pkt, h << 16 | w, &ovl->cmdq_reg, ovl->regs,
+@@ -366,6 +506,12 @@ unsigned int mtk_ovl_layer_nr(struct device *dev, int pipeline_index)
+ 
+ unsigned int mtk_ovl_supported_rotations(struct device *dev)
+ {
++	struct mtk_disp_ovl *ovl = dev_get_drvdata(dev);
++
++	/* A horizontal flip would have to swap the halves between the pipes */
++	if (ovl->twin_np)
++		return DRM_MODE_ROTATE_0 | DRM_MODE_REFLECT_Y;
++
+ 	return DRM_MODE_ROTATE_0 | DRM_MODE_ROTATE_180 |
+ 	       DRM_MODE_REFLECT_X | DRM_MODE_REFLECT_Y;
+ }
+@@ -566,9 +712,65 @@ static void mtk_ovl_afbc_layer_config(struct mtk_disp_ovl *ovl,
+ 	}
+ }
+ 
++static void mtk_ovl_layer_config_one(struct device *dev, unsigned int idx,
++				     struct mtk_plane_state *state,
++				     struct cmdq_pkt *cmdq_pkt);
++
++/*
++ * Dual pipe: clip the layer to each half of the screen. The left OVL takes
++ * [0, half_w), the right OVL [half_w, width) shifted to its own origin.
++ */
+ void mtk_ovl_layer_config(struct device *dev, unsigned int idx,
+ 			  struct mtk_plane_state *state,
+ 			  struct cmdq_pkt *cmdq_pkt)
++{
++	struct mtk_disp_ovl *ovl = dev_get_drvdata(dev);
++	struct mtk_disp_ovl *twin = mtk_ovl_twin(ovl);
++	struct mtk_plane_pending_state *p = &state->pending;
++	struct mtk_plane_state half;
++	unsigned int cpp, x0, x1, half_w = ovl->half_w;
++
++	if (!twin) {
++		mtk_ovl_layer_config_one(dev, idx, state, cmdq_pkt);
++		return;
++	}
++
++	if (!p->enable || !p->width || !p->height || !state->base.fb) {
++		mtk_ovl_layer_config_one(dev, idx, state, cmdq_pkt);
++		mtk_ovl_layer_config_one(ovl->twin, idx, state, cmdq_pkt);
++		return;
++	}
++
++	cpp = state->base.fb->format->cpp[0];
++	x0 = p->x;
++	x1 = p->x + p->width;
++
++	/* Left half */
++	half = *state;
++	if (x0 >= half_w) {
++		half.pending.enable = false;
++	} else {
++		half.pending.width = min(x1, half_w) - x0;
++	}
++	mtk_ovl_layer_config_one(dev, idx, &half, cmdq_pkt);
++
++	/* Right half */
++	half = *state;
++	if (x1 <= half_w) {
++		half.pending.enable = false;
++	} else if (x0 < half_w) {
++		half.pending.x = 0;
++		half.pending.width = x1 - half_w;
++		half.pending.addr += (dma_addr_t)(half_w - x0) * cpp;
++	} else {
++		half.pending.x = x0 - half_w;
++	}
++	mtk_ovl_layer_config_one(ovl->twin, idx, &half, cmdq_pkt);
++}
++
++static void mtk_ovl_layer_config_one(struct device *dev, unsigned int idx,
++				     struct mtk_plane_state *state,
++				     struct cmdq_pkt *cmdq_pkt)
+ {
+ 	struct mtk_disp_ovl *ovl = dev_get_drvdata(dev);
+ 	struct mtk_plane_pending_state *pending = &state->pending;
+@@ -636,6 +838,10 @@ void mtk_ovl_layer_config(struct device *dev, unsigned int idx,
+ 			      DISP_REG_OVL_OFFSET(idx));
+ 	mtk_ddp_write_relaxed(cmdq_pkt, addr, &ovl->cmdq_reg, ovl->regs,
+ 			      DISP_REG_OVL_ADDR(ovl, idx));
++	if (ovl->data->addr_msb)
++		mtk_ddp_write_mask(cmdq_pkt, upper_32_bits(pending->addr),
++				   &ovl->cmdq_reg, ovl->regs,
++				   DISP_REG_OVL_ADDR_MSB(idx), OVL_ADDR_MSB_MASK);
+ 
+ 	if (ovl->data->supports_afbc)
+ 		mtk_ovl_afbc_layer_config(ovl, idx, pending, cmdq_pkt);
+@@ -644,24 +850,36 @@ void mtk_ovl_layer_config(struct device *dev, unsigned int idx,
+ 	mtk_ovl_layer_on(dev, idx, cmdq_pkt);
+ }
+ 
+-void mtk_ovl_bgclr_in_on(struct device *dev)
++static void mtk_ovl_bgclr_in_set(struct mtk_disp_ovl *ovl, bool on)
+ {
+-	struct mtk_disp_ovl *ovl = dev_get_drvdata(dev);
+ 	unsigned int reg;
+ 
+ 	reg = readl(ovl->regs + DISP_REG_OVL_DATAPATH_CON);
+-	reg = reg | OVL_BGCLR_SEL_IN;
++	if (on)
++		reg |= OVL_BGCLR_SEL_IN;
++	else
++		reg &= ~OVL_BGCLR_SEL_IN;
+ 	writel(reg, ovl->regs + DISP_REG_OVL_DATAPATH_CON);
+ }
+ 
++void mtk_ovl_bgclr_in_on(struct device *dev)
++{
++	struct mtk_disp_ovl *ovl = dev_get_drvdata(dev);
++	struct mtk_disp_ovl *twin = mtk_ovl_twin(ovl);
++
++	mtk_ovl_bgclr_in_set(ovl, true);
++	if (twin)
++		mtk_ovl_bgclr_in_set(twin, true);
++}
++
+ void mtk_ovl_bgclr_in_off(struct device *dev)
+ {
+ 	struct mtk_disp_ovl *ovl = dev_get_drvdata(dev);
+-	unsigned int reg;
++	struct mtk_disp_ovl *twin = mtk_ovl_twin(ovl);
+ 
+-	reg = readl(ovl->regs + DISP_REG_OVL_DATAPATH_CON);
+-	reg = reg & ~OVL_BGCLR_SEL_IN;
+-	writel(reg, ovl->regs + DISP_REG_OVL_DATAPATH_CON);
++	if (twin)
++		mtk_ovl_bgclr_in_set(twin, false);
++	mtk_ovl_bgclr_in_set(ovl, false);
+ }
+ 
+ static int mtk_disp_ovl_bind(struct device *dev, struct device *master,
+@@ -711,8 +929,15 @@ static int mtk_disp_ovl_probe(struct platform_device *pdev)
+ #endif
+ 
+ 	priv->data = of_device_get_match_data(dev);
++	priv->twin_np = of_parse_phandle(dev->of_node, "mediatek,dual-pipe-twin", 0);
+ 	platform_set_drvdata(pdev, priv);
+ 
++	if (priv->data->addr_msb) {
++		ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(34));
++		if (ret)
++			return dev_err_probe(dev, ret, "Failed to set the DMA mask\n");
++	}
++
+ 	ret = devm_request_irq(dev, irq, mtk_disp_ovl_irq_handler,
+ 			       IRQF_TRIGGER_NONE, dev_name(dev), priv);
+ 	if (ret < 0)
+@@ -731,6 +956,11 @@ static int mtk_disp_ovl_probe(struct platform_device *pdev)
+ 
+ static void mtk_disp_ovl_remove(struct platform_device *pdev)
+ {
++	struct mtk_disp_ovl *ovl = platform_get_drvdata(pdev);
++
++	if (ovl->twin)
++		put_device(ovl->twin);
++	of_node_put(ovl->twin_np);
+ 	component_del(&pdev->dev, &mtk_disp_ovl_component_ops);
+ 	pm_runtime_disable(&pdev->dev);
+ }
+@@ -803,6 +1033,19 @@ static const struct mtk_disp_ovl_data mt8192_ovl_2l_driver_data = {
+ 	.num_formats = mt8173_ovl_formats_len,
+ };
+ 
++static const struct mtk_disp_ovl_data mt6897_ovl_2l_driver_data = {
++	.addr = DISP_REG_OVL_ADDR_MT8173,
++	.gmc_bits = 10,
++	.layer_nr = 2,
++	.fmt_rgb565_is_0 = true,
++	.smi_id_en = true,
++	.blend_modes = MTK_OVL_SUPPORT_BLEND_MODES,
++	.formats = mt8173_ovl_formats,
++	.num_formats = mt8173_ovl_formats_len,
++	.addr_msb = true,
++	.en_keep = true,
++};
++
+ static const struct mtk_disp_ovl_data mt8195_ovl_driver_data = {
+ 	.addr = DISP_REG_OVL_ADDR_MT8173,
+ 	.gmc_bits = 10,
+@@ -829,6 +1072,8 @@ static const struct of_device_id mtk_disp_ovl_driver_dt_match[] = {
+ 	  .data = &mt8183_ovl_2l_driver_data},
+ 	{ .compatible = "mediatek,mt8192-disp-ovl",
+ 	  .data = &mt8192_ovl_driver_data},
++	{ .compatible = "mediatek,mt6897-disp-ovl-2l",
++	  .data = &mt6897_ovl_2l_driver_data},
+ 	{ .compatible = "mediatek,mt8192-disp-ovl-2l",
+ 	  .data = &mt8192_ovl_2l_driver_data},
+ 	{ .compatible = "mediatek,mt8195-disp-ovl",
+-- 
+2.56.0
+

@@ -9,7 +9,6 @@ Enable SSH and configure your public key:
 
 ```nix
 {
-  androidDevices.usbSerial = "my-phone-01";
   androidDevices.usb.ssh.enable = true;
   users.users.root.openssh.authorizedKeys.keys = [
     "ssh-ed25519 REPLACE_WITH_YOUR_PUBLIC_KEY"
@@ -79,7 +78,7 @@ Set `androidDevices.usb.acm.enable = true;` to expose an ACM serial login
 console alongside NCM in developer mode. It defaults to `false`; the public
 USB examples enable it explicitly. The kernel must include `USB_CONFIGFS_ACM`.
 Connect using the device's serial-number link under `/dev/serial/by-id/` on the
-host. When the gadget port appears, `serial-getty@ttyGS0` starts a background
+host. After configuring ACM, usb-signaller starts `serial-getty@ttyGS0` as a background
 waiter. It reads the selected controller's state without opening or resetting
 the TTY, and runs getty once USB enumeration reaches `configured`. This means
 USB is configured, not necessarily that a host application has opened the
@@ -127,7 +126,9 @@ this backend deliberately does not add networking to the normal initrd.
 ## Modes and peripherals
 
 The supported modes are `developer_mode`, `charging_only`, and
-`host_mode`. MTP, tethering and mass storage are not advertised because their
+`host_mode`. Devices whose Type-C port manager owns the USB data role (the
+T880) set `androidDevices.usb.signaller.hostMode = false`; there host mode
+follows the attached partner and PD data-role swaps instead. MTP, tethering and mass storage are not advertised because their
 supporting services and policy are not configured here. USB role changes are
 root-only by default; ordinary users may query the daemon over the system bus.
 
@@ -175,3 +176,17 @@ not implemented. Driver configuration alone is not a physical peripheral test.
 
 
 Package patches and upstream details are documented [with the package](../pkgs/usb-signaller/README.md).
+
+When a Type-C port manager owns data-role selection, set
+`androidDevices.usb.signaller.manageRole = false` and
+`androidDevices.usb.signaller.hostMode = false`. T880 uses these defaults.
+Developer and charging modes configure the gadget without changing an existing
+`host`, `device` or `none` role, including at service startup. The gadget is
+ready when the port manager subsequently selects device role; selecting host
+role through the signaller is unavailable.
+
+The daemon synchronously stops the ACM console before switching roles or
+reconfiguring gadgets, including charging-only changes over D-Bus and service
+shutdown. A stop failure aborts the change. Developer mode queues the console
+start after successful gadget setup; it does not wait for a USB client.
+Systemd also orders console shutdown before usb-signaller during stop/restart.

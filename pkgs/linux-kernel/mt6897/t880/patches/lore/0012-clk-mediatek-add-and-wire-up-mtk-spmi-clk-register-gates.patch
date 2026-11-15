@@ -1,0 +1,84 @@
+From c1089ed151c7faf2943ca66453089636d74afdd6 Mon Sep 17 00:00:00 2001
+From: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Date: Mon, 27 Oct 2025 12:13:40 +0100
+Subject: [PATCH] clk: mediatek: Add and wire up mtk_spmi_clk_register_gates()
+
+In preparation for adding means to register SPMI clock controllers
+add a new mtk_spmi_clk_register_gates() function and wire it up to
+mtk_clk_simple_probe_internal().
+
+Signed-off-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Link: https://patch.msgid.link/20251027111343.21723-5-angelogioacchino.delregno@collabora.com
+---
+ drivers/clk/mediatek/clk-gate.c | 10 ++++++++++
+ drivers/clk/mediatek/clk-gate.h |  6 ++++++
+ drivers/clk/mediatek/clk-mtk.c  |  8 ++++++--
+ 3 files changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/clk/mediatek/clk-gate.c b/drivers/clk/mediatek/clk-gate.c
+index f230bf3d5d..cbf8968303 100644
+--- a/drivers/clk/mediatek/clk-gate.c
++++ b/drivers/clk/mediatek/clk-gate.c
+@@ -319,6 +319,16 @@ int mtk_clk_register_gates(struct device *dev, struct device_node *node,
+ }
+ EXPORT_SYMBOL_GPL(mtk_clk_register_gates);
+ 
++int mtk_spmi_clk_register_gates(struct device *dev, struct device_node *node,
++				const struct mtk_gate *clks, int num,
++				struct clk_hw_onecell_data *clk_data,
++				struct regmap *regmap)
++{
++	return mtk_clk_register_all_gates(dev, node, regmap, NULL,
++					  clks, num, clk_data);
++}
++EXPORT_SYMBOL_GPL(mtk_spmi_clk_register_gates);
++
+ void mtk_clk_unregister_gates(const struct mtk_gate *clks, int num,
+ 			      struct clk_hw_onecell_data *clk_data)
+ {
+diff --git a/drivers/clk/mediatek/clk-gate.h b/drivers/clk/mediatek/clk-gate.h
+index 4f05b9855d..9242193440 100644
+--- a/drivers/clk/mediatek/clk-gate.h
++++ b/drivers/clk/mediatek/clk-gate.h
+@@ -14,6 +14,7 @@ struct clk_hw_onecell_data;
+ struct clk_ops;
+ struct device;
+ struct device_node;
++struct regmap;
+ 
+ extern const struct clk_ops mtk_clk_gate_ops_setclr;
+ extern const struct clk_ops mtk_clk_gate_ops_setclr_inv;
+@@ -57,6 +58,11 @@ int mtk_clk_register_gates(struct device *dev, struct device_node *node,
+ 			   const struct mtk_gate *clks, int num,
+ 			   struct clk_hw_onecell_data *clk_data);
+ 
++int mtk_spmi_clk_register_gates(struct device *dev, struct device_node *node,
++				const struct mtk_gate *clks, int num,
++				struct clk_hw_onecell_data *clk_data,
++				struct regmap *regmap);
++
+ void mtk_clk_unregister_gates(const struct mtk_gate *clks, int num,
+ 			      struct clk_hw_onecell_data *clk_data);
+ 
+diff --git a/drivers/clk/mediatek/clk-mtk.c b/drivers/clk/mediatek/clk-mtk.c
+index 3295cbb1e7..e003699771 100644
+--- a/drivers/clk/mediatek/clk-mtk.c
++++ b/drivers/clk/mediatek/clk-mtk.c
+@@ -554,8 +554,12 @@ int mtk_clk_simple_probe_internal(struct platform_device *pdev,
+ 	}
+ 
+ 	if (mcd->clks) {
+-		r = mtk_clk_register_gates(&pdev->dev, node, mcd->clks,
+-					   mcd->num_clks, clk_data);
++		if (regmap)
++			r = mtk_spmi_clk_register_gates(&pdev->dev, node, mcd->clks,
++							mcd->num_clks, clk_data, regmap);
++		else
++			r = mtk_clk_register_gates(&pdev->dev, node, mcd->clks,
++						   mcd->num_clks, clk_data);
+ 		if (r)
+ 			goto unregister_dividers;
+ 	}
+-- 
+2.56.0
+

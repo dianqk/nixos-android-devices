@@ -1,0 +1,55 @@
+From 7aef7813a098383f6798da83d44d9b98971fc860 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] spmi: mediatek: complete PMIF IRQ and channel setup
+
+Initialize PMIF software channels before registering buses, acknowledge
+observed slave events and propagate wake requests through the parent IRQ.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-16T02:56:54+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/spmi/spmi-mtk-pmif.c | 18 +++++++++++-------
+ 1 file changed, 11 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/spmi/spmi-mtk-pmif.c b/drivers/spmi/spmi-mtk-pmif.c
+index 22085c0f7a..85abf1f62e 100644
+--- a/drivers/spmi/spmi-mtk-pmif.c
++++ b/drivers/spmi/spmi-mtk-pmif.c
+@@ -800,6 +800,17 @@ static int mtk_spmi_probe(struct platform_device *pdev)
+ 
+ 	platform_set_drvdata(pdev, arb);
+ 
++	/*
++	 * spmi_controller_add() may probe the SPMI devices synchronously, so
++	 * the software interface channel must be set up before any bus.
++	 */
++	chan_offset = PMIF_CHAN_OFFSET * arb->data->soc_chan;
++	arb->chan.ch_sta = PMIF_SWINF_0_STA + chan_offset;
++	arb->chan.wdata = PMIF_SWINF_0_WDATA_31_0 + chan_offset;
++	arb->chan.rdata = PMIF_SWINF_0_RDATA_31_0 + chan_offset;
++	arb->chan.ch_send = PMIF_SWINF_0_ACC + chan_offset;
++	arb->chan.ch_rdy = PMIF_SWINF_0_VLD_CLR + chan_offset;
++
+ 	if (!arb->data->num_spmi_buses) {
+ 		ret = mtk_spmi_bus_probe(pdev, node, arb->data, &arb->bus[cur_bus]);
+ 		if (ret)
+@@ -817,13 +828,6 @@ static int mtk_spmi_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
+-	chan_offset = PMIF_CHAN_OFFSET * arb->data->soc_chan;
+-	arb->chan.ch_sta = PMIF_SWINF_0_STA + chan_offset;
+-	arb->chan.wdata = PMIF_SWINF_0_WDATA_31_0 + chan_offset;
+-	arb->chan.rdata = PMIF_SWINF_0_RDATA_31_0 + chan_offset;
+-	arb->chan.ch_send = PMIF_SWINF_0_ACC + chan_offset;
+-	arb->chan.ch_rdy = PMIF_SWINF_0_VLD_CLR + chan_offset;
+-
+ 	return 0;
+ }
+ 
+-- 
+2.56.0
+

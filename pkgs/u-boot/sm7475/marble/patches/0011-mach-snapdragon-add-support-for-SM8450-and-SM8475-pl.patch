@@ -1,0 +1,128 @@
+From 4df31b5c58a0ebfcef8b1bde5cd074b28c3f4cfb Mon Sep 17 00:00:00 2001
+From: Tatsuki Tanaka <tatsuki@tanakatatsuki.dev>
+Date: Fri, 9 Oct 2026 18:32:59 +0800
+Subject: [PATCH] mach-snapdragon: add support for SM8450 and SM8475 platforms
+
+Add architecture glue for SM8450/SM8475:
+- Memory map and carveout reservations
+- Support preferring previous bootloader (ABL) memory map via
+  CONFIG_QCOM_PREFER_PREVBL_MEMORY for universal 8/12/16 GiB support
+- IOMMU / SMMU compatibles
+- ARM64 image text offset and safe 32-bit memory banks
+
+Signed-off-by: Tatsuki Tanaka <tatsuki@tanakatatsuki.dev>
+(cherry picked from commit 86075d55e27f9efc806d89ac7516a1ed9e6d6135)
+[Conflict, resolved for v2026.10 plus the picked upstream b5e13f6ce and
+ 0b57dc1c9: the SMEM memory map (ed40a06be) and the board_spl.c/mem_map.c
+ split (050621b08) are not present. qcom_parse_memory() keeps its
+ one-argument v2026.10 form, which already returns -ENODATA without a
+ usable /memory node, so the dram.c hunks are dropped. The mem_map.c
+ hunks (framebuffer/splash mapping, SM8450/SM8475 carveout) are applied
+ to the same functions in board.c. The boot0.h/MBN Kconfig context from
+ next is not taken; only QCOM_PREFER_PREVBL_MEMORY is added.]
+---
+ arch/arm/mach-snapdragon/Kconfig | 12 +++++++++++-
+ arch/arm/mach-snapdragon/board.c | 21 +++++++++++++++++++--
+ configs/qcom_defconfig           |  1 +
+ drivers/iommu/qcom-hyp-smmu.c    |  1 +
+ 4 files changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/arch/arm/mach-snapdragon/Kconfig b/arch/arm/mach-snapdragon/Kconfig
+index d3de8693b..87a90f0f0 100644
+--- a/arch/arm/mach-snapdragon/Kconfig
++++ b/arch/arm/mach-snapdragon/Kconfig
+@@ -24,7 +24,7 @@ config SYS_MALLOC_LEN
+ 	default 0x800000
+ 
+ config LNX_KRNL_IMG_TEXT_OFFSET_BASE
+-	default 0x80000000
++	default 0x0
+ 
+ config SYS_BOARD
+ 	string "Snapdragon SoCs based board"
+@@ -42,4 +42,14 @@ config SYS_CONFIG_NAME
+ 	  Based on this option include/configs/<CONFIG_SYS_CONFIG_NAME>.h header
+ 	  will be used for board configuration.
+ 
++config QCOM_PREFER_PREVBL_MEMORY
++	bool "Prefer the memory map from the previous bootloader's DT"
++	help
++	  When U-Boot is chainloaded by ABL with a built-in DT, take the
++	  /memory node from the DT that ABL passes in x0 instead of the one in
++	  the built-in DT. ABL fills it with the banks of the RAM that is
++	  actually fitted, so one U-Boot build works on every RAM variant of a
++	  phone (e.g. 8, 12 and 16 GiB). The built-in /memory node is used as a
++	  fallback when ABL does not provide one.
++
+ endif
+diff --git a/arch/arm/mach-snapdragon/board.c b/arch/arm/mach-snapdragon/board.c
+index 9a1124e73..56af5f02c 100644
+--- a/arch/arm/mach-snapdragon/board.c
++++ b/arch/arm/mach-snapdragon/board.c
+@@ -108,8 +108,18 @@ int board_fdt_blob_setup(void **fdtp)
+ 		panic("Internal FDT is invalid and no external FDT was provided! (fdt=%#llx)\n",
+ 		      (phys_addr_t)external_fdt);
+ 
++	/*
++	 * ABL fills /memory in the DT it passes with the RAM actually fitted;
++	 * boards with several RAM variants can opt in to use it first.
++	 */
++	if (IS_ENABLED(CONFIG_QCOM_PREFER_PREVBL_MEMORY) && external_valid) {
++		ret = qcom_parse_memory(external_fdt);
++		if (ret < 0)
++			debug("No memory info in external FDT, falling back to internal\n");
++	}
++
+ 	/* Prefer memory information from internal DT if it's present */
+-	if (internal_valid)
++	if (ret < 0 && internal_valid)
+ 		ret = qcom_parse_memory(internal_fdt);
+ 
+ 	if (ret < 0 && external_valid) {
+@@ -558,6 +568,11 @@ static void configure_reserved_memory(void)
+ 		if (fdt_getprop(gd->fdt_blob, rmem, "compatible", NULL))
+ 			attrs = PTE_TYPE_VALID | PTE_BLOCK_MEMTYPE(MT_NORMAL);
+ 
++		/* Never fault display framebuffer or splash memory */
++		const char *node_name = fdt_get_name(gd->fdt_blob, rmem, NULL);
++		if (node_name && (strstr(node_name, "framebuffer") || strstr(node_name, "splash")))
++			attrs = PTE_TYPE_VALID | PTE_BLOCK_MEMTYPE(MT_NORMAL);
++
+ 		if (i == N_RESERVED_REGIONS) {
+ 			log_err("Too many reserved regions!\n");
+ 			break;
+@@ -651,7 +666,9 @@ void enable_caches(void)
+ 
+ 	/* On some boards speculative access may trigger a NOC or XPU violation so explicitly mark reserved
+ 	 * regions as inacessible (PTE_TYPE_FAULT) */
+-	if (fdt_node_check_compatible(gd->fdt_blob, 0, "qcom,qcs404") == 0) {
++	if (fdt_node_check_compatible(gd->fdt_blob, 0, "qcom,qcs404") == 0 ||
++	    fdt_node_check_compatible(gd->fdt_blob, 0, "qcom,sm8450") == 0 ||
++	    fdt_node_check_compatible(gd->fdt_blob, 0, "qcom,sm8475") == 0) {
+ 		carveout_start = get_timer(0);
+ 		/* Takes ~20-50ms on SDM845 */
+ 		configure_reserved_memory();
+diff --git a/configs/qcom_defconfig b/configs/qcom_defconfig
+index c52f61985..67c8f3966 100644
+--- a/configs/qcom_defconfig
++++ b/configs/qcom_defconfig
+@@ -71,6 +71,7 @@ CONFIG_CLK_QCOM_SM6350=y
+ CONFIG_CLK_QCOM_SM7150=y
+ CONFIG_CLK_QCOM_SM8150=y
+ CONFIG_CLK_QCOM_SM8250=y
++CONFIG_CLK_QCOM_SM8450=y
+ CONFIG_CLK_QCOM_SM8550=y
+ CONFIG_CLK_QCOM_SM8650=y
+ CONFIG_CLK_QCOM_SC7280=y
+diff --git a/drivers/iommu/qcom-hyp-smmu.c b/drivers/iommu/qcom-hyp-smmu.c
+index 5b37c21f6..50f98ee90 100644
+--- a/drivers/iommu/qcom-hyp-smmu.c
++++ b/drivers/iommu/qcom-hyp-smmu.c
+@@ -392,6 +392,7 @@ static const struct udevice_id qcom_smmu500_ids[] = {
+ 	{ .compatible = "qcom,sc7280-smmu-500" },
+ 	{ .compatible = "qcom,sdm845-smmu-500" },
+ 	{ .compatible = "qcom,sm6350-smmu-500" },
++	{ .compatible = "qcom,sm8450-smmu-500" },
+ 	{ .compatible = "qcom,smmu-500", },
+ 	{ /* sentinel */ }
+ };

@@ -1,0 +1,170 @@
+From bbcd8a038c074117b04d4644fa0f61cf04528b8a Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 31 Oct 2026 20:22:54 +0800
+Subject: [PATCH] soc: qcom: cpr3: Undo a failed or removed CPU attachment
+
+The first device attached to a thread sets up its corners and, on CPRh,
+an OPP table for it. When the attach callback fails after that point, or
+when the device is removed again, the thread keeps pointing to the
+device and its OPP table stays registered for a device that is about to
+be freed:
+
+- A later attachment of another CPU of the cluster returns early
+  because the thread looks attached, and the caller finds no CPR data.
+- A new virtual device allocated at the same address is taken for a
+  member of the stale OPP table, so its voltages cannot be adjusted.
+
+Undo the attachment completely on every error path of the attach
+callback and in the detach callback: remove the OPP table that was
+added, free the corners and clear the device data, so a retry starts
+from scratch.
+
+Scope: SDM630/660 common
+Porting notes: Local fix for the CPR3 driver (not upstream).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/pmdomain/qcom/cpr3.c | 71 ++++++++++++++++++++++++++----------
+ 1 file changed, 51 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/pmdomain/qcom/cpr3.c b/drivers/pmdomain/qcom/cpr3.c
+index 65e0be9b42..b5fb6c0a67 100644
+--- a/drivers/pmdomain/qcom/cpr3.c
++++ b/drivers/pmdomain/qcom/cpr3.c
+@@ -272,6 +272,7 @@ struct cpr_thread {
+ 	struct cpr_ext_data	ext_data;
+ 	struct generic_pm_domain pd;
+ 	struct device		*attached_cpu_dev;
++	bool			opp_table_added;
+ 	struct work_struct	restart_work;
+ 	bool			restarting;
+ 
+@@ -2155,6 +2156,30 @@ static int cpr_power_on(struct generic_pm_domain *domain)
+ 	return cpr_enable(thread);
+ }
+ 
++/*
++ * Undo the attachment of the first device of a thread: drop the OPP table that
++ * was added for it and the corners, so that a later attachment, possibly of
++ * another CPU of the same cluster, starts from scratch.
++ */
++static void cpr_pd_release_dev(struct cpr_thread *thread)
++{
++	struct device *dev = thread->attached_cpu_dev;
++
++	if (thread->opp_table_added)
++		dev_pm_opp_of_remove_table(dev);
++	thread->opp_table_added = false;
++
++	thread->num_corners = 0;
++	thread->corner = NULL;
++	if (thread->corners)
++		devm_kfree(thread->drv->dev, thread->corners);
++	thread->corners = NULL;
++
++	dev_set_drvdata(dev, NULL);
++	thread->cpu_clk = NULL;
++	thread->attached_cpu_dev = NULL;
++}
++
+ static void cpr_pd_detach_dev(struct generic_pm_domain *domain,
+ 			      struct device *dev)
+ {
+@@ -2164,7 +2189,8 @@ static void cpr_pd_detach_dev(struct generic_pm_domain *domain,
+ 	guard(mutex)(&drv->lock);
+ 
+ 	dev_dbg(drv->dev, "detach callback for: %s\n", dev_name(dev));
+-	thread->attached_cpu_dev = NULL;
++	if (thread->attached_cpu_dev == dev)
++		cpr_pd_release_dev(thread);
+ }
+ 
+ static int cpr_pd_attach_dev(struct generic_pm_domain *domain,
+@@ -2173,7 +2199,6 @@ static int cpr_pd_attach_dev(struct generic_pm_domain *domain,
+ 	struct cpr_thread *thread = container_of(domain, struct cpr_thread, pd);
+ 	struct cpr_drv *drv = thread->drv;
+ 	const struct acc_desc *acc_desc = drv->acc_desc;
+-	bool cprh_opp_remove_table = false;
+ 	int ret = 0;
+ 
+ 	guard(mutex)(&drv->lock);
+@@ -2232,10 +2257,10 @@ static int cpr_pd_attach_dev(struct generic_pm_domain *domain,
+ 	 * frequency associated with each fuse corner.
+ 	 */
+ 	ret = dev_pm_opp_get_opp_count(&thread->pd.dev);
+-	if (ret < 0) {
++	if (ret <= 0) {
+ 		dev_err(drv->dev, "could not get OPP count\n");
+-		thread->attached_cpu_dev = NULL;
+-		return ret;
++		ret = ret ? ret : -ENODEV;
++		goto release;
+ 	}
+ 	thread->num_corners = ret;
+ 
+@@ -2244,8 +2269,10 @@ static int cpr_pd_attach_dev(struct generic_pm_domain *domain,
+ 				       drv->extra_corners,
+ 				       sizeof(*thread->corners),
+ 				       GFP_KERNEL);
+-	if (!thread->corners)
+-		return -ENOMEM;
++	if (!thread->corners) {
++		ret = -ENOMEM;
++		goto release;
++	}
+ 
+ 	/*
+ 	 * If we are on CPR-Hardened we have to make sure that the attached
+@@ -2256,28 +2283,28 @@ static int cpr_pd_attach_dev(struct generic_pm_domain *domain,
+ 		ret = dev_pm_opp_of_add_table(dev);
+ 		if (ret && ret != -EEXIST) {
+ 			dev_err(drv->dev, "Cannot add table: %d\n", ret);
+-			return ret;
++			goto release;
+ 		}
+-		cprh_opp_remove_table = true;
++		/*
++		 * If we reach an error condition, we installed the OPP table
++		 * but we haven't done any setup on it, nor we ever will. In
++		 * order to leave a clean state, it is removed again.
++		 */
++		thread->opp_table_added = !ret;
+ 	}
+ 
+ 	ret = cpr3_corner_init(thread);
+ 	if (ret) {
+-		/*
+-		 * If we are on CPRh and we reached an error condition, we installed
+-		 * the OPP table but we haven't done any setup on it, nor we ever will.
+-		 * In order to leave a clean state, remove the table.
+-		 */
+-		if (cprh_opp_remove_table)
+-			dev_pm_opp_of_remove_table(thread->attached_cpu_dev);
+-
+-		return dev_err_probe(dev, ret, "Couldn't initialize corners\n");
++		dev_err_probe(dev, ret, "Couldn't initialize corners\n");
++		goto release;
+ 	}
+ 
+ 	if (drv->desc->cpr_type != CTRL_TYPE_CPRH) {
+ 		ret = cpr3_find_initial_corner(thread);
+-		if (ret)
+-			return dev_err_probe(dev, ret, "Couldn't find initial corner\n");
++		if (ret) {
++			dev_err_probe(dev, ret, "Couldn't find initial corner\n");
++			goto release;
++		}
+ 
+ 		if (acc_desc && acc_desc->config)
+ 			regmap_multi_reg_write(drv->tcsr, acc_desc->config,
+@@ -2291,6 +2318,10 @@ static int cpr_pd_attach_dev(struct generic_pm_domain *domain,
+ 	dev_info(drv->dev, "thread %d initialized with %u OPPs\n",
+ 		 thread->id, thread->num_corners);
+ 
++	return 0;
++
++release:
++	cpr_pd_release_dev(thread);
+ 	return ret;
+ }
+ 

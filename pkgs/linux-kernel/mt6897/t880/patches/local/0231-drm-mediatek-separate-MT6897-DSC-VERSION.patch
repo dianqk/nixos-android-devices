@@ -1,0 +1,371 @@
+From 17215baaaaf36eeca83ef0888ce5c6fe707230d8 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 10 Nov 2026 13:55:25 +0800
+Subject: [PATCH] drm/mediatek: separate MT6897 DSC VERSION and shadow control
+
+MT6897 keeps the DSC VERSION field at 0x200 while its shadow control moved
+to 0x228. Initialize VERSION at its own register instead of placing those
+bits in the relocated control word, including after display-domain power
+loss. Preserve non-version fields with the vendor's 0x60 mask.
+
+Keep the existing FORCE_COMMIT/BYPASS behavior and programming order at
+0x228. MT8195 retains its combined register path and MMIO trace. No DSC
+geometry, PPS arithmetic, reset or enable sequencing changes are included.
+Add production core/wrapper regressions for versions, register seeds,
+enabled and disabled setup, twins and repeated epochs.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_disp_dsc.c#L1219-L1221
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_disp_dsc.c#L206-L219
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/gpu/drm/mediatek/mtk_disp_dsc.c       |  12 +
+ tools/testing/selftests/mtk_clk/Makefile      |   4 +-
+ .../selftests/mtk_clk/dsc_version_cases.c     | 223 ++++++++++++++++++
+ .../selftests/mtk_clk/test_dsc_version.py     |  46 ++++
+ 4 files changed, 283 insertions(+), 2 deletions(-)
+ create mode 100644 tools/testing/selftests/mtk_clk/dsc_version_cases.c
+ create mode 100755 tools/testing/selftests/mtk_clk/test_dsc_version.py
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_dsc.c b/drivers/gpu/drm/mediatek/mtk_disp_dsc.c
+index 0729f06807..272f74920a 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_dsc.c
++++ b/drivers/gpu/drm/mediatek/mtk_disp_dsc.c
+@@ -130,10 +130,12 @@
+ #  define DSC_BYPASS_SHADOW		BIT(1)
+ #  define DSC_READ_WORKING		BIT(2)
+ #  define DSC_SHADOW_DSC_VERSION_MINOR	GENMASK(8, 5)
++#  define DSC_VERSION_MINOR_MASK		GENMASK(6, 5)
+ 
+ /**
+  * struct mtk_dsc_data - per-SoC DSC data
+  * @shadow_reg: offset of the shadow control register
++ * @version_reg: separate VERSION register, or 0 when combined with shadow control
+  * @obuf_sw_narrow: output buffer setting (with the software override bit)
+  *		    for encoded widths below 1440, or 0 for the default size
+  * @dsi_buffer: the DSI has a TX buffer (no DSC init delay), and the core
+@@ -145,6 +147,7 @@
+  */
+ struct mtk_dsc_data {
+ 	u16 shadow_reg;
++	u16 version_reg;
+ 	u32 obuf_sw_narrow;
+ 	bool dsi_buffer;
+ };
+@@ -156,6 +159,7 @@ static const struct mtk_dsc_data mt8195_dsc_data = {
+ /* MT6897: shadow control at 0x228 and a smaller output buffer below 1440 */
+ static const struct mtk_dsc_data mt6897_dsc_data = {
+ 	.shadow_reg = 0x228,
++	.version_reg = DISP_REG_DSC_SHADOW,
+ 	.obuf_sw_narrow = 0x800000c8,
+ 	.dsi_buffer = true,
+ };
+@@ -404,6 +408,14 @@ static void mtk_dsc_setup_core(struct mtk_dsc *disp_dsc, void __iomem *reg,
+ 		writel(disp_dsc->data->obuf_sw_narrow, reg + DISP_REG_DSC_OUTBUF);
+ 	else
+ 		writel(FIELD_PREP_CONST(DSC_OBUF_SIZE, 1040), reg + DISP_REG_DSC_OUTBUF);
++	if (disp_dsc->data->version_reg) {
++		u32 version = readl(reg + disp_dsc->data->version_reg);
++
++		version &= ~DSC_VERSION_MINOR_MASK;
++		version |= dsc_shadow & DSC_VERSION_MINOR_MASK;
++		writel(version, reg + disp_dsc->data->version_reg);
++		dsc_shadow &= ~DSC_SHADOW_DSC_VERSION_MINOR;
++	}
+ 	writel(dsc_shadow, reg + disp_dsc->data->shadow_reg);
+ 
+ 	/* Set PPS registers configuration */
+diff --git a/tools/testing/selftests/mtk_clk/Makefile b/tools/testing/selftests/mtk_clk/Makefile
+index 2c30a08fdd..c50b132c3f 100644
+--- a/tools/testing/selftests/mtk_clk/Makefile
++++ b/tools/testing/selftests/mtk_clk/Makefile
+@@ -1,4 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-TEST_PROGS := test_tinysys_mailbox.py test_dram_bootstrap.py test_mt6897.py test_domains.py test_boot_owner.py test_directlink.py test_display_pm.py test_dpintf_pm.py test_cmdq_stop.py test_crtc_stop.py test_dsi_routing.py test_dsc_epoch.py test_mipi_tx_order.py test_ovl_fetch.py
+-TEST_FILES := tinysys_mailbox_cases.c mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c ven_cases.c boot_stubs.h boot_cases.c directlink_cases.c display_pm_cases.c mmsys_pm_cases.c dpintf_pm_cases.c cmdq_stop_cases.c crtc_stop_cases.c dsi_routing_cases.c dsi_mmsys_cases.c dsc_epoch_cases.c mipi_tx_order_cases.c ovl_fetch_cases.c
++TEST_PROGS := test_tinysys_mailbox.py test_dram_bootstrap.py test_mt6897.py test_domains.py test_boot_owner.py test_directlink.py test_display_pm.py test_dpintf_pm.py test_cmdq_stop.py test_crtc_stop.py test_dsi_routing.py test_dsc_epoch.py test_mipi_tx_order.py test_ovl_fetch.py test_dsc_version.py
++TEST_FILES := tinysys_mailbox_cases.c mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c ven_cases.c boot_stubs.h boot_cases.c directlink_cases.c display_pm_cases.c mmsys_pm_cases.c dpintf_pm_cases.c cmdq_stop_cases.c crtc_stop_cases.c dsi_routing_cases.c dsi_mmsys_cases.c dsc_epoch_cases.c mipi_tx_order_cases.c ovl_fetch_cases.c dsc_version_cases.c
+ include ../lib.mk
+diff --git a/tools/testing/selftests/mtk_clk/dsc_version_cases.c b/tools/testing/selftests/mtk_clk/dsc_version_cases.c
+new file mode 100644
+index 0000000000..b20948f1a5
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/dsc_version_cases.c
+@@ -0,0 +1,223 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++#define __iomem
++#define BIT(n) (1U << (n))
++#define GENMASK(h, l) ((UINT32_MAX << (l)) & (UINT32_MAX >> (31 - (h))))
++#define FIELD_PREP(mask, val) (((u32)(val) << __builtin_ctz(mask)) & (mask))
++#define FIELD_PREP_CONST(mask, val) FIELD_PREP(mask, val)
++#define DIV_ROUND_UP(n, d) div_round_up(n, d)
++typedef uint32_t u32;
++typedef uint16_t u16;
++
++static u32 div_round_up(u32 n, u32 d)
++{
++	return (n + d - 1) / d;
++}
++
++struct clk;
++struct device { void *data; };
++struct platform_device { struct device dev; };
++struct device_node { struct platform_device *device; };
++struct drm_dsc_config {
++	u32 pic_height, pic_width, slice_height, slice_width, slice_count;
++	u32 slice_chunk_size, bits_per_pixel, bits_per_component, dsc_version_minor;
++};
++
++/* DECLARATIONS */
++
++static u32 registers[2][256];
++static bool trace, target;
++static unsigned int version_writes[2], control_writes[2], pps_calls;
++static u32 expected_version;
++
++static void *dev_get_drvdata(struct device *dev)
++{
++	return dev->data;
++}
++
++static void *platform_get_drvdata(struct platform_device *pdev)
++{
++	return pdev->dev.data;
++}
++
++static struct platform_device *of_find_device_by_node(struct device_node *node)
++{
++	return node->device;
++}
++
++static void put_device(struct device *dev)
++{
++}
++
++static int bank(void *reg, unsigned int *offset)
++{
++	uintptr_t address = (uintptr_t)reg;
++	int i;
++
++	for (i = 0; i < 2; i++) {
++		uintptr_t base = (uintptr_t)registers[i];
++
++		if (address >= base && address < base + sizeof(registers[i])) {
++			*offset = address - base;
++			assert(!(*offset % 4));
++			return i;
++		}
++	}
++	assert(false);
++	return -1;
++}
++
++static u32 readl(void *reg)
++{
++	unsigned int offset;
++	int i = bank(reg, &offset);
++
++	if (trace)
++		printf("R %d %03x %08x\n", i, offset, *(u32 *)reg);
++	return *(u32 *)reg;
++}
++
++static void writel(u32 value, void *reg)
++{
++	unsigned int offset;
++	int i = bank(reg, &offset);
++
++	if (target && offset == 0x200)
++		version_writes[i]++;
++	if (target && offset == 0x228)
++		control_writes[i]++;
++	if (trace)
++		printf("W %d %03x %08x\n", i, offset, value);
++	*(u32 *)reg = value;
++}
++
++/* PPS arithmetic is unchanged; only this backend is mocked. Core/wrappers are real. */
++static void mtk_dsc_pps_setup(void *reg, struct drm_dsc_config *cfg)
++{
++	unsigned int offset;
++	int i = bank(reg, &offset);
++
++	assert(!offset);
++	if (target) {
++		assert((registers[i][0x200 / 4] & 0x60) == expected_version);
++		assert(version_writes[i] == 1 && control_writes[i] == 1);
++	}
++	if (trace)
++		printf("PPS %d %u\n", i, cfg->dsc_version_minor);
++	pps_calls++;
++}
++
++/* PRODUCTION */
++
++static struct drm_dsc_config config(unsigned int version)
++{
++	struct drm_dsc_config cfg = {
++		.pic_height = 2560, .pic_width = 800,
++		.slice_height = 20, .slice_width = 800, .slice_count = 1,
++		.slice_chunk_size = 800, .bits_per_pixel = 128,
++		.bits_per_component = 8, .dsc_version_minor = version,
++	};
++
++	return cfg;
++}
++
++static void seed(unsigned int value)
++{
++	int i, j;
++
++	for (i = 0; i < 2; i++) {
++		for (j = 0; j < 256; j++) {
++			value = value * 1664525U + 1013904223U;
++			registers[i][j] = value;
++		}
++		version_writes[i] = 0;
++		control_writes[i] = 0;
++	}
++}
++
++static void test_version(bool dual)
++{
++	struct mtk_dsc cores[2] = { 0 };
++	struct platform_device partner = { .dev.data = &cores[1] };
++	struct device_node node = { .device = &partner };
++	struct device lead = { .data = &cores[0] };
++	unsigned int version, epoch, i;
++	u32 before[2];
++
++	for (i = 0; i < 2; i++) {
++		cores[i].reg = registers[i];
++		cores[i].data = &mt6897_dsc_data;
++	}
++#if HAS_VERSION_REG
++	assert(cores[0].data->version_reg == 0x200);
++#endif
++	assert(cores[0].data->shadow_reg == 0x228);
++	cores[0].twin_np = dual ? &node : NULL;
++	target = true;
++	for (version = 1; version <= 2; version++) {
++		struct drm_dsc_config cfg = config(version);
++
++		expected_version = version << 5;
++		for (epoch = 0; epoch < 4; epoch++) {
++			seed(epoch);
++			for (i = 0; i < 2; i++) {
++				/* Zero/lost VERSION and arbitrary non-version fields. */
++				registers[i][0x200 / 4] = epoch ? 0x9b35c49f ^ epoch : 0;
++				if (epoch > 1)
++					registers[i][0x200 / 4] |= version == 1 ? 0x40 : 0x20;
++				before[i] = registers[i][0x200 / 4];
++				registers[i][0] = epoch & 1;
++			}
++			if (epoch & 1)
++				mtk_dsc_start(&lead);
++			mtk_dsc_setup(&lead, &cfg);
++			for (i = 0; i < (dual ? 2U : 1U); i++) {
++				assert(registers[i][0x200 / 4] ==
++				       ((before[i] & ~0x60) | expected_version));
++				/* Existing FORCE|BYPASS control, without misplaced VERSION. */
++				assert(registers[i][0x228 / 4] == 3);
++				assert(!!(registers[i][0] & DSC_EN) == !!(epoch & 1));
++				assert(cores[i].dsc_config_done);
++			}
++			if (!dual)
++				assert(registers[1][0x200 / 4] == before[1]);
++			mtk_dsc_stop(&lead);
++		}
++	}
++	target = false;
++}
++
++static void legacy_trace(void)
++{
++	struct mtk_dsc core = { .reg = registers[0], .data = &mt8195_dsc_data };
++	struct device dev = { .data = &core };
++	unsigned int version;
++
++	trace = true;
++	for (version = 1; version <= 2; version++) {
++		struct drm_dsc_config cfg = config(version);
++
++		seed(42);
++		mtk_dsc_start(&dev);
++		mtk_dsc_setup(&dev, &cfg);
++		mtk_dsc_stop(&dev);
++	}
++}
++
++int main(int argc, char **argv)
++{
++	if (argc > 1 && !strcmp(argv[1], "--legacy-trace")) {
++		legacy_trace();
++		return 0;
++	}
++	test_version(false);
++	test_version(true);
++	assert(pps_calls == 24);
++	puts("DSC production VERSION restore, preservation and twin epochs: PASS");
++	return 0;
++}
+diff --git a/tools/testing/selftests/mtk_clk/test_dsc_version.py b/tools/testing/selftests/mtk_clk/test_dsc_version.py
+new file mode 100755
+index 0000000000..359bdbb427
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/test_dsc_version.py
+@@ -0,0 +1,46 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Exercise production DSC core VERSION restoration and legacy MMIO traces."""
++from pathlib import Path
++import os
++import re
++import subprocess
++import tempfile
++
++assets = Path(__file__).resolve().parent
++repo = Path(os.environ.get('KERNEL_SRC', str(assets.parents[3])))
++source = Path(os.environ.get('DSC_SOURCE', str(repo / 'drivers/gpu/drm/mediatek/mtk_disp_dsc.c'))).read_text()
++
++
++def function(name):
++    match = re.search(r'^(?:static )?(?:void|struct mtk_dsc \*)\s*' + name
++                      + r'\([^;]*?\)\n\{', source, re.M)
++    start = match.start()
++    end = source.index('{', start) + 1
++    depth = 1
++    while depth:
++        depth += (source[end] == '{') - (source[end] == '}')
++        end += 1
++    return source[start:end]
++
++
++constants = '\n'.join(re.findall(r'^#\s*define [^\n]*(?:\\\n[^\n]*)*', source, re.M))
++structures = '\n'.join(re.search(r'^struct ' + name + r' \{.*?^};', source, re.M | re.S)[0]
++                       for name in ['mtk_dsc_data', 'mtk_dsc'])
++data = '\n'.join(re.search(r'^static const struct mtk_dsc_data ' + name
++                           + r' = \{.*?^};', source, re.M | re.S)[0]
++                 for name in ['mt8195_dsc_data', 'mt6897_dsc_data'])
++production = '\n'.join(function(name) for name in [
++    'mtk_dsc_setup_core', 'mtk_dsc_twin', 'mtk_dsc_setup', 'mtk_dsc_start', 'mtk_dsc_stop'])
++cases = (assets / 'dsc_version_cases.c').read_text()
++with tempfile.TemporaryDirectory(prefix='mtk-dsc-version-') as tmp:
++    tmp = Path(tmp)
++    c = tmp / 'test.c'
++    c.write_text(cases.replace('/* DECLARATIONS */', constants + '\n' + structures + '\n' + data
++                              + '\n#define HAS_VERSION_REG ' + str(int('u16 version_reg;' in source)))
++                 .replace('/* PRODUCTION */', production))
++    binary = tmp / 'test'
++    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
++                    '-Wno-unused-parameter', '-Werror', '-g', '-fsanitize=address,undefined',
++                    str(c), '-o', str(binary)], check=True)
++    subprocess.run([str(binary), *os.environ.get('DSC_TEST_ARGS', '').split()], check=True)
+-- 
+2.56.0
+

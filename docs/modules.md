@@ -26,6 +26,12 @@ behavior using a device family. Configure their inputs in the device module:
 | `persistentImage.rootfs.device` | Installed ext4 root |
 | `usb.signaller.address`, `usb.signaller.controlGroup`, controller and serial | USB management modules |
 | `recovery.targetHostName` and `recovery.daemon.*` (slot model, compatibles, controller, boot request, storage roles, UFS safe mode) | Recovery daemon configuration |
+| `power.wakeup.sources` (named sysfs wakeup devices) | Optional wakeup-source policy (`power.wakeup.enable`/`keep` are consumer choices) |
+| `audio.orientation.card` and `audio.orientation.routes.*` (mixer settings per output transform) | Optional speaker routing for screen orientation (`audio.orientation.enable` is a consumer choice) |
+| `clock.rtcOffset.enable` and `clock.rtcOffset.rtc` (for an RTC Linux cannot set) | Userspace RTC offset for the system clock |
+| `charging.thermalLimit.{currentFile,sensors,steps,defaultCurrent}` (`enable` is a consumer choice) | Temperature-stepped charge current cap |
+| `charging.window.{battery,startThreshold,endThreshold}` (`enable` is a consumer choice) | Battery care charge window |
+| `power.rtUtilClampMin` (default 0) | Real-time task minimum utilization clamp |
 
 The option prefixes in the table are under `androidDevices`, except for standard
 NixOS options. Device-specific options such as `hardware.<device>.systemHostName`
@@ -70,7 +76,7 @@ checks standard/vendor FAT policies, direct-kernel selection, recovery inputs an
 missing-firmware rejection on both build platforms. Its fixtures support
 evaluation only and are not bootable images.
 
-`tests/eval-platforms.nix` covers the five supported devices and their existing
+`tests/eval-platforms.nix` covers the five U-Boot/EFI example systems and their existing
 artifact contracts. Run the checks in the [development guide](development.md)
 when changing a common option or moving policy between modules. Build and hardware
 validation remain separate from these evaluations.

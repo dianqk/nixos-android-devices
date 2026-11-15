@@ -1,0 +1,116 @@
+From b98659e5c98143680ec5a9ba756aafd3196e1f85 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 7 Nov 2026 07:46:56 +0800
+Subject: [PATCH] arm: qualcomm: map validated Dodge loader ramdisk data
+
+The ABL ramdisk remains excluded from DRAM allocation alongside firmware carveouts. Validate its page-rounded span against the original memory banks, protected ranges and running Image before retaining it across relocation. Map only that checked span through the normal MMU API before boot commands read the embedded FIT. Other firmware carveouts remain unmapped.
+---
+ arch/arm/mach-snapdragon/board.c |  3 ++
+ arch/arm/mach-snapdragon/dodge.c | 56 ++++++++++++++++++++++++++++++--
+ 2 files changed, 57 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm/mach-snapdragon/board.c b/arch/arm/mach-snapdragon/board.c
+index 599702d7..6beae3c5 100644
+--- a/arch/arm/mach-snapdragon/board.c
++++ b/arch/arm/mach-snapdragon/board.c
+@@ -591,6 +591,9 @@ int board_late_init(void)
+ 		    lmb_alloc_mem(LMB_MEM_ALLOC_ADDR, SZ_4K, &addr, SZ_64M,
+ 				  LMB_NOOVERWRITE))
+ 			panic("Dodge: no safe 64MiB transfer region\n");
++#ifdef CONFIG_QCOM_DODGE
++		dodge_map_initrd();
++#endif
+ 		env_set_hex("loadaddr", addr);
+ 		env_set_hex("fastboot_addr_r", addr);
+ 		env_set("board", "oneplus-dodge");
+diff --git a/arch/arm/mach-snapdragon/dodge.c b/arch/arm/mach-snapdragon/dodge.c
+index 431a39a9..16fb01d8 100644
+--- a/arch/arm/mach-snapdragon/dodge.c
++++ b/arch/arm/mach-snapdragon/dodge.c
+@@ -11,6 +11,9 @@ struct dodge_range {
+ 	u64 start, end;
+ };
+ 
++/* Populated before BSS is available; keep checked loader data across relocation. */
++static struct dodge_range dodge_initrd __section(".data") = { 1, 1 };
++
+ /* Select a contiguous, DMA-addressable arena without the running Image. */
+ static u64 dodge_select_arena(const fdt64_t *banks, int count, u64 image_start,
+ 			      u64 image_end, u64 needed)
+@@ -51,6 +54,54 @@ static void dodge_add_range(struct dodge_range *ranges, int *count, u64 start,
+ 	(*count)++;
+ }
+ 
++/* Loader data stays reserved from allocation, but must be readable for FIT boot. */
++static void dodge_check_initrd(const void *external,
++			       const struct dodge_range *reserved, int nres,
++			       u64 start, u64 end)
++{
++	const fdt64_t *reg;
++	struct dodge_range span;
++	bool contained = false;
++	int node, len, i;
++	u64 base, size, image_start, image_end;
++
++	if (end <= start || end > U64_MAX - (SZ_4K - 1))
++		panic("Dodge: invalid initrd range\n");
++	span.start = ALIGN_DOWN(start, SZ_4K);
++	span.end = ALIGN(end, SZ_4K);
++	node = fdt_path_offset(external, "/memory");
++	reg = fdt_getprop(external, node, "reg", &len);
++	if (!reg || len <= 0 || len % 16 || len / 16 > CONFIG_NR_DRAM_BANKS)
++		panic("Dodge: invalid initrd memory banks\n");
++	for (i = 0; i < len / 16; i++) {
++		base = get_unaligned_be64(&reg[i * 2]);
++		size = get_unaligned_be64(&reg[i * 2 + 1]);
++		if (!size)
++			continue;
++		if (base + size < base || (base | size) & (SZ_4K - 1))
++			panic("Dodge: invalid initrd memory bank\n");
++		if (base <= span.start && span.end <= base + size)
++			contained = true;
++	}
++	if (!contained)
++		panic("Dodge: initrd outside ABL RAM\n");
++	for (i = 0; i < nres; i++)
++		if (span.start < reserved[i].end && reserved[i].start < span.end)
++			panic("Dodge: initrd overlaps a protected range\n");
++	image_start = (uintptr_t)_start;
++	image_end = (uintptr_t)__bss_start + CONFIG_SYS_INIT_SP_BSS_OFFSET;
++	if (span.start < image_end && image_start < span.end)
++		panic("Dodge: initrd overlaps Image or early stack\n");
++	dodge_initrd = span;
++}
++
++static void dodge_map_initrd(void)
++{
++	if (dodge_initrd.end > dodge_initrd.start)
++		mmu_map_region(dodge_initrd.start,
++			       dodge_initrd.end - dodge_initrd.start, false);
++}
++
+ /* Called only for the embedded Dodge DT. Never alter the caller's ABL DT. */
+ static void *dodge_import_fdt(const void *internal, const void *external)
+ {
+@@ -62,6 +113,8 @@ static void *dodge_import_fdt(const void *internal, const void *external)
+ 	const void *prop;
+ 	const char *name;
+ 
++	dodge_initrd.start = 0;
++	dodge_initrd.end = 0;
+ 	if (!external || fdt_check_header(external) ||
+ 	    (fdt_node_check_compatible(external, 0, "qcom,sun") &&
+ 	     fdt_node_check_compatible(external, 0, "qcom,sm8750")))
+@@ -124,8 +177,7 @@ static void *dodge_import_fdt(const void *internal, const void *external)
+ 		if (!reg || len != 8)
+ 			panic("Dodge: invalid initrd end\n");
+ 		end = get_unaligned_be64(reg);
+-		if (end <= start)
+-			panic("Dodge: invalid initrd range\n");
++		dodge_check_initrd(external, reserved, nres, start, end);
+ 		dodge_add_range(reserved, &nres, start, end - start);
+ 		if (fdt_setprop_u64(dodge_fdt, dst, "linux,initrd-start",
+ 				    start) ||
+-- 
+2.56.0
+

@@ -1,0 +1,1274 @@
+From 76ad3076c50e04aaae34ab439ec6640ed480e552 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 7 Nov 2026 03:13:56 +0800
+Subject: [PATCH] drm/mediatek: retain MT6897 target ownership on unverified
+ CMDQ stop
+
+Check MT6897 CMDQ stop before pending-state changes, gamma/CTM writes and packet reuse, and unconditionally before target teardown even when the vblank countdown has expired. Coordinate old callbacks across flush so they cannot clear newly swapped pending state.
+
+An uncertain stop or submission latches a CRTC fault under hardware serialization. Keep component/mutex/PM ownership and enabled state, reject future atomic checks, and block CRTC-owned queued MMIO, reacquisition, teardown and packet reuse. Complete owned and incoming current/passed-state events exactly once, returning only the vblank reference actually acquired.
+
+Keep healthy non-MT6897 behavior. Add extracted-function sanitizer tests for stop ordering, target reference retention, callback coordination, event aliases/nonblocking swapped states and host event races. This is target-power retention, not cancellation of independent bridge callbacks or repair of framebuffer retirement/manual unbind after hardware faults.
+---
+ drivers/gpu/drm/mediatek/mtk_crtc.c           | 305 ++++++++-
+ drivers/gpu/drm/mediatek/mtk_drm_drv.c        |   4 +
+ drivers/gpu/drm/mediatek/mtk_drm_drv.h        |   1 +
+ tools/testing/selftests/mtk_clk/Makefile      |   4 +-
+ .../selftests/mtk_clk/crtc_stop_cases.c       | 595 ++++++++++++++++++
+ .../selftests/mtk_clk/test_crtc_stop.py       |  54 ++
+ 6 files changed, 930 insertions(+), 33 deletions(-)
+ create mode 100644 tools/testing/selftests/mtk_clk/crtc_stop_cases.c
+ create mode 100755 tools/testing/selftests/mtk_clk/test_crtc_stop.py
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_crtc.c b/drivers/gpu/drm/mediatek/mtk_crtc.c
+index cf3b0b6ae1..fee36ff643 100644
+--- a/drivers/gpu/drm/mediatek/mtk_crtc.c
++++ b/drivers/gpu/drm/mediatek/mtk_crtc.c
+@@ -83,6 +83,9 @@ struct mtk_crtc_hw_layer {
+ struct mtk_crtc {
+ 	struct drm_crtc			base;
+ 	bool				enabled;
++	bool				cmdq_checked_stop;
++	bool				cmdq_faulted;
++	bool				event_vblank_ref;
+ 	u8				*controller_idmap;
+ 	u8				num_controllers;
+ 
+@@ -141,18 +144,109 @@ static inline struct mtk_crtc_state *to_mtk_crtc_state(struct drm_crtc_state *s)
+ 	return container_of(s, struct mtk_crtc_state, base);
+ }
+ 
++static bool mtk_crtc_faulted(struct mtk_crtc *mtk_crtc)
++{
++	return READ_ONCE(mtk_crtc->cmdq_faulted);
++}
++
+ static void mtk_crtc_finish_page_flip(struct mtk_crtc *mtk_crtc)
+ {
+ 	struct drm_crtc *crtc = &mtk_crtc->base;
+ 	unsigned long flags;
++	bool put = false;
+ 
++	spin_lock_irqsave(&crtc->dev->event_lock, flags);
+ 	if (mtk_crtc->event) {
+-		spin_lock_irqsave(&crtc->dev->event_lock, flags);
+ 		drm_crtc_send_vblank_event(crtc, mtk_crtc->event);
+-		drm_crtc_vblank_put(crtc);
++		put = !mtk_crtc->cmdq_checked_stop || mtk_crtc->event_vblank_ref;
+ 		mtk_crtc->event = NULL;
+-		spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
++		mtk_crtc->event_vblank_ref = false;
++	}
++	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
++	if (put)
++		drm_crtc_vblank_put(crtc);
++}
++
++/* Fault completion only: it does not prove pending scanout/FB retirement. */
++static void mtk_crtc_fault_events(struct mtk_crtc *mtk_crtc,
++				  struct drm_crtc_state *passed)
++{
++	struct drm_crtc *crtc = &mtk_crtc->base;
++	struct drm_pending_vblank_event *owned, *incoming, *queued;
++	unsigned long flags;
++	bool put;
++
++	spin_lock_irqsave(&crtc->dev->event_lock, flags);
++	owned = mtk_crtc->event;
++	incoming = crtc->state ? crtc->state->event : NULL;
++	queued = passed && passed != crtc->state ? passed->event : NULL;
++	put = owned && mtk_crtc->event_vblank_ref;
++	mtk_crtc->event = NULL;
++	mtk_crtc->event_vblank_ref = false;
++	if (crtc->state)
++		crtc->state->event = NULL;
++	if (passed)
++		passed->event = NULL;
++	if (owned)
++		drm_crtc_send_vblank_event(crtc, owned);
++	if (incoming && incoming != owned)
++		drm_crtc_send_vblank_event(crtc, incoming);
++	if (queued && queued != owned && queued != incoming)
++		drm_crtc_send_vblank_event(crtc, queued);
++	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
++	if (put)
++		drm_crtc_vblank_put(crtc);
++}
++
++static void mtk_crtc_set_config_updating(struct mtk_crtc *mtk_crtc, bool updating)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&mtk_crtc->config_lock, flags);
++	mtk_crtc->config_updating = updating;
++	spin_unlock_irqrestore(&mtk_crtc->config_lock, flags);
++}
++
++#if IS_REACHABLE(CONFIG_MTK_CMDQ)
++static void mtk_crtc_cmdq_fault_locked(struct mtk_crtc *mtk_crtc,
++				      const char *operation, int error,
++				      struct drm_crtc_state *passed)
++{
++	unsigned long flags;
++
++	lockdep_assert_held(&mtk_crtc->hw_lock);
++	WRITE_ONCE(mtk_crtc->cmdq_faulted, true);
++	spin_lock_irqsave(&mtk_crtc->config_lock, flags);
++	mtk_crtc->config_updating = false;
++	mtk_crtc->pending_needs_vblank = false;
++	spin_unlock_irqrestore(&mtk_crtc->config_lock, flags);
++	/* Never hold config_lock across callbacks or event/vblank completion. */
++	mtk_crtc_fault_events(mtk_crtc, passed);
++	drm_err(mtk_crtc->base.dev,
++		"[CRTC:%d] CMDQ %s failed: %d; target ownership retained, reboot required\n",
++		mtk_crtc->base.base.id, operation, error);
++}
++
++#endif
++
++static int mtk_crtc_cmdq_stop_locked(struct mtk_crtc *mtk_crtc,
++				     struct drm_crtc_state *passed)
++{
++	int ret = 0;
++
++	lockdep_assert_held(&mtk_crtc->hw_lock);
++	if (mtk_crtc_faulted(mtk_crtc))
++		return -EIO;
++#if IS_REACHABLE(CONFIG_MTK_CMDQ)
++	if (mtk_crtc->cmdq_checked_stop && mtk_crtc->cmdq_client.chan) {
++		/* Suppress old callbacks clearing the newly swapped pending state. */
++		mtk_crtc_set_config_updating(mtk_crtc, true);
++		ret = mbox_flush(mtk_crtc->cmdq_client.chan, 2000);
++		if (ret < 0)
++			mtk_crtc_cmdq_fault_locked(mtk_crtc, "stop", ret, passed);
+ 	}
++#endif
++	return ret;
+ }
+ 
+ static void mtk_drm_finish_page_flip(struct mtk_crtc *mtk_crtc)
+@@ -265,6 +359,9 @@ static void mtk_crtc_mode_set_nofb(struct drm_crtc *crtc)
+ {
+ 	struct mtk_crtc_state *state = to_mtk_crtc_state(crtc->state);
+ 
++	if (mtk_crtc_faulted(to_mtk_crtc(crtc)))
++		return;
++
+ 	state->pending_width = crtc->mode.hdisplay;
+ 	state->pending_height = crtc->mode.vdisplay;
+ 	state->pending_vrefresh = drm_mode_vrefresh(&crtc->mode);
+@@ -330,7 +427,7 @@ static void ddp_cmdq_cb(struct mbox_client *cl, void *mssg)
+ 	pm_runtime_mark_last_busy(cmdq_cl->chan->mbox->dev);
+ 	pm_runtime_put_autosuspend(cmdq_cl->chan->mbox->dev);
+ 
+-	if (data->sta < 0)
++	if (data->sta < 0 || mtk_crtc_faulted(mtk_crtc))
+ 		return;
+ 
+ 	state = to_mtk_crtc_state(mtk_crtc->base.state);
+@@ -896,22 +993,35 @@ static void mtk_crtc_ddp_config(struct drm_crtc *crtc,
+ 	}
+ }
+ 
+-static void mtk_crtc_update_config(struct mtk_crtc *mtk_crtc, bool needs_vblank)
++static void mtk_crtc_update_config_locked(struct mtk_crtc *mtk_crtc, bool needs_vblank,
++					  bool color_mgmt, bool stopped,
++					  struct drm_crtc_state *passed)
+ {
+ #if IS_REACHABLE(CONFIG_MTK_CMDQ)
+ 	struct cmdq_pkt *cmdq_handle = &mtk_crtc->cmdq_handle;
++	int ret;
+ #endif
+ 	struct drm_crtc *crtc = &mtk_crtc->base;
+ 	struct mtk_drm_private *priv = crtc->dev->dev_private;
+ 	unsigned int pending_planes = 0, pending_async_planes = 0;
+ 	int i;
+-	unsigned long flags;
+ 
+-	mutex_lock(&mtk_crtc->hw_lock);
++	lockdep_assert_held(&mtk_crtc->hw_lock);
++	if (mtk_crtc_faulted(mtk_crtc)) {
++		mtk_crtc_fault_events(mtk_crtc, passed);
++		return;
++	}
++	/* Checked stop precedes pending-state mutation, MMIO and packet reuse. */
++	if (mtk_crtc->cmdq_checked_stop && !stopped &&
++	    mtk_crtc_cmdq_stop_locked(mtk_crtc, passed))
++		return;
++	if (color_mgmt && crtc->state->color_mgmt_changed)
++		for (i = 0; i < mtk_crtc->ddp_comp_nr; i++) {
++			mtk_ddp_gamma_set(mtk_crtc->ddp_comp[i], crtc->state);
++			mtk_ddp_ctm_set(mtk_crtc->ddp_comp[i], crtc->state);
++		}
+ 
+-	spin_lock_irqsave(&mtk_crtc->config_lock, flags);
+-	mtk_crtc->config_updating = true;
+-	spin_unlock_irqrestore(&mtk_crtc->config_lock, flags);
++	mtk_crtc_set_config_updating(mtk_crtc, true);
+ 
+ 	if (needs_vblank)
+ 		mtk_crtc->pending_needs_vblank = true;
+@@ -947,7 +1057,8 @@ static void mtk_crtc_update_config(struct mtk_crtc *mtk_crtc, bool needs_vblank)
+ 	}
+ #if IS_REACHABLE(CONFIG_MTK_CMDQ)
+ 	if (mtk_crtc->cmdq_client.chan) {
+-		mbox_flush(mtk_crtc->cmdq_client.chan, 2000);
++		if (!mtk_crtc->cmdq_checked_stop)
++			mbox_flush(mtk_crtc->cmdq_client.chan, 2000);
+ 		cmdq_handle->cmd_buf_size = 0;
+ 		cmdq_pkt_clear_event(cmdq_handle, mtk_crtc->cmdq_event);
+ 		cmdq_pkt_wfe(cmdq_handle, mtk_crtc->cmdq_event, false);
+@@ -966,25 +1077,38 @@ static void mtk_crtc_update_config(struct mtk_crtc *mtk_crtc, bool needs_vblank)
+ 		 */
+ 		mtk_crtc->cmdq_vblank_cnt = 3;
+ 
+-		spin_lock_irqsave(&mtk_crtc->config_lock, flags);
+-		mtk_crtc->config_updating = false;
+-		spin_unlock_irqrestore(&mtk_crtc->config_lock, flags);
++		mtk_crtc_set_config_updating(mtk_crtc, false);
+ 
+-		if (pm_runtime_resume_and_get(mtk_crtc->cmdq_client.chan->mbox->dev) < 0)
++		ret = pm_runtime_resume_and_get(mtk_crtc->cmdq_client.chan->mbox->dev);
++		if (ret < 0) {
++			if (mtk_crtc->cmdq_checked_stop)
++				mtk_crtc_cmdq_fault_locked(mtk_crtc, "submit PM", ret, passed);
+ 			goto update_config_out;
++		}
+ 
+-		mbox_send_message(mtk_crtc->cmdq_client.chan, cmdq_handle);
++		ret = mbox_send_message(mtk_crtc->cmdq_client.chan, cmdq_handle);
++		if (ret < 0 && mtk_crtc->cmdq_checked_stop) {
++			pm_runtime_mark_last_busy(mtk_crtc->cmdq_client.chan->mbox->dev);
++			pm_runtime_put_autosuspend(mtk_crtc->cmdq_client.chan->mbox->dev);
++			mtk_crtc_cmdq_fault_locked(mtk_crtc, "submit", ret, passed);
++			goto update_config_out;
++		}
+ 		mbox_client_txdone(mtk_crtc->cmdq_client.chan, 0);
+ 		goto update_config_out;
+ 	}
+ #endif
+-	spin_lock_irqsave(&mtk_crtc->config_lock, flags);
+-	mtk_crtc->config_updating = false;
+-	spin_unlock_irqrestore(&mtk_crtc->config_lock, flags);
++	mtk_crtc_set_config_updating(mtk_crtc, false);
+ 
+ #if IS_REACHABLE(CONFIG_MTK_CMDQ)
+ update_config_out:
++	return;
+ #endif
++}
++
++static void mtk_crtc_update_config(struct mtk_crtc *mtk_crtc, bool needs_vblank)
++{
++	mutex_lock(&mtk_crtc->hw_lock);
++	mtk_crtc_update_config_locked(mtk_crtc, needs_vblank, false, false, NULL);
+ 	mutex_unlock(&mtk_crtc->hw_lock);
+ }
+ 
+@@ -994,6 +1118,9 @@ static void mtk_crtc_ddp_irq(void *data)
+ 	struct mtk_crtc *mtk_crtc = to_mtk_crtc(crtc);
+ 	struct mtk_drm_private *priv = crtc->dev->dev_private;
+ 
++	if (mtk_crtc_faulted(mtk_crtc))
++		return;
++
+ #if IS_REACHABLE(CONFIG_MTK_CMDQ)
+ 	struct drm_device *dev = mtk_crtc->base.dev;
+ 	if (!priv->data->shadow_register && !mtk_crtc->cmdq_client.chan)
+@@ -1013,6 +1140,9 @@ static int mtk_crtc_enable_vblank(struct drm_crtc *crtc)
+ 	struct mtk_crtc *mtk_crtc = to_mtk_crtc(crtc);
+ 	struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[mtk_crtc->vblank_comp_idx];
+ 
++	if (mtk_crtc_faulted(mtk_crtc))
++		return -EIO;
++
+ 	mtk_ddp_comp_enable_vblank(comp);
+ 
+ 	return 0;
+@@ -1023,6 +1153,9 @@ static void mtk_crtc_disable_vblank(struct drm_crtc *crtc)
+ 	struct mtk_crtc *mtk_crtc = to_mtk_crtc(crtc);
+ 	struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[mtk_crtc->vblank_comp_idx];
+ 
++	if (mtk_crtc_faulted(mtk_crtc))
++		return;
++
+ 	mtk_ddp_comp_disable_vblank(comp);
+ }
+ 
+@@ -1076,6 +1209,9 @@ int mtk_crtc_plane_check(struct drm_crtc *crtc, struct drm_plane *plane,
+ 	u8 *layer_stages = hwlayer->layer_stages;
+ 	int i, ret;
+ 
++	if (mtk_crtc_faulted(mtk_crtc))
++		return -EIO;
++
+ 	for (i = 0; i < hwlayer->layer_stages_nr; i++) {
+ 		struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[layer_stages[i]];
+ 
+@@ -1098,8 +1234,16 @@ void mtk_crtc_plane_disable(struct drm_crtc *crtc, struct drm_plane *plane)
+ 	if (!mtk_crtc->cmdq_client.chan)
+ 		return;
+ 
+-	if (!mtk_crtc->enabled)
++	mutex_lock(&mtk_crtc->hw_lock);
++	if (!mtk_crtc->enabled || mtk_crtc_faulted(mtk_crtc)) {
++		mutex_unlock(&mtk_crtc->hw_lock);
++		return;
++	}
++
++	if (mtk_crtc->cmdq_checked_stop && mtk_crtc_cmdq_stop_locked(mtk_crtc, NULL)) {
++		mutex_unlock(&mtk_crtc->hw_lock);
+ 		return;
++	}
+ 
+ 	/* set pending plane state to disabled */
+ 	for (i = 0; i < mtk_crtc->hwlayer_nr; i++) {
+@@ -1111,7 +1255,11 @@ void mtk_crtc_plane_disable(struct drm_crtc *crtc, struct drm_plane *plane)
+ 			break;
+ 		}
+ 	}
+-	mtk_crtc_update_config(mtk_crtc, false);
++	mtk_crtc_update_config_locked(mtk_crtc, false, false,
++				      mtk_crtc->cmdq_checked_stop, NULL);
++	mutex_unlock(&mtk_crtc->hw_lock);
++	if (mtk_crtc_faulted(mtk_crtc))
++		return;
+ 
+ 	/* wait for planes to be disabled by CMDQ */
+ 	wait_event_timeout(mtk_crtc->cb_blocking_queue,
+@@ -1124,27 +1272,39 @@ void mtk_crtc_async_update(struct drm_crtc *crtc, struct drm_plane *plane,
+ 			   struct drm_atomic_commit *state)
+ {
+ 	struct mtk_crtc *mtk_crtc = to_mtk_crtc(crtc);
++	struct drm_crtc_state *passed = drm_atomic_get_new_crtc_state(state, crtc);
+ 
+-	if (!mtk_crtc->enabled)
+-		return;
+-
+-	mtk_crtc_update_config(mtk_crtc, false);
++	mutex_lock(&mtk_crtc->hw_lock);
++	if (mtk_crtc->enabled && !mtk_crtc_faulted(mtk_crtc))
++		mtk_crtc_update_config_locked(mtk_crtc, false, false, false,
++				      passed);
++	mutex_unlock(&mtk_crtc->hw_lock);
+ }
+ 
+ static void mtk_crtc_atomic_enable(struct drm_crtc *crtc,
+ 				   struct drm_atomic_commit *state)
+ {
+ 	struct mtk_crtc *mtk_crtc = to_mtk_crtc(crtc);
++	struct drm_crtc_state *passed = drm_atomic_get_new_crtc_state(state, crtc);
+ 	struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[mtk_crtc->config_comp_idx];
+ 	struct drm_device *dev = mtk_crtc->base.dev;
+ 	int ret;
+ 
+ 	drm_dbg_driver(dev, "%s %d\n", __func__, crtc->base.id);
++	if (mtk_crtc->cmdq_checked_stop) {
++		mutex_lock(&mtk_crtc->hw_lock);
++		if (mtk_crtc_faulted(mtk_crtc)) {
++			mtk_crtc_fault_events(mtk_crtc, passed);
++			goto out_unlock;
++		}
++		if (mtk_crtc->enabled)
++			goto out_unlock;
++	}
+ 
+ 	ret = mtk_ddp_comp_power_on(comp);
+ 	if (ret < 0) {
+ 		DRM_DEV_ERROR(comp->dev, "Failed to enable power domain: %d\n", ret);
+-		return;
++		goto out_unlock;
+ 	}
+ 
+ 	mtk_crtc_update_output(crtc, state);
+@@ -1152,24 +1312,38 @@ static void mtk_crtc_atomic_enable(struct drm_crtc *crtc,
+ 	ret = mtk_crtc_ddp_hw_init(mtk_crtc);
+ 	if (ret) {
+ 		mtk_ddp_comp_power_off(comp);
+-		return;
++		goto out_unlock;
+ 	}
+ 
+ 	drm_crtc_vblank_on(crtc);
+ 	mtk_crtc->enabled = true;
++out_unlock:
++	if (mtk_crtc->cmdq_checked_stop)
++		mutex_unlock(&mtk_crtc->hw_lock);
+ }
+ 
+ static void mtk_crtc_atomic_disable(struct drm_crtc *crtc,
+ 				    struct drm_atomic_commit *state)
+ {
+ 	struct mtk_crtc *mtk_crtc = to_mtk_crtc(crtc);
++	struct drm_crtc_state *passed = drm_atomic_get_new_crtc_state(state, crtc);
+ 	struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[mtk_crtc->config_comp_idx];
+ 	struct drm_device *dev = mtk_crtc->base.dev;
+ 	int i;
+ 
+ 	drm_dbg_driver(dev, "%s %d\n", __func__, crtc->base.id);
++	if (mtk_crtc->cmdq_checked_stop)
++		mutex_lock(&mtk_crtc->hw_lock);
++	if (mtk_crtc_faulted(mtk_crtc)) {
++		mtk_crtc_fault_events(mtk_crtc, passed);
++		goto out_unlock;
++	}
+ 	if (!mtk_crtc->enabled)
+-		return;
++		goto out_unlock;
++
++	if (mtk_crtc->cmdq_checked_stop &&
++	    mtk_crtc_cmdq_stop_locked(mtk_crtc, passed))
++		goto out_unlock;
+ 
+ 	/* Set all pending plane state to disabled */
+ 	for (i = 0; i < mtk_crtc->hwlayer_nr; i++) {
+@@ -1182,10 +1356,25 @@ static void mtk_crtc_atomic_disable(struct drm_crtc *crtc,
+ 	}
+ 	mtk_crtc->pending_planes = true;
+ 
+-	mtk_crtc_update_config(mtk_crtc, false);
++	if (mtk_crtc->cmdq_checked_stop)
++		mtk_crtc_update_config_locked(mtk_crtc, false, false, true,
++				      passed);
++	else
++		mtk_crtc_update_config(mtk_crtc, false);
++	if (mtk_crtc_faulted(mtk_crtc))
++		goto out_unlock;
+ #if IS_REACHABLE(CONFIG_MTK_CMDQ)
+-	/* Wait for planes to be disabled by cmdq */
+-	if (mtk_crtc->cmdq_client.chan &&
++	if (mtk_crtc->cmdq_checked_stop && mtk_crtc->cmdq_client.chan) {
++		wait_event_timeout(mtk_crtc->cb_blocking_queue,
++				   mtk_crtc->cmdq_vblank_cnt == 0, msecs_to_jiffies(500));
++		/* A zero vblank counter is not proof of thread stop. */
++		if (mtk_crtc_cmdq_stop_locked(mtk_crtc, passed))
++			goto out_unlock;
++		mtk_crtc_set_config_updating(mtk_crtc, false);
++		mtk_crtc->cmdq_vblank_cnt = 0;
++		mtk_crtc->pending_needs_vblank = false;
++		mtk_crtc_finish_page_flip(mtk_crtc);
++	} else if (mtk_crtc->cmdq_client.chan &&
+ 	    !wait_event_timeout(mtk_crtc->cb_blocking_queue,
+ 				mtk_crtc->cmdq_vblank_cnt == 0,
+ 				msecs_to_jiffies(500))) {
+@@ -1224,6 +1413,22 @@ static void mtk_crtc_atomic_disable(struct drm_crtc *crtc,
+ 	mtk_ddp_comp_power_off(comp);
+ 
+ 	mtk_crtc->enabled = false;
++out_unlock:
++	if (mtk_crtc->cmdq_checked_stop)
++		mutex_unlock(&mtk_crtc->hw_lock);
++}
++
++static void mtk_crtc_send_unowned_event(struct drm_crtc *crtc,
++				       struct drm_crtc_state *state)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&crtc->dev->event_lock, flags);
++	if (state->event) {
++		drm_crtc_send_vblank_event(crtc, state->event);
++		state->event = NULL;
++	}
++	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
+ }
+ 
+ static void mtk_crtc_atomic_begin(struct drm_crtc *crtc,
+@@ -1236,6 +1441,27 @@ static void mtk_crtc_atomic_begin(struct drm_crtc *crtc,
+ 	struct drm_device *dev = mtk_crtc->base.dev;
+ 	unsigned long flags;
+ 
++	if (mtk_crtc->cmdq_checked_stop) {
++		mutex_lock(&mtk_crtc->hw_lock);
++		if (mtk_crtc_faulted(mtk_crtc)) {
++			mtk_crtc_fault_events(mtk_crtc, crtc_state);
++		} else if (crtc_state->event) {
++			if (mtk_crtc->event || drm_crtc_vblank_get(crtc)) {
++				/* Do not overwrite an event/reference already owned. */
++				mtk_crtc_send_unowned_event(crtc, crtc_state);
++			} else {
++				crtc_state->event->pipe = drm_crtc_index(crtc);
++				spin_lock_irqsave(&crtc->dev->event_lock, flags);
++				mtk_crtc->event = crtc_state->event;
++				mtk_crtc->event_vblank_ref = true;
++				crtc_state->event = NULL;
++				spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
++			}
++		}
++		mutex_unlock(&mtk_crtc->hw_lock);
++		return;
++	}
++
+ 	if (mtk_crtc->event && mtk_crtc_state->base.event)
+ 		drm_err(dev, "new event while there is still a pending event\n");
+ 
+@@ -1255,8 +1481,17 @@ static void mtk_crtc_atomic_flush(struct drm_crtc *crtc,
+ 				  struct drm_atomic_commit *state)
+ {
+ 	struct mtk_crtc *mtk_crtc = to_mtk_crtc(crtc);
++	struct drm_crtc_state *passed = drm_atomic_get_new_crtc_state(state, crtc);
+ 	int i;
+ 
++	if (mtk_crtc->cmdq_checked_stop) {
++		mutex_lock(&mtk_crtc->hw_lock);
++		mtk_crtc_update_config_locked(mtk_crtc, !!mtk_crtc->event, true, false,
++				      passed);
++		mutex_unlock(&mtk_crtc->hw_lock);
++		return;
++	}
++
+ 	if (crtc->state->color_mgmt_changed)
+ 		for (i = 0; i < mtk_crtc->ddp_comp_nr; i++) {
+ 			mtk_ddp_gamma_set(mtk_crtc->ddp_comp[i], crtc->state);
+@@ -1265,6 +1500,12 @@ static void mtk_crtc_atomic_flush(struct drm_crtc *crtc,
+ 	mtk_crtc_update_config(mtk_crtc, !!mtk_crtc->event);
+ }
+ 
++static int mtk_crtc_atomic_check(struct drm_crtc *crtc,
++				 struct drm_atomic_commit *state)
++{
++	return mtk_crtc_faulted(to_mtk_crtc(crtc)) ? -EIO : 0;
++}
++
+ static const struct drm_crtc_funcs mtk_crtc_funcs = {
+ 	.set_config		= drm_atomic_helper_set_config,
+ 	.page_flip		= drm_atomic_helper_page_flip,
+@@ -1280,6 +1521,7 @@ static const struct drm_crtc_helper_funcs mtk_crtc_helper_funcs = {
+ 	.mode_fixup	= mtk_crtc_mode_fixup,
+ 	.mode_set_nofb	= mtk_crtc_mode_set_nofb,
+ 	.mode_valid	= mtk_crtc_mode_valid,
++	.atomic_check	= mtk_crtc_atomic_check,
+ 	.atomic_begin	= mtk_crtc_atomic_begin,
+ 	.atomic_flush	= mtk_crtc_atomic_flush,
+ 	.atomic_enable	= mtk_crtc_atomic_enable,
+@@ -1805,6 +2047,7 @@ int mtk_crtc_create(struct drm_device *drm_dev,
+ 				GFP_KERNEL);
+ 	if (!mtk_crtc)
+ 		return -ENOMEM;
++	mtk_crtc->cmdq_checked_stop = priv->data->cmdq_checked_stop;
+ 
+ 	mtk_crtc->ddp_comp_nr = output_path_len;
+ 	mtk_crtc->mmsys_dev = priv->mmsys_dev;
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_drv.c b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+index f5afb1abc2..51ef81c7ce 100644
+--- a/drivers/gpu/drm/mediatek/mtk_drm_drv.c
++++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+@@ -127,6 +127,7 @@ static const struct mtk_mmsys_driver_data mt8192_mmsys_driver_data = {
+  * devicetree graph.
+  */
+ static const struct mtk_mmsys_driver_data mt6897_dispsys0_driver_data = {
++	.cmdq_checked_stop = true,
+ 	.mmsys_id = 0,
+ 	.mmsys_dev_num = 4,
+ 	.max_width = 4096,
+@@ -135,6 +136,7 @@ static const struct mtk_mmsys_driver_data mt6897_dispsys0_driver_data = {
+ };
+ 
+ static const struct mtk_mmsys_driver_data mt6897_dispsys1_driver_data = {
++	.cmdq_checked_stop = true,
+ 	.mmsys_id = 1,
+ 	.mmsys_dev_num = 4,
+ 	.max_width = 4096,
+@@ -143,6 +145,7 @@ static const struct mtk_mmsys_driver_data mt6897_dispsys1_driver_data = {
+ };
+ 
+ static const struct mtk_mmsys_driver_data mt6897_ovlsys0_driver_data = {
++	.cmdq_checked_stop = true,
+ 	.mmsys_id = 2,
+ 	.mmsys_dev_num = 4,
+ 	.max_width = 4096,
+@@ -151,6 +154,7 @@ static const struct mtk_mmsys_driver_data mt6897_ovlsys0_driver_data = {
+ };
+ 
+ static const struct mtk_mmsys_driver_data mt6897_ovlsys1_driver_data = {
++	.cmdq_checked_stop = true,
+ 	.mmsys_id = 3,
+ 	.mmsys_dev_num = 4,
+ 	.max_width = 4096,
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_drv.h b/drivers/gpu/drm/mediatek/mtk_drm_drv.h
+index 9b9401bbbf..e72e5044ba 100644
+--- a/drivers/gpu/drm/mediatek/mtk_drm_drv.h
++++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.h
+@@ -52,6 +52,7 @@ struct mtk_mmsys_driver_data {
+ 	unsigned int num_conn_routes;
+ 
+ 	bool shadow_register;
++	bool cmdq_checked_stop;
+ 	unsigned int mmsys_id;
+ 	unsigned int mmsys_dev_num;
+ 
+diff --git a/tools/testing/selftests/mtk_clk/Makefile b/tools/testing/selftests/mtk_clk/Makefile
+index b47b95b004..d63cb75850 100644
+--- a/tools/testing/selftests/mtk_clk/Makefile
++++ b/tools/testing/selftests/mtk_clk/Makefile
+@@ -1,4 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-TEST_PROGS := test_mt6897.py test_domains.py test_boot_owner.py test_directlink.py test_display_pm.py test_dpintf_pm.py test_cmdq_stop.py
+-TEST_FILES := mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c ven_cases.c boot_stubs.h boot_cases.c directlink_cases.c display_pm_cases.c mmsys_pm_cases.c dpintf_pm_cases.c cmdq_stop_cases.c
++TEST_PROGS := test_mt6897.py test_domains.py test_boot_owner.py test_directlink.py test_display_pm.py test_dpintf_pm.py test_cmdq_stop.py test_crtc_stop.py
++TEST_FILES := mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c ven_cases.c boot_stubs.h boot_cases.c directlink_cases.c display_pm_cases.c mmsys_pm_cases.c dpintf_pm_cases.c cmdq_stop_cases.c crtc_stop_cases.c
+ include ../lib.mk
+diff --git a/tools/testing/selftests/mtk_clk/crtc_stop_cases.c b/tools/testing/selftests/mtk_clk/crtc_stop_cases.c
+new file mode 100644
+index 0000000000..b6154aa831
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/crtc_stop_cases.c
+@@ -0,0 +1,595 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <string.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <errno.h>
++typedef uint32_t u32;
++typedef uint64_t u64;
++typedef uint8_t u8;
++#define IS_REACHABLE(x) 1
++#define READ_ONCE(x) atomic_load(&(x))
++#define WRITE_ONCE(x, v) atomic_store(&(x), (v))
++#define BIT(x) (1U << (x))
++#define DMA_TO_DEVICE 0
++#define drm_err(dev, ...) ((void)(dev))
++#define drm_warn(dev, ...) ((void)(dev))
++#define drm_dbg_driver(dev, ...) ((void)(dev))
++#define DRM_DEV_ERROR(...) ((void)0)
++#define WARN_ON(x) ((void)(x))
++#define msecs_to_jiffies(x) (x)
++#define container_of(p, type, member) \
++	((type *)((char *)(p) - offsetof(type, member)))
++struct device {
++	int refs;
++};
++struct drm_pending_vblank_event {
++	int id, pipe;
++};
++struct drm_crtc_state {
++	struct drm_pending_vblank_event *event;
++	bool active, color_mgmt_changed;
++};
++struct mtk_crtc_state {
++	struct drm_crtc_state base;
++	bool pending_config;
++};
++struct drm_device {
++	void *dev_private;
++	pthread_mutex_t event_lock;
++};
++struct drm_crtc {
++	struct drm_device *dev;
++	struct drm_crtc_state *state;
++	struct {
++		int id;
++	} base;
++};
++struct drm_plane {
++	void *state;
++	int index;
++};
++struct mtk_plane_state {
++	struct {
++		bool dirty, config, async_dirty, async_config, enable;
++	} pending;
++};
++struct mtk_crtc_hw_layer {
++	struct drm_plane plane;
++	u8 *layer_stages;
++	int layer_stages_nr;
++};
++struct mtk_ddp_comp {
++	struct device *dev;
++};
++struct mtk_drm_private {
++	struct {
++		bool shadow_register;
++	} *data;
++};
++struct mbox_chan {
++	struct {
++		struct device *dev;
++	} *mbox;
++};
++struct cmdq_pkt {
++	unsigned int cmd_buf_size;
++	uintptr_t pa_base;
++};
++struct mtk_crtc {
++	struct drm_crtc base;
++	bool enabled, cmdq_checked_stop, event_vblank_ref;
++	atomic_bool cmdq_faulted;
++	bool pending_needs_vblank, pending_planes, pending_async_planes,
++		config_updating;
++	struct drm_pending_vblank_event *event;
++	struct mtk_crtc_hw_layer *hwlayers;
++	unsigned int hwlayer_nr, ddp_comp_nr, num_controllers;
++	int config_comp_idx;
++	struct mtk_ddp_comp **ddp_comp;
++	void **mutex;
++	struct {
++		struct mbox_chan *chan;
++	} cmdq_client;
++	struct cmdq_pkt cmdq_handle;
++	u32 cmdq_event, cmdq_vblank_cnt;
++	int cb_blocking_queue;
++	pthread_mutex_t hw_lock, config_lock;
++};
++struct drm_atomic_commit {
++	struct drm_crtc_state *new_state;
++};
++static struct mtk_crtc context;
++static struct drm_device drm;
++static struct mtk_crtc_state state;
++static struct mtk_plane_state planes[2];
++static struct mtk_crtc_hw_layer layers[2];
++static struct device engine, gce;
++static struct mtk_ddp_comp comp, *components[1];
++static struct {
++	struct device *dev;
++} controller;
++static struct mbox_chan channel;
++static struct {
++	bool shadow_register;
++} data;
++static struct mtk_drm_private private;
++static _Thread_local bool hw_held, config_held, event_held;
++static atomic_int gets, vblank_refs, vblank_puts, sent[4];
++static int flush_calls, fail_flush, submit_error, pm_error, packet_writes;
++static int config_calls, gamma_calls, ctm_calls, irq_calls, fini_calls,
++	init_calls, power_calls;
++static int target_refs, root_refs, vblank_queue;
++static bool packet_active, zero_wait, callback_on_flush, pending_observed;
++static void host_hw_lock(pthread_mutex_t *lock)
++{
++	assert(!hw_held);
++	assert(pthread_mutex_lock(lock) == 0);
++	hw_held = true;
++}
++static void host_hw_unlock(pthread_mutex_t *lock)
++{
++	assert(hw_held);
++	hw_held = false;
++	assert(pthread_mutex_unlock(lock) == 0);
++}
++#define mutex_lock(p) host_hw_lock(p)
++#define mutex_unlock(p) host_hw_unlock(p)
++#define lockdep_assert_held(p) assert(hw_held)
++static void host_spin_lock(pthread_mutex_t *lock)
++{
++	assert(pthread_mutex_lock(lock) == 0);
++	if (lock == &context.config_lock)
++		config_held = true;
++	if (lock == &drm.event_lock)
++		event_held = true;
++}
++static void host_spin_unlock(pthread_mutex_t *lock)
++{
++	if (lock == &context.config_lock)
++		config_held = false;
++	if (lock == &drm.event_lock)
++		event_held = false;
++	assert(pthread_mutex_unlock(lock) == 0);
++}
++#define spin_lock_irqsave(p, f)    \
++	do {                       \
++		(f) = 0;           \
++		host_spin_lock(p); \
++	} while (0)
++#define spin_unlock_irqrestore(p, f) \
++	do {                         \
++		(void)(f);           \
++		host_spin_unlock(p); \
++	} while (0)
++static struct mtk_crtc *to_mtk_crtc(struct drm_crtc *crtc)
++{
++	return container_of(crtc, struct mtk_crtc, base);
++}
++static struct mtk_crtc_state *to_mtk_crtc_state(struct drm_crtc_state *s)
++{
++	return container_of(s, struct mtk_crtc_state, base);
++}
++static struct mtk_plane_state *to_mtk_plane_state(void *s)
++{
++	return s;
++}
++static void drm_crtc_send_vblank_event(struct drm_crtc *crtc,
++				       struct drm_pending_vblank_event *event)
++{
++	assert(event_held && event->id >= 0 && event->id < 4);
++	assert(atomic_fetch_add(&sent[event->id], 1) == 0);
++}
++static int drm_crtc_vblank_get(struct drm_crtc *crtc)
++{
++	gets++;
++	vblank_refs++;
++	return 0;
++}
++static void drm_crtc_vblank_put(struct drm_crtc *crtc)
++{
++	assert(!config_held);
++	assert(atomic_fetch_sub(&vblank_refs, 1) > 0);
++	vblank_puts++;
++}
++static int drm_crtc_index(struct drm_crtc *crtc)
++{
++	return 0;
++}
++static struct drm_crtc_state *
++drm_atomic_get_new_crtc_state(struct drm_atomic_commit *commit,
++			      struct drm_crtc *crtc)
++{
++	return commit->new_state;
++}
++static void drm_crtc_vblank_on(struct drm_crtc *crtc)
++{
++}
++static void drm_crtc_vblank_off(struct drm_crtc *crtc)
++{
++}
++static u64 drm_crtc_vblank_count(struct drm_crtc *crtc)
++{
++	return 0;
++}
++static int *drm_crtc_vblank_waitqueue(struct drm_crtc *crtc)
++{
++	return &vblank_queue;
++}
++static void host_wait(void)
++{
++	if (zero_wait)
++		context.cmdq_vblank_cnt = 0;
++}
++static int host_wait_result(bool condition)
++{
++	return condition;
++}
++#define wait_event_timeout(queue, condition, timeout) \
++	({                                            \
++		host_wait();                          \
++		(void)(queue);                        \
++		(void)(timeout);                      \
++		host_wait_result(condition);          \
++	})
++static int mbox_flush(struct mbox_chan *chan, unsigned long timeout)
++{
++	assert(hw_held && !config_held);
++	flush_calls++;
++	if (callback_on_flush) {
++		callback_on_flush = false;
++		if (!context.config_updating) {
++			state.pending_config = false;
++			if (context.pending_planes)
++				for (int i = 0; i < 2; i++)
++					planes[i].pending.config = false;
++			context.pending_planes = false;
++		}
++	}
++	if (fail_flush == flush_calls)
++		return -EIO;
++	if (packet_active) {
++		assert(gce.refs > 0);
++		gce.refs--;
++		packet_active = false;
++	}
++	return 0;
++}
++static int pm_runtime_resume_and_get(struct device *dev)
++{
++	if (pm_error)
++		return pm_error;
++	dev->refs++;
++	return 0;
++}
++static void pm_runtime_mark_last_busy(struct device *dev)
++{
++}
++static void pm_runtime_put_autosuspend(struct device *dev)
++{
++	assert(dev->refs > 0);
++	dev->refs--;
++}
++static int mbox_send_message(struct mbox_chan *chan, struct cmdq_pkt *pkt)
++{
++	if (submit_error)
++		return submit_error; /* API queue-full error, not send_data ENOMEM. */
++	packet_active = true;
++	return 0;
++}
++static void mbox_client_txdone(struct mbox_chan *chan, int status)
++{
++}
++static void cmdq_pkt_clear_event(struct cmdq_pkt *pkt, u32 event)
++{
++	pkt->cmd_buf_size += 8;
++	packet_writes++;
++}
++static void cmdq_pkt_wfe(struct cmdq_pkt *pkt, u32 event, bool clear)
++{
++	pkt->cmd_buf_size += 8;
++	packet_writes++;
++}
++static void cmdq_pkt_eoc(struct cmdq_pkt *pkt)
++{
++	pkt->cmd_buf_size += 8;
++	packet_writes++;
++}
++static void dma_sync_single_for_device(struct device *dev, uintptr_t address,
++				       unsigned int size, int direction)
++{
++}
++static void mtk_mutex_acquire(void *mutex)
++{
++}
++static void mtk_mutex_release(void *mutex)
++{
++}
++static void mtk_ddp_gamma_set(struct mtk_ddp_comp *c, struct drm_crtc_state *s)
++{
++	gamma_calls++;
++}
++static void mtk_ddp_ctm_set(struct mtk_ddp_comp *c, struct drm_crtc_state *s)
++{
++	ctm_calls++;
++}
++static void mtk_crtc_ddp_config(struct drm_crtc *c, struct cmdq_pkt *pkt)
++{
++	config_calls++;
++	pending_observed = state.pending_config;
++	if (pkt)
++		pkt->cmd_buf_size += 8;
++}
++static void mtk_drm_finish_page_flip(struct mtk_crtc *c)
++{
++	irq_calls++;
++}
++static int mtk_ddp_comp_power_on(struct mtk_ddp_comp *c)
++{
++	power_calls++;
++	root_refs++;
++	return 0;
++}
++static void mtk_ddp_comp_power_off(struct mtk_ddp_comp *c)
++{
++	assert(root_refs > 0);
++	root_refs--;
++}
++static void mtk_crtc_update_output(struct drm_crtc *c,
++				   struct drm_atomic_commit *s)
++{
++}
++static int mtk_crtc_ddp_hw_init(struct mtk_crtc *c)
++{
++	init_calls++;
++	target_refs += 3;
++	return 0;
++}
++static void mtk_crtc_ddp_hw_fini(struct mtk_crtc *c)
++{
++	fini_calls++;
++	assert(target_refs == 3);
++	target_refs = 0;
++}
++static int mtk_ddp_comp_layer_check(struct mtk_ddp_comp *c, int layer,
++				    struct mtk_plane_state *s)
++{
++	return 0;
++}
++/* PRODUCTION */
++
++static void reset(void)
++{
++	context.enabled = context.cmdq_checked_stop = true;
++	atomic_store(&context.cmdq_faulted, false);
++	context.event_vblank_ref = false;
++	context.pending_needs_vblank = context.pending_planes =
++		context.pending_async_planes = context.config_updating = false;
++	context.event = NULL;
++	state = (struct mtk_crtc_state){ .base.active = true,
++					 .pending_config = true };
++	context.base.state = &state.base;
++	context.cmdq_handle.cmd_buf_size = 128;
++	context.cmdq_vblank_cnt = 3;
++	for (int i = 0; i < 2; i++)
++		planes[i] = (struct mtk_plane_state){
++			.pending = { .dirty = true, .enable = true }
++		};
++	gce.refs = 0;
++	target_refs = 3;
++	root_refs = 1;
++	flush_calls = fail_flush = submit_error = pm_error = packet_writes =
++		config_calls = gamma_calls = ctm_calls = irq_calls =
++			fini_calls = init_calls = power_calls = 0;
++	packet_active = zero_wait = callback_on_flush = pending_observed =
++		false;
++	atomic_store(&gets, 0);
++	atomic_store(&vblank_refs, 0);
++	atomic_store(&vblank_puts, 0);
++	for (int i = 0; i < 4; i++)
++		atomic_store(&sent[i], 0);
++}
++static void events(struct drm_pending_vblank_event *owned,
++		   struct drm_pending_vblank_event *incoming)
++{
++	context.event = owned;
++	context.event_vblank_ref = owned != NULL;
++	state.base.event = incoming;
++	if (owned)
++		atomic_store(&vblank_refs, 1);
++}
++static void retained(void)
++{
++	assert(atomic_load(&context.cmdq_faulted) && context.enabled);
++	assert(target_refs == 3 && root_refs == 1 && !context.config_updating);
++	int before = flush_calls;
++	struct drm_atomic_commit commit = { .new_state = &state.base };
++	mtk_crtc_atomic_enable(&context.base, &commit);
++	mtk_crtc_atomic_disable(&context.base, &commit);
++	mtk_crtc_atomic_flush(&context.base, &commit);
++	mtk_crtc_async_update(&context.base, &layers[0].plane, &commit);
++	mtk_crtc_plane_disable(&context.base, &layers[0].plane);
++	mtk_crtc_ddp_irq(&context.base);
++	assert(flush_calls == before && fini_calls == 0 && init_calls == 0 &&
++	       power_calls == 0);
++	assert(mtk_crtc_atomic_check(&context.base, &commit) == -EIO);
++	assert(mtk_crtc_plane_check(&context.base, &layers[0].plane,
++				    &planes[0]) == -EIO);
++}
++static pthread_barrier_t barrier;
++static void *fault_worker(void *arg)
++{
++	pthread_barrier_wait(&barrier);
++	mutex_lock(&context.hw_lock);
++	mtk_crtc_cmdq_fault_locked(&context, "test", -EIO, NULL);
++	mutex_unlock(&context.hw_lock);
++	return NULL;
++}
++static void *event_worker(void *arg)
++{
++	pthread_barrier_wait(&barrier);
++	mtk_crtc_finish_page_flip(&context);
++	return NULL;
++}
++int main(void)
++{
++	assert(pthread_mutex_init(&context.hw_lock, NULL) == 0);
++	assert(pthread_mutex_init(&context.config_lock, NULL) == 0);
++	assert(pthread_mutex_init(&drm.event_lock, NULL) == 0);
++	private.data = (void *)&data;
++	drm.dev_private = &private;
++	context.base.dev = &drm;
++	context.base.base.id = 63;
++	context.hwlayers = layers;
++	context.hwlayer_nr = 2;
++	context.ddp_comp_nr = 1;
++	for (int i = 0; i < 2; i++)
++		layers[i].plane =
++			(struct drm_plane){ .state = &planes[i], .index = i };
++	comp.dev = &engine;
++	components[0] = &comp;
++	context.ddp_comp = components;
++	controller.dev = &gce;
++	channel.mbox = (void *)&controller;
++	context.cmdq_client.chan = &channel;
++	struct drm_atomic_commit commit = { .new_state = &state.base };
++	struct drm_pending_vblank_event owned = { .id = 0 },
++					incoming = { .id = 1 };
++
++	reset();
++	fail_flush = 1;
++	state.base.color_mgmt_changed = true;
++	mtk_crtc_atomic_flush(&context.base, &commit);
++	assert(packet_writes == 0 && config_calls == 0 && gamma_calls == 0 &&
++	       ctm_calls == 0);
++	assert(context.cmdq_handle.cmd_buf_size == 128 &&
++	       planes[0].pending.dirty);
++	retained();
++	for (int fail = 1; fail <= 2; fail++) {
++		reset();
++		fail_flush = fail;
++		events(&owned, &incoming);
++		mtk_crtc_atomic_disable(&context.base, &commit);
++		assert(atomic_load(&sent[0]) == 1 &&
++		       atomic_load(&sent[1]) == 1);
++		assert(vblank_refs == 0 && vblank_puts == 1);
++		assert(context.cmdq_vblank_cnt == 3);
++		retained();
++	}
++	reset();
++	zero_wait = true;
++	mtk_crtc_atomic_disable(&context.base, &commit);
++	assert(flush_calls == 2 && fini_calls == 1 && !context.enabled);
++	assert(target_refs == 0 && root_refs == 0 && gce.refs == 0 &&
++	       !context.config_updating);
++	assert(gets == vblank_puts && vblank_refs == 0);
++	mtk_crtc_atomic_enable(&context.base, &commit);
++	assert(context.enabled && target_refs == 3 && root_refs == 1 &&
++	       init_calls == 1);
++	reset();
++	callback_on_flush = true;
++	planes[0].pending.dirty = false;
++	planes[0].pending.config = true;
++	context.pending_planes = true;
++	mtk_crtc_atomic_flush(&context.base, &commit);
++	assert(pending_observed && state.pending_config &&
++	       planes[0].pending.config && !context.config_updating);
++	assert(packet_active && gce.refs == 1);
++	reset();
++	pm_error = -EIO;
++	mtk_crtc_atomic_flush(&context.base, &commit);
++	retained();
++	reset();
++	submit_error = -ENOBUFS;
++	mtk_crtc_atomic_flush(&context.base, &commit);
++	assert(gce.refs == 0);
++	retained();
++	reset();
++	events(&owned, &owned);
++	mutex_lock(&context.hw_lock);
++	mtk_crtc_cmdq_fault_locked(&context, "test", -EIO, NULL);
++	mutex_unlock(&context.hw_lock);
++	assert(sent[0] == 1 && vblank_puts == 1 && vblank_refs == 0);
++	state.base.event = &incoming;
++	mtk_crtc_atomic_begin(&context.base, &commit);
++	assert(sent[1] == 1 && gets == 0 && vblank_puts == 1);
++	reset();
++	state.base.event = &incoming;
++	mtk_crtc_atomic_begin(&context.base, &commit);
++	assert(gets == 1 && context.event == &incoming &&
++	       state.base.event == NULL);
++	mutex_lock(&context.hw_lock);
++	mtk_crtc_cmdq_fault_locked(&context, "test", -EIO, NULL);
++	mutex_unlock(&context.hw_lock);
++	assert(sent[1] == 1 && vblank_puts == 1 && vblank_refs == 0);
++	reset();
++	events(&owned, &incoming);
++	pthread_t first, second;
++	assert(pthread_barrier_init(&barrier, NULL, 2) == 0);
++	assert(pthread_create(&first, NULL, fault_worker, NULL) == 0);
++	assert(pthread_create(&second, NULL, event_worker, NULL) == 0);
++	assert(pthread_join(first, NULL) == 0 &&
++	       pthread_join(second, NULL) == 0);
++	assert(sent[0] == 1 && sent[1] == 1 && vblank_puts == 1 &&
++	       vblank_refs == 0);
++	assert(pthread_barrier_destroy(&barrier) == 0);
++	/* Already-checked commits can carry a state different from crtc->state. */
++	for (int alias = 0; alias < 2; alias++) {
++		for (int operation = 0; operation < 4; operation++) {
++			reset();
++			struct drm_pending_vblank_event queued = { .id = 2 };
++			struct mtk_crtc_state swapped = {
++				.base.event = alias ? &owned : &queued
++			};
++			events(&owned, &incoming);
++			atomic_store(&context.cmdq_faulted, true);
++			commit.new_state = &swapped.base;
++			if (operation == 0)
++				mtk_crtc_atomic_begin(&context.base, &commit);
++			if (operation == 1)
++				mtk_crtc_atomic_enable(&context.base, &commit);
++			if (operation == 2)
++				mtk_crtc_atomic_disable(&context.base, &commit);
++			if (operation == 3)
++				mtk_crtc_atomic_flush(&context.base, &commit);
++			assert(sent[0] == 1 && sent[1] == 1 &&
++			       sent[2] == !alias);
++			assert(vblank_puts == 1 && vblank_refs == 0 &&
++			       gets == 0);
++			assert(!context.event && !state.base.event &&
++			       !swapped.base.event);
++			assert(flush_calls == 0 && fini_calls == 0 &&
++			       power_calls == 0);
++		}
++		reset();
++		fail_flush = 1;
++		struct drm_pending_vblank_event queued = { .id = 2 };
++		struct mtk_crtc_state swapped = {
++			.base.event = alias ? &owned : &queued
++		};
++		events(&owned, &incoming);
++		commit.new_state = &swapped.base;
++		mtk_crtc_atomic_disable(&context.base, &commit);
++		assert(sent[0] == 1 && sent[1] == 1 && sent[2] == !alias);
++		assert(vblank_puts == 1 && vblank_refs == 0 &&
++		       !swapped.base.event);
++		assert(context.enabled && target_refs == 3 && root_refs == 1);
++	}
++	commit.new_state = &state.base;
++	reset();
++	context.cmdq_checked_stop = false;
++	zero_wait = true;
++	mtk_crtc_atomic_disable(&context.base, &commit);
++	assert(!atomic_load(&context.cmdq_faulted) && !context.enabled &&
++	       fini_calls == 1);
++	assert(flush_calls == 1 && target_refs == 0 && root_refs == 0);
++	assert(pthread_mutex_destroy(&context.hw_lock) == 0);
++	assert(pthread_mutex_destroy(&context.config_lock) == 0);
++	assert(pthread_mutex_destroy(&drm.event_lock) == 0);
++	puts("CRTC stop ordering, target retention, callback coordination, event balance and future guards passed");
++	return 0;
++}
+diff --git a/tools/testing/selftests/mtk_clk/test_crtc_stop.py b/tools/testing/selftests/mtk_clk/test_crtc_stop.py
+new file mode 100755
+index 0000000000..7e9276abea
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/test_crtc_stop.py
+@@ -0,0 +1,54 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Exercise production CRTC checked-stop power retention with host mocks."""
++from pathlib import Path
++import os
++import re
++import subprocess
++import tempfile
++
++assets = Path(__file__).resolve().parent
++repo = Path(os.environ.get('KERNEL_SRC', str(assets.parents[3])))
++source = (repo / 'drivers/gpu/drm/mediatek/mtk_crtc.c').read_text()
++
++
++def function(name):
++    match = re.search(r'^(?:static )?(?:int|void|bool) ' + name + r'\(', source, re.M)
++    start = match.start()
++    end = source.index('{', start) + 1
++    depth = 1
++    while depth:
++        depth += (source[end] == '{') - (source[end] == '}')
++        end += 1
++    return source[start:end]
++
++
++soc = (repo / 'drivers/gpu/drm/mediatek/mtk_drm_drv.c').read_text()
++assert soc.count('.cmdq_checked_stop = true') == 4
++stop = function('mtk_crtc_cmdq_stop_locked')
++assert stop.index('mtk_crtc_set_config_updating') < stop.index('mbox_flush')
++worker = function('mtk_crtc_update_config_locked')
++assert worker.index('mtk_crtc_cmdq_stop_locked') < worker.index('mtk_ddp_gamma_set') < worker.index('pending.config = true') < worker.index('cmd_buf_size = 0')
++shutdown = function('mtk_crtc_atomic_disable')
++checked = shutdown.split('if (mtk_crtc->cmdq_checked_stop && mtk_crtc->cmdq_client.chan)', 1)[1].split('} else if', 1)[0]
++assert checked.index('mtk_crtc_cmdq_stop_locked') < checked.index('cmdq_vblank_cnt = 0')
++assert shutdown.index('mtk_crtc_cmdq_stop_locked') < shutdown.index('mtk_crtc_ddp_hw_fini')
++callback = source[source.index('static void ddp_cmdq_cb('):source.index('\n#endif', source.index('static void ddp_cmdq_cb('))]
++assert callback.index('mtk_crtc_faulted') < callback.index('state = to_mtk_crtc_state')
++production = '\n'.join(function(name) for name in [
++    'mtk_crtc_faulted', 'mtk_crtc_finish_page_flip', 'mtk_crtc_fault_events',
++    'mtk_crtc_set_config_updating', 'mtk_crtc_cmdq_fault_locked',
++    'mtk_crtc_cmdq_stop_locked', 'mtk_crtc_update_config_locked',
++    'mtk_crtc_update_config', 'mtk_crtc_atomic_enable', 'mtk_crtc_atomic_disable',
++    'mtk_crtc_send_unowned_event', 'mtk_crtc_atomic_begin', 'mtk_crtc_atomic_flush',
++    'mtk_crtc_atomic_check', 'mtk_crtc_plane_check', 'mtk_crtc_plane_disable',
++    'mtk_crtc_async_update', 'mtk_crtc_ddp_irq'])
++with tempfile.TemporaryDirectory(prefix='mtk-crtc-stop-') as tmp:
++    tmp = Path(tmp)
++    c = tmp / 'test.c'
++    c.write_text((assets / 'crtc_stop_cases.c').read_text().replace('/* PRODUCTION */', production))
++    binary = tmp / 'test'
++    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
++                    '-Wno-unused-parameter', '-Wno-sign-compare', '-Werror', '-g', '-pthread',
++                    '-fsanitize=address,undefined', str(c), '-o', str(binary)], check=True)
++    subprocess.run([str(binary)], check=True)
+-- 
+2.56.0
+

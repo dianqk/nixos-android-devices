@@ -1,0 +1,1856 @@
+From 1c38cc681b42c2f8f74464d63dde510f7ea2221f Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 10 Nov 2026 16:15:14 +0800
+Subject: [PATCH] ccci: quiesce CCIF and preserve modem stop failures
+
+A completed stop must distinguish platform power-off failure from GATED.
+Preserve negative PM errors and require logical runtime suspension before
+continuing the existing power-off sequence. Keep a terminal failed-stop
+state and reject later FSM commands instead of reporting stopped and
+allowing another start after an uncertain power transition.
+
+Prepare CCIF in process context before platform power-off: retain an
+independent DATA0 IRQ mask while draining the empty-interrupt poller,
+synchronize DATA1, and drain SRAM/status work and in-flight TX sections.
+Keep reset and clock-off in the successful GATED completion path. Preserve
+the guarded register-access wrappers and the IRQ-safe watchdog callback.
+
+Track queued STOP completion so GET_MD_STATE reports EINPROGRESS until
+callbacks finish, then return any latched stop errno. This supports an
+owner waiting for completed stop rather than asynchronous acceptance or
+an ambiguous public state. Module unload and manual unbind remain disabled;
+DPMAIF stop-error handling and full transport teardown are separate work.
+
+Exercise production start/stop/IRQ/poll/TX and PM/FSM functions, including
+concurrent mask retirement, waiter errors and pending-command completion.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c
+Link: https://docs.kernel.org/core-api/genericirq.html
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/misc/mediatek/eccci/fsm/ccci_fsm.c    |  64 +-
+ .../mediatek/eccci/fsm/ccci_fsm_internal.h    |   5 +-
+ .../misc/mediatek/eccci/fsm/ccci_fsm_ioctl.c  |   7 +
+ .../mediatek/eccci/fsm/md_sys1_platform.c     |  11 +-
+ drivers/misc/mediatek/eccci/fsm/modem_sys1.c  |  17 +-
+ drivers/misc/mediatek/eccci/hif/ccci_hif.c    |   9 +
+ .../misc/mediatek/eccci/hif/ccci_hif_ccif.c   |  71 ++-
+ .../misc/mediatek/eccci/hif/ccci_hif_ccif.h   |   2 +-
+ drivers/misc/mediatek/eccci/inc/ccci_hif.h    |   1 +
+ tools/testing/selftests/mtk_ccci/Makefile     |   4 +-
+ .../selftests/mtk_ccci/ccif_start_cases.c     | 560 +++++++++++++----
+ .../selftests/mtk_ccci/modem_stop_cases.c     | 565 ++++++++++++++++++
+ .../selftests/mtk_ccci/test_ccif_start.py     |  56 +-
+ .../selftests/mtk_ccci/test_modem_stop.py     |  76 +++
+ 14 files changed, 1296 insertions(+), 152 deletions(-)
+ create mode 100644 tools/testing/selftests/mtk_ccci/modem_stop_cases.c
+ create mode 100755 tools/testing/selftests/mtk_ccci/test_modem_stop.py
+
+diff --git a/drivers/misc/mediatek/eccci/fsm/ccci_fsm.c b/drivers/misc/mediatek/eccci/fsm/ccci_fsm.c
+index a34d3cb3da..c194c77e34 100644
+--- a/drivers/misc/mediatek/eccci/fsm/ccci_fsm.c
++++ b/drivers/misc/mediatek/eccci/fsm/ccci_fsm.c
+@@ -174,6 +174,9 @@ int fsm_append_command(struct ccci_fsm_ctl *ctl,
+ 			"invalid command %d\n", cmd_id);
+ 		return -CCCI_ERR_INVALID_PARAM;
+ 	}
++	ret = READ_ONCE(ctl->stop_error);
++	if (ret)
++		return ret;
+ 	cmd = kmalloc(sizeof(struct ccci_fsm_command),
+ 		(in_irq() || in_softirq()
+ 		|| irqs_disabled()) ? GFP_ATOMIC : GFP_KERNEL);
+@@ -191,6 +194,14 @@ int fsm_append_command(struct ccci_fsm_ctl *ctl,
+ 	cmd->flag = flag;
+ 
+ 	spin_lock_irqsave(&ctl->command_lock, flags);
++	ret = READ_ONCE(ctl->stop_error);
++	if (ret) {
++		spin_unlock_irqrestore(&ctl->command_lock, flags);
++		kfree(cmd);
++		return ret;
++	}
++	if (cmd_id == CCCI_COMMAND_STOP)
++		atomic_inc(&ctl->stop_pending);
+ 	list_add_tail(&cmd->entry, &ctl->command_queue);
+ 	spin_unlock_irqrestore(&ctl->command_lock, flags);
+ 	if (!in_irq())
+@@ -208,7 +219,9 @@ int fsm_append_command(struct ccci_fsm_ctl *ctl,
+ 				cmd->complete != 0);
+ 			if (ret == -ERESTARTSYS)
+ 				continue;
+-			if (cmd->complete != 1)
++			if (cmd->complete < 0)
++				result = cmd->complete;
++			else if (cmd->complete != 1)
+ 				result = -1;
+ 			spin_lock_irqsave(&ctl->cmd_complete_lock, flags);
+ 			kfree(cmd);
+@@ -228,6 +241,9 @@ static void fsm_finish_command(struct ccci_fsm_ctl *ctl,
+ 		"command %d is completed %d by %ps\n",
+ 		cmd->cmd_id, result,
+ 		__builtin_return_address(0));
++	/* Publish completion only after stop callbacks and state updates finish. */
++	if (cmd->cmd_id == CCCI_COMMAND_STOP)
++		atomic_dec_return(&ctl->stop_pending);
+ 	if (cmd->flag & FSM_CMD_FLAG_WAIT_FOR_COMPLETE) {
+ 		spin_lock_irqsave(&ctl->cmd_complete_lock, flags);
+ 		cmd->complete = result;
+@@ -265,6 +281,8 @@ int fsm_append_event(struct ccci_fsm_ctl *ctl, enum CCCI_FSM_EVENT event_id,
+ 		CCCI_ERROR_LOG(0, FSM, "invalid event %d\n", event_id);
+ 		return -CCCI_ERR_INVALID_PARAM;
+ 	}
++	if (READ_ONCE(ctl->stop_error))
++		return READ_ONCE(ctl->stop_error);
+ 	if (event_id == CCCI_EVENT_FS_IN) {
+ 		atomic_set(&(ctl->fs_ongoing), 1);
+ 		return 0;
+@@ -286,6 +304,11 @@ int fsm_append_event(struct ccci_fsm_ctl *ctl, enum CCCI_FSM_EVENT event_id,
+ 		memcpy(event->data, data, length);
+ 
+ 	spin_lock_irqsave(&ctl->event_lock, flags);
++	if (READ_ONCE(ctl->stop_error)) {
++		spin_unlock_irqrestore(&ctl->event_lock, flags);
++		kfree(event);
++		return READ_ONCE(ctl->stop_error);
++	}
+ 	list_add_tail(&event->entry, &ctl->event_queue);
+ 	spin_unlock_irqrestore(&ctl->event_lock, flags);
+ 	/* do not derefence event after here */
+@@ -1507,7 +1530,7 @@ static void fsm_routine_stop(struct ccci_fsm_ctl *ctl,
+ 	ctl->curr_state = CCCI_FSM_STOPPING;
+ 
+ 	/* 2. pre-stop: polling MD for infinit sleep mode */
+-	ccci_md_pre_stop(cmd->flag & FSM_CMD_FLAG_FLIGHT_MODE ?
++	ret = ccci_md_pre_stop(cmd->flag & FSM_CMD_FLAG_FLIGHT_MODE ?
+ 		MD_FLIGHT_MODE_ENTER : MD_FLIGHT_MODE_NONE);
+ 	/* 3. check for EE */
+ 	ee_cmd = fsm_check_for_ee(ctl, 1);
+@@ -1520,9 +1543,21 @@ static void fsm_routine_stop(struct ccci_fsm_ctl *ctl,
+ 	/*reset fsm poller*/
+ 	ctl->poller_ctl.poller_state = FSM_POLLER_RECEIVED_RESPONSE;
+ 	wake_up(&ctl->poller_ctl.status_rx_wq);
+-	/* 4. hardware stop */
+-	ccci_md_stop(cmd->flag & FSM_CMD_FLAG_FLIGHT_MODE ?
+-		MD_FLIGHT_MODE_ENTER : MD_FLIGHT_MODE_NONE);
++	/* Even a failed pre-stop must first block port writes above. */
++	if (!ret)
++		ret = ccci_md_stop(cmd->flag & FSM_CMD_FLAG_FLIGHT_MODE ?
++			MD_FLIGHT_MODE_ENTER : MD_FLIGHT_MODE_NONE);
++	if (ret) {
++		CCCI_ERROR_LOG(0, FSM, "stop failed: %d; host reboot required\n", ret);
++		/* Stop APIs return zero on success; preserve negative errno. */
++		if (ret > 0)
++			ret = -EIO;
++		spin_lock_irqsave(&ctl->command_lock, flags);
++		WRITE_ONCE(ctl->stop_error, ret);
++		ctl->last_state = ctl->curr_state;
++		ctl->curr_state = CCCI_FSM_STOP_FAILED;
++		spin_unlock_irqrestore(&ctl->command_lock, flags);
++	}
+ 	/* 5. clear event queue */
+ 	spin_lock_irqsave(&ctl->event_lock, flags);
+ 	list_for_each_entry_safe(event, next, &ctl->event_queue, entry) {
+@@ -1532,7 +1567,12 @@ static void fsm_routine_stop(struct ccci_fsm_ctl *ctl,
+ 	}
+ 	spin_unlock_irqrestore(&ctl->event_lock, flags);
+ 	__pm_relax(ctl->wakelock);
+-	/* 6. always end in stopped state */
++	if (ret) {
++		needforcestop = 0;
++		fsm_finish_command(ctl, cmd, ret);
++		return;
++	}
++	/* 6. Publish stopped only after successful hardware stop. */
+ success:
+ 	needforcestop = 0;
+ 
+@@ -1625,6 +1665,11 @@ static int fsm_main_thread(void *data)
+ 
+ 		CCCI_NORMAL_LOG(0, FSM, "command process\n");
+ 		cmd_id = cmd->cmd_id;
++		ret = READ_ONCE(ctl->stop_error);
++		if (ret) {
++			fsm_finish_command(ctl, cmd, ret);
++			continue;
++		}
+ 		fsm_command_pre(cmd_id);
+ 
+ 		switch (cmd->cmd_id) {
+@@ -1693,6 +1738,7 @@ int ccci_fsm_init(void)
+ 	spin_lock_init(&ctl->cmd_complete_lock);
+ 	spin_lock_init(&state_broadcase_lock);
+ 	atomic_set(&ctl->fs_ongoing, 0);
++	atomic_set(&ctl->stop_pending, 0);
+ 	ret = snprintf(ctl->wakelock_name, sizeof(ctl->wakelock_name), "md_wakelock");
+ 	if (ret <= 0 || ret >= sizeof(ctl->wakelock_name)) {
+ 		CCCI_ERROR_LOG(0, FSM,
+@@ -1771,6 +1817,8 @@ int ccci_fsm_recv_md_interrupt(enum MD_IRQ_TYPE type)
+ 	if (!ctl)
+ 		return -CCCI_ERR_INVALID_PARAM;
+ 
++	if (READ_ONCE(ctl->stop_error))
++		return READ_ONCE(ctl->stop_error);
+ 	__pm_wakeup_event(ctl->wakelock, jiffies_to_msecs(10 * HZ));
+ 
+ 	if (type == MD_IRQ_WDT) {
+@@ -1793,6 +1841,10 @@ int ccci_fsm_recv_control_packet(struct sk_buff *skb)
+ 	if (!ctl)
+ 		return -CCCI_ERR_INVALID_PARAM;
+ 
++	if (READ_ONCE(ctl->stop_error)) {
++		ccci_free_skb(skb);
++		return READ_ONCE(ctl->stop_error);
++	}
+ 	CCCI_NORMAL_LOG(0, FSM,
+ 		"control message 0x%X,0x%X\n",
+ 		ccci_h->data[1], ccci_h->reserved);
+diff --git a/drivers/misc/mediatek/eccci/fsm/ccci_fsm_internal.h b/drivers/misc/mediatek/eccci/fsm/ccci_fsm_internal.h
+index f5b72c7807..586443169a 100644
+--- a/drivers/misc/mediatek/eccci/fsm/ccci_fsm_internal.h
++++ b/drivers/misc/mediatek/eccci/fsm/ccci_fsm_internal.h
+@@ -38,6 +38,7 @@ enum {
+ 	CCCI_FSM_READY,
+ 	CCCI_FSM_STOPPING,
+ 	CCCI_FSM_EXCEPTION,
++	CCCI_FSM_STOP_FAILED,
+ };
+ 
+ enum CCCI_FSM_EVENT {
+@@ -225,6 +226,8 @@ struct ccci_fsm_ctl {
+ 
+ 	unsigned int curr_state;
+ 	unsigned int last_state;
++	int stop_error; /* Terminal failure: only a host reboot can recover. */
++	atomic_t stop_pending;
+ 	struct list_head command_queue;
+ 	struct list_head event_queue;
+ 	wait_queue_head_t command_wq;
+@@ -259,7 +262,7 @@ struct ccci_fsm_command {
+ 	struct list_head entry;
+ 	enum CCCI_FSM_COMMAND cmd_id;
+ 	unsigned int flag;
+-	int complete; /* -1: fail; 0: on-going; 1: success */
++	int complete; /* negative: error; 0: on-going; 1: success */
+ 	wait_queue_head_t complete_wq;
+ };
+ 
+diff --git a/drivers/misc/mediatek/eccci/fsm/ccci_fsm_ioctl.c b/drivers/misc/mediatek/eccci/fsm/ccci_fsm_ioctl.c
+index 0ef862194f..814cb2e97a 100644
+--- a/drivers/misc/mediatek/eccci/fsm/ccci_fsm_ioctl.c
++++ b/drivers/misc/mediatek/eccci/fsm/ccci_fsm_ioctl.c
+@@ -534,6 +534,13 @@ long ccci_fsm_ioctl(unsigned int cmd, unsigned long arg)
+ 
+ 	switch (cmd) {
+ 	case CCCI_IOC_GET_MD_STATE:
++		ret = READ_ONCE(ctl->stop_error);
++		if (ret)
++			break;
++		if (atomic_read_acquire(&ctl->stop_pending)) {
++			ret = -EINPROGRESS;
++			break;
++		}
+ 		state_for_user = ccci_fsm_get_md_state_for_user();
+ 		ret = put_user((unsigned int)state_for_user,
+ 					(unsigned int __user *)arg);
+diff --git a/drivers/misc/mediatek/eccci/fsm/md_sys1_platform.c b/drivers/misc/mediatek/eccci/fsm/md_sys1_platform.c
+index d8e72872b0..8d2c31f5fa 100644
+--- a/drivers/misc/mediatek/eccci/fsm/md_sys1_platform.c
++++ b/drivers/misc/mediatek/eccci/fsm/md_sys1_platform.c
+@@ -599,7 +599,7 @@ static int md1_disable_sequencer_setting(struct ccci_modem *md)
+ 
+ static int md_cd_power_off(struct ccci_modem *md, unsigned int timeout)
+ {
+-	int ret;
++	int ret = 0;
+ 	unsigned int reg_value = 0;
+ 	void __iomem *reg;
+ 
+@@ -641,6 +641,15 @@ static int md_cd_power_off(struct ccci_modem *md, unsigned int timeout)
+ 		"[POWER OFF] MD MTCMOS OFF start\n");
+ #ifdef USING_PM_RUNTIME
+ 	ret = pm_runtime_put_sync(&md->plat_dev->dev);
++	CCCI_NORMAL_LOG(0, TAG, "[POWER OFF] PM result=%d suspended=%d usage=%d\n",
++		ret, pm_runtime_status_suspended(&md->plat_dev->dev),
++		atomic_read(&md->plat_dev->dev.power.usage_count));
++	if (ret < 0)
++		return ret;
++	if (!pm_runtime_status_suspended(&md->plat_dev->dev))
++		return -EBUSY;
++	/* A positive PM return can also indicate successful suspension. */
++	ret = 0;
+ #else
+ 	clk_disable_unprepare(clk_table[0].clk_ref);
+ 	CCCI_BOOTUP_LOG(0, TAG, "CCF:disable md1 clk\n");
+diff --git a/drivers/misc/mediatek/eccci/fsm/modem_sys1.c b/drivers/misc/mediatek/eccci/fsm/modem_sys1.c
+index f1cac3dd47..c1d92e08a4 100644
+--- a/drivers/misc/mediatek/eccci/fsm/modem_sys1.c
++++ b/drivers/misc/mediatek/eccci/fsm/modem_sys1.c
+@@ -370,13 +370,18 @@ static int md_cd_stop(struct ccci_modem *md, unsigned int stop_type)
+ 		"modem is power off, stop_type=%d\n", stop_type);
+ 	ccci_hif_md_exception((1<<CCIF_HIF_ID), HIF_EX_STOP_EE_NOTIFY);
+ 
+-	/* power off MD */
+-	if (md->hw_info->plat_ptr->power_off)
+-		ret = md->hw_info->plat_ptr->power_off(md,
+-			stop_type == MD_FLIGHT_MODE_ENTER ? 100 : 0);
+-	CCCI_NORMAL_LOG(0, TAG, "modem is power off done, %d\n", ret);
++	ret = ccci_hif_pre_stop(CCIF_HIF_ID);
++	if (ret)
++		return ret;
+ 
+-	return 0;
++	/* Keep the quiesced AP resources if platform power-off fails. */
++	if (!md->hw_info->plat_ptr->power_off)
++		return -EOPNOTSUPP;
++	ret = md->hw_info->plat_ptr->power_off(md,
++		stop_type == MD_FLIGHT_MODE_ENTER ? 100 : 0);
++	CCCI_NORMAL_LOG(0, TAG, "modem power-off result %d\n", ret);
++
++	return ret;
+ }
+ 
+ static void dump_runtime_data_v2(struct ccci_modem *md,
+diff --git a/drivers/misc/mediatek/eccci/hif/ccci_hif.c b/drivers/misc/mediatek/eccci/hif/ccci_hif.c
+index 6cfddb46ae..2feb3219f1 100644
+--- a/drivers/misc/mediatek/eccci/hif/ccci_hif.c
++++ b/drivers/misc/mediatek/eccci/hif/ccci_hif.c
+@@ -361,6 +361,15 @@ void ccci_md_dump_log_history(
+ }
+ EXPORT_SYMBOL(ccci_md_dump_log_history);
+ 
++/* Mandatory process-context preparation; never called from the WDT IRQ. */
++int ccci_hif_pre_stop(unsigned char hif_id)
++{
++	if (hif_id >= CCCI_HIF_NUM || !ccci_hif[hif_id] ||
++	    !ccci_hif_op[hif_id] || !ccci_hif_op[hif_id]->pre_stop)
++		return -ENODEV;
++	return ccci_hif_op[hif_id]->pre_stop(hif_id);
++}
++
+ int ccci_hif_stop(unsigned char hif_id)
+ {
+ 	int ret = 0;
+diff --git a/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c b/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c
+index 941fb26e4f..5e9cdd3cce 100644
+--- a/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c
++++ b/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c
+@@ -333,7 +333,8 @@ static int md_ccif_op_dump_status(unsigned char hif_id,
+ 		return -1;
+ 
+ 	if (ccif_ctrl->ccif_state == HIFCCIF_STATE_PWROFF
+-		|| ccif_ctrl->ccif_state == HIFCCIF_STATE_MIN) {
++		|| ccif_ctrl->ccif_state == HIFCCIF_STATE_MIN
++		|| READ_ONCE(ccif_ctrl->ccif_state) == HIFCCIF_STATE_QUIESCED) {
+ 		CCCI_MEM_LOG_TAG(0, TAG, "CCIF not power on, skip dump\n");
+ 		return -2;
+ 	}
+@@ -937,6 +938,9 @@ static int md_ccif_send(unsigned char hif_id, int channel_id)
+ 	int busy = 0;
+ 	struct md_ccif_ctrl *ccif_ctrl = ccci_ccif_ctrl;
+ 
++	if (READ_ONCE(ccif_ctrl->ccif_state) == HIFCCIF_STATE_QUIESCED)
++		return -ESHUTDOWN;
++
+ 	busy = ccif_read32(ccif_ctrl->ccif_ap_base, APCCIF_BUSY);
+ 	if (busy & (1 << channel_id)) {
+ 		CCCI_REPEAT_LOG(0, TAG, "CCIF channel %d busy\n", channel_id);
+@@ -1048,6 +1052,11 @@ static int md_ccif_op_send_skb(unsigned char hif_id, int qno,
+ 	 * cause a potential deadlock
+ 	 */
+ 	spin_lock_irqsave(&queue->tx_lock, flags);
++	if (READ_ONCE(ccif_ctrl->ccif_state) == HIFCCIF_STATE_QUIESCED ||
++	    ccci_fsm_get_md_state() == WAITING_TO_STOP) {
++		spin_unlock_irqrestore(&queue->tx_lock, flags);
++		return -ESHUTDOWN;
++	}
+ 
+ 	if (ccci_ringbuf_writeable(queue->ringbuf, skb->len) > 0) {
+ 
+@@ -1549,6 +1558,38 @@ static int ccif_disable_irq1(unsigned char hif_id)
+ 	return 0;
+ }
+ 
++/* Process context only: stop_for_ee also runs from the watchdog IRQ. */
++static int ccif_pre_stop(unsigned char hif_id)
++{
++	struct md_ccif_ctrl *ccif_ctrl = ccci_ccif_ctrl;
++	enum hifccif_state state = READ_ONCE(ccif_ctrl->ccif_state);
++	unsigned long flags;
++	unsigned int i;
++
++	if (state == HIFCCIF_STATE_MIN || state == HIFCCIF_STATE_PWROFF ||
++	    state == HIFCCIF_STATE_QUIESCED)
++		return 0;
++	if (state != HIFCCIF_STATE_PWRON)
++		return -EINVAL;
++
++	WRITE_ONCE(ccif_ctrl->ccif_state, HIFCCIF_STATE_QUIESCED);
++	/* New sends fail under these locks; finish sends that already passed. */
++	for (i = 0; i < QUEUE_NUM; i++) {
++		spin_lock_irqsave(&ccif_ctrl->txq[i].tx_lock, flags);
++		spin_unlock_irqrestore(&ccif_ctrl->txq[i].tx_lock, flags);
++	}
++	/* Own a separate mask while the poller retires its nested disable. */
++	disable_irq(ccif_ctrl->ap_ccif_irq0_id);
++	ccif_disable_irq1(hif_id);
++	synchronize_irq(ccif_ctrl->ap_ccif_irq1_id);
++	cancel_delayed_work_sync(&ccif_ctrl->data0_poll_work);
++	if (atomic_xchg(&ccif_ctrl->data0_irq_masked, 0))
++		enable_irq(ccif_ctrl->ap_ccif_irq0_id);
++	cancel_work_sync(&ccif_ctrl->ccif_sram_work);
++	cancel_work_sync(&ccif_ctrl->ccif_status_notify_work);
++	return 0;
++}
++
+ static void md_ccif_sram_reset(unsigned char hif_id)
+ {
+ 	int idx = 0;
+@@ -1565,11 +1606,20 @@ static int ccif_start(unsigned char hif_id)
+ {
+ 	unsigned long flags;
+ 	struct md_ccif_ctrl *ccif_ctrl = ccci_ccif_ctrl;
++	int ret;
+ 
++	if (READ_ONCE(ccif_ctrl->ccif_state) == HIFCCIF_STATE_QUIESCED)
++		return -ESHUTDOWN;
+ 	if (ccif_ctrl->ccif_state == HIFCCIF_STATE_PWRON)
+ 		return 0;
+-	if (ccif_ctrl->ccif_state == HIFCCIF_STATE_MIN)
+-		ccif_late_init(hif_id);
++	if (ccif_ctrl->ccif_state != HIFCCIF_STATE_MIN &&
++	    ccif_ctrl->ccif_state != HIFCCIF_STATE_PWROFF)
++		return -EINVAL;
++	if (ccif_ctrl->ccif_state == HIFCCIF_STATE_MIN) {
++		ret = ccif_late_init(hif_id);
++		if (ret)
++			return ret;
++	}
+ 	if (hif_id != CCIF_HIF_ID)
+ 		CCCI_NORMAL_LOG(0, TAG, "%s but %d\n",
+ 			__func__, hif_id);
+@@ -1594,13 +1644,8 @@ static int ccif_start(unsigned char hif_id)
+ 	/* An immediate empty IRQ may run its poll worker before start returns. */
+ 	WRITE_ONCE(ccif_ctrl->ccif_state, HIFCCIF_STATE_PWRON);
+ 	ccif_enable_irq1(CCIF_HIF_ID);
+-	if (!ccif_ctrl->irq0_armed) {
+-		ccif_ctrl->irq0_armed = true;
+-		enable_irq(ccif_ctrl->ap_ccif_irq0_id);
+-	} else if (atomic_cmpxchg(&ccif_ctrl->data0_irq_masked, 1, 0) == 1) {
+-		/* masked by an empty interrupt before the last stop */
+-		enable_irq(ccif_ctrl->ap_ccif_irq0_id);
+-	}
++	/* Initial NOAUTOEN or the single mask retained by the previous stop. */
++	enable_irq(ccif_ctrl->ap_ccif_irq0_id);
+ 	CCCI_NORMAL_LOG(0, TAG, "%s\n", __func__);
+ 	return 0;
+ }
+@@ -1608,6 +1653,7 @@ static int ccif_start(unsigned char hif_id)
+ static int ccif_stop(unsigned char hif_id)
+ {
+ 	struct md_ccif_ctrl *ccif_ctrl = ccci_ccif_ctrl;
++	int ret;
+ 
+ 	if (ccif_ctrl->ccif_state == HIFCCIF_STATE_PWROFF
+ 		|| ccif_ctrl->ccif_state == HIFCCIF_STATE_MIN)
+@@ -1615,8 +1661,10 @@ static int ccif_stop(unsigned char hif_id)
+ 	/* ACK CCIF for MD. while entering flight mode,
+ 	 * we may send something after MD slept
+ 	 */
++	ret = ccif_pre_stop(hif_id);
++	if (ret)
++		return ret;
+ 	WRITE_ONCE(ccif_ctrl->ccif_state, HIFCCIF_STATE_PWROFF);
+-	cancel_delayed_work_sync(&ccif_ctrl->data0_poll_work);
+ 	ccci_reset_ccif_hw(AP_MD1_CCIF,
+ 		ccif_ctrl->ccif_ap_base, ccif_ctrl->ccif_md_base, ccif_ctrl);
+ 
+@@ -1637,6 +1685,7 @@ static struct ccci_hif_ops ccci_hif_ccif_ops = {
+ 	.dump_status = &md_ccif_op_dump_status,
+ 
+ 	.start = &ccif_start,
++	.pre_stop = &ccif_pre_stop,
+ 	.stop = &ccif_stop,
+ 	.debug = &ccif_debug,
+ 	.send_data = &md_ccif_send_data,
+diff --git a/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.h b/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.h
+index 25f9e6c88c..41e2b34416 100644
+--- a/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.h
++++ b/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.h
+@@ -84,6 +84,7 @@ enum hifccif_state {
+ 	HIFCCIF_STATE_PWROFF,
+ 	HIFCCIF_STATE_PWRON,
+ 	HIFCCIF_STATE_EXCEPTION,
++	HIFCCIF_STATE_QUIESCED,
+ 	HIFCCIF_STATE_MAX,
+ };
+ struct md_ccif_ctrl {
+@@ -117,7 +118,6 @@ struct md_ccif_ctrl {
+ 	unsigned char hif_id;
+ 	struct ccci_hif_traffic traffic_info;
+ 	struct timer_list traffic_monitor;
+-	bool irq0_armed; /* CCIF_AP_DATA0 enabled at the first start */
+ 	/* CCIF_AP_DATA0 masked after an entry without a channel, polled */
+ 	struct delayed_work data0_poll_work;
+ 	atomic_t data0_irq_masked;
+diff --git a/drivers/misc/mediatek/eccci/inc/ccci_hif.h b/drivers/misc/mediatek/eccci/inc/ccci_hif.h
+index 5ef17592ca..90c481ae18 100644
+--- a/drivers/misc/mediatek/eccci/inc/ccci_hif.h
++++ b/drivers/misc/mediatek/eccci/inc/ccci_hif.h
+@@ -38,6 +38,7 @@ enum ccci_hif_debug_flg {
+ 
+ int ccci_hif_init(unsigned int hif_flag);
+ int ccci_hif_late_init(unsigned int hif_flag);
++int ccci_hif_pre_stop(unsigned char hif_id);
+ int ccci_hif_send_skb(unsigned char hif_id, int tx_qno, struct sk_buff *skb,
+ 	int from_pool, int blocking);
+ int ccci_hif_write_room(unsigned char hif_id, unsigned char qno);
+diff --git a/tools/testing/selftests/mtk_ccci/Makefile b/tools/testing/selftests/mtk_ccci/Makefile
+index ce88e445b5..a74666be9e 100644
+--- a/tools/testing/selftests/mtk_ccci/Makefile
++++ b/tools/testing/selftests/mtk_ccci/Makefile
+@@ -1,4 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-TEST_PROGS := test_ccif_start.py test_lk_metadata.py
+-TEST_FILES := ccif_start_cases.c lk_metadata_stubs.h lk_metadata_flow_stubs.h lk_metadata_cases.h
++TEST_PROGS := test_ccif_start.py test_lk_metadata.py test_modem_stop.py
++TEST_FILES := modem_stop_cases.c ccif_start_cases.c lk_metadata_stubs.h lk_metadata_flow_stubs.h lk_metadata_cases.h
+ include ../lib.mk
+diff --git a/tools/testing/selftests/mtk_ccci/ccif_start_cases.c b/tools/testing/selftests/mtk_ccci/ccif_start_cases.c
+index 601358f5fa..38c3ff30b3 100644
+--- a/tools/testing/selftests/mtk_ccci/ccif_start_cases.c
++++ b/tools/testing/selftests/mtk_ccci/ccif_start_cases.c
+@@ -1,137 +1,485 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+ #include <assert.h>
++#include <errno.h>
++#include <pthread.h>
++#include <sched.h>
+ #include <stdbool.h>
+ #include <stddef.h>
+ #include <stdio.h>
+ #include <string.h>
+-#define HIFCCIF_STATE_MIN 0
+-#define HIFCCIF_STATE_PWROFF 1
+-#define HIFCCIF_STATE_PWRON 2
++/* ENUM */
+ #define CCIF_HIF_ID 1
++#define QUEUE_NUM 2
+ #define RB_EXP 1
+ #define RB_NORMAL 0
+ #define AP_MD1_CCIF 0
+ #define APCCIF_RCHNUM 4
+ #define CCIF_EMPTY_IRQ_POLL_MS 20
+ #define IRQ_HANDLED 1
++#define READY 3
++#define EXCEPTION 4
++#define GATED 5
++#define WAITING_TO_STOP 6
++#define CCCI_MD_LOG_TX 1
++#define CCCI_UART1_TX 2
++#define CCCI_FS_TX 3
++#define CCCI_ERR_INVALID_QUEUE_INDEX 100
++#define OUT 0
++#define TAG "test"
++#define __iomem
++#define mb() ((void)0)
+ typedef int irqreturn_t;
+-typedef struct { int value; } atomic_t;
+-struct work_struct { int unused; };
+-struct delayed_work { struct work_struct work; bool pending; };
++typedef int enum_state_placeholder;
++_Static_assert(HIFCCIF_STATE_EXCEPTION == 3, "legacy CCIF state changed");
++_Static_assert(HIFCCIF_STATE_QUIESCED > HIFCCIF_STATE_EXCEPTION,
++	       "state was not appended");
++typedef struct {
++	int value;
++} atomic_t;
++struct work_struct {
++	bool pending;
++};
++struct delayed_work {
++	struct work_struct work;
++	bool pending;
++};
++struct ccci_header {
++	unsigned int channel;
++};
++struct sk_buff {
++	char data[32];
++	int len;
++};
++struct md_ccif_queue {
++	int tx_lock, index, ccif_ch;
++	void *ringbuf;
++};
++struct ccci_per_md {
++	bool data_usb_bypass;
++};
+ struct md_ccif_ctrl {
+-    int ccif_state;
+-    bool ccif_clk_free_run, irq0_armed;
+-    unsigned int ap_ccif_irq0_id, ap_ccif_irq1_id, data0_empty_polls;
+-    void *ccif_ap_base, *ccif_md_base;
+-    atomic_t data0_irq_masked, ccif_irq1_enabled;
+-    struct delayed_work data0_poll_work;
++	int ccif_state;
++	bool ccif_clk_free_run;
++	unsigned int ap_ccif_irq0_id, ap_ccif_irq1_id, data0_empty_polls;
++	void *ccif_ap_base, *ccif_md_base;
++	atomic_t data0_irq_masked, ccif_irq1_enabled;
++	struct delayed_work data0_poll_work;
++	struct work_struct ccif_sram_work, ccif_status_notify_work;
++	struct md_ccif_queue txq[QUEUE_NUM];
++	struct {
++		int md_gen;
++	} plat_val;
++	struct {
++		int logic_ch_pkt_cnt;
++	} traffic_info;
+ };
+ static struct md_ccif_ctrl ctrl, *ccci_ccif_ctrl = &ctrl;
++static struct ccci_per_md per_md;
+ static int devapc_flag_lock, devapc_check_flag, system_wq;
+-static unsigned int rchnum, reads, processed, schedules, enables[2], disables;
+-static unsigned int depth[2], reset_stage, late_inits, clock_on, clock_off, cancels;
+-static bool inject;
+-#define READ_ONCE(x) (*(volatile __typeof__(x) *)&(x))
+-#define WRITE_ONCE(x, v) (READ_ONCE(x) = (v))
+-#define container_of(p, type, member) ((type *)((char *)(p) - offsetof(type, member)))
++static unsigned int rchnum, reads, writes, processed, schedules, enables[2];
++static unsigned int depth[2], reset_stage, late_inits, clock_on, clock_off,
++	cancels;
++static unsigned int work_cancels, late_error, skb_frees, ring_writes,
++	state_queries;
++static int md_state, space, race;
++static bool inject, late_irq, worker_live;
++static pthread_t worker;
++static pthread_mutex_t tx_locks[QUEUE_NUM] = { PTHREAD_MUTEX_INITIALIZER,
++					       PTHREAD_MUTEX_INITIALIZER };
++static bool stop_done;
++static struct sk_buff thread_skb;
++static pthread_mutex_t pause_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t pause_cond = PTHREAD_COND_INITIALIZER;
++static int pause_kind;
++static bool entered, released;
++#define READ_ONCE(x) __atomic_load_n(&(x), __ATOMIC_SEQ_CST)
++#define WRITE_ONCE(x, v) __atomic_store_n(&(x), (v), __ATOMIC_SEQ_CST)
++#define container_of(p, type, member) \
++	((type *)((char *)(p) - offsetof(type, member)))
+ #define to_delayed_work(w) container_of(w, struct delayed_work, work)
+ #define CCCI_NORMAL_LOG(...) ((void)0)
+ #define CCCI_NOTICE_LOG(...) ((void)0)
+-#define spin_lock_irqsave(lock, flags) ((void)(lock), (flags) = 0)
+-#define spin_unlock_irqrestore(lock, flags) ((void)(lock), (void)(flags))
++#define CCCI_ERROR_LOG(...) ((void)0)
++#define CCCI_REPEAT_LOG(...) ((void)0)
++#define CCCI_DEBUG_LOG(...) ((void)0)
++static void fixture_lock(int *lock)
++{
++	if (*lock > 0)
++		pthread_mutex_lock(&tx_locks[*lock - 1]);
++}
++static void fixture_unlock(int *lock)
++{
++	if (*lock > 0)
++		pthread_mutex_unlock(&tx_locks[*lock - 1]);
++}
++#define spin_lock_irqsave(lock, flags) (fixture_lock(lock), (flags) = 0)
++#define spin_unlock_irqrestore(lock, flags) \
++	(fixture_unlock(lock), (void)(flags))
+ #define msecs_to_jiffies(x) (x)
+-static int atomic_cmpxchg(atomic_t *a, int old, int value) {
+-    int prior=a->value; if (prior==old) a->value=value; return prior;
++static int atomic_cmpxchg(atomic_t *a, int old, int value)
++{
++	__atomic_compare_exchange_n(&a->value, &old, value, false,
++				    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
++	return old;
++}
++static int atomic_xchg(atomic_t *a, int value)
++{
++	return __atomic_exchange_n(&a->value, value, __ATOMIC_SEQ_CST);
++}
++static void pause_at(int kind)
++{
++	pthread_mutex_lock(&pause_lock);
++	if (pause_kind == kind && worker_live &&
++	    pthread_equal(pthread_self(), worker)) {
++		entered = true;
++		pthread_cond_broadcast(&pause_cond);
++		while (!released)
++			pthread_cond_wait(&pause_cond, &pause_lock);
++	}
++	pthread_mutex_unlock(&pause_lock);
+ }
+-static unsigned int ccif_read32(void *base, int offset) {
+-    assert(offset==APCCIF_RCHNUM); reads++; return rchnum;
++static void finish_worker(void)
++{
++	if (!worker_live)
++		return;
++	pthread_mutex_lock(&pause_lock);
++	released = true;
++	pthread_cond_broadcast(&pause_cond);
++	pthread_mutex_unlock(&pause_lock);
++	assert(!pthread_join(worker, NULL));
++	worker_live = false;
+ }
+-static void md_ccif_process_data0(struct md_ccif_ctrl *c, unsigned int channel) {
+-    assert(channel && channel==rchnum); processed++; rchnum=0;
++static unsigned int ioread32(void *address)
++{
++	pause_at(1);
++	reads++;
++	return rchnum;
+ }
+-static void mod_delayed_work(int wq, struct delayed_work *w, unsigned int delay) {
+-    assert(delay==20); schedules++; w->pending=true;
++static void writel(unsigned int value, void *address)
++{
++	writes++;
++}
++static void md_ccif_process_data0(struct md_ccif_ctrl *c, unsigned int channel)
++{
++	assert(channel && channel == rchnum);
++	processed++;
++	rchnum = 0;
++	c->ccif_sram_work.pending = c->ccif_status_notify_work.pending = true;
++}
++static void mod_delayed_work(int wq, struct delayed_work *w, unsigned int delay)
++{
++	assert(delay == 20);
++	schedules++;
++	w->pending = true;
+ }
+ static irqreturn_t md_ccif_isr0(int irq, void *data);
+ static void md_ccif_data0_poll(struct work_struct *work);
+-static void run_poll(void) {
+-    assert(ctrl.data0_poll_work.pending);
+-    ctrl.data0_poll_work.pending=false;
+-    md_ccif_data0_poll(&ctrl.data0_poll_work.work);
+-}
+-static void enable_irq(unsigned int irq) {
+-    assert(irq<2 && depth[irq]==1);
+-    if (irq==1) assert(ctrl.ccif_state==HIFCCIF_STATE_PWRON && reset_stage==6);
+-    depth[irq]--; enables[irq]++;
+-    if (irq==0 && inject) {
+-        inject=false;
+-        assert(reset_stage==6); /* All queue/SRAM/hardware reset calls finished. */
+-        assert(md_ccif_isr0(0,&ctrl)==IRQ_HANDLED);
+-        run_poll(); /* Start is descheduled past the 20-ms delay here. */
+-    }
+-}
+-static void disable_irq_nosync(unsigned int irq) {
+-    assert(irq==0 && depth[0]==0); depth[0]++; disables++;
+-}
+-static void cancel_delayed_work_sync(struct delayed_work *w) {
+-    assert(ctrl.ccif_state==HIFCCIF_STATE_PWROFF); w->pending=false; cancels++;
+-}
+-static void ccif_late_init(unsigned char id) { late_inits++; }
+-static void ccif_set_clk_on(unsigned char id) { clock_on++; }
+-static void ccif_set_clk_off(unsigned char id) { clock_off++; }
+-static void md_ccif_sram_reset(unsigned char id) { assert(++reset_stage==1); }
+-static void md_ccif_switch_ringbuf(unsigned char id, int mode) {
+-    reset_stage++; assert((reset_stage==2 && mode==RB_EXP) || (reset_stage==4 && mode==RB_NORMAL));
+-}
+-static void md_ccif_reset_queue(unsigned char id, int mode) {
+-    reset_stage++; assert(reset_stage==3 || reset_stage==5);
+-}
+-static void ccci_reset_ccif_hw(int id, void *ap, void *md, struct md_ccif_ctrl *c) {
+-    if (ctrl.ccif_state==HIFCCIF_STATE_PWROFF && cancels) return;
+-    assert(++reset_stage==6);
++static void run_poll(void)
++{
++	assert(ctrl.data0_poll_work.pending);
++	ctrl.data0_poll_work.pending = false;
++	md_ccif_data0_poll(&ctrl.data0_poll_work.work);
++}
++static void enable_irq(unsigned int irq)
++{
++	pause_at(2);
++	assert(irq < 2 && __atomic_load_n(&depth[irq], __ATOMIC_SEQ_CST));
++	__atomic_sub_fetch(&depth[irq], 1, __ATOMIC_SEQ_CST);
++	enables[irq]++;
++	if (irq == 0 && inject) {
++		inject = false;
++		assert(reset_stage == 6);
++		assert(md_ccif_isr0(0, &ctrl) == IRQ_HANDLED);
++		run_poll();
++	}
++}
++static void disable_irq_nosync(unsigned int irq)
++{
++	pause_at(3);
++	assert(irq < 2);
++	__atomic_add_fetch(&depth[irq], 1, __ATOMIC_SEQ_CST);
++}
++static void synchronize_irq(unsigned int irq)
++{
++	if (!irq && race == 3)
++		finish_worker();
++}
++static void disable_irq(unsigned int irq)
++{
++	/* The stop hold is independent of a pending poll-owned disable. */
++	__atomic_add_fetch(&depth[irq], 1, __ATOMIC_SEQ_CST);
++	synchronize_irq(irq);
++}
++static void cancel_delayed_work_sync(struct delayed_work *w)
++{
++	finish_worker();
++	w->pending = false;
++	cancels++;
++	/* An interrupt already arriving just after the old cancellation. */
++	if (late_irq && !depth[0])
++		md_ccif_isr0(0, &ctrl);
++}
++static void cancel_work_sync(struct work_struct *w)
++{
++	w->pending = false;
++	work_cancels++;
++}
++static int ccif_late_init(unsigned char id)
++{
++	late_inits++;
++	return -(int)late_error;
++}
++static void ccif_set_clk_on(unsigned char id)
++{
++	clock_on++;
++	devapc_check_flag = 1;
++}
++static void ccif_set_clk_off(unsigned char id)
++{
++	assert(depth[0] == 1 && depth[1] == 1);
++	assert(!ctrl.data0_irq_masked.value && !ctrl.data0_poll_work.pending);
++	assert(!ctrl.ccif_sram_work.pending &&
++	       !ctrl.ccif_status_notify_work.pending);
++	devapc_check_flag = 0;
++	clock_off++;
++}
++static void md_ccif_sram_reset(unsigned char id)
++{
++	assert(++reset_stage == 1);
++}
++static void md_ccif_switch_ringbuf(unsigned char id, int mode)
++{
++	reset_stage++;
++	assert((reset_stage == 2 && mode == RB_EXP) ||
++	       (reset_stage == 4 && mode == RB_NORMAL));
++}
++static void md_ccif_reset_queue(unsigned char id, int mode)
++{
++	reset_stage++;
++	assert(reset_stage == 3 || reset_stage == 5);
++}
++static void ccci_reset_ccif_hw(int id, void *ap, void *md,
++			       struct md_ccif_ctrl *c)
++{
++	if (READ_ONCE(ctrl.ccif_state) == HIFCCIF_STATE_PWROFF && cancels)
++		return;
++	assert(++reset_stage == 6);
++}
++static struct ccci_per_md *ccci_get_per_md_data(void)
++{
++	return &per_md;
++}
++static int ccci_fsm_get_md_state(void)
++{
++	assert(++state_queries < 12);
++	if (race == 4 && state_queries >= 3)
++		md_state = WAITING_TO_STOP;
++	return md_state;
++}
++static int ccci_ringbuf_writeable(void *ring, int len)
++{
++	return space;
++}
++static int ccci_ringbuf_write(void *ring, void *data, int len)
++{
++	pause_at(5);
++	ring_writes++;
++	return len;
++}
++static void ccci_free_skb(struct sk_buff *skb)
++{
++	skb_frees++;
++}
++#define ccci_md_inc_tx_seq_num(...) ((void)0)
++#define ccci_channel_update_packet_counter(...) ((void)0)
++#define ccci_md_add_log_history(...) ((void)0)
++static int md_ccif_send(unsigned char id, int channel)
++{
++	return 0;
+ }
+ /* PRODUCTION */
+-static void setup(bool restart) {
+-    memset(&ctrl,0,sizeof(ctrl)); memset(enables,0,sizeof(enables));
+-    rchnum=reads=processed=schedules=disables=reset_stage=late_inits=clock_on=clock_off=cancels=0;
+-    ctrl.ccif_state=restart ? HIFCCIF_STATE_PWROFF : HIFCCIF_STATE_MIN;
+-    ctrl.ap_ccif_irq0_id=0; ctrl.ap_ccif_irq1_id=1;
+-    ctrl.ccif_irq1_enabled.value=1; /* Probe/request_irq already enabled DATA1. */
+-    ctrl.irq0_armed=restart; ctrl.data0_irq_masked.value=restart;
+-    depth[0]=1; depth[1]=0; inject=true;
+-}
+-static bool boundary_case(bool restart) {
+-    setup(restart); assert(!ccif_start(CCIF_HIF_ID));
+-    assert(ctrl.ccif_state==HIFCCIF_STATE_PWRON && ctrl.data0_irq_masked.value==1 && depth[0]==1);
+-    if (!ctrl.data0_poll_work.pending) return false; /* Old order strands masked IRQ. */
+-    unsigned int prior=schedules;
+-    assert(md_ccif_isr0(0,&ctrl)==IRQ_HANDLED);
+-    assert(disables==1 && schedules==prior); /* Already masked: no duplicate disable. */
+-    assert(!ccif_start(CCIF_HIF_ID)); assert(enables[0]==1 && reset_stage==6); /* ON no-op. */
+-    rchnum=4; run_poll();
+-    assert(processed==1 && !ctrl.data0_poll_work.pending && depth[0]==0);
+-    assert(ctrl.data0_irq_masked.value==0 && enables[0]==2);
+-    rchnum=8; md_ccif_data0_poll(&ctrl.data0_poll_work.work);
+-    assert(processed==2 && enables[0]==2); /* Duplicate/stale poll cannot double-enable. */
+-    assert(!ccif_stop(CCIF_HIF_ID));
+-    assert(ctrl.ccif_state==HIFCCIF_STATE_PWROFF && cancels==1 && clock_off==1);
+-    prior=reads; md_ccif_data0_poll(&ctrl.data0_poll_work.work); assert(reads==prior);
+-    return true;
+-}
+-int main(int argc, char **argv) {
+-    assert(argc==2);
+-    bool initial=boundary_case(false), restart=boundary_case(true);
+-    if (!strcmp(argv[1],"old-order")) {
+-        assert(!initial && !restart);
+-        puts("old production order reproduced stranded IRQ on initial arm and masked restart");
+-        return 42;
+-    }
+-    assert(initial && restart);
+-    setup(true); inject=false; ctrl.data0_irq_masked.value=0; depth[0]=0;
+-    assert(!ccif_start(CCIF_HIF_ID)); assert(!enables[0] && depth[0]==0);
+-    setup(true); inject=false; ctrl.ccif_irq1_enabled.value=0; depth[1]=1;
+-    assert(!ccif_start(CCIF_HIF_ID));
+-    assert(enables[1]==1 && enables[0]==1 && !depth[0] && !depth[1]);
+-    assert(ctrl.ccif_irq1_enabled.value==1);
+-    puts("CCIF production startup/ISR/poll ordering and IRQ balance cases passed");
++static void setup(bool restart)
++{
++	assert(!worker_live);
++	memset(&ctrl, 0, sizeof(ctrl));
++	memset(enables, 0, sizeof(enables));
++	rchnum = reads = writes = processed = schedules = reset_stage =
++		late_inits = 0;
++	clock_on = clock_off = cancels = work_cancels = late_error = 0;
++	skb_frees = ring_writes = state_queries = 0;
++	md_state = READY;
++	space = 32;
++	ctrl.ccif_state = restart ? HIFCCIF_STATE_PWROFF : HIFCCIF_STATE_MIN;
++	ctrl.ap_ccif_irq0_id = 0;
++	ctrl.ap_ccif_irq1_id = 1;
++	ctrl.ccif_irq1_enabled.value = !restart;
++	ctrl.plat_val.md_gen = 6299;
++	depth[0] = 1;
++	depth[1] = restart;
++	for (int i = 0; i < QUEUE_NUM; i++)
++		ctrl.txq[i].tx_lock = i + 1;
++	stop_done = false;
++	devapc_check_flag = 1;
++	inject = false;
++	late_irq = false;
++	race = pause_kind = 0;
++	entered = released = false;
++}
++static bool boundary_case(bool restart)
++{
++	setup(restart);
++	inject = true;
++	assert(!ccif_start(CCIF_HIF_ID));
++	assert(ctrl.ccif_state == HIFCCIF_STATE_PWRON &&
++	       ctrl.data0_irq_masked.value == 1 && depth[0] == 1);
++	if (!ctrl.data0_poll_work.pending)
++		return false;
++	unsigned int prior = schedules;
++	md_ccif_isr0(0, &ctrl);
++	assert(schedules == prior);
++	assert(!ccif_start(CCIF_HIF_ID));
++	assert(enables[0] == 1 && reset_stage == 6);
++	rchnum = 4;
++	run_poll();
++	assert(processed == 1 && !depth[0]);
++	assert(!ctrl.data0_poll_work.pending && !ctrl.data0_irq_masked.value);
++	assert(!ccif_stop(CCIF_HIF_ID));
++	assert(clock_off == 1 && cancels == 1);
++	prior = reads;
++	md_ccif_data0_poll(&ctrl.data0_poll_work.work);
++	assert(reads == prior);
++	return true;
++}
++static void *run_worker(void *unused)
++{
++	if (race == 5)
++		assert(!md_ccif_op_send_skb(1, 0, &thread_skb, 0, 0));
++	else if (race == 3)
++		md_ccif_isr0(0, &ctrl);
++	else
++		md_ccif_data0_poll(&ctrl.data0_poll_work.work);
++	return NULL;
++}
++static void concurrent_case(int kind)
++{
++	setup(false);
++	assert(!ccif_start(CCIF_HIF_ID));
++	race = pause_kind = kind;
++	if (kind != 3) {
++		depth[0] = 1;
++		ctrl.data0_irq_masked.value = 1;
++	}
++	rchnum = kind == 2 ? 4 : 0;
++	pthread_mutex_lock(&pause_lock);
++	worker_live = true;
++	assert(!pthread_create(&worker, NULL, run_worker, NULL));
++	while (!entered)
++		pthread_cond_wait(&pause_cond, &pause_lock);
++	pthread_mutex_unlock(&pause_lock);
++	assert(!ccif_pre_stop(CCIF_HIF_ID));
++	assert(!worker_live && ctrl.ccif_state == HIFCCIF_STATE_QUIESCED);
++	assert(depth[0] == 1 && !ctrl.data0_irq_masked.value &&
++	       !ctrl.data0_poll_work.pending);
++	assert(!clock_off && reset_stage == 6);
++	assert(ccif_start(CCIF_HIF_ID) == -ESHUTDOWN);
++	assert(!ccif_pre_stop(CCIF_HIF_ID) && depth[0] == 1);
++	assert(!ccif_stop(CCIF_HIF_ID) && clock_off == 1);
++	assert(!ccif_stop(CCIF_HIF_ID) && clock_off == 1 && depth[0] == 1);
++	reset_stage = 0;
++	assert(!ccif_start(CCIF_HIF_ID));
++	assert(!depth[0] && !depth[1]);
++}
++static void *stop_sender(void *unused)
++{
++	assert(!ccif_pre_stop(CCIF_HIF_ID));
++	WRITE_ONCE(stop_done, true);
++	return NULL;
++}
++static void inflight_tx_case(void)
++{
++	setup(false);
++	assert(!ccif_start(1));
++	race = pause_kind = 5;
++	thread_skb.len = 16;
++	pthread_mutex_lock(&pause_lock);
++	worker_live = true;
++	assert(!pthread_create(&worker, NULL, run_worker, NULL));
++	while (!entered)
++		pthread_cond_wait(&pause_cond, &pause_lock);
++	pthread_mutex_unlock(&pause_lock);
++	pthread_t stopper;
++	assert(!pthread_create(&stopper, NULL, stop_sender, NULL));
++	while (READ_ONCE(ctrl.ccif_state) != HIFCCIF_STATE_QUIESCED)
++		sched_yield();
++	assert(!READ_ONCE(
++		stop_done)); /* The real TX mutex still belongs to the sender. */
++	pthread_mutex_lock(&pause_lock);
++	released = true;
++	pthread_cond_broadcast(&pause_cond);
++	pthread_mutex_unlock(&pause_lock);
++	assert(!pthread_join(stopper, NULL));
++	assert(stop_done && !worker_live && ring_writes == 1 && skb_frees == 1);
++	/* In-flight send finished before preparation; all later sends retain the SKB. */
++	assert(md_ccif_op_send_skb(1, 0, &thread_skb, 0, 0) == -ESHUTDOWN);
++	assert(ring_writes == 1 && skb_frees == 1);
++}
++int main(int argc, char **argv)
++{
++	assert(argc == 2);
++	if (!strcmp(argv[1], "old-stop")) {
++		setup(false);
++		assert(!ccif_start(CCIF_HIF_ID));
++		late_irq = true;
++		ccif_disable_irq1(1); /* Existing md_cd_stop already masks DATA1. */
++		ccif_stop(CCIF_HIF_ID);
++		return 0;
++	}
++	if (!strcmp(argv[1], "old-tx")) {
++		setup(false);
++		race = 4;
++		space = 0;
++		struct sk_buff skb = { .len = 16 };
++		md_ccif_op_send_skb(1, 0, &skb, 0, 1);
++		return 0;
++	}
++	bool first = boundary_case(false), restart = boundary_case(true);
++	if (!strcmp(argv[1], "old-order")) {
++		assert(!first && !restart);
++		return 42;
++	}
++	assert(first && restart);
++	for (int i = 1; i <= 3; i++)
++		concurrent_case(i);
++	inflight_tx_case();
++	setup(false);
++	assert(!ccif_pre_stop(1) && !ccif_stop(1));
++	assert(depth[0] == 1 && !cancels);
++	late_error = EBUSY;
++	assert(ccif_start(1) == -EBUSY && !clock_on && !enables[0]);
++	setup(false);
++	ctrl.ccif_state = HIFCCIF_STATE_EXCEPTION;
++	assert(ccif_start(1) == -EINVAL && ccif_pre_stop(1) == -EINVAL);
++	setup(false);
++	race = 4;
++	space = 0;
++	struct sk_buff skb = { .len = 16 };
++	assert(md_ccif_op_send_skb(1, 0, &skb, 0, 1) == -ESHUTDOWN);
++	assert(!ring_writes && !skb_frees);
++	setup(false);
++	ctrl.ccif_state = HIFCCIF_STATE_QUIESCED;
++	assert(md_ccif_op_send_skb(1, 0, &skb, 0, 0) == -ESHUTDOWN &&
++	       !skb_frees && !ring_writes);
++	ctrl.ccif_state = HIFCCIF_STATE_PWRON;
++	assert(!md_ccif_op_send_skb(1, 0, &skb, 0, 0) && ring_writes == 1 &&
++	       skb_frees == 1);
++	/* Actual production wrappers preserve the firmware access guard. */
++	unsigned int before = reads;
++	devapc_check_flag = 0;
++	assert(!ccif_read32(NULL, 0) && reads == before);
++	ccif_write32(NULL, 0, 1);
++	assert(!writes);
++	devapc_check_flag = 1;
++	ccif_write32(NULL, 0, 1);
++	assert(writes == 1);
++	puts("CCIF production publication, quiescence, concurrent IRQ/poll depth and TX ownership PASS");
+ }
+diff --git a/tools/testing/selftests/mtk_ccci/modem_stop_cases.c b/tools/testing/selftests/mtk_ccci/modem_stop_cases.c
+new file mode 100644
+index 0000000000..0dd64f52d0
+--- /dev/null
++++ b/tools/testing/selftests/mtk_ccci/modem_stop_cases.c
+@@ -0,0 +1,565 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <assert.h>
++#include <errno.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#define IS_ENABLED(x) 0
++#define USING_PM_RUNTIME
++#define CCCI_KMODULE_ENABLE
++#define __iomem
++#define ERESTARTSYS 512
++#define TAG "test"
++#define FSM "test"
++#define MD_SYS1 0
++#define CCIF_HIF_ID 1
++#define CCCI_HIF_NUM 3
++#define HIF_EX_STOP_EE_NOTIFY 1
++#define MD_FLIGHT_MODE_ENTER 1
++#define MD_FLIGHT_MODE_NONE 0
++#define CCCI_ERR_MD_IN_RESET 200
++#define CCCI_ERR_INVALID_PARAM 201
++#define CCCI_ERR_GET_MEM_FAIL 202
++#define MD_DBG_DUMP_SMEM 0
++#define CCCI_DUMP_MEM_DUMP 0
++#define SMEM_USER_RAW_MDCCCI_DBG 0
++#define SMEM_USER_RAW_MDSS_DBG 1
++#define SRCCLKENA_SETTING_BIT 0
++#define INFRA_AO_MD_SRCCLKENA 0
++#define IRQCHIP_STATE_PENDING 0
++#define EE_DONE_TIMEOUT 0
++#define EXCEPTION_EE 0
++#define EXCEPTION_WDT 1
++#define EXCEPTION_MD_NO_RESPONSE 2
++#define GFP_ATOMIC 0
++#define GFP_KERNEL 0
++#define FSM_CMD_FLAG_WAIT_FOR_COMPLETE 1
++#define FSM_CMD_FLAG_FLIGHT_MODE 2
++#define INIT_LIST_HEAD(p) ((p)->next = (p), (p)->prev = (p))
++#define container_of(p, type, member) \
++	((type *)((char *)(p) - offsetof(type, member)))
++struct list_head {
++	struct list_head *next, *prev;
++};
++static bool list_empty(struct list_head *p)
++{
++	return p->next == p;
++}
++static void list_add_tail(struct list_head *n, struct list_head *p)
++{
++	n->next = p;
++	n->prev = p->prev;
++	p->prev->next = n;
++	p->prev = n;
++}
++static void list_del(struct list_head *n)
++{
++	n->next->prev = n->prev;
++	n->prev->next = n->next;
++}
++#define list_first_entry(p, type, member) container_of((p)->next, type, member)
++#define list_for_each_entry_safe(pos, tmp, head, member)                    \
++	for (pos = container_of((head)->next, __typeof__(*pos), member),    \
++	    tmp = container_of(pos->member.next, __typeof__(*pos), member); \
++	     &pos->member != (head); pos = tmp,                             \
++	    tmp = container_of(tmp->member.next, __typeof__(*tmp), member))
++typedef unsigned int u32;
++typedef int wait_queue_head_t;
++typedef struct {
++	int value;
++} atomic_t;
++#define READ_ONCE(x) __atomic_load_n(&(x), __ATOMIC_SEQ_CST)
++#define WRITE_ONCE(x, v) __atomic_store_n(&(x), (v), __ATOMIC_SEQ_CST)
++#define atomic_read(p) ((p)->value)
++#define atomic_set(p, v) ((p)->value = (v))
++#define atomic_inc(p) ((p)->value++)
++#define atomic_read_acquire(p) __atomic_load_n(&(p)->value, __ATOMIC_ACQUIRE)
++static int atomic_dec_return(atomic_t *p)
++{
++	assert(p->value > 0);
++	return --p->value;
++}
++static int atomic_add_return(int v, atomic_t *p)
++{
++	return p->value += v;
++}
++#define spin_lock_irqsave(lock, flags) ((void)(lock), (flags) = 0)
++#define spin_unlock_irqrestore(lock, flags) ((void)(lock), (void)(flags))
++#define CCCI_NORMAL_LOG(m, tag, ...) fixture_log(__VA_ARGS__)
++#define CCCI_ERROR_LOG(...) ((void)0)
++#define CCCI_BOOTUP_LOG(...) ((void)0)
++#define CCCI_MEM_LOG_TAG(...) ((void)0)
++#define in_irq() 0
++#define in_softirq() 0
++#define in_interrupt() 0
++#define irqs_disabled() 0
++#define init_waitqueue_head(p) (*(p) = 0)
++#define wake_up(p) ((void)(p))
++#define wake_up_all(p) ((void)(p))
++#define unlikely(x) (x)
++/* DECLARATIONS */
++struct ccci_fsm_command {
++	struct list_head entry;
++	enum CCCI_FSM_COMMAND cmd_id;
++	unsigned int flag;
++	int complete;
++	wait_queue_head_t complete_wq;
++};
++struct ccci_fsm_event {
++	struct list_head entry;
++	enum CCCI_FSM_EVENT event_id;
++	unsigned int length;
++	unsigned char data[];
++};
++struct ccci_fsm_ctl {
++	enum MD_STATE md_state;
++	unsigned int curr_state, last_state;
++	int stop_error;
++	atomic_t stop_pending;
++	struct list_head command_queue, event_queue;
++	int command_lock, event_lock, cmd_complete_lock, command_wq;
++	atomic_t fs_ongoing;
++	int *wakelock;
++	int ee_ctl;
++	struct {
++		int poller_state, status_rx_wq;
++	} poller_ctl;
++};
++struct device {
++	struct {
++		atomic_t usage_count;
++		bool suspended;
++	} power;
++};
++struct platform_device {
++	struct device dev;
++};
++struct ccci_modem;
++struct plat_ops {
++	int (*power_off)(struct ccci_modem *, unsigned int);
++	void (*debug_reg)(struct ccci_modem *, bool);
++};
++struct ccci_modem {
++	struct platform_device *plat_dev;
++	struct {
++		struct plat_ops *plat_ptr;
++		struct {
++			void *infra_ao_base;
++		} *plat_val;
++	} *hw_info;
++	atomic_t reset_on_going;
++	unsigned int md_wdt_irq_id;
++};
++struct ccci_smem_region {
++	void *base_ap_view_vir;
++	unsigned int size;
++};
++struct ccci_per_md {
++	int md_dbg_dump_flag;
++};
++struct ccci_hif_ops {
++	int (*pre_stop)(unsigned char);
++};
++static void *ccci_hif[CCCI_HIF_NUM];
++static struct ccci_hif_ops *ccci_hif_op[CCCI_HIF_NUM];
++static struct ccci_fsm_ctl ctl;
++static struct ccci_fsm_ctl *ccci_fsm_entries = &ctl;
++static long query(struct ccci_fsm_ctl *ctl, unsigned long arg);
++static unsigned int put_calls;
++static int fixture_put(unsigned int value, unsigned int *destination)
++{
++	put_calls++;
++	*destination = value;
++	return 0;
++}
++#define put_user(v, p) fixture_put(v, p)
++#define __user
++#define CCCI_IOC_GET_MD_STATE 1
++static struct ccci_modem md;
++static struct platform_device plat;
++static struct plat_ops ops;
++static struct ccci_per_md per_md;
++static struct ccci_smem_region smem;
++static struct {
++	int md_gen, md_sub_ver, power_flow_config;
++} md_cd_plat_val_ptr;
++static atomic_t md_ee_occurred;
++static int needforcestop, wakes, allocations, frees, command_pre, command_post;
++static int pm_return, preparation_return, preparation_calls, pm_calls, post_pm,
++	delays;
++static int broadcasts[16], pending_clear, wdt_disabled, queued_hardware,
++	irq_error_stage;
++static bool suspend_result, quiesced;
++static struct ccci_fsm_command *pending_ee;
++
++static void fixture_log(const char *format, ...)
++{
++}
++static void *kmalloc(size_t n, int flags)
++{
++	allocations++;
++	return calloc(1, n);
++}
++static void kfree(void *p)
++{
++	frees++;
++	free(p);
++}
++static void __pm_stay_awake(int *w)
++{
++	assert(!wakes);
++	wakes++;
++}
++static void __pm_relax(int *w)
++{
++	assert(wakes == 1);
++	wakes--;
++}
++static struct ccci_modem *ccci_get_modem(void)
++{
++	return &md;
++}
++static struct ccci_per_md *ccci_get_per_md_data(void)
++{
++	return &per_md;
++}
++static struct ccci_smem_region *ccci_md_get_smem_by_user_id(int id)
++{
++	return &smem;
++}
++static void wdt_disable_irq(struct ccci_modem *m)
++{
++	wdt_disabled++;
++}
++static void debug_in_flight_mode(struct ccci_modem *m)
++{
++}
++static void ccci_util_mem_dump(int flag, void *memory, unsigned int size)
++{
++}
++static int ccci_fsm_get_md_state(void)
++{
++	return ctl.md_state;
++}
++static void ccci_hif_md_exception(unsigned int flags, unsigned char stage)
++{
++}
++static int prepare(unsigned char id)
++{
++	preparation_calls++;
++	quiesced = !preparation_return;
++	return preparation_return;
++}
++static int pm_runtime_put_sync(struct device *d)
++{
++	assert(quiesced || irq_error_stage);
++	pm_calls++;
++	d->power.suspended = suspend_result;
++	return pm_return;
++}
++static bool pm_runtime_status_suspended(struct device *d)
++{
++	return d->power.suspended;
++}
++static void *ioremap_wc(unsigned long address, size_t size)
++{
++	return &plat;
++}
++static void iounmap(void *p)
++{
++}
++static void md_cd_lock_modem_clock_src(int state)
++{
++}
++#define ccci_read32(...) 0U
++#define ccci_write32(...) ((void)0)
++static int md1_revert_sequencer_setting(struct ccci_modem *m)
++{
++	return 0;
++}
++static int md1_enable_sequencer_setting(struct ccci_modem *m)
++{
++	return 0;
++}
++static int regmap_read(void *map, int reg, unsigned int *val)
++{
++	*val = 0;
++	return 0;
++}
++static int regmap_write(void *map, int reg, unsigned int val)
++{
++	return 0;
++}
++static void mdelay(int ms)
++{
++	assert(ms == 4);
++	delays++;
++}
++static void flight_mode_set_by_atf(struct ccci_modem *m, bool mode)
++{
++	post_pm++;
++}
++static void md_cd_topclkgen_off(struct ccci_modem *m)
++{
++	post_pm++;
++}
++static int ccci_get_hs2_done_status(void)
++{
++	return 0;
++}
++static void reset_modem_hs2_status(void)
++{
++}
++static int ccci_port_md_status_notify(int state)
++{
++	broadcasts[state]++;
++	return 0;
++}
++static int ccci_hif_state_notification(int state)
++{
++	if (state == GATED) {
++		unsigned int value = 99;
++		assert(query(&ctl, (unsigned long)&value) == -EINPROGRESS &&
++		       value == 99);
++		queued_hardware++;
++	}
++	return 0;
++}
++static void broadcast_md_state_kernel(int old_state, int state)
++{
++}
++static int irq_set_irqchip_state(unsigned int irq, int state, bool value)
++{
++	pending_clear++;
++	return 0;
++}
++static void fsm_ee_cmd_init(int id)
++{
++	command_pre++;
++}
++static void fsm_ee_cmd_deinit(int id)
++{
++	command_post++;
++}
++static int kthread_should_stop(void)
++{
++	return list_empty(&ctl.command_queue);
++}
++static int fsm_main_thread(void *data);
++static int wait_step(void)
++{
++	fsm_main_thread(&ctl);
++	return 0;
++}
++#define wait_event_interruptible(wq, condition) ((condition) ? 0 : wait_step())
++static void fsm_finish_command(struct ccci_fsm_ctl *, struct ccci_fsm_command *,
++			       int);
++static void fsm_routine_zombie(struct ccci_fsm_ctl *c);
++static void fsm_routine_start(struct ccci_fsm_ctl *c,
++			      struct ccci_fsm_command *cmd)
++{
++	queued_hardware++;
++	fsm_finish_command(c, cmd, 1);
++}
++static void fsm_routine_wdt(struct ccci_fsm_ctl *c,
++			    struct ccci_fsm_command *cmd)
++{
++	queued_hardware++;
++	fsm_finish_command(c, cmd, 1);
++}
++static void fsm_routine_exception(struct ccci_fsm_ctl *c,
++				  struct ccci_fsm_command *cmd, int why)
++{
++	fsm_finish_command(c, cmd, 1);
++}
++static struct ccci_fsm_command *fsm_check_for_ee(struct ccci_fsm_ctl *c,
++						 int remove)
++{
++	struct ccci_fsm_command *p = pending_ee;
++	pending_ee = NULL;
++	return p;
++}
++static void fsm_check_ee_done(int *ee, int timeout)
++{
++}
++/* PRODUCTION */
++static void setup(void)
++{
++	memset(&ctl, 0, sizeof(ctl));
++	memset(&md, 0, sizeof(md));
++	memset(&plat, 0, sizeof(plat));
++	memset(broadcasts, 0, sizeof(broadcasts));
++	INIT_LIST_HEAD(&ctl.command_queue);
++	INIT_LIST_HEAD(&ctl.event_queue);
++	ctl.curr_state = CCCI_FSM_READY;
++	ctl.md_state = READY;
++	static __typeof__(*md.hw_info) hw;
++	static __typeof__(*hw.plat_val) val;
++	hw.plat_ptr = &ops;
++	hw.plat_val = &val;
++	md.hw_info = &hw;
++	md.plat_dev = &plat;
++	ops.power_off = md_cd_power_off;
++	ops.debug_reg = NULL;
++	static struct ccci_hif_ops hifops = { .pre_stop = prepare };
++	ccci_hif[CCIF_HIF_ID] = &ctl;
++	ccci_hif_op[CCIF_HIF_ID] = &hifops;
++	md_cd_plat_val_ptr.md_gen = 6299;
++	md_cd_plat_val_ptr.md_sub_ver = 0;
++	md_cd_plat_val_ptr.power_flow_config = 2;
++	needforcestop = wakes = allocations = frees = command_pre =
++		command_post = 0;
++	pm_return = preparation_return = preparation_calls = pm_calls =
++		post_pm = delays = 0;
++	pending_clear = wdt_disabled = queued_hardware = irq_error_stage = 0;
++	suspend_result = true;
++	quiesced = false;
++	pending_ee = NULL;
++	put_calls = 0;
++}
++static struct ccci_fsm_command *command(int id, bool wait)
++{
++	struct ccci_fsm_command *c = kmalloc(sizeof(*c), 0);
++	c->cmd_id = id;
++	c->flag = wait ? FSM_CMD_FLAG_WAIT_FOR_COMPLETE : 0;
++	if (id == CCCI_COMMAND_STOP)
++		atomic_inc(&ctl.stop_pending);
++	return c;
++}
++static void events(void)
++{
++	assert(!fsm_append_event(&ctl, CCCI_EVENT_HS1, NULL, 0));
++	assert(!fsm_append_event(&ctl, CCCI_EVENT_HS2, NULL, 0));
++}
++static void failed_case(int pm, bool suspended, int prep, bool pre_error)
++{
++	setup();
++	pm_return = pm;
++	suspend_result = suspended;
++	preparation_return = prep;
++	if (pre_error)
++		md.reset_on_going.value = 1;
++	events();
++	struct ccci_fsm_command *c = command(CCCI_COMMAND_STOP, true);
++	fsm_routine_stop(&ctl, c);
++	int expected = pre_error ? -CCCI_ERR_MD_IN_RESET :
++		       prep	 ? prep :
++		       pm < 0	 ? pm :
++				   -EBUSY;
++	assert(ctl.curr_state == CCCI_FSM_STOP_FAILED &&
++	       ctl.stop_error == expected);
++	assert(ctl.md_state == WAITING_TO_STOP &&
++	       broadcasts[WAITING_TO_STOP] == 1);
++	assert(!broadcasts[GATED] && !broadcasts[EXCEPTION] && !pending_clear &&
++	       !queued_hardware);
++	assert(!wakes && c->complete == expected &&
++	       list_empty(&ctl.event_queue));
++	unsigned int output = 99;
++	assert(query(&ctl, (unsigned long)&output) == expected);
++	assert(output == 99 && !ctl.stop_pending.value);
++	assert(!post_pm && !delays);
++	kfree(c);
++	int before = allocations;
++	assert(fsm_append_command(&ctl, CCCI_COMMAND_START, 0) == expected);
++	assert(fsm_append_event(&ctl, CCCI_EVENT_HS1, NULL, 0) == expected &&
++	       allocations == before);
++	/* Commands queued before the latch are rejected before EE command setup. */
++	c = command(CCCI_COMMAND_START, false);
++	list_add_tail(&c->entry, &ctl.command_queue);
++	fsm_main_thread(&ctl);
++	assert(!command_pre && !queued_hardware);
++	assert(allocations == frees);
++}
++int main(int argc, char **argv)
++{
++	assert(argc == 2);
++	if (!strcmp(argv[1], "old-dispatch")) {
++		setup();
++		ctl.stop_error = -EIO;
++		struct ccci_fsm_command *c = command(CCCI_COMMAND_START, false);
++		list_add_tail(&c->entry, &ctl.command_queue);
++		fsm_main_thread(&ctl);
++		assert(!command_pre && !queued_hardware);
++		return 0;
++	}
++	if (!strcmp(argv[1], "old-pm")) {
++		setup();
++		suspend_result = false;
++		struct ccci_fsm_command *c = command(CCCI_COMMAND_STOP, true);
++		fsm_routine_stop(&ctl, c);
++		assert(ctl.stop_error == -EBUSY);
++		return 0;
++	}
++	if (!strcmp(argv[1], "old-stop")) {
++		setup();
++		pm_return = -ETIMEDOUT;
++		events();
++		struct ccci_fsm_command *c = command(CCCI_COMMAND_STOP, true);
++		fsm_routine_stop(&ctl, c);
++		assert(ctl.stop_error == -ETIMEDOUT);
++		return 0;
++	}
++	failed_case(-ETIMEDOUT, false, 0, false);
++	failed_case(0, false, 0, false);
++	failed_case(0, true, -ENODEV, false);
++	failed_case(0, true, 0, true);
++	for (int value = 0; value <= 1; value++) {
++		setup();
++		pm_return = value;
++		events();
++		struct ccci_fsm_command *c = command(CCCI_COMMAND_STOP, true);
++		fsm_routine_stop(&ctl, c);
++		assert(!ctl.stop_error && ctl.curr_state == CCCI_FSM_GATED &&
++		       c->complete == 1);
++		assert(broadcasts[GATED] == 1 && !wakes && post_pm == 2 &&
++		       delays == 1);
++		assert(quiesced && preparation_calls == 1 && pm_calls == 1);
++		kfree(c);
++		assert(allocations == frees);
++	}
++	setup();
++	pm_return = -EIO;
++	assert(fsm_append_command(&ctl, CCCI_COMMAND_STOP,
++				  FSM_CMD_FLAG_WAIT_FOR_COMPLETE) == -EIO);
++	assert(!wakes && command_pre == 1 && command_post == 1 &&
++	       allocations == frees);
++	setup();
++	ccci_hif[CCIF_HIF_ID] = NULL;
++	assert(ccci_hif_pre_stop(CCIF_HIF_ID) == -ENODEV && !pm_calls);
++	assert(ccci_hif_pre_stop(CCCI_HIF_NUM) == -ENODEV);
++	setup();
++	ctl.curr_state = CCCI_FSM_GATED;
++	struct ccci_fsm_command *c = command(CCCI_COMMAND_STOP, true);
++	fsm_routine_stop(&ctl, c);
++	assert(c->complete == 1 && !wakes && !pm_calls);
++	kfree(c);
++	setup();
++	ctl.curr_state = CCCI_FSM_GATED;
++	ctl.md_state = GATED;
++	assert(!fsm_append_command(&ctl, CCCI_COMMAND_START, 0));
++	assert(!fsm_append_command(&ctl, CCCI_COMMAND_STOP, 0));
++	unsigned int value = 99;
++	assert(query(&ctl, (unsigned long)&value) == -EINPROGRESS &&
++	       value == 99);
++	fsm_main_thread(&ctl);
++	assert(!ctl.stop_pending.value && !query(&ctl, (unsigned long)&value) &&
++	       value == MD_STATE_INVALID);
++	setup();
++	pm_return = -EIO;
++	assert(!fsm_append_command(&ctl, CCCI_COMMAND_STOP, 0));
++	assert(!fsm_append_command(&ctl, CCCI_COMMAND_STOP, 0));
++	assert(ctl.stop_pending.value == 2);
++	fsm_main_thread(&ctl);
++	assert(!ctl.stop_pending.value && ctl.stop_error == -EIO &&
++	       pm_calls == 1);
++	assert(command_pre == 1 && allocations == frees);
++	setup();
++	assert(!fsm_append_command(&ctl, CCCI_COMMAND_STOP, 0));
++	assert(!fsm_append_command(&ctl, CCCI_COMMAND_STOP, 0));
++	fsm_routine_zombie(&ctl);
++	assert(!ctl.stop_pending.value && allocations == frees);
++	puts("Modem production PM/stop/FSM pending, error, waiter, event and wakelock cases PASS");
++}
+diff --git a/tools/testing/selftests/mtk_ccci/test_ccif_start.py b/tools/testing/selftests/mtk_ccci/test_ccif_start.py
+index fbc8a23a09..d153d9fc7a 100755
+--- a/tools/testing/selftests/mtk_ccci/test_ccif_start.py
++++ b/tools/testing/selftests/mtk_ccci/test_ccif_start.py
+@@ -1,8 +1,9 @@
+ #!/usr/bin/env python3
+ # SPDX-License-Identifier: GPL-2.0-only
+-"""Exercise production CCIF startup/ISR/poll paths at the IRQ-enable boundary."""
++"""Exercise production CCIF start/stop, guarded IO and IRQ/poll interleavings."""
+ from pathlib import Path
+ import os
++import re
+ import subprocess
+ import tempfile
+ 
+@@ -10,34 +11,53 @@ assets = Path(__file__).resolve().parent
+ repo = Path(os.environ.get('KERNEL_SRC', str(assets.parents[3])))
+ source = (repo / 'drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c').read_text()
+ 
++
+ def function(name):
+-    pos = source.index(name + '(')
+-    start = source.rfind('\nstatic ', 0, pos) + 1
+-    end = source.index('{', pos) + 1
++    match = re.search(r'^(?:static )?(?:int|void|irqreturn_t)\s+' + name + r'\(', source, re.M)
++    start = match.start()
++    end = source.index('{', start) + 1
+     depth = 1
+     while depth:
+         depth += (source[end] == '{') - (source[end] == '}')
+         end += 1
+     return source[start:end]
+ 
+-names = ['md_ccif_data0_poll', 'md_ccif_isr0', 'ccif_enable_irq1', 'ccif_start', 'ccif_stop']
++
++names = ['ccif_read32', 'ccif_write32', 'md_ccif_data0_poll', 'md_ccif_isr0',
++         'ccif_enable_irq1', 'ccif_disable_irq1', 'ccif_pre_stop', 'ccif_start',
++         'ccif_stop', 'md_ccif_op_send_skb']
+ production = '\n'.join(function(name) for name in names)
+-# Recreate the old publication position in the same production function. Even
+-# WRITE_ONCE cannot repair that ordering: the worker has already seen OFF.
++header = (repo / 'drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.h').read_text()
++enum = re.search(r'enum hifccif_state \{.*?^};', header, re.M | re.S)[0]
+ publication = '\tWRITE_ONCE(ccif_ctrl->ccif_state, HIFCCIF_STATE_PWRON);\n'
+ start = function('ccif_start')
+-assert start.count(publication) == 1
+-old = start.replace(publication, '').replace('\tCCCI_NORMAL_LOG(0, TAG, "%s\\n", __func__);', publication + '\tCCCI_NORMAL_LOG(0, TAG, "%s\\n", __func__);')
+-legacy = production.replace(start, old)
++old_order = start.replace(publication, '').replace(
++    '\tCCCI_NORMAL_LOG(0, TAG, "%s\\n", __func__);',
++    publication + '\tCCCI_NORMAL_LOG(0, TAG, "%s\\n", __func__);')
++stop = function('ccif_stop')
++old_stop = stop.replace('\tret = ccif_pre_stop(hif_id);\n\tif (ret)\n\t\treturn ret;\n', '')
++old_stop = old_stop.replace('\n\tint ret;', '').replace(
++    '\tWRITE_ONCE(ccif_ctrl->ccif_state, HIFCCIF_STATE_PWROFF);',
++    '\tWRITE_ONCE(ccif_ctrl->ccif_state, HIFCCIF_STATE_PWROFF);\n'
++    '\tcancel_delayed_work_sync(&ccif_ctrl->data0_poll_work);')
++tx = function('md_ccif_op_send_skb')
++old_tx = re.sub(r'\tif \(READ_ONCE\(ccif_ctrl->ccif_state\).*?\t}\n', '', tx, count=1, flags=re.S)
+ with tempfile.TemporaryDirectory(prefix='mtk-ccif-start-') as tmp:
+     tmp = Path(tmp)
+-    for mode, code in [('fixed', production), ('old-order', legacy)]:
++    for mode, code in [('fixed', production), ('old-order', production.replace(start, old_order)),
++                       ('old-stop', production.replace(stop, old_stop)),
++                       ('old-tx', production.replace(tx, old_tx))]:
+         c = tmp / (mode + '.c')
+-        c.write_text((assets / 'ccif_start_cases.c').read_text().replace('/* PRODUCTION */', code))
++        c.write_text((assets / 'ccif_start_cases.c').read_text().replace('/* PRODUCTION */', code).replace('/* ENUM */', enum))
+         binary = tmp / mode
+-        command = [os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
+-                   '-Wno-unused-parameter', '-Werror', '-fsanitize=address,undefined',
+-                   str(c), '-o', str(binary)]
+-        subprocess.run(command, check=True)
+-        result = subprocess.run([str(binary), mode], check=False)
+-        assert result.returncode == (42 if mode == 'old-order' else 0), (mode, result.returncode)
++        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
++                        '-Wno-unused-parameter', '-Werror', '-pthread',
++                        '-fsanitize=address,undefined', str(c), '-o', str(binary)], check=True)
++        result = subprocess.run([str(binary), mode], capture_output=True, text=True, timeout=10)
++        if mode in ['old-stop', 'old-tx']:
++            assert result.returncode < 0 and 'Assertion' in result.stderr, (mode, result)
++            print(mode + ': production counterexample reproduced')
++            print(result.stderr.strip())
++        else:
++            assert result.returncode == (42 if mode == 'old-order' else 0), (mode, result)
++            print(result.stdout, end='')
+diff --git a/tools/testing/selftests/mtk_ccci/test_modem_stop.py b/tools/testing/selftests/mtk_ccci/test_modem_stop.py
+new file mode 100755
+index 0000000000..b007321e15
+--- /dev/null
++++ b/tools/testing/selftests/mtk_ccci/test_modem_stop.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Exercise production modem stop/PM/FSM completion without device access."""
++from pathlib import Path
++import os
++import re
++import subprocess
++import tempfile
++
++assets = Path(__file__).resolve().parent
++repo = Path(os.environ.get('KERNEL_SRC', str(assets.parents[3])))
++base = repo / 'drivers/misc/mediatek/eccci'
++fsm = (base / 'fsm/ccci_fsm.c').read_text()
++header = (base / 'fsm/ccci_fsm_internal.h').read_text()
++
++
++def function(name, source):
++    match = re.search(r'^(?:(?:static|inline)\s+)*(?:int|void|enum \w+|struct ccci_fsm_command\s*\*)\s*'
++                      + name + r'\(', source, re.M)
++    start = match.start()
++    end = source.index('{', start) + 1
++    depth = 1
++    while depth:
++        depth += (source[end] == '{') - (source[end] == '}')
++        end += 1
++    return source[start:end]
++
++
++enums = re.search(r'^enum \{\n\tCCCI_FSM_INVALID.*?^};', header, re.M | re.S)[0] + '\n' + '\n'.join(re.findall(r'^enum (?:CCCI_FSM_STATE|CCCI_FSM_EVENT|CCCI_FSM_COMMAND|CCCI_FSM_POLLER_STATE) \{.*?^};',
++                             header, re.M | re.S))
++md_header = (repo / 'drivers/misc/mediatek/include/mt-plat/mtk_ccci_common.h').read_text()
++enums += '\n' + re.search(r'^enum MD_STATE \{.*?^};', md_header, re.M | re.S)[0]
++enums += '\n' + re.search(r'^enum MD_STATE_FOR_USER \{.*?^};', md_header, re.M | re.S)[0]
++platform = function('md_cd_power_off', (base / 'fsm/md_sys1_platform.c').read_text())
++modem = (base / 'fsm/modem_sys1.c').read_text()
++production = function('ccci_hif_pre_stop', (base / 'hif/ccci_hif.c').read_text()) + '\n' + platform
++production += '\n' + '\n'.join(function(n, modem) for n in ['md_cd_pre_stop', 'md_cd_stop', 'ccci_md_pre_stop', 'ccci_md_stop'])
++# Public wrappers delegate through the real stop methods supplied by the fixture.
++production = production.replace('return md->ops->pre_stop(md, stop_type);', 'return md_cd_pre_stop(md, stop_type);')
++production = production.replace('return md->ops->stop(md, stop_type);', 'return md_cd_stop(md, stop_type);')
++production += '\n' + '\n'.join(function(n, fsm) for n in ['fsm_finish_command', 'fsm_append_command',
++    'fsm_command_pre', 'fsm_command_post', 'fsm_append_event', 'fsm_finish_event',
++    'fsm_broadcast_state', 'fsm_routine_stop', 'fsm_main_thread', 'fsm_routine_zombie',
++    'ccci_fsm_get_md_state_for_user'])
++ioctl = (base / 'fsm/ccci_fsm_ioctl.c').read_text()
++case = ioctl[ioctl.index('\tcase CCCI_IOC_GET_MD_STATE:'):ioctl.index('\tcase CCCI_IOC_MD_RESET:')]
++production += '\nstatic long query(struct ccci_fsm_ctl *ctl, unsigned long arg)\n{\n' + \
++    'enum MD_STATE_FOR_USER state_for_user; int ret = 0; switch (CCCI_IOC_GET_MD_STATE) {\n' + \
++    case + '} return ret; }\n'
++stop = function('md_cd_stop', modem)
++old_stop = stop.rsplit('return ret;', 1)
++old_stop = old_stop[0] + 'return 0;' + old_stop[1]
++old_pm = platform.replace('\tif (ret < 0)\n\t\treturn ret;\n', '').replace(
++    '\tif (!pm_runtime_status_suspended(&md->plat_dev->dev))\n\t\treturn -EBUSY;\n', '')
++thread = function('fsm_main_thread', fsm)
++old_thread = re.sub(r'\t\tret = READ_ONCE\(ctl->stop_error\);.*?\t\t}\n', '', thread, count=1, flags=re.S)
++with tempfile.TemporaryDirectory(prefix='mtk-modem-stop-') as tmp:
++    tmp = Path(tmp)
++    for mode, code in [('fixed', production), ('old-stop', production.replace(stop, old_stop)),
++                       ('old-pm', production.replace(platform, old_pm)),
++                       ('old-dispatch', production.replace(thread, old_thread))]:
++        c = tmp / (mode + '.c')
++        c.write_text((assets / 'modem_stop_cases.c').read_text().replace('/* DECLARATIONS */', enums)
++                     .replace('/* PRODUCTION */', code))
++        binary = tmp / mode
++        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
++                        '-Wno-unused-parameter', '-Werror', '-fsanitize=address,undefined',
++                        str(c), '-o', str(binary)], check=True)
++        result = subprocess.run([str(binary), mode], capture_output=True, text=True, timeout=10)
++        if mode != 'fixed':
++            assert result.returncode < 0 and 'Assertion' in result.stderr, (mode, result)
++            print(mode + ': reintroduced production failure reproduced')
++            print(result.stderr.strip())
++        else:
++            assert result.returncode == 0, result
++            print(result.stdout, end='')
+-- 
+2.56.0
+

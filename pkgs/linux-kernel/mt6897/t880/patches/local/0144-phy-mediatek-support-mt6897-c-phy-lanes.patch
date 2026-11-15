@@ -1,0 +1,218 @@
+From 3acf77fea8d033109ebf517a0c91b70027369dc5 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] phy: mediatek: support MT6897 C-PHY lanes
+
+Program the MT6897 C-PHY lane layout while retaining the dual-link
+configuration required by the internal panel.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T14:13:45+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ .../phy/mediatek/phy-mtk-mipi-dsi-mt8196.c    | 53 ++++++++++++++++++-
+ drivers/phy/mediatek/phy-mtk-mipi-dsi.c       | 15 +++++-
+ drivers/phy/mediatek/phy-mtk-mipi-dsi.h       |  3 ++
+ 3 files changed, 68 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/phy/mediatek/phy-mtk-mipi-dsi-mt8196.c b/drivers/phy/mediatek/phy-mtk-mipi-dsi-mt8196.c
+index eac3db9922..aa84edc9b0 100644
+--- a/drivers/phy/mediatek/phy-mtk-mipi-dsi-mt8196.c
++++ b/drivers/phy/mediatek/phy-mtk-mipi-dsi-mt8196.c
+@@ -31,6 +31,7 @@
+ #define MIPITX_PRESERVED	0x000c
+ #define MIPITX_PRESERVED_DEF		0xffff0040
+ #define MIPITX_PRESERVED_MINI		0xffff00f0
++#define MIPITX_PRESERVED_CPHY_FAST	0xffff0030
+ 
+ #define MIPITX_PLL_PWR		0x0028
+ #define AD_DSI_PLL_SDM_PWR_ON		BIT(0)
+@@ -39,10 +40,18 @@
+ #define MIPITX_PLL_CON1		0x0030
+ #define RG_DSI_PLL_EN			BIT(0)
+ #define RG_DSI_PLL_POSDIV		GENMASK(10, 8)
++#define RG_DSI_PLL_FBSEL		BIT(13)
++#define RG_DSI_PLL_DIV3_EN		BIT(28)
+ #define MIPITX_PLL_CON2		0x0034
+ #define MIPITX_PLL_CON3		0x0038
+ #define MIPITX_PLL_CON4		0x003c
+ #define RG_DSI_PLL_IBIAS		GENMASK(11, 10)
++#define MIPITX_PLL_CON4_CPHY		0x00ff12e0
++
++#define MIPITX_PHY_SEL0		0x0040
++#define RG_MIPI_TX_CPHY_EN		BIT(0)
++#define RG_MIPI_TX_LPRX0_CPHY_SEL	GENMASK(17, 16)
++#define RG_MIPI_TX_LPRX1_CPHY_SEL	GENMASK(21, 20)
+ 
+ #define MIPITX_D2_SW_CTL_EN	0x015c
+ #define MIPITX_D0_SW_CTL_EN	0x025c
+@@ -56,6 +65,8 @@
+ #define DSI_PHY_XTAL_CLK_HZ		26000000
+ #define DSI_PHY_PLL_MIN_RATE_HZ		125000000
+ #define DSI_PHY_PLL_MAX_RATE_HZ		2000000000
++#define DSI_PHY_CPHY_FAST_RATE_HZ	2500000000UL
++#define DSI_PHY_CPHY_HSTX_LDO_REF	0xd /* 500 mV swing */
+ 
+ static int mtk_mipi_tx_pll_enable(struct clk_hw *hw)
+ {
+@@ -100,6 +111,20 @@ static int mtk_mipi_tx_pll_enable(struct clk_hw *hw)
+ 	}
+ 	pcw = (u32)pcw_calc;
+ 
++	if (mipi_tx->cphy) {
++		/*
++		 * C-PHY: 500 mV signalling and the vendor's PRESERVED/PLL_CON4
++		 * values; the PLL feedback divider and DIV3 stay off.
++		 */
++		voltage = RG_DSI_PRD_REF_DEF;
++		pres = mipi_tx->data_rate >= DSI_PHY_CPHY_FAST_RATE_HZ ?
++		       MIPITX_PRESERVED_CPHY_FAST : MIPITX_PRESERVED_MINI;
++		mtk_phy_update_field(base + MIPITX_VOLTAGE_SEL, RG_DSI_HSTX_LDO_REF_SEL,
++				     DSI_PHY_CPHY_HSTX_LDO_REF);
++		writel(MIPITX_PLL_CON4_CPHY, base + MIPITX_PLL_CON4);
++		mtk_phy_clear_bits(base + MIPITX_PLL_CON1, RG_DSI_PLL_FBSEL | RG_DSI_PLL_DIV3_EN);
++	}
++
+ 	mtk_phy_update_field(base + MIPITX_VOLTAGE_SEL, RG_DSI_PRD_REF_SEL, voltage);
+ 	writel(pres, base + MIPITX_PRESERVED);
+ 
+@@ -152,12 +177,13 @@ static void mtk_mipi_tx_power_on_signal(struct phy *phy)
+ {
+ 	struct mtk_mipi_tx *mipi_tx = phy_get_drvdata(phy);
+ 	void __iomem *base = mipi_tx->regs;
++	u32 cphy = mipi_tx->cphy ? RG_DSI_CPHY_EN : 0;
+ 
+ 	/* BG_LPF_EN / BG_CORE_EN */
+-	writel(RG_DSI_PAD_TIEL_SEL | RG_DSI_BG_CORE_EN, base + MIPITX_LANE_CON);
++	writel(RG_DSI_PAD_TIEL_SEL | RG_DSI_BG_CORE_EN | cphy, base + MIPITX_LANE_CON);
+ 	/* Wait for MIPI core to enable */
+ 	usleep_range(30, 100);
+-	writel(RG_DSI_BG_CORE_EN | RG_DSI_BG_LPF_EN, base + MIPITX_LANE_CON);
++	writel(RG_DSI_BG_CORE_EN | RG_DSI_BG_LPF_EN | cphy, base + MIPITX_LANE_CON);
+ 
+ 	/* Switch OFF each Lane */
+ 	mtk_phy_clear_bits(base + MIPITX_D0_SW_CTL_EN, DSI_SW_CTL_EN);
+@@ -172,6 +198,18 @@ static void mtk_mipi_tx_power_on_signal(struct phy *phy)
+ 	 * strength (3000uA) and can add a maximum offset of 3000uA, reaching a
+ 	 * maximum drive strength of 3000+3000=6000uA.
+ 	 */
++	if (mipi_tx->cphy) {
++		/*
++		 * Three trios, no clock lane. The LP receivers take their
++		 * C-PHY inputs as the vendor configures them; the drive
++		 * strength stays at the C-PHY swing set with the PLL.
++		 */
++		mtk_phy_set_bits(base + MIPITX_PHY_SEL0, RG_MIPI_TX_CPHY_EN);
++		mtk_phy_update_field(base + MIPITX_PHY_SEL0, RG_MIPI_TX_LPRX0_CPHY_SEL, 0);
++		mtk_phy_update_field(base + MIPITX_PHY_SEL0, RG_MIPI_TX_LPRX1_CPHY_SEL, 3);
++		return;
++	}
++
+ 	mtk_phy_update_field(base + MIPITX_VOLTAGE_SEL, RG_DSI_HSTX_LDO_REF_SEL,
+ 			     (mipi_tx->mipitx_drive - 3000) / 200);
+ 
+@@ -192,8 +230,19 @@ static void mtk_mipi_tx_power_off_signal(struct phy *phy)
+ 
+ 	writel(RG_DSI_PAD_TIEL_SEL | RG_DSI_BG_CORE_EN, base + MIPITX_LANE_CON);
+ 	writel(RG_DSI_PAD_TIEL_SEL, base + MIPITX_LANE_CON);
++
++	if (mipi_tx->cphy)
++		mtk_phy_clear_bits(base + MIPITX_PHY_SEL0, RG_MIPI_TX_CPHY_EN);
+ }
+ 
++/* MT6897: the MT8196 register layout, with C-PHY (three trios) support */
++const struct mtk_mipitx_data mt6897_mipitx_data = {
++	.has_cphy = true,
++	.mipi_tx_clk_ops = &mtk_mipi_tx_pll_ops,
++	.mipi_tx_enable_signal = mtk_mipi_tx_power_on_signal,
++	.mipi_tx_disable_signal = mtk_mipi_tx_power_off_signal,
++};
++
+ const struct mtk_mipitx_data mt8196_mipitx_data = {
+ 	.mipi_tx_clk_ops = &mtk_mipi_tx_pll_ops,
+ 	.mipi_tx_enable_signal = mtk_mipi_tx_power_on_signal,
+diff --git a/drivers/phy/mediatek/phy-mtk-mipi-dsi.c b/drivers/phy/mediatek/phy-mtk-mipi-dsi.c
+index 46f0cb3ac0..dd2b153efe 100644
+--- a/drivers/phy/mediatek/phy-mtk-mipi-dsi.c
++++ b/drivers/phy/mediatek/phy-mtk-mipi-dsi.c
+@@ -3,6 +3,8 @@
+  * Copyright (c) 2015 MediaTek Inc.
+  */
+ 
++#include <dt-bindings/phy/phy.h>
++
+ #include "phy-mtk-mipi-dsi.h"
+ 
+ inline struct mtk_mipi_tx *mtk_mipi_tx_from_clk_hw(struct clk_hw *hw)
+@@ -115,6 +117,7 @@ static int mtk_mipi_tx_probe(struct platform_device *pdev)
+ 	};
+ 	struct phy *phy;
+ 	struct phy_provider *phy_provider;
++	u32 phy_type;
+ 	int ret;
+ 
+ 	mipi_tx = devm_kzalloc(dev, sizeof(*mipi_tx), GFP_KERNEL);
+@@ -148,6 +151,15 @@ static int mtk_mipi_tx_probe(struct platform_device *pdev)
+ 						  6000);
+ 	}
+ 
++	ret = of_property_read_u32(dev->of_node, "phy-type", &phy_type);
++	if (!ret && phy_type == PHY_TYPE_CPHY) {
++		if (!mipi_tx->driver_data->has_cphy)
++			return dev_err_probe(dev, -EINVAL, "C-PHY mode is not supported\n");
++		mipi_tx->cphy = true;
++	} else if (!ret && phy_type != PHY_TYPE_DPHY) {
++		return dev_err_probe(dev, -EINVAL, "Invalid phy-type %u\n", phy_type);
++	}
++
+ 	ref_clk_name = __clk_get_name(ref_clk);
+ 
+ 	ret = of_property_read_string(dev->of_node, "clock-output-names",
+@@ -164,7 +176,7 @@ static int mtk_mipi_tx_probe(struct platform_device *pdev)
+ 
+ 	phy = devm_phy_create(dev, NULL, &mtk_mipi_tx_ops);
+ 	if (IS_ERR(phy))
+-		return dev_err_probe(dev, PTR_ERR(phy), "Failed to create MIPI D-PHY\n");
++		return dev_err_probe(dev, PTR_ERR(phy), "Failed to create MIPI PHY\n");
+ 
+ 	phy_set_drvdata(phy, mipi_tx);
+ 
+@@ -183,6 +195,7 @@ static const struct of_device_id mtk_mipi_tx_match[] = {
+ 	{ .compatible = "mediatek,mt2701-mipi-tx", .data = &mt2701_mipitx_data },
+ 	{ .compatible = "mediatek,mt8173-mipi-tx", .data = &mt8173_mipitx_data },
+ 	{ .compatible = "mediatek,mt8183-mipi-tx", .data = &mt8183_mipitx_data },
++	{ .compatible = "mediatek,mt6897-mipi-tx", .data = &mt6897_mipitx_data },
+ 	{ .compatible = "mediatek,mt8196-mipi-tx", .data = &mt8196_mipitx_data },
+ 	{ /* sentinel */ }
+ };
+diff --git a/drivers/phy/mediatek/phy-mtk-mipi-dsi.h b/drivers/phy/mediatek/phy-mtk-mipi-dsi.h
+index e6f967078e..43dd141e6a 100644
+--- a/drivers/phy/mediatek/phy-mtk-mipi-dsi.h
++++ b/drivers/phy/mediatek/phy-mtk-mipi-dsi.h
+@@ -18,6 +18,7 @@
+ 
+ struct mtk_mipitx_data {
+ 	const u32 mppll_preserve;
++	const bool has_cphy;
+ 	const struct clk_ops *mipi_tx_clk_ops;
+ 	void (*mipi_tx_enable_signal)(struct phy *phy);
+ 	void (*mipi_tx_disable_signal)(struct phy *phy);
+@@ -28,6 +29,7 @@ struct mtk_mipi_tx {
+ 	void __iomem *regs;
+ 	u32 data_rate;
+ 	u32 mipitx_drive;
++	bool cphy;
+ 	u32 rt_code[5];
+ 	const struct mtk_mipitx_data *driver_data;
+ 	struct clk_hw pll_hw;
+@@ -42,5 +44,6 @@ unsigned long mtk_mipi_tx_pll_recalc_rate(struct clk_hw *hw,
+ extern const struct mtk_mipitx_data mt2701_mipitx_data;
+ extern const struct mtk_mipitx_data mt8173_mipitx_data;
+ extern const struct mtk_mipitx_data mt8183_mipitx_data;
++extern const struct mtk_mipitx_data mt6897_mipitx_data;
+ extern const struct mtk_mipitx_data mt8196_mipitx_data;
+ #endif
+-- 
+2.56.0
+

@@ -5,6 +5,8 @@
     ../patches/0000-gdsc-flags.patch
     ../patches/0000-gdsc-poll.patch
     ../patches/0001-sdm660-gcc.patch
+    ../patches/0002-spmi-arbiter-v3.patch
+    ../patches/0003-pm660-gpio.patch
     ./patches/0001-clover-dts.patch
     ./patches/0002-clover-upstream-dt.patch
     ./patches/0003-clover-boot-constraints.patch

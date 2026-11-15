@@ -1,0 +1,62 @@
+From: Armada <noreply@armada.local>
+Date: Thu, 15 Oct 2026 21:58:40 -0400
+Subject: [PATCH] clk: qcom: gcc-sm8650: let the PCIe GDSCs collapse in suspend
+
+Same change as for SM8550: with PWRSTS_RET_ON, gdsc_disable() returns
+without touching the hardware, so the PCIe controllers and PHYs stay
+powered through s2idle, the sleep set has to keep a system-NoC vote for
+them, and DDR never enters self-refresh. pcie-qcom turns the link off
+whenever D3cold is possible and retrains it on resume, so the GDSCs can
+collapse.
+
+Link: https://github.com/armada-os/armada/commit/8dc0be9ad27c775e04bcfbc05808d60d77ddcad9
+(armada packages/kernel/patches/0567-clk-qcom-gcc-sm8650-let-the-pcie-gdscs-collapse-in-suspend.patch,
+committed by virtudude <virtudude@protonmail.com>, based on research by
+@noahcdls)
+
+Local changes (nixos-android-devices): unchanged code; regenerated against
+Linux 7.3 with git headers. Applied to Aurora only, together with armada's
+0522 (only endpoints veto D3cold), which it needs so that the link is
+really torn down before the GDSCs collapse. Armada's SM8550 patch (0566)
+is not taken. The suspend OPP floor stays (pcie_qcom.suspend_opp_floor,
+default full) as a runtime fallback.
+---
+diff --git a/drivers/clk/qcom/gcc-sm8650.c b/drivers/clk/qcom/gcc-sm8650.c
+--- a/drivers/clk/qcom/gcc-sm8650.c
++++ b/drivers/clk/qcom/gcc-sm8650.c
+@@ -3436,7 +3436,7 @@
+ 	.pd = {
+ 		.name = "pcie_0_gdsc",
+ 	},
+-	.pwrsts = PWRSTS_RET_ON,
++	.pwrsts = PWRSTS_OFF_ON,
+ 	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE | VOTABLE,
+ };
+ 
+@@ -3447,7 +3447,7 @@
+ 	.pd = {
+ 		.name = "pcie_0_phy_gdsc",
+ 	},
+-	.pwrsts = PWRSTS_RET_ON,
++	.pwrsts = PWRSTS_OFF_ON,
+ 	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE | VOTABLE,
+ };
+ 
+@@ -3458,7 +3458,7 @@
+ 	.pd = {
+ 		.name = "pcie_1_gdsc",
+ 	},
+-	.pwrsts = PWRSTS_RET_ON,
++	.pwrsts = PWRSTS_OFF_ON,
+ 	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE | VOTABLE,
+ };
+ 
+@@ -3469,7 +3469,7 @@
+ 	.pd = {
+ 		.name = "pcie_1_phy_gdsc",
+ 	},
+-	.pwrsts = PWRSTS_RET_ON,
++	.pwrsts = PWRSTS_OFF_ON,
+ 	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE | VOTABLE,
+ };
+ 

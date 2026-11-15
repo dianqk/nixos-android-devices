@@ -37,4 +37,11 @@
   ./patches/upstream/0028-gcc-sm8450-cx-binding.patch
   ./patches/upstream/0029-gcc-sm8450-cx-runtime-pm.patch
   ./patches/upstream/0030-sm8450-gcc-cx-domain.patch
+  ./patches/local/0032-sm8475-ufs-phy-base-tables.patch
+  ./patches/local/0033-sm8475-ufs-dt-bindings.patch
+  ./patches/local/0034-sm8475-ufs-turbo-mode.patch
+  ./patches/local/0035-sm8475-ufs-opp-table.patch
+  ../../patches/iris-hfi-gen2-deblocking.patch
+  ../../patches/iris-hfi-gen2-error-timestamps.patch
+  ../../patches/iris-hfi-gen2-noshow.patch
 ]

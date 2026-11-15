@@ -22,7 +22,7 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
         ];
       };
   in
-  lib.genAttrs [ "asphalt" "polaris" "aurora" ] (
+  lib.genAttrs [ "asphalt" "polaris" "aurora" "marble" "dodge" ] (
     board:
     let
       s = make board { };
@@ -48,12 +48,18 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
     assert !(disabled.systemd.services ? android-ssc-sensors);
     assert !c.programs.sway.enable;
     assert lib.hasSuffix "/bin/${
-      if board == "aurora" then "adsprpcd" else "sdsprpcd"
+      if lib.elem board [ "aurora" "dodge" ] then "adsprpcd" else "sdsprpcd"
     } sensorspd" c.systemd.services.android-ssc-sensors.serviceConfig.ExecStart;
-    assert
-      c.systemd.services.android-ssc-sensors.bindsTo
-      == [ "dev-fastrpc\\x2d${if board == "aurora" then "adsp" else "sdsp"}.device" ];
+    assert c.systemd.services.android-ssc-sensors.bindsTo == [ ];
+    assert lib.elem "dev-fastrpc\\x2d${
+      if board == "dodge" then "adsp\\x2dsecure" else if board == "aurora" then "adsp" else "sdsp"
+    }.device" c.systemd.services.android-ssc-sensors.requires;
+    assert lib.elem "dev-fastrpc\\x2d${
+      if board == "dodge" then "adsp\\x2dsecure" else if board == "aurora" then "adsp" else "sdsp"
+    }.device" c.systemd.services.android-ssc-sensors.after;
+    assert c.systemd.services.android-ssc-sensors.serviceConfig.Restart == "on-failure";
     assert board != "aurora" || lib.elem "/odm/etc/sensors" c.androidDevices.sensors.configPaths;
+    assert board != "dodge" || lib.elem "/odm/etc/sensor" c.androidDevices.sensors.configPaths;
     assert lib.elem "/share/uncompressed-firmware" alone.environment.pathsToLink;
     assert board != "polaris" || alone.systemd.services ? polaris-pd-mapper;
     assert rpc.stdenv.hostPlatform.system == "aarch64-linux";

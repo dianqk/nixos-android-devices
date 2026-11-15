@@ -1,0 +1,37 @@
+From df5392341552261313672129419605937dea0dea Mon Sep 17 00:00:00 2001
+From: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
+Date: Sat, 24 Oct 2026 03:35:22 +0300
+Subject: [PATCH 075/144] drm/msm/dp: don't take extra references on multiple
+ plug events
+
+The upper layers might signal multiple sequential HPD plug events. Don't
+take extra references and skip all further HPD plug events until we
+receive the unplug event.
+
+Fixes: 3ea2d1c3d154 ("drm/msm/dp: turn link_ready into plugged")
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
+Message-ID: <20261024-hpd-irq-events-v8-6-6ee949e7a384@oss.qualcomm.com>
+Link: https://lore.kernel.org/all/20261024-hpd-irq-events-v8-6-6ee949e7a384@oss.qualcomm.com/
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0097-drm-msm-dp-don-t-take-extra-references-on-multiple-p.patch
+Import-SHA256: 947ab3168a25b0183e06f37bba3d8ff9a4cbc5fe7ec72b8d4b41503b64265dde
+Import-Provenance: mail headers
+(cherry picked from commit 12c28099a5c65b463378bcade5c56b4c70271dba)
+---
+ drivers/gpu/drm/msm/dp/dp_display.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index 4dcbd9b99d..ae5a1674cf 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -411,6 +411,9 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
+ 
+ 	guard(mutex)(&dp->plugged_lock);
+ 
++	if (dp->plugged)
++		return 0;
++
+ 	ret = pm_runtime_resume_and_get(&pdev->dev);
+ 	if (ret) {
+ 		DRM_ERROR("failed to pm_runtime_resume\n");

@@ -13,6 +13,14 @@ let
   efiArch = pkgs.stdenv.hostPlatform.efiArch;
   actions = cfg.boot.actions;
   specialActions = actions.bootloader || actions.recovery || actions.android;
+  choice = cfg.boot.uefi.bootChoice;
+  choicePath = "EFI/android-devices/boot-choice.efi";
+  choiceMenu = androidPackages.packaging.writeText "android-same-slot.conf" ''
+    title Reboot to Android
+    sort-key z-android-action
+    efi /${choicePath}
+    options target=android
+  '';
   helperPath = "EFI/android-devices/mobile-boot-action.efi";
   loaderActions =
     lib.optionalString actions.reboot "auto-reboot yes\n"
@@ -39,6 +47,7 @@ in
       default = "oem";
       description = "OEM recovery on non-A/B devices, or the installed NixOS recovery_b on Qualcomm A/B devices.";
     };
+    androidSameSlot = lib.mkEnableOption "commit Android preference in the current owned boot partition and reset (no slot switch or second confirmation)";
     android = lib.mkEnableOption "confirmed switch to Android boot_a using compatible Qualcomm A/B firmware";
     helperPackage = lib.mkOption {
       type = lib.types.package;
@@ -47,6 +56,14 @@ in
     };
   };
   options.androidDevices.boot.uefi = {
+    bootChoice = {
+      enable = lib.mkEnableOption "owned same-slot boot-choice EFI integration with context ABI 1 and durable UFS/FAT protocol ABI 1 firmware";
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = androidPackages.boot-choice-efi;
+        description = "Freestanding boot-choice helper matched to the selected firmware and owned boot image. Enabling installation is not hardware validation.";
+      };
+    };
     requireStandardEsp = lib.mkOption {
       type = lib.types.bool;
       default = true;
@@ -60,6 +77,11 @@ in
     device = lib.mkOption {
       type = lib.types.str;
       description = "Physical FAT boot partition; never an Android super logical partition.";
+    };
+    label = lib.mkOption {
+      type = lib.types.strMatching "[A-Z0-9_]{1,11}";
+      default = "BOOT";
+      description = "FAT filesystem label of the boot partition. Mounts use `device`; the recovery creates the FAT filesystem with this label and checks it. Share this setting with recovery.";
     };
   };
   # Apply to the upstream NixOS installer instead of copying its implementation.
@@ -104,6 +126,10 @@ in
             bytes=$(${pkgs.coreutils}/bin/stat -Lc %s ${actions.helperPackage}/mobile-boot-action.efi)
             needed=$((needed + bytes))
           ''}
+          ${lib.optionalString choice.enable ''
+            bytes=$(${pkgs.coreutils}/bin/stat -Lc %s ${choice.package}/boot-choice.efi)
+            needed=$((needed + bytes))
+          ''}
           ${lib.optionalString cfg.charger.enable ''
             bytes=$(${pkgs.coreutils}/bin/stat -Lc %s ${config.system.build.mobileChargerImage})
             needed=$((needed + bytes))
@@ -121,7 +147,17 @@ in
         installer;
   };
   config = lib.mkIf enabled {
+    environment.systemPackages = lib.optional choice.enable androidPackages.boot-choice-native;
     assertions = [
+      {
+        assertion =
+          !(extraFiles ? "EFI/android-devices/boot-choice.efi") && !(extraEntries ? "android-same-slot.conf");
+        message = "Boot-choice helper/menu are native-owned or runtime-bootstrap files; do not register them in systemd-boot extraFiles/extraEntries.";
+      }
+      {
+        assertion = !actions.androidSameSlot || (choice.enable && !actions.android);
+        message = "Same-slot Android requires owned boot-choice integration and must not coexist with the legacy Android slot-switch action.";
+      }
       {
         assertion = config.boot.loader.systemd-boot.enable;
         message = "Installed mobile systems require U-Boot and systemd-boot.";
@@ -135,7 +171,8 @@ in
         message = "Use an explicit physical GPT partition for mobile /boot.";
       }
       {
-        assertion = !specialActions || config.boot.loader.systemd-boot.xbootldrMountPoint == null;
+        assertion =
+          !(specialActions || choice.enable) || config.boot.loader.systemd-boot.xbootldrMountPoint == null;
         message = "Mobile boot actions require their entries and EFI helper on the same ESP.";
       }
     ];
@@ -180,6 +217,15 @@ in
           lib.optionalString (loaderActions != "") ''
             ${pkgs.python3}/bin/python3 ${./loader-actions.py} /boot/loader/loader.conf ${loaderActionsFile}
           ''
+          + lib.optionalString choice.enable ''
+            # Never register this pair in extraFiles/extraEntries: upstream
+            # removes tracked paths before hooks, including during disable.
+            ${pkgs.python3}/bin/python3 ${./install-boot-choice.py} /boot ${choice.package}/boot-choice.efi ${choiceMenu}
+          ''
+          + lib.optionalString actions.androidSameSlot ''
+            # Only the superseded legacy slot-switch entry; preserve other entries.
+            ${pkgs.coreutils}/bin/rm -f /boot/loader/entries/android-system.conf
+          ''
           + lib.optionalString cfg.charger.enable ''
             ${pkgs.python3}/bin/python3 ${./install-charger.py} ${config.system.build.mobileChargerImage} /boot
           ''
@@ -199,7 +245,6 @@ in
     system.systemBuilderCommands = ''
       touch $out/mobile-efi
       printf '%s\n' ${lib.escapeShellArg cfg.deviceName} > $out/mobile-device
-      ln -s ${config.system.build.mobileBootImage} $out/mobile-boot.img
     '';
     system.build.mobileBootFiles =
       androidPackages.packaging.runCommand "${cfg.deviceName}-boot-files" { }

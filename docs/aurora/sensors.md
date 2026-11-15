@@ -1,15 +1,14 @@
-# Aurora Android 14 sensor integration
+# Aurora sensor integration
 
 [中文](sensors.zh.md)
 
-The `sensors` output of the Aurora firmware package consumes pinned
-[OEM data](https://github.com/dianqk/firmware-xiaomi-aurora/tree/60febc4751f8b939468bd57879d6831635d520d7/android14/sensors). It requires
-China OS1.0.3.0.UNACNXM (runtime V816.0.3.0.UNACNXM), the same baseline as the
-ADSP firmware. It contains 68 OEM configuration files and 10 Hexagon DSP files;
+The `sensors` output of the Aurora firmware package consumes OEM data in `sensors/` of the
+[firmware release archive](firmware.md#firmware-source). It requires
+China OS3.0.308.0.WNACNXM (Android 16), the same baseline as the
+ADSP firmware. It contains 67 OEM configuration files and 10 Hexagon DSP files;
 no handset-specific calibration or Android daemon is included.
 
-`SOURCE.json` records the original ROM paths and SHA-256 values; `SHA256SUMS`
-checks the unmodified files. Config selection follows `/odm/etc/sensors/config/json.lst`
+`sensors/SHA256SUMS` checks the unmodified files. Config selection follows `/odm/etc/sensors/config/json.lst`
 for MTP / SoC 557. That OEM list also names three absent secondary SAR files
 (`sm8650_sx937x_1.json`, `sx937x_1.json`, `sx937x_reg_1.json`); these are omitted.
 The duplicate vendor/ODM CHRE configuration differs only in platform selectors;

@@ -1,0 +1,969 @@
+From 83a1e0ba06235e55d1c411a8888fbc172760e14a Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 11 Nov 2026 06:46:44 +0800
+Subject: [PATCH] drm/mediatek: order MT6897 display runtime PM ownership
+
+Hold the MMSYS devices used by an active CRTC, including the shared DRM parent, before starting the path. Use the controller order for acquisition and reverse it after checked stop. Replace follower links only for this variant.
+
+Pin the actual component, mutex, supplier and parent closure during teardown so its existing asynchronous puts cannot become final before the consumer-first drain. Preserve other owners and retain still-owned resources on failure.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_drm_drv.c#L5554-L5641
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_drm_drv.c#L5734-L5813
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/gpu/drm/mediatek/Makefile             |   1 +
+ drivers/gpu/drm/mediatek/mtk_crtc.c           | 225 +++++++++-
+ drivers/gpu/drm/mediatek/mtk_drm_drv.c        |   7 +
+ drivers/gpu/drm/mediatek/mtk_drm_drv.h        |   4 +
+ drivers/gpu/drm/mediatek/mtk_drm_pm.c         | 397 ++++++++++++++++++
+ drivers/gpu/drm/mediatek/mtk_drm_pm.h         |  17 +
+ .../selftests/mtk_clk/crtc_stop_cases.c       |  30 ++
+ 7 files changed, 673 insertions(+), 8 deletions(-)
+ create mode 100644 drivers/gpu/drm/mediatek/mtk_drm_pm.c
+ create mode 100644 drivers/gpu/drm/mediatek/mtk_drm_pm.h
+
+diff --git a/drivers/gpu/drm/mediatek/Makefile b/drivers/gpu/drm/mediatek/Makefile
+index 0d4f30f080..acc047f6d0 100644
+--- a/drivers/gpu/drm/mediatek/Makefile
++++ b/drivers/gpu/drm/mediatek/Makefile
+@@ -18,6 +18,7 @@ mediatek-drm-y := mtk_crtc.o \
+ 		  mtk_disp_tdshp.o \
+ 		  mtk_disp_wdma.o \
+ 		  mtk_drm_drv.o \
++		  mtk_drm_pm.o \
+ 		  mtk_drm_legacy.o \
+ 		  mtk_dsi.o \
+ 		  mtk_dpi_common.o \
+diff --git a/drivers/gpu/drm/mediatek/mtk_crtc.c b/drivers/gpu/drm/mediatek/mtk_crtc.c
+index fee36ff643..5cd2d8112a 100644
+--- a/drivers/gpu/drm/mediatek/mtk_crtc.c
++++ b/drivers/gpu/drm/mediatek/mtk_crtc.c
+@@ -28,6 +28,7 @@
+ #include "mtk_ddp_comp.h"
+ #include "mtk_disp_drv.h"
+ #include "mtk_drm_drv.h"
++#include "mtk_drm_pm.h"
+ #include "mtk_plane.h"
+ 
+ /*
+@@ -63,6 +64,7 @@ struct mtk_crtc_hw_layer {
+  * @mmsys_dev:       Pointer to the MMSYS device for configuration registers
+  * @dma_dev:         Pointer to the DMA device (usually linked to an IOMMU)
+  * @mutex:           Pointer to the MediaTek MuteX devices for HW triggers mute/unmuting
++ * @pm_group:        Ordered controller runtime references, where supported
+  * @vblank_comp_idx: Index of HW component where to enable sending VBlanks
+  * @config_comp_idx: Index of main HW component to use for plane configuration
+  * @ddp_comp_nr:     Number of HW components in ddp_comp structure
+@@ -108,6 +110,7 @@ struct mtk_crtc {
+ 	struct device			*mmsys_dev;
+ 	struct device			*dma_dev;
+ 	struct mtk_mutex		**mutex;
++	struct mtk_drm_pm_group		*pm_group;
+ 	s8				vblank_comp_idx;
+ 	s8				config_comp_idx;
+ 	unsigned int			ddp_comp_nr;
+@@ -144,9 +147,22 @@ static inline struct mtk_crtc_state *to_mtk_crtc_state(struct drm_crtc_state *s)
+ 	return container_of(s, struct mtk_crtc_state, base);
+ }
+ 
++static bool mtk_crtc_uses_ordered_pm(const struct mtk_drm_private *priv)
++{
++	return IS_ENABLED(CONFIG_PM) && priv->data->ordered_runtime_pm;
++}
++
+ static bool mtk_crtc_faulted(struct mtk_crtc *mtk_crtc)
+ {
+-	return READ_ONCE(mtk_crtc->cmdq_faulted);
++	struct mtk_drm_private *priv;
++
++	if (READ_ONCE(mtk_crtc->cmdq_faulted))
++		return true;
++	if (!mtk_crtc->pm_group)
++		return false;
++
++	priv = mtk_crtc->base.dev->dev_private;
++	return READ_ONCE(priv->pm_transition_failed);
+ }
+ 
+ static void mtk_crtc_finish_page_flip(struct mtk_crtc *mtk_crtc)
+@@ -290,6 +306,7 @@ static void mtk_crtc_destroy(struct drm_crtc *crtc)
+ 		mtk_ddp_comp_unregister_vblank_cb(comp);
+ 	}
+ 
++	mtk_drm_pm_group_destroy(mtk_crtc->pm_group);
+ 	drm_crtc_cleanup(crtc);
+ }
+ 
+@@ -1281,6 +1298,64 @@ void mtk_crtc_async_update(struct drm_crtc *crtc, struct drm_plane *plane,
+ 	mutex_unlock(&mtk_crtc->hw_lock);
+ }
+ 
++static int mtk_crtc_prepare_pm_put(struct mtk_crtc *mtk_crtc)
++{
++	struct drm_device *drm = mtk_crtc->base.dev;
++	struct mtk_drm_private *priv = drm->dev_private;
++	unsigned int comps = mtk_crtc->ddp_comp_nr + mtk_crtc->shadow_comp_nr;
++	struct device **participants;
++	unsigned int i, count = 0;
++	int ret;
++
++	lockdep_assert_held(&priv->pm_transition_lock);
++	participants = kcalloc(2 * comps + mtk_crtc->num_controllers + 1,
++			       sizeof(*participants), GFP_KERNEL);
++	if (!participants)
++		return -ENOMEM;
++
++	participants[count++] = drm->dev;
++	for (i = 0; i < mtk_crtc->num_controllers; i++) {
++		struct mtk_drm_private *controller;
++
++		controller = mtk_crtc_get_controller_priv(mtk_crtc,
++							  mtk_crtc->controller_idmap[i]);
++		participants[count++] = controller->mutex_dev;
++	}
++	for (i = 0; i < comps; i++) {
++		struct mtk_ddp_comp *comp;
++		struct device *twin;
++
++		if (i < mtk_crtc->ddp_comp_nr)
++			comp = mtk_crtc->ddp_comp[i];
++		else
++			comp = mtk_crtc->shadow_comp[i - mtk_crtc->ddp_comp_nr];
++		if (!comp || !comp->dev)
++			continue;
++		participants[count++] = comp->dev;
++		if (comp->type == MTK_DISP_OVL || comp->type == MTK_DISP_OVL_2L) {
++			twin = mtk_ovl_get_twin(comp->dev);
++			if (twin)
++				participants[count++] = twin;
++		}
++	}
++	ret = mtk_drm_pm_prepare_put(mtk_crtc->pm_group, participants, count);
++	kfree(participants);
++	return ret;
++}
++
++static void mtk_crtc_pm_fault(struct mtk_crtc *mtk_crtc,
++			     struct drm_crtc_state *passed, int ret)
++{
++	struct drm_device *drm = mtk_crtc->base.dev;
++	struct mtk_drm_private *priv = drm->dev_private;
++
++	lockdep_assert_held(&priv->pm_transition_lock);
++	drm_err(drm, "[CRTC:%d] Ordered runtime PM failed: %d; retaining resources\n",
++		mtk_crtc->base.base.id, ret);
++	WRITE_ONCE(priv->pm_transition_failed, true);
++	mtk_crtc_fault_events(mtk_crtc, passed);
++}
++
+ static void mtk_crtc_atomic_enable(struct drm_crtc *crtc,
+ 				   struct drm_atomic_commit *state)
+ {
+@@ -1288,7 +1363,9 @@ static void mtk_crtc_atomic_enable(struct drm_crtc *crtc,
+ 	struct drm_crtc_state *passed = drm_atomic_get_new_crtc_state(state, crtc);
+ 	struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[mtk_crtc->config_comp_idx];
+ 	struct drm_device *dev = mtk_crtc->base.dev;
+-	int ret;
++	struct mtk_drm_private *priv = dev->dev_private;
++	bool powered = false;
++	int ret, put_ret;
+ 
+ 	drm_dbg_driver(dev, "%s %d\n", __func__, crtc->base.id);
+ 	if (mtk_crtc->cmdq_checked_stop) {
+@@ -1301,22 +1378,59 @@ static void mtk_crtc_atomic_enable(struct drm_crtc *crtc,
+ 			goto out_unlock;
+ 	}
+ 
++	if (mtk_crtc->pm_group) {
++		mutex_lock(&priv->pm_transition_lock);
++		if (mtk_crtc_faulted(mtk_crtc)) {
++			mtk_crtc_fault_events(mtk_crtc, passed);
++			goto out_pm_unlock;
++		}
++		ret = mtk_drm_pm_group_get(mtk_crtc->pm_group);
++		if (ret)
++			goto err_ordered;
++	}
++
+ 	ret = mtk_ddp_comp_power_on(comp);
+ 	if (ret < 0) {
+ 		DRM_DEV_ERROR(comp->dev, "Failed to enable power domain: %d\n", ret);
++		if (mtk_crtc->pm_group)
++			goto err_ordered;
+ 		goto out_unlock;
+ 	}
+ 
++	powered = true;
+ 	mtk_crtc_update_output(crtc, state);
+ 
+ 	ret = mtk_crtc_ddp_hw_init(mtk_crtc);
+ 	if (ret) {
++		if (mtk_crtc->pm_group)
++			goto err_ordered;
+ 		mtk_ddp_comp_power_off(comp);
+ 		goto out_unlock;
+ 	}
+ 
+ 	drm_crtc_vblank_on(crtc);
+ 	mtk_crtc->enabled = true;
++	goto out_pm_unlock;
++
++err_ordered:
++	/* hw_init may have queued its own unwind puts. Hold the group while
++	 * settling that closure, and pin it before the config component's put.
++	 */
++	put_ret = mtk_crtc_prepare_pm_put(mtk_crtc);
++	if (!put_ret) {
++		if (powered)
++			mtk_ddp_comp_power_off(comp);
++		put_ret = mtk_drm_pm_group_put(mtk_crtc->pm_group);
++	}
++	if (put_ret)
++		mtk_crtc_pm_fault(mtk_crtc, passed, put_ret);
++	else
++		mtk_crtc_fault_events(mtk_crtc, passed);
++	drm_err(dev, "[CRTC:%d] Ordered enable failed: %d\n", crtc->base.id, ret);
++
++out_pm_unlock:
++	if (mtk_crtc->pm_group)
++		mutex_unlock(&priv->pm_transition_lock);
+ out_unlock:
+ 	if (mtk_crtc->cmdq_checked_stop)
+ 		mutex_unlock(&mtk_crtc->hw_lock);
+@@ -1329,7 +1443,8 @@ static void mtk_crtc_atomic_disable(struct drm_crtc *crtc,
+ 	struct drm_crtc_state *passed = drm_atomic_get_new_crtc_state(state, crtc);
+ 	struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[mtk_crtc->config_comp_idx];
+ 	struct drm_device *dev = mtk_crtc->base.dev;
+-	int i;
++	struct mtk_drm_private *priv = dev->dev_private;
++	int i, ret;
+ 
+ 	drm_dbg_driver(dev, "%s %d\n", __func__, crtc->base.id);
+ 	if (mtk_crtc->cmdq_checked_stop)
+@@ -1408,11 +1523,32 @@ static void mtk_crtc_atomic_disable(struct drm_crtc *crtc,
+ 		drm_crtc_vblank_put(crtc);
+ 	}
+ 
++	if (mtk_crtc->pm_group) {
++		mutex_lock(&priv->pm_transition_lock);
++		if (mtk_crtc_faulted(mtk_crtc)) {
++			mtk_crtc_fault_events(mtk_crtc, passed);
++			goto out_pm_unlock;
++		}
++		ret = mtk_crtc_prepare_pm_put(mtk_crtc);
++		if (ret) {
++			mtk_crtc_pm_fault(mtk_crtc, passed, ret);
++			goto out_pm_unlock;
++		}
++	}
++
+ 	drm_crtc_vblank_off(crtc);
+ 	mtk_crtc_ddp_hw_fini(mtk_crtc);
+ 	mtk_ddp_comp_power_off(comp);
+ 
+ 	mtk_crtc->enabled = false;
++	if (mtk_crtc->pm_group) {
++		ret = mtk_drm_pm_group_put(mtk_crtc->pm_group);
++		if (ret)
++			mtk_crtc_pm_fault(mtk_crtc, passed, ret);
++	}
++out_pm_unlock:
++	if (mtk_crtc->pm_group)
++		mutex_unlock(&priv->pm_transition_lock);
+ out_unlock:
+ 	if (mtk_crtc->cmdq_checked_stop)
+ 		mutex_unlock(&mtk_crtc->hw_lock);
+@@ -1824,6 +1960,9 @@ static int mtk_crtc_init_multi_controller_properties(struct device *dev,
+ 			mtk_crtc->controller_idmap[z] = comp->controller_id;
+ 			z++;
+ 
++			if (mtk_crtc_uses_ordered_pm(priv))
++				break;
++
+ 			/*
+ 			 * If this is a multi-controller path, link the follower
+ 			 * with the leader controller to make sure that any call
+@@ -1845,6 +1984,58 @@ static int mtk_crtc_init_multi_controller_properties(struct device *dev,
+ 	return 0;
+ }
+ 
++static int mtk_crtc_init_pm_group(struct mtk_crtc *mtk_crtc)
++{
++	struct drm_device *drm = mtk_crtc->base.dev;
++	struct mtk_drm_private *priv = drm->dev_private;
++	struct device *controllers[MTK_DISP_CONTROLLER_MAX_CONTROLLERS_NUM];
++	unsigned long mask = 0;
++	unsigned int count = 0, i, j;
++	bool found_parent = false;
++
++	if (!mtk_crtc_uses_ordered_pm(priv))
++		return 0;
++
++	for (i = 0; i < mtk_crtc->num_controllers; i++)
++		mask |= BIT(mtk_crtc->controller_idmap[i]);
++
++	/* The DRM device itself is also a runtime consumer. Its MMSYS parent
++	 * depends on bind order and need not be part of this CRTC's routes.
++	 */
++	for (i = 0; i < priv->data->mmsys_dev_num; i++) {
++		struct mtk_drm_private *controller = priv->all_drm_private[i];
++
++		if (controller->mmsys_dev == drm->dev->parent) {
++			mask |= BIT(controller->data->mmsys_id);
++			found_parent = true;
++		}
++	}
++	if (!found_parent)
++		return -ENODEV;
++
++	for_each_set_bit(i, &mask, MTK_DISP_CONTROLLER_MAX_CONTROLLERS_NUM) {
++		for (j = 0; j < priv->data->mmsys_dev_num; j++) {
++			struct mtk_drm_private *controller = priv->all_drm_private[j];
++
++			if (controller->data->mmsys_id != i)
++				continue;
++			controllers[count++] = controller->mmsys_dev;
++			break;
++		}
++		if (j == priv->data->mmsys_dev_num)
++			return -ENODEV;
++	}
++
++	mtk_crtc->pm_group = mtk_drm_pm_group_create(controllers, count);
++	if (IS_ERR(mtk_crtc->pm_group)) {
++		int ret = PTR_ERR(mtk_crtc->pm_group);
++
++		mtk_crtc->pm_group = NULL;
++		return ret;
++	}
++	return 0;
++}
++
+ static int mtk_crtc_init_mutex(struct device *dev, struct mtk_crtc *mtk_crtc)
+ {
+ 	unsigned int i;
+@@ -1859,18 +2050,26 @@ static int mtk_crtc_init_mutex(struct device *dev, struct mtk_crtc *mtk_crtc)
+ 		u8 controller_num = mtk_crtc->controller_idmap[i];
+ 		struct mtk_drm_private *priv = mtk_crtc_get_controller_priv(mtk_crtc, controller_num);
+ 
+-		if (!priv)
+-			return -ENODEV;
++		if (!priv) {
++			ret = -ENODEV;
++			goto err_mutex_put;
++		}
+ 
+ 		mtk_crtc->mutex[i] = mtk_mutex_get(priv->mutex_dev);
+ 		if (IS_ERR(mtk_crtc->mutex[i])) {
+ 			ret = PTR_ERR(mtk_crtc->mutex[i]);
+ 			dev_err(dev, "Failed to get Controller %u MuteX: %d\n", i, ret);
+-			return ret;
++			goto err_mutex_put;
+ 		}
+ 	}
+ 
+ 	return 0;
++
++err_mutex_put:
++	if (mtk_crtc->pm_group)
++		while (i--)
++			mtk_mutex_put(mtk_crtc->mutex[i]);
++	return ret;
+ }
+ 
+ /* Collect a CRTC path's components across all controllers, in order */
+@@ -2226,12 +2425,16 @@ int mtk_crtc_create(struct drm_device *drm_dev,
+ 
+ 	ret = mtk_crtc_init_multi_controller_properties(dev, mtk_crtc);
+ 	if (ret)
+-		goto err_free_layer_stages;
++		goto err_cleanup_ordered_crtc;
+ 
+-	ret = mtk_crtc_init_mutex(dev, mtk_crtc);
++	ret = mtk_crtc_init_pm_group(mtk_crtc);
+ 	if (ret)
+ 		goto err_free_idmap;
+ 
++	ret = mtk_crtc_init_mutex(dev, mtk_crtc);
++	if (ret)
++		goto err_free_pm_group;
++
+ 	if (gamma_lut_size)
+ 		drm_mode_crtc_set_gamma_size(&mtk_crtc->base, gamma_lut_size);
+ 	drm_crtc_enable_color_mgmt(&mtk_crtc->base, 0, has_ctm, gamma_lut_size);
+@@ -2308,8 +2511,14 @@ int mtk_crtc_create(struct drm_device *drm_dev,
+ 
+ 	return 0;
+ 
++err_free_pm_group:
++	mtk_drm_pm_group_destroy(mtk_crtc->pm_group);
++	mtk_crtc->pm_group = NULL;
+ err_free_idmap:
+ 	devm_kfree(dev, mtk_crtc->controller_idmap);
++err_cleanup_ordered_crtc:
++	if (mtk_crtc_uses_ordered_pm(priv))
++		drm_crtc_cleanup(&mtk_crtc->base);
+ err_free_layer_stages:
+ 	for (i = 0; i < num_comp_planes; i++) {
+ 		struct mtk_crtc_hw_layer *comp_plane = &mtk_crtc->hwlayers[i];
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_drv.c b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+index 51ef81c7ce..269e7e1f97 100644
+--- a/drivers/gpu/drm/mediatek/mtk_drm_drv.c
++++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+@@ -128,6 +128,7 @@ static const struct mtk_mmsys_driver_data mt8192_mmsys_driver_data = {
+  */
+ static const struct mtk_mmsys_driver_data mt6897_dispsys0_driver_data = {
+ 	.cmdq_checked_stop = true,
++	.ordered_runtime_pm = true,
+ 	.mmsys_id = 0,
+ 	.mmsys_dev_num = 4,
+ 	.max_width = 4096,
+@@ -137,6 +138,7 @@ static const struct mtk_mmsys_driver_data mt6897_dispsys0_driver_data = {
+ 
+ static const struct mtk_mmsys_driver_data mt6897_dispsys1_driver_data = {
+ 	.cmdq_checked_stop = true,
++	.ordered_runtime_pm = true,
+ 	.mmsys_id = 1,
+ 	.mmsys_dev_num = 4,
+ 	.max_width = 4096,
+@@ -146,6 +148,7 @@ static const struct mtk_mmsys_driver_data mt6897_dispsys1_driver_data = {
+ 
+ static const struct mtk_mmsys_driver_data mt6897_ovlsys0_driver_data = {
+ 	.cmdq_checked_stop = true,
++	.ordered_runtime_pm = true,
+ 	.mmsys_id = 2,
+ 	.mmsys_dev_num = 4,
+ 	.max_width = 4096,
+@@ -155,6 +158,7 @@ static const struct mtk_mmsys_driver_data mt6897_ovlsys0_driver_data = {
+ 
+ static const struct mtk_mmsys_driver_data mt6897_ovlsys1_driver_data = {
+ 	.cmdq_checked_stop = true,
++	.ordered_runtime_pm = true,
+ 	.mmsys_id = 3,
+ 	.mmsys_dev_num = 4,
+ 	.max_width = 4096,
+@@ -1536,6 +1540,9 @@ static int mtk_drm_probe(struct platform_device *pdev)
+ 	if (!mtk_drm_data)
+ 		return -EINVAL;
+ 
++	if (mtk_drm_data->ordered_runtime_pm)
++		mutex_init(&private->pm_transition_lock);
++
+ 	hash_init(private->hlist.ddp_list);
+ 
+ 	if (of_graph_is_present(phandle))
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_drv.h b/drivers/gpu/drm/mediatek/mtk_drm_drv.h
+index e72e5044ba..4043b4f82c 100644
+--- a/drivers/gpu/drm/mediatek/mtk_drm_drv.h
++++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.h
+@@ -7,6 +7,7 @@
+ #define MTK_DRM_DRV_H
+ 
+ #include <linux/io.h>
++#include <linux/mutex.h>
+ #include "mtk_ddp_comp.h"
+ 
+ #define MAX_CONNECTOR	2
+@@ -53,6 +54,7 @@ struct mtk_mmsys_driver_data {
+ 
+ 	bool shadow_register;
+ 	bool cmdq_checked_stop;
++	bool ordered_runtime_pm;
+ 	unsigned int mmsys_id;
+ 	unsigned int mmsys_dev_num;
+ 
+@@ -75,6 +77,8 @@ struct mtk_drm_private {
+ 	struct drm_atomic_commit *suspend_state;
+ 	unsigned int mbox_index;
+ 	struct mtk_drm_private **all_drm_private;
++	struct mutex pm_transition_lock;
++	bool pm_transition_failed;
+ };
+ 
+ extern struct platform_driver mtk_direct_link_driver;
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_pm.c b/drivers/gpu/drm/mediatek/mtk_drm_pm.c
+new file mode 100644
+index 0000000000..026adaaa52
+--- /dev/null
++++ b/drivers/gpu/drm/mediatek/mtk_drm_pm.c
+@@ -0,0 +1,397 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/list.h>
++#include <linux/pm_runtime.h>
++#include <linux/slab.h>
++
++#include "mtk_drm_pm.h"
++
++struct mtk_drm_pm_node {
++	struct list_head node;
++	struct list_head order;
++	struct device *dev;
++	struct mtk_drm_pm_node **suppliers;
++	unsigned int num_suppliers;
++	unsigned int consumers;
++	bool pinned;
++};
++
++struct mtk_drm_pm_graph {
++	struct list_head nodes;
++	struct list_head ordered;
++	unsigned int count;
++};
++
++struct mtk_drm_pm_group {
++	struct mtk_drm_pm_graph *graph;
++	unsigned int count;
++	unsigned int acquired;
++	bool faulted;
++	struct device *controllers[];
++};
++
++struct mtk_drm_pm_group *
++mtk_drm_pm_group_create(struct device * const *controllers, unsigned int count)
++{
++	struct mtk_drm_pm_group *group;
++	unsigned int i;
++
++	if (!count)
++		return ERR_PTR(-EINVAL);
++	group = kzalloc(struct_size(group, controllers, count), GFP_KERNEL);
++	if (!group)
++		return ERR_PTR(-ENOMEM);
++
++	group->count = count;
++	for (i = 0; i < count; i++)
++		group->controllers[i] = get_device(controllers[i]);
++
++	return group;
++}
++
++void mtk_drm_pm_group_destroy(struct mtk_drm_pm_group *group)
++{
++	unsigned int i;
++
++	if (!group)
++		return;
++
++	/* A failed stop can leave hardware live. Don't drop its resources on
++	 * unbind. This record and its device references outlive the CRTC.
++	 */
++	if (group->acquired || group->graph) {
++		dev_err(group->controllers[0],
++			"Retaining display PM resources after failed teardown\n");
++		return;
++	}
++
++	for (i = 0; i < group->count; i++)
++		put_device(group->controllers[i]);
++	kfree(group);
++}
++
++/* An unsuccessful get leaves only its successfully acquired prefix owned. */
++int mtk_drm_pm_group_get(struct mtk_drm_pm_group *group)
++{
++	int ret;
++
++	if (group->faulted || group->acquired || group->graph)
++		return -EIO;
++
++	while (group->acquired < group->count) {
++		ret = pm_runtime_resume_and_get(group->controllers[group->acquired]);
++		if (ret < 0)
++			return ret;
++		group->acquired++;
++	}
++
++	return 0;
++}
++
++static void mtk_drm_pm_graph_free(struct mtk_drm_pm_graph *graph)
++{
++	struct mtk_drm_pm_node *node, *next;
++
++	list_for_each_entry_safe(node, next, &graph->nodes, node) {
++		put_device(node->dev);
++		kfree(node->suppliers);
++		kfree(node);
++	}
++	kfree(graph);
++}
++
++static struct mtk_drm_pm_node *
++mtk_drm_pm_graph_add(struct mtk_drm_pm_graph *graph, struct device *dev)
++{
++	struct mtk_drm_pm_node *node;
++
++	list_for_each_entry(node, &graph->nodes, node)
++		if (node->dev == dev)
++			return node;
++
++	node = kzalloc(sizeof(*node), GFP_KERNEL);
++	if (!node)
++		return ERR_PTR(-ENOMEM);
++
++	node->dev = get_device(dev);
++	list_add_tail(&node->node, &graph->nodes);
++	graph->count++;
++	return node;
++}
++
++static int mtk_drm_pm_graph_edge(struct mtk_drm_pm_graph *graph,
++				 struct mtk_drm_pm_node *consumer, struct device *dev)
++{
++	struct mtk_drm_pm_node *supplier;
++	unsigned int i;
++
++	supplier = mtk_drm_pm_graph_add(graph, dev);
++	if (IS_ERR(supplier))
++		return PTR_ERR(supplier);
++
++	for (i = 0; i < consumer->num_suppliers; i++)
++		if (consumer->suppliers[i] == supplier)
++			return 0;
++
++	consumer->suppliers[consumer->num_suppliers++] = supplier;
++	supplier->consumers++;
++	return 0;
++}
++
++static int mtk_drm_pm_graph_expand(struct mtk_drm_pm_graph *graph,
++				   struct mtk_drm_pm_node *node)
++{
++	struct device **suppliers;
++	struct device *parent = node->dev->parent;
++	unsigned int count, i;
++	int ret;
++
++	ret = device_links_get_runtime_suppliers(node->dev, &suppliers, &count);
++	if (ret)
++		return ret;
++
++	if (count || parent) {
++		node->suppliers = kcalloc((size_t)count + !!parent,
++					  sizeof(*node->suppliers), GFP_KERNEL);
++		if (!node->suppliers) {
++			ret = -ENOMEM;
++			goto out;
++		}
++	}
++
++	for (i = 0; i < count; i++) {
++		ret = mtk_drm_pm_graph_edge(graph, node, suppliers[i]);
++		if (ret)
++			goto out;
++	}
++	if (parent)
++		ret = mtk_drm_pm_graph_edge(graph, node, parent);
++
++out:
++	device_links_put_suppliers(suppliers, count);
++	return ret;
++}
++
++static int mtk_drm_pm_graph_sort(struct mtk_drm_pm_graph *graph)
++{
++	struct mtk_drm_pm_node *node;
++	unsigned int count = 0, i;
++
++	list_for_each_entry(node, &graph->nodes, node)
++		if (!node->consumers)
++			list_add_tail(&node->order, &graph->ordered);
++
++	/* Newly ready suppliers go after all their consumers. */
++	list_for_each_entry(node, &graph->ordered, order) {
++		count++;
++		for (i = 0; i < node->num_suppliers; i++) {
++			struct mtk_drm_pm_node *supplier = node->suppliers[i];
++
++			if (!--supplier->consumers)
++				list_add_tail(&supplier->order, &graph->ordered);
++		}
++	}
++
++	return count == graph->count ? 0 : -ELOOP;
++}
++
++static bool mtk_drm_pm_controller_held(struct mtk_drm_pm_group *group,
++				       struct device *dev)
++{
++	unsigned int i;
++
++	for (i = 0; i < group->acquired; i++)
++		if (group->controllers[i] == dev)
++			return true;
++	return false;
++}
++
++struct mtk_drm_pm_state {
++	enum rpm_status status;
++	bool enabled;
++	bool in_use;
++	bool unsettled;
++};
++
++static struct mtk_drm_pm_state mtk_drm_pm_read_state(struct device *dev)
++{
++	struct mtk_drm_pm_state state = { };
++#ifdef CONFIG_PM
++	unsigned long flags;
++
++	spin_lock_irqsave(&dev->power.lock, flags);
++	state.status = dev->power.runtime_status;
++	state.enabled = !dev->power.disable_depth;
++	state.in_use = atomic_read(&dev->power.usage_count) > 0 ||
++		       (!dev->power.ignore_children &&
++			atomic_read(&dev->power.child_count) > 0);
++	state.unsettled = state.status == RPM_SUSPENDING ||
++			  state.status == RPM_RESUMING ||
++			  dev->power.idle_notification ||
++			  (dev->power.request_pending &&
++			   dev->power.request == RPM_REQ_RESUME);
++	spin_unlock_irqrestore(&dev->power.lock, flags);
++#endif
++	return state;
++}
++
++static int mtk_drm_pm_pin(struct mtk_drm_pm_node *node)
++{
++	struct device *dev = node->dev;
++	struct mtk_drm_pm_state state = mtk_drm_pm_read_state(dev);
++	int ret;
++
++	if (!state.enabled)
++		return 0;
++
++	ret = pm_runtime_get_if_active(dev);
++	if (!ret) {
++		state = mtk_drm_pm_read_state(dev);
++		if (state.unsettled)
++			pm_runtime_barrier(dev);
++		else if (state.enabled && state.status == RPM_SUSPENDED)
++			return 0;
++
++		ret = pm_runtime_get_if_active(dev);
++		if (!ret) {
++			state = mtk_drm_pm_read_state(dev);
++			if (!state.enabled || state.unsettled ||
++			    state.status != RPM_SUSPENDED)
++				return -EAGAIN;
++		}
++	}
++
++	if (ret > 0) {
++		node->pinned = true;
++		return 0;
++	}
++
++	return ret;
++}
++
++int mtk_drm_pm_prepare_put(struct mtk_drm_pm_group *group,
++			   struct device * const *participants, unsigned int count)
++{
++	struct mtk_drm_pm_graph *graph;
++	struct mtk_drm_pm_node *node;
++	unsigned int i;
++	int ret;
++
++	if (group->faulted || group->graph)
++		return -EIO;
++	if (!group->acquired)
++		return 0;
++
++	graph = kzalloc(sizeof(*graph), GFP_KERNEL);
++	if (!graph)
++		return -ENOMEM;
++	INIT_LIST_HEAD(&graph->nodes);
++	INIT_LIST_HEAD(&graph->ordered);
++
++	for (i = 0; i < group->acquired; i++) {
++		node = mtk_drm_pm_graph_add(graph, group->controllers[i]);
++		if (IS_ERR(node)) {
++			ret = PTR_ERR(node);
++			goto err_graph;
++		}
++	}
++	for (i = 0; i < count; i++) {
++		node = mtk_drm_pm_graph_add(graph, participants[i]);
++		if (IS_ERR(node)) {
++			ret = PTR_ERR(node);
++			goto err_graph;
++		}
++	}
++
++	/* Expansion appends actual runtime suppliers and physical parents. */
++	list_for_each_entry(node, &graph->nodes, node) {
++		ret = mtk_drm_pm_graph_expand(graph, node);
++		if (ret)
++			goto err_graph;
++	}
++	ret = mtk_drm_pm_graph_sort(graph);
++	if (ret)
++		goto err_graph;
++
++	/* Pin suppliers first, before settling any in-flight consumer put. */
++	list_for_each_entry_reverse(node, &graph->ordered, order) {
++		if (mtk_drm_pm_controller_held(group, node->dev))
++			continue;
++		ret = mtk_drm_pm_pin(node);
++		if (ret)
++			goto err_pins;
++	}
++	group->graph = graph;
++	return 0;
++
++err_pins:
++	/* No participant put by the caller has happened. Undo only our pins. */
++	list_for_each_entry(node, &graph->ordered, order)
++		if (node->pinned)
++			pm_runtime_put_noidle(node->dev);
++err_graph:
++	mtk_drm_pm_graph_free(graph);
++	return ret;
++}
++
++static int mtk_drm_pm_put(struct device *dev)
++{
++	struct mtk_drm_pm_state state;
++	int ret = pm_runtime_put_sync_suspend(dev);
++
++	/* The put consumed our ref, even if the suspend was rejected. */
++	if (ret < 0 && ret != -EBUSY && ret != -EAGAIN)
++		return ret;
++
++	state = mtk_drm_pm_read_state(dev);
++	if (state.unsettled) {
++		pm_runtime_barrier(dev);
++		state = mtk_drm_pm_read_state(dev);
++	}
++	if (!state.enabled || state.unsettled)
++		return -EAGAIN;
++
++	/* A stable external user or child may legitimately keep it active. */
++	if (state.status == RPM_SUSPENDED ||
++	    (state.status == RPM_ACTIVE && state.in_use))
++		return 0;
++
++	return ret < 0 ? ret : -EBUSY;
++}
++
++int mtk_drm_pm_group_put(struct mtk_drm_pm_group *group)
++{
++	struct mtk_drm_pm_graph *graph = group->graph;
++	struct mtk_drm_pm_node *node;
++	int ret;
++
++	if (group->faulted)
++		return -EIO;
++	if (!graph)
++		return group->acquired ? -EIO : 0;
++
++	list_for_each_entry(node, &graph->ordered, order) {
++		if (!node->pinned)
++			continue;
++		node->pinned = false;
++		ret = mtk_drm_pm_put(node->dev);
++		if (ret)
++			goto fault;
++	}
++	group->graph = NULL;
++	mtk_drm_pm_graph_free(graph);
++
++	while (group->acquired) {
++		ret = mtk_drm_pm_put(group->controllers[--group->acquired]);
++		if (ret)
++			goto fault;
++	}
++
++	return 0;
++
++fault:
++	/* Retain the still-owned pins and group refs, without retrying puts. */
++	group->faulted = true;
++	return ret;
++}
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_pm.h b/drivers/gpu/drm/mediatek/mtk_drm_pm.h
+new file mode 100644
+index 0000000000..1ec5543e41
+--- /dev/null
++++ b/drivers/gpu/drm/mediatek/mtk_drm_pm.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef MTK_DRM_PM_H
++#define MTK_DRM_PM_H
++
++struct device;
++struct mtk_drm_pm_group;
++
++/* Serialize runtime operations with the DRM resource owner's mutex. */
++struct mtk_drm_pm_group *
++mtk_drm_pm_group_create(struct device * const *controllers, unsigned int count);
++void mtk_drm_pm_group_destroy(struct mtk_drm_pm_group *group);
++int mtk_drm_pm_group_get(struct mtk_drm_pm_group *group);
++int mtk_drm_pm_prepare_put(struct mtk_drm_pm_group *group,
++			   struct device * const *participants, unsigned int count);
++int mtk_drm_pm_group_put(struct mtk_drm_pm_group *group);
++
++#endif
+diff --git a/tools/testing/selftests/mtk_clk/crtc_stop_cases.c b/tools/testing/selftests/mtk_clk/crtc_stop_cases.c
+index b6154aa831..9284904d88 100644
+--- a/tools/testing/selftests/mtk_clk/crtc_stop_cases.c
++++ b/tools/testing/selftests/mtk_clk/crtc_stop_cases.c
+@@ -66,7 +66,10 @@ struct mtk_crtc_hw_layer {
+ struct mtk_ddp_comp {
+ 	struct device *dev;
+ };
++struct mtk_drm_pm_group;
+ struct mtk_drm_private {
++	pthread_mutex_t pm_transition_lock;
++	atomic_bool pm_transition_failed;
+ 	struct {
+ 		bool shadow_register;
+ 	} *data;
+@@ -92,6 +95,7 @@ struct mtk_crtc {
+ 	int config_comp_idx;
+ 	struct mtk_ddp_comp **ddp_comp;
+ 	void **mutex;
++	struct mtk_drm_pm_group *pm_group;
+ 	struct {
+ 		struct mbox_chan *chan;
+ 	} cmdq_client;
+@@ -360,6 +364,32 @@ static int mtk_ddp_comp_layer_check(struct mtk_ddp_comp *c, int layer,
+ {
+ 	return 0;
+ }
++/* The checked-stop fixtures use the legacy PM path. The ordered owner's
++ * actual references and fault transitions are tested in test_ordered_pm.py.
++ */
++static int mtk_drm_pm_group_get(struct mtk_drm_pm_group *group)
++{
++	assert(!group);
++	return -EINVAL;
++}
++static int mtk_drm_pm_group_put(struct mtk_drm_pm_group *group)
++{
++	assert(!group);
++	return -EINVAL;
++}
++static int mtk_crtc_prepare_pm_put(struct mtk_crtc *crtc)
++{
++	assert(!crtc->pm_group);
++	return -EINVAL;
++}
++static void mtk_crtc_pm_fault(struct mtk_crtc *crtc,
++			      struct drm_crtc_state *passed, int ret)
++{
++	(void)passed;
++	(void)ret;
++	assert(!crtc->pm_group);
++}
++
+ /* PRODUCTION */
+ 
+ static void reset(void)
+-- 
+2.56.0
+

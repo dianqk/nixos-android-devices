@@ -1,0 +1,204 @@
+From 159de310db774431e6ce9d5973cc185d66151eed Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] soc: mediatek: parse MT6897 LK modem metadata
+
+Parse bootloader modem tags and report reserved/shared-memory metadata
+without starting or resetting the modem.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T04:15:32+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/soc/mediatek/mtk-ccci-lk-info.c | 177 ++++++++++++++++++++++++
+ 1 file changed, 177 insertions(+)
+ create mode 100644 drivers/soc/mediatek/mtk-ccci-lk-info.c
+
+diff --git a/drivers/soc/mediatek/mtk-ccci-lk-info.c b/drivers/soc/mediatek/mtk-ccci-lk-info.c
+new file mode 100644
+index 0000000000..2afadf6c15
+--- /dev/null
++++ b/drivers/soc/mediatek/mtk-ccci-lk-info.c
+@@ -0,0 +1,177 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek CCCI: the modem boot information LK leaves for the kernel.
++ *
++ * LK loads the modem images and describes the result in a list of tags in
++ * memory; the kernel finds the list through the "ccci,modem_info_v2"
++ * property of the modem driver node. This module only copies the list once
++ * and reports it in debugfs: it does not power or start the modem, makes
++ * no secure calls and writes nothing. Layout and parsing as the MediaTek
++ * vendor driver (MiCode MTK_kernel_device_modules 3c4ccd07,
++ * drivers/misc/mediatek/ccci_util/ccci_util_lib_fo.c: struct
++ * _ccci_lk_info_v2, lk_info_parsing_v2, lk_tag_inf_parsing_to_args_table).
++ */
++
++#include <linux/debugfs.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++
++#define LK_INFO_MAX_SIZE	0x10000
++#define LK_TAG_NAME_LEN_V1	16
++#define LK_TAG_NAME_LEN_V2	64
++#define LK_INFO_VER_V2		2
++#define LK_TAG_DUMP_MAX		64
++
++/* "ccci,modem_info_v2": a raw little-endian copy of LK's structure */
++struct lk_info_v2 {
++	__le64 base;
++	__le32 size;
++	__le32 err_no;
++	__le32 version;
++	__le32 tag_num;
++	__le32 ld_flag;
++	__le32 ld_md_errno;
++} __packed;
++
++struct lk_tag_v1 {
++	char name[LK_TAG_NAME_LEN_V1];
++	__le32 data_offset;
++	__le32 data_size;
++	__le32 next_tag_offset;
++} __packed;
++
++struct lk_tag_v2 {
++	char name[LK_TAG_NAME_LEN_V2];
++	__le32 data_offset;
++	__le32 data_size;
++	__le32 next_tag_offset;
++} __packed;
++
++static struct {
++	struct lk_info_v2 info;
++	u8 *buf;
++	u32 size;
++	struct dentry *dir;
++} lk;
++
++static int lk_tags_show(struct seq_file *s, void *unused)
++{
++	u32 version = le32_to_cpu(lk.info.version);
++	u32 count = le32_to_cpu(lk.info.tag_num);
++	u32 next = 0;
++	u32 i;
++
++	seq_printf(s, "base 0x%llx size 0x%x version %u tags %u ld_flag 0x%x err %d md_errno %d\n",
++		   le64_to_cpu(lk.info.base), lk.size, version, count,
++		   le32_to_cpu(lk.info.ld_flag), (int)le32_to_cpu(lk.info.err_no),
++		   (int)le32_to_cpu(lk.info.ld_md_errno));
++
++	for (i = 0; i < count; i++) {
++		char name[LK_TAG_NAME_LEN_V2 + 1] = { };
++		u32 offset, size;
++
++		if (version >= LK_INFO_VER_V2) {
++			struct lk_tag_v2 tag;
++
++			if (next > lk.size || lk.size - next < sizeof(tag))
++				break;
++			memcpy(&tag, lk.buf + next, sizeof(tag));
++			memcpy(name, tag.name, sizeof(tag.name));
++			offset = le32_to_cpu(tag.data_offset);
++			size = le32_to_cpu(tag.data_size);
++			next = le32_to_cpu(tag.next_tag_offset);
++		} else {
++			struct lk_tag_v1 tag;
++
++			if (next > lk.size || lk.size - next < sizeof(tag))
++				break;
++			memcpy(&tag, lk.buf + next, sizeof(tag));
++			memcpy(name, tag.name, sizeof(tag.name));
++			offset = le32_to_cpu(tag.data_offset);
++			size = le32_to_cpu(tag.data_size);
++			next = le32_to_cpu(tag.next_tag_offset);
++		}
++
++		seq_printf(s, "%2u %-24s offset 0x%04x size %u\n", i, name, offset, size);
++		if (offset > lk.size || lk.size - offset < size) {
++			seq_puts(s, "   (outside the list)\n");
++			continue;
++		}
++		seq_hex_dump(s, "   ", DUMP_PREFIX_OFFSET, 16, 4, lk.buf + offset,
++			     min_t(u32, size, LK_TAG_DUMP_MAX), false);
++	}
++
++	if (i < count)
++		seq_printf(s, "list ends early at tag %u\n", i);
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(lk_tags);
++
++static int __init mtk_ccci_lk_info_init(void)
++{
++	struct device_node *np;
++	void __iomem *base;
++	const void *prop;
++	int len, ret = 0;
++	u64 addr;
++
++	np = of_find_compatible_node(NULL, NULL, "mediatek,mt6897-mddriver");
++	if (!np)
++		return -ENODEV;
++
++	prop = of_get_property(np, "ccci,modem_info_v2", &len);
++	if (!prop || len < sizeof(lk.info)) {
++		ret = -ENOENT;
++		goto out;
++	}
++	memcpy(&lk.info, prop, sizeof(lk.info));
++
++	addr = le64_to_cpu(lk.info.base);
++	lk.size = le32_to_cpu(lk.info.size);
++	if (!addr || !lk.size || lk.size > LK_INFO_MAX_SIZE) {
++		pr_err("no usable LK modem information (base 0x%llx size 0x%x)\n",
++		       addr, lk.size);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	lk.buf = kmalloc(lk.size, GFP_KERNEL);
++	if (!lk.buf) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	/* LK's reserved memory, outside the kernel's linear map */
++	base = ioremap_wc(addr, lk.size);
++	if (!base) {
++		kfree(lk.buf);
++		ret = -ENOMEM;
++		goto out;
++	}
++	memcpy_fromio(lk.buf, base, lk.size);
++	iounmap(base);
++
++	lk.dir = debugfs_create_dir("mtk_ccci", NULL);
++	debugfs_create_file("lk_info", 0400, lk.dir, NULL, &lk_tags_fops);
++
++	pr_info("LK modem information: %u tags at 0x%llx, ld_flag 0x%x\n",
++		le32_to_cpu(lk.info.tag_num), addr, le32_to_cpu(lk.info.ld_flag));
++out:
++	of_node_put(np);
++	return ret;
++}
++module_init(mtk_ccci_lk_info_init);
++
++static void __exit mtk_ccci_lk_info_exit(void)
++{
++	debugfs_remove_recursive(lk.dir);
++	kfree(lk.buf);
++}
++module_exit(mtk_ccci_lk_info_exit);
++
++MODULE_DESCRIPTION("MediaTek CCCI modem boot information from LK (read-only)");
++MODULE_LICENSE("GPL");
+-- 
+2.56.0
+

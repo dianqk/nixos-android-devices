@@ -1,8 +1,8 @@
 # Xiaomi Pad 6S Pro 12.4 (sheng)
 
-[中文](README.zh.md) · [All devices](../README.md) · [Hardware support](hardware.md)
+[中文](README.zh.md) · [All devices](../README.md) · [Support status](status.md) · [Hardware support](hardware.md)
 
-Support: Tier 2. See [support criteria](../README.md#support-tiers).
+Status: see the [hardware page](hardware.md) and [support status](status.md).
 
 An optional `boot-kernel` image boots a fixed Linux system directly.
 U-Boot is the default. See [configuration and usage](../configuration.md#supplemental-direct-kernel-image-sheng-and-clover)
@@ -21,8 +21,6 @@ and [Android/U-Boot compatibility and A/B limits](../android-uboot-compatibility
 
 ```nix
 {
-  androidDevices.usbSerial = "my-sheng-01";
-  androidDevices.persistentImage.rootfs.label = "NIXOS";
   # Use this tablet's verified factory addresses when needed:
   # hardware.sheng.wifiMacAddress = "YOUR_FACTORY_WIFI_ADDRESS";
   # hardware.sheng.bluetoothAddress = "YOUR_FACTORY_BLUETOOTH_ADDRESS";
@@ -38,7 +36,7 @@ features you intend to use. `hardware.sheng.suspendWorkarounds.enable` defaults 
 claim of validated suspend. Preserve the device's recovery firmware list because
 ADSP firmware is also needed for the Type-C/USB path.
 
-Sheng packages the Nixpkgs Linux 7.3-rc6 kernel for the installed system and
+Sheng packages the Nixpkgs Linux 7.3 kernel for the installed system and
 RAM recovery, available as `devices.sheng.kernel`. The hardware results below
 were obtained with 7.3-rc5. See the
 [kernel package notes](../../pkgs/linux-kernel/sm8550/sheng/PATCHES.md)
@@ -70,7 +68,7 @@ The repository examples use `.#devices.sheng.<role>`, for example `.#devices.she
 Device-specific firmware is fetched from a pinned upstream commit; this repository
 does not store its binary payloads.
 
-- Source: [code002-2/sheng-firmware at `14a4d70`](https://github.com/code002-2/sheng-firmware/tree/14a4d70b0759bd0746264dc145f2d51a5a94902c).
+- Source: [the per-device firmware archive](https://github.com/dianqk/nixos-android-devices/releases/download/firmware/sheng-firmware-14a4d70-20261115.tar.zst), assembled from code002-2/sheng-firmware at `14a4d70` and ianchb/sheng-firmware at `053da477`.
 - Used for: GPU, Wi-Fi, audio, touch, ADSP and optional fingerprint/sensor services.
 
 See the [firmware license notes](../README.md#firmware-sources-and-licensing) for generic firmware

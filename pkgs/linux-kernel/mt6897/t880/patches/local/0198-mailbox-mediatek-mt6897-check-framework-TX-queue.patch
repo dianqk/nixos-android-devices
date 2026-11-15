@@ -1,0 +1,241 @@
+From b8e5cce586c459b0c6f1f55174c536846b4b60aa Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 7 Nov 2026 03:06:29 +0800
+Subject: [PATCH] mailbox: mediatek: reject queued TX at MT6897 stop boundary
+
+A nonblocking mailbox send returns a queued token even when send_data fails to allocate a GCE task. The framework ring can therefore retain a packet while the GCE task list and enable bit are both empty. A later TX tick could otherwise dispatch that packet after consumers release target power.
+
+Require an empty framework queue under the channel lock before checked flush reports success. Latch the fault and retain the acquired PM lease on queued TX, so framework retry cannot bypass the submit fault gate. Do not purge the ring or misreport its token as confirmed hardware submission.
+
+Exercise the actual mailbox-core queue, submit, send, TX tick and flush functions with allocation failure and retry, alongside the checked-stop tests.
+---
+ drivers/mailbox/mtk-cmdq-mailbox.c            |  5 +
+ .../selftests/mtk_clk/cmdq_stop_cases.c       | 98 ++++++++++++++++++-
+ .../selftests/mtk_clk/test_cmdq_stop.py       | 10 +-
+ 3 files changed, 107 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/mailbox/mtk-cmdq-mailbox.c b/drivers/mailbox/mtk-cmdq-mailbox.c
+index 7cd11c1d40..f10d7f3bc2 100644
+--- a/drivers/mailbox/mtk-cmdq-mailbox.c
++++ b/drivers/mailbox/mtk-cmdq-mailbox.c
+@@ -873,6 +873,11 @@ static int cmdq_mbox_flush_checked(struct mbox_chan *chan, unsigned long timeout
+ 		goto fault;
+ 	}
+ stopped:
++	/* A queued framework token can outlive a failed send_data allocation. */
++	if (chan->msg_count) {
++		ret = -EBUSY;
++		goto fault;
++	}
+ 	thread->stopping = false;
+ 	put_pm = true;
+ 	ret = 0;
+diff --git a/tools/testing/selftests/mtk_clk/cmdq_stop_cases.c b/tools/testing/selftests/mtk_clk/cmdq_stop_cases.c
+index 24a66ebf3c..c06a8da5a6 100644
+--- a/tools/testing/selftests/mtk_clk/cmdq_stop_cases.c
++++ b/tools/testing/selftests/mtk_clk/cmdq_stop_cases.c
+@@ -34,6 +34,14 @@ typedef uintptr_t dma_addr_t;
+ #define CMDQ_THR_IS_WAITING (1U << 31)
+ #define CMDQ_INST_SIZE 8
+ #define GFP_ATOMIC 0
++#define MBOX_TX_QUEUE_LEN 8
++#define MBOX_NO_MSG NULL
++#define MBOX_TXDONE_BY_POLL 1
++#define MBOX_TXDONE_BY_ACK 2
++#define HRTIMER_MODE_REL 0
++#define ENOTSUPP EOPNOTSUPP
++#define unlikely(x) (x)
++#define msecs_to_jiffies(x) (x)
+ #define READ_ONCE(x) (x)
+ #define dev_err(...) ((void)0)
+ #define WARN_ON(x) ((void)(x))
+@@ -74,13 +82,30 @@ struct device {
+ 	void *data;
+ 	atomic_int refs;
+ };
++struct mbox_chan;
++struct mbox_chan_ops {
++	int (*send_data)(struct mbox_chan *, void *);
++	int (*flush)(struct mbox_chan *, unsigned long);
++};
++struct mbox_client {
++	void (*tx_prepare)(struct mbox_client *, void *);
++	void (*tx_done)(struct mbox_client *, void *, int);
++	bool tx_block;
++	unsigned int tx_tout;
++};
+ struct mbox_controller {
+ 	struct device *dev;
++	const struct mbox_chan_ops *ops;
++	int poll_hrt_lock, poll_hrt;
+ };
+ struct mbox_chan {
+ 	void *con_priv;
+ 	struct mbox_controller *mbox;
+ 	int lock;
++	struct mbox_client *cl;
++	unsigned int msg_count, msg_free;
++	void *active_req, *msg_data[MBOX_TX_QUEUE_LEN];
++	int txdone_method, tx_status, tx_complete;
+ };
+ struct cmdq_thread {
+ 	struct mbox_chan *chan;
+@@ -115,6 +140,9 @@ static u32 regs[128];
+ static struct device device;
+ static struct gce_plat pdata = { .checked_flush = true };
+ static struct cmdq cmdq;
++static const struct mbox_chan_ops host_ops;
++static struct mbox_client client;
++static bool alloc_fail;
+ static struct cmdq_thread thread;
+ static struct mbox_chan chan;
+ static atomic_int pm_calls, pm_puts, callbacks, frees, allocations, reads,
+@@ -140,6 +168,44 @@ static int pm_mode, poll_mode, hooks;
+ 		locked = false;                                   \
+ 		assert(pthread_mutex_unlock(&channel_lock) == 0); \
+ 	} while (0)
++struct host_guard {
++	bool held;
++};
++static struct host_guard host_guard_acquire(void *lock)
++{
++	assert(!locked);
++	assert(pthread_mutex_lock(&channel_lock) == 0);
++	locked = true;
++	return (struct host_guard){ true };
++}
++static void host_guard_release(struct host_guard *guard)
++{
++	if (!guard->held)
++		return;
++	guard
++		->held = false;
++	locked = false;
++	assert(pthread_mutex_unlock(&channel_lock) == 0);
++}
++#define guard(type)                                            \
++	struct host_guard _guard                               \
++		__attribute__((cleanup(host_guard_release))) = \
++			host_guard_acquire
++#define scoped_guard(type, lock)                            \
++	for (struct host_guard _scope                       \
++	     __attribute__((cleanup(host_guard_release))) = \
++		     host_guard_acquire(lock);              \
++	     _scope.held; host_guard_release(&_scope))
++static void hrtimer_start(int *timer, int delay, int mode)
++{
++}
++static void complete(int *completion)
++{
++}
++static int wait_for_completion_timeout(int *completion, unsigned long wait)
++{
++	return 1;
++}
+ static void *dev_get_drvdata(struct device *dev)
+ {
+ 	return dev->data;
+@@ -244,7 +310,7 @@ static void kfree(void *task)
+ static void *host_alloc(size_t size)
+ {
+ 	allocations++;
+-	return calloc(1, size);
++	return alloc_fail ? NULL : calloc(1, size);
+ }
+ #define kzalloc_obj(obj, flags) host_alloc(sizeof(obj))
+ static u32 cmdq_convert_gce_addr(dma_addr_t addr, const struct gce_plat *p)
+@@ -262,6 +328,11 @@ static void cmdq_task_handle_error(struct cmdq_task *task)
+ {
+ }
+ /* PRODUCTION */
++/* FRAMEWORK */
++static const struct mbox_chan_ops host_ops = {
++	.send_data = cmdq_mbox_send_data,
++	.flush = cmdq_mbox_flush_checked,
++};
+ 
+ static void poll_hook(void *addr)
+ {
+@@ -309,11 +380,14 @@ static void reset(void)
+ 	for (size_t i = 0; i < 128; i++)
+ 		regs[i] = 0;
+ 	device = (struct device){ .data = &cmdq };
+-	cmdq = (struct cmdq){ .mbox.dev = &device,
++	cmdq = (struct cmdq){ .mbox = { .dev = &device, .ops = &host_ops },
+ 			      .base = regs,
+ 			      .pdata = &pdata };
+ 	thread = (struct cmdq_thread){ .chan = &chan, .base = regs + 64 };
+-	chan = (struct mbox_chan){ .con_priv = &thread, .mbox = &cmdq.mbox };
++	chan = (struct mbox_chan){ .con_priv = &thread,
++				   .mbox = &cmdq.mbox,
++				   .cl = &client,
++				   .txdone_method = MBOX_TXDONE_BY_ACK };
+ 	INIT_LIST_HEAD(&thread.task_busy_list);
+ 	pm_calls = pm_puts = callbacks = frees = allocations = reads = writes =
+ 		ack_writes = hooks = 0;
+@@ -324,6 +398,7 @@ static void reset(void)
+ 	atomic_store(&release_poll, false);
+ 	suspend_fail = reset_fail = disable_fail = locked = false;
+ 	pdata.checked_flush = true;
++	alloc_fail = false;
+ }
+ static void add_task(bool wfe)
+ {
+@@ -471,6 +546,23 @@ int main(void)
+ 	int before = pm_calls;
+ 	cmdq_mbox_shutdown(&chan);
+ 	assert(pm_calls == before && device.refs == 1);
++	reset();
++	alloc_fail = true;
++	struct cmdq_pkt queued = { .pa_base = 0x2000, .cmd_buf_size = 16 };
++	assert(mbox_send_message(&chan, &queued) >= 0);
++	assert(chan.msg_count == 1 && list_empty(&thread.task_busy_list));
++	assert(allocations == 1 &&
++	       !*(u32 *)(thread.base + CMDQ_THR_ENABLE_TASK));
++	mbox_client_txdone(&chan, 0);
++	assert(chan.msg_count == 1 && allocations == 2);
++	assert(mbox_flush(&chan, 10) == -EBUSY);
++	assert(thread.stop_faulted && device.refs == 1 && chan.msg_count == 1);
++	assert(allocations == 2 && callbacks == 0 && frees == 0);
++	alloc_fail = false;
++	mbox_client_txdone(&chan, 0);
++	assert(allocations == 2 && chan.msg_count == 1 &&
++	       list_empty(&thread.task_busy_list));
++	fault_retained(1);
+ 	threaded_races();
+ 	reset();
+ 	assert(pthread_mutex_destroy(&channel_lock) == 0);
+diff --git a/tools/testing/selftests/mtk_clk/test_cmdq_stop.py b/tools/testing/selftests/mtk_clk/test_cmdq_stop.py
+index bac2ce54cc..853a76996c 100755
+--- a/tools/testing/selftests/mtk_clk/test_cmdq_stop.py
++++ b/tools/testing/selftests/mtk_clk/test_cmdq_stop.py
+@@ -12,8 +12,8 @@ repo = Path(os.environ.get('KERNEL_SRC', str(assets.parents[3])))
+ source = (repo / 'drivers/mailbox/mtk-cmdq-mailbox.c').read_text()
+ 
+ 
+-def function(name):
+-    match = re.search(r'^static (?:int|void|bool) ' + name + r'\(', source, re.M)
++def function(name, source=source):
++    match = re.search(r'^(?:static )?(?:int|void|bool) ' + name + r'\(', source, re.M)
+     start = match.start()
+     end = source.index('{', start) + 1
+     depth = 1
+@@ -37,10 +37,14 @@ production = '\n'.join(function(name) for name in [
+ a = source.index('static void cmdq_thread_resume(')
+ b = source.index('\n}\n', a) + 3
+ production = source[a:b] + '\n' + production
++framework_source = (repo / 'drivers/mailbox/mailbox.c').read_text()
++framework = '\n'.join(function(name, framework_source) for name in [
++    'add_to_rbuf', 'msg_submit', 'tx_tick', 'mbox_send_message',
++    'mbox_client_txdone', 'mbox_flush'])
+ with tempfile.TemporaryDirectory(prefix='mtk-cmdq-stop-') as tmp:
+     tmp = Path(tmp)
+     c = tmp / 'test.c'
+-    c.write_text((assets / 'cmdq_stop_cases.c').read_text().replace('/* PRODUCTION */', production))
++    c.write_text((assets / 'cmdq_stop_cases.c').read_text().replace('/* PRODUCTION */', production).replace('/* FRAMEWORK */', framework))
+     binary = tmp / 'test'
+     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
+                     '-Wno-unused-parameter', '-Werror', '-g', '-pthread', '-fsanitize=address,undefined',
+-- 
+2.56.0
+

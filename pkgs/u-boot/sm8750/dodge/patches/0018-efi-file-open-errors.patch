@@ -1,0 +1,302 @@
+From: dianqk <dianqk@dianqk.net>
+Subject: [PATCH] efi: distinguish missing FAT files from failed opens
+
+Only report NOT_FOUND after a successful FAT path traversal. Preserve
+allocation, device selection, directory/FAT read and create failures through
+EFI Open when durable boot-choice I/O is enabled. Keep legacy boolean
+existence APIs for their existing callers; carry checked traversal errno in
+the iterator, not global filesystem state.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+--- a/fs/fat/fat.c
++++ b/fs/fat/fat.c
+@@ -302,13 +302,16 @@
+  * Get the entry at index 'entry' in a FAT (12/16/32) table.
+  * On failure 0x00 is returned.
+  */
+-static __u32 get_fatent(fsdata *mydata, __u32 entry)
++static __u32 get_fatent_checked(fsdata *mydata, __u32 entry, int *error)
+ {
+ 	__u32 bufnum;
+ 	__u32 offset, off8;
+ 	__u32 ret = 0x00;
+ 
++	*error = 0;
++
+ 	if (CHECK_CLUST(entry, mydata->fatsize)) {
++		*error = -EIO;
+ 		log_err("Invalid FAT entry: %#08x\n", entry);
+ 		return ret;
+ 	}
+@@ -329,6 +332,7 @@
+ 
+ 	default:
+ 		/* Unsupported FAT size */
++		*error = -EINVAL;
+ 		return ret;
+ 	}
+ 
+@@ -349,8 +353,10 @@
+ 		startblock += mydata->fat_sect;	/* Offset from start of disk */
+ 
+ 		/* Write back the fatbuf to the disk */
+-		if (flush_dirty_fat_buffer(mydata) < 0)
++		if (flush_dirty_fat_buffer(mydata) < 0) {
++			*error = -EIO;
+ 			return -1;
++		}
+ 
+ 		if (getsize > FATBUFBLOCKS) {
+ 			debug("getsize is too large for bufptr\n");
+@@ -358,6 +364,7 @@
+ 		}
+ 
+ 		if (disk_read(startblock, getsize, bufptr) < 0) {
++			*error = -EIO;
+ 			debug("Error reading FAT blocks\n");
+ 			return ret;
+ 		}
+@@ -391,6 +398,15 @@
+  * Read at most 'size' bytes from the specified cluster into 'buffer'.
+  * Return 0 on success, -1 otherwise.
+  */
++/* Legacy readers retain their sentinel interface. Directory lookup must carry
++ * the actual I/O error separately from a valid end-of-chain entry. */
++static __u32 get_fatent(fsdata *mydata, __u32 entry)
++{
++	int error;
++
++	return get_fatent_checked(mydata, entry, &error);
++}
++
+ static int
+ get_cluster(fsdata *mydata, __u32 clustnum, __u8 *buffer, unsigned long size)
+ {
+@@ -873,6 +889,8 @@
+  * For a more complete example, see fat_itr_resolve().
+  */
+ struct fat_itr {
++	/* Directory traversal errno, never a global filesystem side channel. */
++	int error;
+ 	/**
+ 	 * @fsdata:		filesystem parameters
+ 	 */
+@@ -957,6 +975,7 @@
+ 	itr->dent = NULL;
+ 	itr->remaining = 0;
+ 	itr->last_cluster = 0;
++	itr->error = 0;
+ 	itr->is_root = 1;
+ 
+ 	return 0;
+@@ -1001,6 +1020,7 @@
+ 	itr->dent = NULL;
+ 	itr->remaining = 0;
+ 	itr->last_cluster = 0;
++	itr->error = 0;
+ }
+ 
+ /**
+@@ -1056,6 +1076,7 @@
+ 	 */
+ 	ret = disk_read(sect, read_size, itr->block);
+ 	if (ret < 0) {
++		itr->error = -EIO;
+ 		debug("Error: reading block\n");
+ 		return NULL;
+ 	}
+@@ -1070,7 +1091,10 @@
+ 			itr->last_cluster = 1;
+ 		}
+ 	} else {
+-		itr->next_clust = get_fatent(itr->fsdata, itr->next_clust);
++		itr->next_clust = get_fatent_checked(itr->fsdata, itr->next_clust,
++					     &itr->error);
++		if (itr->error)
++			return NULL;
+ 		if (CHECK_CLUST(itr->next_clust, itr->fsdata->fatsize)) {
+ 			debug("nextclust: 0x%x\n", itr->next_clust);
+ 			itr->last_cluster = 1;
+@@ -1082,6 +1106,8 @@
+ 
+ static dir_entry *next_dent(fat_itr *itr)
+ {
++	if (itr->error)
++		return NULL;
+ 	if (itr->remaining == 0) {
+ 		unsigned nbytes;
+ 		struct dir_entry *dent = fat_next_cluster(itr, &nbytes);
+@@ -1337,7 +1363,7 @@
+ 		}
+ 	}
+ 
+-	return -ENOENT;
++	return itr->error ? itr->error : -ENOENT;
+ }
+ 
+ int file_fat_detectfs(void)
+@@ -1369,6 +1395,33 @@
+ 	printf("Filesystem: FAT%d \"%s\"\n", fatsize, vol_label);
+ 
+ 	return 0;
++}
++
++/**
++ * fat_lookup() - checked existence/type lookup for durable EFI file operations
++ * @filename: path on the selected FAT volume
++ * @isdir: receives the type on success
++ * Return: 0 if present, -ENOENT only after successful traversal, other -errno
++ */
++int fat_lookup(const char *filename, int *isdir)
++{
++	fsdata fsdata;
++	fat_itr *itr;
++	int ret;
++
++	itr = malloc_cache_aligned(sizeof(fat_itr));
++	if (!itr)
++		return -ENOMEM;
++	ret = fat_itr_root(itr, &fsdata);
++	if (ret)
++		goto out;
++	ret = fat_itr_resolve(itr, filename, TYPE_ANY);
++	if (!ret)
++		*isdir = !itr->dent || fat_itr_isdir(itr);
++	free(fsdata.fatbuf);
++out:
++	free(itr);
++	return ret;
+ }
+ 
+ int fat_exists(const char *filename)
+--- a/include/fat.h
++++ b/include/fat.h
+@@ -218,6 +218,7 @@
+ 
+ int file_fat_detectfs(void);
+ int fat_exists(const char *filename);
++int fat_lookup(const char *filename, int *isdir);
+ int fat_size(const char *filename, loff_t *size);
+ int file_fat_read(const char *filename, void *buffer, int maxsize);
+ int fat_set_blk_dev(struct blk_desc *rbdd, struct disk_partition *info);
+--- a/lib/efi_loader/efi_file.c
++++ b/lib/efi_loader/efi_file.c
+@@ -13,6 +13,7 @@
+ #include <malloc.h>
+ #include <mapmem.h>
+ #include <fs.h>
++#include <fat.h>
+ #include <part.h>
+ #include <efi_boot_choice_io.h>
+ 
+@@ -177,7 +178,7 @@
+  */
+ static struct efi_file_handle *file_open(struct file_system *fs,
+ 		struct file_handle *parent, u16 *file_name, u64 open_mode,
+-		u64 attributes)
++		u64 attributes, efi_status_t *status)
+ {
+ 	struct file_handle *fh;
+ 	char *path;
+@@ -197,6 +198,7 @@
+ 		plen = strlen(parent->path) + 1;
+ 	}
+ 
++	*status = EFI_OUT_OF_RESOURCES;
+ 	fh = calloc(1, sizeof(*fh));
+ 	/* +2 is for null and '/' */
+ 	path = calloc(1, plen + (flen * MAX_UTF8_PER_UTF16) + 2);
+@@ -220,33 +222,59 @@
+ 
+ 		utf16_to_utf8((u8 *)p, file_name, flen);
+ 
++		*status = EFI_INVALID_PARAMETER;
+ 		if (sanitize_path(fh->path))
+ 			goto error;
++		*status = EFI_DEVICE_ERROR;
+ 
+ 		/* check if file exists: */
+ 		if (set_blk_dev(fh))
+ 			goto error;
+ 
+-		exists = fs_exists(fh->path);
++		if (IS_ENABLED(CONFIG_EFI_BOOT_CHOICE_DURABLE_IO)) {
++			int err;
++
++			if (fs_get_type() != FS_TYPE_FAT) {
++				*status = EFI_UNSUPPORTED;
++				goto error;
++			}
++			/* fs_exists() is boolean and hides failed FAT reads. */
++			err = fat_lookup(fh->path, &fh->isdir);
++			fs_close();
++			if (err && err != -ENOENT) {
++				if (err == -ENOMEM)
++					*status = EFI_OUT_OF_RESOURCES;
++				goto error;
++			}
++			exists = !err;
++		} else {
++			exists = fs_exists(fh->path);
++		}
+ 		/* fs_exists() calls fs_close(), so open file system again */
+ 		if (set_blk_dev(fh))
+ 			goto error;
+ 
+ 		if (!exists) {
+-			if (!(open_mode & EFI_FILE_MODE_CREATE) ||
+-			    efi_create_file(fh, attributes))
++			if (!(open_mode & EFI_FILE_MODE_CREATE)) {
++				*status = EFI_NOT_FOUND;
+ 				goto error;
++			}
++			if (efi_create_file(fh, attributes))
++				goto error;
++			fh->isdir = !!(attributes & EFI_FILE_DIRECTORY);
+ 			if (set_blk_dev(fh))
+ 				goto error;
+ 		}
+ 
+ 		/* figure out if file is a directory: */
+-		fh->isdir = is_dir(fh);
++		if (!IS_ENABLED(CONFIG_EFI_BOOT_CHOICE_DURABLE_IO))
++			fh->isdir = is_dir(fh);
+ 	} else {
+ 		fh->isdir = 1;
+ 		strcpy(fh->path, "");
+ 	}
+ 
++	*status = EFI_SUCCESS;
+ 	return &fh->base;
+ 
+ error:
+@@ -291,11 +319,11 @@
+ 	}
+ 
+ 	/* Open file */
+-	*new_handle = file_open(fh->fs, fh, file_name, open_mode, attributes);
++	*new_handle = file_open(fh->fs, fh, file_name, open_mode, attributes, &ret);
+ 	if (*new_handle) {
+ 		EFI_PRINT("file handle %p\n", *new_handle);
+ 		ret = EFI_SUCCESS;
+-	} else {
++	} else if (!IS_ENABLED(CONFIG_EFI_BOOT_CHOICE_DURABLE_IO)) {
+ 		ret = EFI_NOT_FOUND;
+ 	}
+ out:
+@@ -1241,9 +1269,11 @@
+ {
+ 	struct file_system *fs = to_fs(this);
+ 
+-	*root = file_open(fs, NULL, NULL, 0, 0);
+-
+-	return EFI_SUCCESS;
++	efi_status_t ret;
++
++	*root = file_open(fs, NULL, NULL, 0, 0, &ret);
++
++	return IS_ENABLED(CONFIG_EFI_BOOT_CHOICE_DURABLE_IO) ? ret : EFI_SUCCESS;
+ }
+ 
+ static efi_status_t EFIAPI

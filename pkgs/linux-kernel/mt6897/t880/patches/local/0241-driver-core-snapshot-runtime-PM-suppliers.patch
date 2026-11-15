@@ -1,0 +1,121 @@
+From c98feccd10f3e87085456e988becd398295788e2 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 11 Nov 2026 06:46:44 +0800
+Subject: [PATCH] driver core: snapshot runtime PM suppliers with device
+ references
+
+Allow a sleepable caller to collect its runtime supplier graph without exporting device link internals. Grow the referenced array during one SRCU walk and release references outside the read-side section. The caller owns lifecycle serialization and all runtime PM policy.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/base/core.c    | 78 ++++++++++++++++++++++++++++++++++++++++++
+ include/linux/device.h |  4 +++
+ 2 files changed, 82 insertions(+)
+
+diff --git a/drivers/base/core.c b/drivers/base/core.c
+index 4c0c373998..f70da6e332 100644
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -342,6 +342,84 @@ int device_links_read_lock_held(void)
+ 	return srcu_read_lock_held(&device_links_srcu);
+ }
+ 
++/**
++ * device_links_put_suppliers - Release a referenced supplier snapshot.
++ * @suppliers: Array returned by device_links_get_runtime_suppliers().
++ * @count: Number of referenced devices in @suppliers.
++ */
++void device_links_put_suppliers(struct device **suppliers, unsigned int count)
++{
++	while (count)
++		put_device(suppliers[--count]);
++	kfree(suppliers);
++}
++EXPORT_SYMBOL_GPL(device_links_put_suppliers);
++
++/**
++ * device_links_get_runtime_suppliers - Snapshot runtime PM suppliers.
++ * @dev: Consumer whose links are examined.
++ * @suppliers: Receives an allocated array of referenced supplier devices.
++ * @count: Receives the number of devices in @suppliers.
++ *
++ * This sleepable helper copies DL_FLAG_PM_RUNTIME suppliers under the device
++ * link SRCU lock. Links may change while the snapshot is collected; callers
++ * must provide any lifecycle serialization their use of the snapshot needs.
++ * No runtime PM operation is performed. Release a successful snapshot with
++ * device_links_put_suppliers(), outside any device-link read-side section.
++ *
++ * Return: 0 on success, including an empty snapshot, or a negative error.
++ * On error, both outputs are reset and no device references are retained.
++ */
++int device_links_get_runtime_suppliers(struct device *dev,
++				      struct device ***suppliers,
++				      unsigned int *count)
++{
++	struct device **array = NULL;
++	unsigned int capacity = 0, nr = 0;
++	struct device_link *link;
++	int idx, ret = 0;
++
++	if (!suppliers || !count)
++		return -EINVAL;
++	*suppliers = NULL;
++	*count = 0;
++	if (!dev)
++		return -EINVAL;
++
++	idx = device_links_read_lock();
++	list_for_each_entry_rcu(link, &dev->links.suppliers, c_node,
++			       device_links_read_lock_held()) {
++		if (!(READ_ONCE(link->flags) & DL_FLAG_PM_RUNTIME))
++			continue;
++		if (nr == capacity) {
++			unsigned int next = capacity ? capacity * 2 : 4;
++			struct device **grown;
++
++			if (next < capacity) {
++				ret = -EOVERFLOW;
++				break;
++			}
++			grown = krealloc_array(array, next, sizeof(*array), GFP_KERNEL);
++			if (!grown) {
++				ret = -ENOMEM;
++				break;
++			}
++			array = grown;
++			capacity = next;
++		}
++		array[nr++] = get_device(link->supplier);
++	}
++	device_links_read_unlock(idx);
++	if (ret) {
++		device_links_put_suppliers(array, nr);
++		return ret;
++	}
++	*suppliers = array;
++	*count = nr;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(device_links_get_runtime_suppliers);
++
+ static void device_link_synchronize_removal(void)
+ {
+ 	synchronize_srcu(&device_links_srcu);
+diff --git a/include/linux/device.h b/include/linux/device.h
+index aee79fd6b3..d8c0bc972d 100644
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@ -1381,6 +1381,10 @@ struct device_link *device_link_add(struct device *consumer,
+ 				    struct device *supplier, u32 flags);
+ void device_link_del(struct device_link *link);
+ void device_link_remove(void *consumer, struct device *supplier);
++int device_links_get_runtime_suppliers(struct device *dev,
++				      struct device ***suppliers,
++				      unsigned int *count);
++void device_links_put_suppliers(struct device **suppliers, unsigned int count);
+ void device_links_supplier_sync_state_pause(void);
+ void device_links_supplier_sync_state_resume(void);
+ void device_link_wait_removal(void);
+-- 
+2.56.0
+

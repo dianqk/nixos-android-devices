@@ -1,0 +1,77 @@
+From b8de686f23b5d95c86e74ee96b20e9b23165e10d Mon Sep 17 00:00:00 2001
+From: Xi Zhang <xz.ca.cn@gmail.com>
+Date: Mon, 26 Oct 2026 17:25:42 -0300
+Subject: [PATCH 038/144] drm/msm/dpu: reset unassigned resource slots to NULL
+ on topology update
+
+While this is not currently the case, it may be possible that topology
+for cwb and dsc resource requirements change between mode set in the
+future.
+
+e.g. when dsc support is added to DisplayPort, dsc may be optionally
+enabled and disabled between different modes due to
+bandwidth requirements.
+
+Set unassigned resource slots to NULL on topology update to avoid
+issues in the future. It's good practice to do so anyway.
+
+Signed-off-by: Xi Zhang <xz.ca.cn@gmail.com>
+Message-ID: <20261026-msm-dpu-res-clean-v2-1-3d864435186e@gmail.com>
+
+Link: https://lore.kernel.org/r/20261026-msm-dpu-res-clean-v2-1-3d864435186e@gmail.com
+(cherry picked from commit b1b18b113b0635feaaa479bd315cb5c2a926490b)
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0056-drm-msm-dpu-reset-unassigned-resource-slots-to-NULL-.patch
+Import-SHA256: 8ad0fb981bc6e9e111274164c583d8f989e1adbc8b971fc356f7138063b59020
+Import-Provenance: mail headers
+(cherry picked from commit 0c39797f7dd19041efc85539154c703c4469c5ea)
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c | 22 ++++++++++++++-------
+ 1 file changed, 15 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+index 1f20695f81..727267570a 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -1205,9 +1205,13 @@ static void dpu_encoder_virt_atomic_mode_set(struct drm_encoder *drm_enc,
+ 						       ARRAY_SIZE(hw_pp));
+ 	}
+ 
+-	for (i = 0; i < num_cwb; i++) {
+-		dpu_enc->hw_cwb[i] = to_dpu_hw_cwb(hw_cwb[i]);
+-		cwb_mask |= BIT(dpu_enc->hw_cwb[i]->idx - CWB_0);
++	for (i = 0; i < ARRAY_SIZE(dpu_enc->hw_cwb); i++) {
++		if (i < num_cwb) {
++			dpu_enc->hw_cwb[i] = to_dpu_hw_cwb(hw_cwb[i]);
++			cwb_mask |= BIT(dpu_enc->hw_cwb[i]->idx - CWB_0);
++		} else {
++			dpu_enc->hw_cwb[i] = NULL;
++		}
+ 	}
+ 
+ 	dpu_enc->cwb_mask = cwb_mask;
+@@ -1215,16 +1219,20 @@ static void dpu_encoder_virt_atomic_mode_set(struct drm_encoder *drm_enc,
+ 	num_ctl = dpu_rm_get_assigned_resources(&dpu_kms->rm, global_state,
+ 		drm_enc->crtc, DPU_HW_BLK_CTL, hw_ctl, ARRAY_SIZE(hw_ctl));
+ 
+-	for (i = 0; i < MAX_CHANNELS_PER_ENC; i++)
++	for (i = 0; i < ARRAY_SIZE(dpu_enc->hw_pp); i++)
+ 		dpu_enc->hw_pp[i] = i < num_pp ? to_dpu_hw_pingpong(hw_pp[i])
+ 						: NULL;
+ 
+ 	num_dsc = dpu_rm_get_assigned_resources(&dpu_kms->rm, global_state,
+ 						drm_enc->crtc, DPU_HW_BLK_DSC,
+ 						hw_dsc, ARRAY_SIZE(hw_dsc));
+-	for (i = 0; i < num_dsc; i++) {
+-		dpu_enc->hw_dsc[i] = to_dpu_hw_dsc(hw_dsc[i]);
+-		dsc_mask |= BIT(dpu_enc->hw_dsc[i]->idx - DSC_0);
++	for (i = 0; i < ARRAY_SIZE(dpu_enc->hw_dsc); i++) {
++		if (i < num_dsc) {
++			dpu_enc->hw_dsc[i] = to_dpu_hw_dsc(hw_dsc[i]);
++			dsc_mask |= BIT(dpu_enc->hw_dsc[i]->idx - DSC_0);
++		} else {
++			dpu_enc->hw_dsc[i] = NULL;
++		}
+ 	}
+ 
+ 	dpu_enc->dsc_mask = dsc_mask;

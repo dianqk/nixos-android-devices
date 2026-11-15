@@ -9,7 +9,6 @@
 
 ```nix
 {
-  androidDevices.usbSerial = "my-phone-01";
   androidDevices.usb.ssh.enable = true;
   users.users.root.openssh.authorizedKeys.keys = [
     "ssh-ed25519 REPLACE_WITH_YOUR_PUBLIC_KEY"
@@ -117,7 +116,9 @@ ssh root@172.16.42.1 systemctl reboot
 <a id="modes-and-peripherals"></a>
 ## 模式与外设
 
-支持的模式为 `developer_mode`、`charging_only` 和 `host_mode`。MTP、网络共享和
+支持的模式为 `developer_mode`、`charging_only` 和 `host_mode`。由 Type-C 端口管理器
+掌管 USB 数据角色的设备（T880）设置 `androidDevices.usb.signaller.hostMode = false`；
+其主机模式随所接设备和 PD 数据角色交换而定。MTP、网络共享和
 大容量存储未提供，因为这里没有配置相应的服务和策略。USB 角色切换默认仅限 root；
 普通用户可以通过系统总线查询守护进程。
 

@@ -6,14 +6,10 @@ in
 {
   options.hardware.aurora.audio.enable = lib.mkOption {
     type = lib.types.bool;
-    default = !config.androidDevices.recovery.enable && cfg.firmwareVariant == "android14";
-    description = "Install Aurora Android 14 AudioReach topology and CS35L43 speaker firmware. Physical audio validation is pending.";
+    default = !config.androidDevices.recovery.enable;
+    description = "Install Aurora Android 16 AudioReach topology and CS35L43 speaker firmware. Physical audio validation is pending.";
   };
   config = lib.mkIf cfg.audio.enable {
-    assertions = [ {
-      assertion = cfg.firmwareVariant == "android14";
-      message = "Aurora audio currently requires the Android 14 firmware baseline.";
-    } ];
     hardware.firmware = [ cfg.firmwarePackage.audio ];
     environment.systemPackages = [ pkgs.alsa-utils ];
     environment.variables.ALSA_CONFIG_UCM2 = ucmDirectory;

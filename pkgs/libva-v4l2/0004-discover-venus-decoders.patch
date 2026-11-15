@@ -12,11 +12,16 @@ On SDM845 Polaris with Linux 7.3-rc5, stock FFmpeg VA-API H264 High and HEVC
 Main each pass 90 frames with B frames and pixel-exact software comparisons.
 Do not extend encoder discovery: Venus encoding still faults in firmware.
 
+
+Adapted to qcom-va-driver 0980a1decf26: retain capability/format checks in the current decoder discovery loop.
+
+diff --git a/src/decoder.cpp b/src/decoder.cpp
+index 1b13105..2354787 100644
 --- a/src/decoder.cpp
 +++ b/src/decoder.cpp
-@@ -72,7 +72,8 @@
+@@ -78,7 +78,8 @@ std::string find_device(bool &av1) {
          v4l2_capability cap{};
-         bool match = false;
+         bool match = false, has_av1 = false;
          if (!call(fd, VIDIOC_QUERYCAP, &cap) &&
 -            !strcmp(reinterpret_cast<char *>(cap.driver), "iris_driver")) {
 +            (!strcmp(reinterpret_cast<char *>(cap.driver), "iris_driver") ||
@@ -24,12 +29,3 @@ Do not extend encoder discovery: Venus encoding still faults in firmware.
              unsigned caps =
                  cap.capabilities & V4L2_CAP_DEVICE_CAPS ? cap.device_caps : cap.capabilities;
              if (caps & V4L2_CAP_VIDEO_M2M_MPLANE) {
-@@ -89,7 +90,7 @@
-         if (match)
-             return path;
-     }
--    throw Error(VA_STATUS_ERROR_OPERATION_FAILED, "no Iris stateful H264 decoder found");
-+    throw Error(VA_STATUS_ERROR_OPERATION_FAILED, "no Qualcomm stateful H264 decoder found");
- }
- bool device_supports_av1(const std::string &device) {
-     int fd = open(device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);

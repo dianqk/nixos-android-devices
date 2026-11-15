@@ -1,0 +1,992 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 14 Oct 2026 15:45:21 +0800
+Subject: [PATCH 10/11] board: mediatek-mobile: run chainloaded from LK as a
+ boot-image kernel
+
+Rework the mediatek-mobile board for the stock-LK handoff, modelled on
+board/samsung/exynos-mobile and mach-snapdragon: LK loads U-Boot as the
+kernel of an Android boot image and passes its own Android FDT in x0.
+
+- Keep U-Boot's appended control DT (OF_SEPARATE with OF_BOARD) and parse
+  LK's FDT before relocation for DRAM banks, /memreserve/ entries,
+  reserved-memory regions with a reg property, the initrd window from
+  /chosen and the MediaTek videolfb framebuffer tags.
+- Relocate into the largest DRAM window below 4 GiB that avoids those
+  reservations, LK's FDT, its initrd and the loaded image, instead of
+  assuming a fixed 2 GiB bank. Build the MMU map from LK's banks with the
+  no-map reservations left unmapped (the framebuffer stays mapped).
+- Reserve LK's regions in LMB, allocate the load buffers below 4 GiB and
+  take serial# from androidboot.serialno.
+- Detect a FIT payload carried as the boot image's ramdisk: search the
+  initrd window (LK may prepend other ramdisks), copy the FIT marked with
+  "android-devices,payload" to an aligned buffer and export payload_addr.
+- Forward LK's fixed reservations to the OS FDT in ft_board_setup() for
+  both bootm and EFI.
+- Point a simple-framebuffer node at LK's framebuffer from
+  board_fix_fdt() only when LK reports one large enough.
+- Define TARGET_MEDIATEK_MOBILE and its board name, add a generic
+  mediatek_mobile_defconfig, and drop the TB373FU-specific environment and
+  unsourced board Kconfig; devices provide their environment file.
+- Remove the hard-coded TB373FU memory map and 2 GiB cap from mt6897.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm/mach-mediatek/Kconfig                |  20 +
+ arch/arm/mach-mediatek/mt6897/init.c          |  85 ---
+ board/mediatek/mediatek-mobile/Kconfig        |  15 -
+ .../mediatek-mobile/mediatek-mobile.c         | 591 ++++++++++++++++--
+ .../mediatek-mobile/mediatek-mobile.env       |  51 --
+ configs/mediatek_mobile_defconfig             |  94 +++
+ 6 files changed, 659 insertions(+), 197 deletions(-)
+ delete mode 100644 board/mediatek/mediatek-mobile/Kconfig
+ delete mode 100644 board/mediatek/mediatek-mobile/mediatek-mobile.env
+ create mode 100644 configs/mediatek_mobile_defconfig
+
+diff --git a/arch/arm/mach-mediatek/Kconfig b/arch/arm/mach-mediatek/Kconfig
+index 0677dc414f..9790b96b60 100644
+--- a/arch/arm/mach-mediatek/Kconfig
++++ b/arch/arm/mach-mediatek/Kconfig
+@@ -185,8 +185,28 @@ config MTK_MEM_MAP_MMIO_SIZE
+ 
+ endif
+ 
++config TARGET_MEDIATEK_MOBILE
++	bool
++	select LINUX_KERNEL_IMAGE_HEADER
++	select MISC_INIT_R
++	select OF_BOARD
++	select OF_BOARD_FIXUP
++	select OF_BOARD_SETUP
++	select POSITION_INDEPENDENT
++	select SAVE_PREV_BL_FDT_ADDR
++	select SAVE_PREV_BL_INITRAMFS_START_ADDR
++	help
++	  Generic MediaTek mobile board, loaded by the stock LK bootloader
++	  as the kernel of an Android boot image. DRAM, reserved memory, the
++	  initrd window and the boot framebuffer come from the FDT that LK
++	  passes in x0; U-Boot keeps its own appended control DT.
++
++config LNX_KRNL_IMG_TEXT_OFFSET_BASE
++	default 0x40000000 if TARGET_MEDIATEK_MOBILE
++
+ config SYS_BOARD
+ 	string "Board name"
++	default "mediatek-mobile" if TARGET_MEDIATEK_MOBILE
+ 	default "mt7622" if TARGET_MT7622
+ 	default "mt7623" if TARGET_MT7623
+ 	default "mt7629" if TARGET_MT7629
+diff --git a/arch/arm/mach-mediatek/mt6897/init.c b/arch/arm/mach-mediatek/mt6897/init.c
+index 22bdab1cd1..be278043a5 100644
+--- a/arch/arm/mach-mediatek/mt6897/init.c
++++ b/arch/arm/mach-mediatek/mt6897/init.c
+@@ -3,100 +3,15 @@
+  * Copyright (C) 2026 Igor Belwon <igor.belwon@mentallysanemainliners.org>
+  */
+ 
+-#include <fdtdec.h>
+ #include <init.h>
+-#include <asm/armv8/mmu.h>
+ #include <asm/system.h>
+-#include <asm/global_data.h>
+-#include <linux/sizes.h>
+-
+-DECLARE_GLOBAL_DATA_PTR;
+ 
+ int print_cpuinfo(void)
+ {
+ 	return 0;
+ }
+ 
+-int dram_init(void)
+-{
+-	int ret;
+-
+-	ret = fdtdec_setup_mem_size_base();
+-	if (ret)
+-		return ret;
+-
+-	// Fix ram_size to 2GB, above that things start to break
+-	gd->ram_size = get_ram_size((void *)gd->ram_base, SZ_2G);
+-
+-	return 0;
+-}
+-
+ void reset_cpu(void)
+ {
+ 	psci_system_reset();
+ }
+-
+-static struct mm_region tb373fu_mem_map[] = {
+-	{
+-		/* Peripheral region */
+-		.virt = 0x00000000UL,
+-		.phys = 0x00000000UL,
+-		.size = 0x40000000UL,
+-		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+-		PTE_BLOCK_NON_SHARE |
+-		PTE_BLOCK_PXN | PTE_BLOCK_UXN,
+-	},
+-	{
+-		/* DRAM region 0 */
+-		.virt = 0x040000000UL,
+-		.phys = 0x040000000UL,
+-		.size = 0x026f00000UL,
+-		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) | PTE_BLOCK_OUTER_SHARE
+-	},
+-	{
+-		/* TEE Reserved 0 */
+-		.virt = 0x66f00000UL,
+-		.phys = 0x66f00000UL,
+-		.size = 0x09100000UL,
+-		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+-		PTE_BLOCK_NON_SHARE |
+-		PTE_BLOCK_PXN | PTE_BLOCK_UXN,
+-	},
+-	{
+-		/* DRAM region 1 */
+-		.virt = 0x70000000UL,
+-		.phys = 0x70000000UL,
+-		.size = 0x08000000UL,
+-		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) | PTE_BLOCK_OUTER_SHARE
+-	},
+-	{
+-		/* TEE Reserved 1 */
+-		.virt = 0x78000000UL,
+-		.phys = 0x78000000UL,
+-		.size = 0x07fff000UL,
+-		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+-		PTE_BLOCK_NON_SHARE |
+-		PTE_BLOCK_PXN | PTE_BLOCK_UXN,
+-	},
+-	{
+-		/* DRAM region 2 */
+-		.virt = 0x7ffff000UL,
+-		.phys = 0x7ffff000UL,
+-		.size = 0x7e0d1000UL,
+-		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) | PTE_BLOCK_OUTER_SHARE
+-	},
+-	{
+-		/* Framebuffer Reserved */
+-		.virt = 0xfc16f000UL,
+-		.phys = 0xfc16f000UL,
+-		.size = 0x03e90000UL,
+-		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
+-				 PTE_BLOCK_INNER_SHARE |
+-				 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+-	},
+-	{
+-		0,
+-	}
+-};
+-
+-struct mm_region *mem_map = tb373fu_mem_map;
+diff --git a/board/mediatek/mediatek-mobile/Kconfig b/board/mediatek/mediatek-mobile/Kconfig
+deleted file mode 100644
+index 72de228ba0..0000000000
+--- a/board/mediatek/mediatek-mobile/Kconfig
++++ /dev/null
+@@ -1,15 +0,0 @@
+-if TARGET_MEDIATEK_MOBILE
+-
+-config ENV_SOURCE_FILE
+-	default "mediatek-mobile"
+-
+-config SYS_BOARD
+-	default "mediatek-mobile"
+-
+-config SYS_CONFIG_NAME
+-	default "mediatek-mobile"
+-
+-config SYS_VENDOR
+-	default "MediaTek"
+-
+-endif # TARGET_MEDIATEK_MOBILE
+diff --git a/board/mediatek/mediatek-mobile/mediatek-mobile.c b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+index 308f43eac2..42c7aa34d9 100644
+--- a/board/mediatek/mediatek-mobile/mediatek-mobile.c
++++ b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+@@ -1,81 +1,580 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+- * MediaTek generic mobile board source
+- * Mostly stolen from board/samsung/exynos-mobile/exynos-mobile.c
++ * MediaTek generic mobile board, chainloaded by the stock LK bootloader as
++ * the kernel of an Android boot image.
++ *
++ * LK passes its own (Android) FDT in x0. U-Boot keeps its appended control
++ * DT, but takes every runtime fact from LK's FDT: DRAM banks, reserved
++ * memory, the initrd window and the boot framebuffer. Those reservations are
++ * honoured by U-Boot itself (relocation window, LMB, MMU carve-outs) and
++ * forwarded to the operating system's FDT.
+  *
+  * Copyright (c) 2025 Kaustabh Chakraborty <kauschluss@disroot.org>
+  * Copyright (c) 2026 Igor Belwon <igor.belwon@mentallysanemainliners.org>
++ * Copyright (c) 2026 NixOS Android devices contributors
+  */
+ 
+ #include <asm/armv8/mmu.h>
+-#include <blk.h>
+-#include <bootflow.h>
+-#include <ctype.h>
+-#include <dm/ofnode.h>
+-#include <efi.h>
+-#include <efi_loader.h>
++#include <asm/global_data.h>
++#include <asm/sections.h>
++#include <asm/system.h>
++#include <asm/unaligned.h>
+ #include <env.h>
+-#include <errno.h>
++#include <fdt_support.h>
++#include <fdtdec.h>
++#include <image.h>
+ #include <init.h>
+-#include <linux/sizes.h>
+ #include <lmb.h>
+-#include <part.h>
+-#include <stdbool.h>
+-#include <string.h>
+-
+-#include <scsi.h>
++#include <log.h>
++#include <mapmem.h>
++#include <linux/libfdt.h>
++#include <linux/sizes.h>
++#include <linux/string.h>
+ 
+ DECLARE_GLOBAL_DATA_PTR;
+ 
+-#define lmb_alloc(size, addr) \
+-	lmb_alloc_mem(LMB_MEM_ALLOC_ANY, SZ_2M, addr, size, LMB_NONE)
++#define MTK_MAX_RESERVED	128
++/* Keep U-Boot and its DMA buffers below 4 GiB. */
++#define MTK_DMA_LIMIT		0x100000000ULL
++#define MTK_PAYLOAD_PROP	"android-devices,payload"
+ 
+-struct efi_fw_image fw_images[] = {
+-	{
+-		.fw_name = u"UBOOT_BOOT_PARTITION",
+-		.image_index = 1,
+-	},
++struct mtk_region {
++	u64 start;
++	u64 size;
++	bool nomap;
+ };
+ 
+-struct efi_capsule_update_info update_info = {
+-	.dfu_string = NULL,
+-	.images = fw_images,
+-	.num_images = ARRAY_SIZE(fw_images),
+-};
++/*
++ * Parsed before relocation, when .bss is not yet usable; .data is copied
++ * along with U-Boot.
++ */
++static struct mtk_region mtk_banks[CONFIG_NR_DRAM_BANKS] __section(".data");
++static int mtk_bank_count __section(".data");
++static struct mtk_region mtk_reserved[MTK_MAX_RESERVED] __section(".data");
++static int mtk_reserved_count __section(".data");
++static u64 mtk_lk_fdt __section(".data");
++static u64 mtk_lk_fdt_size __section(".data");
++static u64 mtk_initrd_start __section(".data");
++static u64 mtk_initrd_end __section(".data");
++static u64 mtk_fb_start __section(".data");
++static u64 mtk_fb_size __section(".data");
++
++/* MMIO below DRAM, DRAM split around no-map regions, terminator. */
++static struct mm_region mtk_mem_map[CONFIG_NR_DRAM_BANKS + 2 * MTK_MAX_RESERVED + 2]
++	__section(".data");
++struct mm_region *mem_map = mtk_mem_map;
+ 
+-static int mediatek_fastboot_setup(void)
++static u64 mtk_cells(const fdt32_t *cell, int count)
+ {
+-	struct blk_desc *blk_dev;
+-	struct disk_partition info = {0};
+-	phys_addr_t addr;
+-	int i;
++	u64 value = 0;
+ 
+-	/* Allocate and define buffer address for fastboot interface. */
+-	if (lmb_alloc(CONFIG_FASTBOOT_BUF_SIZE, &addr)) {
+-		log_err("%s: failed to allocate fastboot buffer\n", __func__);
+-		return -ENOMEM;
++	while (count--)
++		value = (value << 32) | fdt32_to_cpu(*cell++);
++
++	return value;
++}
++
++static u64 mtk_prop_u64(const void *fdt, int node, const char *name)
++{
++	const fdt32_t *cell;
++	int len;
++
++	cell = fdt_getprop(fdt, node, name, &len);
++	if (!cell || (len != 4 && len != 8))
++		return 0;
++
++	return mtk_cells(cell, len / 4);
++}
++
++static void mtk_add_reserved(u64 start, u64 size, bool nomap)
++{
++	if (!size)
++		return;
++	if (mtk_reserved_count == MTK_MAX_RESERVED) {
++		log_warning("Too many reserved regions; ignoring 0x%llx\n", start);
++		return;
++	}
++	mtk_reserved[mtk_reserved_count].start = start;
++	mtk_reserved[mtk_reserved_count].size = size;
++	mtk_reserved[mtk_reserved_count].nomap = nomap;
++	mtk_reserved_count++;
++}
++
++static void mtk_sort(struct mtk_region *regions, int count)
++{
++	int i, j;
++
++	for (i = 1; i < count; i++) {
++		struct mtk_region value = regions[i];
++
++		for (j = i; j > 0 && regions[j - 1].start > value.start; j--)
++			regions[j] = regions[j - 1];
++		regions[j] = value;
+ 	}
+-	env_set_hex("fastboot_addr_r", addr);
++}
+ 
+-	scsi_scan(true);
++static void mtk_parse_reg(const void *fdt, int node, int ac, int sc,
++			  bool memory, bool nomap)
++{
++	const fdt32_t *reg;
++	int len, i;
++
++	reg = fdt_getprop(fdt, node, "reg", &len);
++	if (!reg || ac < 1 || ac > 2 || sc < 1 || sc > 2)
++		return;
++
++	for (i = 0; (i + ac + sc) * 4 <= len; i += ac + sc) {
++		u64 start = mtk_cells(reg + i, ac);
++		u64 size = mtk_cells(reg + i + ac, sc);
+ 
+-	blk_dev = blk_get_dev("scsi", CONFIG_FASTBOOT_FLASH_BLOCK_DEVICE_ID);
+-	if (!blk_dev) {
+-		log_err("%s: required scsi device not available\n", __func__);
+-		return -ENODEV;
++		if (!size)
++			continue;
++		if (!memory) {
++			mtk_add_reserved(start, size, nomap);
++			continue;
++		}
++		if (mtk_bank_count == CONFIG_NR_DRAM_BANKS) {
++			log_warning("Too many DRAM banks; ignoring 0x%llx\n", start);
++			return;
++		}
++		mtk_banks[mtk_bank_count].start = start;
++		mtk_banks[mtk_bank_count].size = size;
++		mtk_bank_count++;
+ 	}
++}
++
++/*
++ * MediaTek LK describes its boot framebuffer through the videolfb tags in
++ * /chosen. Only use it when LK states a non-empty VRAM region.
++ */
++static void mtk_parse_framebuffer(const void *fdt, int chosen)
++{
++	u64 base = (mtk_prop_u64(fdt, chosen, "atag,videolfb-fb_base_h") << 32) |
++		   mtk_prop_u64(fdt, chosen, "atag,videolfb-fb_base_l");
++	u64 size = mtk_prop_u64(fdt, chosen, "atag,videolfb-vramSize");
++
++	if (base && size) {
++		mtk_fb_start = base;
++		mtk_fb_size = size;
++	}
++}
++
++static int mtk_parse_prev_fdt(const void *fdt)
++{
++	int node, parent, i;
++	u64 start, size;
+ 
+-	for (i = 1; i < CONFIG_EFI_PARTITION_ENTRIES_NUMBERS; i++) {
+-		if (part_get_info(blk_dev, i, &info))
++	if (fdt_check_header(fdt))
++		return -EINVAL;
++
++	mtk_lk_fdt = (uintptr_t)fdt;
++	mtk_lk_fdt_size = fdt_totalsize(fdt);
++
++	fdt_for_each_subnode(node, fdt, 0) {
++		const char *type = fdt_getprop(fdt, node, "device_type", NULL);
++
++		if (!type || strcmp(type, "memory") ||
++		    !fdtdec_get_is_enabled(fdt, node))
+ 			continue;
++		mtk_parse_reg(fdt, node, fdt_address_cells(fdt, 0),
++			      fdt_size_cells(fdt, 0), true, false);
++	}
++
++	for (i = 0; i < fdt_num_mem_rsv(fdt); i++)
++		if (!fdt_get_mem_rsv(fdt, i, &start, &size))
++			mtk_add_reserved(start, size, false);
++
++	parent = fdt_path_offset(fdt, "/reserved-memory");
++	if (parent >= 0) {
++		int ac = fdt_address_cells(fdt, parent);
++		int sc = fdt_size_cells(fdt, parent);
++
++		/* Regions without reg are allocated by the Android kernel. */
++		fdt_for_each_subnode(node, fdt, parent) {
++			if (!fdtdec_get_is_enabled(fdt, node))
++				continue;
++			mtk_parse_reg(fdt, node, ac, sc, false,
++				      !!fdt_getprop(fdt, node, "no-map", NULL));
++		}
++	}
++
++	node = fdt_path_offset(fdt, "/chosen");
++	if (node >= 0) {
++		mtk_initrd_start = mtk_prop_u64(fdt, node, "linux,initrd-start");
++		mtk_initrd_end = mtk_prop_u64(fdt, node, "linux,initrd-end");
++		if (mtk_initrd_end <= mtk_initrd_start)
++			mtk_initrd_start = mtk_initrd_end = 0;
++		mtk_parse_framebuffer(fdt, node);
++	}
++
++	mtk_sort(mtk_banks, mtk_bank_count);
++	mtk_sort(mtk_reserved, mtk_reserved_count);
++
++	return mtk_bank_count ? 0 : -ENODATA;
++}
++
++/* Keep our own control DT; LK's Android FDT only supplies runtime facts. */
++int board_fdt_blob_setup(void **fdtp)
++{
++	void *prev = (void *)get_prev_bl_fdt_addr();
++	bool internal = !fdt_check_header(*fdtp);
++
++	if (!prev || mtk_parse_prev_fdt(prev))
++		panic("No usable FDT with /memory from LK in x0 (%p)\n", prev);
++
++	if (internal)
++		return -EEXIST;
++
++	*fdtp = prev;
++	return 0;
++}
++
++static bool mtk_overlaps(u64 a, u64 as, u64 b, u64 bs)
++{
++	return a < b + bs && b < a + as;
++}
++
++/*
++ * The largest DRAM window below 4 GiB that avoids every LK reservation, the
++ * LK FDT, the initrd LK loaded and this image. U-Boot relocates to its top.
++ */
++static int mtk_select_window(void)
++{
++	struct mtk_region avoid[MTK_MAX_RESERVED + 3];
++	u64 best_start = 0, best_size = 0;
++	u64 image = (uintptr_t)__image_copy_start;
++	u64 image_end = (uintptr_t)_end + fdt_totalsize(gd->fdt_blob);
++	int count = 0, b, i;
+ 
+-		// works printk("Partition: %s\n", info.name);
++	for (i = 0; i < mtk_reserved_count; i++)
++		avoid[count++] = mtk_reserved[i];
++	avoid[count++] = (struct mtk_region){ mtk_lk_fdt, mtk_lk_fdt_size };
++	avoid[count++] = (struct mtk_region){ image, image_end - image };
++	if (mtk_initrd_start)
++		avoid[count++] = (struct mtk_region){
++			mtk_initrd_start, mtk_initrd_end - mtk_initrd_start };
++	mtk_sort(avoid, count);
++
++	for (b = 0; b < mtk_bank_count; b++) {
++		u64 cursor = mtk_banks[b].start;
++		u64 end = min_t(u64, mtk_banks[b].start + mtk_banks[b].size,
++				MTK_DMA_LIMIT);
++
++		for (i = 0; i <= count && cursor < end; i++) {
++			u64 start = ALIGN(cursor, SZ_4K);
++			u64 limit = i < count ? max(avoid[i].start, cursor) : end;
++
++			limit = ALIGN_DOWN(min(limit, end), SZ_4K);
++			if (limit > start && limit - start > best_size) {
++				best_start = start;
++				best_size = limit - start;
++			}
++			if (i < count)
++				cursor = max(cursor, avoid[i].start + avoid[i].size);
++		}
+ 	}
+ 
++	if (best_size < SZ_64M)
++		return -ENOMEM;
++
++	gd->ram_base = best_start;
++	gd->ram_size = best_size;
+ 	return 0;
+ }
+ 
++static void mtk_map(int *index, u64 start, u64 end, u64 attrs)
++{
++	start = ALIGN(start, SZ_4K);
++	end = ALIGN_DOWN(end, SZ_4K);
++	if (end <= start || *index >= ARRAY_SIZE(mtk_mem_map) - 1)
++		return;
++	mtk_mem_map[*index].phys = start;
++	mtk_mem_map[*index].virt = start;
++	mtk_mem_map[*index].size = end - start;
++	mtk_mem_map[*index].attrs = attrs;
++	(*index)++;
++}
++
++/*
++ * Map DRAM except the no-map reservations, so that speculative accesses never
++ * reach secure carve-outs. The LK framebuffer stays mapped for simplefb.
++ */
++static void mtk_build_mem_map(void)
++{
++	const u64 normal = PTE_BLOCK_MEMTYPE(MT_NORMAL) | PTE_BLOCK_INNER_SHARE;
++	const u64 framebuffer = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
++				PTE_BLOCK_INNER_SHARE | PTE_BLOCK_PXN |
++				PTE_BLOCK_UXN;
++	int index = 0, b, i;
++
++	mtk_map(&index, SZ_4K, mtk_banks[0].start,
++		PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) | PTE_BLOCK_NON_SHARE |
++		PTE_BLOCK_PXN | PTE_BLOCK_UXN);
++
++	for (b = 0; b < mtk_bank_count; b++) {
++		u64 cursor = mtk_banks[b].start;
++		u64 end = mtk_banks[b].start + mtk_banks[b].size;
++
++		for (i = 0; i < mtk_reserved_count && cursor < end; i++) {
++			const struct mtk_region *r = &mtk_reserved[i];
++			u64 hole = ALIGN_DOWN(r->start, SZ_4K);
++			u64 hole_end = ALIGN(r->start + r->size, SZ_4K);
++
++			if (!r->nomap || hole_end <= cursor || hole >= end)
++				continue;
++			mtk_map(&index, cursor, min(hole, end), normal);
++			if (mtk_fb_size &&
++			    mtk_overlaps(hole, hole_end - hole, mtk_fb_start, mtk_fb_size))
++				mtk_map(&index, max(hole, mtk_fb_start),
++					min(hole_end, mtk_fb_start + mtk_fb_size),
++					framebuffer);
++			cursor = max(cursor, hole_end);
++		}
++		mtk_map(&index, cursor, end, normal);
++	}
++	/* Zero size and attributes terminate the map. */
++}
++
++int dram_init(void)
++{
++	if (mtk_select_window())
++		panic("No usable DRAM window for U-Boot\n");
++
++	mtk_build_mem_map();
++	return 0;
++}
++
++int dram_init_banksize(void)
++{
++	int i;
++
++	for (i = 0; i < CONFIG_NR_DRAM_BANKS; i++) {
++		gd->dram[i].start = i < mtk_bank_count ? mtk_banks[i].start : 0;
++		gd->dram[i].size = i < mtk_bank_count ? mtk_banks[i].size : 0;
++	}
++
++	return 0;
++}
++
++int board_init(void)
++{
++	return 0;
++}
++
++/* Point the simplefb node at LK's framebuffer, or leave it disabled. */
++int board_fix_fdt(void *fdt)
++{
++	const fdt32_t *cell;
++	fdt64_t reg[2];
++	u32 stride, height;
++	int node, parent;
++
++	node = fdt_node_offset_by_compatible(fdt, -1, "simple-framebuffer");
++	if (node < 0 || !mtk_fb_size)
++		return 0;
++
++	parent = fdt_parent_offset(fdt, node);
++	if (fdt_address_cells(fdt, parent) != 2 || fdt_size_cells(fdt, parent) != 2)
++		return 0;
++
++	cell = fdt_getprop(fdt, node, "stride", NULL);
++	stride = cell ? fdt32_to_cpu(*cell) : 0;
++	cell = fdt_getprop(fdt, node, "height", NULL);
++	height = cell ? fdt32_to_cpu(*cell) : 0;
++	if (!stride || !height || (u64)stride * height > mtk_fb_size) {
++		log_warning("LK framebuffer (0x%llx bytes) does not hold the simplefb geometry\n",
++			    mtk_fb_size);
++		return 0;
++	}
++
++	reg[0] = cpu_to_fdt64(mtk_fb_start);
++	reg[1] = cpu_to_fdt64((u64)stride * height);
++	if (fdt_setprop_inplace(fdt, node, "reg", reg, sizeof(reg)))
++		return 0;
++
++	return fdt_setprop_string(fdt, node, "status", "okay");
++}
++
++static void mtk_reserve(u64 start, u64 size, u32 flags)
++{
++	phys_addr_t addr = start;
++
++	if (size)
++		lmb_alloc_mem(LMB_MEM_ALLOC_ADDR, 0, &addr, size, flags);
++}
++
++static int mtk_alloc_low(phys_size_t size, u64 align, phys_addr_t *addr)
++{
++	*addr = MTK_DMA_LIMIT - 1;
++	return lmb_alloc_mem(LMB_MEM_ALLOC_MAX, align, addr, size, LMB_NONE);
++}
++
++static void mtk_env_buffer(const char *name, phys_size_t size)
++{
++	phys_addr_t addr;
++
++	if (mtk_alloc_low(size, SZ_2M, &addr)) {
++		log_err("Cannot allocate %s\n", name);
++		return;
++	}
++	env_set_hex(name, addr);
++}
++
++static void mtk_set_serial(void)
++{
++	const void *fdt = (const void *)(uintptr_t)mtk_lk_fdt;
++	const char *bootargs = NULL, *value, *end;
++	char serial[65];
++	int node;
++
++	node = fdt_path_offset(fdt, "/chosen");
++	if (node >= 0)
++		bootargs = fdt_getprop(fdt, node, "bootargs", NULL);
++	if (!bootargs)
++		return;
++
++	for (value = bootargs; (value = strstr(value, "androidboot.serialno=")); value++) {
++		if (value != bootargs && value[-1] != ' ')
++			continue;
++		value += strlen("androidboot.serialno=");
++		end = strchrnul(value, ' ');
++		if (end == value || end - value >= sizeof(serial))
++			return;
++		memcpy(serial, value, end - value);
++		serial[end - value] = '\0';
++		env_set("serial#", serial);
++		return;
++	}
++}
++
++static bool mtk_fdt_header_fits(const u8 *p, u64 avail)
++{
++	u32 total, structure, strings, version;
++
++	if (avail < sizeof(struct fdt_header) ||
++	    get_unaligned_be32(p) != FDT_MAGIC)
++		return false;
++	total = get_unaligned_be32(p + 4);
++	structure = get_unaligned_be32(p + 8);
++	strings = get_unaligned_be32(p + 12);
++	version = get_unaligned_be32(p + 20);
++
++	return total >= sizeof(struct fdt_header) && total <= avail &&
++	       version >= 16 && structure < total && strings < total;
++}
++
++/*
++ * A boot image may carry a FIT payload (kernel, initrd and DTB) as its
++ * ramdisk. LK may concatenate other ramdisks before it, so search the whole
++ * initrd window it reports, copy the FIT to an aligned buffer and verify it.
++ */
++static void mtk_find_payload(void)
++{
++	const u8 *base, *p, *end;
++	phys_addr_t addr;
++	u32 total;
++
++	if (!mtk_initrd_start)
++		return;
++
++	base = map_sysmem(mtk_initrd_start, mtk_initrd_end - mtk_initrd_start);
++	end = base + (mtk_initrd_end - mtk_initrd_start);
++	for (p = base; p < end; p++) {
++		void *copy;
++
++		p = memchr(p, 0xd0, end - p);
++		if (!p)
++			break;
++		if (!mtk_fdt_header_fits(p, end - p))
++			continue;
++
++		total = get_unaligned_be32(p + 4);
++		if (mtk_alloc_low(total, SZ_4K, &addr))
++			break;
++		copy = map_sysmem(addr, total);
++		memcpy(copy, p, total);
++		if (!fdt_check_header(copy) &&
++		    fdt_getprop(copy, 0, MTK_PAYLOAD_PROP, NULL) &&
++		    !fit_check_format(copy, total)) {
++			log_info("Boot payload: FIT at initrd offset 0x%lx, %u bytes, copied to 0x%llx\n",
++				 (ulong)(p - base), total, (u64)addr);
++			env_set_hex("payload_addr", addr);
++			unmap_sysmem(copy);
++			break;
++		}
++		unmap_sysmem(copy);
++		lmb_free(addr, total, LMB_NONE);
++	}
++	unmap_sysmem(base);
++}
++
+ int misc_init_r(void)
+ {
+-	return mediatek_fastboot_setup();
++	phys_addr_t fastboot;
++	int i;
++
++	for (i = 0; i < mtk_reserved_count; i++)
++		mtk_reserve(mtk_reserved[i].start, mtk_reserved[i].size,
++			    mtk_reserved[i].nomap ? LMB_NOMAP : LMB_NOOVERWRITE);
++	/* ft_board_setup() reads LK's FDT again; keep it and the initrd intact. */
++	mtk_reserve(mtk_lk_fdt, mtk_lk_fdt_size, LMB_NOOVERWRITE);
++	mtk_reserve(mtk_initrd_start, mtk_initrd_end - mtk_initrd_start,
++		    LMB_NOOVERWRITE);
++
++	mtk_set_serial();
++	mtk_find_payload();
++
++	mtk_env_buffer("kernel_addr_r", SZ_128M);
++	mtk_env_buffer("ramdisk_addr_r", SZ_256M);
++	mtk_env_buffer("fdt_addr_r", SZ_2M);
++	mtk_env_buffer("kernel_comp_addr_r", SZ_128M);
++	env_set_hex("kernel_comp_size", SZ_128M);
++	env_set("loadaddr", env_get("kernel_addr_r"));
++	if (CONFIG_IS_ENABLED(USB_FUNCTION_FASTBOOT) &&
++	    !mtk_alloc_low(CONFIG_FASTBOOT_BUF_SIZE, SZ_2M, &fastboot))
++		env_set_hex("fastboot_addr_r", fastboot);
++
++	return 0;
++}
++
++/* Forward LK's fixed reservations to the operating system's FDT. */
++int ft_board_setup(void *blob, struct bd_info *bd)
++{
++	int parent, node, i, ret;
++	char name[40];
++
++	parent = fdt_path_offset(blob, "/reserved-memory");
++	if (parent < 0) {
++		parent = fdt_add_subnode(blob, 0, "reserved-memory");
++		if (parent < 0)
++			return parent;
++		ret = fdt_setprop_u32(blob, parent, "#address-cells", 2);
++		ret = ret ?: fdt_setprop_u32(blob, parent, "#size-cells", 2);
++		ret = ret ?: fdt_setprop_empty(blob, parent, "ranges");
++		if (ret)
++			return ret;
++	} else if (fdt_address_cells(blob, parent) != 2 ||
++		   fdt_size_cells(blob, parent) != 2) {
++		log_err("OS /reserved-memory must use two address and size cells\n");
++		return -EINVAL;
++	}
++
++	for (i = 0; i < mtk_reserved_count; i++) {
++		const struct mtk_region *r = &mtk_reserved[i];
++		fdt64_t reg[2] = { cpu_to_fdt64(r->start), cpu_to_fdt64(r->size) };
++
++		snprintf(name, sizeof(name), "lk-reserved@%llx", r->start);
++		node = fdt_add_subnode(blob, parent, name);
++		if (node == -FDT_ERR_EXISTS)
++			continue;
++		if (node < 0)
++			return node;
++		ret = fdt_setprop(blob, node, "reg", reg, sizeof(reg));
++		if (!ret && r->nomap)
++			ret = fdt_setprop_empty(blob, node, "no-map");
++		if (ret)
++			return ret;
++	}
++
++	return 0;
+ }
+diff --git a/board/mediatek/mediatek-mobile/mediatek-mobile.env b/board/mediatek/mediatek-mobile/mediatek-mobile.env
+deleted file mode 100644
+index f559e265a7..0000000000
+--- a/board/mediatek/mediatek-mobile/mediatek-mobile.env
++++ /dev/null
+@@ -1,51 +0,0 @@
+-bootdelay=3
+-bootretry=1
+-stdin=serial,button-kbd
+-stdout=serial,vidconsole
+-stderr=serial,vidconsole
+-
+-# Fastboot is keen to use the address from kconfig, but we
+-# allocate its buffer at runtime.
+-fastboot=echo fastboot buffer located at 0x$fastboot_addr_r; fastboot -l $fastboot_addr_r usb 0
+-
+-# For kernels compressed with gzip
+-kernel_comp_addr_r=0x52000000
+-kernel_comp_size=0x10000000
+-bootargs=clk_ignore_unused console=ttyS0,921600
+-
+-# scsi scan is done by our misc_init.
+-
+-normal_boot=ext4load scsi 2:51 0x42000000 /vmlinuz;                   \
+-            ext4load scsi 2:51 0x45500000 /initramfs;                 \
+-            ext4load scsi 2:51 0x47000000 /mt6897-lenovo-tb373fu.dtb; \
+-            booti 0x42000000 0x45500000:0x1400000 0x47000000          \
+-                setcurs 0 3; lcdputs "Failed to do normal boot!";     \
+-            run menucmd;
+-
+-# bootretry will run this command over and over, if we fail once
+-# then bail out to the boot menu instead (with a pause to read
+-# the error message)
+-bootcmd=bootefi bootmgr; pause; run menucmd
+-
+-# When entering the menu (either from button press or failed boot)
+-# remap bootcmd so it will re-open the menu and we won't get stuck
+-# at the console with no way to type
+-menucmd=setenv bootcmd run menucmd; bootmenu -1
+-
+-# Pause is used so the output can be read on the display
+-bootmenu_0=Boot=bootefi bootmgr; pause
+-bootmenu_1=Enable serial console gadget=run serial_gadget
+-bootmenu_2=Enable USB mass storage=echo "Press any key to exit UMS mode"; ums 0 scsi 0
+-bootmenu_3=Enable fastboot mode=run fastboot
+-# Disabling bootretry means we'll just drop the shell
+-bootmenu_4=Drop to shell=setenv bootretry -1
+-bootmenu_5=Reset device=reset
+-bootmenu_6=Dump clocks=clk dump; pause
+-bootmenu_7=Dump environment=printenv; pause
+-bootmenu_8=Board info=bdinfo; pause
+-bootmenu_9=Dump bootargs=fdt print /chosen bootargs; pause
+-
+-# Allow holding the volume down button while U-Boot loads to enter
+-# the boot menu
+-button_cmd_0_name=Volume Down
+-button_cmd_0=run menucmd
+diff --git a/configs/mediatek_mobile_defconfig b/configs/mediatek_mobile_defconfig
+new file mode 100644
+index 0000000000..fea22cc0c4
+--- /dev/null
++++ b/configs/mediatek_mobile_defconfig
+@@ -0,0 +1,94 @@
++CONFIG_ARM=y
++CONFIG_SKIP_LOWLEVEL_INIT=y
++CONFIG_POSITION_INDEPENDENT=y
++CONFIG_SYS_INIT_SP_BSS_OFFSET=0x180000
++CONFIG_ARCH_MEDIATEK=y
++CONFIG_TEXT_BASE=0x40000000
++CONFIG_SYS_MALLOC_LEN=0x2000000
++CONFIG_SYS_MALLOC_F_LEN=0x20000
++CONFIG_NR_DRAM_BANKS=16
++CONFIG_DM_GPIO=y
++CONFIG_DM_RESET=y
++CONFIG_TARGET_MT6897=y
++CONFIG_SYS_BOOTM_LEN=0x8000000
++CONFIG_SYS_LOAD_ADDR=0x40000000
++CONFIG_SYS_FDT_PAD=0x10000
++CONFIG_FIT=y
++CONFIG_FIT_VERBOSE=y
++CONFIG_SUPPORT_RAW_INITRD=y
++CONFIG_BOOTDELAY=0
++CONFIG_USE_PREBOOT=y
++CONFIG_SYS_CBSIZE=2048
++CONFIG_SYS_PBSIZE=2068
++CONFIG_LOG_MAX_LEVEL=7
++CONFIG_LOG_DEFAULT_LEVEL=6
++# CONFIG_DISPLAY_CPUINFO is not set
++CONFIG_HUSH_PARSER=y
++CONFIG_CMD_BOOTI=y
++CONFIG_CMD_BOOTMENU=y
++CONFIG_CMD_BOOTEFI=y
++CONFIG_CMD_FDT=y
++CONFIG_CMD_GPIO=y
++CONFIG_CMD_PART=y
++CONFIG_CMD_SCSI=y
++CONFIG_CMD_UFS=y
++CONFIG_CMD_USB=y
++CONFIG_CMD_USB_MASS_STORAGE=y
++CONFIG_CMD_UMS_ABORT_KEYED=y
++CONFIG_CMD_FASTBOOT_ABORT_KEYED=y
++CONFIG_CMD_PAUSE=y
++CONFIG_CMD_FAT=y
++CONFIG_CMD_EXT4=y
++CONFIG_CMD_FS_GENERIC=y
++CONFIG_CMD_MEMINFO=y
++CONFIG_CMD_MEMINFO_MAP=y
++CONFIG_CMD_WDT=y
++CONFIG_BOOT_RETRY=y
++CONFIG_BOOT_RETRY_TIME=1
++CONFIG_RETRY_BOOTCMD=y
++CONFIG_EFI_PARTITION=y
++CONFIG_FS_FAT=y
++CONFIG_FS_FAT_HANDLE_SECTOR_SIZE_MISMATCH=y
++CONFIG_ENV_USE_DEFAULT_ENV_TEXT_FILE=y
++CONFIG_NO_NET=y
++CONFIG_BUTTON=y
++CONFIG_BUTTON_CMD=y
++CONFIG_BUTTON_REMAP_PHONE_KEYS=y
++CONFIG_BUTTON_KEYBOARD=y
++CONFIG_DM_KEYBOARD=y
++CONFIG_CONSOLE_RECORD=y
++CONFIG_CONSOLE_RECORD_OUT_SIZE=0x6000
++CONFIG_USB_FUNCTION_FASTBOOT=y
++CONFIG_FASTBOOT_BUF_ADDR=0x0
++CONFIG_FASTBOOT_BUF_SIZE=0x8000000
++# CONFIG_FASTBOOT_FLASH is not set
++CONFIG_FASTBOOT_CMD_OEM_CONSOLE=y
++CONFIG_PHY=y
++CONFIG_PHY_MTK_TPHY=y
++CONFIG_PINCTRL=y
++CONFIG_RESET_TI_SYSCON=y
++CONFIG_SCSI=y
++CONFIG_DM_SCSI=y
++# CONFIG_REQUIRE_SERIAL_CONSOLE is not set
++CONFIG_DM_SERIAL=y
++CONFIG_MTK_SERIAL=y
++CONFIG_USB=y
++CONFIG_DM_USB_GADGET=y
++CONFIG_USB_GADGET=y
++CONFIG_USB_GADGET_MANUFACTURER="U-Boot"
++CONFIG_USB_GADGET_VENDOR_NUM=0x18d1
++CONFIG_USB_GADGET_PRODUCT_NUM=0x4ee0
++CONFIG_USB_MTU3=y
++CONFIG_USB_MTU3_GADGET=y
++CONFIG_USB_FUNCTION_ACM=y
++CONFIG_UFS=y
++CONFIG_UFS_MEDIATEK=y
++CONFIG_VIDEO=y
++CONFIG_VIDEO_SIMPLE=y
++CONFIG_NO_FB_CLEAR=y
++CONFIG_SYS_WHITE_ON_BLACK=y
++CONFIG_WDT=y
++# CONFIG_WATCHDOG_AUTOSTART is not set
++CONFIG_WDT_MTK=y
++# CONFIG_PANIC_HANG is not set
++# CONFIG_OF_UPSTREAM is not set

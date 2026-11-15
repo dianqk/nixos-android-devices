@@ -1,0 +1,87 @@
+From 66bf842fb171c70c77e41707d8c7336e1ee10457 Mon Sep 17 00:00:00 2001
+From: Hangxiang Ma <hangxiang.ma@oss.qualcomm.com>
+Date: Mon, 2 Nov 2026 02:42:14 -0800
+Subject: [PATCH 104/144] media: qcom: camss: Add Kaanapali compatible
+
+Add CAMSS_KAANAPALI enum, Kaanapali compatible and Kaanapali CAMSS driver
+private data. The private data includes the ICC paths and TPG resources
+and sets the CSIPHY count. CSIPHY resources are not listed because the
+PHY is probed standalone. CSID and VFE resources are added by later
+changes.
+
+Reviewed-by: Bryan O'Donoghue <bryan.odonoghue@linaro.org>
+Reviewed-by: Loic Poulain <loic.poulain@oss.qualcomm.com>
+Signed-off-by: Hangxiang Ma <hangxiang.ma@oss.qualcomm.com>
+Link: https://lore.kernel.org/r/20261102-kaanapali-camss-v24-6-d6b8f3f6f66f@oss.qualcomm.com
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0136-media-qcom-camss-Add-Kaanapali-compatible.patch
+Import-SHA256: 9a51b5efbaa11635479ec83d6e3ea6caf73beddc6af95d7c53b269f193f610aa
+Import-Provenance: mail headers
+(cherry picked from commit a7342cd9d06a3cf9f129955d3cf968bde6f6bb8a)
+---
+ drivers/media/platform/qcom/camss/camss.c | 25 +++++++++++++++++++++++
+ drivers/media/platform/qcom/camss/camss.h |  1 +
+ 2 files changed, 26 insertions(+)
+
+diff --git a/drivers/media/platform/qcom/camss/camss.c b/drivers/media/platform/qcom/camss/camss.c
+index c483e480f3..b014051ab1 100644
+--- a/drivers/media/platform/qcom/camss/camss.c
++++ b/drivers/media/platform/qcom/camss/camss.c
+@@ -34,6 +34,20 @@
+ 
+ static const struct parent_dev_ops vfe_parent_dev_ops;
+ 
++static const struct resources_icc icc_res_kaanapali[] = {
++	{
++		.name = "ahb",
++		.icc_bw_tbl.avg = 150000,
++		.icc_bw_tbl.peak = 300000,
++	},
++	/* Based on 4096 x 3072 30 FPS 2496 Mbps mode */
++	{
++		.name = "hf_mnoc",
++		.icc_bw_tbl.avg = 471860,
++		.icc_bw_tbl.peak = 925857,
++	}
++};
++
+ static const struct camss_subdev_resources csiphy_res_8x16[] = {
+ 	/* CSIPHY0 */
+ 	{
+@@ -5610,6 +5624,16 @@ static void camss_remove(struct platform_device *pdev)
+ 	camss_genpd_cleanup(camss);
+ }
+ 
++static const struct camss_resources kaanapali_resources = {
++	.version = CAMSS_KAANAPALI,
++	.pd_name = "top",
++	.icc_res = icc_res_kaanapali,
++	.tpg_res = tpg_res_8775p,
++	.icc_path_num = ARRAY_SIZE(icc_res_kaanapali),
++	.csiphy_num = 6,
++	.tpg_num = ARRAY_SIZE(tpg_res_8775p),
++};
++
+ static const struct camss_resources msm8916_resources = {
+ 	.version = CAMSS_8x16,
+ 	.csiphy_res = csiphy_res_8x16,
+@@ -5843,6 +5867,7 @@ static const struct camss_resources x1e80100_resources = {
+ };
+ 
+ static const struct of_device_id camss_dt_match[] = {
++	{ .compatible = "qcom,kaanapali-camss", .data = &kaanapali_resources },
+ 	{ .compatible = "qcom,msm8916-camss", .data = &msm8916_resources },
+ 	{ .compatible = "qcom,msm8939-camss", .data = &msm8939_resources },
+ 	{ .compatible = "qcom,msm8953-camss", .data = &msm8953_resources },
+diff --git a/drivers/media/platform/qcom/camss/camss.h b/drivers/media/platform/qcom/camss/camss.h
+index 3dcf0dc2ab..b9845465ae 100644
+--- a/drivers/media/platform/qcom/camss/camss.h
++++ b/drivers/media/platform/qcom/camss/camss.h
+@@ -96,6 +96,7 @@ enum camss_version {
+ 	CAMSS_8550,
+ 	CAMSS_8650,
+ 	CAMSS_8775P,
++	CAMSS_KAANAPALI,
+ 	CAMSS_X1E80100,
+ };
+ 

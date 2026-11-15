@@ -1,0 +1,155 @@
+From 048a3ba31c395c1e4b0779385151616110e44095 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 24 Oct 2026 09:25:01 +0800
+Subject: [PATCH 46/46] media: qcom: iris: adapt the SM8450/SM8475 VPU2 support
+ to Linux 7.3
+
+Linux 7.3 gained encoder key-frame requests (upstream 6f62dcefd249,
+"media: qcom: iris: Add request key frame support for encoder") and
+split the platform firmware descriptor into firmware_desc_gen1/gen2.
+The cherry-picked VPU2 support (93acb52146de, from linux-marble
+af1b85e54f57) carried its own copy of the former and used the old
+single descriptor.
+
+Drop the duplicate HFI_PROP_REQUEST_SYNC_FRAME definitions, the
+REQUEST_I_FRAME capability and its iris_set_req_sync_frame_gen2()
+setter in favour of the upstream REQUEST_SYNC_FRAME capability that
+SM8550 encoder caps (shared by VPU2) already carry, and describe the
+SM8450 HFI gen2 firmware with firmware_desc_gen2.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/media/platform/qcom/iris/iris_ctrls.c | 26 -------------------
+ drivers/media/platform/qcom/iris/iris_ctrls.h |  1 -
+ .../media/platform/qcom/iris/iris_hfi_gen2.c  | 10 -------
+ .../qcom/iris/iris_hfi_gen2_defines.h         |  6 -----
+ .../platform/qcom/iris/iris_platform_common.h |  1 -
+ .../platform/qcom/iris/iris_platform_vpu2.c   |  2 +-
+ 6 files changed, 1 insertion(+), 45 deletions(-)
+
+diff --git a/drivers/media/platform/qcom/iris/iris_ctrls.c b/drivers/media/platform/qcom/iris/iris_ctrls.c
+index bedf6f5f360e..bf17d310eac0 100644
+--- a/drivers/media/platform/qcom/iris/iris_ctrls.c
++++ b/drivers/media/platform/qcom/iris/iris_ctrls.c
+@@ -40,8 +40,6 @@ static enum platform_inst_fw_cap_type iris_get_cap_id(u32 id)
+ 		return HEADER_MODE;
+ 	case V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR:
+ 		return PREPEND_SPSPPS_TO_IDR;
+-	case V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME:
+-		return REQUEST_I_FRAME;
+ 	case V4L2_CID_MPEG_VIDEO_BITRATE:
+ 		return BITRATE;
+ 	case V4L2_CID_MPEG_VIDEO_BITRATE_PEAK:
+@@ -187,8 +185,6 @@ static u32 iris_get_v4l2_id(enum platform_inst_fw_cap_type cap_id)
+ 		return V4L2_CID_MPEG_VIDEO_HEADER_MODE;
+ 	case PREPEND_SPSPPS_TO_IDR:
+ 		return V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR;
+-	case REQUEST_I_FRAME:
+-		return V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME;
+ 	case BITRATE:
+ 		return V4L2_CID_MPEG_VIDEO_BITRATE;
+ 	case BITRATE_PEAK:
+@@ -651,28 +647,6 @@ int iris_set_header_mode_gen2(struct iris_inst *inst, enum platform_inst_fw_cap_
+ 				     &hfi_val, sizeof(u32));
+ }
+ 
+-int iris_set_req_sync_frame_gen2(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id)
+-{
+-	const struct iris_hfi_session_ops *hfi_ops = inst->hfi_session_ops;
+-	u32 hfi_id = inst->fw_caps[cap_id].hfi_id;
+-	u32 hfi_val;
+-
+-	/* A button: only meaningful while frames are flowing */
+-	if (!vb2_is_streaming(v4l2_m2m_get_src_vq(inst->m2m_ctx)))
+-		return 0;
+-
+-	if (inst->fw_caps[PREPEND_SPSPPS_TO_IDR].value)
+-		hfi_val = HFI_SYNC_FRAME_REQUEST_WITH_PREFIX_SEQ_HDR;
+-	else
+-		hfi_val = HFI_SYNC_FRAME_REQUEST_WITHOUT_SEQ_HDR;
+-
+-	return hfi_ops->session_set_property(inst, hfi_id,
+-					     HFI_HOST_FLAGS_NONE,
+-					     iris_get_port_info(inst, cap_id),
+-					     HFI_PAYLOAD_U32_ENUM,
+-					     &hfi_val, sizeof(u32));
+-}
+-
+ int iris_set_bitrate_gen1(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id)
+ {
+ 	const struct iris_hfi_session_ops *hfi_ops = inst->hfi_session_ops;
+diff --git a/drivers/media/platform/qcom/iris/iris_ctrls.h b/drivers/media/platform/qcom/iris/iris_ctrls.h
+index 87560c8e2e7a..5180d53d3c90 100644
+--- a/drivers/media/platform/qcom/iris/iris_ctrls.h
++++ b/drivers/media/platform/qcom/iris/iris_ctrls.h
+@@ -22,7 +22,6 @@ int iris_set_level(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id
+ int iris_set_profile_level_gen1(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id);
+ int iris_set_header_mode_gen1(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id);
+ int iris_set_header_mode_gen2(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id);
+-int iris_set_req_sync_frame_gen2(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id);
+ int iris_set_bitrate_gen1(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id);
+ int iris_set_bitrate_gen2(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id);
+ int iris_set_peak_bitrate(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id);
+diff --git a/drivers/media/platform/qcom/iris/iris_hfi_gen2.c b/drivers/media/platform/qcom/iris/iris_hfi_gen2.c
+index 9027efc141ed..9fbd53844ee3 100644
+--- a/drivers/media/platform/qcom/iris/iris_hfi_gen2.c
++++ b/drivers/media/platform/qcom/iris/iris_hfi_gen2.c
+@@ -1207,16 +1207,6 @@ static const struct platform_inst_fw_cap inst_fw_cap_sm8550_enc[] = {
+ 		.step_or_mask = 1,
+ 		.value = 0,
+ 	},
+-	{
+-		.cap_id = REQUEST_I_FRAME,
+-		.min = 0,
+-		.max = 0,
+-		.step_or_mask = 0,
+-		.value = 0,
+-		.hfi_id = HFI_PROP_REQUEST_SYNC_FRAME,
+-		.flags = CAP_FLAG_INPUT_PORT | CAP_FLAG_DYNAMIC_ALLOWED,
+-		.set = iris_set_req_sync_frame_gen2,
+-	},
+ 	{
+ 		.cap_id = BITRATE,
+ 		.min = 1,
+diff --git a/drivers/media/platform/qcom/iris/iris_hfi_gen2_defines.h b/drivers/media/platform/qcom/iris/iris_hfi_gen2_defines.h
+index 601567b3c759..6745e64def8c 100644
+--- a/drivers/media/platform/qcom/iris/iris_hfi_gen2_defines.h
++++ b/drivers/media/platform/qcom/iris/iris_hfi_gen2_defines.h
+@@ -110,12 +110,6 @@ enum hfi_seq_header_mode {
+ 	HFI_SEQ_HEADER_METADATA			= 0x00000008,
+ };
+ 
+-enum hfi_syncframe_request_mode {
+-	HFI_SYNC_FRAME_REQUEST_WITHOUT_SEQ_HDR	= 0x00000001,
+-	HFI_SYNC_FRAME_REQUEST_WITH_PREFIX_SEQ_HDR	= 0x00000002,
+-};
+-
+-#define HFI_PROP_REQUEST_SYNC_FRAME		0x03000145
+ #define HFI_PROP_SEQ_HEADER_MODE		0x03000149
+ 
+ enum hfi_rotation {
+diff --git a/drivers/media/platform/qcom/iris/iris_platform_common.h b/drivers/media/platform/qcom/iris/iris_platform_common.h
+index f7b351cffad1..8ac5706ab9e2 100644
+--- a/drivers/media/platform/qcom/iris/iris_platform_common.h
++++ b/drivers/media/platform/qcom/iris/iris_platform_common.h
+@@ -131,7 +131,6 @@ enum platform_inst_fw_cap_type {
+ 	TIER,
+ 	HEADER_MODE,
+ 	PREPEND_SPSPPS_TO_IDR,
+-	REQUEST_I_FRAME,
+ 	BITRATE,
+ 	BITRATE_PEAK,
+ 	BITRATE_MODE,
+diff --git a/drivers/media/platform/qcom/iris/iris_platform_vpu2.c b/drivers/media/platform/qcom/iris/iris_platform_vpu2.c
+index 935fad283876..54dae3b4d48c 100644
+--- a/drivers/media/platform/qcom/iris/iris_platform_vpu2.c
++++ b/drivers/media/platform/qcom/iris/iris_platform_vpu2.c
+@@ -174,7 +174,7 @@ const struct iris_platform_data sm8250_data = {
+ static const char * const sm8450_opp_pd_table[] = { "mxc", "mmcx" };
+ 
+ const struct iris_platform_data sm8450_data = {
+-	.firmware_desc = &iris_vpu20_4v_gen2_desc,
++	.firmware_desc_gen2 = &iris_vpu20_4v_gen2_desc,
+ 	.vpu_ops = &iris_vpu2_ops,
+ 	.icc_tbl = iris_icc_info_vpu2,
+ 	.icc_tbl_size = ARRAY_SIZE(iris_icc_info_vpu2),

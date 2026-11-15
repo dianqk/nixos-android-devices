@@ -1,0 +1,858 @@
+From a28e9a3c584b6529578ad9416fa9ca0591e70ff1 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 7 Nov 2026 00:23:07 +0800
+Subject: [PATCH 191/192] clk: mediatek: transfer MT6897 OVL boot votes after
+ off epochs
+
+Add a single-controller boot-owner handle for the static built-in top
+provider. Resolve the bound provider under its device lock, validate the
+explicit voted OVL mux IDs and retain its device reference. Publish private
+state only after successful clock-provider setup and suppress unbind.
+
+Serialize enable/disable ownership and live state with off-epoch accounting
+under one IRQ-safe lock. Require the classified ordinary roots to be live
+before recording an epoch. OVL1's epoch permits its functional root;
+both sticky epochs permit shared OVL0. Transfer only inherited/owned
+accounting, without CCF/PM calls or SET/CLR writes. Ordinary last disable
+performs release and retains retry state on unvote failure.
+
+Add portable enrollment, predicate, ordering, retry and shared-lock tests,
+including shared-bank bit preservation. These host tests do not establish
+hardware timing or kernel lockdep behavior.
+---
+ drivers/clk/mediatek/clk-mt6897-topckgen.c    | 167 +++++++++++-
+ include/linux/clk/mediatek-mt6897.h           |  41 +++
+ tools/testing/selftests/mtk_clk/Makefile      |   4 +-
+ tools/testing/selftests/mtk_clk/boot_cases.c  | 243 ++++++++++++++++++
+ tools/testing/selftests/mtk_clk/boot_stubs.h  |  51 ++++
+ .../testing/selftests/mtk_clk/mt6897_cases.c  |  32 ++-
+ .../testing/selftests/mtk_clk/mt6897_stubs.h  |   9 +-
+ .../selftests/mtk_clk/test_boot_owner.py      |  36 +++
+ .../testing/selftests/mtk_clk/test_mt6897.py  |   2 +-
+ 9 files changed, 565 insertions(+), 20 deletions(-)
+ create mode 100644 include/linux/clk/mediatek-mt6897.h
+ create mode 100644 tools/testing/selftests/mtk_clk/boot_cases.c
+ create mode 100644 tools/testing/selftests/mtk_clk/boot_stubs.h
+ create mode 100755 tools/testing/selftests/mtk_clk/test_boot_owner.py
+
+diff --git a/drivers/clk/mediatek/clk-mt6897-topckgen.c b/drivers/clk/mediatek/clk-mt6897-topckgen.c
+index c8b8e66429..51d5622c63 100644
+--- a/drivers/clk/mediatek/clk-mt6897-topckgen.c
++++ b/drivers/clk/mediatek/clk-mt6897-topckgen.c
+@@ -11,11 +11,13 @@
+ 
+ #include <dt-bindings/clock/mediatek,mt6897-clock.h>
+ #include <linux/clk-provider.h>
++#include <linux/clk/mediatek-mt6897.h>
+ #include <linux/iopoll.h>
+ #include <linux/mfd/syscon.h>
+ #include <linux/module.h>
+ #include <linux/regmap.h>
+ #include <linux/of.h>
++#include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ 
+ #include "clk-mtk.h"
+@@ -1533,11 +1535,23 @@ static const struct mt6897_ro_mux top_ro_muxes[] = {
+  * Source: https://github.com/MiCode/MTK_kernel_device_modules/blob/
+  * 3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/clk/mediatek/clk-mux.c
+  */
++struct mt6897_voted_mux;
++struct mt6897_clk_boot_owner {
++	spinlock_t lock;
++	struct device *dev;
++	struct device *controller;
++	struct mt6897_voted_mux *mux[2];
++	u8 epochs;
++	u8 reported;
++};
++
+ struct mt6897_voted_mux {
+ 	struct clk_hw hw;
+ 	const struct mt6897_ro_mux *data;
+ 	struct regmap *voter;
+ 	void __iomem *base;
++	struct mt6897_clk_boot_owner *owner;
++	bool live;
+ 	bool classified;
+ 	bool inherited;
+ 	bool owned;
+@@ -1564,7 +1578,7 @@ static int mt6897_mux_vote(struct mt6897_voted_mux *m, bool on)
+ 				  2, 100000);
+ }
+ 
+-static int mt6897_mux_enable(struct clk_hw *hw)
++static int mt6897_mux_enable_locked(struct clk_hw *hw)
+ {
+ 	struct mt6897_voted_mux *m = container_of(hw, struct mt6897_voted_mux, hw);
+ 	u32 val, bit = BIT(m->data->shift + 7);
+@@ -1598,7 +1612,7 @@ static int mt6897_mux_enable(struct clk_hw *hw)
+ 	return ret;
+ }
+ 
+-static void mt6897_mux_disable(struct clk_hw *hw)
++static void mt6897_mux_disable_locked(struct clk_hw *hw)
+ {
+ 	struct mt6897_voted_mux *m = container_of(hw, struct mt6897_voted_mux, hw);
+ 	int ret;
+@@ -1612,6 +1626,31 @@ static void mt6897_mux_disable(struct clk_hw *hw)
+ 		m->owned = false;
+ }
+ 
++static int mt6897_mux_enable(struct clk_hw *hw)
++{
++	struct mt6897_voted_mux *m = container_of(hw, struct mt6897_voted_mux, hw);
++	unsigned long flags;
++	int ret;
++
++	spin_lock_irqsave(&m->owner->lock, flags);
++	ret = mt6897_mux_enable_locked(hw);
++	if (!ret)
++		m->live = true;
++	spin_unlock_irqrestore(&m->owner->lock, flags);
++	return ret;
++}
++
++static void mt6897_mux_disable(struct clk_hw *hw)
++{
++	struct mt6897_voted_mux *m = container_of(hw, struct mt6897_voted_mux, hw);
++	unsigned long flags;
++
++	spin_lock_irqsave(&m->owner->lock, flags);
++	m->live = false;
++	mt6897_mux_disable_locked(hw);
++	spin_unlock_irqrestore(&m->owner->lock, flags);
++}
++
+ static u8 mt6897_mux_get_parent(struct clk_hw *hw)
+ {
+ 	struct mt6897_voted_mux *m = container_of(hw, struct mt6897_voted_mux, hw);
+@@ -1627,7 +1666,8 @@ static const struct clk_ops mt6897_mux_ops = {
+ };
+ 
+ static struct clk_hw *mt6897_mux_register(struct device *dev,
+-		const struct mt6897_ro_mux *d, void __iomem *base, struct regmap *voter)
++		const struct mt6897_ro_mux *d, void __iomem *base, struct regmap *voter,
++		struct mt6897_clk_boot_owner *owner)
+ {
+ 	struct mt6897_voted_mux *m;
+ 	struct clk_init_data init = {
+@@ -1644,18 +1684,130 @@ static struct clk_hw *mt6897_mux_register(struct device *dev,
+ 	m->data = d;
+ 	m->base = base;
+ 	m->voter = voter;
++	m->owner = owner;
+ 	ret = devm_clk_hw_register(dev, &m->hw);
++	if (!ret && d->id == CLK_TOP_OVL0_SEL)
++		owner->mux[0] = m;
++	if (!ret && d->id == CLK_TOP_OVL1_SEL)
++		owner->mux[1] = m;
+ 	return ret ? ERR_PTR(ret) : &m->hw;
+ }
+ 
++/* Lock order: CCF enable lock -> owner lock, or owner lock alone.
++ * Never call CCF, runtime PM or device locking with owner->lock held.
++ */
++static struct platform_driver clk_mt6897_top_drv;
++
++struct mt6897_clk_boot_owner *mt6897_clk_boot_get(struct device_node *np,
++					       struct device *controller)
++{
++	struct platform_device *pdev;
++	struct mt6897_clk_boot_owner *owner;
++	unsigned long flags;
++	int ret = -EPROBE_DEFER;
++
++	if (!np || !controller || !of_device_is_compatible(np, "mediatek,mt6897-topckgen"))
++		return ERR_PTR(-EINVAL);
++	pdev = of_find_device_by_node(np);
++	if (!pdev)
++		return ERR_PTR(-EPROBE_DEFER);
++	device_lock(&pdev->dev);
++	owner = platform_get_drvdata(pdev);
++	if (!device_is_bound(&pdev->dev) ||
++	    pdev->dev.driver != &clk_mt6897_top_drv.driver || !owner)
++		goto out;
++	ret = -EINVAL;
++	if (!owner->mux[0] || !owner->mux[1] ||
++	    owner->mux[0]->data->id != CLK_TOP_OVL0_SEL ||
++	    owner->mux[1]->data->id != CLK_TOP_OVL1_SEL ||
++	    owner->mux[0]->owner != owner || owner->mux[1]->owner != owner ||
++	    !owner->mux[0]->voter || owner->mux[0]->voter != owner->mux[1]->voter)
++		goto out;
++	spin_lock_irqsave(&owner->lock, flags);
++	if (owner->controller) {
++		ret = -EBUSY;
++	} else {
++		owner->controller = controller;
++		ret = 0;
++	}
++	spin_unlock_irqrestore(&owner->lock, flags);
++out:
++	device_unlock(&pdev->dev);
++	if (ret) {
++		put_device(&pdev->dev);
++		return ERR_PTR(ret);
++	}
++	/* of_find_device_by_node's reference belongs to this enrollment. */
++	return owner;
++}
++EXPORT_SYMBOL_GPL(mt6897_clk_boot_get);
++
++void mt6897_clk_boot_put(struct mt6897_clk_boot_owner *owner)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&owner->lock, flags);
++	owner->controller = NULL;
++	spin_unlock_irqrestore(&owner->lock, flags);
++	put_device(owner->dev);
++}
++EXPORT_SYMBOL_GPL(mt6897_clk_boot_put);
++
++int mt6897_clk_boot_record_off(struct mt6897_clk_boot_owner *owner,
++			     unsigned int bank, u32 status)
++{
++	const u32 on = BIT(31) | BIT(30) | BIT(0) | BIT(2) | BIT(3);
++	const u32 isolated = BIT(1) | BIT(4);
++	unsigned long flags;
++	u8 reported = 0;
++	int ret = -EINVAL;
++
++	if (!owner || bank > 1 || (status & on) || (status & isolated) != isolated)
++		return -EINVAL;
++	spin_lock_irqsave(&owner->lock, flags);
++	if (!owner->controller || !owner->mux[0]->classified || !owner->mux[0]->live ||
++	    (bank == 1 && (!owner->mux[1]->classified || !owner->mux[1]->live)))
++		goto out;
++	owner->epochs |= BIT(bank);
++	/* Transfer accounting only; the caller still holds the ordinary roots. */
++	if (bank == 1) {
++		if (owner->mux[1]->inherited && !(owner->reported & BIT(1)))
++			reported |= BIT(1);
++		owner->mux[1]->inherited = false;
++		owner->mux[1]->owned = true;
++	}
++	if (owner->epochs == (BIT(0) | BIT(1))) {
++		if (owner->mux[0]->inherited && !(owner->reported & BIT(0)))
++			reported |= BIT(0);
++		owner->mux[0]->inherited = false;
++		owner->mux[0]->owned = true;
++	}
++	owner->reported |= reported;
++	ret = 0;
++out:
++	spin_unlock_irqrestore(&owner->lock, flags);
++	if (reported & BIT(0))
++		dev_info(owner->dev, "OVL0 root BOOT accounting transferred to ordinary users\n");
++	if (reported & BIT(1))
++		dev_info(owner->dev, "OVL1 root BOOT accounting transferred to ordinary users\n");
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mt6897_clk_boot_record_off);
++
+ static int clk_mt6897_top_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+ 	struct clk_hw_onecell_data *clk_data;
++	struct mt6897_clk_boot_owner *owner;
+ 	void __iomem *base;
+ 	struct regmap *voter;
+ 	int i, ret;
+ 
++	owner = devm_kzalloc(dev, sizeof(*owner), GFP_KERNEL);
++	if (!owner)
++		return -ENOMEM;
++	owner->dev = dev;
++	spin_lock_init(&owner->lock);
+ 	base = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(base))
+ 		return PTR_ERR(base);
+@@ -1695,7 +1847,7 @@ static int clk_mt6897_top_probe(struct platform_device *pdev)
+ 
+ 		/* Without the voter, keep firmware gate and parent ownership. */
+ 		if (m->vote_set && voter)
+-			hw = mt6897_mux_register(dev, m, base, voter);
++			hw = mt6897_mux_register(dev, m, base, voter, owner);
+ 		else
+ 			hw = devm_clk_hw_register_mux(dev, m->name, m->parents,
+ 					      m->num_parents, 0,
+@@ -1707,7 +1859,11 @@ static int clk_mt6897_top_probe(struct platform_device *pdev)
+ 		clk_data->hws[m->id] = hw;
+ 	}
+ 
+-	return devm_of_clk_add_hw_provider(dev, of_clk_hw_onecell_get, clk_data);
++	ret = devm_of_clk_add_hw_provider(dev, of_clk_hw_onecell_get, clk_data);
++	if (ret)
++		return ret;
++	platform_set_drvdata(pdev, owner);
++	return 0;
+ }
+ 
+ static const struct of_device_id of_match_clk_mt6897_top[] = {
+@@ -1720,6 +1876,7 @@ static struct platform_driver clk_mt6897_top_drv = {
+ 	.probe = clk_mt6897_top_probe,
+ 	.driver = {
+ 		.name = "clk-mt6897-top",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = of_match_clk_mt6897_top,
+ 	},
+ };
+diff --git a/include/linux/clk/mediatek-mt6897.h b/include/linux/clk/mediatek-mt6897.h
+new file mode 100644
+index 0000000000..9f7afdd961
+--- /dev/null
++++ b/include/linux/clk/mediatek-mt6897.h
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_CLK_MEDIATEK_MT6897_H
++#define _LINUX_CLK_MEDIATEK_MT6897_H
++
++#include <linux/err.h>
++#include <linux/errno.h>
++#include <linux/kconfig.h>
++#include <linux/types.h>
++
++struct device;
++struct device_node;
++struct mt6897_clk_boot_owner;
++
++/* This handle is for the static built-in provider with unbind suppressed.
++ * Successful and quarantined controllers retain it for their lifetime.
++ */
++#if IS_ENABLED(CONFIG_COMMON_CLK_MT6897)
++struct mt6897_clk_boot_owner *mt6897_clk_boot_get(struct device_node *np,
++					       struct device *controller);
++/* Only for preflight unwind, before hardware/domain callbacks can use it. */
++void mt6897_clk_boot_put(struct mt6897_clk_boot_owner *owner);
++/* Atomic. Caller holds every ordinary root enable reference for this bank:
++ * OVL0: ovl0; OVL1: ovl0 and ovl1. Records no epoch without live roots.
++ * The raw SPM value must be read after successful HWV-off, before root release.
++ */
++int mt6897_clk_boot_record_off(struct mt6897_clk_boot_owner *owner,
++			     unsigned int bank, u32 status);
++#else
++static inline struct mt6897_clk_boot_owner *
++mt6897_clk_boot_get(struct device_node *np, struct device *controller)
++{
++	return ERR_PTR(-ENODEV);
++}
++static inline void mt6897_clk_boot_put(struct mt6897_clk_boot_owner *owner) {}
++static inline int mt6897_clk_boot_record_off(struct mt6897_clk_boot_owner *owner,
++					   unsigned int bank, u32 status)
++{
++	return -ENODEV;
++}
++#endif
++#endif
+diff --git a/tools/testing/selftests/mtk_clk/Makefile b/tools/testing/selftests/mtk_clk/Makefile
+index b36bb93355..8c9b04d5c0 100644
+--- a/tools/testing/selftests/mtk_clk/Makefile
++++ b/tools/testing/selftests/mtk_clk/Makefile
+@@ -1,4 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-TEST_PROGS := test_mt6897.py test_domains.py
+-TEST_FILES := mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c
++TEST_PROGS := test_mt6897.py test_domains.py test_boot_owner.py
++TEST_FILES := mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c boot_stubs.h boot_cases.c
+ include ../lib.mk
+diff --git a/tools/testing/selftests/mtk_clk/boot_cases.c b/tools/testing/selftests/mtk_clk/boot_cases.c
+new file mode 100644
+index 0000000000..9a4a179aeb
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/boot_cases.c
+@@ -0,0 +1,243 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#define OVL0_BIT BIT(7)
++#define OVL1_BIT BIT(15)
++#define OVL_BITS (OVL0_BIT | OVL1_BIT)
++static struct mt6897_clk_boot_owner owner;
++static struct mt6897_ro_mux data[2];
++static struct mt6897_voted_mux mux[2];
++static struct regmap voter, foreign_voter;
++static u32 regs;
++static struct device controller;
++static struct device_node node = {.compatible = true};
++static bool initialized;
++
++static void cleanup(void)
++{
++	if (!initialized)
++		return;
++	assert(!pthread_mutex_destroy(&owner.lock));
++	assert(!pthread_mutex_destroy(&provider.dev.lock));
++	initialized = false;
++}
++
++static void reset(void)
++{
++	cleanup();
++	memset(&owner, 0, sizeof(owner));
++	spin_lock_init(&owner.lock);
++	provider = (struct platform_device){
++	    .dev = {.driver = &clk_mt6897_top_drv.driver, .bound = true},
++	    .data = &owner,
++	};
++	assert(!pthread_mutex_init(&provider.dev.lock, NULL));
++	initialized = true;
++	owner.dev = &provider.dev;
++	present = true;
++	node.compatible = true;
++	regs = 0;
++	voter = (struct regmap){.vote = OVL_BITS,
++				.done = OVL_BITS,
++				.set = 1,
++				.clr = 2,
++				.done_reg = 3,
++				.pdn = &regs,
++				.allowed = OVL_BITS};
++	for (int i = 0; i < 2; i++) {
++		data[i] = (struct mt6897_ro_mux){
++		    .id = i ? CLK_TOP_OVL1_SEL : CLK_TOP_OVL0_SEL,
++		    .vote_set = 1,
++		    .vote_clr = 2,
++		    .vote_done = 3,
++		    .shift = i * 8,
++		};
++		mux[i] = (struct mt6897_voted_mux){.owner = &owner,
++						   .data = &data[i],
++						   .voter = &voter,
++						   .base = &regs};
++		owner.mux[i] = &mux[i];
++	}
++}
++
++static void enroll_enable(void)
++{
++	assert(mt6897_clk_boot_get(&node, &controller) == &owner);
++	assert(provider.dev.refs == 1);
++	assert(!mt6897_mux_enable(&mux[0].hw));
++	assert(!mt6897_mux_enable(&mux[1].hw));
++}
++
++static void test_enrollment(void)
++{
++	reset();
++	present = false;
++	assert(PTR_ERR(mt6897_clk_boot_get(&node, &controller)) ==
++	       -EPROBE_DEFER);
++	present = true;
++	provider.data = NULL;
++	assert(PTR_ERR(mt6897_clk_boot_get(&node, &controller)) ==
++	       -EPROBE_DEFER);
++	assert(!provider.dev.refs);
++	provider.data = &owner;
++	provider.dev.bound = false;
++	assert(PTR_ERR(mt6897_clk_boot_get(&node, &controller)) ==
++	       -EPROBE_DEFER);
++	assert(!provider.dev.refs);
++	provider.dev.bound = true;
++	provider.dev.driver = NULL;
++	assert(PTR_ERR(mt6897_clk_boot_get(&node, &controller)) ==
++	       -EPROBE_DEFER);
++	assert(!provider.dev.refs);
++	provider.dev.driver = &clk_mt6897_top_drv.driver;
++	owner.mux[1] = NULL;
++	assert(PTR_ERR(mt6897_clk_boot_get(&node, &controller)) == -EINVAL);
++	assert(!provider.dev.refs);
++	owner.mux[1] = &mux[1];
++	data[1].id = 999;
++	assert(PTR_ERR(mt6897_clk_boot_get(&node, &controller)) == -EINVAL);
++	assert(!provider.dev.refs);
++	data[1].id = CLK_TOP_OVL1_SEL;
++	mux[1].voter = &foreign_voter;
++	assert(PTR_ERR(mt6897_clk_boot_get(&node, &controller)) == -EINVAL);
++	assert(!provider.dev.refs);
++	mux[1].voter = &voter;
++	mux[1].owner = NULL;
++	assert(PTR_ERR(mt6897_clk_boot_get(&node, &controller)) == -EINVAL);
++	assert(!provider.dev.refs);
++	mux[1].owner = &owner;
++	assert(mt6897_clk_boot_get(&node, &controller) == &owner);
++	assert(PTR_ERR(mt6897_clk_boot_get(&node, &controller)) == -EBUSY);
++	assert(provider.dev.refs == 1);
++	mt6897_clk_boot_put(&owner);
++	assert(!provider.dev.refs && !owner.controller);
++	assert(mt6897_clk_boot_get(&node, &controller) == &owner);
++	mt6897_clk_boot_put(&owner);
++}
++
++static void test_orders_and_resume(void)
++{
++	for (int first = 0; first < 2; first++) {
++		reset();
++		enroll_enable();
++		int writes = voter.writes;
++		assert(!mt6897_clk_boot_record_off(&owner, first, 18 | BIT(8)));
++		assert(owner.epochs == BIT(first));
++		assert(!mt6897_clk_boot_record_off(&owner, first, 18));
++		assert(voter.writes == writes);
++		if (first == 0) {
++			assert(mux[0].inherited && mux[1].inherited);
++			mt6897_mux_disable(&mux[0].hw);
++			assert(!mt6897_mux_enable(&mux[0].hw));
++		} else {
++			assert(mux[0].inherited && !mux[1].inherited);
++			mt6897_mux_disable(&mux[1].hw);
++			assert(voter.vote == OVL0_BIT);
++			assert(!mt6897_mux_enable(&mux[1].hw));
++		}
++		writes = voter.writes;
++		assert(!mt6897_clk_boot_record_off(&owner, 1 - first, 18));
++		assert(voter.writes == writes && owner.epochs == 3);
++		assert(!mux[0].inherited && !mux[1].inherited);
++		assert(mux[0].owned && mux[1].owned);
++		mt6897_mux_disable(&mux[0].hw);
++		assert(voter.vote == OVL1_BIT);
++		mt6897_mux_disable(&mux[1].hw);
++		assert(!voter.vote);
++	}
++}
++
++static void test_prerequisites(void)
++{
++	reset();
++	enroll_enable();
++	for (unsigned bit = 0; bit < 32; bit++) {
++		if (bit != 0 && bit != 1 && bit != 2 && bit != 3 && bit != 4 &&
++		    bit != 30 && bit != 31)
++			continue;
++		assert(mt6897_clk_boot_record_off(&owner, 1, 18 ^ BIT(bit)) ==
++		       -EINVAL);
++		assert(!owner.epochs);
++	}
++	mux[1].live = false;
++	assert(mt6897_clk_boot_record_off(&owner, 1, 18) == -EINVAL);
++	assert(!owner.epochs);
++	mux[1].live = true;
++	mux[0].live = false;
++	assert(mt6897_clk_boot_record_off(&owner, 0, 18) == -EINVAL);
++	assert(mt6897_clk_boot_record_off(&owner, 1, 18) == -EINVAL);
++	assert(!owner.epochs);
++	mux[0].live = true;
++	mux[0].classified = false;
++	assert(mt6897_clk_boot_record_off(&owner, 0, 18) == -EINVAL);
++	assert(!owner.epochs);
++	mux[0].classified = true;
++	mux[1].classified = false;
++	assert(!mt6897_clk_boot_record_off(&owner, 0, 18));
++	assert(mt6897_clk_boot_record_off(&owner, 1, 18) == -EINVAL);
++	assert(owner.epochs == 1 && mux[0].inherited && mux[1].inherited);
++	mux[1].classified = true;
++	assert(mt6897_clk_boot_record_off(&owner, 2, 18) == -EINVAL);
++}
++
++static void test_unvote_retry(void)
++{
++	reset();
++	enroll_enable();
++	assert(!mt6897_clk_boot_record_off(&owner, 1, 18));
++	assert(!mt6897_clk_boot_record_off(&owner, 0, 18));
++	voter.fail_clear = 1;
++	mt6897_mux_disable(&mux[0].hw);
++	assert(!mux[0].live && mux[0].owned && (voter.vote & OVL0_BIT));
++	assert(mt6897_clk_boot_record_off(&owner, 0, 18) == -EINVAL);
++	voter.fail_clear = 0;
++	assert(!mt6897_mux_enable(&mux[0].hw));
++	mt6897_mux_disable(&mux[0].hw);
++	assert(!(voter.vote & OVL0_BIT) && !mux[0].owned);
++	assert(voter.vote & OVL1_BIT);
++}
++
++static void *racing_enable(void *unused)
++{
++	for (int i = 0; i < 1000; i++) {
++		assert(!mt6897_mux_enable(&mux[0].hw));
++		mt6897_mux_disable(&mux[0].hw);
++	}
++	return NULL;
++}
++
++static void *racing_epoch(void *unused)
++{
++	for (int i = 0; i < 1000; i++) {
++		int ret = mt6897_clk_boot_record_off(&owner, 0, 18);
++		assert(!ret || ret == -EINVAL);
++	}
++	return NULL;
++}
++
++static void test_race(void)
++{
++	reset();
++	enroll_enable();
++	assert(!mt6897_clk_boot_record_off(&owner, 1, 18));
++	mt6897_mux_disable(&mux[0].hw);
++	pthread_t a, b;
++	assert(!pthread_create(&a, NULL, racing_enable, NULL));
++	assert(!pthread_create(&b, NULL, racing_epoch, NULL));
++	pthread_join(a, NULL);
++	pthread_join(b, NULL);
++	assert(!mt6897_mux_enable(&mux[0].hw));
++	assert(!mt6897_clk_boot_record_off(&owner, 0, 18));
++	mt6897_mux_disable(&mux[0].hw);
++	assert(!(voter.vote & OVL0_BIT) && !mux[0].live);
++}
++
++int main(void)
++{
++	test_enrollment();
++	test_orders_and_resume();
++	test_prerequisites();
++	test_unvote_retry();
++	test_race();
++	cleanup();
++	puts("boot-owner enrollment, epochs, retry and 2000 concurrent "
++	     "operations passed");
++}
+diff --git a/tools/testing/selftests/mtk_clk/boot_stubs.h b/tools/testing/selftests/mtk_clk/boot_stubs.h
+new file mode 100644
+index 0000000000..90586637a8
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/boot_stubs.h
+@@ -0,0 +1,51 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#define EPROBE_DEFER 517
++#define ERR_PTR(e) ((void *)(intptr_t)(e))
++#define PTR_ERR(p) ((int)(intptr_t)(p))
++#define IS_ERR(p) ((uintptr_t)(p) >= (uintptr_t)-4095)
++#define CLK_TOP_OVL0_SEL 6
++#define CLK_TOP_OVL1_SEL 7
++#define dev_info(...) ((void)0)
++struct device_driver {
++	int id;
++};
++struct device {
++	struct device_driver *driver;
++	int refs;
++	bool bound;
++	pthread_mutex_t lock;
++};
++struct platform_device {
++	struct device dev;
++	void *data;
++};
++struct platform_driver {
++	struct device_driver driver;
++};
++struct device_node {
++	bool compatible;
++};
++static struct platform_driver clk_mt6897_top_drv;
++static struct platform_device provider;
++static bool present;
++static bool of_device_is_compatible(struct device_node *n, const char *c)
++{
++	return n->compatible;
++}
++static struct platform_device *of_find_device_by_node(struct device_node *n)
++{
++	if (!present)
++		return NULL;
++	provider.dev.refs++;
++	return &provider;
++}
++static void device_lock(struct device *d) { pthread_mutex_lock(&d->lock); }
++static void device_unlock(struct device *d) { pthread_mutex_unlock(&d->lock); }
++static void *platform_get_drvdata(struct platform_device *p) { return p->data; }
++static void put_device(struct device *d)
++{
++	assert(d->refs > 0);
++	d->refs--;
++}
++
++static bool device_is_bound(struct device *d) { return d->bound; }
+diff --git a/tools/testing/selftests/mtk_clk/mt6897_cases.c b/tools/testing/selftests/mtk_clk/mt6897_cases.c
+index acc0222a4f..4afa6a9364 100644
+--- a/tools/testing/selftests/mtk_clk/mt6897_cases.c
++++ b/tools/testing/selftests/mtk_clk/mt6897_cases.c
+@@ -5,6 +5,7 @@ static struct mt6897_ro_mux d = {.reg = 0,
+ 				 .vote_set = 0x90,
+ 				 .vote_clr = 0x94,
+ 				 .vote_done = 0x1c48};
++static struct mt6897_clk_boot_owner owner = {.lock = PTHREAD_MUTEX_INITIALIZER};
+ static u32 regs[256] = {0};
+ static int cases = 0;
+ static struct mt6897_pll pd = {
+@@ -21,8 +22,10 @@ static void test_mux_faults(void)
+ 					   .clr = d.vote_clr,
+ 					   .done_reg = d.vote_done,
+ 					   .fail = fail};
+-			struct mt6897_voted_mux m = {
+-			    .data = &d, .voter = &v, .base = regs};
++			struct mt6897_voted_mux m = {.owner = &owner,
++						     .data = &d,
++						     .voter = &v,
++						     .base = regs};
+ 			regs[0] = 128;
+ 			int ret = mt6897_mux_enable(&m.hw);
+ 			if (ret)
+@@ -52,7 +55,7 @@ static void test_mux_timeouts(void)
+ 				   .stuck = which == 0,
+ 				   .hold_pdn = which == 2};
+ 		struct mt6897_voted_mux m = {
+-		    .data = &d, .voter = &v, .base = regs};
++		    .owner = &owner, .data = &d, .voter = &v, .base = regs};
+ 		regs[0] = 128;
+ 		assert(mt6897_mux_enable(&m.hw) == -ETIMEDOUT);
+ 		assert(v.vote == 0);
+@@ -70,7 +73,8 @@ static void test_other_master(void)
+ 			   .set = d.vote_set,
+ 			   .clr = d.vote_clr,
+ 			   .done_reg = d.vote_done};
+-	struct mt6897_voted_mux m = {.data = &d, .voter = &v, .base = regs};
++	struct mt6897_voted_mux m = {
++	    .owner = &owner, .data = &d, .voter = &v, .base = regs};
+ 	assert(!mt6897_mux_enable(&m.hw));
+ 	mt6897_mux_disable(&m.hw);
+ 	assert(!v.vote && regs[0] == 0);
+@@ -168,8 +172,10 @@ static void test_owned_retry(void)
+ 			mt6897_hwv_pll_unprepare(&h.hw);
+ 			assert(!q.vote);
+ 		} else {
+-			struct mt6897_voted_mux h = {
+-			    .data = &d, .base = regs, .voter = &q};
++			struct mt6897_voted_mux h = {.owner = &owner,
++						     .data = &d,
++						     .base = regs,
++						     .voter = &q};
+ 			regs[0] = 128;
+ 			assert(mt6897_mux_enable(&h.hw) == -ETIMEDOUT);
+ 			assert(h.owned && !h.inherited && q.vote == 128);
+@@ -223,8 +229,11 @@ static void test_done_latch_and_clear_status(void)
+ 			   .done_reg = d.vote_done,
+ 			   .done_pulse = 1,
+ 			   .hold_pdn = 1};
+-	struct mt6897_voted_mux m = {
+-	    .data = &d, .voter = &v, .base = regs, .classified = true};
++	struct mt6897_voted_mux m = {.owner = &owner,
++				     .data = &d,
++				     .voter = &v,
++				     .base = regs,
++				     .classified = true};
+ 	regs[0] = 128;
+ 	changing = &regs[0];
+ 	assert(!mt6897_mux_enable(&m.hw));
+@@ -263,7 +272,7 @@ static void test_boot_unknown(void)
+ 			       .done_reg = d.vote_done,
+ 			       .stuck = 1};
+ 	struct mt6897_voted_mux boot = {
+-	    .data = &d, .voter = &stuck, .base = regs};
++	    .owner = &owner, .data = &d, .voter = &stuck, .base = regs};
+ 	regs[0] = 0;
+ 	assert(mt6897_mux_enable(&boot.hw) == -ETIMEDOUT);
+ 	assert(boot.inherited && !boot.owned && stuck.writes == 1 &&
+@@ -279,7 +288,7 @@ static void test_boot_unknown(void)
+ 				   .done_reg = d.vote_done,
+ 				   .fail = fail};
+ 		struct mt6897_voted_mux m = {
+-		    .data = &d, .voter = &v, .base = regs};
++		    .owner = &owner, .data = &d, .voter = &v, .base = regs};
+ 		regs[0] = 0;
+ 		int ret = mt6897_mux_enable(&m.hw);
+ 		if (fail == 1) {
+@@ -301,7 +310,8 @@ static void test_boot_unknown(void)
+ 			   .set = d.vote_set,
+ 			   .clr = d.vote_clr,
+ 			   .done_reg = d.vote_done};
+-	struct mt6897_voted_mux m = {.data = &d, .voter = &v, .base = regs};
++	struct mt6897_voted_mux m = {
++	    .owner = &owner, .data = &d, .voter = &v, .base = regs};
+ 	regs[0] = 128;
+ 	assert(!mt6897_mux_enable(&m.hw));
+ 	mt6897_mux_disable(&m.hw);
+diff --git a/tools/testing/selftests/mtk_clk/mt6897_stubs.h b/tools/testing/selftests/mtk_clk/mt6897_stubs.h
+index 4248780cd1..2833b3c592 100644
+--- a/tools/testing/selftests/mtk_clk/mt6897_stubs.h
++++ b/tools/testing/selftests/mtk_clk/mt6897_stubs.h
+@@ -5,6 +5,7 @@
+ #include <stdbool.h>
+ #include <stddef.h>
+ #include <stdint.h>
++#include <pthread.h>
+ #include <stdio.h>
+ #include <string.h>
+ typedef uint32_t u32;
+@@ -50,6 +51,7 @@ struct regmap {
+ 	u32 vote, done, bit, set, clr, done_reg;
+ 	int calls, fail, stuck, writes, fail_clear, sta, done_pulse, hold_pdn;
+ 	u32 *pdn;
++	u32 allowed;
+ };
+ static int regmap_read(struct regmap *m, u32 r, u32 *v)
+ {
+@@ -66,7 +68,7 @@ static int regmap_read(struct regmap *m, u32 r, u32 *v)
+ static int regmap_write(struct regmap *m, u32 r, u32 v)
+ {
+ 	assert(r == m->set || r == m->clr);
+-	assert(v == m->bit);
++	assert(m->allowed ? v && !(v & ~m->allowed) : v == m->bit);
+ 	m->writes++;
+ 	if (m->fail_clear && r == m->clr)
+ 		return -EIO;
+@@ -133,3 +135,8 @@ static u32 readl(void *p)
+ 	})
+ 
+ #define readl_poll_timeout_atomic readl_poll_timeout
++
++typedef pthread_mutex_t spinlock_t;
++#define spin_lock_init(l) pthread_mutex_init((l), NULL)
++#define spin_lock_irqsave(l,f) do {(f)=0;pthread_mutex_lock(l);} while(0)
++#define spin_unlock_irqrestore(l,f) pthread_mutex_unlock(l)
+diff --git a/tools/testing/selftests/mtk_clk/test_boot_owner.py b/tools/testing/selftests/mtk_clk/test_boot_owner.py
+new file mode 100755
+index 0000000000..6386aa9d34
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/test_boot_owner.py
+@@ -0,0 +1,36 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Exercise production boot-owner enrollment, epochs and shared-lock races."""
++from pathlib import Path
++import os
++import subprocess
++import tempfile
++
++assets = Path(__file__).resolve().parent
++repo = Path(os.environ.get('KERNEL_SRC', str(assets.parents[3])))
++s = (repo / 'drivers/clk/mediatek/clk-mt6897-topckgen.c').read_text()
++start = s.index('struct mt6897_voted_mux;')
++end = s.index('static const struct clk_ops mt6897_mux_ops', start)
++production = s[start:end]
++for name in ['mt6897_clk_boot_get', 'mt6897_clk_boot_put', 'mt6897_clk_boot_record_off']:
++    start = s.index(name + '(')
++    start = s.rfind('\n', 0, start) + 1
++    brace = s.index('{', start)
++    end, depth = brace + 1, 1
++    while depth:
++        depth += (s[end] == '{') - (s[end] == '}')
++        end += 1
++    function = s[start:end]
++    production += function + '\n'
++    if name == 'mt6897_clk_boot_record_off':
++        assert 'regmap_' not in function and 'clk_enable(' not in function
++        assert 'clk_disable(' not in function
++with tempfile.TemporaryDirectory(prefix='mtk-boot-') as temporary:
++    out = Path(temporary)
++    (out / 'test.c').write_text((assets / 'mt6897_stubs.h').read_text() +
++                              (assets / 'boot_stubs.h').read_text() + production +
++                              (assets / 'boot_cases.c').read_text())
++    subprocess.run([os.environ.get('CC', 'cc'), '-g', '-pthread',
++                    '-fsanitize=address,undefined', '-o', str(out / 'test'),
++                    str(out / 'test.c')], check=True)
++    subprocess.run([str(out / 'test')], check=True)
+diff --git a/tools/testing/selftests/mtk_clk/test_mt6897.py b/tools/testing/selftests/mtk_clk/test_mt6897.py
+index 85043d3a50..d209caadb8 100755
+--- a/tools/testing/selftests/mtk_clk/test_mt6897.py
++++ b/tools/testing/selftests/mtk_clk/test_mt6897.py
+@@ -46,6 +46,6 @@ header = (assets / 'mt6897_stubs.h').read_text()
+ main = (assets / 'mt6897_cases.c').read_text()
+ (w / 'test.c').write_text(header + body + pll + main)
+ subprocess.run(
+-    [os.environ.get('CC', 'cc'), '-fsanitize=address,undefined', '-g',
++    [os.environ.get('CC', 'cc'), '-fsanitize=address,undefined', '-pthread', '-g',
+      '-o', str(w / 'test'), str(w / 'test.c')], check=True)
+ subprocess.run([str(w / 'test')], check=True)
+-- 
+2.56.0
+

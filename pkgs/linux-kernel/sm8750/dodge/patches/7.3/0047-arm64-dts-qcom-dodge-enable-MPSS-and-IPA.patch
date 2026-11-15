@@ -1,0 +1,79 @@
+From 633635b7c6ddf713a487e0b79d392fe1899587d9 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 8 Nov 2026 10:12:30 +0800
+Subject: [PATCH 047/144] arm64: dts: qcom: dodge: enable MPSS and IPA
+
+Use the handset's split OEM MPSS, modem DTB and IPA firmware and provide
+a four MiB rmtfs shared-memory region for modem client 1. Keep the modem,
+IPA and rmtfs memory device disabled in the USB recovery role.
+
+The fixed rmtfs placement follows the community Dodge port. Existing
+MPSS, DSM, DTB and IPA reservations retain the OEM memory layout.
+
+Link: https://github.com/mrlund/linux-omarchy-mobile/blob/6cc4b65df980355e00417df3d4b7b8109e7d0d21/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0065-arm64-dts-qcom-dodge-enable-MPSS-and-IPA.patch
+Import-SHA256: 7d490aa57437feab51108a686d93715029f4904b903435997736aebc38112552
+Import-Provenance: mail headers
+(cherry picked from commit 596320ed9d000d0408e556b1b0a6fa1ae04a1d1e)
+---
+ .../qcom/sm8750-oneplus-dodge-recovery.dts    | 12 +++++++++++
+ .../boot/dts/qcom/sm8750-oneplus-dodge.dts    | 21 +++++++++++++++++++
+ 2 files changed, 33 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge-recovery.dts b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge-recovery.dts
+index cffebda861..70bb4d1ba5 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge-recovery.dts
++++ b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge-recovery.dts
+@@ -46,3 +46,15 @@ &wcd_usbss {
+ 	status = "disabled";
+ 	/delete-node/ ports;
+ };
++
++&ipa {
++	status = "disabled";
++};
++
++&remoteproc_mpss {
++	status = "disabled";
++};
++
++&rmtfs_mem {
++	status = "disabled";
++};
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+index c427646c4e..4c427f3e0c 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
++++ b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+@@ -129,6 +129,16 @@ bi_tcxo_ao_div2: bi-tcxo-ao-div2-clk {
+ 	};
+ 
+ 	reserved-memory {
++		/* Four MiB shared with MPSS, below the secure-world reservation. */
++		rmtfs_mem: rmtfs@d7c00000 {
++			compatible = "qcom,rmtfs-mem";
++			reg = <0x0 0xd7c00000 0x0 0x400000>;
++			no-map;
++
++			qcom,client-id = <1>;
++			qcom,vmid = <QCOM_SCM_VMID_MSS_MSA>;
++		};
++
+ 		cont_splash_mem: splash@fc800000 {
+ 			reg = <0x0 0xfc800000 0x0 0x2b00000>;
+ 			no-map;
+@@ -847,3 +857,14 @@ gpr {
+ &adspslpi_mem {
+ 	reg = <0x0 0x9ee00000 0x0 0x5080000>;
+ };
++
++&ipa {
++	firmware-name = "qcom/sm8750/oneplus/dodge/ipa_fws.mdt";
++	status = "okay";
++};
++
++&remoteproc_mpss {
++	firmware-name = "qcom/sm8750/oneplus/dodge/modem.mdt",
++			"qcom/sm8750/oneplus/dodge/modem_dtb.mdt";
++	status = "okay";
++};

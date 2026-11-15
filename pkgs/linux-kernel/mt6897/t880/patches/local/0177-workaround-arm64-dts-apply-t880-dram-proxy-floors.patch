@@ -1,0 +1,56 @@
+From 4b208a74cb9f519391b476999ef92da8c98ed78e Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] workaround: arm64: dts: apply T880 DRAM proxy floors
+
+Select the retained proxy bandwidth policy and multimedia vcore floors
+for the board while the complete firmware policy is unavailable.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T03:24:28+08:00
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ .../dts/mediatek/mt6897-alldocube-t880.dts    | 22 +++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880.dts b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880.dts
+index 7cfbc63a9c..ea5572d3c3 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880.dts
+@@ -847,9 +847,31 @@ dp_tx_out: endpoint {
+ 	};
+ };
+ 
++&dvfsrc {
++	status = "okay";
++};
++
++&dram_bw {
++	/*
++	 * 750 mV: the multimedia clocks run at the bootloader's 687.5 MHz
++	 * (stock mmdvfs table: 688 MHz needs 750 mV), the level BL31 INIT
++	 * holds. HRT: DSI at 1600x2560@144 (2.36 GB/s) plus a DisplayPort
++	 * stream up to 4K60 (2.38 GB/s).
++	 */
++	mediatek,vcore-floor-microvolt = <750000>;
++	mediatek,hrt-floor-kBps = <4800000>;
++	/* load % -> peak kBps; the stock DRAM gear votes (cm_mgr/helper) */
++	mediatek,load-steps = <90 40800000>, <70 26900000>,
++			      <50 19800000>, <30 13200000>, <0 0>;
++	mediatek,devfreq = <&gpu>, <&ufshci>;
++	status = "okay";
++};
++
+ &ufshci {
+ 	/* As the stock DT: MCQ without the run-time-command (RTC) path. */
+ 	mediatek,ufs-broken-rtc;
++	dvfsrc-vcore-supply = <&dvfsrc_vcore>;
++	clk-scale-up-vcore-min = <650000>;
+ 	status = "okay";
+ };
+ 
+-- 
+2.56.0
+

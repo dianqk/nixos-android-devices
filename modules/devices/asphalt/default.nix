@@ -22,6 +22,7 @@ in
     ./hardware.nix
     ./firmware.nix
     ./sensors.nix
+    ./power.nix
     ./audio
     ./recovery.nix
   ];

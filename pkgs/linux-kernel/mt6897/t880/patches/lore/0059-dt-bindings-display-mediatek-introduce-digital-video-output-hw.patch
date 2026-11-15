@@ -1,0 +1,172 @@
+From 7a22245e188fbf1f6f4c0a043b84cbe3bb3270ee Mon Sep 17 00:00:00 2001
+From: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Date: Tue, 14 Jul 2026 13:43:55 +0200
+Subject: [PATCH] dt-bindings: display: mediatek: Introduce Digital Video
+ Output HW
+
+Add documentation for the Digital Video Output (DVO) IP found in
+the newer generation SoCs MT8196, MT8189 and their variants.
+
+This is effectively a more capable block replacing the DisplayPort
+Interface (DPI/DP_INTF) one found in older SoCs.
+
+Signed-off-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Link: https://patchwork.kernel.org/project/linux-mediatek/list/?series=1127365
+[dianqk: from the Huge Restructuring v2 series, applied to v7.3-rc6; rc6 drift resolved]
+---
+ .../display/mediatek/mediatek,mt8196-dvo.yaml | 143 ++++++++++++++++++
+ 1 file changed, 143 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/display/mediatek/mediatek,mt8196-dvo.yaml
+
+diff --git a/Documentation/devicetree/bindings/display/mediatek/mediatek,mt8196-dvo.yaml b/Documentation/devicetree/bindings/display/mediatek/mediatek,mt8196-dvo.yaml
+new file mode 100644
+index 0000000000..b38960327c
+--- /dev/null
++++ b/Documentation/devicetree/bindings/display/mediatek/mediatek,mt8196-dvo.yaml
+@@ -0,0 +1,143 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/display/mediatek/mediatek,mt8196-dvo.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: MediaTek Digital Video Output (DVO) Controller
++
++maintainers:
++  - AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
++
++description:
++  The MediaTek Digital Video Output (DVO) hardware provides 120-bits (4P) data,
++  video timing and info data for the Embedded DisplayPort, hardware-abstracting
++  the previous generation Display Port Interface (DPI/DP_INTF) blocks, other
++  than providing new capabilities.
++  This hardware block supports 1/2/4 pixels per iteration in both its input and
++  output and provides 8/10-bit RGB, YUV422 and YUV444 data formats in output,
++  other than supporting input/output video window cropping and padding.
++  Digital Video Output also provides Panel Self Refresh (PSR) and Multi-SST
++  Operation (MSO) features for eDP 1.3/1.4.
++
++properties:
++  compatible:
++    enum:
++      - mediatek,mt8189-dp-dvo
++      - mediatek,mt8189-edp-dvo
++      - mediatek,mt8196-edp-dvo
++
++  reg:
++    maxItems: 1
++
++  interrupts:
++    maxItems: 1
++
++  clocks:
++    items:
++      - description: Pixel Clock
++      - description: Engine Clock
++      - description: DVO PLL
++
++  clock-names:
++    items:
++      - const: pixel
++      - const: engine
++      - const: pll
++
++  pinctrl-0: true
++  pinctrl-1: true
++
++  pinctrl-names:
++    items:
++      - const: default
++      - const: sleep
++
++  power-domains:
++    maxItems: 1
++
++  ports:
++    $ref: /schemas/graph.yaml#/properties/ports
++
++    properties:
++      port@0:
++        $ref: /schemas/graph.yaml#/properties/port
++        description: Digital Video Output's input port
++
++      port@1:
++        $ref: /schemas/graph.yaml#/properties/port
++        description: DVO output to an HDMI, LVDS or DisplayPort encoder input
++
++    required:
++      - port@0
++      - port@1
++
++  resets:
++    maxItems: 1
++
++  reset-names:
++    items:
++      - const: dvo
++
++  trigger-sources:
++    maxItems: 1
++
++required:
++  - compatible
++  - reg
++  - interrupts
++  - clocks
++  - clock-names
++  - ports
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/interrupt-controller/arm-gic.h>
++    #include <dt-bindings/clock/mediatek,mt8196-clock.h>
++    #include <dt-bindings/power/mediatek,mt8196-power.h>
++
++    dvo@324c0000 {
++        compatible = "mediatek,mt8196-edp-dvo";
++        reg = <0x324c0000 0x1000>;
++        interrupts = <GIC_SPI 461 IRQ_TYPE_LEVEL_HIGH>;
++        clocks = <&dispsys1 CLK_MM1_DISP_DVO0>,
++                 <&dispsys1 CLK_MM1_MOD6>,
++                 <&apmixedsys_gp2 CLK_APMIXED2_TVDPLL3>;
++        clock-names = "pixel", "engine", "pll";
++        power-domains = <&hpm_hwv MT8196_POWER_DOMAIN_DIS0_DORMANT>;
++        pinctrl-names = "default", "sleep";
++        pinctrl-0 = <&dvo_pins_default>;
++        pinctrl-1 = <&dvo_pin_sleep>;
++        trigger-sources = <&disp1_mutex 29>;
++
++        ports {
++            #address-cells = <1>;
++            #size-cells = <0>;
++
++            port@0 {
++                #address-cells = <1>;
++                #size-cells = <0>;
++                reg = <0>;
++
++                endpoint@0 {
++                    reg = <0>;
++                    remote-endpoint = <&directlink_output>;
++                };
++            };
++
++            port@1 {
++                #address-cells = <1>;
++                #size-cells = <0>;
++                reg = <1>;
++
++                endpoint@0 {
++                    reg = <0>;
++                    remote-endpoint = <&displayport_input>;
++                };
++            };
++        };
++    };
++
++...
+-- 
+2.56.0
+

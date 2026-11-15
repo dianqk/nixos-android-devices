@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Thu, 15 Oct 2026 08:15:39 +0800
+Subject: [PATCH 21/24] phy: mediatek: xsphy: release UTMI signals forced by
+ the bootloader
+
+On MT6897 the stock bootloader leaves the U2 port in its low-power
+state when it starts the next stage: U2PHYDTM0 has suspend, pull-downs,
+termination, transceiver select and data forced (0x02be00d4), so the
+PHY PLL is off, the frequency meter reads 0 and the host never sees the
+device pull-up although the controller sets SOFT_CONN.
+
+Clear the force bits and the UART selection when initialising a USB2
+port, as the t-phy driver does in u2_phy_instance_init().
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/phy/phy-mtk-xsphy.c | 33 +++++++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/drivers/phy/phy-mtk-xsphy.c b/drivers/phy/phy-mtk-xsphy.c
+index d3418ffb101..d3999aa54ef 100644
+--- a/drivers/phy/phy-mtk-xsphy.c
++++ b/drivers/phy/phy-mtk-xsphy.c
+@@ -75,7 +75,27 @@
+ #define P2A6_RG_BC11_SW_EN		BIT(23)
+ #define P2A6_RG_OTG_VBUSCMP_EN		BIT(20)
+ 
++#define XSP_U2PHYDTM0		((SSUSB_SIFSLV_U2PHY_COM) + 0x068)
++#define P2D_FORCE_UART_EN		BIT(26)
++#define P2D_FORCE_USB_CLKEN		BIT(25)
++#define P2D_FORCE_DATAIN		BIT(23)
++#define P2D_FORCE_DM_PULLDOWN		BIT(21)
++#define P2D_FORCE_DP_PULLDOWN		BIT(20)
++#define P2D_FORCE_XCVRSEL		BIT(19)
++#define P2D_FORCE_SUSPENDM		BIT(18)
++#define P2D_FORCE_TERMSEL		BIT(17)
++#define P2D_RG_DATAIN			GENMASK(13, 10)
++#define P2D_RG_DMPULLDOWN		BIT(7)
++#define P2D_RG_DPPULLDOWN		BIT(6)
++#define P2D_RG_XCVRSEL			GENMASK(5, 4)
++#define P2D_RG_TERMSEL			BIT(2)
++#define P2D_DTM0_FORCE_MASK		(P2D_FORCE_UART_EN | P2D_FORCE_USB_CLKEN | \
++					 P2D_FORCE_DATAIN | P2D_FORCE_DM_PULLDOWN | \
++					 P2D_FORCE_DP_PULLDOWN | P2D_FORCE_XCVRSEL | \
++					 P2D_FORCE_SUSPENDM | P2D_FORCE_TERMSEL)
++
+ #define XSP_U2PHYDTM1		((SSUSB_SIFSLV_U2PHY_COM) + 0x06C)
++#define P2D_RG_UART_EN			BIT(16)
+ #define P2D_FORCE_IDDIG			BIT(9)
+ #define P2D_RG_VBUSVALID		BIT(5)
+ #define P2D_RG_SESSEND			BIT(4)
+@@ -196,6 +216,19 @@ static void mtk_xsphy_u2_instance_init(struct mtk_xsphy *xsphy,
+ {
+ 	void __iomem *pbase = instance->port_base;
+ 
++	/*
++	 * A previous bootloader may leave the port in its low-power state:
++	 * UTMI signals forced (suspend, pull-downs, termination, data) or the
++	 * UART function selected. Return them to the controller, as the t-phy
++	 * driver does, otherwise the PLL stays off and no pull-up appears.
++	 */
++	dev_dbg(xsphy->dev, "u2 dtm0 %08x dtm1 %08x before init\n",
++		readl(pbase + XSP_U2PHYDTM0), readl(pbase + XSP_U2PHYDTM1));
++	clrbits_le32(pbase + XSP_U2PHYDTM0, P2D_DTM0_FORCE_MASK |
++		     P2D_RG_DATAIN | P2D_RG_DMPULLDOWN | P2D_RG_DPPULLDOWN |
++		     P2D_RG_XCVRSEL | P2D_RG_TERMSEL);
++	clrbits_le32(pbase + XSP_U2PHYDTM1, P2D_RG_UART_EN);
++
+ 	/* DP/DM BC1.1 path Disable */
+ 	clrbits_le32(pbase + XSP_USBPHYACR6, P2A6_RG_BC11_SW_EN);
+ 
+-- 
+2.55.0
+

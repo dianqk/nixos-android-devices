@@ -30,6 +30,6 @@ For a local text preview, run `mobile-recovery-screen --preview OUTPUT.txt`.
 and `MOBILE_RECOVERY_PREVIEW_LOG=PATH` to supply a log file. Preview mode does
 not access devices or run recovery actions.
 
-Every device uses the [Rust recovery daemon and shell](daemon.md) for all recovery
+Every device uses the Rust recovery daemon and shell for all recovery
 operations. Its UI subscribes to daemon task state, and its initrd contains no
 Python runtime or storage/install shell backend.

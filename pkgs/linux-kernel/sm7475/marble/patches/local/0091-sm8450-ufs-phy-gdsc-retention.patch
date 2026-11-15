@@ -1,0 +1,117 @@
+From f2a7027a757b9fa579fffb1cd5da12583b657c8d Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 27 Oct 2026 21:20:10 +0800
+Subject: [PATCH] clk: qcom: gcc-sm8450: keep the UFS PHY GDSC in retention
+
+Use retention rather than ALWAYS_ON so CX can collapse. Retain flip-flops and poll CFG_GDSCR for the UFS PHY GDSC.
+
+Source changes (original messages and trailers follow).
+
+Source-commit: e94bd90d85f8ca1592f327f29810b17d826468ec
+Source-author: dianqk <dianqk@dianqk.net>
+Source-date: 2026-10-27T21:20:10+08:00
+Imported-from: pkgs/linux-kernel/sm7475/marble/patches/local/0091-clk-qcom-gcc-sm8450-let-the-UFS-PHY-GDSC-power-off-a.patch
+
+clk: qcom: gcc-sm8450: let the UFS PHY GDSC power off again
+
+Drop the ALWAYS_ON flag that linux-marble c003e6341111 ("clk: qcom:
+sm8450: poll USB GDSC and keep UFS PHY GDSC enabled") set on
+UFS_PHY_GDSC; keep its USB30_PRIM_GDSC polling and retention flags.
+
+The GCC GDSCs are now parented to RPMh CX, and the SM8475 UFS OPP table
+votes CX through the UFS host's power domain (NOM for the node,
+TURBO_L1 at 850 MHz). With UFS_PHY_GDSC always on, its genpd never
+powered off, so the TURBO_L1 performance vote was never dropped and CX
+stayed at that level through s2idle: on Marble the CX and DDR sleep
+counters no longer advanced, where they did before this series.
+
+ALWAYS_ON worked around UFS bus faults across power collapse. The SM8475
+UFS series taken from Asphalt (full PHY tables, turbo configuration,
+CX levels) together with no_phy_retention (spm_lvl 5) now powers the
+UFS controller, device and PHY down in system suspend and fully
+reinitialises them on resume; s2idle with spm_lvl 5 resumed cleanly on
+Marble with that series, and 2 x 2 GiB writes and reads ran without
+errors. Asphalt (SM8475) has never set this flag.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+
+Source-commit: 98f3d7e17abac530be21f8369e6e6b31ff2bd879
+Source-author: dianqk <dianqk@dianqk.net>
+Source-date: 2026-10-27T21:50:34+08:00
+Imported-from: pkgs/linux-kernel/sm7475/marble/patches/local/0092-clk-qcom-gcc-sm8450-poll-CFG_GDSCR-and-retain-flip-f.patch
+
+clk: qcom: gcc-sm8450: poll CFG_GDSCR and retain flip-flops for the UFS PHY GDSC
+
+Since the UFS PHY GDSC is no longer always on, it is powered off in
+system suspend and switched back on by genpd in the noirq resume phase.
+On a Xiaomi Poco F5 (SM7475, SM8475 GCC) every s2idle resume then warns
+that the GDSC did not report its new state in time:
+
+  ufs_phy_gdsc status stuck at 'off'
+  WARNING: drivers/clk/qcom/gdsc.c:192 gdsc_toggle_logic
+   gdsc_enable <- genpd_sync_power_on <- genpd_resume_noirq
+  (triggered by the qcom-ice 1d88000.crypto resume)
+
+UFS works afterwards and the SoC reaches CX collapse, but the power-up
+handshake is not observed correctly. Like the USB30_PRIM_GDSC on this
+board, and like ufs_phy_gdsc in the SM8550 (955f2ea3b9e9) and SM8650
+(c58225b7e3d7) GCC drivers, poll the power status through CFG_GDSCR,
+which reports the completed power-up/down sequence, and keep the
+flip-flop state (RETAIN_FF_ENABLE) across the collapse.
+
+Neither mainline nor linux-next (next-20261026) sets flags on the SM8450
+ufs_phy_gdsc.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+
+Source-commit: ef7319fc9e834f665188ec622d48b8e22172b5d2
+Source-author: dianqk <dianqk@dianqk.net>
+Source-date: 2026-10-28T22:32:44+08:00
+Imported-from: pkgs/linux-kernel/sm7475/marble/patches/local/0093-clk-qcom-gcc-sm8450-keep-the-UFS-PHY-GDSC-in-retenti.patch
+
+clk: qcom: gcc-sm8450: keep the UFS PHY GDSC in retention instead of off
+
+Without ALWAYS_ON the UFS PHY GDSC is powered off in system suspend and
+switched back on by genpd in the noirq resume phase. On a Xiaomi Poco F5
+(SM7475, SM8475 GCC) every s2idle resume then warns:
+
+  ufs_phy_gdsc status stuck at 'off'
+  WARNING: drivers/clk/qcom/gdsc.c:192 gdsc_toggle_logic
+   gdsc_enable <- genpd_sync_power_on <- genpd_resume_noirq
+  (triggered by the qcom-ice 1d88000.crypto resume)
+
+Polling CFG_GDSCR and retaining the flip-flops did not change this.
+
+The SM8450/SM8475 UFS PHY GDSC supports retention; SM8550 and later do
+not, which is why the UFS PHY GDSC is ALWAYS_ON there. Describe it as
+PWRSTS_RET_ON: gdsc_disable() then leaves the GDSC on in hardware and it
+enters retention when its parent CX collapses, so it is never switched
+off and on by software. Unlike ALWAYS_ON, genpd still powers the domain
+off and drops its vote on the parent CX domain, so CX can still collapse
+in suspend. Keep POLL_CFG_GDSCR and RETAIN_FF_ENABLE; the latter keeps
+the flip-flop state while the GDSC is in retention.
+
+This follows the fix for "gcc_pcie_0_gdsc status stuck at 'off'" on
+QCS8300, which moves the PCIe and USB GDSCs to PWRSTS_RET_ON.
+
+Link: https://ratatoskr.run/linux-clk/2026/06/17190022/t
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/clk/qcom/gcc-sm8450.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/clk/qcom/gcc-sm8450.c b/drivers/clk/qcom/gcc-sm8450.c
+index d77ab34224..a062b3ce9a 100644
+--- a/drivers/clk/qcom/gcc-sm8450.c
++++ b/drivers/clk/qcom/gcc-sm8450.c
+@@ -3133,8 +3133,8 @@ static struct gdsc ufs_phy_gdsc = {
+ 	.pd = {
+ 		.name = "ufs_phy_gdsc",
+ 	},
+-	.pwrsts = PWRSTS_OFF_ON,
+-	.flags = ALWAYS_ON,
++	.pwrsts = PWRSTS_RET_ON,
++	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE,
+ };
+ 
+ static struct gdsc usb30_prim_gdsc = {

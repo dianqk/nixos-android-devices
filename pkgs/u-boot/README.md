@@ -1,16 +1,22 @@
-# Qualcomm device U-Boot
+# Device U-Boot
 
-The baseline is official U-Boot **v2026.10-rc5**, commit
-[`a06e89ab05eaa2b8344d521319399333cd760ae5`](https://git.u-boot-project.org/u-boot/u-boot/-/commit/a06e89ab05eaa2b8344d521319399333cd760ae5).
-`default.nix` pins its archive and hash; `devices.nix` selects the board package.
+[中文](README.zh.md)
+
+The baseline is official U-Boot **v2026.10**, commit
+[`5508406582f6f7120dce0c4b3059819a41788db2`](https://git.u-boot-project.org/u-boot/u-boot/-/commit/5508406582f6f7120dce0c4b3059819a41788db2).
+`default.nix` builds from nixpkgs' default `buildUBoot` source for that release
+and applies the local patches; `devices.nix` selects the board package.
 For configuration and installation, see the [installation guide](../../docs/u-boot-install.md).
 
 | Device | Package reference |
 | --- | --- |
-| Polaris / SDM845 | [Display and keys](../../docs/polaris/boot-menu-reference.md) |
-| Asphalt / SM8475 | [Firmware and patch sources](sm8475/README.md) |
-| Clover / SDM660 | [Firmware and patch sources](sdm660/README.md) |
-| Sheng / SM8550 | [Firmware and patch sources](sm8550/README.md) |
+| Dodge / SM8750 | `devices.dodge.boot-firmware` |
+| Polaris / SDM845 | `devices.polaris.u-boot` |
+| Asphalt / SM8475 | `devices.asphalt.u-boot` |
+| Marble / SM7475 (U-Boot only) | `devices.marble.u-boot` |
+| Clover / SDM660 | `devices.clover.u-boot` |
+| Sheng / SM8550 | `devices.sheng.u-boot` |
+| T880 / MT6897 | `devices.t880.u-boot` |
 
 ## Polaris
 

@@ -1,0 +1,545 @@
+From 523366343f0e4d42b90d7551b90ac143410d2fa3 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] memory: mediatek: describe MT6897 SMI suppliers
+
+Add MT6897 display and encoder supplier data and preserve component
+binding dependencies for runtime PM.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-16T18:55:48+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T14:39:23+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T15:50:44+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T20:11:16+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+(cherry picked from commit b4b9060cf0349730e0481692baa84bac702e308d)
+Link: https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec
+Link: https://github.com/MT6895-Mainline/linux/tree/f1c0c8245d163fece46699612b8322d11e26348d
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/memory/mtk-smi.c
+---
+ drivers/memory/mtk-smi.c                      | 314 +++++++++++++++---
+ .../selftests/mtk_vcp/test_smi_suppliers.py   |  64 ++++
+ 2 files changed, 326 insertions(+), 52 deletions(-)
+ create mode 100644 tools/testing/selftests/mtk_vcp/test_smi_suppliers.py
+
+diff --git a/drivers/memory/mtk-smi.c b/drivers/memory/mtk-smi.c
+index dfc65b2089..df4964008a 100644
+--- a/drivers/memory/mtk-smi.c
++++ b/drivers/memory/mtk-smi.c
+@@ -42,6 +42,7 @@
+ #define SLP_PROT_RDY                    BIT(16)
+ 
+ #define SMI_LARB_CMD_THRT_CON		0x24
++#define SMI_LARB_INT_CMD_THRT_CON	0x524
+ #define SMI_LARB_THRT_RD_NU_LMT_MSK	GENMASK(7, 4)
+ #define SMI_LARB_THRT_RD_NU_LMT		(5 << 4)
+ 
+@@ -123,6 +124,8 @@ static const char * const mtk_smi_common_clks[] = {"apb", "smi", "gals0", "gals1
+ struct mtk_smi_common_plat {
+ 	enum mtk_smi_type	type;
+ 	bool			has_gals;
++	bool			no_parent;
++	u8			required_clks, init_nr, suppliers;
+ 	u32			bus_sel; /* Balance some larbs to enter mmu0 or mmu1 */
+ 
+ 	const struct mtk_smi_reg_pair	*init;
+@@ -133,6 +136,8 @@ struct mtk_smi_larb_gen {
+ 	int				(*config_port)(struct device *dev);
+ 	unsigned int			larb_direct_to_common_mask;
+ 	unsigned int			flags_general;
++	bool				clockless;
++	u8				suppliers;
+ 	const u8			(*ostd)[SMI_LARB_PORT_NR_MAX];
+ };
+ 
+@@ -550,6 +555,97 @@ static const struct mtk_smi_larb_gen mtk_smi_larb_mt8192 = {
+ 	.ostd			    = mtk_smi_larb_mt8192_ostd,
+ };
+ 
++/*
++ * MT6897 display larbs, values from the vendor bandwidth-limit table
++ * (MiCode 3c4ccd07 mtk-smi.c). larb32/33 have no ID below 32: they use the
++ * free compact IDs 6 and 10 ("mediatek,larb-id").
++ */
++static const u8 mtk_smi_larb_mt6897_ostd[][SMI_LARB_PORT_NR_MAX] = {
++	[0] = {0x08, 0x30, 0x30, 0x08, 0x30, 0x30, 0x14, 0x01,},  /* larb0 */
++	[1] = {0x08, 0x30, 0x30, 0x08, 0x30, 0x30, 0x14, 0x01,},  /* larb1 */
++	[6] = {0x01, 0x05, 0x06, 0x06, 0x06, 0x0a, 0x0a,},        /* larb32 */
++	[10] = {0x02, 0x0a, 0x06, 0x06, 0x06, 0x14, 0x14,},       /* larb33 */
++	[20] = {0x08, 0x30, 0x30, 0x08, 0x30, 0x30, 0x14, 0x01,}, /* larb20 */
++	[21] = {0x08, 0x30, 0x30, 0x08, 0x30, 0x30, 0x14, 0x01,}, /* larb21 */
++};
++
++/* MT6897 vendor mtk-smi.c 3c4ccd07: decoder larbs have no local clocks.
++ * Keep their transport and PM links; do not invent display clock aliases.
++ */
++static const u8 mtk_smi_larb_mt6897_vdec_ostd[][SMI_LARB_PORT_NR_MAX] = {
++	[4] = {0x40, 0x40, 0x22, 4, 1, 1, 1, 1, 3, 3, 0xa},
++	[5] = {2, 2, 0xa, 0x40, 1, 1, 3, 0x2d, 0x17},
++};
++static int mtk_smi_larb_config_mt6897_vdec(struct device *dev)
++{
++	struct mtk_smi_larb *larb = dev_get_drvdata(dev);
++	unsigned int i, ports = larb->larbid == 4 ? 11 : 9;
++	int ret;
++
++	if (larb->larbid != 4 && larb->larbid != 5)
++		return -EINVAL;
++	writel(larb->larbid == 4 ? 0x370256 : 0x370223, larb->base + 0x24);
++	writel(0x370223, larb->base + 0x524);
++	writel(1, larb->base + 0x40);
++	writel(0xffffffff, larb->base + 0x70);
++	ret = mtk_smi_larb_config_port_gen2_general(dev);
++	if (ret)
++		return ret;
++	for (i = 0; i < ports; i++)
++		writel(readl(larb->base + SMI_LARB_NONSEC_CON(i)) | BIT(3),
++		       larb->base + SMI_LARB_NONSEC_CON(i));
++	wmb();
++	return 0;
++}
++static const struct mtk_smi_larb_gen mtk_smi_larb_mt6897_vdec = {
++	.config_port = mtk_smi_larb_config_mt6897_vdec,
++	.ostd = mtk_smi_larb_mt6897_vdec_ostd,
++	.clockless = true,
++};
++
++/* MT6897 vendor mtk-smi.c: VENC larbs 7/8 each have 32 ports and
++ * unconditional DRAM and SYSRAM fabric suppliers. No sleep handshake. */
++#define MT6897_VENC_OSTD { \
++	0x20, 4, 7, 1, 1, 0x1b, 0x1b, 7, 4, 1, 1, 8, 8, 8, 3, 8, \
++	3, 3, 5, 0xd, 0xd, 4, 2, 8, 0xb, 3, 4, 8, 5, 1, 1, 7 }
++static const u8 mtk_smi_larb_mt6897_venc_ostd[][SMI_LARB_PORT_NR_MAX] = {
++	[7] = MT6897_VENC_OSTD,
++	[8] = MT6897_VENC_OSTD,
++};
++static int mtk_smi_larb_config_mt6897_venc(struct device *dev)
++{
++	struct mtk_smi_larb *larb = dev_get_drvdata(dev);
++	unsigned int i;
++	int ret;
++	if (larb->larbid != 7 && larb->larbid != 8)
++		return -EINVAL;
++	writel(0x370223, larb->base + SMI_LARB_CMD_THRT_CON);
++	writel(larb->larbid == 7 ? 0x370256 : 0x370223,
++	       larb->base + SMI_LARB_INT_CMD_THRT_CON);
++	writel(1, larb->base + 0x40);
++	writel(0xffffffff, larb->base + 0x70);
++	ret = mtk_smi_larb_config_port_gen2_general(dev);
++	if (ret)
++		return ret;
++	for (i = 0; i < 32; i++)
++		writel(readl(larb->base + SMI_LARB_NONSEC_CON(i)) | BIT(3),
++		       larb->base + SMI_LARB_NONSEC_CON(i));
++	wmb();
++	return 0;
++}
++static const struct mtk_smi_larb_gen mtk_smi_larb_mt6897_venc = {
++	.config_port = mtk_smi_larb_config_mt6897_venc,
++	.ostd = mtk_smi_larb_mt6897_venc_ostd,
++	.suppliers = 2,
++};
++
++static const struct mtk_smi_larb_gen mtk_smi_larb_mt6897 = {
++	.config_port                = mtk_smi_larb_config_port_gen2_general,
++	.flags_general	            = MTK_SMI_FLAG_THRT_UPDATE | MTK_SMI_FLAG_SW_FLAG |
++				      MTK_SMI_FLAG_SLEEP_CTL,
++	.ostd		            = mtk_smi_larb_mt6897_ostd,
++};
++
+ static const struct mtk_smi_larb_gen mtk_smi_larb_mt8195 = {
+ 	.config_port                = mtk_smi_larb_config_port_gen2_general,
+ 	.flags_general	            = MTK_SMI_FLAG_THRT_UPDATE | MTK_SMI_FLAG_SW_FLAG |
+@@ -558,11 +654,14 @@ static const struct mtk_smi_larb_gen mtk_smi_larb_mt8195 = {
+ };
+ 
+ static const struct of_device_id mtk_smi_larb_of_ids[] = {
++	{.compatible = "mediatek,mt6897-smi-vdec-larb", .data = &mtk_smi_larb_mt6897_vdec},
++	{.compatible = "mediatek,mt6897-smi-venc-larb", .data = &mtk_smi_larb_mt6897_venc},
+ 	{.compatible = "mediatek,mt2701-smi-larb", .data = &mtk_smi_larb_mt2701},
+ 	{.compatible = "mediatek,mt2712-smi-larb", .data = &mtk_smi_larb_mt2712},
+ 	{.compatible = "mediatek,mt6779-smi-larb", .data = &mtk_smi_larb_mt6779},
+ 	{.compatible = "mediatek,mt6795-smi-larb", .data = &mtk_smi_larb_mt8173},
+ 	{.compatible = "mediatek,mt6893-smi-larb", .data = &mtk_smi_larb_mt6893},
++	{.compatible = "mediatek,mt6897-smi-larb", .data = &mtk_smi_larb_mt6897},
+ 	{.compatible = "mediatek,mt8167-smi-larb", .data = &mtk_smi_larb_mt8167},
+ 	{.compatible = "mediatek,mt8173-smi-larb", .data = &mtk_smi_larb_mt8173},
+ 	{.compatible = "mediatek,mt8183-smi-larb", .data = &mtk_smi_larb_mt8183},
+@@ -594,42 +693,86 @@ static void mtk_smi_larb_sleep_ctrl_disable(struct mtk_smi_larb *larb)
+ 	writel_relaxed(0, larb->base + SMI_LARB_SLP_CON);
+ }
+ 
+-static int mtk_smi_device_link_common(struct device *dev, struct device **com_dev)
+-{
+-	struct platform_device *smi_com_pdev;
+-	struct device_node *smi_com_node;
+-	struct device *smi_com_dev;
++struct mtk_smi_supplier {
++	struct device *dev;
+ 	struct device_link *link;
++};
++static void mtk_smi_supplier_release(void *data)
++{
++	struct mtk_smi_supplier *supplier = data;
++	device_link_del(supplier->link);
++	put_device(supplier->dev);
++}
+ 
+-	smi_com_node = of_parse_phandle(dev->of_node, "mediatek,smi", 0);
+-	if (!smi_com_node)
+-		return -EINVAL;
++static int mtk_smi_device_link_common(struct device *dev, struct device **com_dev,
++				      unsigned int maximum)
++{
++	struct device_node *nodes[2] = {};
++	void *group;
++	int count, i, ret = 0;
+ 
+-	smi_com_pdev = of_find_device_by_node(smi_com_node);
+-	of_node_put(smi_com_node);
+-	if (!smi_com_pdev) {
+-		dev_err(dev, "Failed to get the smi_common device\n");
++	*com_dev = NULL;
++	count = of_count_phandle_with_args(dev->of_node, "mediatek,smi", NULL);
++	if (count < 1 || count > maximum || count > ARRAY_SIZE(nodes))
+ 		return -EINVAL;
++	for (i = 0; i < count; i++) {
++		nodes[i] = of_parse_phandle(dev->of_node, "mediatek,smi", i);
++		if (!nodes[i] || nodes[i] == dev->of_node ||
++		    (i && nodes[i] == nodes[0])) {
++			ret = -EINVAL;
++			goto put_nodes;
++		}
+ 	}
+-
+-	/* smi common is the supplier, Make sure it is ready before */
+-	if (!platform_get_drvdata(smi_com_pdev)) {
+-		put_device(&smi_com_pdev->dev);
+-		return -EPROBE_DEFER;
++	group = devres_open_group(dev, NULL, GFP_KERNEL);
++	if (!group) {
++		ret = -ENOMEM;
++		goto put_nodes;
+ 	}
++	for (i = 0; i < count; i++) {
++		struct platform_device *pdev = of_find_device_by_node(nodes[i]);
++		struct mtk_smi_supplier *supplier;
+ 
+-	smi_com_dev = &smi_com_pdev->dev;
+-	link = device_link_add(dev, smi_com_dev,
+-			       DL_FLAG_PM_RUNTIME | DL_FLAG_STATELESS);
+-	if (!link) {
+-		dev_err(dev, "Unable to link smi-common dev\n");
+-		put_device(&smi_com_pdev->dev);
+-		return -ENODEV;
++		if (!pdev) {
++			ret = -EPROBE_DEFER;
++			goto release;
++		}
++		if (!platform_get_drvdata(pdev)) {
++			put_device(&pdev->dev);
++			ret = -EPROBE_DEFER;
++			goto release;
++		}
++		supplier = devm_kzalloc(dev, sizeof(*supplier), GFP_KERNEL);
++		if (!supplier) {
++			put_device(&pdev->dev);
++			ret = -ENOMEM;
++			goto release;
++		}
++		supplier->dev = &pdev->dev;
++		supplier->link = device_link_add(dev, supplier->dev,
++				DL_FLAG_PM_RUNTIME | DL_FLAG_STATELESS);
++		if (!supplier->link) {
++			put_device(supplier->dev);
++			ret = -ENODEV;
++			goto release;
++		}
++		ret = devm_add_action_or_reset(dev, mtk_smi_supplier_release, supplier);
++		if (ret)
++			goto release;
++		/* Keep the primary identity used by existing register queries.
++		 * The managed supplier action owns its reference and link. */
++		if (!i)
++			*com_dev = supplier->dev;
+ 	}
+-
+-	*com_dev = smi_com_dev;
+-
+-	return 0;
++	devres_close_group(dev, group);
++	devres_remove_group(dev, group);
++	goto put_nodes;
++release:
++	devres_release_group(dev, group);
++	*com_dev = NULL;
++put_nodes:
++	for (i = 0; i < ARRAY_SIZE(nodes); i++)
++		of_node_put(nodes[i]);
++	return ret;
+ }
+ 
+ static int mtk_smi_dts_clk_init(struct device *dev, struct mtk_smi *smi,
+@@ -668,14 +811,17 @@ static int mtk_smi_larb_probe(struct platform_device *pdev)
+ 	if (IS_ERR(larb->base))
+ 		return PTR_ERR(larb->base);
+ 
+-	ret = mtk_smi_dts_clk_init(dev, &larb->smi, mtk_smi_larb_clks,
+-				   MTK_SMI_LARB_REQ_CLK_NR, MTK_SMI_LARB_OPT_CLK_NR);
+-	if (ret)
+-		return ret;
++	if (!larb->larb_gen->clockless) {
++		ret = mtk_smi_dts_clk_init(dev, &larb->smi, mtk_smi_larb_clks,
++					   MTK_SMI_LARB_REQ_CLK_NR, MTK_SMI_LARB_OPT_CLK_NR);
++		if (ret)
++			return ret;
++	}
+ 
+ 	larb->smi.dev = dev;
+ 
+-	ret = mtk_smi_device_link_common(dev, &larb->smi_common_dev);
++	ret = mtk_smi_device_link_common(dev, &larb->smi_common_dev,
++					     larb->larb_gen->suppliers ?: 1);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -688,19 +834,13 @@ static int mtk_smi_larb_probe(struct platform_device *pdev)
+ 
+ err_pm_disable:
+ 	pm_runtime_disable(dev);
+-	device_link_remove(dev, larb->smi_common_dev);
+-	put_device(larb->smi_common_dev);
+ 	return ret;
+ }
+ 
+ static void mtk_smi_larb_remove(struct platform_device *pdev)
+ {
+-	struct mtk_smi_larb *larb = platform_get_drvdata(pdev);
+-
+-	device_link_remove(&pdev->dev, larb->smi_common_dev);
+-	pm_runtime_disable(&pdev->dev);
+ 	component_del(&pdev->dev, &mtk_smi_larb_component_ops);
+-	put_device(larb->smi_common_dev);
++	pm_runtime_disable(&pdev->dev);
+ }
+ 
+ static int __maybe_unused mtk_smi_larb_resume(struct device *dev)
+@@ -840,6 +980,70 @@ static const struct mtk_smi_common_plat mtk_smi_common_mt8192 = {
+ 		    F_MMU1_LARB(6),
+ };
+ 
++/* MT6897 bus selection values from the vendor driver (MiCode 3c4ccd07) */
++static const struct mtk_smi_common_plat mtk_smi_common_mt6897_disp = {
++	.type     = MTK_SMI_GEN2,
++	.has_gals = true,
++	.bus_sel  = 0x4444,
++	.init     = mtk_smi_common_mt8195_init,
++};
++
++static const struct mtk_smi_common_plat mtk_smi_common_mt6897_mdp = {
++	.type     = MTK_SMI_GEN2,
++	.has_gals = true,
++	.bus_sel  = 0x5104,
++	.init     = mtk_smi_common_mt8195_init,
++};
++
++/* MT6897 vendor common IDs 8/9: preserve their supplier topology and
++ * all four clocks. Unlike a full common these blocks have no BUS_SEL write.
++ * MiCode MTK_kernel_device_modules 3c4ccd07, mtk_smi_common_mt6897_misc.
++ */
++#define MT6897_VCP_SUB_INIT(mask) \
++	{0x104, 0}, {0x108, 0}, {0x10c, 0}, {0x110, 0}, \
++	{0x114, 0}, {0x118, 0}, {0x11c, 0}, {0x120, 0}, \
++	{SMI_L1LEN, 0xa}, {0x244, mask}, {SMI_DUMMY, 1}
++static const struct mtk_smi_reg_pair mt6897_mmsram_init[] = {
++	MT6897_VCP_SUB_INIT(0x2105),
++};
++static const struct mtk_smi_reg_pair mt6897_mdp_sub_init[] = {
++	MT6897_VCP_SUB_INIT(0x2146),
++};
++/* Vendor common ID 2, supplied by MMSRAM subcommons 7 and 8. */
++static const struct mtk_smi_reg_pair mt6897_sysram_init[] = {
++	{0x104, 0}, {0x108, 0}, {0x10c, 0}, {0x110, 0},
++	{0x114, 0}, {0x118, 0}, {0x11c, 0}, {0x120, 0},
++	{SMI_L1LEN, 2}, {SMI_DCM, 0x4f1}, {SMI_DUMMY, 1},
++};
++static const struct mtk_smi_common_plat mtk_smi_sysram_mt6897 = {
++	.type = MTK_SMI_GEN2,
++	.has_gals = true,
++	.suppliers = 2,
++	.bus_sel = 0x4101,
++	.init = mt6897_sysram_init,
++	.init_nr = ARRAY_SIZE(mt6897_sysram_init),
++};
++static const struct mtk_smi_common_plat mtk_smi_mmsram_mt6897 = {
++	.type = MTK_SMI_GEN2_SUB_COMM,
++	.has_gals = true,
++	.no_parent = true,
++	.required_clks = 4,
++	.init = mt6897_mmsram_init,
++	.init_nr = ARRAY_SIZE(mt6897_mmsram_init),
++};
++static const struct mtk_smi_common_plat mtk_smi_mdp_sub_mt6897 = {
++	.type = MTK_SMI_GEN2_SUB_COMM,
++	.has_gals = true,
++	.required_clks = 4,
++	.init = mt6897_mdp_sub_init,
++	.init_nr = ARRAY_SIZE(mt6897_mdp_sub_init),
++};
++
++static const struct mtk_smi_common_plat mtk_smi_sub_common_mt6897 = {
++	.type     = MTK_SMI_GEN2_SUB_COMM,
++	.has_gals = true,
++};
++
+ static const struct mtk_smi_common_plat mtk_smi_common_mt8195_vdo = {
+ 	.type     = MTK_SMI_GEN2,
+ 	.has_gals = true,
+@@ -866,6 +1070,12 @@ static const struct mtk_smi_common_plat mtk_smi_common_mt8365 = {
+ };
+ 
+ static const struct of_device_id mtk_smi_common_of_ids[] = {
++	{.compatible = "mediatek,mt6897-smi-common-disp", .data = &mtk_smi_common_mt6897_disp},
++	{.compatible = "mediatek,mt6897-smi-common-mdp", .data = &mtk_smi_common_mt6897_mdp},
++	{.compatible = "mediatek,mt6897-smi-common-sysram", .data = &mtk_smi_sysram_mt6897},
++	{.compatible = "mediatek,mt6897-smi-mmsram-sub-common", .data = &mtk_smi_mmsram_mt6897},
++	{.compatible = "mediatek,mt6897-smi-mdp-sub-common", .data = &mtk_smi_mdp_sub_mt6897},
++	{.compatible = "mediatek,mt6897-smi-sub-common", .data = &mtk_smi_sub_common_mt6897},
+ 	{.compatible = "mediatek,mt2701-smi-common", .data = &mtk_smi_common_gen1},
+ 	{.compatible = "mediatek,mt2712-smi-common", .data = &mtk_smi_common_gen2},
+ 	{.compatible = "mediatek,mt6779-smi-common", .data = &mtk_smi_common_mt6779},
+@@ -904,6 +1114,8 @@ static int mtk_smi_common_probe(struct platform_device *pdev)
+ 		else if (common->plat->type == MTK_SMI_GEN2_SUB_COMM)
+ 			clk_required = MTK_SMI_SUB_COM_GALS_REQ_CLK_NR;
+ 	}
++	if (common->plat->required_clks)
++		clk_required = common->plat->required_clks;
+ 	ret = mtk_smi_dts_clk_init(dev, common, mtk_smi_common_clks, clk_required, 0);
+ 	if (ret)
+ 		return ret;
+@@ -929,8 +1141,10 @@ static int mtk_smi_common_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	/* link its smi-common if this is smi-sub-common */
+-	if (common->plat->type == MTK_SMI_GEN2_SUB_COMM) {
+-		ret = mtk_smi_device_link_common(dev, &common->smi_common_dev);
++	if (!common->plat->no_parent &&
++	    (common->plat->type == MTK_SMI_GEN2_SUB_COMM || common->plat->suppliers)) {
++		ret = mtk_smi_device_link_common(dev, &common->smi_common_dev,
++					     common->plat->suppliers ?: 1);
+ 		if (ret < 0)
+ 			return ret;
+ 	}
+@@ -942,12 +1156,7 @@ static int mtk_smi_common_probe(struct platform_device *pdev)
+ 
+ static void mtk_smi_common_remove(struct platform_device *pdev)
+ {
+-	struct mtk_smi *common = dev_get_drvdata(&pdev->dev);
+-
+-	if (common->plat->type == MTK_SMI_GEN2_SUB_COMM)
+-		device_link_remove(&pdev->dev, common->smi_common_dev);
+ 	pm_runtime_disable(&pdev->dev);
+-	put_device(common->smi_common_dev);
+ }
+ 
+ static int __maybe_unused mtk_smi_common_resume(struct device *dev)
+@@ -961,13 +1170,14 @@ static int __maybe_unused mtk_smi_common_resume(struct device *dev)
+ 	if (ret)
+ 		return ret;
+ 
+-	if (common->plat->type != MTK_SMI_GEN2)
+-		return 0;
+-
+-	for (i = 0; i < SMI_COMMON_INIT_REGS_NR && init && init[i].offset; i++)
++	for (i = 0; i < (common->plat->init_nr ?: SMI_COMMON_INIT_REGS_NR) &&
++	     init && init[i].offset; i++)
+ 		writel_relaxed(init[i].value, common->base + init[i].offset);
+ 
+-	writel(bus_sel, common->base + SMI_BUS_SEL);
++	if (common->plat->type == MTK_SMI_GEN2)
++		writel(bus_sel, common->base + SMI_BUS_SEL);
++	/* Complete subcommon initialization before clients may submit DMA. */
++	wmb();
+ 	return 0;
+ }
+ 
+diff --git a/tools/testing/selftests/mtk_vcp/test_smi_suppliers.py b/tools/testing/selftests/mtk_vcp/test_smi_suppliers.py
+new file mode 100644
+index 0000000000..571613bc53
+--- /dev/null
++++ b/tools/testing/selftests/mtk_vcp/test_smi_suppliers.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Exercise the actual SMI supplier helper with resource API mocks."""
++from pathlib import Path
++import os
++import subprocess
++import tempfile
++repo=Path(__file__).resolve().parents[4]
++work=tempfile.TemporaryDirectory(prefix='mtk-smi-suppliers-')
++root=Path(work.name)
++s=(repo/'drivers/memory/mtk-smi.c').read_text();actual=s[s.index('struct mtk_smi_supplier {'):s.index('static int mtk_smi_dts_clk_init')]
++mock=r'''
++#include <assert.h>
++#include <stdlib.h>
++#include <errno.h>
++#include <stddef.h>
++#include <stdbool.h>
++#include <string.h>
++#define ARRAY_SIZE(x) (sizeof(x)/sizeof((x)[0]))
++#define GFP_KERNEL 0
++#define EPROBE_DEFER 517
++#define DL_FLAG_PM_RUNTIME 1
++#define DL_FLAG_STATELESS 2
++struct device_node {int id;};
++struct device {struct device_node *of_node;int refs;};
++struct platform_device {struct device dev;int bound;};
++struct device_link {bool alive;};
++static struct device_node nodes[3];static struct platform_device pdev[2];static struct device consumer;
++static bool duplicate;static int count,missing=-1,unbound=-1,fail_link=-1,fail_action=-1,link_calls,action_calls,links,puts,actions;
++static struct device_link link[2];static void *allocations[8];static unsigned allocated;
++static struct {void (*fn)(void*);void *arg;} action[2];
++static int of_count_phandle_with_args(struct device_node *n,const char *p,void *a){return count;}
++static struct device_node *of_parse_phandle(struct device_node *n,const char *p,int i){return &nodes[duplicate?0:i];}
++static void of_node_put(struct device_node *n){}
++static struct platform_device *of_find_device_by_node(struct device_node *n){if(n->id==missing)return NULL;pdev[n->id].dev.refs++;return &pdev[n->id];}
++static void *platform_get_drvdata(struct platform_device *p){return p->dev.of_node->id==unbound?NULL:p;}
++static void put_device(struct device *d){assert(d->refs>0);d->refs--;puts++;}
++static void *devres_open_group(struct device *d,void *id,int flags){return (void*)1;}
++static void *devm_kzalloc(struct device *d,size_t n,int flags){void *p=calloc(1,n);allocations[allocated++]=p;return p;}
++static struct device_link *device_link_add(struct device *a,struct device *b,unsigned f){int i=link_calls++;if(i==fail_link)return NULL;link[i].alive=true;links++;return &link[i];}
++static void device_link_del(struct device_link *l){assert(l->alive);l->alive=false;links--;}
++static int devm_add_action_or_reset(struct device *d,void (*fn)(void*),void *arg){int i=action_calls++;if(i==fail_action){fn(arg);return -ENOMEM;}action[actions++]=(typeof(action[0])){fn,arg};return 0;}
++static void devres_release_group(struct device *d,void *g){while(actions){actions--;action[actions].fn(action[actions].arg);}}
++static void devres_close_group(struct device *d,void *g){}
++static void devres_remove_group(struct device *d,void *g){}
++'''
++test=r'''
++static void reset(void){assert(!links);for(unsigned i=0;i<allocated;i++)free(allocations[i]);allocated=0;duplicate=false;count=1;missing=unbound=fail_link=fail_action=-1;link_calls=action_calls=puts=actions=0;memset(pdev,0,sizeof(pdev));for(int i=0;i<3;i++)nodes[i].id=i;for(int i=0;i<2;i++)pdev[i].dev.of_node=&nodes[i];consumer.of_node=&nodes[2];}
++static void balanced(void){assert(!links&&!pdev[0].dev.refs&&!pdev[1].dev.refs);}
++int main(void){struct device *primary=NULL;reset();assert(!mtk_smi_device_link_common(&consumer,&primary,1));assert(primary==&pdev[0].dev&&links==1);devres_release_group(&consumer,(void*)1);balanced();assert(puts==1);
++ reset();count=2;assert(!mtk_smi_device_link_common(&consumer,&primary,2));assert(primary==&pdev[0].dev&&links==2);devres_release_group(&consumer,(void*)1);balanced();assert(puts==2);
++ reset();count=2;missing=1;assert(mtk_smi_device_link_common(&consumer,&primary,2)==-EPROBE_DEFER);assert(!primary);balanced();assert(puts==1);
++ reset();count=2;unbound=1;assert(mtk_smi_device_link_common(&consumer,&primary,2)==-EPROBE_DEFER);balanced();assert(puts==2);
++ reset();count=2;fail_action=1;assert(mtk_smi_device_link_common(&consumer,&primary,2)==-ENOMEM);assert(!primary);balanced();assert(puts==2);
++ reset();count=2;fail_link=1;assert(mtk_smi_device_link_common(&consumer,&primary,2)==-ENODEV);balanced();assert(puts==2);
++ reset();count=2;assert(mtk_smi_device_link_common(&consumer,&primary,1)==-EINVAL);balanced();
++ reset();count=3;assert(mtk_smi_device_link_common(&consumer,&primary,2)==-EINVAL);balanced();
++ reset();count=2;duplicate=true;assert(mtk_smi_device_link_common(&consumer,&primary,2)==-EINVAL);balanced();
++ reset();consumer.of_node=&nodes[0];assert(mtk_smi_device_link_common(&consumer,&primary,2)==-EINVAL);balanced();reset();return 0;}
++'''
++p=root/'smi-supplier-test.c';p.write_text(mock+actual+test)
++subprocess.run([os.environ.get('CC','cc'),'-std=gnu11','-Wall','-Werror','-Wno-sign-compare','-fsanitize=address,undefined','-O1',str(p),'-o',str(root/'smi-supplier-test')],check=True)
++subprocess.run([str(root/'smi-supplier-test')],check=True)
++print('PASS actual SMI supplier helper: single/dual, defer/unbound/link/action failure, exact cleanup, count/self guards')
+-- 
+2.56.0
+

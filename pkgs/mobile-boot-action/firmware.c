@@ -16,7 +16,7 @@ static struct udevice *pon_pmic;
 static const efi_guid_t protocol_guid = MOBILE_BOOT_ACTION_GUID;
 static struct mobile_boot_action_protocol protocol;
 
-#ifdef CONFIG_EFI_MOBILE_BOOT_ACTION_QCOM_AB
+#if defined(CONFIG_EFI_MOBILE_BOOT_ACTION_QCOM_AB) || defined(CONFIG_EFI_MOBILE_BOOT_ACTION_QCOM_REASON)
 static int check_reason_backend(void)
 {
 	struct uclass *pmics;
@@ -62,7 +62,7 @@ static int check_backend(void)
 	struct udevice *psci;
 	u32 version;
 	int ret;
-#ifndef CONFIG_EFI_MOBILE_BOOT_ACTION_QCOM_AB
+#if !defined(CONFIG_EFI_MOBILE_BOOT_ACTION_QCOM_AB) && !defined(CONFIG_EFI_MOBILE_BOOT_ACTION_QCOM_REASON)
 	struct udevice *dev;
 	struct uclass *pmics;
 	ofnode node;
@@ -70,7 +70,7 @@ static int check_backend(void)
 	int matches = 0;
 #endif
 
-#ifdef CONFIG_EFI_MOBILE_BOOT_ACTION_QCOM_AB
+#if defined(CONFIG_EFI_MOBILE_BOOT_ACTION_QCOM_AB) || defined(CONFIG_EFI_MOBILE_BOOT_ACTION_QCOM_REASON)
 	ret = check_reason_backend();
 	if (ret)
 		return ret;
@@ -121,7 +121,7 @@ static int check_backend(void)
 
 static int pon_read(void *context, unsigned char *value)
 {
-	#ifdef CONFIG_EFI_MOBILE_BOOT_ACTION_QCOM_AB
+	#if defined(CONFIG_EFI_MOBILE_BOOT_ACTION_QCOM_AB) || defined(CONFIG_EFI_MOBILE_BOOT_ACTION_QCOM_REASON)
 	return pmic_read(context, 0x7148, value, 1);
 #else
 	return pmic_read(context, 0x88f, value, 1);
@@ -130,7 +130,7 @@ static int pon_read(void *context, unsigned char *value)
 
 static int pon_write(void *context, unsigned char value)
 {
-	#ifdef CONFIG_EFI_MOBILE_BOOT_ACTION_QCOM_AB
+	#if defined(CONFIG_EFI_MOBILE_BOOT_ACTION_QCOM_AB) || defined(CONFIG_EFI_MOBILE_BOOT_ACTION_QCOM_REASON)
 	return pmic_write(context, 0x7148, &value, 1);
 #else
 	return pmic_write(context, 0x88f, &value, 1);

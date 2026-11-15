@@ -1,0 +1,150 @@
+From 014ca9adb2d5a4733022eface3eca1840fe6ca6d Mon Sep 17 00:00:00 2001
+From: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Date: Tue, 14 Jul 2026 13:43:52 +0200
+Subject: [PATCH] drm/mediatek: mtk_dpi: Pass parameters with new mtk_dpi_sync
+ structure
+
+In preparation for moving common code between DPI and DVO into a
+new mtk_dpi_common library, add a new mtk_dpi_sync structure which
+contains all of the sync parameters, such as HSYNC and Left/Right
+Odd and Even VSYNC.
+
+This is now passed as parameter of mtk_dpi_set_display_mode() and
+stack initialized in mtk_dpi_bridge_enable(): future preparation
+changes will add abstraction for hardware specific configuration
+which purpose will be to interpret the generic parameters to write
+those to the hardware specific registers.
+
+This brings no functional change.
+
+Signed-off-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Link: https://patchwork.kernel.org/project/linux-mediatek/list/?series=1127365
+[dianqk: from the Huge Restructuring v2 series, applied to v7.3-rc6; rc6 drift resolved]
+---
+ drivers/gpu/drm/mediatek/mtk_dpi.c | 76 +++++++++++++++---------------
+ 1 file changed, 39 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_dpi.c b/drivers/gpu/drm/mediatek/mtk_dpi.c
+index 0e4f430de9..2022a283e0 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dpi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dpi.c
+@@ -112,6 +112,14 @@ struct mtk_dpi_sync_param {
+ 	bool shift_half_line;
+ };
+ 
++struct mtk_dpi_sync {
++	struct mtk_dpi_sync_param hsync;
++	struct mtk_dpi_sync_param vsync_l_odd;
++	struct mtk_dpi_sync_param vsync_l_even;
++	struct mtk_dpi_sync_param vsync_r_odd;
++	struct mtk_dpi_sync_param vsync_r_even;
++};
++
+ struct mtk_dpi_yc_limit {
+ 	u16 y_top;
+ 	u16 y_bottom;
+@@ -600,14 +608,10 @@ static void mtk_dpi_set_pixel_clk(struct mtk_dpi *dpi, struct videomode *vm, int
+ }
+ 
+ static int mtk_dpi_set_display_mode(struct mtk_dpi *dpi,
++				    struct mtk_dpi_sync *sync,
+ 				    struct drm_display_mode *mode)
+ {
+ 	struct mtk_dpi_polarities dpi_pol;
+-	struct mtk_dpi_sync_param hsync;
+-	struct mtk_dpi_sync_param vsync_lodd = { 0 };
+-	struct mtk_dpi_sync_param vsync_leven = { 0 };
+-	struct mtk_dpi_sync_param vsync_rodd = { 0 };
+-	struct mtk_dpi_sync_param vsync_reven = { 0 };
+ 	struct videomode vm = { 0 };
+ 
+ 	drm_display_mode_to_videomode(mode, &vm);
+@@ -624,42 +628,39 @@ static int mtk_dpi_set_display_mode(struct mtk_dpi *dpi,
+ 
+ 	/*
+ 	 * Depending on the IP version, we may output a different amount of
+-	 * pixels for each iteration: divide the clock by this number and
+-	 * adjust the display porches accordingly.
++	 * pixels for each iteration: adjust the display porches accordingly.
+ 	 */
+-	hsync.sync_width = vm.hsync_len / dpi->conf->pixels_per_iter;
+-	hsync.back_porch = vm.hback_porch / dpi->conf->pixels_per_iter;
+-	hsync.front_porch = vm.hfront_porch / dpi->conf->pixels_per_iter;
+-
+-	hsync.shift_half_line = false;
+-	vsync_lodd.sync_width = vm.vsync_len;
+-	vsync_lodd.back_porch = vm.vback_porch;
+-	vsync_lodd.front_porch = vm.vfront_porch;
+-	vsync_lodd.shift_half_line = false;
+-
+-	if (vm.flags & DISPLAY_FLAGS_INTERLACED &&
+-	    mode->flags & DRM_MODE_FLAG_3D_MASK) {
+-		vsync_leven = vsync_lodd;
+-		vsync_rodd = vsync_lodd;
+-		vsync_reven = vsync_lodd;
+-		vsync_leven.shift_half_line = true;
+-		vsync_reven.shift_half_line = true;
+-	} else if (vm.flags & DISPLAY_FLAGS_INTERLACED &&
+-		   !(mode->flags & DRM_MODE_FLAG_3D_MASK)) {
+-		vsync_leven = vsync_lodd;
+-		vsync_leven.shift_half_line = true;
+-	} else if (!(vm.flags & DISPLAY_FLAGS_INTERLACED) &&
+-		   mode->flags & DRM_MODE_FLAG_3D_MASK) {
+-		vsync_rodd = vsync_lodd;
++	sync->hsync.sync_width = vm.hsync_len / dpi->conf->pixels_per_iter;
++	sync->hsync.back_porch = vm.hback_porch / dpi->conf->pixels_per_iter;
++	sync->hsync.front_porch = vm.hfront_porch / dpi->conf->pixels_per_iter;
++	sync->hsync.shift_half_line = false;
++
++	sync->vsync_l_odd.sync_width = vm.vsync_len;
++	sync->vsync_l_odd.back_porch = vm.vback_porch;
++	sync->vsync_l_odd.front_porch = vm.vfront_porch;
++	sync->vsync_l_odd.shift_half_line = false;
++
++	if (vm.flags & DISPLAY_FLAGS_INTERLACED) {
++		sync->vsync_l_even = sync->vsync_l_odd;
++		sync->vsync_l_even.shift_half_line = true;
++
++		if (mode->flags & DRM_MODE_FLAG_3D_MASK) {
++			sync->vsync_r_odd = sync->vsync_l_odd;
++			sync->vsync_r_even = sync->vsync_l_odd;
++			sync->vsync_r_even.shift_half_line = true;
++		}
++	} else if (mode->flags & DRM_MODE_FLAG_3D_MASK) {
++		sync->vsync_r_odd = sync->vsync_l_odd;
+ 	}
++
+ 	mtk_dpi_sw_reset(dpi, true);
+ 	mtk_dpi_config_pol(dpi, &dpi_pol);
+ 
+-	mtk_dpi_config_hsync(dpi, &hsync);
+-	mtk_dpi_config_vsync_lodd(dpi, &vsync_lodd);
+-	mtk_dpi_config_vsync_rodd(dpi, &vsync_rodd);
+-	mtk_dpi_config_vsync_leven(dpi, &vsync_leven);
+-	mtk_dpi_config_vsync_reven(dpi, &vsync_reven);
++	mtk_dpi_config_hsync(dpi, &sync->hsync);
++	mtk_dpi_config_vsync_lodd(dpi, &sync->vsync_l_odd);
++	mtk_dpi_config_vsync_rodd(dpi, &sync->vsync_r_odd);
++	mtk_dpi_config_vsync_leven(dpi, &sync->vsync_l_even);
++	mtk_dpi_config_vsync_reven(dpi, &sync->vsync_r_even);
+ 
+ 	mtk_dpi_config_3d(dpi, !!(mode->flags & DRM_MODE_FLAG_3D_MASK));
+ 	mtk_dpi_config_interface(dpi, !!(vm.flags &
+@@ -865,12 +866,13 @@ static void mtk_dpi_bridge_enable(struct drm_bridge *bridge,
+ 				  struct drm_atomic_commit *commit)
+ {
+ 	struct mtk_dpi *dpi = bridge_to_dpi(bridge);
++	struct mtk_dpi_sync sync = { 0 };
+ 
+ 	if (dpi->pinctrl && dpi->pins_dpi)
+ 		pinctrl_select_state(dpi->pinctrl, dpi->pins_dpi);
+ 
+ 	mtk_dpi_power_on(dpi);
+-	mtk_dpi_set_display_mode(dpi, &dpi->mode);
++	mtk_dpi_set_display_mode(dpi, &sync, &dpi->mode);
+ 	mtk_dpi_enable(dpi);
+ }
+ 
+-- 
+2.56.0
+

@@ -86,7 +86,7 @@ def split(name, group, result):
     result[name] = fields
 
 
-def generate(source, output, platform, soc_id, version, layout="group"):
+def generate(source, output, platform, soc_id, version, layout="group", config_input=False):
     if layout not in ("group", "file-group"):
         raise ValueError(f"unsupported registry layout: {layout}")
     output.mkdir(parents=True, exist_ok=False)
@@ -120,9 +120,12 @@ def generate(source, output, platform, soc_id, version, layout="group"):
     flattened = {}
     for name, group in groups.items():
         split(name, group, flattened)
+    (configs / "json.lst").write_text("\n".join(selected) + "\n")
     if layout == "group":
         for name, fields in sorted(flattened.items()):
             (registry / name).write_text(dumps({name: fields}))
+        if config_input:
+            (registry.parent / "parsed_file_list.csv").write_text("\n".join(sorted(flattened)) + "\n")
     else:
         parsed = []
         for filename, entries in file_groups.items():
@@ -131,7 +134,6 @@ def generate(source, output, platform, soc_id, version, layout="group"):
                 (registry / target).write_text(dumps({name: fields}))
                 parsed.append(target)
         (registry.parent / "parsed_file_list.csv").write_text("\n".join(parsed) + "\n")
-        (configs / "json.lst").write_text("\n".join(selected) + "\n")
     sensors = output / "etc/sensors"
     selectors = {"hw_platform": platform, "soc_id": soc_id}
     lines = [f"version={version}"]
@@ -139,7 +141,10 @@ def generate(source, output, platform, soc_id, version, layout="group"):
         (sensors / name).write_text(value + "\n")
         lines.append(f"file={name}=/vendor/etc/sensors/{name}")
     lines.append("file=output=/mnt/vendor/persist/sensors/registry/registry")
-    if layout == "file-group":
+    if config_input:
+        (configs / "json_list").write_text("\n".join(selected) + "\n")
+        lines.append("file=config=/vendor/etc/sensors/config")
+    if layout == "file-group" or config_input:
         lines.append("file=input=json.lst")
     # Android property callbacks require a Bionic-only bridge. These optional
     # properties are absent in the observed registry and are not configured.
@@ -160,5 +165,6 @@ if __name__ == "__main__":
     parser.add_argument("--soc-id", required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--layout", choices=("group", "file-group"), default="group")
+    parser.add_argument("--config-input", action="store_true")
     args = parser.parse_args()
-    generate(args.source, args.output, args.platform, args.soc_id, args.version, args.layout)
+    generate(args.source, args.output, args.platform, args.soc_id, args.version, args.layout, args.config_input)

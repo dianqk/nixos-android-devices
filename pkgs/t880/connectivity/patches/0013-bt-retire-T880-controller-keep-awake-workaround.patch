@@ -1,0 +1,70 @@
+From: Dian QK <dianqk@dianqk.net>
+Date: Tue, 10 Nov 2026 23:18:00 +0800
+Subject: [PATCH] bt: remove the T880 controller keep-awake workaround
+
+Use the normal firmware/driver ownership transitions and physical HCI close
+path. The unused PCIe PHY consumer now permits the shared clock request to
+be released without holding the Bluetooth controller awake.
+
+Remove the module parameter and its sleep/close bypasses. Keep the standard
+HCI management power initialization, address setup and SMP registration.
+
+Signed-off-by: Dian QK <dianqk@dianqk.net>
+---
+--- a/connectivity/bt/mt66xx/btif/btmtk_btif_main.c
++++ b/connectivity/bt/mt66xx/btif/btmtk_btif_main.c
+@@ -1796,22 +1796,10 @@
+ 	return btmtk_intcmd_wmt_calibration(bdev->hdev);
+ }
+ #if SUPPORT_BEIF
+-/*
+- * T880 (experimental): keep the BGF powered and in driver own. The BGF does
+- * not come back from firmware-own sleep, nor from a power off while conninfra
+- * stays up, on this port yet.
+- */
+-bool t880_no_sleep;
+-module_param(t880_no_sleep, bool, 0444);
+-MODULE_PARM_DESC(t880_no_sleep, "keep Bluetooth powered and awake (experimental workaround)");
+-
+ static void btmtk_set_normal_sleep(struct work_struct *work)
+ {
+ 	struct btmtk_btif_dev *cif_dev = (struct btmtk_btif_dev *)g_sbdev->cif_dev;
+-	if (t880_no_sleep) {
+-		BTMTK_INFO("T880: firmware-own sleep disabled");
+-		return;
+-	}
++
+ 	if (cif_dev->bt_state != FUNC_OFF) {
+ 		cif_dev->psm.force_on = FALSE;
+ 		btmtk_set_sleep(g_sbdev->hdev, FALSE);
+--- a/connectivity/bt/mt66xx/btmtk_main.c
++++ b/connectivity/bt/mt66xx/btmtk_main.c
+@@ -15,7 +15,6 @@
+ #include "btmtk_main.h"
+ #include "btmtk_fw_log.h"
+ 
+-extern bool t880_no_sleep; /* btif/btmtk_btif_main.c */
+ #include "btmtk_chip_if.h"
+ 
+ #define MTKBT_UNSLEEPABLE_LOCK(x, y)	spin_lock_irqsave(x, y)
+@@ -3354,11 +3353,7 @@
+ 	/* Flush RX works */
+ 	flush_work(&bdev->rx_work);
+ 
+-	/* T880: with t880_no_sleep the BGF stays powered across HCI close. */
+-	if (!t880_no_sleep)
+-		main_info.hif_hook.close(hdev);
+-	else
+-		BTMTK_INFO("%s: T880 keeps the BGF powered", __func__);
++	main_info.hif_hook.close(hdev);
+ 
+ unlock:
+ 	btmtk_fops_set_state(bdev, BTMTK_FOPS_STATE_CLOSED);
+@@ -3577,7 +3572,6 @@
+ 		/*
+ 		 * T880: program the nvdata address before the core reads it,
+ 		 * keeping the core management power transition and SMP registration.
+-		 * t880_no_sleep keeps the physical BGF powered in bt_close.
+ 		 */
+ 		if (btmtk_t880_get_bdaddr(&addr)) {
+ 			ret = btmtk_t880_set_bdaddr(hdev, &addr);

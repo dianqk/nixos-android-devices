@@ -1,0 +1,84 @@
+From: Android Devices contributors
+Subject: [PATCH] efi: publish checked selection context; require Dodge helper dispatch
+
+Selection integrity is not transaction authority. Default off for other boards.
+
+--- a/lib/efi_loader/Kconfig
++++ b/lib/efi_loader/Kconfig
+@@ -730,3 +730,17 @@
+ source "lib/efi/Kconfig"
+ 
+ endmenu
++
++config EFI_BOOT_CHOICE_CONTEXT
++	bool "Checked boot-choice context configuration table"
++	depends on EFI_LOADER
++	default n
++	help
++	  Publish a strict slot-bound intent, not storage write authority.
++
++config EFI_MOBILE_BOOT_ACTION_QCOM_REASON
++	bool "Qualcomm SDAM reboot reason only (no slot metadata writes)"
++	depends on EFI_MOBILE_BOOT_ACTION && !EFI_MOBILE_BOOT_ACTION_QCOM_AB
++	default n
++	help
++	  Keep OEM recovery/bootloader reset reasons without Android slot switching.
+--- a/lib/efi_loader/Makefile
++++ b/lib/efi_loader/Makefile
+@@ -106,3 +106,5 @@
+ 
+ always-y += $(foreach f,$(apps-y),$(f).efi)
+ targets += $(foreach f,$(apps-y),$(f).o)
++
++obj-$(CONFIG_EFI_BOOT_CHOICE_CONTEXT) += efi_boot_choice_context.o boot_choice_wire.o
+--- a/lib/efi_loader/efi_setup.c
++++ b/lib/efi_loader/efi_setup.c
+@@ -8,6 +8,7 @@
+ #define LOG_CATEGORY LOGC_EFI
+ 
+ #include <efi_loader.h>
++#include <boot-choice-context.h>
+ #include <efi_variable.h>
+ #include <log.h>
+ #include <asm-generic/unaligned.h>
+@@ -388,6 +389,12 @@
+ 			goto out;
+ 	}
+ 
++	if (IS_ENABLED(CONFIG_EFI_BOOT_CHOICE_CONTEXT)) {
++		ret = efi_boot_choice_context_register();
++		if (ret != EFI_SUCCESS)
++			goto out;
++	}
++
+ 	/* Execute capsules after reboot */
+ 	if (IS_ENABLED(CONFIG_EFI_CAPSULE_ON_DISK) &&
+ 	    !IS_ENABLED(CONFIG_EFI_CAPSULE_ON_DISK_EARLY))
+--- a/arch/arm/mach-snapdragon/dodge.c
++++ b/arch/arm/mach-snapdragon/dodge.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0+
+ /* ABL runtime memory contract for the OnePlus 13 embedded control tree. */
+ #include <asm/sections.h>
++#include <boot-choice-context.h>
+ 
+ #define DODGE_MAX_RESERVED 128
+ #define DODGE_FDT_BYTES SZ_64K
+@@ -117,7 +118,7 @@
+ 
+ 	dodge_initrd.start = 0;
+ 	dodge_initrd.end = 0;
+-	if (!external || fdt_check_header(external) ||
++	if (!external || fdt_check_full(external, 1536 * 1024) ||
+ 	    (fdt_node_check_compatible(external, 0, "qcom,sun") &&
+ 	     fdt_node_check_compatible(external, 0, "qcom,sm8750")))
+ 		panic("Dodge: SM8750 ABL FDT required\n");
+@@ -274,5 +275,8 @@
+ 	dst = fdt_path_offset(dodge_fdt, "/memory");
+ 	if (!nbanks || fdt_setprop(dodge_fdt, dst, "reg", banks, nbanks * 16))
+ 		panic("Dodge: memory import failed\n");
++	if (IS_ENABLED(CONFIG_EFI_BOOT_CHOICE_CONTEXT) &&
++	    mobile_boot_choice_copy(external, dodge_fdt, sizeof(dodge_fdt)))
++		panic("Dodge: missing or invalid boot-choice context; maintenance required\n");
+ 	return dodge_fdt;
+ }

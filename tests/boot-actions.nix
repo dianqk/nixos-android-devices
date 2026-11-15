@@ -14,6 +14,8 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
             "aurora-firmware"
             "aurora-firmware-zstd"
             "aurora-touch"
+            "dodge-firmware"
+            "dodge-firmware-zstd"
           ];
         inherit device buildSystem;
         modules = [
@@ -36,7 +38,7 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
         hook = c.boot.loader.systemd-boot.extraInstallCommands;
         initial =
           if c.androidDevices.recovery.enable then "" else c.system.build.mobileBootFiles.buildCommand;
-        firmwareConfig = c.androidDevices.boot.firmwarePackage.firmware.extraConfig;
+        firmwareConfig = (c.androidDevices.boot.firmwarePackage.firmware or c.androidDevices.boot.firmwarePackage).extraConfig;
       };
     valid =
       s:
@@ -94,6 +96,29 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
         profile = "pon";
         chargerConfirmationPath = "/EFI/android-devices/charger.efi";
       };
+      assert lib.all
+        (
+          names:
+          rejected {
+            profile = "qcom-ab";
+            nonSlotPartitionNames = names;
+          }
+        )
+        [
+          "last_parti"
+          [ 1 ]
+          [ "boot_a" ]
+          [ "misc" ]
+          [ "bad name" ]
+          [ "bad\"name" ]
+        ];
+      assert rejected {
+        profile = "pon";
+        nonSlotPartitionNames = [ "last_parti" ];
+      };
+      assert lib.hasInfix ''NON_SLOT_NAMES=""'' (profile {
+        profile = "qcom-ab";
+      });
       assert rejected {
         profile = "qcom-ab";
         chargerConfirmationPath = "bad\"value";
@@ -111,6 +136,19 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
         profile = "qcom-ab";
         confirmationNonGptLunMask = 192;
       };
+    dodge =
+      let
+        s = valid (make "dodge" [ ]);
+        c = s.config;
+        firmware = (c.androidDevices.boot.firmwarePackage.firmware or c.androidDevices.boot.firmwarePackage).extraConfig;
+      in
+      assert c.androidDevices.boot.actions.android;
+      assert !c.androidDevices.boot.actions.recovery;
+      assert builtins.attrNames c.boot.loader.systemd-boot.extraEntries == [ "android-system.conf" ];
+      assert lib.hasInfix "options android" c.boot.loader.systemd-boot.extraEntries."android-system.conf";
+      assert lib.hasInfix "CONFIG_EFI_MOBILE_BOOT_ACTION_QCOM_REASON=y" firmware;
+      assert lib.hasInfix "# CONFIG_EFI_MOBILE_BOOT_ACTION_QCOM_AB is not set" firmware;
+      inspect s;
     devices = lib.genAttrs [ "polaris" "clover" "asphalt" "sheng" "aurora" ] (
       device:
       let

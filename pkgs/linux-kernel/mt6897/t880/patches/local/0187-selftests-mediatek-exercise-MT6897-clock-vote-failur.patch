@@ -1,0 +1,473 @@
+From ff040b06cacf7edeaf2d4c47e7dbcc29b98bfa7f Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 20:37:00 +0800
+Subject: [PATCH] selftests: mediatek: exercise MT6897 clock vote failures and
+ rates
+
+---
+ tools/testing/selftests/mtk_clk/Makefile      |   4 +
+ .../testing/selftests/mtk_clk/mt6897_cases.c  | 251 ++++++++++++++++++
+ .../testing/selftests/mtk_clk/mt6897_stubs.h  | 129 +++++++++
+ .../testing/selftests/mtk_clk/test_mt6897.py  |  45 ++++
+ 4 files changed, 429 insertions(+)
+ create mode 100644 tools/testing/selftests/mtk_clk/Makefile
+ create mode 100644 tools/testing/selftests/mtk_clk/mt6897_cases.c
+ create mode 100644 tools/testing/selftests/mtk_clk/mt6897_stubs.h
+ create mode 100755 tools/testing/selftests/mtk_clk/test_mt6897.py
+
+diff --git a/tools/testing/selftests/mtk_clk/Makefile b/tools/testing/selftests/mtk_clk/Makefile
+new file mode 100644
+index 0000000000..7e28089190
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/Makefile
+@@ -0,0 +1,4 @@
++# SPDX-License-Identifier: GPL-2.0-only
++TEST_PROGS := test_mt6897.py
++TEST_FILES := mt6897_stubs.h mt6897_cases.c
++include ../lib.mk
+diff --git a/tools/testing/selftests/mtk_clk/mt6897_cases.c b/tools/testing/selftests/mtk_clk/mt6897_cases.c
+new file mode 100644
+index 0000000000..c2d058e8c6
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/mt6897_cases.c
+@@ -0,0 +1,251 @@
++// SPDX-License-Identifier: GPL-2.0-only
++static struct mt6897_ro_mux d = {.reg = 0,
++				 .shift = 0,
++				 .width = 4,
++				 .vote_set = 0x90,
++				 .vote_clr = 0x94,
++				 .vote_done = 0x1c48};
++static u32 regs[256] = {0};
++static int cases = 0;
++static struct mt6897_pll pd = {
++    .con0 = 0, .pd_reg = 4, .pcw_reg = 8, .pcw_bits = 32};
++static void test_mux_faults(void)
++{
++	for (int inherited = 0; inherited < 2; inherited++)
++		for (int fail = 0; fail < 18; fail++) {
++			struct regmap v = {.vote = inherited ? 128 : 0,
++					   .done = 128,
++					   .bit = 128,
++					   .set = d.vote_set,
++					   .clr = d.vote_clr,
++					   .done_reg = d.vote_done,
++					   .fail = fail};
++			struct mt6897_voted_mux m = {
++			    .data = &d, .voter = &v, .base = regs};
++			int ret = mt6897_mux_prepare(&m.hw);
++			if (ret)
++				assert(ret == -EIO);
++			else
++				mt6897_mux_unprepare(&m.hw);
++			if (inherited)
++				assert(v.vote == 128);
++			else if (v.vote) {
++				v.fail = 0;
++				mt6897_mux_unprepare(&m.hw);
++				assert(v.vote == 0);
++			}
++			cases++;
++		}
++}
++
++static void test_mux_timeouts(void)
++{
++	for (int which = 0; which < 3; which++) {
++		struct regmap v = {.done = which == 1 ? 0 : 128,
++				   .bit = 128,
++				   .set = d.vote_set,
++				   .clr = d.vote_clr,
++				   .done_reg = d.vote_done,
++				   .stuck = which == 0};
++		struct mt6897_voted_mux m = {
++		    .data = &d, .voter = &v, .base = regs};
++		regs[0] = which == 2 ? 128 : 0;
++		assert(mt6897_mux_prepare(&m.hw) == -ETIMEDOUT);
++		assert(v.vote == 0);
++		cases++;
++	}
++}
++
++static void test_other_master(void)
++{
++	regs[0] = 0;
++	/* Other master's globally enabled clock never obstructs AP unvote. */
++	struct regmap v = {.done = 128,
++			   .bit = 128,
++			   .set = d.vote_set,
++			   .clr = d.vote_clr,
++			   .done_reg = d.vote_done};
++	struct mt6897_voted_mux m = {.data = &d, .voter = &v, .base = regs};
++	assert(!mt6897_mux_prepare(&m.hw));
++	mt6897_mux_unprepare(&m.hw);
++	assert(!v.vote && regs[0] == 0);
++	cases++;
++}
++
++static void test_live_rates(void)
++{
++	struct mt6897_hwv_pll p = {.pll = &pd, .base = regs};
++	regs[0] = 0;
++	regs[1] = 2U << 24;
++	regs[2] = 0xffffffff;
++	assert(mt6897_hwv_pll_recalc_rate(&p.hw, 0) == 1663999999UL);
++	cases++;
++	regs[2] = 0x80000000;
++	assert(mt6897_hwv_pll_recalc_rate(&p.hw, 0) == 832000000);
++	cases++;
++	pd.pcw_bits = 22;
++	regs[2] = 0xff123456;
++	u64 expected = 26000000ULL * (regs[2] & 0x3fffff) / (1 << 14) / 4;
++	assert(mt6897_hwv_pll_recalc_rate(&p.hw, 0) == expected);
++	cases++;
++	/* CON1 PCW/divider must come from a single sample under firmware
++	 * writes. */
++	pd.pd_reg = pd.pcw_reg = 8;
++	regs[2] = (2U << 24) | 0x123456;
++	changing = &regs[2];
++	changes = 0;
++	expected = 26000000ULL * 0x123456 / (1 << 14) / 4;
++	assert(mt6897_hwv_pll_recalc_rate(&p.hw, 0) == expected &&
++	       changes == 1);
++	changing = NULL;
++	cases++;
++	pd.con0 = 0;
++	pd.pd_reg = 4;
++	pd.pcw_reg = 8;
++}
++
++static void test_pll_faults(void)
++{
++	for (int inherited = 0; inherited < 2; inherited++)
++		for (int fail = 0; fail < 24; fail++) {
++			struct regmap q = {.vote = inherited ? 8 : 0,
++					   .done = 8,
++					   .bit = 8,
++					   .set = HWV_PLL_SET,
++					   .clr = HWV_PLL_CLR,
++					   .done_reg = HWV_PLL_DONE,
++					   .fail = fail};
++			struct mt6897_hwv_pll h = {
++			    .pll = &pd, .base = regs, .hwv = &q, .bit = 8};
++			regs[0] = 1;
++			int ret = mt6897_hwv_pll_prepare(&h.hw);
++			if (ret)
++				assert(ret == -EIO);
++			else
++				mt6897_hwv_pll_unprepare(&h.hw);
++			if (inherited)
++				assert(q.vote == 8);
++			else if (q.vote) {
++				q.fail = 0;
++				mt6897_hwv_pll_unprepare(&h.hw);
++				assert(!q.vote);
++			}
++			cases++;
++		}
++}
++
++static void test_owned_retry(void)
++{
++	/* A failed own rollback remains owned on the next prepare. */
++	for (int pll = 0; pll < 2; pll++) {
++		struct regmap q = {.done = pll ? 8 : 0,
++				   .bit = pll ? 8 : 128,
++				   .set = pll ? HWV_PLL_SET : d.vote_set,
++				   .clr = pll ? HWV_PLL_CLR : d.vote_clr,
++				   .done_reg = pll ? HWV_PLL_DONE : d.vote_done,
++				   .fail_clear = 1};
++		if (pll) {
++			regs[0] = 0;
++			struct mt6897_hwv_pll h = {
++			    .pll = &pd, .base = regs, .hwv = &q, .bit = 8};
++			assert(mt6897_hwv_pll_prepare(&h.hw) == -ETIMEDOUT);
++			assert(h.owned && !h.inherited && q.vote == 8);
++			q.fail_clear = 0;
++			q.done = 8;
++			regs[0] = 1;
++			assert(!mt6897_hwv_pll_prepare(&h.hw));
++			mt6897_hwv_pll_unprepare(&h.hw);
++			assert(!q.vote);
++		} else {
++			struct mt6897_voted_mux h = {
++			    .data = &d, .base = regs, .voter = &q};
++			regs[0] = 0;
++			assert(mt6897_mux_prepare(&h.hw) == -ETIMEDOUT);
++			assert(h.owned && !h.inherited && q.vote == 128);
++			q.fail_clear = 0;
++			q.done = 128;
++			assert(!mt6897_mux_prepare(&h.hw));
++			mt6897_mux_unprepare(&h.hw);
++			assert(!q.vote);
++		}
++		cases++;
++	}
++}
++
++static void test_pll_timeouts(void)
++{
++	for (int mode = 0; mode < 5; mode++) {
++		struct regmap q = {.done = mode == 0 ? 0 : 8,
++				   .bit = 8,
++				   .set = HWV_PLL_SET,
++				   .clr = HWV_PLL_CLR,
++				   .done_reg = HWV_PLL_DONE,
++				   .stuck = mode == 1,
++				   .sta = mode == 4 ? 8 : 0};
++		struct mt6897_hwv_pll h = {
++		    .pll = &pd, .base = regs, .hwv = &q, .bit = 8};
++		regs[0] = mode == 2 ? 0 : 1;
++		if (mode < 3 || mode == 4) {
++			assert(mt6897_hwv_pll_prepare(&h.hw) == -ETIMEDOUT);
++			assert(!q.vote);
++		} else {
++			assert(!mt6897_hwv_pll_prepare(&h.hw));
++			q.fail_clear = 1;
++			mt6897_hwv_pll_unprepare(&h.hw);
++			assert(h.owned && q.vote);
++			q.fail_clear = 0;
++			mt6897_hwv_pll_unprepare(&h.hw);
++			assert(!q.vote && !h.owned);
++		}
++		cases++;
++	}
++}
++
++static void test_done_latch_and_clear_status(void)
++{
++	struct regmap v = {.done = 128,
++			   .bit = 128,
++			   .set = d.vote_set,
++			   .clr = d.vote_clr,
++			   .done_reg = d.vote_done,
++			   .done_pulse = 1};
++	struct mt6897_voted_mux m = {.data = &d, .voter = &v, .base = regs};
++	regs[0] = 128;
++	changing = &regs[0];
++	assert(!mt6897_mux_prepare(&m.hw));
++	changing = NULL;
++	assert(!v.done && m.owned);
++	v.done = 128;
++	mt6897_mux_unprepare(&m.hw);
++	assert(!v.vote);
++	cases++;
++	struct regmap q = {.done = 8,
++			   .bit = 8,
++			   .set = HWV_PLL_SET,
++			   .clr = HWV_PLL_CLR,
++			   .done_reg = HWV_PLL_DONE};
++	struct mt6897_hwv_pll h = {
++	    .pll = &pd, .base = regs, .hwv = &q, .bit = 8};
++	regs[0] = 1;
++	assert(!mt6897_hwv_pll_prepare(&h.hw));
++	q.sta = 8;
++	mt6897_hwv_pll_unprepare(&h.hw);
++	assert(!q.vote && h.owned);
++	q.sta = 0;
++	mt6897_hwv_pll_unprepare(&h.hw);
++	assert(!h.owned);
++	cases++;
++}
++
++int main(void)
++{
++	test_done_latch_and_clear_status();
++	test_mux_faults();
++	test_mux_timeouts();
++	test_other_master();
++	test_live_rates();
++	test_pll_faults();
++	test_owned_retry();
++	test_pll_timeouts();
++	printf("%d production-function scenarios passed\n", cases);
++}
+diff --git a/tools/testing/selftests/mtk_clk/mt6897_stubs.h b/tools/testing/selftests/mtk_clk/mt6897_stubs.h
+new file mode 100644
+index 0000000000..f224d06b6c
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/mt6897_stubs.h
+@@ -0,0 +1,129 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include <assert.h>
++#include <errno.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++typedef uint32_t u32;
++typedef uint8_t u8;
++typedef uint64_t u64;
++#define __iomem
++#define BIT(x) (1U << (x))
++#define GENMASK(h, l) ((uint32_t)((~0ULL << (l)) & (~0ULL >> (63 - (h)))))
++#define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
++#define pr_err(...) ((void)0)
++#define udelay(x) ((void)0)
++#define div_u64(a, b) ((a) / (b))
++#define MT6897_PLL_EN 1
++#define MT6897_PLL_FIN 26000000ULL
++#define MT6897_PCW_INT_BITS 8
++#define MT6897_POSTDIV_MASK GENMASK(26, 24)
++#define MT6897_POSTDIV_SHIFT 24
++#define HWV_PLL_SET 0x190
++#define HWV_PLL_CLR 0x194
++#define HWV_PLL_DONE 0x140c
++#define HWV_PLL_SET_STA 0x1464
++#define HWV_PLL_CLR_STA 0x1468
++struct clk_hw {
++	int x;
++};
++const char *clk_hw_get_name(struct clk_hw *h) { return "test"; }
++struct mt6897_ro_mux {
++	int id;
++	const char *name;
++	const char *const *parents;
++	u8 num_parents;
++	u32 reg;
++	u8 shift, width;
++	uint16_t vote_set, vote_clr, vote_done;
++};
++struct mt6897_pll {
++	int id;
++	const char *name;
++	uint16_t con0, pd_reg, pcw_reg;
++	u8 pcw_bits;
++};
++struct regmap {
++	u32 vote, done, bit, set, clr, done_reg;
++	int calls, fail, stuck, writes, fail_clear, sta, done_pulse;
++};
++static int regmap_read(struct regmap *m, u32 r, u32 *v)
++{
++	if (++m->calls == m->fail)
++		return -EIO;
++	*v = r == m->set				      ? m->vote
++	     : r == m->done_reg				      ? m->done
++	     : (r == HWV_PLL_SET_STA || r == HWV_PLL_CLR_STA) ? m->sta
++							      : 0;
++	if (r == m->done_reg && m->done_pulse)
++		m->done = 0;
++	return 0;
++}
++static int regmap_write(struct regmap *m, u32 r, u32 v)
++{
++	assert(r == m->set || r == m->clr);
++	assert(v == m->bit);
++	m->writes++;
++	if (m->fail_clear && r == m->clr)
++		return -EIO;
++	if (++m->calls == m->fail)
++		return -EIO;
++	if (!m->stuck) {
++		if (r == m->set)
++			m->vote |= v;
++		else
++			m->vote &= ~v;
++	}
++	return 0;
++}
++static void *changing;
++static int changes;
++static u32 readl(void *p)
++{
++	u32 v = *(u32 *)p;
++	if (p == changing) {
++		changes++;
++		*(u32 *)p = 0;
++	}
++	return v;
++}
++#define regmap_read_poll_timeout(m, r, v, c, d, t)                             \
++	({                                                                     \
++		int _r = 0, _i;                                                \
++		for (_i = 0; _i < 3; _i++) {                                   \
++			_r = regmap_read(m, r, &v);                            \
++			if (_r || (c))                                         \
++				break;                                         \
++		}                                                              \
++		if (!_r && _i == 3)                                            \
++			_r = -ETIMEDOUT;                                       \
++		_r;                                                            \
++	})
++#define regmap_read_poll_timeout_atomic regmap_read_poll_timeout
++#define readl_poll_timeout(p, v, c, d, t)                                      \
++	({                                                                     \
++		int _r = 0, _i;                                                \
++		for (_i = 0; _i < 3; _i++) {                                   \
++			v = readl(p);                                          \
++			if (c)                                                 \
++				break;                                         \
++		}                                                              \
++		if (_i == 3)                                                   \
++			_r = -ETIMEDOUT;                                       \
++		_r;                                                            \
++	})
++#define read_poll_timeout_atomic(fn, v, c, d, t, s, ...)                       \
++	({                                                                     \
++		int _r = 0, _i;                                                \
++		for (_i = 0; _i < 3; _i++) {                                   \
++			v = fn(__VA_ARGS__);                                   \
++			if (c)                                                 \
++				break;                                         \
++		}                                                              \
++		if (_i == 3)                                                   \
++			_r = -ETIMEDOUT;                                       \
++		_r;                                                            \
++	})
+diff --git a/tools/testing/selftests/mtk_clk/test_mt6897.py b/tools/testing/selftests/mtk_clk/test_mt6897.py
+new file mode 100755
+index 0000000000..734d1feded
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/test_mt6897.py
+@@ -0,0 +1,45 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Run production MT6897 vote/rate functions with fault-injected registers."""
++from pathlib import Path
++import os
++import re
++import subprocess
++import tempfile
++assets = Path(__file__).resolve().parent
++work = tempfile.TemporaryDirectory(prefix='mtk-clk-')
++w = Path(work.name)
++r = Path(os.environ.get('KERNEL_SRC', str(assets.parents[3]))) / 'drivers/clk/mediatek'
++s = (r / 'clk-mt6897-topckgen.c').read_text()
++a = s.index('struct mt6897_voted_mux')
++b = s.index('static const struct clk_ops mt6897_mux_ops', a)
++body = s[a:b]
++expected = {
++    'DISP0': (1, 0, 4, 18), 'DISP1': (1, 8, 4, 18),
++    'OVL0': (1, 16, 4, 18), 'OVL1': (1, 24, 4, 18),
++    'MMINFRA': (2, 16, 4, 19), 'DISP_PWM': (7, 8, 3, 20),
++    'I2C': (8, 0, 2, 21), 'VENC': (12, 24, 4, 22),
++}
++for name, fields in expected.items():
++    match = re.search(
++        r'HWV_MUX\(CLK_TOP_' + name +
++        r'_SEL, "[^"]+", (\w+), CLK_CFG_(\d+), (\d+), (\d+), (\d+)\)', s)
++    assert match and tuple(map(int, match.groups()[1:])) == fields
++    parents = re.search(
++        r'static const char \* const ' + match[1] + r'\[\] = \{(.*?)\};',
++        s, re.S)[1]
++    assert 'tvdpll' not in parents
++assert len(re.findall('\\n\\s*HWV_MUX\\(CLK_TOP_', s)) == 8
++assert len(re.findall('\\n\\s*RO_MUX\\(CLK_TOP_', s)) == 4
++assert '.set_parent' not in body and 'writel(' not in body
++p = (r / 'clk-mt6897-apmixedsys.c').read_text()
++a = p.index('struct mt6897_hwv_pll')
++b = p.index('static void mt6897_hwv_pll_calc', a)
++pll = p[a:b]
++header = (assets / 'mt6897_stubs.h').read_text()
++main = (assets / 'mt6897_cases.c').read_text()
++(w / 'test.c').write_text(header + body + pll + main)
++subprocess.run(
++    [os.environ.get('CC', 'cc'), '-fsanitize=address,undefined', '-g',
++     '-o', str(w / 'test'), str(w / 'test.c')], check=True)
++subprocess.run([str(w / 'test')], check=True)
+-- 
+2.56.0
+

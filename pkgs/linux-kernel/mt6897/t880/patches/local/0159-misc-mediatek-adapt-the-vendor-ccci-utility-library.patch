@@ -1,0 +1,422 @@
+From 3b700c4720c751d96bf10cb4022635fa2c6187c3 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] misc: mediatek: adapt the vendor CCCI utility library
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adapt boot information, reserved memory and broadcast interfaces to
+MT6897, including the borrowed no-map handling correction.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T07:19:48+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T07:23:45+08:00
+Link: https://github.com/MiCode/MTK_kernel_device_modules (commit 3c4ccd07d5624879555ec710c11bb8818e5cb5c6, drivers/misc/mediatek/ccci_util, drivers/misc/mediatek/include/mt-plat/mtk_ccci_common.h)
+Source commit: 3c4ccd07d562 "Kernel: Xiaomi kernel_device_modules changes for
+Redmi K70E Android U" by 何发云 <hefayun@xiaomi.com>, 2024-01-12.
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/misc/mediatek/ccci_util/Kconfig       | 47 +++--------
+ drivers/misc/mediatek/ccci_util/Makefile      | 81 +++++--------------
+ .../mediatek/ccci_util/ccci_util_broadcast.c  |  6 +-
+ .../misc/mediatek/ccci_util/ccci_util_decls.h | 45 +++++++++++
+ .../misc/mediatek/ccci_util/ccci_util_dummy.c |  2 +-
+ .../mediatek/ccci_util/ccci_util_lib_fo.c     | 35 +-------
+ .../mediatek/ccci_util/ccci_util_lib_main.c   |  3 +-
+ .../mediatek/ccci_util/ccci_util_lib_main.h   |  2 +-
+ .../ccci_util/ccci_util_lib_reserved_mem.c    | 12 +++
+ .../mediatek/ccci_util/ccci_util_lib_sys.h    |  2 +-
+ .../ccci_util/ccci_util_pin_broadcast.c       |  2 +-
+ 11 files changed, 102 insertions(+), 135 deletions(-)
+ create mode 100644 drivers/misc/mediatek/ccci_util/ccci_util_decls.h
+
+diff --git a/drivers/misc/mediatek/ccci_util/Kconfig b/drivers/misc/mediatek/ccci_util/Kconfig
+index 9805aff6d0..05843da3b7 100644
+--- a/drivers/misc/mediatek/ccci_util/Kconfig
++++ b/drivers/misc/mediatek/ccci_util/Kconfig
+@@ -1,38 +1,13 @@
+-menuconfig MTK_CCCI_DEVICES
+-	bool "CCCI Devices"
++# SPDX-License-Identifier: GPL-2.0-only
++config MTK_CCCI_UTIL
++	tristate "MediaTek CCCI utility library"
++	depends on OF && ARM64
+ 	help
+-	  Cross Core Communication Interface:
+-	  Say Y here to enable CCCI basic
+-	  support. If you say N,
+-	  all CCCI related code
+-	  (including dummy API) will be disable.
+-
+-config MTK_MD1_SUPPORT
+-	int "configure modem 1 boot up capability"
+-	depends on MTK_CCCI_DRIVER || MTK_CCCI_EXT || MTK_ECCCI_DRIVER
+-	default 0
+-	help
+-	  modem 1 mode:
+-	  0=>invalid,
+-	  1=>2g,
+-	  2=>3g,
+-	  3=>wg,
+-	  4=>tg,
+-	  5=>lwg,
+-	  6=>ltg,
+-	  7=>sglte,
+-	  8=>ultg,
+-	  9=>ulwg,
+-	  10=>ulwtg,
+-	  11=>ulwcg,
+-	  12=>ulwctg,
+-	  13=>ulttg,
+-	  14=>ulfwg,
+-	  15=>ulfwcg,
+-	  16=>ulctg,
+-	  17=>ultctg,
+-	  18=>ultwg,
+-	  19=>ultwcg,
+-	  20=>ulftg,
+-	  21=>ulfctg
++	  The MediaTek Cross Core Communication Interface utility library:
++	  the modem boot information LK leaves (the tag list behind
++	  "ccci,modem_info_v2"), the reserved and shared memory layout of the
++	  modem, its image header checks and the CCCI logs. It neither powers
++	  nor starts the modem.
+ 
++	  Build it as a module and load it by hand while the modem driver is
++	  brought up.
+diff --git a/drivers/misc/mediatek/ccci_util/Makefile b/drivers/misc/mediatek/ccci_util/Makefile
+index 95f6719691..024381ddb6 100644
+--- a/drivers/misc/mediatek/ccci_util/Makefile
++++ b/drivers/misc/mediatek/ccci_util/Makefile
+@@ -1,60 +1,21 @@
+-#
+-# Copyright (C) 2015 MediaTek Inc.
+-#
+-# This program is free software: you can redistribute it and/or modify
+-# it under the terms of the GNU General Public License version 2 as
+-# published by the Free Software Foundation.
+-#
+-# This program is distributed in the hope that it will be useful,
+-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+-# GNU General Public License for more details.
+-#
+-
+-#FPGA project no need build-in
+-ifndef CONFIG_MTK_FPGA
+-
+-# ccci_util is build when ECCCI driver or CCCI driver enabled
+-
+-
+-ifeq ($(CONFIG_MTK_ECCCI_DRIVER), y)
+-CCCI_OBJ=y
+-else ifeq ($(CONFIG_MTK_ECCCI_DRIVER), m)
+-CCCI_OBJ=m
+-else
+-CCCI_OBJ=n
+-endif
+-
+-ifneq ($(CCCI_OBJ), n)
+-
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/ccci_util
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/include/
+-
+-ifeq ($(CONFIG_MTK_SECURITY_SW_SUPPORT), y)
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/masp/asfv2/asf_export_inc
+-ccflags-y += -DENABLE_MD_IMG_SECURITY_FEATURE
+-endif
+-
+-ifeq ($(CONFIG_MTK_SEC_MODEM_NVRAM_ANTI_CLONE), y)
+-ccflags-y += -DMTK_SEC_MODEM_NVRAM_ANTI_CLONE
+-endif
+-
+-obj-$(CCCI_OBJ) += ccci_util_lib.o
+-ccci_util_lib-$(CCCI_OBJ) := ccci_util_lib_fo.o \
+-			ccci_util_lib_load_img.o \
+-			ccci_util_lib_sys.o \
+-			ccci_private_log.o \
+-			ccci_util_lib_main.o \
+-			ccci_util_ld_md_errno.o \
+-			ccci_util_broadcast.o \
+-			ccci_util_pin_broadcast.o \
+-			ccci_util_sib.o \
+-			ccci_util_lib_reserved_mem.o \
+-			ccci_util_md_rat.o \
+-			ccci_util_boot_args.o \
+-			ccci_util_img_parsing.o \
+-			ccci_util_md_mem.o
+-
+-endif
+-endif
+-
++# SPDX-License-Identifier: GPL-2.0-only
++ccflags-y += -I$(srctree)/drivers/misc/mediatek/include
++ccflags-y += -I$(srctree)/drivers/misc/mediatek/ccci_util
++ccflags-y += -include $(srctree)/drivers/misc/mediatek/ccci_util/ccci_util_decls.h
++
++obj-$(CONFIG_MTK_CCCI_UTIL) += ccci_util_lib.o
++ccci_util_lib-y := ccci_util_lib_fo.o \
++		   ccci_util_lib_load_img.o \
++		   ccci_util_lib_sys.o \
++		   ccci_private_log.o \
++		   ccci_util_lib_main.o \
++		   ccci_util_ld_md_errno.o \
++		   ccci_util_broadcast.o \
++		   ccci_util_pin_broadcast.o \
++		   ccci_util_sib.o \
++		   ccci_util_lib_reserved_mem.o \
++		   ccci_util_md_rat.o \
++		   ccci_util_boot_args.o \
++		   ccci_util_img_parsing.o \
++		   ccci_util_md_mem.o \
++		   ccci_util_dummy.o
+diff --git a/drivers/misc/mediatek/ccci_util/ccci_util_broadcast.c b/drivers/misc/mediatek/ccci_util/ccci_util_broadcast.c
+index c32253a995..f1bfc23d8f 100644
+--- a/drivers/misc/mediatek/ccci_util/ccci_util_broadcast.c
++++ b/drivers/misc/mediatek/ccci_util/ccci_util_broadcast.c
+@@ -62,7 +62,7 @@ struct md_status_compat_event {
+ static struct bc_ctl_block_t *s_bc_ctl_tbl[MD_BC_MAX_NUM];
+ static spinlock_t s_event_update_lock;
+ static int s_md1_user_request_lock_cnt;
+-static int s_md3_user_request_lock_cnt;
++static int s_md3_user_request_lock_cnt __maybe_unused;
+ static spinlock_t s_md1_user_lock_cnt_lock;
+ static spinlock_t s_md3_user_lock_cnt_lock;
+ 
+@@ -486,7 +486,7 @@ long ccci_util_bc_compat_ioctl(struct file *filp, unsigned int cmd,
+ 	unsigned long arg)
+ {
+ 	struct ccci_util_bc_user_ctlb *user_ctlb;
+-	struct bc_ctl_block_t *bc_dev;
++	struct bc_ctl_block_t *bc_dev __maybe_unused;
+ 
+ 	user_ctlb = filp->private_data;
+ 	bc_dev = user_ctlb->bc_dev_ptr;
+@@ -559,7 +559,7 @@ int ccci_util_broadcast_init(void)
+ 	spin_lock_init(&s_event_update_lock);
+ 	spin_lock_init(&s_md1_user_lock_cnt_lock);
+ 	spin_lock_init(&s_md3_user_lock_cnt_lock);
+-	s_ccci_bd_class = class_create(THIS_MODULE, "ccci_md_sta");
++	s_ccci_bd_class = class_create("ccci_md_sta");
+ 	s_md1_user_request_lock_cnt = 0;
+ 	s_md3_user_request_lock_cnt = 0;
+ 
+diff --git a/drivers/misc/mediatek/ccci_util/ccci_util_decls.h b/drivers/misc/mediatek/ccci_util/ccci_util_decls.h
+new file mode 100644
+index 0000000000..42aaccffed
+--- /dev/null
++++ b/drivers/misc/mediatek/ccci_util/ccci_util_decls.h
+@@ -0,0 +1,45 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Declarations of the vendor ccci_util functions that are shared between
++ * its files (or with the modem driver) without a header, included in every
++ * file of the library through the Makefile.
++ */
++#ifndef __CCCI_UTIL_DECLS_H__
++#define __CCCI_UTIL_DECLS_H__
++
++#include <linux/poll.h>
++#include <linux/types.h>
++#include <linux/pgtable.h>
++#include "mt-plat/mtk_ccci_common.h"
++#include "ccci_util_lib_main.h"
++#include "ccci_util_lib_reserved_mem.h"
++#include "ccci_util_lib_sys.h"
++#include "ccci_util_md_mem.h"
++#include "ccci_util_sib.h"
++
++struct file;
++
++int lk_tag_inf_parsing_to_args_table(void);
++unsigned int get_md_smem_align(void);
++char *ccci_get_ap_platform(void);
++int ccci_get_plat_ft_inf(char buf[], int size);
++unsigned int ccci_log_poll(struct file *fp, struct poll_table_struct *poll);
++unsigned int ccci_dump_fops_poll(struct file *fp, struct poll_table_struct *poll);
++void inject_md_status_event(int event_type, char reason[]);
++int get_lock_rst_user_list(char list_buff[], int size);
++long ccci_util_bc_compat_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
++unsigned int ccci_sib_poll(struct file *fp, struct poll_table_struct *poll);
++unsigned int mtk_ccci_get_md_img_cap(void);
++void set_soc_md_rt_rat(unsigned int bitmap, unsigned int id);
++bool spm_is_md1_sleep(void);
++void spm_ap_mdsrc_req(u8 lock);
++unsigned int mt_irq_get_pending(unsigned int irq);
++bool is_clk_buf_from_pmic(void);
++void clk_buf_get_swctrl_status(void *swctrl_status);
++void clk_buf_get_rf_drv_curr(void *rf_drv_curr);
++void clk_buf_save_afc_val(unsigned int afcdac);
++int rawbulk_push_upstream_buffer(int transfer_id, const void *buffer, unsigned int length);
++int free_reserved_memory(phys_addr_t start_phys, phys_addr_t end_phys);
++void *vmap_reserved_mem(phys_addr_t start, phys_addr_t size, pgprot_t prot);
++
++#endif
+diff --git a/drivers/misc/mediatek/ccci_util/ccci_util_dummy.c b/drivers/misc/mediatek/ccci_util/ccci_util_dummy.c
+index d692b2b2ad..7263a0e970 100644
+--- a/drivers/misc/mediatek/ccci_util/ccci_util_dummy.c
++++ b/drivers/misc/mediatek/ccci_util/ccci_util_dummy.c
+@@ -49,7 +49,7 @@ unsigned int __weak get_modem_is_enabled(void)
+ }
+ 
+ int __weak register_ccci_sys_call_back(unsigned int id,
+-	int (*func)(int, int))
++	ccci_sys_cb_func_t func)
+ {
+ 	pr_debug("[ccci/dummy] %s is not supported!\n", __func__);
+ 	return 0;
+diff --git a/drivers/misc/mediatek/ccci_util/ccci_util_lib_fo.c b/drivers/misc/mediatek/ccci_util/ccci_util_lib_fo.c
+index 5cea9eed98..0451e83887 100644
+--- a/drivers/misc/mediatek/ccci_util/ccci_util_lib_fo.c
++++ b/drivers/misc/mediatek/ccci_util/ccci_util_lib_fo.c
+@@ -98,7 +98,7 @@ static unsigned int md_type_at_lk;
+ 
+ static unsigned int s_g_lk_load_img_status;
+ static int s_g_lk_ld_md_errno;
+-static unsigned int s_g_tag_inf_size;
++static unsigned int s_g_tag_inf_size __maybe_unused;
+ 
+ /* ------ tag info for each modem ---------------------- */
+ struct _modem_info {
+@@ -114,7 +114,7 @@ struct _modem_info {
+ static int lk_load_img_err_no;
+ 
+ static void __iomem *s_g_lk_inf_base;
+-static phys_addr_t s_g_tag_phy_addr;
++static phys_addr_t s_g_tag_phy_addr __maybe_unused;
+ static unsigned int s_g_tag_cnt;
+ /* Note, this for tag info solution version */
+ static unsigned int s_g_lk_info_tag_version;
+@@ -731,11 +731,6 @@ static void verify_md_enable_setting(void)
+ }
+ 
+ 
+-int __weak free_reserved_memory(phys_addr_t start_phys, phys_addr_t end_phys)
+-{
+-	pr_debug("[ccci/dummy] %s is not supported!\n", __func__);
+-	return 0;
+-}
+ 
+ static void dump_retrieve_info(void)
+ {
+@@ -831,7 +826,7 @@ static int __init collect_lk_boot_arguments(void)
+ 
+ 	if (s_g_lk_inf_base && s_g_lk_info_tag_version < 3) {
+ 		/* clear memory to zero that used by tag info. */
+-		memset_io(s_g_lk_inf_base, 0, s_g_tag_inf_size);
++		/* LK's memory: read only, never cleared */
+ 		iounmap(s_g_lk_inf_base);
+ 	} else if (s_g_lk_info_tag_version >= 3) {
+ /*		if (!pfn_valid(__phys_to_pfn(s_g_tag_phy_addr))) {
+@@ -1234,29 +1229,7 @@ void ccci_md_mem_reserve(void)
+ 	CCCI_UTIL_INF_MSG("%s phased out.\n", __func__);
+ }
+ 
+-#ifdef CONFIG_OF_RESERVED_MEM
+-#define CCCI_MD1_MEM_RESERVED_KEY "mediatek,reserve-memory-ccci_md1"
+-
+-int ccci_reserve_mem_of_init(struct reserved_mem *rmem)
+-{
+-	phys_addr_t rptr = 0;
+-	unsigned int rsize = 0;
+-
+-	rptr = rmem->base;
+-	rsize = (unsigned int)rmem->size;
+-
+-	CCCI_UTIL_INF_MSG("reserve_mem_of_init, rptr=0x%pa, rsize=0x%x\n",
+-			&rptr, rsize);
+-	md_resv_mem_list = rptr;
+-	md_resv_size_list = rsize;
+-	s_g_md_usage_case |= (1U << 0);
+-	return 0;
+-}
+-
+-RESERVEDMEM_OF_DECLARE(ccci_reserve_mem_md1_init,
+-	CCCI_MD1_MEM_RESERVED_KEY, ccci_reserve_mem_of_init);
+-
+-#endif
++/* the vendor's early RESERVEDMEM_OF_DECLARE hook is phased out and cannot run in a module */
+ 
+ 
+ /**************************************************************/
+diff --git a/drivers/misc/mediatek/ccci_util/ccci_util_lib_main.c b/drivers/misc/mediatek/ccci_util/ccci_util_lib_main.c
+index c9b0dbc032..ee7591250e 100644
+--- a/drivers/misc/mediatek/ccci_util/ccci_util_lib_main.c
++++ b/drivers/misc/mediatek/ccci_util/ccci_util_lib_main.c
+@@ -43,6 +43,7 @@ static int __init ccci_util_init(void)
+ 	return 0;
+ }
+ 
+-subsys_initcall(ccci_util_init);
++/* no exit: the library registers devices it never removes; load by hand */
++module_init(ccci_util_init);
+ MODULE_DESCRIPTION("MTK CCCI UTIL Driver");
+ MODULE_LICENSE("GPL");
+diff --git a/drivers/misc/mediatek/ccci_util/ccci_util_lib_main.h b/drivers/misc/mediatek/ccci_util/ccci_util_lib_main.h
+index 3cdf29357b..1a0eabe4c4 100644
+--- a/drivers/misc/mediatek/ccci_util/ccci_util_lib_main.h
++++ b/drivers/misc/mediatek/ccci_util/ccci_util_lib_main.h
+@@ -291,7 +291,7 @@ extern int mtk_ccci_compatible_md_chk_hdr_parsing(void);
+ extern int __init ccci_util_fo_init(void);
+ extern const char *ld_md_errno_to_str(int errno);
+ extern int ccci_util_broadcast_init(void);
+-extern int ccci_sib_init(void);
++extern void ccci_sib_init(void);
+ extern int ccci_util_pin_broadcast_init(void);
+ 
+ 
+diff --git a/drivers/misc/mediatek/ccci_util/ccci_util_lib_reserved_mem.c b/drivers/misc/mediatek/ccci_util/ccci_util_lib_reserved_mem.c
+index f55a03ff38..9170e490c3 100644
+--- a/drivers/misc/mediatek/ccci_util/ccci_util_lib_reserved_mem.c
++++ b/drivers/misc/mediatek/ccci_util/ccci_util_lib_reserved_mem.c
+@@ -74,6 +74,18 @@ EXPORT_SYMBOL(vmap_reserved_mem);
+ int free_reserved_memory(phys_addr_t start_phys,
+ 				phys_addr_t end_phys)
+ {
++	/*
++	 * The modem regions are LK's no-map reservations: giving them to the
++	 * page allocator corrupts memory (the MT6895 port saw UFS DMA oopses).
++	 * Never free them.
++	 */
++	pr_notice("%s: refusing to free %pa-%pa\n", __func__, &start_phys, &end_phys);
++	return -EPERM;
++}
++
++static int __maybe_unused free_reserved_memory_vendor(phys_addr_t start_phys,
++						      phys_addr_t end_phys)
++{
+ 
+ 	phys_addr_t pos;
+ 	unsigned long pages = 0;
+diff --git a/drivers/misc/mediatek/ccci_util/ccci_util_lib_sys.h b/drivers/misc/mediatek/ccci_util/ccci_util_lib_sys.h
+index 68e797ec8c..c723f448e2 100644
+--- a/drivers/misc/mediatek/ccci_util/ccci_util_lib_sys.h
++++ b/drivers/misc/mediatek/ccci_util/ccci_util_lib_sys.h
+@@ -5,5 +5,5 @@
+ 
+ 
+ int get_dump_buf_usage(char buf[], int size);
+-extern void inject_pin_status_event(int pin_value, char pin_name[]);
++extern void inject_pin_status_event(int pin_value, const char pin_name[]);
+ 
+diff --git a/drivers/misc/mediatek/ccci_util/ccci_util_pin_broadcast.c b/drivers/misc/mediatek/ccci_util/ccci_util_pin_broadcast.c
+index 3852525b53..48dfa3eb6b 100644
+--- a/drivers/misc/mediatek/ccci_util/ccci_util_pin_broadcast.c
++++ b/drivers/misc/mediatek/ccci_util/ccci_util_pin_broadcast.c
+@@ -175,7 +175,7 @@ int ccci_util_pin_broadcast_init(void)
+ 		goto _exit_2;
+ 	}
+ 
+-	s_ccci_pin_class = class_create(THIS_MODULE, "ccci_pin_sta");
++	s_ccci_pin_class = class_create("ccci_pin_sta");
+ 	device_create(s_ccci_pin_class, NULL, s_pin_status_dev, NULL, "ccci_pin_sta");
+ 
+ 	return 0;
+-- 
+2.56.0
+

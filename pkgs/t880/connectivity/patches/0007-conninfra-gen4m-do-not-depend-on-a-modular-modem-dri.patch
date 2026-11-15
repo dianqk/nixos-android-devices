@@ -1,0 +1,42 @@
+From 45e84ee30f78acf67ba79d6200b988630c6a8244 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 20 Oct 2026 09:17:48 +0800
+Subject: [PATCH] conninfra, gen4m: do not depend on a modular modem driver
+
+With the T880 kernel building the vendor CCCI modem driver as modules
+(CONFIG_MTK_ECCCI_DRIVER=m), conninfra's MT6897 EMI code calls the modem
+driver's shared memory lookup and gen4m enables its CCCI support. The
+connectivity modules load at boot, while the modem modules are loaded by
+hand during the modem bring-up: a dependency would load the modem driver
+at boot (and the out-of-tree build does not see its header).
+
+conninfra uses the lookup only with a built-in modem driver (the MCIF
+area stays "not supported", as before); the build passes
+CONFIG_MTK_WIFI_CCCI_SUPPORT=n to gen4m (CFG_MTK_CCCI_SUPPORT=0, as
+before).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../conninfra/conn_drv/connv2/platform/mt6897/mt6897_emi.c  | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/connectivity/conninfra/conn_drv/connv2/platform/mt6897/mt6897_emi.c b/connectivity/conninfra/conn_drv/connv2/platform/mt6897/mt6897_emi.c
+index d87553d..53aec02 100644
+--- a/connectivity/conninfra/conn_drv/connv2/platform/mt6897/mt6897_emi.c
++++ b/connectivity/conninfra/conn_drv/connv2/platform/mt6897/mt6897_emi.c
+@@ -74,7 +74,11 @@ void consys_emi_get_md_shared_emi_mt6897(phys_addr_t* base, unsigned int* size)
+ 	int ret = 0;
+ 
+ #ifndef CONFIG_FPGA_EARLY_PORTING
+-#if IS_ENABLED(CONFIG_MTK_ECCCI_DRIVER)
++/*
++ * Only with a built-in modem driver: conninfra loads at boot and must not
++ * pull in the modem driver modules, which are loaded by hand.
++ */
++#if IS_BUILTIN(CONFIG_MTK_ECCCI_DRIVER)
+ 	mdPhy = get_smem_phy_start_addr(MD_SYS1, SMEM_USER_RAW_MD_CONSYS, &ret);
+ #else
+ 	pr_info("[%s] ECCCI Driver is not supported.\n", __func__);
+-- 
+2.55.0
+

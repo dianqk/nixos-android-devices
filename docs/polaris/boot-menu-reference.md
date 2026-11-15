@@ -1,5 +1,7 @@
 # Polaris EFI console implementation
 
+[中文](boot-menu-reference.zh.md)
+
 The installed chain is Android firmware → U-Boot → systemd-boot → Linux EFI.
 The Android boot header wraps U-Boot; only RAM recovery boots Linux directly
 through the Android firmware. U-Boot lives in physical `boot`. Physical `system`
@@ -30,7 +32,7 @@ starts with `vidconsole`; the environment uses `vidconsole,serial,usbacm`
 Do not assume `console-mode max` makes the phone's text bigger. The explicit
 bitmap scale sets glyph size before EFI queries the display. Native panel
 resolution and Linux fonts remain unchanged.
-See [U-Boot EFI console source](https://github.com/u-boot/u-boot/blob/a06e89ab05eaa2b8344d521319399333cd760ae5/lib/efi_loader/efi_console.c).
+See [U-Boot EFI console source](https://github.com/u-boot/u-boot/blob/5508406582f6f7120dce0c4b3059819a41788db2/lib/efi_loader/efi_console.c).
 
 ## Physical keys
 
@@ -44,7 +46,7 @@ The compiled firmware enables `BUTTON_KEYBOARD`, `BUTTON_GPIO`,
 | Volume down | Down |
 | Power, short press | Enter |
 
-See the [upstream mapping](https://github.com/u-boot/u-boot/blob/a06e89ab05eaa2b8344d521319399333cd760ae5/drivers/button/button-uclass.c)
+See the [upstream mapping](https://github.com/u-boot/u-boot/blob/5508406582f6f7120dce0c4b3059819a41788db2/drivers/button/button-uclass.c)
 and [systemd-boot menu keys](https://systemd.io/BOOT/).
 Polaris DT describes volume up on PM8998 GPIO 6, volume down on PM8998 resin,
 and power on the PM8998 power-key input. Holding volume down during U-Boot

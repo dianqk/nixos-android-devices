@@ -1,0 +1,136 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 25 Oct 2026 17:30:00 +0800
+Subject: [PATCH] soc: qcom: qcom_pm_vx: opt-in PCIe state manager power-control override
+
+Aurora reaches CX and DDR collapse in s2idle, but AOSS sleep never
+happens (aosd 0 %), also with the UFS clocks no longer holding XO. The
+SM8650 PCIe state managers (CESTA, "PCI0 CESTA"/"PCI1 CESTA" in the AOP's
+requestor list) report a power state to the AOSS. Downstream pci-msm sets
+their PWR_CTRL and PWR_CTRL_MASK override registers at init (pineapple
+bootargs pci-msm-drv.pcie_sm_regs=0x1D07000,0x1040,0x1048,0x3000,0x2) and
+clears them only when it runs the state manager program, which pcie-qcom
+never does. Add pcie_sm_override (bit 0 RC0, bit 1 RC1, default 0) to
+the qcom_pm_vx debug module: setting it writes 1 to both registers of
+the selected instances, logs the readback and repeats this at every
+resume if the value did not stick.
+
+Based on armada's SM8750 override, adapted to the SM8650 registers and
+made an opt-in runtime knob:
+Link: https://github.com/armada-os/armada/commit/008e910e10812acc8d4fdae3ebccb451e2f17c89
+(armada packages/kernel/patches/0566-soc-qcom-override-the-sm8750-pcie-state-manager-power-control.patch,
+author Noahcdls <noahcdls@gmail.com>, 2026-10-17; no sign-off trailers)
+Downstream reference: drivers/pci/controller/pci-msm.c (pcie_sm_regs) in
+https://github.com/OnePlusOSS/android_kernel_oneplus_sm8650/tree/b2696d4a2bda11cb74de35f839ef0cf6ccc1b9cb
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/drivers/soc/qcom/qcom_pm_vx.c b/drivers/soc/qcom/qcom_pm_vx.c
+--- a/drivers/soc/qcom/qcom_pm_vx.c
++++ b/drivers/soc/qcom/qcom_pm_vx.c
+@@ -12,7 +12,15 @@
+  *   send     raw QMP message, sent immediately (root only)
+  *   monitor  QMP message sent at every system suspend; empty disables it
+  *   log      decoded log;  raw  the log region as read
+- * The log region is only read; nothing outside QMP is written.
++ * The log region is only read.
++ *
++ * Opt-in: pcie_sm_override (module parameter, bit 0 = RC0, bit 1 = RC1)
++ * sets the PCIe state manager (CESTA) PWR_CTRL and PWR_CTRL_MASK override
++ * registers, as downstream pci-msm does at init with
++ * pcie_sm_regs=0x1D07000,0x1040,0x1048,0x3000,0x2 on SM8650 ("If the override
++ * is not done then CX Power Collapse won't happen"); pcie-qcom never runs the
++ * state manager program. Written on set and again at every resume if it did
++ * not stick; 0 (default) leaves the registers alone.
+  */
+ #include <linux/debugfs.h>
+ #include <linux/io.h>
+@@ -32,6 +40,71 @@
+ #define MODE_CXPC	0xcc
+ #define MODE_DDR	0xdd
+ 
++#define PCIE_SM_BASE		0x01d07000
++#define PCIE_SM_PWR_CTRL	0x1040
++#define PCIE_SM_PWR_CTRL_MASK	0x1048
++#define PCIE_SM_INSTANCE	0x3000
++#define PCIE_SM_INSTANCES	2
++
++static unsigned int pcie_sm_override;
++static DEFINE_MUTEX(pcie_sm_lock);
++
++/* Writes 1 to both override registers of each selected instance and logs
++ * the readback. Called with pcie_sm_lock held.
++ */
++static void pcie_sm_apply(unsigned int mask, const char *why)
++{
++	unsigned int i;
++
++	for (i = 0; i < PCIE_SM_INSTANCES; i++) {
++		phys_addr_t pa = PCIE_SM_BASE + PCIE_SM_PWR_CTRL + i * PCIE_SM_INSTANCE;
++		void __iomem *base;
++		u32 ctrl, ctrl_mask;
++
++		if (!(mask & BIT(i)))
++			continue;
++		base = ioremap(pa, PCIE_SM_PWR_CTRL_MASK - PCIE_SM_PWR_CTRL + 4);
++		if (!base) {
++			pr_err("qcom_pm_vx: cannot map PCIe SM %u\n", i);
++			continue;
++		}
++		ctrl = readl(base);
++		ctrl_mask = readl(base + PCIE_SM_PWR_CTRL_MASK - PCIE_SM_PWR_CTRL);
++		if (ctrl != 1 || ctrl_mask != 1) {
++			writel(1, base);
++			writel(1, base + PCIE_SM_PWR_CTRL_MASK - PCIE_SM_PWR_CTRL);
++			pr_info("qcom_pm_vx: PCIe SM %u override (%s): %#x/%#x -> %#x/%#x\n",
++				i, why, ctrl, ctrl_mask, readl(base),
++				readl(base + PCIE_SM_PWR_CTRL_MASK - PCIE_SM_PWR_CTRL));
++		}
++		iounmap(base);
++	}
++}
++
++static int pcie_sm_override_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned int mask;
++	int ret = kstrtouint(val, 0, &mask);
++
++	if (ret)
++		return ret;
++	if (mask & ~GENMASK(PCIE_SM_INSTANCES - 1, 0))
++		return -EINVAL;
++	mutex_lock(&pcie_sm_lock);
++	pcie_sm_override = mask;
++	pcie_sm_apply(mask, "set");
++	mutex_unlock(&pcie_sm_lock);
++	return 0;
++}
++
++static const struct kernel_param_ops pcie_sm_override_ops = {
++	.set = pcie_sm_override_set,
++	.get = param_get_uint,
++};
++module_param_cb(pcie_sm_override, &pcie_sm_override_ops, &pcie_sm_override, 0644);
++MODULE_PARM_DESC(pcie_sm_override,
++		 "Set the PCIe state manager power-control override: bit 0 RC0, bit 1 RC1 (default 0)");
++
+ static const char * const cxpc_drvs[] = {
+ 	"TZ", "L3", "HLOS", "HYP", "SECPROC", "AUDIO", "AOP", "DEBUG",
+ 	"GPU", "DISPLAY", "COMPUTE_DSP", "TME_HW", "TME_SW", "MDM SW",
+@@ -211,7 +284,16 @@
+ 	return 0;
+ }
+ 
+-static DEFINE_SIMPLE_DEV_PM_OPS(pm_vx_pm_ops, pm_vx_suspend, NULL);
++static int pm_vx_resume(struct device *dev)
++{
++	mutex_lock(&pcie_sm_lock);
++	if (pcie_sm_override)
++		pcie_sm_apply(pcie_sm_override, "resume");
++	mutex_unlock(&pcie_sm_lock);
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(pm_vx_pm_ops, pm_vx_suspend, pm_vx_resume);
+ 
+ static int pm_vx_probe(struct platform_device *pdev)
+ {

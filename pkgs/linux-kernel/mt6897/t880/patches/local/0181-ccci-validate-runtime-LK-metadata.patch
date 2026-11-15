@@ -1,0 +1,610 @@
+From 7f7e7a3c32ad22e25809852c42b5f519f78ab3cc Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 19:25:25 +0800
+Subject: [PATCH] ccci: validate runtime LK metadata before publishing modem
+ arguments
+
+Bound descriptor prefixes and signed version/count fields before mapping
+LK's full 64 KiB no-map reservation. Validate each consumed tag header,
+name, payload range and chain link before publishing any LK arguments.
+Preserve existing DT priority and first-wins duplicate behavior, preflight
+the finite argument table and roll back partial publication on failure.
+
+Malformed supplied metadata cannot enter the legacy fallback or enable the
+modem. Valid no-image sentinels skip dependent parsers. Keep the existing
+permanent util module loaded because its logger already registered proc
+callbacks. Retain successful read-only mappings while argument entries refer
+to them, and make diagnostic dumping bounded and non-mutating.
+
+The descriptor and tag layouts retain the vendor little-endian contract;
+this changes input boundaries, not tag payload interpretation or modem
+startup policy.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ .../mediatek/ccci_util/ccci_util_boot_args.c  |  72 ++--
+ .../mediatek/ccci_util/ccci_util_lib_fo.c     | 345 ++++++++++--------
+ .../mediatek/ccci_util/ccci_util_lib_main.c   |  18 +-
+ .../mediatek/ccci_util/ccci_util_lib_main.h   |   5 +
+ 4 files changed, 255 insertions(+), 185 deletions(-)
+
+diff --git a/drivers/misc/mediatek/ccci_util/ccci_util_boot_args.c b/drivers/misc/mediatek/ccci_util/ccci_util_boot_args.c
+index b4b2b35f2a..bbb3a8879d 100644
+--- a/drivers/misc/mediatek/ccci_util/ccci_util_boot_args.c
++++ b/drivers/misc/mediatek/ccci_util/ccci_util_boot_args.c
+@@ -19,10 +19,10 @@
+ #include "ccci_util_lib_main.h"
+ 
+ 
+-#define ARGS_KEY_VAL_KEY_SIZE		36
++#define ARGS_KEY_VAL_KEY_SIZE		CCCI_ARGS_KEY_SIZE
+ #define ARGS_KEY_VAL_BUF_NUM		8
+ #define ARGS_KEY_VAL_BUF_SIZE		4096
+-#define ARGS_KEY_VAL_MAX_KEY_NUM	73
++#define ARGS_KEY_VAL_MAX_KEY_NUM	CCCI_ARGS_MAX_KEYS
+ 
+ 
+ struct args_key_val {
+@@ -57,6 +57,25 @@ static int is_key_exist(const char key[], unsigned int size)
+ 	return -1;
+ }
+ 
++unsigned int mtk_ccci_args_count(void)
++{
++	return s_args_num;
++}
++
++bool mtk_ccci_args_has_key(const char *key)
++{
++	return is_key_exist(key, strlen(key) + 1) >= 0;
++}
++
++void mtk_ccci_args_rollback(unsigned int count)
++{
++	if (count > s_args_num)
++		return;
++	memset(&s_args_tbl[count], 0,
++	       (s_args_num - count) * sizeof(s_args_tbl[0]));
++	s_args_num = count;
++}
++
+ int mtk_ccci_find_args_val(const char key[], unsigned char o_val[], unsigned int val_buf_size)
+ {
+ 	int idx;
+@@ -134,6 +153,9 @@ int mtk_ccci_add_new_args(const char key[], unsigned char val[],
+ 		return -1;
+ 	}
+ 
++	if (s_args_num >= ARGS_KEY_VAL_MAX_KEY_NUM)
++		return -ENOSPC;
++
+ 	if (source == FROM_LK_TAG) {
+ 		memcpy(s_args_tbl[s_args_num].key, key, key_size);
+ 		s_args_tbl[s_args_num].key_size = key_size;
+@@ -230,29 +252,35 @@ int mtk_ccci_args_key_val_init(void)
+ void mtk_ccci_dump_args_info(void)
+ {
+ 	unsigned int i;
+-	unsigned int *ptr = NULL;
+-	unsigned char *ch;
+ 
+ 	CCCI_UTIL_INF_MSG("------ Dump args: [key]:[val] --------\n");
+ 	for (i = 0; i < s_args_num; i++) {
+-		if (strncmp(s_args_tbl[i].key, "err_trace", 9) == 0) {
+-			s_args_tbl[i].pdata[s_args_tbl[i].val_size] = 0;
+-			CCCI_UTIL_INF_MSG("<key>[err_trace(%u)]:[%s]\n", s_args_tbl[i].val_size,
+-						s_args_tbl[i].pdata);
+-		} else {
+-			if (s_args_tbl[i].val_size >= 8) {
+-				ptr = (unsigned int *)s_args_tbl[i].pdata;
+-				CCCI_UTIL_INF_MSG("<key>[%s(%u)]:[%x:%x]\n", s_args_tbl[i].key,
+-						s_args_tbl[i].val_size, ptr[0], ptr[1]);
+-			} else if (s_args_tbl[i].val_size >= 4) {
+-				ptr = (unsigned int *)s_args_tbl[i].pdata;
+-				CCCI_UTIL_INF_MSG("<key>[%s(%u)]:[%x]\n", s_args_tbl[i].key,
+-						s_args_tbl[i].val_size, ptr[0]);
+-			} else {
+-				ch = (unsigned char *)s_args_tbl[i].pdata;
+-				CCCI_UTIL_INF_MSG("<key>[%s(%u)]:[%x]\n", s_args_tbl[i].key,
+-						s_args_tbl[i].val_size, (unsigned int)(*ch));
+-			}
++		struct args_key_val *arg = &s_args_tbl[i];
++		u32 words[2] = {0};
++		size_t len;
++
++		if (!arg->val_size)
++			continue;
++		if (strncmp(arg->key, "err_trace", 9) == 0) {
++			char *trace = kmalloc((size_t)arg->val_size + 1, GFP_KERNEL);
++
++			if (!trace)
++				continue;
++			if (arg->source == FROM_LK_TAG)
++				memcpy_fromio(trace, arg->pdata, arg->val_size);
++			else
++				memcpy(trace, arg->pdata, arg->val_size);
++			trace[arg->val_size] = 0;
++			CCCI_UTIL_INF_MSG("<key>[err_trace(%u)]:[%s]\n", arg->val_size, trace);
++			kfree(trace);
++			continue;
+ 		}
++		len = arg->val_size >= 8 ? 8 : arg->val_size >= 4 ? 4 : 1;
++		if (arg->source == FROM_LK_TAG)
++			memcpy_fromio(words, arg->pdata, len);
++		else
++			memcpy(words, arg->pdata, len);
++		CCCI_UTIL_INF_MSG("<key>[%s(%u)]:[%x:%x]\n", arg->key,
++				  arg->val_size, words[0], words[1]);
+ 	}
+ }
+diff --git a/drivers/misc/mediatek/ccci_util/ccci_util_lib_fo.c b/drivers/misc/mediatek/ccci_util/ccci_util_lib_fo.c
+index 0451e83887..f09e10bba2 100644
+--- a/drivers/misc/mediatek/ccci_util/ccci_util_lib_fo.c
++++ b/drivers/misc/mediatek/ccci_util/ccci_util_lib_fo.c
+@@ -24,6 +24,8 @@
+ //#include <asm/memblock.h>
+ 
+ #include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/unaligned.h>
+ #include <linux/of_fdt.h>
+ 
+ #ifdef CONFIG_OF_RESERVED_MEM
+@@ -120,52 +122,88 @@ static unsigned int s_g_tag_cnt;
+ static unsigned int s_g_lk_info_tag_version;
+ 
+ 
++struct ccci_checked_tag {
++	char name[CCCI_ARGS_KEY_SIZE];
++	u32 offset;
++	u32 data_offset;
++	u32 data_size;
++};
++
+ int lk_tag_inf_parsing_to_args_table(void)
+ {
+-	unsigned int i;
+-
+-	/* For strcmp/strncmp should not be used on device memory,
+-	 * so prepare a temp buffer.
+-	 */
+-	char tag_name[64];
+-	unsigned int data_offset = 0;
+-	unsigned int data_size = 0;
+-	unsigned int next_tag_offset = 0;
+-	unsigned char *tmp_buf = NULL;
+-	char *curr = NULL;
+-	union u_tag {
+-		struct _ccci_tag v1;
+-		struct _ccci_tag_v2 v2;
+-	} tag = {0};
+-
+-	if (s_g_lk_inf_base == NULL) {
+-		CCCI_UTIL_INF_MSG("%s: s_g_lk_inf_base NULL\n", __func__);
+-		return -1;
++	struct ccci_checked_tag *checked;
++	unsigned int i, j, offset = 0, needed = 0;
++	unsigned int checkpoint = mtk_ccci_args_count();
++	unsigned int name_size, header_size;
++	u8 header[sizeof(struct _ccci_tag_v2)];
++	int ret = -EINVAL;
++
++	name_size = s_g_lk_info_tag_version >= CCCI_LK_INFO_VER_V2 ?
++		CCCI_TAG_NAME_LEN_V2 : CCCI_TAG_NAME_LEN;
++	header_size = name_size + 3 * sizeof(u32);
++	if (checkpoint > CCCI_ARGS_MAX_KEYS || !s_g_lk_inf_base || !s_g_tag_cnt ||
++	    s_g_tag_cnt > s_g_tag_inf_size / header_size)
++		return -EINVAL;
++	checked = kcalloc(s_g_tag_cnt, sizeof(*checked), GFP_KERNEL);
++	if (!checked)
++		return -ENOMEM;
++
++	/* Validate the complete bounded chain before publishing any LK pointer. */
++	for (i = 0; i < s_g_tag_cnt; i++) {
++		u32 next;
++		size_t len;
++		bool duplicate = false;
++
++		if (offset > s_g_tag_inf_size ||
++		    header_size > s_g_tag_inf_size - offset)
++			goto out;
++		for (j = 0; j < i; j++)
++			if (checked[j].offset == offset)
++				goto out;
++		memcpy_fromio(header, s_g_lk_inf_base + offset, header_size);
++		len = strnlen((const char *)header, name_size);
++		if (!len || len == name_size || len >= CCCI_ARGS_KEY_SIZE)
++			goto out;
++		memcpy(checked[i].name, header, len + 1);
++		checked[i].offset = offset;
++		checked[i].data_offset = get_unaligned_le32(header + name_size);
++		checked[i].data_size = get_unaligned_le32(header + name_size + 4);
++		next = get_unaligned_le32(header + name_size + 8);
++		if (checked[i].data_offset > s_g_tag_inf_size ||
++		    checked[i].data_size > s_g_tag_inf_size - checked[i].data_offset)
++			goto out;
++		/* The final next field is unused by the count-delimited LK format. */
++		if (i + 1 < s_g_tag_cnt &&
++		    (next > s_g_tag_inf_size || header_size > s_g_tag_inf_size - next))
++			goto out;
++		offset = next;
++		/* Preserve DT priority and the first occurrence of each LK key. */
++		duplicate = mtk_ccci_args_has_key(checked[i].name);
++		for (j = 0; !duplicate && j < i; j++)
++			duplicate = !strcmp(checked[j].name, checked[i].name);
++		if (!duplicate)
++			needed++;
++	}
++	if (checkpoint > CCCI_ARGS_MAX_KEYS ||
++	    needed > CCCI_ARGS_MAX_KEYS - checkpoint) {
++		ret = -ENOSPC;
++		goto out;
+ 	}
+-
+-	curr = (char *)s_g_lk_inf_base;
+ 	for (i = 0; i < s_g_tag_cnt; i++) {
+-		memcpy_fromio(&tag, curr, sizeof(union u_tag));
+-		if (s_g_lk_info_tag_version >= CCCI_LK_INFO_VER_V2) {
+-			scnprintf(tag_name, 64, "%s", tag.v2.tag_name);
+-			data_offset = tag.v2.data_offset;
+-			data_size = tag.v2.data_size;
+-			next_tag_offset = tag.v2.next_tag_offset;
+-		} else {
+-			scnprintf(tag_name, 64, "%s", tag.v1.tag_name);
+-			data_offset = tag.v1.data_offset;
+-			data_size = tag.v1.data_size;
+-			next_tag_offset = tag.v1.next_tag_offset;
++		if (mtk_ccci_args_has_key(checked[i].name))
++			continue;
++		ret = mtk_ccci_add_new_args(checked[i].name,
++					  (unsigned char *)s_g_lk_inf_base + checked[i].data_offset,
++					  checked[i].data_size, FROM_LK_TAG);
++		if (ret < 0) {
++			mtk_ccci_args_rollback(checkpoint);
++			goto out;
+ 		}
+-
+-		tmp_buf = (unsigned char *)(s_g_lk_inf_base + data_offset);
+-
+-		mtk_ccci_add_new_args((const char *)tag_name, tmp_buf, data_size, FROM_LK_TAG);
+-
+-		curr = (char *)(s_g_lk_inf_base + next_tag_offset);
+ 	}
+-
+-	return 0;
++	ret = 0;
++out:
++	kfree(checked);
++	return ret;
+ }
+ 
+ /*====================================================== */
+@@ -618,93 +656,90 @@ static void md_chk_hdr_info_parse(void)
+ 	}
+ }
+ 
+-static void lk_info_parsing_v1(unsigned int *raw_ptr)
++/* The vendor mapping helper maps 64 KiB and rounds its address to PAGE_MASK. */
++static bool ccci_lk_reserved_range(u64 base)
+ {
+-	struct _ccci_lk_info lk_inf;
+-
+-	memcpy((void *)&lk_inf, raw_ptr, sizeof(struct _ccci_lk_info));
+-
+-	CCCI_UTIL_INF_MSG("lk info.lk_info_base_addr: 0x%llX\n",
+-		lk_inf.lk_info_base_addr);
+-	CCCI_UTIL_INF_MSG("lk info.lk_info_size:      0x%x\n",
+-		lk_inf.lk_info_size);
+-	CCCI_UTIL_INF_MSG("lk info.lk_info_tag_num:   0x%x\n",
+-		lk_inf.lk_info_tag_num);
+-	s_g_tag_inf_size = lk_inf.lk_info_size;
+-
+-	if (lk_inf.lk_info_base_addr == 0LL) {
+-		CCCI_UTIL_ERR_MSG("no image load success\n");
+-		s_g_lk_load_img_status |= LK_LOAD_MD_ERR_NO_MD_LOAD;
+-		return;
+-	}
+-
+-	if (lk_inf.lk_info_size > MAX_LK_INFO_SIZE) {
+-		CCCI_UTIL_ERR_MSG("tag info mem size too large\n");
+-		s_g_lk_load_img_status |= LK_TAG_BUFF_SIZE_NOT_ENOUGH;
+-		return;
++	struct device_node *parent, *node;
++	struct resource res;
++	bool found = false;
++
++	parent = of_find_node_by_path("/reserved-memory");
++	if (!parent)
++		return false;
++	for_each_available_child_of_node(parent, node) {
++		if (!of_property_present(node, "no-map") ||
++		    of_property_present(node, "reusable") ||
++		    of_address_to_resource(node, 0, &res) || res.end < res.start)
++			continue;
++		if (base >= res.start && base - res.start <= resource_size(&res) &&
++		    resource_size(&res) - (base - res.start) >= MAX_LK_INFO_SIZE) {
++			found = true;
++			of_node_put(node);
++			break;
++		}
+ 	}
++	of_node_put(parent);
++	return found;
++}
+ 
+-	s_g_lk_info_tag_version = 1;
+-	s_g_tag_cnt = (unsigned int)lk_inf.lk_info_tag_num;
++static int ccci_lk_map_info(u64 base, u32 size, u32 count, u32 version)
++{
++	unsigned int header = version >= CCCI_LK_INFO_VER_V2 ?
++		sizeof(struct _ccci_tag_v2) : sizeof(struct _ccci_tag);
++	void __iomem *mapping;
++
++	if (!size || size > MAX_LK_INFO_SIZE || !count || count > size / header ||
++	    !IS_ALIGNED(base, PAGE_SIZE) || base > U64_MAX - MAX_LK_INFO_SIZE ||
++	    !ccci_lk_reserved_range(base))
++		return -EINVAL;
++	mapping = ccci_map_phy_addr(base, MAX_LK_INFO_SIZE);
++	if (!mapping)
++		return -ENOMEM;
++	s_g_tag_phy_addr = base;
++	s_g_tag_inf_size = size;
++	s_g_tag_cnt = count;
++	s_g_lk_info_tag_version = version;
++	s_g_lk_inf_base = mapping;
++	return 0;
++}
+ 
+-	s_g_lk_inf_base = ccci_map_phy_addr(
+-		(phys_addr_t)lk_inf.lk_info_base_addr, MAX_LK_INFO_SIZE);
++static int lk_info_parsing_v1(const void *raw, int len)
++{
++	const u8 *p = raw;
++	u64 base;
+ 
+-	if (s_g_lk_inf_base == NULL) {
+-		CCCI_UTIL_ERR_MSG("remap lk info buf fail\n");
++	if (!raw || len < (int)sizeof(struct _ccci_lk_info))
++		return -EINVAL;
++	base = get_unaligned_le64(p);
++	if (!base) {
+ 		s_g_lk_load_img_status |= LK_LOAD_MD_ERR_NO_MD_LOAD;
++		return 1;
+ 	}
++	return ccci_lk_map_info(base, get_unaligned_le32(p + 8),
++				get_unaligned_le32(p + 12), 1);
+ }
+ 
+-static int lk_info_parsing_v2(unsigned int *raw_ptr)
++static int lk_info_parsing_v2(const void *raw, int len)
+ {
+-	struct _ccci_lk_info_v2 lk_inf;
+-
+-	memcpy((void *)&lk_inf, raw_ptr, sizeof(struct _ccci_lk_info_v2));
+-
+-	CCCI_UTIL_INF_MSG("lk info.lk_info_base_addr: 0x%llX\n",
+-		lk_inf.lk_info_base_addr);
+-	CCCI_UTIL_INF_MSG("lk info.lk_info_size:      0x%x\n",
+-		lk_inf.lk_info_size);
+-	CCCI_UTIL_INF_MSG("lk info.lk_info_tag_num:   0x%x\n",
+-		lk_inf.lk_info_tag_num);
+-
+-	s_g_lk_ld_md_errno = lk_inf.lk_info_err_no;
+-	s_g_tag_inf_size = lk_inf.lk_info_size;
+-	lk_load_img_err_no = lk_inf.lk_info_ld_md_errno;
+-
+-	if ((lk_inf.lk_info_base_addr == 0LL) && (s_g_lk_ld_md_errno == 0)) {
+-		CCCI_UTIL_ERR_MSG("no image enabled\n");
++	const u8 *p = raw;
++	u64 base;
++	s32 version, count;
++
++	if (!raw || len < (int)sizeof(struct _ccci_lk_info_v2))
++		return -EINVAL;
++	base = get_unaligned_le64(p);
++	s_g_lk_ld_md_errno = (s32)get_unaligned_le32(p + 12);
++	lk_load_img_err_no = (s32)get_unaligned_le32(p + 28);
++	if (!base && !s_g_lk_ld_md_errno) {
+ 		s_g_lk_inf_base = NULL;
+ 		s_g_lk_load_img_status = 0;
+ 		return 1;
+ 	}
+-
+-	if (lk_inf.lk_info_base_addr == 0LL) {
+-		CCCI_UTIL_ERR_MSG("no image load success\n");
+-		s_g_lk_load_img_status |= LK_LOAD_MD_ERR_NO_MD_LOAD;
+-		return -1;
+-	}
+-
+-	if (lk_inf.lk_info_size > MAX_LK_INFO_SIZE) {
+-		CCCI_UTIL_ERR_MSG("tag info mem size too large\n");
+-		s_g_lk_load_img_status |= LK_TAG_BUFF_SIZE_NOT_ENOUGH;
+-		return -1;
+-	}
+-
+-	s_g_tag_phy_addr = (phys_addr_t)lk_inf.lk_info_base_addr;
+-	s_g_lk_info_tag_version = (unsigned int)lk_inf.lk_info_version;
+-	s_g_tag_cnt = (unsigned int)lk_inf.lk_info_tag_num;
+-
+-	s_g_lk_inf_base = ccci_map_phy_addr(
+-		(phys_addr_t)lk_inf.lk_info_base_addr, MAX_LK_INFO_SIZE);
+-
+-	if (s_g_lk_inf_base == NULL) {
+-		CCCI_UTIL_ERR_MSG("remap lk info buf fail\n");
+-		s_g_lk_load_img_status |= LK_LOAD_MD_ERR_NO_MD_LOAD;
+-	}
+-
+-	return 0;
++	version = (s32)get_unaligned_le32(p + 16);
++	count = (s32)get_unaligned_le32(p + 20);
++	if (!base || version < 1 || count < 0)
++		return -EINVAL;
++	return ccci_lk_map_info(base, get_unaligned_le32(p + 8), count, version);
+ }
+ 
+ static void verify_md_enable_setting(void)
+@@ -780,40 +815,31 @@ static void dump_retrieve_info(void)
+ 
+ static int __init collect_lk_boot_arguments(void)
+ {
+-	/* Device tree method */
+-	struct device_node *node = NULL;
+-//	int ret;
+-	unsigned int *raw_ptr;
++	struct device_node *node;
++	const struct property *prop;
++	int len, ret;
+ 
+ 	node = of_find_compatible_node(NULL, NULL, "mediatek,mddriver");
+-	if (!node) {
+-		CCCI_UTIL_INF_MSG("device node no mediatek,mddriver node\n");
+-		return -1;
+-	}
+-
+-	raw_ptr = (unsigned int *)of_get_property(node, "ccci,modem_info_v2",
+-			NULL);
+-	if (raw_ptr != NULL) {
+-		if (lk_info_parsing_v2(raw_ptr) == 1) /* No md enabled in LK */
+-			return 0;
+-		goto _common_process;
++	if (!node)
++		return -ENOENT;
++	prop = of_find_property(node, "ccci,modem_info_v2", &len);
++	if (prop) {
++		ret = lk_info_parsing_v2(prop->value, len);
++	} else {
++		prop = of_find_property(node, "ccci,modem_info", &len);
++		ret = prop ? lk_info_parsing_v1(prop->value, len) : -ENOENT;
+ 	}
++	of_node_put(node);
++	if (ret)
++		return ret;
+ 
+-	CCCI_UTIL_INF_MSG("ccci,modem_info_v2 not found, try v1\n");
+-	raw_ptr = (unsigned int *)of_get_property(node, "ccci,modem_info",
+-			NULL);
+-	if (raw_ptr != NULL) {
+-		lk_info_parsing_v1(raw_ptr);
+-		goto _common_process;
++	ret = lk_tag_inf_parsing_to_args_table();
++	if (ret) {
++		iounmap(s_g_lk_inf_base);
++		s_g_lk_inf_base = NULL;
++		return ret;
+ 	}
+-
+-	CCCI_UTIL_INF_MSG("ccci,modem_info_v1 still not found, using v0!!!\n");
+-	return -1;
+-
+-_common_process:
+ 	s_g_md_usage_case |= (1 << MD_SYS1);
+-
+-	lk_tag_inf_parsing_to_args_table();
+ 	mtk_ccci_dump_md_mem_layout();
+ 	mtk_ccci_md_smem_layout_init();
+ 	md_mem_info_parsing();
+@@ -824,22 +850,9 @@ static int __init collect_lk_boot_arguments(void)
+ 
+ 	s_g_lk_load_img_status |= LK_LOAD_MD_EN;
+ 
+-	if (s_g_lk_inf_base && s_g_lk_info_tag_version < 3) {
+-		/* clear memory to zero that used by tag info. */
+-		/* LK's memory: read only, never cleared */
+-		iounmap(s_g_lk_inf_base);
+-	} else if (s_g_lk_info_tag_version >= 3) {
+-/*		if (!pfn_valid(__phys_to_pfn(s_g_tag_phy_addr))) {
+-			iounmap(s_g_lk_inf_base);
+-		} else {
+-			vunmap(s_g_lk_inf_base);
+-			ret = free_reserved_memory(s_g_tag_phy_addr,
+-				s_g_tag_phy_addr + MAX_LK_INFO_SIZE);
+-			CCCI_UTIL_INF_MSG(
+-				"unmap && free reserved tag result=%d\n", ret);
+-		}
+-*/
+-	}
++	/* Argument entries retain pointers into this read-only mapping. The util
++	 * module is permanent, so keep the mapping for every supported version.
++	 */
+ 
+ 	return 0;
+ }
+@@ -1238,12 +1251,26 @@ void ccci_md_mem_reserve(void)
+ int __init ccci_util_fo_init(void)
+ {
+ 	struct device_node *node = NULL;
++	int ret;
+ 
+ 	CCCI_UTIL_INF_MSG("%s 0.\n", __func__);
+ 
+-	if (collect_lk_boot_arguments() == 0) {
+-		CCCI_UTIL_INF_MSG("using v3.\n");
++	ret = collect_lk_boot_arguments();
++	if (ret > 0) {
++		s_g_md_usage_case = 0;
++		s_g_md_env_rdy_flag = 0;
++		s_g_lk_load_img_status &= ~LK_LOAD_MD_EN;
++		return ret; /* Valid LK no-image sentinel, modem disabled. */
++	}
++	if (!ret)
+ 		return 0;
++	if (ret != -ENOENT) {
++		s_g_md_usage_case = 0;
++		s_g_md_env_rdy_flag = 0;
++		s_g_lk_load_img_status &= ~LK_LOAD_MD_EN;
++		s_g_lk_load_img_status |= LK_LOAD_MD_ERR_LK_INFO_FAIL;
++		CCCI_UTIL_ERR_MSG("invalid LK modem metadata (%d); modem disabled\n", ret);
++		return ret;
+ 	}
+ 
+ 	node = of_find_compatible_node(NULL, NULL, "mediatek,ccci_util_cfg");
+diff --git a/drivers/misc/mediatek/ccci_util/ccci_util_lib_main.c b/drivers/misc/mediatek/ccci_util/ccci_util_lib_main.c
+index ee7591250e..ba70666c2a 100644
+--- a/drivers/misc/mediatek/ccci_util/ccci_util_lib_main.c
++++ b/drivers/misc/mediatek/ccci_util/ccci_util_lib_main.c
+@@ -30,11 +30,21 @@
+ 
+ static int __init ccci_util_init(void)
+ {
++	int ret;
++
+ 	ccci_log_init();
+-	mtk_ccci_args_key_val_init();
+-	ccci_util_fo_init();
+-	mtk_ccci_compatible_md_chk_hdr_parsing();
+-	mtk_ccci_dump_args_info();
++	ret = mtk_ccci_args_key_val_init();
++	if (!ret)
++		ret = ccci_util_fo_init();
++	if (!ret) {
++		mtk_ccci_compatible_md_chk_hdr_parsing();
++		mtk_ccci_dump_args_info();
++	} else {
++		/* Logging already registered permanent proc callbacks. Keep this
++		 * module loaded, but never consume invalid or disabled LK metadata.
++		 */
++		pr_warn("ccci: modem metadata unavailable (%d); modem disabled\n", ret);
++	}
+ 	ccci_common_sysfs_init();
+ 	ccci_util_broadcast_init();
+ 	ccci_sib_init();
+diff --git a/drivers/misc/mediatek/ccci_util/ccci_util_lib_main.h b/drivers/misc/mediatek/ccci_util/ccci_util_lib_main.h
+index 1a0eabe4c4..a96b137093 100644
+--- a/drivers/misc/mediatek/ccci_util/ccci_util_lib_main.h
++++ b/drivers/misc/mediatek/ccci_util/ccci_util_lib_main.h
+@@ -303,6 +303,11 @@ enum args_src {
+ int mtk_ccci_find_args_val(const char key[], unsigned char o_val[], unsigned int val_buf_size);
+ int mtk_ccci_add_new_args(const char key[], unsigned char val[], unsigned int val_size,
+ 				enum args_src src);
++#define CCCI_ARGS_KEY_SIZE 36
++#define CCCI_ARGS_MAX_KEYS 73
++unsigned int mtk_ccci_args_count(void);
++bool mtk_ccci_args_has_key(const char *key);
++void mtk_ccci_args_rollback(unsigned int count);
+ void mtk_ccci_dump_args_info(void);
+ 
+ int mtk_ccci_get_lk_load_md_info(char buf[], int size);
+-- 
+2.56.0
+

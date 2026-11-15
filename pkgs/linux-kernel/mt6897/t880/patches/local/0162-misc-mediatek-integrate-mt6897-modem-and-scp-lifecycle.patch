@@ -1,0 +1,1017 @@
+From 7a83055ce51bb7284669de5c0645c052b31611e2 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] misc: mediatek: integrate MT6897 modem and SCP lifecycle
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adapt modem startup, reset, exception and power ownership to MT6897
+and synchronize CCCI states with the SCP transport.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T08:13:54+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T08:44:42+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T08:45:08+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-05T15:20:03+08:00
+Link: https://github.com/MiCode/MTK_kernel_device_modules (commit 3c4ccd07d5624879555ec710c11bb8818e5cb5c6, drivers/misc/mediatek/eccci, drivers/misc/mediatek/ccmni)
+Source commit: 3c4ccd07d562 "Kernel: Xiaomi kernel_device_modules changes for
+Redmi K70E Android U" by 何发云 <hefayun@xiaomi.com>, 2024-01-12.
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Link: https://github.com/MT6895-Mainline/linux/tree/qqcandy (the MT6895 port, used as a reference for the sysctl path)
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/misc/mediatek/eccci/fsm/ccci_fsm_scp_c.c
+---
+ drivers/misc/mediatek/eccci/fsm/Makefile      |  64 ---
+ drivers/misc/mediatek/eccci/fsm/ap_md_mem.c   |   3 +-
+ .../misc/mediatek/eccci/fsm/ap_md_reg_dump.c  |   2 +-
+ drivers/misc/mediatek/eccci/fsm/ccci_fsm.c    |  10 +-
+ drivers/misc/mediatek/eccci/fsm/ccci_fsm_ee.c |   7 +-
+ .../misc/mediatek/eccci/fsm/ccci_fsm_ioctl.c  |   7 +-
+ .../mediatek/eccci/fsm/md_sys1_platform.c     |  15 +-
+ .../mediatek/eccci/fsm/md_sys1_platform.h     |   4 +-
+ .../misc/mediatek/eccci/fsm/mdee_dumper_v1.c  |   6 +-
+ .../misc/mediatek/eccci/fsm/mdee_dumper_v2.c  |   4 +-
+ .../misc/mediatek/eccci/fsm/mdee_dumper_v3.c  |   8 +-
+ .../misc/mediatek/eccci/fsm/mdee_dumper_v5.c  |   8 +-
+ .../misc/mediatek/eccci/fsm/mdee_dumper_v6.c  |   8 +-
+ drivers/misc/mediatek/eccci/fsm/modem_sys1.c  |  31 +-
+ .../misc/mediatek/eccci/fsm/mt6897_ccci_scp.c | 381 ++++++++++++++++++
+ .../misc/mediatek/eccci/fsm/mt6897_ccci_scp.h |  25 ++
+ 16 files changed, 475 insertions(+), 108 deletions(-)
+ delete mode 100644 drivers/misc/mediatek/eccci/fsm/Makefile
+ create mode 100644 drivers/misc/mediatek/eccci/fsm/mt6897_ccci_scp.c
+ create mode 100644 drivers/misc/mediatek/eccci/fsm/mt6897_ccci_scp.h
+
+diff --git a/drivers/misc/mediatek/eccci/fsm/Makefile b/drivers/misc/mediatek/eccci/fsm/Makefile
+deleted file mode 100644
+index 03c7976041..0000000000
+--- a/drivers/misc/mediatek/eccci/fsm/Makefile
++++ /dev/null
+@@ -1,64 +0,0 @@
+-#
+-# Copyright (C) 2016 MediaTek Inc.
+-#
+-# This program is free software; you can redistribute it and/or modify
+-# it under the terms of the GNU General Public License version 2 as
+-# published by the Free Software Foundation.
+-#
+-# This program is distributed in the hope that it will be useful,
+-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+-# See http://www.gnu.org/licenses/gpl-2.0.html for more details.
+-#
+-
+-ifeq ($(CONFIG_MTK_ECCCI_DRIVER), m)
+-
+-ccflags-y += -DCCCI_KMODULE_ENABLE
+-
+-#ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/inc
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/port
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/platform
+-#ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/scp/mt6873
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/scp/include/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/scp/rv/
+-#ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/include/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/hif/
+-
+-ccci_fsm_scp-y := ccci_fsm_scp_c.o
+-obj-$(CONFIG_MTK_ECCCI_DRIVER) += ccci_fsm_scp.o
+-
+-endif
+-
+-
+-
+-
+-
+-ifeq ($(CONFIG_MTK_ECCCI_DRIVER), y)
+-
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/inc
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/port
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/platform
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/scp/mt6873
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/scp/include/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/include/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/hif/
+-
+-# fsm objects
+-obj-$(CONFIG_MTK_ECCCI_DRIVER) := ccci_fsm_all.o
+-
+-ccci_fsm_all-y := ccci_fsm.o \
+-			ccci_fsm_ioctl.o \
+-			ccci_fsm_monitor.o \
+-			ccci_fsm_poller.o \
+-			ccci_fsm_scp_c.o \
+-			ccci_fsm_ee.o \
+-			ccci_fsm_sys.o \
+-			mdee_dumper_v1.o \
+-			mdee_dumper_v2.o \
+-			mdee_dumper_v3.o \
+-			mdee_dumper_v5.o \
+-			mdee_dumper_v6.o
+-
+-endif
+diff --git a/drivers/misc/mediatek/eccci/fsm/ap_md_mem.c b/drivers/misc/mediatek/eccci/fsm/ap_md_mem.c
+index 75b687484a..2991cbb8a3 100644
+--- a/drivers/misc/mediatek/eccci/fsm/ap_md_mem.c
++++ b/drivers/misc/mediatek/eccci/fsm/ap_md_mem.c
+@@ -90,7 +90,7 @@ static struct ccci_smem_region md1_cacheable_tbl[] = {
+ };
+ 
+ 
+-struct ccci_smem_region *get_smem_by_user_id(
++static struct ccci_smem_region *get_smem_by_user_id(
+ 	struct ccci_smem_region *regions, enum SMEM_USER_ID user_id)
+ {
+ 	int i;
+@@ -311,6 +311,7 @@ struct ccci_smem_region *ccci_md_get_smem_by_user_id(enum SMEM_USER_ID user_id)
+ }
+ EXPORT_SYMBOL(ccci_md_get_smem_by_user_id);
+ 
++void ccci_md_clear_smem(int first_boot);
+ void ccci_md_clear_smem(int first_boot)
+ {
+ 	struct ccci_smem_region *region = NULL;
+diff --git a/drivers/misc/mediatek/eccci/fsm/ap_md_reg_dump.c b/drivers/misc/mediatek/eccci/fsm/ap_md_reg_dump.c
+index 39ef5e50e0..d648b09309 100644
+--- a/drivers/misc/mediatek/eccci/fsm/ap_md_reg_dump.c
++++ b/drivers/misc/mediatek/eccci/fsm/ap_md_reg_dump.c
+@@ -31,7 +31,7 @@ static size_t mdreg_write32(size_t reg_id, size_t value)
+  * With ap_md_reg_dump_code_gentool.py v0.1
+  * Date 2019-10-04 09:48:58.843141
+  */
+-void internal_md_dump_debug_register(void)
++static void internal_md_dump_debug_register(void)
+ {
+ 	void __iomem *dump_reg0;
+ 
+diff --git a/drivers/misc/mediatek/eccci/fsm/ccci_fsm.c b/drivers/misc/mediatek/eccci/fsm/ccci_fsm.c
+index 7eb4bf5b4e..a34d3cb3da 100644
+--- a/drivers/misc/mediatek/eccci/fsm/ccci_fsm.c
++++ b/drivers/misc/mediatek/eccci/fsm/ccci_fsm.c
+@@ -3,6 +3,7 @@
+  * Copyright (C) 2016 MediaTek Inc.
+  */
+ 
++#include "mt6897_ccci_scp.h"
+ #include <linux/platform_device.h>
+ #include <linux/device.h>
+ #include <linux/module.h>
+@@ -116,6 +117,7 @@ static void broadcast_md_state_kernel(int old_stat, int new_stat)
+ 	CCCI_NORMAL_LOG(0, FSM, "kern_broadcast_md_sate: %d start\n", new_stat);
+ #endif
+ 
++	mt6897_ccci_scp_md_state(new_stat);
+ 	spin_lock_irqsave(&state_broadcase_lock, flags);
+ 	bitmap = kern_reg_cb_bitmap;
+ 	spin_unlock_irqrestore(&state_broadcase_lock, flags);
+@@ -141,6 +143,7 @@ static void broadcast_md_state_kernel(int old_stat, int new_stat)
+ 
+ static void (*s_dpmaif_debug_push_data_to_stack)(void);
+ 
++void ccci_set_dpmaif_debug_cb(void (*dpmaif_debug_cb)(void));
+ void ccci_set_dpmaif_debug_cb(void (*dpmaif_debug_cb)(void))
+ {
+ 	s_dpmaif_debug_push_data_to_stack = dpmaif_debug_cb;
+@@ -814,7 +817,7 @@ static void *ccci_md_get_time_info(struct ccci_runtime_feature *rt_feature,
+ 
+ 
+ 
+-int ccci_md_prepare_runtime_data(unsigned char *data, int length)
++static int ccci_md_prepare_runtime_data(unsigned char *data, int length)
+ {
+ 	struct ccci_modem *md = ccci_get_modem();
+ 	u8 i = 0;
+@@ -1319,6 +1322,11 @@ static void fsm_routine_start(struct ccci_fsm_ctl *ctl,
+ 		fsm_routine_zombie(ctl);
+ 		return;
+ 	}
++	ret = mt6897_ccci_scp_prepare_start();
++	if (ret) {
++		fsm_finish_command(ctl, cmd, ret);
++		return;
++	}
+ 	ctl->last_state = ctl->curr_state;
+ 	ctl->curr_state = CCCI_FSM_STARTING;
+ 	atomic_set(&md_ee_occurred, 0);
+diff --git a/drivers/misc/mediatek/eccci/fsm/ccci_fsm_ee.c b/drivers/misc/mediatek/eccci/fsm/ccci_fsm_ee.c
+index cda577f069..de6052cfe1 100644
+--- a/drivers/misc/mediatek/eccci/fsm/ccci_fsm_ee.c
++++ b/drivers/misc/mediatek/eccci/fsm/ccci_fsm_ee.c
+@@ -17,7 +17,7 @@
+ #include <soc/mediatek/smpu.h>
+ #endif
+ 
+-static int s_is_normal_mdee;
++static __maybe_unused int s_is_normal_mdee;
+ 
+ void mdee_set_ex_start_str(struct ccci_fsm_ee *ee_ctl,
+ 	const unsigned int type, const char *str)
+@@ -384,7 +384,7 @@ static void ccci_md_exception_handshake(int timeout)
+ void fsm_md_normal_ee_handler(struct ccci_fsm_ctl *ctl)
+ {
+ 	struct ccci_fsm_event *event = NULL;
+-	int count = 0, ex_got = 0;
++	__maybe_unused int count = 0, ex_got = 0;
+ 	int rec_ok_got = 0, pass_got = 0;
+ 	unsigned long flags;
+ 
+@@ -488,6 +488,7 @@ int fsm_check_ee_done(struct ccci_fsm_ee *ee_ctl, int timeout)
+ 	return 0;
+ }
+ 
++int md_fsm_exp_info(unsigned int channel_id);
+ int md_fsm_exp_info(unsigned int channel_id)
+ {
+ 	struct ccci_modem *md;
+@@ -521,10 +522,10 @@ int md_fsm_exp_info(unsigned int channel_id)
+ }
+ EXPORT_SYMBOL(md_fsm_exp_info);
+ 
++atomic_t en_flight_timeout; /* enter flight mode timeout && devapc occurred */
+ #if IS_ENABLED(CONFIG_DEVICE_MODULES_MTK_DEVAPC)
+ atomic_t pw_off_disable_dapc_ke;
+ atomic_t md_dapc_ke_occurred;
+-atomic_t en_flight_timeout; /* enter flight mode timeout && devapc occurred */
+ 
+ static int s_devapc_dump_counter;
+ 
+diff --git a/drivers/misc/mediatek/eccci/fsm/ccci_fsm_ioctl.c b/drivers/misc/mediatek/eccci/fsm/ccci_fsm_ioctl.c
+index 1580a38478..0ef862194f 100644
+--- a/drivers/misc/mediatek/eccci/fsm/ccci_fsm_ioctl.c
++++ b/drivers/misc/mediatek/eccci/fsm/ccci_fsm_ioctl.c
+@@ -25,6 +25,7 @@
+ #if IS_ENABLED(CONFIG_DEVICE_MODULES_MTK_DEVAPC)
+ extern atomic_t pw_off_disable_dapc_ke;
+ #endif
++signed int __weak battery_get_bat_voltage(void);
+ signed int __weak battery_get_bat_voltage(void)
+ {
+ 	pr_debug("[ccci/dummy] %s is not supported!\n", __func__);
+@@ -45,7 +46,7 @@ unsigned int get_sim_switch_type(void)
+ }
+ #endif
+ 
+-struct ccci_runtime_feature *
++static struct ccci_runtime_feature *
+ ccci_md_get_rt_feature_by_id(u8 feature_id, u8 ap_query_md)
+ {
+ 	struct ccci_runtime_feature *rt_feature = NULL;
+@@ -81,7 +82,7 @@ ccci_md_get_rt_feature_by_id(u8 feature_id, u8 ap_query_md)
+ 	return NULL;
+ }
+ 
+-int ccci_md_parse_rt_feature(struct ccci_runtime_feature *rt_feature,
++static int ccci_md_parse_rt_feature(struct ccci_runtime_feature *rt_feature,
+ 	void *data, u32 data_len)
+ {
+ 	if (unlikely(!rt_feature)) {
+@@ -103,7 +104,7 @@ int ccci_md_parse_rt_feature(struct ccci_runtime_feature *rt_feature,
+ 	return 0;
+ }
+ 
+-int ccci_md_set_boot_data(unsigned int data[], int len)
++static int ccci_md_set_boot_data(unsigned int data[], int len)
+ {
+ 	struct ccci_modem *md = ccci_get_modem();
+ 	unsigned int rat_flag;
+diff --git a/drivers/misc/mediatek/eccci/fsm/md_sys1_platform.c b/drivers/misc/mediatek/eccci/fsm/md_sys1_platform.c
+index 9e7579af1e..78d98a0551 100644
+--- a/drivers/misc/mediatek/eccci/fsm/md_sys1_platform.c
++++ b/drivers/misc/mediatek/eccci/fsm/md_sys1_platform.c
+@@ -33,6 +33,7 @@
+ #include "md_sys1_platform.h"
+ #include "modem_secure_base.h"
+ #include "modem_reg_base.h"
++#include "mt6897_ccci_scp.h"
+ #include "ap_md_reg_dump.h"
+ 
+ #if IS_ENABLED(CONFIG_MTK_PBM)
+@@ -135,6 +136,7 @@ static int md_cd_io_remap_md_side_register(struct ccci_modem *md)
+ 	return 0;
+ }
+ 
++void md_cd_lock_modem_clock_src(int locked);
+ void md_cd_lock_modem_clock_src(int locked)
+ {
+ 	int settle;
+@@ -209,6 +211,7 @@ static void md_cd_get_md_bootup_status(
+  * GEN98+ == 0x5443000FU;
+  * GEN99 == 0x54430012U;
+  */
++u32 get_expected_boot_status_val(void);
+ u32 get_expected_boot_status_val(void)
+ {
+ 	u32 boot_status_val = 0;
+@@ -435,7 +438,7 @@ static int md_cd_topclkgen_off(struct ccci_modem *md)
+  * 2.wait sequencer done
+  * 3.revert mux of sequencer to AOC1.0
+  */
+-int md1_revert_sequencer_setting(struct ccci_modem *md)
++static int md1_revert_sequencer_setting(struct ccci_modem *md)
+ {
+ 	void __iomem *reg = NULL;
+ 	int count = 0;
+@@ -1368,9 +1371,8 @@ static int md_cd_get_modem_hw_info(struct platform_device *dev_ptr,
+ 	return 0;
+ }
+ 
+-static int ccci_modem_remove(struct platform_device *dev)
++static void ccci_modem_remove(struct platform_device *dev)
+ {
+-	return 0;
+ }
+ 
+ static void ccci_modem_shutdown(struct platform_device *dev)
+@@ -1510,6 +1512,13 @@ static int __init modem_cd_init(void)
+ 			ret);
+ 		return ret;
+ 	}
++	ret = mt6897_ccci_scp_register();
++	if (ret)
++		CCCI_ERROR_LOG(
++			-1, TAG,
++			"SCP bridge registration failed: %d; start gated\n",
++			ret);
++	/* The modem driver is already registered and cannot be unloaded safely. */
+ 	return 0;
+ }
+ 
+diff --git a/drivers/misc/mediatek/eccci/fsm/md_sys1_platform.h b/drivers/misc/mediatek/eccci/fsm/md_sys1_platform.h
+index 2b1486d6a9..5a47aecc35 100644
+--- a/drivers/misc/mediatek/eccci/fsm/md_sys1_platform.h
++++ b/drivers/misc/mediatek/eccci/fsm/md_sys1_platform.h
+@@ -104,8 +104,8 @@ enum {
+ 
+ 
+ /* ADD_SYS_CORE */
+-int ccci_modem_syssuspend(void);
+-void ccci_modem_sysresume(void);
++int ccci_modem_syssuspend(void *data);
++void ccci_modem_sysresume(void *data);
+ void md_dump_register_6873(void);
+ 
+ #if IS_ENABLED(CONFIG_MTK_EMI)
+diff --git a/drivers/misc/mediatek/eccci/fsm/mdee_dumper_v1.c b/drivers/misc/mediatek/eccci/fsm/mdee_dumper_v1.c
+index e49bdefff6..21d2a6d759 100644
+--- a/drivers/misc/mediatek/eccci/fsm/mdee_dumper_v1.c
++++ b/drivers/misc/mediatek/eccci/fsm/mdee_dumper_v1.c
+@@ -24,8 +24,8 @@
+ static void ccci_aed_v1(struct ccci_fsm_ee *mdee, unsigned int dump_flag,
+ 	const char *aed_str, int db_opt)
+ {
+-	void *ex_log_addr = NULL;
+-	int ex_log_len = 0;
++	__maybe_unused void *ex_log_addr = NULL;
++	__maybe_unused int ex_log_len = 0;
+ #if IS_ENABLED(CONFIG_MTK_AEE_FEATURE)
+ 	void *md_img_addr = NULL;
+ 	int md_img_len = 0;
+@@ -381,7 +381,7 @@ static void mdee_dumper_info_dump_v1(struct ccci_fsm_ee *mdee)
+ static void mdee_dumper_info_prepare_v1(struct ccci_fsm_ee *mdee)
+ {
+ 	struct ex_log_t *ex_info = NULL;
+-	int ee_type, ee_case;
++	__maybe_unused int ee_type, ee_case;
+ 	struct mdee_dumper_v1 *dumper = mdee->dumper_obj;
+ 	struct debug_info_t *debug_info = &dumper->debug_info;
+ 	struct ccci_smem_region *mdss_dbg =
+diff --git a/drivers/misc/mediatek/eccci/fsm/mdee_dumper_v2.c b/drivers/misc/mediatek/eccci/fsm/mdee_dumper_v2.c
+index d1ce6828b9..a968c34e6f 100644
+--- a/drivers/misc/mediatek/eccci/fsm/mdee_dumper_v2.c
++++ b/drivers/misc/mediatek/eccci/fsm/mdee_dumper_v2.c
+@@ -28,8 +28,8 @@
+ static void ccci_aed_v2(struct ccci_fsm_ee *mdee, unsigned int dump_flag,
+ 	const char *aed_str, int db_opt)
+ {
+-	void *ex_log_addr = NULL;
+-	int ex_log_len = 0;
++	__maybe_unused void *ex_log_addr = NULL;
++	__maybe_unused int ex_log_len = 0;
+ 
+ #if IS_ENABLED(CONFIG_MTK_AEE_FEATURE)
+ 	void *md_img_addr = NULL;
+diff --git a/drivers/misc/mediatek/eccci/fsm/mdee_dumper_v3.c b/drivers/misc/mediatek/eccci/fsm/mdee_dumper_v3.c
+index 6c01ff286d..0fe6e8a2cd 100644
+--- a/drivers/misc/mediatek/eccci/fsm/mdee_dumper_v3.c
++++ b/drivers/misc/mediatek/eccci/fsm/mdee_dumper_v3.c
+@@ -28,10 +28,10 @@
+ static void ccci_aed_v3(struct ccci_fsm_ee *mdee, unsigned int dump_flag,
+ 	char *aed_str, int db_opt)
+ {
+-	void *ex_log_addr = NULL;
+-	int ex_log_len = 0;
+-	void *md_dump_addr = NULL;
+-	int md_dump_len = 0;
++	__maybe_unused void *ex_log_addr = NULL;
++	__maybe_unused int ex_log_len = 0;
++	__maybe_unused void *md_dump_addr = NULL;
++	__maybe_unused int md_dump_len = 0;
+ 	int info_str_len = 0;
+ 	char *buff;		/*[AED_STR_LEN]; */
+ #if IS_ENABLED(CONFIG_MTK_AEE_FEATURE)
+diff --git a/drivers/misc/mediatek/eccci/fsm/mdee_dumper_v5.c b/drivers/misc/mediatek/eccci/fsm/mdee_dumper_v5.c
+index a91fdbeb91..1d8f8ee57f 100644
+--- a/drivers/misc/mediatek/eccci/fsm/mdee_dumper_v5.c
++++ b/drivers/misc/mediatek/eccci/fsm/mdee_dumper_v5.c
+@@ -32,10 +32,10 @@
+ static void ccci_aed_v5(struct ccci_fsm_ee *mdee, unsigned int dump_flag,
+ 	char *aed_str, int db_opt)
+ {
+-	void *ex_log_addr = NULL;
+-	int ex_log_len = 0;
+-	void *md_dump_addr = NULL;
+-	int md_dump_len = 0;
++	__maybe_unused void *ex_log_addr = NULL;
++	__maybe_unused int ex_log_len = 0;
++	__maybe_unused void *md_dump_addr = NULL;
++	__maybe_unused int md_dump_len = 0;
+ 	int info_str_len = 0;
+ 	char *buff;		/*[AED_STR_LEN]; */
+ #if IS_ENABLED(CONFIG_MTK_AEE_FEATURE)
+diff --git a/drivers/misc/mediatek/eccci/fsm/mdee_dumper_v6.c b/drivers/misc/mediatek/eccci/fsm/mdee_dumper_v6.c
+index 8b26b751b0..082cb08d4e 100644
+--- a/drivers/misc/mediatek/eccci/fsm/mdee_dumper_v6.c
++++ b/drivers/misc/mediatek/eccci/fsm/mdee_dumper_v6.c
+@@ -32,10 +32,10 @@
+ static void ccci_aed_v6(struct ccci_fsm_ee *mdee, unsigned int dump_flag,
+ 	char *aed_str, int db_opt)
+ {
+-	void *ex_log_addr = NULL;
+-	int ex_log_len = 0;
+-	void *md_dump_addr = NULL;
+-	int md_dump_len = 0;
++	__maybe_unused void *ex_log_addr = NULL;
++	__maybe_unused int ex_log_len = 0;
++	__maybe_unused void *md_dump_addr = NULL;
++	__maybe_unused int md_dump_len = 0;
+ 	int info_str_len = 0;
+ 	char *buff;		/*[AED_STR_LEN]; */
+ #if IS_ENABLED(CONFIG_MTK_AEE_FEATURE)
+diff --git a/drivers/misc/mediatek/eccci/fsm/modem_sys1.c b/drivers/misc/mediatek/eccci/fsm/modem_sys1.c
+index ab2e804e03..f1cac3dd47 100644
+--- a/drivers/misc/mediatek/eccci/fsm/modem_sys1.c
++++ b/drivers/misc/mediatek/eccci/fsm/modem_sys1.c
+@@ -70,7 +70,7 @@ bool spm_is_md1_sleep(void)
+ 
+ #endif
+ 
+-void wdt_enable_irq(struct ccci_modem *md)
++static void wdt_enable_irq(struct ccci_modem *md)
+ {
+ 	if (atomic_cmpxchg(&md->wdt_enabled, 0, 1) == 0) {
+ 		enable_irq(md->md_wdt_irq_id);
+@@ -78,7 +78,7 @@ void wdt_enable_irq(struct ccci_modem *md)
+ 	}
+ }
+ 
+-void wdt_disable_irq(struct ccci_modem *md)
++static void wdt_disable_irq(struct ccci_modem *md)
+ {
+ 	if (atomic_cmpxchg(&md->wdt_enabled, 1, 0) == 1) {
+ 		/*
+@@ -236,7 +236,7 @@ static int md_cd_soft_stop(struct ccci_modem *md, unsigned int mode)
+ 	return md->hw_info->plat_ptr->soft_power_off(md, mode);
+ }
+ 
+-void md1_sleep_timeout_proc(struct ccci_modem *md)
++static void md1_sleep_timeout_proc(struct ccci_modem *md)
+ {
+ 	struct ccci_smem_region *mdccci_dbg =
+ 		ccci_md_get_smem_by_user_id(SMEM_USER_RAW_MDCCCI_DBG);
+@@ -833,6 +833,7 @@ int ccci_md_stop(unsigned int stop_type)
+ 	return md->ops->stop(md, stop_type);
+ }
+ 
++int __weak md_cd_vcore_config(unsigned int hold_req);
+ int __weak md_cd_vcore_config(unsigned int hold_req)
+ {
+ 	pr_debug("[ccci/dummy] %s is not supported!\n", __func__);
+@@ -1023,7 +1024,7 @@ static ssize_t md_cd_parameter_show(struct ccci_modem *md, char *buf)
+ 
+ 	count += scnprintf(buf + count, 128,
+ 		"PACKET_HISTORY_DEPTH=%d\n", PACKET_HISTORY_DEPTH);
+-	count += scnprintf(buf + count, 128, "BD_NUM=%ld\n", MAX_BD_NUM);
++	count += scnprintf(buf + count, 128, "BD_NUM=%d\n", (int)MAX_BD_NUM);
+ 
+ 	return count;
+ }
+@@ -1072,7 +1073,7 @@ static void md_cd_sysfs_init(struct ccci_modem *md)
+ 			ccci_md_attr_parameter.attr.name, ret);
+ }
+ 
+-void ccci_hif_cldma_restore_reg(struct ccci_modem *md)
++static void ccci_hif_cldma_restore_reg(struct ccci_modem *md)
+ {
+ }
+ 
+@@ -1093,7 +1094,7 @@ static void ccci_modem_restore_reg(struct ccci_modem *md)
+ 	ccci_hif_resume(md->hif_flag);
+ }
+ 
+-int ccci_modem_syssuspend(void)
++int ccci_modem_syssuspend(void *data)
+ {
+ 	struct ccci_modem *md;
+ 
+@@ -1104,7 +1105,7 @@ int ccci_modem_syssuspend(void)
+ 	return 0;
+ }
+ 
+-void ccci_modem_sysresume(void)
++void ccci_modem_sysresume(void *data)
+ {
+ 	struct ccci_modem *md;
+ 
+@@ -1115,11 +1116,15 @@ void ccci_modem_sysresume(void)
+ }
+ 
+ 
+-static struct syscore_ops ccci_modem_sysops = {
++static const struct syscore_ops ccci_modem_sysops = {
+ 	.suspend = ccci_modem_syssuspend,
+ 	.resume = ccci_modem_sysresume,
+ };
+ 
++static struct syscore ccci_modem_syscore = {
++	.ops = &ccci_modem_sysops,
++};
++
+ /* setup function is only for data structure initialization */
+ struct ccci_modem *ccci_md_alloc(int private_size)
+ {
+@@ -1143,7 +1148,7 @@ struct ccci_modem *ccci_md_alloc(int private_size)
+ 	return md;
+ }
+ 
+-void ccci_md_config(struct ccci_modem *md)
++static void ccci_md_config(struct ccci_modem *md)
+ {
+ 	/* setup config */
+ 	md->per_md_data.config.load_type = get_md_img_type();
+@@ -1163,7 +1168,7 @@ void ccci_md_config(struct ccci_modem *md)
+ 	md->per_md_data.img_info[IMG_ARMV7].type = IMG_ARMV7;
+ }
+ 
+-int boot_md_show(char *buf, int size)
++static int boot_md_show(char *buf, int size)
+ {
+ 	int curr = 0;
+ 
+@@ -1173,7 +1178,7 @@ int boot_md_show(char *buf, int size)
+ 	return curr;
+ }
+ 
+-int boot_md_store(void)
++static int boot_md_store(void)
+ {
+ 	return -EACCES;
+ }
+@@ -1225,7 +1230,7 @@ static struct kobj_type ccci_md_ktype = {
+ 	.default_groups = ccci_md_default_groups,
+ };
+ 
+-void ccci_sysfs_add_md(void *kobj)
++static void ccci_sysfs_add_md(void *kobj)
+ {
+ 	ccci_sysfs_add_modem((void *)kobj, (void *)&ccci_md_ktype,
+ 		boot_md_show, boot_md_store);
+@@ -1326,7 +1331,7 @@ int ccci_modem_init_common(struct platform_device *plat_dev,
+ 	}
+ 
+ 	/* register SYS CORE suspend resume call back */
+-	register_syscore_ops(&ccci_modem_sysops);
++	register_syscore(&ccci_modem_syscore);
+ 
+ 	/* add sysfs entries */
+ 	md_cd_sysfs_init(md);
+diff --git a/drivers/misc/mediatek/eccci/fsm/mt6897_ccci_scp.c b/drivers/misc/mediatek/eccci/fsm/mt6897_ccci_scp.c
+new file mode 100644
+index 0000000000..ab05c671ab
+--- /dev/null
++++ b/drivers/misc/mediatek/eccci/fsm/mt6897_ccci_scp.c
+@@ -0,0 +1,381 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* MT6897 APCCCI transport for the vendor CCCI/SCP state protocol.
++ * Protocol source: MediaTek ccci_fsm_scp_c.c, imported with this driver.
++ * The bridge shares the non-unloadable CCCI core lifetime; unbind is disabled.
++ */
++#include <linux/arm-smccc.h>
++#include <linux/clk.h>
++#include <linux/completion.h>
++#include <linux/io.h>
++#include <linux/mt6897-scp-ccci.h>
++#include <linux/of_address.h>
++#include <linux/overflow.h>
++#include <linux/platform_device.h>
++#include <linux/workqueue.h>
++#include "ccci_config.h"
++#include "ccci_common_config.h"
++#include "ccci_fsm_internal.h"
++#include "modem_secure_base.h"
++#include "md_sys1_platform.h"
++#include "mt6897_ccci_scp.h"
++#include "ccci_util_md_mem.h"
++
++#define BRIDGE_EVENTS 32
++#define STOP_TIMEOUT_MS 3000
++/* An event is copied before the IRQ or FSM callback returns. */
++enum bridge_event_type { BR_READY, BR_MD, BR_ACK, BR_RX, BR_BARRIER };
++struct bridge_event {
++	enum bridge_event_type type;
++	u32 a, b;
++};
++struct scp_bridge {
++	struct device *dev;
++	struct mt6897_scp_ccci_client client;
++	struct clk_bulk_data clocks[2];
++	void __iomem *ap, *md;
++	struct work_struct work;
++	spinlock_t lock;
++	struct bridge_event events[BRIDGE_EVENTS];
++	unsigned int head, count;
++	bool failed, clocks_on, init_sent, shm_sent, active;
++	atomic_t stop_pending;
++	struct completion stopped, ready, barrier;
++	unsigned int scp_state;
++};
++static struct scp_bridge *bridge;
++
++static void bridge_fail(struct scp_bridge *b, int err, const char *stage)
++{
++	WRITE_ONCE(b->failed, true);
++	dev_err(b->dev, "%s failed: %d; retain CCIF2 ownership until reboot\n",
++		stage, err);
++	complete_all(&b->stopped);
++}
++
++static void bridge_enqueue(struct scp_bridge *b, enum bridge_event_type type,
++			   u32 a, u32 c)
++{
++	unsigned long flags;
++	spin_lock_irqsave(&b->lock, flags);
++	if (b->count == BRIDGE_EVENTS) {
++		WRITE_ONCE(b->failed, true);
++		dev_err_ratelimited(
++			b->dev,
++			"APCCCI event overflow; STOP not acknowledged\n");
++		complete_all(&b->stopped);
++	} else {
++		b->events[(b->head + b->count) % BRIDGE_EVENTS] =
++			(struct bridge_event){ type, a, c };
++		b->count++;
++	}
++	if (smp_load_acquire(&b->active))
++		schedule_work(&b->work);
++	spin_unlock_irqrestore(&b->lock, flags);
++}
++
++static int bridge_send(struct scp_bridge *b, u16 op, u32 data)
++{
++	struct ccci_ipi_msg_out msg = {
++		.md_id = 0,
++		.op_id = op,
++		.data = { data, SCP_MSG_CHECK_A, SCP_MSG_CHECK_B },
++	};
++	u32 words[4];
++	int ret;
++	memcpy(words, &msg, sizeof(words));
++	ret = mt6897_scp_ccci_send(words);
++	dev_info(b->dev, "APCCCI TX op=%u data=%#x ret=%d\n", op, data, ret);
++	return ret;
++}
++
++static int bridge_ready_md(struct scp_bridge *b)
++{
++	struct arm_smccc_res res;
++	int ret;
++	if (!b->scp_state || b->init_sent)
++		return 0;
++	if (!b->clocks_on) {
++		ret = clk_bulk_prepare_enable(ARRAY_SIZE(b->clocks), b->clocks);
++		if (ret)
++			return ret;
++		b->clocks_on = true;
++	}
++	arm_smccc_smc(MTK_SIP_KERNEL_CCCI_CONTROL, SCP_CLK_SET_DONE, 0, 0, 0, 0,
++		      0, 0, &res);
++	/* Vendor logs this raw result rather than interpreting it as errno. */
++	dev_info(b->dev, "SCP_CLK_SET_DONE raw=%#lx\n", res.a0);
++	ret = ccci_port_send_msg_to_md(CCCI_SYSTEM_TX, CCISM_SHM_INIT, 0, 1);
++	if (ret >= 0)
++		b->init_sent = true;
++	dev_info(b->dev, "CCISM_SHM_INIT ret=%d\n", ret);
++	return ret;
++}
++
++static struct ccci_smem_region *bridge_region(void)
++{
++	struct ccci_smem_region *r =
++		ccci_md_get_smem_by_user_id(SMEM_USER_CCISM_SCP);
++	void __iomem *parent_v = NULL;
++	phys_addr_t parent = 0, end, parent_end;
++	u32 md, parent_size, original_size, original_md;
++	phys_addr_t original_pa = 0;
++	void __iomem *original_v = NULL;
++	if (!r || !r->base_ap_view_vir || !r->size)
++		return ERR_PTR(-EPROTO);
++	original_size = mtk_ccci_get_smem_by_id(
++		SMEM_USER_CCISM_SCP, &original_v, &original_pa, &original_md);
++	if (r->base_ap_view_phy != original_pa || r->size != original_size ||
++	    r->base_ap_view_vir != original_v ||
++	    r->base_md_view_phy != original_md)
++		return ERR_PTR(-ERANGE);
++	parent_size = mtk_ccci_get_md_nc_smem_inf(&parent_v, &parent, &md);
++	if (!parent_v || !parent_size ||
++	    check_add_overflow(r->base_ap_view_phy, (phys_addr_t)r->size,
++			       &end) ||
++	    check_add_overflow(parent, (phys_addr_t)parent_size, &parent_end) ||
++	    r->base_ap_view_phy < parent || end > parent_end ||
++	    end > (1ULL << 32))
++		return ERR_PTR(-ERANGE);
++	return r;
++}
++
++static int bridge_init_shm(struct scp_bridge *b)
++{
++	struct ccci_smem_region *r = bridge_region();
++	if (IS_ERR(r))
++		return PTR_ERR(r);
++	if (b->shm_sent || !b->init_sent)
++		return -EPROTO;
++	memset_io(r->base_ap_view_vir, 0, r->size);
++	wmb();
++	dev_info(b->dev, "CCISM ACK region=%pa+%#x\n", &r->base_ap_view_phy,
++		 r->size);
++	b->shm_sent = true;
++	return bridge_send(b, CCCI_OP_SHM_INIT, (u32)r->base_ap_view_phy);
++}
++
++static void bridge_work(struct work_struct *work)
++{
++	struct scp_bridge *b = container_of(work, struct scp_bridge, work);
++	struct bridge_event e;
++	struct ccci_fsm_ctl *ctl;
++	unsigned long flags;
++	int ret;
++	for (;;) {
++		spin_lock_irqsave(&b->lock, flags);
++		if (!b->count || b->failed) {
++			spin_unlock_irqrestore(&b->lock, flags);
++			return;
++		}
++		e = b->events[b->head];
++		b->head = (b->head + 1) % BRIDGE_EVENTS;
++		b->count--;
++		spin_unlock_irqrestore(&b->lock, flags);
++		ctl = fsm_get_entity();
++		if (!ctl) {
++			bridge_fail(b, -ENODEV, "FSM readiness");
++			return;
++		}
++		if (READ_ONCE(b->failed))
++			return;
++		ret = 0;
++		switch (e.type) {
++		case BR_BARRIER:
++			complete(&b->barrier);
++			break;
++		case BR_READY:
++			b->scp_state = SCP_CCCI_STATE_BOOTING;
++			complete_all(&b->ready);
++			dev_info(b->dev, "READY22 -> local BOOTING\n");
++			if (READ_ONCE(ctl->md_state) == READY)
++				ret = bridge_ready_md(b);
++			break;
++		case BR_MD:
++			if (e.a == READY)
++				ret = bridge_ready_md(b);
++			else if ((e.a == GATED || e.a == INVALID) &&
++				 b->init_sent &&
++				 !atomic_read(&b->stop_pending)) {
++				reinit_completion(&b->stopped);
++				atomic_set(&b->stop_pending, 1);
++				ret = bridge_send(b, CCCI_OP_MD_STATE,
++						  MD_STATE_INVALID);
++			} else if (e.a == EXCEPTION && b->scp_state)
++				ret = bridge_send(b, CCCI_OP_MD_STATE,
++						  MD_STATE_EXCEPTION);
++			break;
++		case BR_ACK:
++			ret = bridge_init_shm(b);
++			break;
++		case BR_RX:
++			if ((e.a & 0xffff) ||
++			    (e.a >> 16) != CCCI_OP_SCP_STATE ||
++			    e.b < SCP_CCCI_STATE_BOOTING ||
++			    e.b > SCP_CCCI_STATE_STOP) {
++				ret = -EPROTO;
++				break;
++			}
++			dev_info(b->dev, "APCCCI RX state=%u\n", e.b);
++			if (e.b == SCP_CCCI_STATE_RBREADY) {
++				if (!b->shm_sent) {
++					ret = -EPROTO;
++					break;
++				}
++				ret = ccci_port_send_msg_to_md(
++					CCCI_SYSTEM_TX, CCISM_SHM_INIT_DONE, 0,
++					1);
++				if (ret >= 0)
++					ret = bridge_send(
++						b, CCCI_OP_MD_STATE,
++						ccci_fsm_get_md_state_for_user());
++			} else if (e.b == SCP_CCCI_STATE_STOP) {
++				if (atomic_cmpxchg(&b->stop_pending, 1, 3) !=
++					    1 ||
++				    READ_ONCE(ctl->md_state) == READY) {
++					ret = -EPROTO;
++					break;
++				}
++				if (b->clocks_on) {
++					writel(0xffff, b->ap + APCCIF_ACK);
++					writel(0xffff, b->md + APCCIF_ACK);
++					clk_bulk_disable_unprepare(
++						ARRAY_SIZE(b->clocks),
++						b->clocks);
++					b->clocks_on = false;
++				}
++				b->init_sent = false;
++				b->shm_sent = false;
++				atomic_set(&b->stop_pending, 0);
++				complete_all(&b->stopped);
++				dev_info(
++					b->dev,
++					"STOP acknowledged; CCIF2 clocks released\n");
++			} else if (b->scp_state == SCP_CCCI_STATE_RBREADY) {
++				b->init_sent = false;
++				b->shm_sent = false;
++				if (READ_ONCE(ctl->md_state) == READY)
++					ret = bridge_ready_md(b);
++			}
++			b->scp_state = e.b;
++			break;
++		}
++		if (ret < 0)
++			bridge_fail(b, ret, "state transaction");
++		if (ret < 0)
++			return;
++	}
++}
++
++static void bridge_ready(void *data)
++{
++	bridge_enqueue(data, BR_READY, 0, 0);
++}
++static void bridge_receive(void *data, const u32 words[2])
++{
++	bridge_enqueue(data, BR_RX, words[0], words[1]);
++}
++
++void mt6897_ccci_scp_md_state(int state)
++{
++	struct scp_bridge *b = smp_load_acquire(&bridge);
++	if (!b)
++		return;
++	bridge_enqueue(b, BR_MD, state, 0);
++}
++void mt6897_ccci_scp_init_ack(void)
++{
++	struct scp_bridge *b = smp_load_acquire(&bridge);
++	if (b)
++		bridge_enqueue(b, BR_ACK, 0, 0);
++}
++static unsigned long bridge_remaining(unsigned long deadline)
++{
++	return time_before(jiffies, deadline) ? deadline - jiffies : 0;
++}
++int mt6897_ccci_scp_prepare_start(void)
++{
++	struct scp_bridge *b = smp_load_acquire(&bridge);
++	unsigned long deadline = jiffies + msecs_to_jiffies(STOP_TIMEOUT_MS);
++	if (!b)
++		return -ENODEV;
++	if (!wait_for_completion_timeout(&b->ready, bridge_remaining(deadline)))
++		return -ETIMEDOUT;
++	/* A FIFO barrier observes earlier GATED events without unbounded flush_work. */
++	reinit_completion(&b->barrier);
++	bridge_enqueue(b, BR_BARRIER, 0, 0);
++	if (!wait_for_completion_timeout(&b->barrier,
++					 bridge_remaining(deadline)))
++		goto timeout;
++	if (atomic_read(&b->stop_pending) &&
++	    !wait_for_completion_timeout(&b->stopped,
++					 bridge_remaining(deadline)))
++		goto timeout;
++	return READ_ONCE(b->failed) ? -EIO : 0;
++timeout:
++	/*
++	 * A STOP already claimed by the worker is known, not an uncertain late ACK.
++	 * Otherwise forbid future retirement and retain clock references.
++	 */
++	atomic_cmpxchg(&b->stop_pending, 1, 2);
++	bridge_fail(b, -ETIMEDOUT, "start synchronization deadline");
++	return -ETIMEDOUT;
++}
++
++static int bridge_probe(struct platform_device *pdev)
++{
++	struct scp_bridge *b;
++	bool ready;
++	int ret;
++	if (!fsm_get_entity())
++		return -EPROBE_DEFER;
++	if (IS_ERR(bridge_region()))
++		return -ENODEV;
++	if (smp_load_acquire(&bridge))
++		return -EBUSY;
++	b = devm_kzalloc(&pdev->dev, sizeof(*b), GFP_KERNEL);
++	if (!b)
++		return -ENOMEM;
++	b->dev = &pdev->dev;
++	b->ap = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(b->ap))
++		return PTR_ERR(b->ap);
++	b->md = devm_platform_ioremap_resource(pdev, 1);
++	if (IS_ERR(b->md))
++		return PTR_ERR(b->md);
++	b->clocks[0].id = "infra-ccif2-ap";
++	b->clocks[1].id = "infra-ccif2-md";
++	ret = devm_clk_bulk_get(&pdev->dev, ARRAY_SIZE(b->clocks), b->clocks);
++	if (ret)
++		return ret;
++	spin_lock_init(&b->lock);
++	INIT_WORK(&b->work, bridge_work);
++	init_completion(&b->stopped);
++	init_completion(&b->ready);
++	init_completion(&b->barrier);
++	b->client = (struct mt6897_scp_ccci_client){ bridge_ready,
++						     bridge_receive, b };
++	/* Callbacks only queue work, and all state is initialized before registration. */
++	ret = mt6897_scp_ccci_register(&b->client, &ready);
++	if (ret)
++		return ret;
++	smp_store_release(&bridge, b);
++	smp_store_release(&b->active, true);
++	schedule_work(&b->work);
++	if (ready)
++		bridge_ready(b);
++	return 0;
++}
++static const struct of_device_id bridge_of_match[] = {
++	{ .compatible = "mediatek,mt6897-ccci-scp" },
++	{}
++};
++static struct platform_driver bridge_driver = {
++	.probe = bridge_probe,
++	.driver = { .name = "mt6897-ccci-scp",
++		    .of_match_table = bridge_of_match,
++		    .suppress_bind_attrs = true },
++};
++int mt6897_ccci_scp_register(void)
++{
++	return platform_driver_register(&bridge_driver);
++}
+diff --git a/drivers/misc/mediatek/eccci/fsm/mt6897_ccci_scp.h b/drivers/misc/mediatek/eccci/fsm/mt6897_ccci_scp.h
+new file mode 100644
+index 0000000000..0a63ccee34
+--- /dev/null
++++ b/drivers/misc/mediatek/eccci/fsm/mt6897_ccci_scp.h
+@@ -0,0 +1,25 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _MT6897_CCCI_SCP_H
++#define _MT6897_CCCI_SCP_H
++#if IS_ENABLED(CONFIG_MTK_MT6897_CCCI_SCP)
++int mt6897_ccci_scp_register(void);
++void mt6897_ccci_scp_md_state(int state);
++void mt6897_ccci_scp_init_ack(void);
++int mt6897_ccci_scp_prepare_start(void);
++#else
++static inline int mt6897_ccci_scp_register(void)
++{
++	return 0;
++}
++static inline void mt6897_ccci_scp_md_state(int state)
++{
++}
++static inline void mt6897_ccci_scp_init_ack(void)
++{
++}
++static inline int mt6897_ccci_scp_prepare_start(void)
++{
++	return 0;
++}
++#endif
++#endif
+-- 
+2.56.0
+

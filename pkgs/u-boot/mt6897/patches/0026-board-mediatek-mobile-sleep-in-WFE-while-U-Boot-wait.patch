@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Thu, 15 Oct 2026 10:24:55 +0800
+Subject: [PATCH 26/29] board: mediatek-mobile: sleep in WFE while U-Boot waits
+
+U-Boot polls in its wait loops (console, fastboot and ACM, menus), which
+all call schedule(). Enable the generic-timer event stream (about 20 us
+at 13 MHz) and wait for an event from a cyclic function, so the CPU
+mostly sleeps instead of spinning; fastboot download speed is unchanged.
+No interrupt controller setup is needed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../mediatek-mobile/mediatek-mobile.c         | 40 +++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+
+diff --git a/board/mediatek/mediatek-mobile/mediatek-mobile.c b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+index 634d1d4e76f..e7ca42dda96 100644
+--- a/board/mediatek/mediatek-mobile/mediatek-mobile.c
++++ b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+@@ -41,6 +41,7 @@
+ #include <vsprintf.h>
+ #include <watchdog.h>
+ #include <asm/io.h>
++#include <linux/bitfield.h>
+ #include <linux/libfdt.h>
+ #include <linux/sizes.h>
+ #include <linux/string.h>
+@@ -857,6 +858,44 @@ U_BOOT_CMD(rebootmode, 2, 0, do_rebootmode,
+ 	   "reset into a stock bootloader mode",
+ 	   "<mode>  - mode-<mode> of the reboot-mode node, e.g. bootloader");
+ 
++/*
++ * U-Boot polls in its wait loops (console, fastboot and ACM, menus), and
++ * each of them calls schedule(). Wait there for the next generic-timer
++ * event instead of spinning: the event stream fires every 2^(EVNTI + 1)
++ * counter ticks (about 20 us at 13 MHz), so latency stays low while the
++ * CPU mostly sleeps in WFE. No interrupt controller setup is needed.
++ */
++#define MTK_IDLE_EVNTI		7
++#define CNTCTL_EVNTEN		BIT(2)
++#define CNTCTL_EVNTDIR		BIT(3)
++#define CNTCTL_EVNTI		GENMASK(7, 4)
++
++static struct cyclic_info mtk_idle;
++
++static void mtk_idle_wait(struct cyclic_info *c)
++{
++	wfe();
++}
++
++static void mtk_idle_init(void)
++{
++	u64 ctl;
++
++	if (current_el() == 2) {
++		asm volatile("mrs %0, cnthctl_el2" : "=r" (ctl));
++		ctl &= ~(CNTCTL_EVNTDIR | CNTCTL_EVNTI);
++		ctl |= CNTCTL_EVNTEN | FIELD_PREP(CNTCTL_EVNTI, MTK_IDLE_EVNTI);
++		asm volatile("msr cnthctl_el2, %0" : : "r" (ctl));
++	} else {
++		asm volatile("mrs %0, cntkctl_el1" : "=r" (ctl));
++		ctl &= ~(CNTCTL_EVNTDIR | CNTCTL_EVNTI);
++		ctl |= CNTCTL_EVNTEN | FIELD_PREP(CNTCTL_EVNTI, MTK_IDLE_EVNTI);
++		asm volatile("msr cntkctl_el1, %0" : : "r" (ctl));
++	}
++	isb();
++	cyclic_register(&mtk_idle, mtk_idle_wait, 0, "idle");
++}
++
+ int misc_init_r(void)
+ {
+ 	phys_addr_t fastboot;
+@@ -878,6 +917,7 @@ int misc_init_r(void)
+ 	    !mtk_alloc_low(CONFIG_FASTBOOT_BUF_SIZE, SZ_2M, &fastboot))
+ 		env_set_hex("fastboot_addr_r", fastboot);
+ 
++	mtk_idle_init();
+ 	mtk_autoreset_start = get_timer(0);
+ 	cyclic_register(&mtk_autoreset, mtk_autoreset_check, 1000000,
+ 			"autoreset");
+-- 
+2.55.0
+

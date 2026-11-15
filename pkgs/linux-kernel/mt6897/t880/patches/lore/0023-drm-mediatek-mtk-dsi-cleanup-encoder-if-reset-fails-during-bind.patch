@@ -1,0 +1,47 @@
+From afb9a7618eb8382d373fa9a5c3b2fdc3813144a2 Mon Sep 17 00:00:00 2001
+From: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Date: Wed, 16 Sep 2026 13:08:16 +0200
+Subject: [PATCH] drm/mediatek: mtk_dsi: Cleanup encoder if reset fails during
+ bind
+
+When binding the dsi component, the .bind() callback initializes
+the encoder, and then will optionally trigger resets.
+
+Should that last operation fail, binding will as well fail but
+the encoder is never removed from the DRM encoder list and if
+the driver gets removed afterwards, this may crash the kernel
+because of an use-after-free condition.
+
+In order to avoid that, cleanup the encoder upon reset failure.
+
+Fixes: 605c83753d97 ("drm/mediatek: mtk_dsi: Reset the dsi0 hardware")
+Reviewed-by: CK Hu <ck.hu@mediatek.com>
+Signed-off-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Link: https://patchwork.kernel.org/project/linux-mediatek/list/?series=1166385
+[dianqk: from the DSC/DSI/WDMA v9 series, applied to v7.3-rc6; rc6 drift resolved]
+---
+ drivers/gpu/drm/mediatek/mtk_dsi.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_dsi.c b/drivers/gpu/drm/mediatek/mtk_dsi.c
+index 6c60362aef..23c9f1d6ca 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dsi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dsi.c
+@@ -1091,7 +1091,13 @@ static int mtk_dsi_bind(struct device *dev, struct device *master, void *data)
+ 	if (ret)
+ 		return ret;
+ 
+-	return device_reset_optional(dev);
++	ret = device_reset_optional(dev);
++	if (ret) {
++		drm_encoder_cleanup(&dsi->encoder);
++		return ret;
++	}
++
++	return 0;
+ }
+ 
+ static void mtk_dsi_unbind(struct device *dev, struct device *master,
+-- 
+2.56.0
+

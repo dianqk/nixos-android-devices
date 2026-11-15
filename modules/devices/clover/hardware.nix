@@ -1,4 +1,5 @@
 {
+  config,
   lib,
   pkgs,
   androidPackages,
@@ -6,7 +7,6 @@
 }:
 {
   androidDevices = {
-    kernelPackage = lib.mkDefault androidPackages.devices.clover.kernel;
 
     boot.android = {
       base = "0x00000000";
@@ -18,5 +18,8 @@
       dtbs = [ "dtbs/qcom/sdm660-xiaomi-clover.dtb" ];
       maximumBytes = 67108864;
     };
+    # The PM660 RTC (rtc@6000) has neither allow-set-time nor an offset nvmem
+    # cell, so Linux can read but not set it.
+    clock.rtcOffset.enable = lib.mkDefault (!config.androidDevices.recovery.enable);
   };
 }

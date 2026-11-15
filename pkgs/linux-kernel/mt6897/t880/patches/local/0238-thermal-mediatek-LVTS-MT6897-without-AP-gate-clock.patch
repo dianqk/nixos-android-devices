@@ -1,0 +1,120 @@
+From 2c8e266068895a6f063a022d8ceec0e5e7ed0b09 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 11 Nov 2026 04:39:44 +0800
+Subject: [PATCH] thermal: mediatek: lvts: describe MT6897 without an AP gate
+ clock
+
+MT6897's LVTS variant does not require a Linux-controlled gate clock.
+Record this independently of the existing firmware-configured-controller
+flag, and omit the synthetic fixed references from both thermal domains.
+Other variants still acquire their required clock.
+
+The variant distinction follows the MediaTek clock_gate_no_need data;
+keep firmware configuration, calibration, reset and thermal protection
+behavior unchanged.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/thermal/mediatek/soc_temp_lvts.c#L4287-L4321
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ .../bindings/thermal/mediatek,lvts-thermal.yaml   | 15 ++++++++++++++-
+ arch/arm64/boot/dts/mediatek/mt6897.dtsi          |  2 --
+ drivers/thermal/mediatek/lvts_thermal.c           | 12 +++++++++---
+ 3 files changed, 23 insertions(+), 6 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/thermal/mediatek,lvts-thermal.yaml b/Documentation/devicetree/bindings/thermal/mediatek,lvts-thermal.yaml
+index 72417896fb..8703587ace 100644
+--- a/Documentation/devicetree/bindings/thermal/mediatek,lvts-thermal.yaml
++++ b/Documentation/devicetree/bindings/thermal/mediatek,lvts-thermal.yaml
+@@ -110,11 +110,24 @@ allOf:
+       required:
+         - resets
+ 
++  - if:
++      properties:
++        compatible:
++          contains:
++            enum:
++              - mediatek,mt6897-lvts-ap
++              - mediatek,mt6897-lvts-mcu
++    then:
++      properties:
++        clocks: false
++    else:
++      required:
++        - clocks
++
+ required:
+   - compatible
+   - reg
+   - interrupts
+-  - clocks
+   - nvmem-cells
+   - nvmem-cell-names
+ 
+diff --git a/arch/arm64/boot/dts/mediatek/mt6897.dtsi b/arch/arm64/boot/dts/mediatek/mt6897.dtsi
+index c5fd109aaa..a64bd1e8ba 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6897.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6897.dtsi
+@@ -1056,7 +1056,6 @@ lvts_ap: thermal-sensor@10315000 {
+ 			compatible = "mediatek,mt6897-lvts-ap";
+ 			reg = <0x0 0x10315000 0x0 0x1000>;
+ 			interrupts = <GIC_SPI 264 IRQ_TYPE_LEVEL_HIGH 0>;
+-			clocks = <&clk26m>;
+ 			nvmem-cells = <&lvts_efuse_data1>, <&lvts_efuse_data2>;
+ 			nvmem-cell-names = "lvts-calib-data-1", "lvts-calib-data-2";
+ 			#thermal-sensor-cells = <1>;
+@@ -1066,7 +1065,6 @@ lvts_mcu: thermal-sensor@10316000 {
+ 			compatible = "mediatek,mt6897-lvts-mcu";
+ 			reg = <0x0 0x10316000 0x0 0x1000>;
+ 			interrupts = <GIC_SPI 265 IRQ_TYPE_LEVEL_HIGH 0>;
+-			clocks = <&clk26m>;
+ 			nvmem-cells = <&lvts_efuse_data1>, <&lvts_efuse_data2>;
+ 			nvmem-cell-names = "lvts-calib-data-1", "lvts-calib-data-2";
+ 			#thermal-sensor-cells = <1>;
+diff --git a/drivers/thermal/mediatek/lvts_thermal.c b/drivers/thermal/mediatek/lvts_thermal.c
+index 236110143c..4578adc848 100644
+--- a/drivers/thermal/mediatek/lvts_thermal.c
++++ b/drivers/thermal/mediatek/lvts_thermal.c
+@@ -177,6 +177,7 @@ struct lvts_data {
+ 	 * hardware protection): only read the temperatures, never write.
+ 	 */
+ 	bool fw_config;
++	bool no_clock;
+ };
+ 
+ struct lvts_sensor {
+@@ -1557,9 +1558,12 @@ static int lvts_probe(struct platform_device *pdev)
+ 	if (!lvts_data)
+ 		return -ENODEV;
+ 
+-	lvts_td->clk = devm_clk_get_enabled(dev, NULL);
+-	if (IS_ERR(lvts_td->clk))
+-		return dev_err_probe(dev, PTR_ERR(lvts_td->clk), "Failed to retrieve clock\n");
++	if (!lvts_data->no_clock) {
++		lvts_td->clk = devm_clk_get_enabled(dev, NULL);
++		if (IS_ERR(lvts_td->clk))
++			return dev_err_probe(dev, PTR_ERR(lvts_td->clk),
++					     "Failed to retrieve clock\n");
++	}
+ 
+ 	res = platform_get_mem_or_io(pdev, 0);
+ 	if (!res)
+@@ -2403,6 +2407,7 @@ static const struct lvts_data mt6897_lvts_mcu_data = {
+ 	.gt_calib_bit_offset = 0,
+ 	.num_cal_offsets = LVTS_NUM_CAL_OFFSETS_MT8196,
+ 	.fw_config	= true,
++	.no_clock	= true,
+ 	.ops = &lvts_platform_ops_mt6897,
+ };
+ 
+@@ -2413,6 +2418,7 @@ static const struct lvts_data mt6897_lvts_ap_data = {
+ 	.gt_calib_bit_offset = 0,
+ 	.num_cal_offsets = LVTS_NUM_CAL_OFFSETS_MT8196,
+ 	.fw_config	= true,
++	.no_clock	= true,
+ 	.ops = &lvts_platform_ops_mt6897,
+ };
+ 
+-- 
+2.56.0
+

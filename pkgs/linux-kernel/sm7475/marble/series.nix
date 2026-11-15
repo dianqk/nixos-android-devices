@@ -1,0 +1,107 @@
+[
+  ./patches/linux-marble/0001-FROMLIST-dt-bindings-pinctrl-qcom-sm8450-tlmm-Add-co.patch
+  ./patches/linux-marble/0002-FROMLIST-pinctrl-qcom-Add-SM8475-pinctrl-driver.patch
+  ./patches/linux-marble/0003-cpufreq-Add-SM8475-to-cpufreq-dt-platdev-blocklist.patch
+  ./patches/linux-marble/0005-arm64-dts-qcom-sm8450-Add-clock-names-to-mdss.patch
+  ./patches/linux-marble/0006-arm64-dts-qcom-sm8450-Add-LOW_SVS_L2-RPMhPD-OPP-leve.patch
+  ./patches/linux-marble/0007-arm64-dts-sm8450-add-bias-and-drive-strength-configu.patch
+  ./patches/linux-marble/0008-arm64-dts-qcom-Add-SM8475-device-tree.patch
+  ./patches/linux-marble/0009-arm64-dts-qcom-sm8475-Add-correct-GPU-opp-table.patch
+  ./patches/linux-marble/0010-soc-qcom-pd_mapper-Add-SM8475-compatible.patch
+  ./patches/linux-marble/0011-soc-qcom-ubwc-add-SM8475-support.patch
+  ./patches/linux-marble/0012-PCI-qcom-honour-iommu-cells-when-parsing-iommu-map-f.patch
+  ./patches/linux-marble/0013-dt-bindings-interconnect-qcom-osm-l3-add-SM8450-comp.patch
+  ./patches/linux-marble/0014-arm64-dts-qcom-sm8475-add-CPU-capacity-and-power-coe.patch
+  ./patches/linux-marble/0015-clk-qcom-sm8450-poll-USB-GDSC-and-keep-UFS-PHY-GDSC-.patch
+  ./patches/linux-marble/0016-drm-panel-add-Xiaomi-Poco-F5-marble-Novatek-M16T-pan.patch
+  ./patches/linux-marble/0017-drm-msm-support-DSC-slice-per-packet-and-10bpc-pclk-.patch
+  ./patches/linux-marble/0018-drm-msm-dpu-improvements-for-video-mode-DSC-and-1-1-.patch
+  ./patches/linux-marble/0019-power-supply-qcom_battmgr-add-SM8475-support-and-Xia.patch
+  ./patches/linux-marble/0020-ASoC-codecs-aw88261-add-support-for-AW88263S-amplifi.patch
+  ./patches/linux-marble/0021-iommu-arm-smmu-qcom-support-secure-non-pixel-context.patch
+  ./patches/linux-marble/0022-media-qcom-iris-add-SM8450-SM8475-VPU2-encoder-and-d.patch
+  ./patches/linux-marble/0023-net-ipa-add-IPA-v5.1-support-for-SM8450-SM8475.patch
+  ./patches/linux-marble/0024-input-misc-add-Qualcomm-PM8350B-SPMI-haptics-driver.patch
+  ./patches/linux-marble/0025-mfd-qcom-pm8008-make-interrupt-optional-for-camera-L.patch
+  ./patches/linux-marble/0026-arm64-dts-qcom-sm8450-add-EPSS-L3-iris-and-IPA-nodes.patch
+  ./patches/linux-marble/0027-arm64-dts-qcom-add-Device-Tree-for-Xiaomi-Poco-F5-ma.patch
+  ./patches/linux-marble/0028-soc-qcom-apr-validate-GPR-frames-and-drain-released-.patch
+  ./patches/linux-marble/0029-ASoC-qcom-audioreach-support-voice-graph-descriptors.patch
+  ./patches/linux-marble/0030-ASoC-qcom-q6apm-preserve-graph-and-mapping-ownership.patch
+  ./patches/linux-marble/0031-ASoC-qcom-q6apm-add-hostless-graph-transport.patch
+  ./patches/linux-marble/0032-ASoC-qcom-q6apm-dai-retain-DMA-until-DSP-teardown-co.patch
+  ./patches/linux-marble/0033-ASoC-qcom-q6dsp-advertise-96-kHz-TDM-playback.patch
+  ./patches/linux-marble/0036-ASoC-aw88261-retain-per-profile-volume-and-playback-.patch
+  ./patches/linux-marble/0037-dt-bindings-sound-qcom-describe-speaker-earpiece-rou.patch
+  ./patches/linux-marble/0038-ASoC-qcom-q6apm-add-hostless-voice-session-control.patch
+  ./patches/linux-marble/0039-arm64-dts-qcom-marble-assign-earpiece-GPIO-to-sound-.patch
+  ./patches/linux-marble/0043-ASoC-qcom-audioreach-align-shared-memory-read-done-v.patch
+  ./patches/linux-marble/0044-ASoC-qcom-q6apm-stop-latching-topology_uncertain-on-.patch
+  ./patches/linux-marble/0045-ASoC-qcom-q6apm-voice-drop-and-free-PCM-on-backend-c.patch
+  ./patches/local/0046-media-qcom-iris-adapt-the-SM8450-SM8475-VPU2-support.patch
+  ./patches/local/0047-marble-m16t-36-0d-0b-panel.patch
+  ../../sm8475/asphalt/patches/upstream/0020-lucid-ole-preserve-enabled-pll.patch
+  ../../patches/iris-hfi-gen2-decode-order.patch
+  ../../patches/iris-hfi-gen2-capture-pool.patch
+  ./patches/local/0051-media-qcom-iris-apply-msm_vidc-rate-control-conditio.patch
+  ./patches/local/0052-audioreach-legacy-tdm-topology.patch
+  ./patches/local/0054-marble-speaker-tdm-card.patch
+  ./patches/local/0064-marble-tdm-clock-and-dcodec-vote.patch
+  ./patches/local/0075-marble-three-channel-tdm.patch
+  ../../patches/ssc-fastrpc-pdr.patch
+  ./patches/local/0078-arm64-dts-qcom-sm8475-xiaomi-marble-subscribe-to-the.patch
+  ./patches/local/0079-arm64-dts-qcom-sm8475-xiaomi-marble-enable-the-PMK83.patch
+  ../../patches/gmu-sync-state/0001.patch
+  ../../patches/gmu-sync-state/0002.patch
+  ../../patches/gmu-sync-state/0003.patch
+  ../../patches/gmu-sync-state/0004.patch
+  ../../patches/gmu-sync-state/0005.patch
+  ./patches/local/0080-arm64-dts-qcom-sm8475-xiaomi-marble-disable-unsuppor.patch
+  ./patches/local/0081-scsi-ufs-qcom-Power-down-the-controller-device-durin.patch
+  ./patches/upstream/0082-dt-bindings-clock-qcom-gcc-sm8450-Add-CX-power-domai.patch
+  ./patches/upstream/0083-clk-qcom-gcc-sm8450-Tie-the-CX-power-domain-to-contr.patch
+  ./patches/upstream/0084-arm64-dts-qcom-sm8450-Add-GCC-CX-power-domain.patch
+  ./patches/local/0085-phy-qcom-qmp-ufs-program-the-full-SM8475-init-sequen.patch
+  ./patches/local/0086-clk-qcom-gcc-sm8450-source-the-SM8475-850-MHz-UFS-cl.patch
+  ./patches/local/0087-dt-bindings-ufs-qcom-sc7180-ufshc-Add-SM8475-UFS-con.patch
+  ./patches/local/0088-scsi-ufs-qcom-Add-the-SM8475-turbo-mode-configuratio.patch
+  ./patches/local/0089-arm64-dts-qcom-sm8475-describe-UFS-operating-points-.patch
+  ./patches/local/0091-sm8450-ufs-phy-gdsc-retention.patch
+  ../../patches/iris-hfi-gen2-deblocking.patch
+  ../../patches/iris-hfi-gen2-error-timestamps.patch
+  ../../patches/iris-hfi-gen2-noshow.patch
+  ./patches/local/0094-iris-vpu2-capture-pool.patch
+  # Cameras. SM8450 CAMSS and camera clock fixes from sm-x800-linux (as
+  # on the Y700 2023), the CSIPHY lane mask for one-lane sensors and the
+  # stream start/stop unwind.
+  ../../sm8475/asphalt/patches/sm-x800-linux/0012-sm8450-camss.patch
+  ../../sm8475/asphalt/patches/sm-x800-linux/0013-camcc-shared-rcg.patch
+  ../../sm8475/asphalt/patches/sm-x800-linux/0017-camcc-retain-ff.patch
+  ./patches/local/0095-media-qcom-camss-keep-the-SM8450-CSIPHY-lane-mask.patch
+  ../../patches/camss-stream-unwind.patch
+  # Upstream series (v9): CAMSS C-PHY support. The SM8450 lane table
+  # moves to the per-PHY selection the series introduces.
+  ../../patches/camss-cphy/0001.patch
+  ../../patches/camss-cphy/0002.patch
+  ../../patches/camss-cphy/0003.patch
+  ../../patches/camss-cphy/0004.patch
+  ./patches/local/0096-media-qcom-camss-drop-SM8450-from-the-CSIPHY-init-la.patch
+  ../../patches/camss-cphy/0005.patch
+  ../../patches/camss-cphy/0006.patch
+  ../../patches/camss-cphy/0007.patch
+  ../../patches/camss-cphy/0008.patch
+  ../../patches/camss-cphy/0009.patch
+  ./patches/local/0097-media-qcom-camss-select-the-SM8450-CSIPHY-lane-table.patch
+  ../../patches/camss-csiphy-cphy-clock.patch
+  # C-PHY on CSID 680 and SM8450-class C-PHY lane settings.
+  ./patches/local/0098-media-qcom-camss-select-C-PHY-on-CSID-680.patch
+  ./patches/local/0099-media-qcom-camss-csiphy-3ph-add-SM8450-C-PHY-lane-se.patch
+  # GalaxyCore GC02M1 (macro), Samsung S5K3P9 (front) and OmniVision
+  # OV64B40 (wide) drivers with fixed modes; board camera wiring.
+  ./patches/local/0100-media-i2c-add-a-GalaxyCore-GC02M1-driver.patch
+  ./patches/local/0101-media-i2c-add-a-Samsung-S5K3P9-driver.patch
+  ./patches/local/0102-media-i2c-add-an-OmniVision-OV64B40-driver.patch
+  ./patches/local/0103-arm64-dts-qcom-sm8475-xiaomi-marble-wire-the-cameras.patch
+  # USB port type (CDP/DCP/SDP) from the SM8475 battery manager firmware.
+  ./patches/local/0104-power-supply-qcom_battmgr-report-the-SM8475-USB-port.patch
+]

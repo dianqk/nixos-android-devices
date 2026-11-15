@@ -1,0 +1,647 @@
+From 9dbc58f17242b0c1f9ee924ee6f16af19ce526a2 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 7 Nov 2026 02:32:38 +0800
+Subject: [PATCH] drm/mediatek: account MT6897 MMSYS and mutex runtime power
+
+MT6897 MMSYS and mutex devices remain runtime-PM disabled even after their active consumers release clocks. Genpd counts each as not suspended, preventing ordinary domain-off and physical-off ownership observation.
+
+Enable managed runtime PM only for the MT6897 data entries. Publish MMSYS children after PM setup, preserve managed child-before-PM cleanup, and guard optional stored clock child unregisters. Each mutex prepare obtains runtime PM before its clock and rolls back locally on clock failure; unprepare releases the clock first.
+
+Unwind only successfully prepared CRTC mutexes if a later controller fails, while retaining full-set cleanup for subsequent initialization errors. Add extracted-function sanitizer tests for ownership and probe/error cleanup. CMDQ shutdown/quiescence safety remains a separate requirement before hardware activation.
+---
+ drivers/gpu/drm/mediatek/mtk_crtc.c           |  29 ++-
+ drivers/soc/mediatek/mtk-mmsys.c              |  23 ++-
+ drivers/soc/mediatek/mtk-mmsys.h              |   2 +
+ drivers/soc/mediatek/mtk-mutex.c              |  25 ++-
+ tools/testing/selftests/mtk_clk/Makefile      |   4 +-
+ .../selftests/mtk_clk/display_pm_cases.c      | 128 +++++++++++++
+ .../selftests/mtk_clk/mmsys_pm_cases.c        | 168 ++++++++++++++++++
+ .../selftests/mtk_clk/test_display_pm.py      |  60 +++++++
+ 8 files changed, 425 insertions(+), 14 deletions(-)
+ create mode 100644 tools/testing/selftests/mtk_clk/display_pm_cases.c
+ create mode 100644 tools/testing/selftests/mtk_clk/mmsys_pm_cases.c
+ create mode 100755 tools/testing/selftests/mtk_clk/test_display_pm.py
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_crtc.c b/drivers/gpu/drm/mediatek/mtk_crtc.c
+index c831f76516..cf3b0b6ae1 100644
+--- a/drivers/gpu/drm/mediatek/mtk_crtc.c
++++ b/drivers/gpu/drm/mediatek/mtk_crtc.c
+@@ -575,6 +575,25 @@ static void mtk_crtc_follower_sof(struct mtk_crtc *mtk_crtc, bool set)
+ 				   mtk_crtc->shadow_comp_nr, &done, set);
+ }
+ 
++static int mtk_crtc_mutex_prepare(struct mtk_crtc *mtk_crtc)
++{
++	int i, ret;
++
++	for (i = 0; i < mtk_crtc->num_controllers; i++) {
++		ret = mtk_mutex_prepare(mtk_crtc->mutex[i]);
++		if (ret < 0) {
++			drm_err(mtk_crtc->base.dev, "Failed to prepare mutex %d: %d\n", i, ret);
++			goto err;
++		}
++	}
++
++	return 0;
++err:
++	while (--i >= 0)
++		mtk_mutex_unprepare(mtk_crtc->mutex[i]);
++	return ret;
++}
++
+ static int mtk_crtc_ddp_hw_init(struct mtk_crtc *mtk_crtc)
+ {
+ 	struct drm_crtc *crtc = &mtk_crtc->base;
+@@ -619,13 +638,9 @@ static int mtk_crtc_ddp_hw_init(struct mtk_crtc *mtk_crtc)
+ 		return ret;
+ 	}
+ 
+-	for (i = 0; i < mtk_crtc->num_controllers; i++) {
+-		ret = mtk_mutex_prepare(mtk_crtc->mutex[i]);
+-		if (ret < 0) {
+-			drm_err(dev, "Failed to enable mutex clock: %d\n", ret);
+-			goto err_pm_runtime_put;
+-		}
+-	}
++	ret = mtk_crtc_mutex_prepare(mtk_crtc);
++	if (ret)
++		goto err_pm_runtime_put;
+ 
+ 	ret = mtk_crtc_ddp_clk_enable(mtk_crtc);
+ 	if (ret < 0) {
+diff --git a/drivers/soc/mediatek/mtk-mmsys.c b/drivers/soc/mediatek/mtk-mmsys.c
+index 0ed1906a94..2f1b89b293 100644
+--- a/drivers/soc/mediatek/mtk-mmsys.c
++++ b/drivers/soc/mediatek/mtk-mmsys.c
+@@ -14,6 +14,7 @@
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ #include <linux/reset-controller.h>
+ #include <linux/soc/mediatek/mtk-mmsys.h>
+ 
+@@ -63,18 +64,21 @@ static const struct mtk_mmsys_driver_data mt6797_mmsys_driver_data = {
+  * clock controller nodes, so no clk_driver here.
+  */
+ static const struct mtk_mmsys_driver_data mt6897_dispsys0_driver_data = {
++	.runtime_pm = true,
+ 	.routes = mmsys_mt6897_dispsys0_routing_table,
+ 	.num_routes = ARRAY_SIZE(mmsys_mt6897_dispsys0_routing_table),
+ 	.bypass_mux_shadow = MT6897_DISPSYS_BYPASS_MUX_SHADOW,
+ };
+ 
+ static const struct mtk_mmsys_driver_data mt6897_dispsys1_driver_data = {
++	.runtime_pm = true,
+ 	.routes = mmsys_mt6897_dispsys1_routing_table,
+ 	.num_routes = ARRAY_SIZE(mmsys_mt6897_dispsys1_routing_table),
+ 	.bypass_mux_shadow = MT6897_DISPSYS_BYPASS_MUX_SHADOW,
+ };
+ 
+ static const struct mtk_mmsys_driver_data mt6897_ovlsys_driver_data = {
++	.runtime_pm = true,
+ 	.routes = mmsys_mt6897_ovlsys_routing_table,
+ 	.num_routes = ARRAY_SIZE(mmsys_mt6897_ovlsys_routing_table),
+ 	.bypass_mux_shadow = MT6897_OVLSYS_BYPASS_MUX_SHADOW,
+@@ -512,6 +516,13 @@ static int mtk_mmsys_probe(struct platform_device *pdev)
+ 
+ 	platform_set_drvdata(pdev, mmsys);
+ 
++	/* Children must be removed before managed runtime PM is disabled. */
++	if (mmsys->data->runtime_pm) {
++		ret = devm_pm_runtime_enable(dev);
++		if (ret)
++			return ret;
++	}
++
+ 	/* Controllers whose clocks come from separate controller nodes have none */
+ 	if (mmsys->data->clk_driver) {
+ 		clks = platform_device_register_data(&pdev->dev, mmsys->data->clk_driver,
+@@ -524,7 +535,8 @@ static int mtk_mmsys_probe(struct platform_device *pdev)
+ 	ret = devm_of_platform_populate(dev);
+ 	if (ret) {
+ 		dev_err(dev, "Failed to populate child devices: %d\n", ret);
+-		platform_device_unregister(clks);
++		if (mmsys->clks_pdev)
++			platform_device_unregister(mmsys->clks_pdev);
+ 		return ret;
+ 	}
+ 
+@@ -534,7 +546,8 @@ static int mtk_mmsys_probe(struct platform_device *pdev)
+ 	drm = platform_device_register_data(&pdev->dev, "mediatek-drm",
+ 					    PLATFORM_DEVID_AUTO, NULL, 0);
+ 	if (IS_ERR(drm)) {
+-		platform_device_unregister(clks);
++		if (mmsys->clks_pdev)
++			platform_device_unregister(mmsys->clks_pdev);
+ 		return PTR_ERR(drm);
+ 	}
+ 	mmsys->drm_pdev = drm;
+@@ -547,8 +560,10 @@ static void mtk_mmsys_remove(struct platform_device *pdev)
+ {
+ 	struct mtk_mmsys *mmsys = platform_get_drvdata(pdev);
+ 
+-	platform_device_unregister(mmsys->drm_pdev);
+-	platform_device_unregister(mmsys->clks_pdev);
++	if (mmsys->drm_pdev)
++		platform_device_unregister(mmsys->drm_pdev);
++	if (mmsys->clks_pdev)
++		platform_device_unregister(mmsys->clks_pdev);
+ }
+ 
+ static const struct of_device_id of_match_mtk_mmsys[] = {
+diff --git a/drivers/soc/mediatek/mtk-mmsys.h b/drivers/soc/mediatek/mtk-mmsys.h
+index e505831990..33ea391e1b 100644
+--- a/drivers/soc/mediatek/mtk-mmsys.h
++++ b/drivers/soc/mediatek/mtk-mmsys.h
+@@ -115,6 +115,7 @@ struct mtk_mmsys_routes {
+  * @num_resets: Number of reset bits that are defined
+  * @is_vppsys: Whether the mmsys is VPPSYS (Video Processing Pipe)
+  *             or VDOSYS (Video). Only VDOSYS needs to be added to drm driver.
++ * @runtime_pm: Participate in runtime PM for domain-managed MT6897 MMSYS.
+  * @vsync_len: VSYNC length of the MIXER.
+  *             VSYNC is usually triggered by the connector, so its length is a
+  *             fixed value when the frame rate is decided, but ETHDR and
+@@ -140,6 +141,7 @@ struct mtk_mmsys_driver_data {
+ 	const u8 *rst_tb;
+ 	const u32 num_resets;
+ 	const bool is_vppsys;
++	const bool runtime_pm;
+ 	const u8 vsync_len;
+ 	/*
+ 	 * @bypass_mux_shadow: offset of the crossbar shadow control, or 0.
+diff --git a/drivers/soc/mediatek/mtk-mutex.c b/drivers/soc/mediatek/mtk-mutex.c
+index 5a7364ac71..47b6edb51f 100644
+--- a/drivers/soc/mediatek/mtk-mutex.c
++++ b/drivers/soc/mediatek/mtk-mutex.c
+@@ -8,6 +8,7 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ #include <linux/regmap.h>
+ #include <linux/soc/mediatek/mtk-mmsys.h>
+ #include <linux/soc/mediatek/mtk-mutex.h>
+@@ -371,6 +372,7 @@ struct mtk_mutex_data {
+ 	const u16 mutex_mod1_reg;
+ 	const u16 mutex_sof_reg;
+ 	const bool no_clk;
++	const bool runtime_pm;
+ };
+ 
+ struct mtk_mutex_ctx {
+@@ -774,6 +776,7 @@ static const u16 mt6897_ovlsys_mutex_sof[DDP_MUTEX_SOF_MAX] = {
+ 
+ /* The module bits come from the trigger-sources of the components. */
+ static const struct mtk_mutex_data mt6897_dispsys0_mutex_driver_data = {
++	.runtime_pm = true,
+ 	.mutex_sof = mt6897_dispsys0_mutex_sof,
+ 	.mutex_mod_reg = MT8183_MUTEX0_MOD0,
+ 	.mutex_mod1_reg = MT8183_MUTEX0_MOD1,
+@@ -781,6 +784,7 @@ static const struct mtk_mutex_data mt6897_dispsys0_mutex_driver_data = {
+ };
+ 
+ static const struct mtk_mutex_data mt6897_dispsys1_mutex_driver_data = {
++	.runtime_pm = true,
+ 	.mutex_sof = mt6897_dispsys1_mutex_sof,
+ 	.mutex_mod_reg = MT8183_MUTEX0_MOD0,
+ 	.mutex_mod1_reg = MT8183_MUTEX0_MOD1,
+@@ -788,6 +792,7 @@ static const struct mtk_mutex_data mt6897_dispsys1_mutex_driver_data = {
+ };
+ 
+ static const struct mtk_mutex_data mt6897_ovlsys_mutex_driver_data = {
++	.runtime_pm = true,
+ 	.mutex_sof = mt6897_ovlsys_mutex_sof,
+ 	.mutex_mod_reg = MT8183_MUTEX0_MOD0,
+ 	.mutex_mod1_reg = MT8183_MUTEX0_MOD1,
+@@ -939,7 +944,19 @@ int mtk_mutex_prepare(struct mtk_mutex *mutex)
+ {
+ 	struct mtk_mutex_ctx *mtx = container_of(mutex, struct mtk_mutex_ctx,
+ 						 mutex[mutex->id]);
+-	return clk_prepare_enable(mtx->clk);
++	int ret;
++
++	if (mtx->data->runtime_pm) {
++		ret = pm_runtime_resume_and_get(mtx->dev);
++		if (ret < 0)
++			return ret;
++	}
++
++	ret = clk_prepare_enable(mtx->clk);
++	if (ret && mtx->data->runtime_pm)
++		pm_runtime_put(mtx->dev);
++
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(mtk_mutex_prepare);
+ 
+@@ -948,6 +965,8 @@ void mtk_mutex_unprepare(struct mtk_mutex *mutex)
+ 	struct mtk_mutex_ctx *mtx = container_of(mutex, struct mtk_mutex_ctx,
+ 						 mutex[mutex->id]);
+ 	clk_disable_unprepare(mtx->clk);
++	if (mtx->data->runtime_pm)
++		pm_runtime_put(mtx->dev);
+ }
+ EXPORT_SYMBOL_GPL(mtk_mutex_unprepare);
+ 
+@@ -1259,8 +1278,12 @@ static int mtk_mutex_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		dev_dbg(dev, "No mediatek,gce-client-reg!\n");
+ 
++	mtx->dev = dev;
+ 	platform_set_drvdata(pdev, mtx);
+ 
++	if (mtx->data->runtime_pm)
++		return devm_pm_runtime_enable(dev);
++
+ 	return 0;
+ }
+ 
+diff --git a/tools/testing/selftests/mtk_clk/Makefile b/tools/testing/selftests/mtk_clk/Makefile
+index 3ce43476bd..5dbde15742 100644
+--- a/tools/testing/selftests/mtk_clk/Makefile
++++ b/tools/testing/selftests/mtk_clk/Makefile
+@@ -1,4 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-TEST_PROGS := test_mt6897.py test_domains.py test_boot_owner.py test_directlink.py
+-TEST_FILES := mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c ven_cases.c boot_stubs.h boot_cases.c directlink_cases.c
++TEST_PROGS := test_mt6897.py test_domains.py test_boot_owner.py test_directlink.py test_display_pm.py
++TEST_FILES := mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c ven_cases.c boot_stubs.h boot_cases.c directlink_cases.c display_pm_cases.c mmsys_pm_cases.c
+ include ../lib.mk
+diff --git a/tools/testing/selftests/mtk_clk/display_pm_cases.c b/tools/testing/selftests/mtk_clk/display_pm_cases.c
+new file mode 100644
+index 0000000000..384a532e97
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/display_pm_cases.c
+@@ -0,0 +1,128 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <assert.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <errno.h>
++#define container_of(ptr, type, member) ((type *)((char *)(ptr) - offsetof(type, member)))
++#define drm_err(dev, ...) ((void)(dev))
++struct device { int id, refs, error; };
++struct clk { int id, refs, error; };
++struct mtk_mutex { int id; };
++struct mtk_mutex_data { bool runtime_pm; };
++struct mtk_mutex_ctx {
++	struct device *dev;
++	struct clk *clk;
++	struct mtk_mutex mutex[3];
++	const struct mtk_mutex_data *data;
++};
++struct mtk_crtc {
++	struct { struct device *dev; } base;
++	int num_controllers;
++	struct mtk_mutex *mutex[3];
++};
++static int events[128], count;
++static int pm_runtime_resume_and_get(struct device *dev)
++{
++	events[count++] = 10 + dev->id;
++	if (dev->error)
++		return dev->error;
++	dev->refs++;
++	return 0;
++}
++static void pm_runtime_put(struct device *dev)
++{
++	events[count++] = -10 - dev->id;
++	assert(dev->refs > 0);
++	dev->refs--;
++}
++static int clk_prepare_enable(struct clk *clk)
++{
++	events[count++] = 20 + clk->id;
++	if (clk->error)
++		return clk->error;
++	clk->refs++;
++	return 0;
++}
++static void clk_disable_unprepare(struct clk *clk)
++{
++	events[count++] = -20 - clk->id;
++	assert(clk->refs > 0);
++	clk->refs--;
++}
++/* PRODUCTION */
++
++static void check_events(const int *expected, int n)
++{
++	assert(count == n);
++	for (int i = 0; i < n; i++)
++		assert(events[i] == expected[i]);
++	count = 0;
++}
++
++int main(void)
++{
++	struct mtk_mutex_data selected = { true }, other = { false };
++	struct device dev[3] = { { .id = 0 }, { .id = 1 }, { .id = 2 } };
++	struct clk clk[3] = { { .id = 0 }, { .id = 1 }, { .id = 2 } };
++	struct mtk_mutex_ctx ctx[3];
++	struct mtk_crtc crtc = { .base.dev = &dev[0], .num_controllers = 3 };
++
++	for (int i = 0; i < 3; i++) {
++		ctx[i] = (struct mtk_mutex_ctx){ .dev = &dev[i], .clk = &clk[i], .data = &selected };
++		for (int j = 0; j < 3; j++)
++			ctx[i].mutex[j].id = j;
++		crtc.mutex[i] = &ctx[i].mutex[i];
++	}
++	dev[0].error = -EIO;
++	assert(mtk_mutex_prepare(crtc.mutex[0]) == -EIO);
++	assert(dev[0].refs == 0 && clk[0].refs == 0);
++	check_events((int[]){ 10 }, 1);
++	dev[0].error = 0;
++	clk[0].error = -ETIMEDOUT;
++	assert(mtk_mutex_prepare(crtc.mutex[0]) == -ETIMEDOUT);
++	assert(dev[0].refs == 0 && clk[0].refs == 0);
++	check_events((int[]){ 10, 20, -10 }, 3);
++	clk[0].error = 0;
++
++	assert(mtk_mutex_prepare(&ctx[0].mutex[0]) == 0);
++	assert(mtk_mutex_prepare(&ctx[0].mutex[1]) == 0);
++	assert(dev[0].refs == 2 && clk[0].refs == 2);
++	mtk_mutex_unprepare(&ctx[0].mutex[1]);
++	assert(dev[0].refs == 1 && clk[0].refs == 1);
++	mtk_mutex_unprepare(&ctx[0].mutex[0]);
++	check_events((int[]){ 10, 20, 10, 20, -20, -10, -20, -10 }, 8);
++
++	for (int clock_failure = 0; clock_failure < 2; clock_failure++) {
++		for (int failed = 0; failed < 3; failed++) {
++			if (clock_failure)
++				clk[failed].error = -EIO;
++			else
++				dev[failed].error = -EIO;
++			assert(mtk_crtc_mutex_prepare(&crtc) == -EIO);
++			for (int i = 0; i < 3; i++)
++				assert(dev[i].refs == 0 && clk[i].refs == 0);
++			/* Failed prepare handles itself; CRTC drops successful prefix. */
++			assert(count == failed * 4 + (clock_failure ? 3 : 1));
++			assert(events[count - 1] == (failed ? -10 : (clock_failure ? -10 : 10)));
++			count = 0;
++			clk[failed].error = 0;
++			dev[failed].error = 0;
++		}
++	}
++	assert(mtk_crtc_mutex_prepare(&crtc) == 0);
++	for (int i = 0; i < 3; i++)
++		mtk_mutex_unprepare(crtc.mutex[i]);
++	for (int i = 0; i < 3; i++)
++		assert(dev[i].refs == 0 && clk[i].refs == 0);
++	count = 0;
++
++	ctx[0].data = &other;
++	dev[0].error = -EIO;
++	assert(mtk_mutex_prepare(crtc.mutex[0]) == 0);
++	mtk_mutex_unprepare(crtc.mutex[0]);
++	assert(dev[0].refs == 0 && clk[0].refs == 0);
++	check_events((int[]){ 20, -20 }, 2);
++	puts("MT6897 mutex PM/clock order, local failures, shared handles and CRTC prefix unwind passed");
++	return 0;
++}
+diff --git a/tools/testing/selftests/mtk_clk/mmsys_pm_cases.c b/tools/testing/selftests/mtk_clk/mmsys_pm_cases.c
+new file mode 100644
+index 0000000000..e64a3491f0
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/mmsys_pm_cases.c
+@@ -0,0 +1,168 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <errno.h>
++#define GFP_KERNEL 0
++#define THIS_MODULE NULL
++#define PLATFORM_DEVID_AUTO 0
++#define IS_ERR(p) ((uintptr_t)(p) > (uintptr_t)-4096)
++#define PTR_ERR(p) ((int)(intptr_t)(p))
++#define ERR_PTR(e) ((void *)(intptr_t)(e))
++#define dev_err(...) ((void)0)
++#define dev_dbg(...) ((void)0)
++#define spin_lock_init(...) ((void)0)
++struct device { void *of_node, *data; };
++struct platform_device { struct device dev; int kind; };
++struct mtk_mmsys_driver_data { int num_resets; bool runtime_pm, is_vppsys; const char *clk_driver; };
++struct mtk_mmsys {
++	void *regs;
++	const struct mtk_mmsys_driver_data *data;
++	struct platform_device *clks_pdev, *drm_pdev;
++	int lock, cmdq_base;
++	struct { void *owner, *ops, *of_node; int nr_resets; } rcdev;
++};
++static int mtk_mmsys_reset_ops;
++static struct mtk_mmsys_driver_data data;
++static struct platform_device clock_child = { .kind = 1 }, drm_child = { .kind = 2 };
++static int events[32], count, failure, pm_enabled, children;
++static void *allocation;
++static void *devm_kzalloc(struct device *dev, size_t size, int flags)
++{
++	(void)dev; (void)flags;
++	if (failure == 1)
++		return NULL;
++	return allocation = calloc(1, size);
++}
++static void *devm_platform_ioremap_resource(struct platform_device *pdev, int index)
++{
++	(void)pdev; (void)index;
++	return failure == 2 ? ERR_PTR(-EIO) : (void *)1;
++}
++static const void *of_device_get_match_data(struct device *dev)
++{
++	(void)dev;
++	return &data;
++}
++static int devm_reset_controller_register(struct device *dev, void *rcdev)
++{
++	(void)dev; (void)rcdev;
++	return 0;
++}
++static int cmdq_dev_get_client_reg(struct device *dev, int *reg, int index)
++{
++	(void)dev; (void)reg; (void)index;
++	return 0;
++}
++static void platform_set_drvdata(struct platform_device *pdev, void *value)
++{
++	pdev->dev.data = value;
++}
++static void *platform_get_drvdata(struct platform_device *pdev)
++{
++	return pdev->dev.data;
++}
++static int devm_pm_runtime_enable(struct device *dev)
++{
++	assert(dev->data);
++	events[count++] = 10;
++	if (failure == 3)
++		return -ENOMEM;
++	pm_enabled = 1;
++	return 0;
++}
++static struct platform_device *platform_device_register_data(struct device *parent,
++	const char *name, int id, const void *payload, size_t size)
++{
++	(void)parent; (void)id; (void)payload; (void)size;
++	if (name[0] == 'c') {
++		events[count++] = 20;
++		return failure == 4 ? ERR_PTR(-EIO) : &clock_child;
++	}
++	assert(!data.runtime_pm || pm_enabled);
++	assert(children);
++	events[count++] = 40;
++	return failure == 6 ? ERR_PTR(-EIO) : &drm_child;
++}
++static void platform_device_unregister(struct platform_device *pdev)
++{
++	assert(pdev == &clock_child || pdev == &drm_child);
++	assert(!data.runtime_pm || pm_enabled);
++	events[count++] = pdev == &clock_child ? -20 : -40;
++}
++static int devm_of_platform_populate(struct device *dev)
++{
++	(void)dev;
++	assert(!data.runtime_pm || pm_enabled);
++	events[count++] = 30;
++	if (failure == 5)
++		return -EIO;
++	children = 1;
++	return 0;
++}
++/* PRODUCTION */
++
++/* Model the documented reverse managed-action release ordering. */
++static void release_managed(void)
++{
++	if (children) {
++		assert(!data.runtime_pm || pm_enabled);
++		events[count++] = -30;
++		children = 0;
++	}
++	if (pm_enabled) {
++		events[count++] = -10;
++		pm_enabled = 0;
++	}
++	free(allocation);
++	allocation = NULL;
++}
++static void reset(void)
++{
++	assert(!allocation && !pm_enabled && !children);
++	count = 0;
++	failure = 0;
++	data = (struct mtk_mmsys_driver_data){ .runtime_pm = true };
++}
++int main(void)
++{
++	struct platform_device pdev = { 0 };
++
++	for (failure = 1; failure <= 6; failure++) {
++		int point = failure;
++		data = (struct mtk_mmsys_driver_data){ .runtime_pm = true };
++		if (point == 4)
++			data.clk_driver = "clock";
++		assert(mtk_mmsys_probe(&pdev) < 0);
++		release_managed();
++		assert(!pm_enabled && !children);
++		count = 0;
++	}
++	reset();
++	assert(mtk_mmsys_probe(&pdev) == 0);
++	assert(pm_enabled && children);
++	mtk_mmsys_remove(&pdev);
++	release_managed();
++	assert(count == 6);
++	assert(events[0] == 10 && events[1] == 30 && events[2] == 40);
++	assert(events[3] == -40 && events[4] == -30 && events[5] == -10);
++	reset();
++	data = (struct mtk_mmsys_driver_data){ .clk_driver = "clock" };
++	assert(mtk_mmsys_probe(&pdev) == 0);
++	mtk_mmsys_remove(&pdev);
++	release_managed();
++	assert(!pm_enabled);
++	assert(count == 6);
++	assert(events[0] == 20 && events[1] == 30 && events[2] == 40);
++	assert(events[3] == -40 && events[4] == -20 && events[5] == -30);
++	reset();
++	data.is_vppsys = true;
++	assert(mtk_mmsys_probe(&pdev) == 0);
++	mtk_mmsys_remove(&pdev);
++	release_managed();
++	assert(count == 4 && events[2] == -30 && events[3] == -10);
++	puts("MMSYS production probe/remove failure cleanup and managed PM/child ordering passed");
++	return 0;
++}
+diff --git a/tools/testing/selftests/mtk_clk/test_display_pm.py b/tools/testing/selftests/mtk_clk/test_display_pm.py
+new file mode 100755
+index 0000000000..9fb7dc51a2
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/test_display_pm.py
+@@ -0,0 +1,60 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Exercise MT6897 display PM ownership with extracted production functions."""
++from pathlib import Path
++import os
++import re
++import subprocess
++import tempfile
++
++assets = Path(__file__).resolve().parent
++repo = Path(os.environ.get('KERNEL_SRC', str(assets.parents[3])))
++
++
++def function(source, name):
++    match = re.search(r'^(?:static )?(?:int|void) ' + name + r'\(', source, re.M)
++    start = match.start()
++    end = source.index('{', start) + 1
++    depth = 1
++    while depth:
++        depth += (source[end] == '{') - (source[end] == '}')
++        end += 1
++    return source[start:end]
++
++
++mutex = (repo / 'drivers/soc/mediatek/mtk-mutex.c').read_text()
++mmsys = (repo / 'drivers/soc/mediatek/mtk-mmsys.c').read_text()
++crtc = (repo / 'drivers/gpu/drm/mediatek/mtk_crtc.c').read_text()
++for source, names in [(mutex, ['mt6897_dispsys0_mutex_driver_data',
++                              'mt6897_dispsys1_mutex_driver_data',
++                              'mt6897_ovlsys_mutex_driver_data']),
++                      (mmsys, ['mt6897_dispsys0_driver_data',
++                               'mt6897_dispsys1_driver_data',
++                               'mt6897_ovlsys_driver_data'])]:
++    assert source.count('.runtime_pm = true') == len(names)
++    for name in names:
++        assert '.runtime_pm = true' in source.split(name + ' = {', 1)[1].split('};', 1)[0]
++probe = function(mmsys, 'mtk_mmsys_probe')
++assert probe.index('platform_set_drvdata') < probe.index('devm_pm_runtime_enable') < probe.index('devm_of_platform_populate') < probe.index('"mediatek-drm"')
++assert 'platform_device_unregister(clks)' not in probe
++mutex_probe = function(mutex, 'mtk_mutex_probe')
++assert mutex_probe.index('mtx->dev = dev') < mutex_probe.index('devm_pm_runtime_enable')
++init = function(crtc, 'mtk_crtc_ddp_hw_init')
++assert init.index('mtk_crtc_mutex_prepare') < init.index('mtk_crtc_ddp_clk_enable')
++assert 'for (i = 0; i < mtk_crtc->num_controllers; i++)\n\t\tmtk_mutex_unprepare' in init.split('err_mutex_unprepare:', 1)[1]
++production = '\n'.join([function(mutex, 'mtk_mutex_prepare'),
++                         function(mutex, 'mtk_mutex_unprepare'),
++                         function(crtc, 'mtk_crtc_mutex_prepare')])
++mmsys_production = '\n'.join([function(mmsys, 'mtk_mmsys_probe'),
++                                 function(mmsys, 'mtk_mmsys_remove')])
++for asset, functions in [('display_pm_cases.c', production),
++                         ('mmsys_pm_cases.c', mmsys_production)]:
++    with tempfile.TemporaryDirectory(prefix='mtk-display-pm-') as tmp:
++        tmp = Path(tmp)
++        c = tmp / 'test.c'
++        c.write_text((assets / asset).read_text().replace('/* PRODUCTION */', functions))
++        binary = tmp / 'test'
++        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
++                        '-Werror', '-g', '-fsanitize=address,undefined', str(c), '-o',
++                        str(binary)], check=True)
++        subprocess.run([str(binary)], check=True)
+-- 
+2.56.0
+

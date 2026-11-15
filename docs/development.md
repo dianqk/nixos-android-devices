@@ -49,10 +49,10 @@ cover QEMU fallback for uncached native ARM jobs.
 
 `tests/native-userspace.nix` checks upstream derivation identities against plain
 native Nixpkgs, host firmware/script/image assembly, target script interpreters,
-selected compiler platforms, and all five devices' module selections (including
+selected compiler platforms, and all supported devices' module selections (including
 experimental Aurora).
 
-Run [basic hardware tests](../tests/basic/README.md) explicitly on the intended
+Run [basic hardware tests](../tests/basic/README.md) and [host tests](../tests/README.md) explicitly on the intended
 device. Evaluation, actual compilation, booting, and physical input/display
 validation are separate results; test the configuration you intend to deploy.
 
@@ -63,6 +63,28 @@ Implementation references: [U-Boot](../pkgs/u-boot/README.md),
 [Polaris](polaris/README.md#firmware-sources),
 [Sheng](sheng/README.md#firmware-sources),
 [Aurora](aurora/firmware.md).
+
+## Device support status
+
+Each device documents its support in `docs/<device>/status.toml`, which gives
+every item of [`docs/status/items.toml`](status/items.toml) one status: Works,
+Partial, Broken, Untested, or N/A when the device lacks the hardware. Write
+notes in English (`note`) and Chinese (`note_zh`); Partial and Broken need a
+short note. An item may also record the date of its last real-device check,
+`verified = "YYYY-MM-DD"`, shown as "(Verified on DATE.)", and a Geekbench
+result, `benchmark = "https://browser.geekbench.com/…"`, shown as a link.
+Regenerate the pages after editing and check them:
+
+```sh
+tools/status-pages.py
+tools/status-pages.py --check
+```
+
+The generator refuses missing or unknown items, unknown statuses or fields,
+notes in only one language, Partial or Broken items without a note, and
+malformed `verified` dates or `benchmark` URLs; the `status-pages` flake check
+fails on stale pages. Add a new item to `items.toml` first, then to every
+device file.
 
 ## Recovery on a new board
 
@@ -91,15 +113,15 @@ Fetch the upstream release tag into any kernel Git repository:
 
 ```sh
 git init linux
-git -C linux remote add upstream https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
-git -C linux fetch --depth=1 upstream tag v7.3-rc6
-git -C linux show v7.3-rc6
+git -C linux remote add upstream https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+git -C linux fetch --depth=1 --no-tags upstream tag v7.3.4
+git -C linux show v7.3.4
 ```
 
 Check the tag identity against the selected Nix source before importing. The
-`v7.3-rc6` tag object is `4eeccbed21e50c19f97be9d325511f3de6343f2d`, commit
-`a90ee4305c4a5df72c11b31dacfdc76e00fcf78a`; the extracted source has recursive
-SHA256 `sha256-310GZztrJw+mkRFQ3IQ1pvTafElqHVKU0HMcZDk1x2c=`. Fetching a signed
+`v7.3.4` tag object is `8310b43a724c54668eeaa6860234078a7886915a`, commit
+`7595a62d45ee1a2297eafa5f2ef5d0a45142d84d`; Nixpkgs fetches
+`linux-7.3.4.tar.xz` with SHA256 `sha256-sRtt+Clejpkf8EC3GqpJlKi1XKojtrCSkH8ZW1hA/R8=`. Fetching a signed
 tag alone does not establish signature trust; verify it with a trusted
 maintainer key when available.
 
@@ -107,9 +129,9 @@ Import a device queue as the branch `android/<release>/<device>` and verify it:
 
 ```sh
 python3 tools/kernel-queue.py import --repo ../linux --device aurora \
-  --version 7.3-rc6 --base v7.3-rc6
+  --version 7.3.4 --base v7.3.4
 python3 tools/kernel-queue.py verify --repo ../linux --device aurora \
-  --version 7.3-rc6 --base v7.3-rc6
+  --version 7.3.4 --base v7.3.4
 ```
 
 Use the release that `pkgs/linux-kernel/default.nix` expects for the device;
@@ -122,13 +144,13 @@ importing user. Import manifests live in `.git/android-queues/`. If an import
 fails, inspect the partial branch before removing it; the helper does not reset
 existing work.
 
-Edit the branch with ordinary Git (for example `git rebase -i v7.3-rc6`).
+Edit the branch with ordinary Git (for example `git rebase -i v7.3.4`).
 Preserve authors, upstream links and review/sign-off trailers, and describe
 local adaptations separately. Then export to a new directory:
 
 ```sh
 python3 tools/kernel-queue.py export --repo ../linux --device aurora \
-  --version 7.3-rc6 --base v7.3-rc6 --output ../export-aurora
+  --version 7.3.4 --base v7.3.4 --output ../export-aurora
 ```
 
 Review the exported patches, copy each to its existing shared or board-owned

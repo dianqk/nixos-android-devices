@@ -1,0 +1,357 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 14 Oct 2026 21:39:21 +0800
+Subject: [PATCH 14/24] board: mediatek-mobile: trace boot into pstore, fall
+ back to the DT timer rate
+
+The first T880 boot reset by hardware watchdog with no screen or USB
+output. Two changes to make such failures visible:
+
+- MEDIATEK_MOBILE_ENTRY_TRACE: at entry (save_boot_params, before the
+  stack and PIE fixups) restart the stock RGU watchdog and start a fresh
+  ramoops-format console record ("DBGC", no ECC) in a configured zone;
+  record board_f/board_r milestones there, keep that zone mapped
+  non-cacheable after relocation, and add a "pstore" console output from
+  misc_init_r on. The stock Android kernel then shows the record as
+  /sys/fs/pstore/console-ramoops-0 after the next reset. Diagnostic aid.
+- Select ARMV8_CNTFRQ_BROKEN and take the arm,armv8-timer clock-frequency
+  when CNTFRQ_EL0 reads 0: with a zero rate every timeout and the
+  watchdog's cyclic feeding would stall.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm/lib/save_prev_bl_data.c              |  29 ++++
+ arch/arm/mach-mediatek/Kconfig                |  30 ++++
+ .../mediatek-mobile/mediatek-mobile.c         | 160 +++++++++++++++++-
+ 3 files changed, 211 insertions(+), 8 deletions(-)
+
+diff --git a/arch/arm/lib/save_prev_bl_data.c b/arch/arm/lib/save_prev_bl_data.c
+index 4357acaef6c..f411a36905a 100644
+--- a/arch/arm/lib/save_prev_bl_data.c
++++ b/arch/arm/lib/save_prev_bl_data.c
+@@ -20,8 +20,37 @@ static ulong reg0 __section(".data");
+  * Save x0 register value, assuming previous bootloader set it to
+  * point on loaded fdt or (for older linux kernels)atags.
+  */
++#if CONFIG_IS_ENABLED(MEDIATEK_MOBILE_ENTRY_TRACE)
++/*
++ * Runs before the stack and the PIE fixups exist: only immediate stores and
++ * PC-relative literals, no calls. Restart the stock bootloader's watchdog
++ * and start a fresh ramoops-format console record with an entry marker.
++ */
++static __always_inline void mediatek_mobile_entry_trace(void)
++{
++	static const char marker[] = "U-Boot: entry from previous bootloader\n";
++	volatile u32 *header = (volatile u32 *)CONFIG_MEDIATEK_MOBILE_PSTORE_CONSOLE;
++	volatile u8 *data = (volatile u8 *)(header + 3);
++	u32 i;
++
++	if (CONFIG_MEDIATEK_MOBILE_ENTRY_WDT_RESTART)
++		*(volatile u32 *)CONFIG_MEDIATEK_MOBILE_ENTRY_WDT_RESTART =
++			CONFIG_MEDIATEK_MOBILE_ENTRY_WDT_RESTART_KEY;
++	if (!CONFIG_MEDIATEK_MOBILE_PSTORE_CONSOLE)
++		return;
++	for (i = 0; i < sizeof(marker) - 1; i++)
++		data[i] = marker[i];
++	header[0] = 0x43474244; /* "DBGC", ramoops console without ECC */
++	header[1] = sizeof(marker) - 1;
++	header[2] = sizeof(marker) - 1;
++}
++#endif
++
+ void save_boot_params(ulong r0)
+ {
++#if CONFIG_IS_ENABLED(MEDIATEK_MOBILE_ENTRY_TRACE)
++	mediatek_mobile_entry_trace();
++#endif
+ 	reg0 = r0;
+ 	save_boot_params_ret();
+ }
+diff --git a/arch/arm/mach-mediatek/Kconfig b/arch/arm/mach-mediatek/Kconfig
+index 9790b96b608..678c1a83be0 100644
+--- a/arch/arm/mach-mediatek/Kconfig
++++ b/arch/arm/mach-mediatek/Kconfig
+@@ -192,6 +192,7 @@ config TARGET_MEDIATEK_MOBILE
+ 	select OF_BOARD
+ 	select OF_BOARD_FIXUP
+ 	select OF_BOARD_SETUP
++	select ARMV8_CNTFRQ_BROKEN
+ 	select POSITION_INDEPENDENT
+ 	select SAVE_PREV_BL_FDT_ADDR
+ 	select SAVE_PREV_BL_INITRAMFS_START_ADDR
+@@ -201,6 +202,35 @@ config TARGET_MEDIATEK_MOBILE
+ 	  initrd window and the boot framebuffer come from the FDT that LK
+ 	  passes in x0; U-Boot keeps its own appended control DT.
+ 
++config MEDIATEK_MOBILE_ENTRY_TRACE
++	bool "Trace early boot into a ramoops console record"
++	depends on TARGET_MEDIATEK_MOBILE
++	help
++	  Without UART or screen, record U-Boot's progress and console in the
++	  ramoops console zone the stock Android kernel reads after a reset
++	  (/sys/fs/pstore/console-ramoops-0), and restart the stock watchdog
++	  at entry. Diagnostic aid for bring-up.
++
++config MEDIATEK_MOBILE_PSTORE_CONSOLE
++	hex "Physical address of the ramoops console zone (0: none)"
++	depends on MEDIATEK_MOBILE_ENTRY_TRACE
++	default 0x0
++
++config MEDIATEK_MOBILE_PSTORE_CONSOLE_SIZE
++	hex "Size of the ramoops console zone"
++	depends on MEDIATEK_MOBILE_ENTRY_TRACE
++	default 0x0
++
++config MEDIATEK_MOBILE_ENTRY_WDT_RESTART
++	hex "Watchdog restart register written at entry (0: none)"
++	depends on MEDIATEK_MOBILE_ENTRY_TRACE
++	default 0x0
++
++config MEDIATEK_MOBILE_ENTRY_WDT_RESTART_KEY
++	hex "Value written to the watchdog restart register"
++	depends on MEDIATEK_MOBILE_ENTRY_TRACE
++	default 0x1971
++
+ config LNX_KRNL_IMG_TEXT_OFFSET_BASE
+ 	default 0x40000000 if TARGET_MEDIATEK_MOBILE
+ 
+diff --git a/board/mediatek/mediatek-mobile/mediatek-mobile.c b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+index 42c7aa34d9c..2a7c4031dce 100644
+--- a/board/mediatek/mediatek-mobile/mediatek-mobile.c
++++ b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+@@ -27,6 +27,12 @@
+ #include <lmb.h>
+ #include <log.h>
+ #include <mapmem.h>
++#include <dm/ofnode.h>
++#include <stdio_dev.h>
++#include <time.h>
++#include <vsprintf.h>
++#include <watchdog.h>
++#include <asm/io.h>
+ #include <linux/libfdt.h>
+ #include <linux/sizes.h>
+ #include <linux/string.h>
+@@ -213,14 +219,116 @@ static int mtk_parse_prev_fdt(const void *fdt)
+ 	return mtk_bank_count ? 0 : -ENODATA;
+ }
+ 
++#if CONFIG_IS_ENABLED(MEDIATEK_MOBILE_ENTRY_TRACE)
++/*
++ * Ramoops console record (struct persistent_ram_buffer without ECC): the
++ * stock Android kernel exposes the previous contents as
++ * /sys/fs/pstore/console-ramoops-0, so U-Boot's progress survives a reset.
++ * The entry code in save_boot_params() already wrote the header.
++ */
++struct mtk_pstore {
++	u32 sig;
++	u32 start;
++	u32 size;
++	u8 data[];
++};
++
++static void mtk_wdt_kick(void)
++{
++	if (CONFIG_MEDIATEK_MOBILE_ENTRY_WDT_RESTART)
++		writel(CONFIG_MEDIATEK_MOBILE_ENTRY_WDT_RESTART_KEY,
++		       (void *)CONFIG_MEDIATEK_MOBILE_ENTRY_WDT_RESTART);
++}
++
++static void mtk_pstore_write(const char *s, size_t len)
++{
++	struct mtk_pstore *p = (void *)CONFIG_MEDIATEK_MOBILE_PSTORE_CONSOLE;
++	u32 capacity = CONFIG_MEDIATEK_MOBILE_PSTORE_CONSOLE_SIZE - sizeof(*p);
++
++	if (!CONFIG_MEDIATEK_MOBILE_PSTORE_CONSOLE || capacity > SZ_16M)
++		return;
++	if (p->sig != 0x43474244 || p->start >= capacity || p->size > capacity) {
++		p->sig = 0x43474244;
++		p->start = 0;
++		p->size = 0;
++	}
++	while (len--) {
++		p->data[p->start] = *s++;
++		p->start = p->start + 1 == capacity ? 0 : p->start + 1;
++		if (p->size < capacity)
++			p->size++;
++	}
++	/* Normal non-cacheable after relocation, uncached before. */
++	dsb();
++}
++
++static void __maybe_unused mtk_trace(const char *fmt, ...)
++{
++	char line[192];
++	va_list args;
++	int len;
++
++	va_start(args, fmt);
++	len = vscnprintf(line, sizeof(line), fmt, args);
++	va_end(args);
++	mtk_pstore_write(line, len);
++	mtk_wdt_kick();
++}
++
++static void mtk_pstore_putc(struct stdio_dev *dev, const char c)
++{
++	mtk_pstore_write(&c, 1);
++}
++
++static void mtk_pstore_puts(struct stdio_dev *dev, const char *s)
++{
++	mtk_pstore_write(s, strlen(s));
++}
++
++/* Add "pstore" to the console outputs once the stdio layer exists. */
++static void mtk_pstore_console(void)
++{
++	struct stdio_dev dev = { 0 };
++	char list[128];
++	const char *names[] = { "stdout", "stderr" };
++	int i;
++
++	strlcpy(dev.name, "pstore", sizeof(dev.name));
++	dev.flags = DEV_FLAGS_OUTPUT;
++	dev.putc = mtk_pstore_putc;
++	dev.puts = mtk_pstore_puts;
++	if (stdio_register(&dev))
++		return;
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		const char *cur = env_get(names[i]);
++
++		if (cur && !strstr(cur, "pstore")) {
++			snprintf(list, sizeof(list), "%s,pstore", cur);
++			env_set(names[i], list);
++		}
++	}
++}
++#else
++static inline void mtk_trace(const char *fmt, ...) {}
++static inline void mtk_pstore_console(void) {}
++#endif
++
+ /* Keep our own control DT; LK's Android FDT only supplies runtime facts. */
+ int board_fdt_blob_setup(void **fdtp)
+ {
+ 	void *prev = (void *)get_prev_bl_fdt_addr();
+ 	bool internal = !fdt_check_header(*fdtp);
+ 
+-	if (!prev || mtk_parse_prev_fdt(prev))
++	mtk_trace("U-Boot: board_fdt_blob_setup, LK FDT %p, own DT %s\n", prev,
++		  internal ? "valid" : "missing");
++	if (!prev || mtk_parse_prev_fdt(prev)) {
++		mtk_trace("U-Boot: no usable LK FDT\n");
+ 		panic("No usable FDT with /memory from LK in x0 (%p)\n", prev);
++	}
++	mtk_trace("U-Boot: LK FDT %llu banks (first 0x%llx+0x%llx), %d reserved, initrd 0x%llx-0x%llx, fb 0x%llx+0x%llx\n",
++		  (u64)mtk_bank_count, mtk_banks[0].start, mtk_banks[0].size,
++		  mtk_reserved_count, mtk_initrd_start, mtk_initrd_end,
++		  mtk_fb_start, mtk_fb_size);
+ 
+ 	if (internal)
+ 		return -EEXIST;
+@@ -229,6 +337,25 @@ int board_fdt_blob_setup(void **fdtp)
+ 	return 0;
+ }
+ 
++/*
++ * Stock firmware may leave CNTFRQ_EL0 unset (the vendor tree states the
++ * 13 MHz rate in the timer node). Use the DT rate then, so delays and the
++ * watchdog's cyclic feeding work.
++ */
++int timer_init(void)
++{
++	ofnode node = ofnode_by_compatible(ofnode_null(), "arm,armv8-timer");
++	unsigned long cntfrq;
++
++	asm volatile("mrs %0, cntfrq_el0" : "=r" (cntfrq));
++	if (!cntfrq)
++		gd->arch.timer_rate_hz = ofnode_read_u32_default(node,
++								"clock-frequency",
++								13000000);
++	mtk_trace("U-Boot: timer CNTFRQ %lu, using %lu Hz\n", cntfrq, get_tbclk());
++	return 0;
++}
++
+ static bool mtk_overlaps(u64 a, u64 as, u64 b, u64 bs)
+ {
+ 	return a < b + bs && b < a + as;
+@@ -305,7 +432,15 @@ static void mtk_build_mem_map(void)
+ 	const u64 framebuffer = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
+ 				PTE_BLOCK_INNER_SHARE | PTE_BLOCK_PXN |
+ 				PTE_BLOCK_UXN;
+-	int index = 0, b, i;
++	/* Reserved regions U-Boot itself writes: framebuffer, pstore console. */
++	const struct mtk_region keep[] = {
++		{ mtk_fb_start, mtk_fb_size },
++#if CONFIG_IS_ENABLED(MEDIATEK_MOBILE_ENTRY_TRACE)
++		{ CONFIG_MEDIATEK_MOBILE_PSTORE_CONSOLE,
++		  CONFIG_MEDIATEK_MOBILE_PSTORE_CONSOLE_SIZE },
++#endif
++	};
++	int index = 0, b, i, k;
+ 
+ 	mtk_map(&index, SZ_4K, mtk_banks[0].start,
+ 		PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) | PTE_BLOCK_NON_SHARE |
+@@ -323,11 +458,12 @@ static void mtk_build_mem_map(void)
+ 			if (!r->nomap || hole_end <= cursor || hole >= end)
+ 				continue;
+ 			mtk_map(&index, cursor, min(hole, end), normal);
+-			if (mtk_fb_size &&
+-			    mtk_overlaps(hole, hole_end - hole, mtk_fb_start, mtk_fb_size))
+-				mtk_map(&index, max(hole, mtk_fb_start),
+-					min(hole_end, mtk_fb_start + mtk_fb_size),
+-					framebuffer);
++			for (k = 0; k < ARRAY_SIZE(keep); k++)
++				if (keep[k].size &&
++				    mtk_overlaps(hole, hole_end - hole, keep[k].start, keep[k].size))
++					mtk_map(&index, max(hole, keep[k].start),
++						min(hole_end, keep[k].start + keep[k].size),
++						framebuffer);
+ 			cursor = max(cursor, hole_end);
+ 		}
+ 		mtk_map(&index, cursor, end, normal);
+@@ -337,10 +473,14 @@ static void mtk_build_mem_map(void)
+ 
+ int dram_init(void)
+ {
+-	if (mtk_select_window())
++	if (mtk_select_window()) {
++		mtk_trace("U-Boot: no usable DRAM window\n");
+ 		panic("No usable DRAM window for U-Boot\n");
++	}
+ 
+ 	mtk_build_mem_map();
++	mtk_trace("U-Boot: relocation window 0x%llx+0x%llx\n",
++		  (u64)gd->ram_base, (u64)gd->ram_size);
+ 	return 0;
+ }
+ 
+@@ -358,6 +498,7 @@ int dram_init_banksize(void)
+ 
+ int board_init(void)
+ {
++	mtk_trace("U-Boot: relocated, board_init\n");
+ 	return 0;
+ }
+ 
+@@ -513,6 +654,8 @@ int misc_init_r(void)
+ 	phys_addr_t fastboot;
+ 	int i;
+ 
++	mtk_trace("U-Boot: misc_init_r\n");
++	mtk_pstore_console();
+ 	for (i = 0; i < mtk_reserved_count; i++)
+ 		mtk_reserve(mtk_reserved[i].start, mtk_reserved[i].size,
+ 			    mtk_reserved[i].nomap ? LMB_NOMAP : LMB_NOOVERWRITE);
+@@ -523,6 +666,7 @@ int misc_init_r(void)
+ 
+ 	mtk_set_serial();
+ 	mtk_find_payload();
++	mtk_trace("U-Boot: payload %s\n", env_get("payload_addr") ?: "none");
+ 
+ 	mtk_env_buffer("kernel_addr_r", SZ_128M);
+ 	mtk_env_buffer("ramdisk_addr_r", SZ_256M);
+-- 
+2.55.0
+

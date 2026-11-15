@@ -1,0 +1,83 @@
+From dd79c893a0f0bd472fbc4e55eec227c442d69b7d Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Mon, 2 Nov 2026 00:02:40 +0800
+Subject: [PATCH] media: qcom: camss: unwind the pipeline on stream start
+ and stop failures
+
+When a subdev in the pipeline failed to start, video_start_streaming()
+returned without stopping the subdevs it had already started, and
+video_stop_streaming() returned at the first subdev that failed to stop,
+leaving the rest (down to the sensor) streaming. Every later session then
+hit the "already started" warning in call_s_stream() and the pipeline
+stayed unusable until the CAMSS device was reset.
+
+Stop the already started subdevs when starting fails, and keep stopping
+the remaining subdevs when one of them fails to stop.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ .../media/platform/qcom/camss/camss-video.c   | 31 +++++++++++++++----
+ 1 file changed, 25 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/media/platform/qcom/camss/camss-video.c b/drivers/media/platform/qcom/camss/camss-video.c
+index 0852eb6f13..4c9acf4481 100644
+--- a/drivers/media/platform/qcom/camss/camss-video.c
++++ b/drivers/media/platform/qcom/camss/camss-video.c
+@@ -253,7 +253,7 @@ static int video_start_streaming(struct vb2_queue *q, unsigned int count)
+ {
+ 	struct camss_video *video = vb2_get_drv_priv(q);
+ 	struct video_device *vdev = &video->vdev;
+-	struct media_entity *entity;
++	struct media_entity *entity, *failed;
+ 	struct media_pad *pad;
+ 	struct v4l2_subdev *subdev;
+ 	int ret;
+@@ -283,11 +283,32 @@ static int video_start_streaming(struct vb2_queue *q, unsigned int count)
+ 
+ 		ret = v4l2_subdev_call(subdev, video, s_stream, 1);
+ 		if (ret < 0 && ret != -ENOIOCTLCMD)
+-			goto error;
++			goto error_stop;
+ 	}
+ 
+ 	return 0;
+ 
++error_stop:
++	/* Stop the subdevs started before the failing one. */
++	failed = entity;
++	entity = &vdev->entity;
++	while (1) {
++		pad = &entity->pads[0];
++		if (!(pad->flags & MEDIA_PAD_FL_SINK))
++			break;
++
++		pad = media_pad_remote_pad_first(pad);
++		if (!pad || !is_media_entity_v4l2_subdev(pad->entity))
++			break;
++
++		entity = pad->entity;
++		if (entity == failed)
++			break;
++
++		v4l2_subdev_call(media_entity_to_v4l2_subdev(entity), video,
++				 s_stream, 0);
++	}
++
+ error:
+ 	video_device_pipeline_stop(vdev);
+ 
+@@ -319,12 +340,10 @@ static void video_stop_streaming(struct vb2_queue *q)
+ 		entity = pad->entity;
+ 		subdev = media_entity_to_v4l2_subdev(entity);
+ 
++		/* Keep stopping the rest of the pipeline after a failure. */
+ 		ret = v4l2_subdev_call(subdev, video, s_stream, 0);
+-
+-		if (ret) {
++		if (ret)
+ 			dev_err(video->camss->dev, "Video pipeline stop failed: %d\n", ret);
+-			return;
+-		}
+ 	}
+ 
+ 	video_device_pipeline_stop(vdev);

@@ -1,5 +1,7 @@
 # usb-signaller package
 
+[中文](README.zh.md)
+
 For configuration, connection and updates, see [USB networking](../../docs/usb-signaller.md).
 
 ## Local packaging changes
@@ -11,6 +13,9 @@ The package retains upstream source and adds a documented local patch for:
 - explicit controller/role-switch selection and ownership of only
   `usb-signaller-*` gadgets;
 - configured mode advertisement, serialized transitions and failure reporting;
+- ACM console shutdown before gadget/role changes and asynchronous restart
+  after developer-mode setup;
+- optional preservation of externally managed Type-C data roles;
 - initial `none` role handling and failed-start retry through systemd.
 
 Executable paths are substituted with Nix store paths. Two upstream unit tests

@@ -1,0 +1,279 @@
+From 223ef984a24c7d145180d6465454b02e08cab0ea Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 11 Nov 2026 04:28:42 +0800
+Subject: [PATCH] clk: mediatek: add MT6897 I2C wrapper gates and consumer
+ wiring
+
+Describe the IMP I2C wrapper C/N/S gates using their vendor IDs, common
+set/clear/status offsets and i2c_ck parent. Wire the enabled I2C0/5/6 main
+inputs to these gates and their DMA inputs to PERAO_DMA_BCLK. This lets
+the existing I2C driver's probe, transfer and PM paths own the real gates
+instead of using fixed references. Keep the other wrapper gate IDs for
+the complete hardware group.
+
+The register and gate data are adapted from the MediaTek driver by
+Benjamin Chao (Copyright 2023 MediaTek Inc.). The local integration uses
+standard MediaTek gate registration, mainline-style compatibles and a
+binding for the three wrappers. Correct the obsolete power-domain comment
+now that those providers and their normal unused-domain policy exist.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/clk/mediatek/clk-mt6897-peri.c
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ .../clock/mediatek,mt6897-imp-iic-wrap.yaml   | 38 +++++++++++++++
+ .../dts/mediatek/mt6897-alldocube-t880.dts    |  3 +-
+ arch/arm64/boot/dts/mediatek/mt6897.dtsi      | 42 +++++++++++------
+ drivers/clk/mediatek/clk-mt6897-peri.c        | 46 ++++++++++++++++++-
+ .../dt-bindings/clock/mediatek,mt6897-clock.h | 10 ++++
+ 5 files changed, 123 insertions(+), 16 deletions(-)
+ create mode 100644 Documentation/devicetree/bindings/clock/mediatek,mt6897-imp-iic-wrap.yaml
+
+diff --git a/Documentation/devicetree/bindings/clock/mediatek,mt6897-imp-iic-wrap.yaml b/Documentation/devicetree/bindings/clock/mediatek,mt6897-imp-iic-wrap.yaml
+new file mode 100644
+index 0000000000..a1e0d43edd
+--- /dev/null
++++ b/Documentation/devicetree/bindings/clock/mediatek,mt6897-imp-iic-wrap.yaml
+@@ -0,0 +1,38 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/clock/mediatek,mt6897-imp-iic-wrap.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: MediaTek MT6897 I2C wrapper clock controllers
++
++maintainers:
++  - dianqk <dianqk@dianqk.net>
++
++properties:
++  compatible:
++    enum:
++      - mediatek,mt6897-imp-iic-wrap-c
++      - mediatek,mt6897-imp-iic-wrap-n
++      - mediatek,mt6897-imp-iic-wrap-s
++
++  reg:
++    maxItems: 1
++
++  '#clock-cells':
++    const: 1
++
++required:
++  - compatible
++  - reg
++  - '#clock-cells'
++
++additionalProperties: false
++
++examples:
++  - |
++    clock-controller@11281000 {
++        compatible = "mediatek,mt6897-imp-iic-wrap-c";
++        reg = <0x11281000 0x1000>;
++        #clock-cells = <1>;
++    };
+diff --git a/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880.dts b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880.dts
+index e30b3597de..2c656413eb 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880.dts
+@@ -759,7 +759,8 @@ i2c6: i2c@11280000 {
+ 		reg = <0x0 0x11280000 0x0 0x1000>,
+ 		      <0x0 0x11300600 0x0 0x80>;
+ 		interrupts = <GIC_SPI 192 IRQ_TYPE_LEVEL_HIGH 0>;
+-		clocks = <&topckgen CLK_TOP_I2C>, <&clk26m>;
++		clocks = <&imp_iic_wrap_c CLK_IMPC_AP_CLOCK>,
++			 <&pericfg_ao CLK_PERAOP_DMA_BCLK>;
+ 		clock-names = "main", "dma";
+ 		clock-div = <1>;
+ 		clock-frequency = <400000>;
+diff --git a/arch/arm64/boot/dts/mediatek/mt6897.dtsi b/arch/arm64/boot/dts/mediatek/mt6897.dtsi
+index ea9529b499..5b2ef95da9 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6897.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6897.dtsi
+@@ -3,9 +3,8 @@
+  * MediaTek MT6897 SoC: minimal boot description.
+  *
+  * Addresses and interrupts were taken from a Lenovo TB375FC bootloader FDT
+- * by the tb375fc-linux project. Clock, pin and power-domain providers are
+- * not described yet: the nodes below rely on the state the stock bootloader
+- * leaves behind, with fixed 26 MHz placeholders where drivers need a clock.
++ * by the tb375fc-linux project, with providers and consumer wiring from
++ * the MediaTek MT6897 hardware descriptions.
+  * The vendor tree uses two address and size cells and four interrupt cells.
+  */
+ 
+@@ -545,10 +544,7 @@ vcp: vcp@1ea00000 {
+ 			status = "disabled";
+ 		};
+ 
+-		/*
+-		 * Clock controllers. The PLLs are read-only for now and nothing
+-		 * consumes these clocks yet; the fixed-clock stand-ins stay.
+-		 */
++		/* SoC clock providers and peripheral gates. */
+ 		topckgen: clock-controller@10000000 {
+ 			compatible = "mediatek,mt6897-topckgen", "syscon";
+ 			reg = <0x0 0x10000000 0x0 0x1000>;
+@@ -873,10 +869,8 @@ dram_bw: dram-bw {
+ 		};
+ 
+ 		/*
+-		 * SPM power domains under direct control. All are default-off in
+-		 * the driver data (probe writes nothing); the modem, connsys,
+-		 * APU and hardware-voter MM domains are not described yet.
+-		 * pd_ignore_unused stays.
++		 * SPM direct-control power domains. The separate hardware voter
++		 * provider owns the multimedia domains.
+ 		 */
+ 		scpsys: syscon@1c001000 {
+ 			compatible = "mediatek,mt6897-scpsys", "syscon", "simple-mfd";
+@@ -1145,6 +1139,12 @@ uart1: serial@11002000 {
+ 			status = "disabled";
+ 		};
+ 
++		imp_iic_wrap_c: clock-controller@11281000 {
++			compatible = "mediatek,mt6897-imp-iic-wrap-c";
++			reg = <0x0 0x11281000 0x0 0x1000>;
++			#clock-cells = <1>;
++		};
++
+ 		ufscfg_ao: syscon@112b8000 {
+ 			compatible = "mediatek,mt6897-ufscfg-ao", "syscon", "simple-mfd";
+ 			reg = <0x0 0x112b8000 0x0 0x1000>;
+@@ -1296,13 +1296,20 @@ u2port0: usb-phy@11e40000 {
+ 			};
+ 		};
+ 
+-		/* The bootloader muxes the pins and runs the clocks. */
++		/* The bootloader muxes the pins; the controller owns its clocks. */
++		imp_iic_wrap_s: clock-controller@11d03000 {
++			compatible = "mediatek,mt6897-imp-iic-wrap-s";
++			reg = <0x0 0x11d03000 0x0 0x1000>;
++			#clock-cells = <1>;
++		};
++
+ 		i2c0: i2c@11d00000 {
+ 			compatible = "mediatek,mt6897-i2c";
+ 			reg = <0x0 0x11d00000 0x0 0x1000>,
+ 			      <0x0 0x11300200 0x0 0x80>;
+ 			interrupts = <GIC_SPI 186 IRQ_TYPE_LEVEL_HIGH 0>;
+-			clocks = <&topckgen CLK_TOP_I2C>, <&clk26m>;
++			clocks = <&imp_iic_wrap_s CLK_IMPS_AP_CLOCK_I2C0>,
++				 <&pericfg_ao CLK_PERAOP_DMA_BCLK>;
+ 			clock-names = "main", "dma";
+ 			clock-div = <1>;
+ 			#address-cells = <1>;
+@@ -1311,12 +1318,19 @@ i2c0: i2c@11d00000 {
+ 		};
+ 
+ 		/* MT6375 charger/TCPC at 0x34 (no driver bound yet). */
++		imp_iic_wrap_n: clock-controller@11f02000 {
++			compatible = "mediatek,mt6897-imp-iic-wrap-n";
++			reg = <0x0 0x11f02000 0x0 0x1000>;
++			#clock-cells = <1>;
++		};
++
+ 		i2c5: i2c@11f01000 {
+ 			compatible = "mediatek,mt6897-i2c";
+ 			reg = <0x0 0x11f01000 0x0 0x1000>,
+ 			      <0x0 0x11300580 0x0 0x80>;
+ 			interrupts = <GIC_SPI 191 IRQ_TYPE_LEVEL_HIGH 0>;
+-			clocks = <&topckgen CLK_TOP_I2C>, <&clk26m>;
++			clocks = <&imp_iic_wrap_n CLK_IMPN_AP_CLOCK_I2C5>,
++				 <&pericfg_ao CLK_PERAOP_DMA_BCLK>;
+ 			clock-names = "main", "dma";
+ 			clock-div = <1>;
+ 			#address-cells = <1>;
+diff --git a/drivers/clk/mediatek/clk-mt6897-peri.c b/drivers/clk/mediatek/clk-mt6897-peri.c
+index 5a2e001bcb..09ad08ccdc 100644
+--- a/drivers/clk/mediatek/clk-mt6897-peri.c
++++ b/drivers/clk/mediatek/clk-mt6897-peri.c
+@@ -17,6 +17,47 @@
+ #include "clk-gate.h"
+ #include "clk-mtk.h"
+ 
++/* IMP I2C gate data: Benjamin Chao, Copyright (c) 2023 MediaTek Inc. */
++static const struct mtk_gate_regs imp_iic_wrap_cg_regs = {
++	.set_ofs = 0xe08,
++	.clr_ofs = 0xe04,
++	.sta_ofs = 0xe00,
++};
++
++#define GATE_IMP(_id, _name, _shift) \
++	GATE_MTK(_id, _name, "i2c_ck", &imp_iic_wrap_cg_regs, _shift, \
++		 &mtk_clk_gate_ops_setclr)
++
++static const struct mtk_gate impc_clks[] = {
++	GATE_IMP(CLK_IMPC_AP_CLOCK, "impc_ap_clock", 0),
++};
++
++static const struct mtk_gate impn_clks[] = {
++	GATE_IMP(CLK_IMPN_AP_CLOCK_I2C3, "impn_api2c3", 0),
++	GATE_IMP(CLK_IMPN_AP_CLOCK_I2C5, "impn_api2c5", 1),
++};
++
++static const struct mtk_gate imps_clks[] = {
++	GATE_IMP(CLK_IMPS_AP_CLOCK_I2C0, "imps_api2c0", 0),
++	GATE_IMP(CLK_IMPS_AP_CLOCK_I2C1, "imps_api2c1", 1),
++	GATE_IMP(CLK_IMPS_AP_CLOCK_I2C7, "imps_api2c7", 2),
++};
++
++static const struct mtk_clk_desc impc_mcd = {
++	.clks = impc_clks,
++	.num_clks = ARRAY_SIZE(impc_clks),
++};
++
++static const struct mtk_clk_desc impn_mcd = {
++	.clks = impn_clks,
++	.num_clks = ARRAY_SIZE(impn_clks),
++};
++
++static const struct mtk_clk_desc imps_mcd = {
++	.clks = imps_clks,
++	.num_clks = ARRAY_SIZE(imps_clks),
++};
++
+ static const struct mtk_gate_regs perao0_cg_regs = {
+ 	.set_ofs = 0x24,
+ 	.clr_ofs = 0x28,
+@@ -133,6 +174,9 @@ static const struct mtk_clk_desc ufscfg_pdn_mcd = {
+ };
+ 
+ static const struct of_device_id of_match_clk_mt6897_peri[] = {
++	{ .compatible = "mediatek,mt6897-imp-iic-wrap-c", .data = &impc_mcd },
++	{ .compatible = "mediatek,mt6897-imp-iic-wrap-n", .data = &impn_mcd },
++	{ .compatible = "mediatek,mt6897-imp-iic-wrap-s", .data = &imps_mcd },
+ 	{ .compatible = "mediatek,mt6897-pericfg-ao", .data = &perao_mcd },
+ 	{ .compatible = "mediatek,mt6897-ufscfg-ao", .data = &ufscfg_ao_mcd },
+ 	{ .compatible = "mediatek,mt6897-ufscfg-pdn", .data = &ufscfg_pdn_mcd },
+@@ -150,5 +194,5 @@ static struct platform_driver clk_mt6897_peri_drv = {
+ };
+ module_platform_driver(clk_mt6897_peri_drv);
+ 
+-MODULE_DESCRIPTION("MediaTek MT6897 pericfg_ao and ufscfg clock gates");
++MODULE_DESCRIPTION("MediaTek MT6897 peripheral clock gates");
+ MODULE_LICENSE("GPL");
+diff --git a/include/dt-bindings/clock/mediatek,mt6897-clock.h b/include/dt-bindings/clock/mediatek,mt6897-clock.h
+index 3dafe55591..3d9cd5bcee 100644
+--- a/include/dt-bindings/clock/mediatek,mt6897-clock.h
++++ b/include/dt-bindings/clock/mediatek,mt6897-clock.h
+@@ -436,6 +436,16 @@
+ #define CLK_VLP_CK_U_TICK1US	67
+ #define CLK_VLP_CK_NR_CLK	68
+ 
++#define CLK_IMPC_AP_CLOCK	0
++#define CLK_IMPC_NR_CLK	1
++#define CLK_IMPN_AP_CLOCK_I2C3	0
++#define CLK_IMPN_AP_CLOCK_I2C5	1
++#define CLK_IMPN_NR_CLK	2
++#define CLK_IMPS_AP_CLOCK_I2C0	0
++#define CLK_IMPS_AP_CLOCK_I2C1	1
++#define CLK_IMPS_AP_CLOCK_I2C7	2
++#define CLK_IMPS_NR_CLK	3
++
+ #define CLK_PERAOP_UART0	0
+ #define CLK_PERAOP_UART1	1
+ #define CLK_PERAOP_UART2	2
+-- 
+2.56.0
+

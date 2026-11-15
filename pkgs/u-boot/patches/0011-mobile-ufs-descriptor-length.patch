@@ -1,0 +1,144 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 24 Oct 2026 16:24:47 +0800
+Subject: [PATCH] ufs: read boot-LUN descriptors by their own length
+
+ufs_mobile_lun_info() required the device descriptor's bLength to equal
+the size probed at start-up (hba->desc_size.dev_desc, which falls back to
+the 0x40 default when the header-only read fails) and the configuration
+descriptor's bLength to equal the LENGTH field of the query response.
+Both are device-dependent: devices answer header-only reads and report
+the response LENGTH (returned or requested bytes) differently, which is
+why Linux requests QUERY_DESC_MAX_SIZE and trusts bLength alone. On the
+Xiaomi Marble (Samsung KLUEG8UHGC, UFS 3.1) the check returned -EINVAL
+without a transport error, so U-Boot never confirmed slot B; which field
+it rejected was not printed.
+
+Read both descriptors like Linux: request the maximum size into a zeroed
+buffer, check the IDN, and take bLength from the descriptor. A response
+LENGTH below bLength (a truncated descriptor) is still refused, as are
+all previous layout and boot-LUN-ID checks. Every refusal now prints the
+values it rejected, so a failure on hardware names the field.
+
+Local fix of 8bdfaba7801f ("ufs: expose narrow boot-LUN selection for
+EFI slot actions"). Baseline: U-Boot v2026.10-rc5,
+a06e89ab05eaa2b8344d521319399333cd760ae5.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/ufs/ufs-uclass.c | 73 +++++++++++++++++++++++++++++-----------
+ 1 file changed, 53 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/ufs/ufs-uclass.c b/drivers/ufs/ufs-uclass.c
+index c06b936d7f..96eda0e773 100644
+--- a/drivers/ufs/ufs-uclass.c
++++ b/drivers/ufs/ufs-uclass.c
+@@ -2352,6 +2352,36 @@ int ufs_mobile_boot_lun_set(struct udevice *dev, unsigned int lun)
+ 				     QUERY_ATTR_IDN_BOOT_LU_EN, 0, 0, &lun);
+ }
+ 
++/* Read a whole descriptor the way Linux does: request the largest size and
++ * take the length from the descriptor's own bLength. Devices differ in the
++ * LENGTH they report in the query response (the bytes returned or the bytes
++ * requested) and in how they answer header-only reads, so neither that field
++ * nor the probe-time descriptor size table is required to match bLength. A
++ * reported LENGTH below bLength means a truncated descriptor and is refused;
++ * the zeroed buffer never yields enabled LUNs that the device did not send. */
++static int ufs_mobile_read_desc(struct ufs_hba *hba, enum desc_idn idn, u8 *buf,
++				int *length, int *returned)
++{
++	int ret;
++
++	memset(buf, 0, QUERY_DESC_MAX_SIZE);
++	*returned = QUERY_DESC_MAX_SIZE;
++	ret = ufshcd_query_descriptor_retry(hba, UPIU_QUERY_OPCODE_READ_DESC,
++					    idn, 0, 0, buf, returned);
++	if (ret) {
++		printf("UFS boot-LUN check: descriptor %d read failed (%d)\n", idn, ret);
++		return ret;
++	}
++	*length = buf[0];
++	if (buf[1] != idn || *length < QUERY_DESC_HDR_SIZE ||
++	    (*returned > 0 && *returned < *length)) {
++		printf("UFS boot-LUN check: descriptor %d header %02x %02x, response length %d\n",
++		       idn, buf[0], buf[1], *returned);
++		return -EINVAL;
++	}
++	return 0;
++}
++
+ int ufs_mobile_lun_info(struct udevice *dev, unsigned int *mask,
+ 			unsigned char boot_ids[8])
+ {
+@@ -2359,49 +2389,52 @@ int ufs_mobile_lun_info(struct udevice *dev, unsigned int *mask,
+ 	unsigned int i, offset, stride;
+ 	u8 device_desc[QUERY_DESC_MAX_SIZE];
+ 	u8 config_desc[QUERY_DESC_MAX_SIZE];
+-	int length = sizeof(config_desc), ret;
++	int device_length, device_returned, length, returned, ret;
+ 	if (!mask || device_get_uclass_id(dev) != UCLASS_UFS || !device_active(dev))
+ 		return -EINVAL;
+ 	*mask = 0;
+ 	if (boot_ids)
+ 		memset(boot_ids, 0, 8);
+-	memset(device_desc, 0, sizeof(device_desc));
+-	ret = ufshcd_read_desc(hba, QUERY_DESC_IDN_DEVICE, 0,
+-			       device_desc, hba->desc_size.dev_desc);
++	ret = ufs_mobile_read_desc(hba, QUERY_DESC_IDN_DEVICE, device_desc,
++				   &device_length, &device_returned);
+ 	if (ret)
+ 		return ret;
+-	if (hba->desc_size.dev_desc <= DEVICE_DESC_PARAM_UD_LEN ||
+-	    device_desc[0] != hba->desc_size.dev_desc ||
+-	    device_desc[1] != QUERY_DESC_IDN_DEVICE)
++	if (device_length <= DEVICE_DESC_PARAM_UD_LEN) {
++		printf("UFS boot-LUN check: device descriptor bLength 0x%x too short\n",
++		       device_length);
+ 		return -EINVAL;
++	}
+ 	offset = device_desc[DEVICE_DESC_PARAM_UD_OFFSET];
+ 	stride = device_desc[DEVICE_DESC_PARAM_UD_LEN];
+-	ret = ufshcd_query_descriptor_retry(hba, UPIU_QUERY_OPCODE_READ_DESC,
+-					    QUERY_DESC_IDN_CONFIGURATION, 0, 0,
+-					    config_desc, &length);
++	ret = ufs_mobile_read_desc(hba, QUERY_DESC_IDN_CONFIGURATION, config_desc,
++				   &length, &returned);
+ 	if (ret)
+ 		return ret;
+ 	/* Unit Descriptor queries may reject unimplemented LUNs. Instead read
+ 	 * all eight bLUEnable fields from the Configuration Descriptor, whose
+ 	 * offset/stride are supplied by the device (and differ by UFS version). */
+-	if (length < 0x10 || config_desc[0] != length ||
+-	    config_desc[1] != QUERY_DESC_IDN_CONFIGURATION ||
+-	    offset < 0x10 || stride < 0x10 || offset + 8 * stride > (unsigned int)length)
++	if (length < 0x10 || offset < 0x10 || stride < 0x10 ||
++	    offset + 8 * stride > (unsigned int)length) {
++		printf("UFS boot-LUN check: device descriptor 0x%x (response %d), unit offset 0x%x, length 0x%x; configuration descriptor 0x%x (response %d)\n",
++		       device_length, device_returned, offset, stride, length, returned);
+ 		return -EINVAL;
+-	if (boot_ids && config_desc[3] != 1)
++	}
++	if (boot_ids && config_desc[3] != 1) {
++		printf("UFS boot-LUN check: bBootEnable is %u\n", config_desc[3]);
+ 		return -EINVAL; /* Boot feature must be enabled for slot switching. */
++	}
+ 	for (i = 0; i < 8; i++) {
+ 		u8 enabled = config_desc[offset + i * stride];
+-		if (enabled > 1)
++		u8 id = config_desc[offset + i * stride + 1];
++		if (enabled > 1 || (boot_ids && (id > 2 || (!enabled && id)))) {
++			printf("UFS boot-LUN check: LUN %u bLUEnable 0x%x, bBootLunID 0x%x\n",
++			       i, enabled, id);
+ 			return -EINVAL;
++		}
+ 		if (enabled)
+ 			*mask |= 1U << i;
+-		if (boot_ids) {
+-			u8 id = config_desc[offset + i * stride + 1];
+-			if (id > 2 || (!enabled && id))
+-				return -EINVAL;
++		if (boot_ids)
+ 			boot_ids[i] = id;
+-		}
+ 	}
+ 	return 0;
+ }

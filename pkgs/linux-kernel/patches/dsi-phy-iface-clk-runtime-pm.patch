@@ -1,0 +1,102 @@
+From 0d04cd0a01e1f96ce20a9911117acd35dfdf2e61 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 21 Oct 2026 20:34:18 +0800
+Subject: [PATCH] drm/msm/dsi/phy: Prepare the interface clock only while
+ runtime-active
+
+The PHY managed its "iface" clock with pm_clk. pm_clk_add() prepares the
+clock when it is added and keeps it prepared for the device's lifetime;
+only enable/disable follow runtime PM. Preparing a clock takes a
+runtime-PM reference on its provider (clk_core_prepare() calls
+clk_pm_runtime_get()), so with a runtime-PM display clock controller the
+PHY kept that controller and its power domain active even while the
+whole display was off.
+
+On SM8650 (Xiaomi Aurora) with the panel off, disp_cc_mdss_ahb_clk stayed
+prepared, dispcc remained runtime-active and MMCX stayed on at its lowest
+level although MDSS, DPU, DSI and the PHY were suspended.
+
+Get the clock with devm_clk_get() and prepare+enable it in runtime resume,
+disable+unprepare it in runtime suspend. This affects every DSI PHY whose
+interface clock comes from a runtime-PM clock controller.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/msm/dsi/phy/dsi_phy.c | 36 ++++++++++++++++++++-------
+ drivers/gpu/drm/msm/dsi/phy/dsi_phy.h |  1 +
+ 2 files changed, 28 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dsi/phy/dsi_phy.c b/drivers/gpu/drm/msm/dsi/phy/dsi_phy.c
+index 1fb3899b88bf..cd5029de3bd1 100644
+--- a/drivers/gpu/drm/msm/dsi/phy/dsi_phy.c
++++ b/drivers/gpu/drm/msm/dsi/phy/dsi_phy.c
+@@ -5,7 +5,6 @@
+ 
+ #include <linux/clk-provider.h>
+ #include <linux/platform_device.h>
+-#include <linux/pm_clock.h>
+ #include <linux/pm_runtime.h>
+ #include <dt-bindings/phy/phy.h>
+ 
+@@ -687,13 +686,16 @@ static int dsi_phy_driver_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = devm_pm_clk_create(dev);
+-	if (ret)
+-		return ret;
+-
+-	ret = pm_clk_add(dev, "iface");
+-	if (ret < 0)
+-		return dev_err_probe(dev, ret, "Unable to get iface clk\n");
++	/*
++	 * Prepare the interface clock only while runtime-active: pm_clk keeps
++	 * its clocks prepared for the device's lifetime, which holds a
++	 * runtime-PM reference on the clock controller (and its power domain)
++	 * while the PHY is suspended.
++	 */
++	phy->iface_clk = devm_clk_get(dev, "iface");
++	if (IS_ERR(phy->iface_clk))
++		return dev_err_probe(dev, PTR_ERR(phy->iface_clk),
++				     "Unable to get iface clk\n");
+ 
+ 	if (phy->cfg->ops.pll_init) {
+ 		ret = phy->cfg->ops.pll_init(phy);
+@@ -711,8 +713,24 @@ static int dsi_phy_driver_probe(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
++static int dsi_phy_runtime_suspend(struct device *dev)
++{
++	struct msm_dsi_phy *phy = dev_get_drvdata(dev);
++
++	clk_disable_unprepare(phy->iface_clk);
++
++	return 0;
++}
++
++static int dsi_phy_runtime_resume(struct device *dev)
++{
++	struct msm_dsi_phy *phy = dev_get_drvdata(dev);
++
++	return clk_prepare_enable(phy->iface_clk);
++}
++
+ static const struct dev_pm_ops dsi_phy_pm_ops = {
+-	SET_RUNTIME_PM_OPS(pm_clk_suspend, pm_clk_resume, NULL)
++	SET_RUNTIME_PM_OPS(dsi_phy_runtime_suspend, dsi_phy_runtime_resume, NULL)
+ };
+ 
+ static struct platform_driver dsi_phy_platform_driver = {
+diff --git a/drivers/gpu/drm/msm/dsi/phy/dsi_phy.h b/drivers/gpu/drm/msm/dsi/phy/dsi_phy.h
+index f5d3e806f8fd..550c5a7442d1 100644
+--- a/drivers/gpu/drm/msm/dsi/phy/dsi_phy.h
++++ b/drivers/gpu/drm/msm/dsi/phy/dsi_phy.h
+@@ -96,6 +96,7 @@ struct msm_dsi_dphy_timing {
+ 
+ struct msm_dsi_phy {
+ 	struct platform_device *pdev;
++	struct clk *iface_clk;
+ 	void __iomem *base;
+ 	void __iomem *pll_base;
+ 	void __iomem *reg_base;

@@ -1,0 +1,249 @@
+From 75f7905a0a67102e901704ae695582bca1ffae46 Mon Sep 17 00:00:00 2001
+From: "henson.chen" <henson.chen@mediatek.com>
+Date: Tue, 7 Feb 2023 01:37:09 +0000
+Subject: [PATCH 219/220] [ALPS07645191] mailbox: clr mbox irq via tfa
+
+SSPM SW workaround for HW issue, clr mbox irq by SSPM cfgreg
+
+MTK-Commit-Id: 1ccfdce74baa65dd31be8d049d69529eb9cf2332
+
+Signed-off-by: henson.chen <henson.chen@mediatek.com>
+CR-Id: ALPS07645191
+Feature: SSPM Firmware
+Change-Id: Iffd3ba95937e6c69eb85d62862267bc69be6e74d
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/commit/2503e13bce9b8e461c5d8124c2d24e01bd39ad5a
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/mailbox/mtk-mbox-mailbox.c
+
+Local changes: adapt the tinysys mailbox into a standalone MT6897 provider
+with two resource-backed channels. Keep secure selection per device, serialize
+send and receive fault state, validate allocations/resources/IRQs and preserve
+IRQ lifetime on shutdown. Accept only generic SiP success zero; vendor code
+ignored a0, so nonzero has unknown per-call semantics. Quarantine that channel
+without retry, fabricated completion or nonsecure fallback. Omit vendor
+shared-memory timestamp writes and Android timeout hooks.
+
+---
+ drivers/mailbox/mtk-tinysys-mailbox.c    | 198 +++++++++++++++++++++++
+ include/linux/soc/mediatek/mtk_sip_svc.h |   3 +
+ 2 files changed, 201 insertions(+)
+ create mode 100644 drivers/mailbox/mtk-tinysys-mailbox.c
+
+diff --git a/drivers/mailbox/mtk-tinysys-mailbox.c b/drivers/mailbox/mtk-tinysys-mailbox.c
+new file mode 100644
+index 0000000000..d4dda6fd4a
+--- /dev/null
++++ b/drivers/mailbox/mtk-tinysys-mailbox.c
+@@ -0,0 +1,198 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2021 MediaTek Inc.
++ * Adapted from the MediaTek tinysys mailbox for MT6897.
++ */
++#include <linux/arm-smccc.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/mailbox_controller.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/soc/mediatek/mtk_sip_svc.h>
++
++#define TINYSYS_CHANNELS	2
++#define TINYSYS_SET	0x0
++#define TINYSYS_CLR	0x4
++#define TINYSYS_MBOX_CLEAR	0
++
++struct tinysys_link {
++	void __iomem *base;
++	spinlock_t lock;
++	unsigned int index;
++	int irq;
++	bool secure_clear;
++	bool faulted;
++};
++
++struct tinysys_mbox {
++	struct mbox_controller controller;
++	struct mbox_chan channels[TINYSYS_CHANNELS];
++	struct tinysys_link links[TINYSYS_CHANNELS];
++};
++
++static unsigned long tinysys_secure_clear(struct tinysys_link *link)
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(MTK_SIP_TINYSYS_SSPM_CONTROL, TINYSYS_MBOX_CLEAR,
++		      link->index, 0, 0, 0, 0, 0, &res);
++	return res.a0;
++}
++
++static irqreturn_t tinysys_rx(int irq, void *data)
++{
++	struct mbox_chan *chan = data;
++	struct tinysys_link *link = chan->con_priv;
++	unsigned long flags, status = SIP_SVC_E_SUCCESS;
++	u32 pending;
++
++	spin_lock_irqsave(&link->lock, flags);
++	if (link->faulted) {
++		spin_unlock_irqrestore(&link->lock, flags);
++		return IRQ_HANDLED;
++	}
++	pending = readl_relaxed(link->base + TINYSYS_CLR);
++	if (!pending) {
++		spin_unlock_irqrestore(&link->lock, flags);
++		return IRQ_NONE;
++	}
++
++	if (link->secure_clear)
++		status = tinysys_secure_clear(link);
++	else
++		writel_relaxed(1, link->base + TINYSYS_CLR);
++
++	if (status != SIP_SVC_E_SUCCESS) {
++		/* Accept only generic SiP success; per-call return semantics are unknown. */
++		link->faulted = true;
++		disable_irq_nosync(irq);
++	}
++	spin_unlock_irqrestore(&link->lock, flags);
++
++	if (status != SIP_SVC_E_SUCCESS) {
++		dev_err(chan->mbox->dev, "channel %u unexpected secure-clear status: %#lx\n",
++			link->index, status);
++		return IRQ_HANDLED;
++	}
++
++	mbox_chan_received_data(chan, &pending);
++	return IRQ_HANDLED;
++}
++
++static int tinysys_send(struct mbox_chan *chan, void *data)
++{
++	struct tinysys_link *link = chan->con_priv;
++	unsigned long flags;
++	int ret = 0;
++
++	spin_lock_irqsave(&link->lock, flags);
++	if (link->faulted) {
++		ret = -EIO;
++	} else {
++		/* Publish the SCMI shared-memory request before ringing the doorbell. */
++		smp_mb();
++		writel_relaxed(1, link->base + TINYSYS_SET);
++	}
++	spin_unlock_irqrestore(&link->lock, flags);
++	return ret;
++}
++
++static bool tinysys_last_tx_done(struct mbox_chan *chan)
++{
++	struct tinysys_link *link = chan->con_priv;
++	unsigned long flags;
++	bool done;
++
++	spin_lock_irqsave(&link->lock, flags);
++	done = !link->faulted && !readl_relaxed(link->base + TINYSYS_SET);
++	spin_unlock_irqrestore(&link->lock, flags);
++	return done;
++}
++
++static int tinysys_startup(struct mbox_chan *chan)
++{
++	struct tinysys_link *link = chan->con_priv;
++
++	/* Faults persist for this device lifetime, including channel reacquisition. */
++	if (READ_ONCE(link->faulted))
++		return -EIO;
++	return request_irq(link->irq, tinysys_rx, IRQF_NO_SUSPEND,
++			   dev_name(chan->mbox->dev), chan);
++}
++
++static void tinysys_shutdown(struct mbox_chan *chan)
++{
++	struct tinysys_link *link = chan->con_priv;
++
++	/* Synchronizes the handler, including its final mailbox callback. */
++	free_irq(link->irq, chan);
++}
++
++static const struct mbox_chan_ops tinysys_ops = {
++	.send_data = tinysys_send,
++	.startup = tinysys_startup,
++	.shutdown = tinysys_shutdown,
++	.last_tx_done = tinysys_last_tx_done,
++};
++
++static int tinysys_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct tinysys_mbox *mbox;
++	bool secure;
++	int i;
++
++	mbox = devm_kzalloc(dev, sizeof(*mbox), GFP_KERNEL);
++	if (!mbox)
++		return -ENOMEM;
++	secure = of_property_read_bool(dev->of_node, "mediatek,secure-clear");
++
++	for (i = 0; i < TINYSYS_CHANNELS; i++) {
++		struct tinysys_link *link = &mbox->links[i];
++		struct resource *res;
++
++		res = platform_get_resource(pdev, IORESOURCE_MEM, i);
++		if (!res || resource_size(res) < TINYSYS_CLR + sizeof(u32))
++			return dev_err_probe(dev, -EINVAL, "invalid channel %d resource\n", i);
++		link->base = devm_ioremap_resource(dev, res);
++		if (IS_ERR(link->base))
++			return PTR_ERR(link->base);
++		link->irq = platform_get_irq(pdev, i);
++		if (link->irq < 0)
++			return link->irq;
++		link->index = i;
++		link->secure_clear = secure;
++		spin_lock_init(&link->lock);
++		mbox->channels[i].con_priv = link;
++	}
++
++	mbox->controller.dev = dev;
++	mbox->controller.chans = mbox->channels;
++	mbox->controller.num_chans = TINYSYS_CHANNELS;
++	mbox->controller.ops = &tinysys_ops;
++	mbox->controller.txdone_poll = true;
++	mbox->controller.txpoll_period = 1;
++
++	/* Unregister/free channels before managed register mappings disappear. */
++	return devm_mbox_controller_register(dev, &mbox->controller);
++}
++
++static const struct of_device_id tinysys_of_match[] = {
++	{ .compatible = "mediatek,mt6897-tinysys-mailbox" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, tinysys_of_match);
++
++static struct platform_driver tinysys_driver = {
++	.probe = tinysys_probe,
++	.driver = {
++		.name = "mtk-tinysys-mailbox",
++		.of_match_table = tinysys_of_match,
++	},
++};
++module_platform_driver(tinysys_driver);
++
++MODULE_DESCRIPTION("MediaTek MT6897 tinysys mailbox");
++MODULE_LICENSE("GPL");
+diff --git a/include/linux/soc/mediatek/mtk_sip_svc.h b/include/linux/soc/mediatek/mtk_sip_svc.h
+index 6c95a29b79..02a74fa9f7 100644
+--- a/include/linux/soc/mediatek/mtk_sip_svc.h
++++ b/include/linux/soc/mediatek/mtk_sip_svc.h
+@@ -28,6 +28,9 @@
+ /* DVFSRC SMC calls */
+ #define MTK_SIP_DVFSRC_VCOREFS_CONTROL	MTK_SIP_SMC_CMD(0x506)
+ 
++/* Tinysys SSPM mailbox control */
++#define MTK_SIP_TINYSYS_SSPM_CONTROL	MTK_SIP_SMC_CMD(0x53c)
++
+ /* IOMMU related SMC call */
+ #define MTK_SIP_KERNEL_IOMMU_CONTROL	MTK_SIP_SMC_CMD(0x514)
+ 

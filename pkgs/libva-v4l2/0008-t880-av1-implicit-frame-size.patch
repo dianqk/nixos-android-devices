@@ -1,0 +1,151 @@
+From: dianqk <dianqk@dianqk.net>
+Subject: [PATCH] t880: use validated implicit AV1 picture dimensions
+
+Avoid the firmware explicit-size path for sequence-sized pictures. Reject
+unvalidated dynamic sizing and switch frames before submission. Ordinary
+Qualcomm serialization remains unchanged.
+
+--- a/src/av1.cpp
++++ b/src/av1.cpp
+@@ -421,7 +421,7 @@
+     }
+ }
+ std::vector<uint8_t> frame(const Av1Picture &picture, const Av1State &state, unsigned width,
+-                           unsigned height, unsigned refresh, bool show, bool reset) {
++                           unsigned height, unsigned refresh, bool show, bool reset, bool implicit_size = false) {
+     const auto &p = picture.params;
+     const auto &f = p.pic_info_fields.bits;
+     const auto &s = p.seq_info_fields.fields;
+@@ -432,6 +432,11 @@
+     bool resilient = (type == key_frame && show) || type == switch_frame || f.error_resilient_mode;
+     unsigned primary = intra || resilient ? 7 : p.primary_ref_frame;
+     auto slots = intra ? std::array<unsigned, 7>{} : reference_slots(p, state);
++    // Avoid firmware's explicit-size path when sequence dimensions already
++    // describe the VA picture. Compare the upscaled width before superres.
++    bool size_override = type == switch_frame || !implicit_size ||
++                         unsigned(p.frame_width_minus1) + 1 != width ||
++                         unsigned(p.frame_height_minus1) + 1 != height;
+     Bits b;
+     b.bit(0); // show_existing_frame is resolved by the VA client using its surface.
+     b.bits(type, 2);
+@@ -445,7 +450,7 @@
+     if (f.allow_screen_content_tools)
+         b.bit(f.force_integer_mv);
+     if (type != switch_frame)
+-        b.bit(1); // Always write explicit dimensions.
++        b.bit(size_override);
+     if (s.enable_order_hint)
+         b.bits(p.order_hint, p.order_hint_bits_minus_1 + 1);
+     if (!intra && !resilient)
+@@ -460,12 +465,14 @@
+             b.bit(0); // Explicit reference mapping, no short signaling.
+         for (unsigned slot : slots)
+             b.bits(slot, 3);
+-        if (!resilient)
++        if (size_override && !resilient)
+             for (unsigned i = 0; i < 7; ++i)
+                 b.bit(0); // Do not inherit dimensions from a reference.
+     }
+-    b.bits(p.frame_width_minus1, log2_ceil(width));
+-    b.bits(p.frame_height_minus1, log2_ceil(height));
++    if (size_override) {
++        b.bits(p.frame_width_minus1, log2_ceil(width));
++        b.bits(p.frame_height_minus1, log2_ceil(height));
++    }
+     b.bit(f.use_superres);
+     if (f.use_superres)
+         b.bits(p.superres_scale_denominator - 9, 3);
+@@ -575,6 +582,11 @@
+     const auto &p = picture.params;
+     const auto &f = p.pic_info_fields.bits;
+     const auto &s = p.seq_info_fields.fields;
++    check(!anchor || (unsigned(p.frame_width_minus1) + 1 == width &&
++                      unsigned(p.frame_height_minus1) + 1 == height &&
++                      f.frame_type != switch_frame),
++          "T880 AV1 requires sequence-sized pictures without switch frames",
++          VA_STATUS_ERROR_UNIMPLEMENTED);
+     check(p.profile == 0 && p.bit_depth_idx <= 1 && !s.mono_chrome && s.subsampling_x &&
+               s.subsampling_y,
+           "AV1 requires Main 8/10-bit 4:2:0", VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+@@ -628,7 +640,7 @@
+         int slot = free_slot(state, p);
+         check(slot >= 0, "AV1 reference map exceeds eight frames", invalid);
+         unsigned refresh = 1u << slot;
+-        obu(out, 6, frame(*state.pending_reference, state, width, height, refresh, false, false));
++        obu(out, 6, frame(*state.pending_reference, state, width, height, refresh, false, false, anchor != nullptr));
+         remember(state, *state.pending_reference, refresh);
+         trace("AV1 install reference surface=%u slot=%d",
+               state.pending_reference->params.current_frame, slot);
+@@ -636,7 +648,7 @@
+     state.pending_reference.reset();
+     int slot = free_slot(state, p);
+     unsigned refresh = reset ? 0xff : slot >= 0 ? 1u << slot : 0;
+-    obu(out, 6, frame(picture, state, width, height, refresh, true, reset));
++    obu(out, 6, frame(picture, state, width, height, refresh, true, reset, anchor != nullptr));
+     remember(state, picture, refresh);
+     if (!refresh)
+         state.pending_reference = std::make_shared<Av1Picture>(picture);
+--- a/tests/t880/anchors.cpp
++++ b/tests/t880/anchors.cpp
+@@ -28,5 +28,40 @@
+     assert(replay_anchor(out, td_end, cached, 3, true, false).empty()); // SWITCH
+     assert(replay_anchor(expected, td_end, cached, 0, false, true) == expected); // initial KEY
+     assert(replay_anchor(expected, td_end, cached, 0, true, true) == expected);
++    Av1Picture picture;
++    auto &p = picture.params;
++    p.frame_width_minus1 = 159; p.frame_height_minus1 = 127;
++    p.tile_cols = p.tile_rows = 1;
++    p.pic_info_fields.bits.uniform_tile_spacing_flag = 1;
++    picture.slices.push_back({{}, {0xaa, 0xbb}});
++    Av1State state;
++    auto bit = [](const auto &v, unsigned n) { return (v[n / 8] >> (7 - n % 8)) & 1; };
++    auto ordinary = frame(picture, state, 160, 128, 255, true, true);
++    auto compact = frame(picture, state, 160, 128, 255, true, true, true);
++    assert(bit(ordinary, 6) == 1 && bit(compact, 6) == 0);
++    assert(ordinary.size() == compact.size() + 2);
++    assert(compact[compact.size() - 2] == 0xaa && compact.back() == 0xbb);
++    p.frame_width_minus1 = 143;
++    assert(frame(picture, state, 160, 128, 255, true, true, true) ==
++           frame(picture, state, 160, 128, 255, true, true));
++    p.frame_width_minus1 = 159; p.pic_info_fields.bits.use_superres = 1;
++    p.superres_scale_denominator = 9;
++    assert(bit(frame(picture, state, 160, 128, 255, true, true, true), 6) == 0);
++    p.pic_info_fields.bits.use_superres = 0;
++    state.references[0].surface = 0;
++    p.pic_info_fields.bits.frame_type = switch_frame;
++    assert(frame(picture, state, 160, 128, 255, true, true, true) ==
++           frame(picture, state, 160, 128, 255, true, true));
++    picture.has_params = true;
++    std::vector<uint8_t> replay;
++    bool rejected = false;
++    try { av1_bitstream(picture, state, 160, 128, &replay); }
++    catch (const Error &e) { rejected = e.status == VA_STATUS_ERROR_UNIMPLEMENTED; }
++    assert(rejected); // switch is not a validated T880 firmware path
++    p.pic_info_fields.bits.frame_type = key_frame; p.frame_width_minus1 = 143;
++    rejected = false;
++    try { av1_bitstream(picture, state, 160, 128, &replay); }
++    catch (const Error &e) { rejected = e.status == VA_STATUS_ERROR_UNIMPLEMENTED; }
++    assert(rejected); // explicit-size pictures are unsupported on T880
+     std::cout << "AV1 initial/cached/hidden/switch anchor framing passed\n";
+ }
+--- a/src/decoder.cpp
++++ b/src/decoder.cpp
+@@ -102,7 +102,7 @@
+         close(fd);
+         if (match) {
+             t880 = is_t880; h264 = match; hevc = has_hevc;
+-            av1 = has_av1 && !t880; vp9 = has_vp9;
++            av1 = has_av1; vp9 = has_vp9;
+             return path;
+         }
+     }
+--- a/src/internal.hpp
++++ b/src/internal.hpp
+@@ -189,6 +189,7 @@
+     std::array<Av1Reference, 8> references;
+     std::shared_ptr<const Av1Picture> pending_reference;
+ };
++// A replay anchor opts into T880's validated sequence-sized picture framing.
+ std::vector<uint8_t> av1_bitstream(const Av1Picture &picture, Av1State &state, unsigned width,
+                                   unsigned height, std::vector<uint8_t> *anchor = nullptr);
+ std::vector<uint8_t> vp9_bitstream(VAProfile profile, const Vp9Picture &picture);

@@ -1,0 +1,757 @@
+From b7517c680d8fb7b29e5926d7739809e1215131b5 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 11 Nov 2026 04:23:05 +0800
+Subject: [PATCH 123/144] media: qcom: integrate SM8750 PHY and AON clock
+ ownership
+
+Use the SM8750 OEM two-phase lane sequence rather than the X1E fallback values. Hold the front camera CSI/MCLK ownership while its clock is prepared and restore the previous mux bits on release. Split the SoC PHY resources from CAMSS and retain the initial three-RDI subset within the existing generic pad API.
+
+Link: https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8750/tree/d50b305f7da9e14715a25120a4ac7b1a4b8b97c3/vendor/qcom/opensource/camera-kernel/drivers/cam_sensor_module/cam_csiphy
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0155-media-qcom-integrate-SM8750-PHY-and-AON-clock-owners.patch
+Import-SHA256: c1f4a44a36025e759f4e6f0aea09d0a018c70e8af13676ae4b00c7b53060d489
+Import-Provenance: mail headers
+(cherry picked from commit a8ff73f8a8a41bf1b59045c9fcd1d99b286e9fad)
+---
+ arch/arm64/boot/dts/qcom/sm8750.dtsi          | 299 +++++++++++-------
+ drivers/media/platform/qcom/camss/Makefile    |   2 +
+ .../media/platform/qcom/camss/camss-aon-mux.c | 127 ++++++++
+ drivers/media/platform/qcom/camss/camss.c     |  11 +-
+ .../qualcomm/phy-qcom-mipi-csi2-3ph-dphy.c    | 129 ++++++++
+ .../phy/qualcomm/phy-qcom-mipi-csi2-core.c    |   1 +
+ drivers/phy/qualcomm/phy-qcom-mipi-csi2.h     |   1 +
+ 7 files changed, 449 insertions(+), 121 deletions(-)
+ create mode 100644 drivers/media/platform/qcom/camss/camss-aon-mux.c
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8750.dtsi b/arch/arm64/boot/dts/qcom/sm8750.dtsi
+index 3aa4e64417..ec624bee6a 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8750.dtsi
+@@ -3566,12 +3566,6 @@ camss: isp@ad27000 {
+ 			      <0x0 0x0ad2d000 0x0 0x2b00>,
+ 			      <0x0 0x0ad6d000 0x0 0xa00>,
+ 			      <0x0 0x0ad72000 0x0 0xa00>,
+-			      <0x0 0x0ada9000 0x0 0x2000>,
+-			      <0x0 0x0adab000 0x0 0x2000>,
+-			      <0x0 0x0adad000 0x0 0x2000>,
+-			      <0x0 0x0adaf000 0x0 0x2000>,
+-			      <0x0 0x0adb1000 0x0 0x2000>,
+-			      <0x0 0x0adb3000 0x0 0x2000>,
+ 			      <0x0 0x0ad8b000 0x0 0x400>,
+ 			      <0x0 0x0ad8c000 0x0 0x400>,
+ 			      <0x0 0x0ad8d000 0x0 0x400>,
+@@ -3585,12 +3579,6 @@ camss: isp@ad27000 {
+ 				    "csid2",
+ 				    "csid_lite0",
+ 				    "csid_lite1",
+-				    "csiphy0",
+-				    "csiphy1",
+-				    "csiphy2",
+-				    "csiphy3",
+-				    "csiphy4",
+-				    "csiphy5",
+ 				    "csitpg0",
+ 				    "csitpg1",
+ 				    "csitpg2",
+@@ -3601,108 +3589,72 @@ camss: isp@ad27000 {
+ 				    "vfe_lite1";
+ 
+ 			clocks = <&camcc CAM_CC_CAMNOC_NRT_AXI_CLK>,
+-				 <&camcc CAM_CC_CAMNOC_RT_AXI_CLK>,
+-				 <&camcc CAM_CC_CAM_TOP_AHB_CLK>,
+-				 <&camcc CAM_CC_CAM_TOP_FAST_AHB_CLK>,
+-				 <&camcc CAM_CC_CAMNOC_RT_TFE_0_MAIN_CLK>,
+-				 <&camcc CAM_CC_CAMNOC_RT_TFE_1_MAIN_CLK>,
+-				 <&camcc CAM_CC_CAMNOC_RT_TFE_2_MAIN_CLK>,
+-				 <&camcc CAM_CC_CAMNOC_RT_IFE_LITE_CLK>,
+-				 <&camcc CAM_CC_CSID_CLK>,
+-				 <&camcc CAM_CC_CSID_CSIPHY_RX_CLK>,
+-				 <&camcc CAM_CC_CSIPHY0_CLK>,
+-				 <&camcc CAM_CC_CSI0PHYTIMER_CLK>,
+-				 <&camcc CAM_CC_CSIPHY1_CLK>,
+-				 <&camcc CAM_CC_CSI1PHYTIMER_CLK>,
+-				 <&camcc CAM_CC_CSIPHY2_CLK>,
+-				 <&camcc CAM_CC_CSI2PHYTIMER_CLK>,
+-				 <&camcc CAM_CC_CSIPHY3_CLK>,
+-				 <&camcc CAM_CC_CSI3PHYTIMER_CLK>,
+-				 <&camcc CAM_CC_CSIPHY4_CLK>,
+-				 <&camcc CAM_CC_CSI4PHYTIMER_CLK>,
+-				 <&camcc CAM_CC_CSIPHY5_CLK>,
+-				 <&camcc CAM_CC_CSI5PHYTIMER_CLK>,
+-				 <&gcc GCC_CAMERA_HF_AXI_CLK>,
+-				 <&gcc GCC_CAMERA_SF_AXI_CLK>,
+-				 <&camcc CAM_CC_TFE_0_MAIN_CLK>,
+-				 <&camcc CAM_CC_TFE_0_MAIN_FAST_AHB_CLK>,
+-				 <&camcc CAM_CC_TFE_1_MAIN_CLK>,
+-				 <&camcc CAM_CC_TFE_1_MAIN_FAST_AHB_CLK>,
+-				 <&camcc CAM_CC_TFE_2_MAIN_CLK>,
+-				 <&camcc CAM_CC_TFE_2_MAIN_FAST_AHB_CLK>,
+-				 <&camcc CAM_CC_IFE_LITE_CLK>,
+-				 <&camcc CAM_CC_IFE_LITE_AHB_CLK>,
+-				 <&camcc CAM_CC_IFE_LITE_CPHY_RX_CLK>,
+-				 <&camcc CAM_CC_IFE_LITE_CSID_CLK>,
+-				 <&camcc CAM_CC_QDSS_DEBUG_XO_CLK>;
++			      <&camcc CAM_CC_CAMNOC_RT_AXI_CLK>,
++			      <&camcc CAM_CC_CAM_TOP_AHB_CLK>,
++			      <&camcc CAM_CC_CAM_TOP_FAST_AHB_CLK>,
++			      <&camcc CAM_CC_CAMNOC_RT_TFE_0_MAIN_CLK>,
++			      <&camcc CAM_CC_CAMNOC_RT_TFE_1_MAIN_CLK>,
++			      <&camcc CAM_CC_CAMNOC_RT_TFE_2_MAIN_CLK>,
++			      <&camcc CAM_CC_CAMNOC_RT_IFE_LITE_CLK>,
++			      <&camcc CAM_CC_CSID_CLK>,
++			      <&camcc CAM_CC_CSID_CSIPHY_RX_CLK>,
++			      <&gcc GCC_CAMERA_HF_AXI_CLK>,
++			      <&gcc GCC_CAMERA_SF_AXI_CLK>,
++			      <&camcc CAM_CC_TFE_0_MAIN_CLK>,
++			      <&camcc CAM_CC_TFE_0_MAIN_FAST_AHB_CLK>,
++			      <&camcc CAM_CC_TFE_1_MAIN_CLK>,
++			      <&camcc CAM_CC_TFE_1_MAIN_FAST_AHB_CLK>,
++			      <&camcc CAM_CC_TFE_2_MAIN_CLK>,
++			      <&camcc CAM_CC_TFE_2_MAIN_FAST_AHB_CLK>,
++			      <&camcc CAM_CC_IFE_LITE_CLK>,
++			      <&camcc CAM_CC_IFE_LITE_AHB_CLK>,
++			      <&camcc CAM_CC_IFE_LITE_CPHY_RX_CLK>,
++			      <&camcc CAM_CC_IFE_LITE_CSID_CLK>,
++			      <&camcc CAM_CC_QDSS_DEBUG_XO_CLK>;
+ 			clock-names = "camnoc_nrt_axi",
+-				      "camnoc_rt_axi",
+-				      "cpas_ahb",
+-				      "cpas_fast_ahb",
+-				      "cpas_vfe0",
+-				      "cpas_vfe1",
+-				      "cpas_vfe2",
+-				      "cpas_vfe_lite",
+-				      "csid",
+-				      "csid_csiphy_rx",
+-				      "csiphy0",
+-				      "csiphy0_timer",
+-				      "csiphy1",
+-				      "csiphy1_timer",
+-				      "csiphy2",
+-				      "csiphy2_timer",
+-				      "csiphy3",
+-				      "csiphy3_timer",
+-				      "csiphy4",
+-				      "csiphy4_timer",
+-				      "csiphy5",
+-				      "csiphy5_timer",
+-				      "gcc_axi_hf",
+-				      "gcc_axi_sf",
+-				      "vfe0",
+-				      "vfe0_fast_ahb",
+-				      "vfe1",
+-				      "vfe1_fast_ahb",
+-				      "vfe2",
+-				      "vfe2_fast_ahb",
+-				      "vfe_lite",
+-				      "vfe_lite_ahb",
+-				      "vfe_lite_cphy_rx",
+-				      "vfe_lite_csid",
+-				      "qdss_debug_xo";
++				    "camnoc_rt_axi",
++				    "cpas_ahb",
++				    "cpas_fast_ahb",
++				    "cpas_vfe0",
++				    "cpas_vfe1",
++				    "cpas_vfe2",
++				    "cpas_vfe_lite",
++				    "csid",
++				    "csid_csiphy_rx",
++				    "gcc_axi_hf",
++				    "gcc_axi_sf",
++				    "vfe0",
++				    "vfe0_fast_ahb",
++				    "vfe1",
++				    "vfe1_fast_ahb",
++				    "vfe2",
++				    "vfe2_fast_ahb",
++				    "vfe_lite",
++				    "vfe_lite_ahb",
++				    "vfe_lite_cphy_rx",
++				    "vfe_lite_csid",
++				    "qdss_debug_xo";
+ 
+ 			interrupts = <GIC_SPI 601 IRQ_TYPE_EDGE_RISING>,
+-				     <GIC_SPI 603 IRQ_TYPE_EDGE_RISING>,
+-				     <GIC_SPI 431 IRQ_TYPE_EDGE_RISING>,
+-				     <GIC_SPI 605 IRQ_TYPE_EDGE_RISING>,
+-				     <GIC_SPI 376 IRQ_TYPE_EDGE_RISING>,
+-				     <GIC_SPI 477 IRQ_TYPE_EDGE_RISING>,
+-				     <GIC_SPI 478 IRQ_TYPE_EDGE_RISING>,
+-				     <GIC_SPI 479 IRQ_TYPE_EDGE_RISING>,
+-				     <GIC_SPI 448 IRQ_TYPE_EDGE_RISING>,
+-				     <GIC_SPI 122 IRQ_TYPE_EDGE_RISING>,
+-				     <GIC_SPI 89 IRQ_TYPE_EDGE_RISING>,
+-				     <GIC_SPI 433 IRQ_TYPE_EDGE_RISING>,
+-				     <GIC_SPI 436 IRQ_TYPE_EDGE_RISING>,
+-				     <GIC_SPI 457 IRQ_TYPE_EDGE_RISING>,
+-				     <GIC_SPI 606 IRQ_TYPE_EDGE_RISING>,
+-				     <GIC_SPI 377 IRQ_TYPE_EDGE_RISING>;
++			      <GIC_SPI 603 IRQ_TYPE_EDGE_RISING>,
++			      <GIC_SPI 431 IRQ_TYPE_EDGE_RISING>,
++			      <GIC_SPI 605 IRQ_TYPE_EDGE_RISING>,
++			      <GIC_SPI 376 IRQ_TYPE_EDGE_RISING>,
++			      <GIC_SPI 433 IRQ_TYPE_EDGE_RISING>,
++			      <GIC_SPI 436 IRQ_TYPE_EDGE_RISING>,
++			      <GIC_SPI 457 IRQ_TYPE_EDGE_RISING>,
++			      <GIC_SPI 606 IRQ_TYPE_EDGE_RISING>,
++			      <GIC_SPI 377 IRQ_TYPE_EDGE_RISING>;
+ 			interrupt-names = "csid0",
+-					  "csid1",
+-					  "csid2",
+-					  "csid_lite0",
+-					  "csid_lite1",
+-					  "csiphy0",
+-					  "csiphy1",
+-					  "csiphy2",
+-					  "csiphy3",
+-					  "csiphy4",
+-					  "csiphy5",
+-					  "vfe0",
+-					  "vfe1",
+-					  "vfe2",
+-					  "vfe_lite0",
+-					  "vfe_lite1";
++				    "csid1",
++				    "csid2",
++				    "csid_lite0",
++				    "csid_lite1",
++				    "vfe0",
++				    "vfe1",
++				    "vfe2",
++				    "vfe_lite0",
++				    "vfe_lite1";
+ 
+ 			interconnects = <&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ACTIVE_ONLY
+ 					 &config_noc SLAVE_CAMERA_CFG QCOM_ICC_TAG_ACTIVE_ONLY>,
+@@ -3734,27 +3686,27 @@ ports {
+ 				#address-cells = <1>;
+ 				#size-cells = <0>;
+ 
+-				port@0 {
++				camss_port0: port@0 {
+ 					reg = <0>;
+ 				};
+ 
+-				port@1 {
++				camss_port1: port@1 {
+ 					reg = <1>;
+ 				};
+ 
+-				port@2 {
++				camss_port2: port@2 {
+ 					reg = <2>;
+ 				};
+ 
+-				port@3 {
++				camss_port3: port@3 {
+ 					reg = <3>;
+ 				};
+ 
+-				port@4 {
++				camss_port4: port@4 {
+ 					reg = <4>;
+ 				};
+ 
+-				port@5 {
++				camss_port5: port@5 {
+ 					reg = <5>;
+ 				};
+ 			};
+@@ -4196,6 +4148,103 @@ dispcc: clock-controller@af00000 {
+ 			#power-domain-cells = <1>;
+ 		};
+ 
++
++		csiphy0: phy@ada9000 {
++			compatible = "qcom,sm8750-csi2-phy", "qcom,kaanapali-csi2-phy";
++			reg = <0x0 0x0ada9000 0x0 0x2000>;
++			clocks = <&camcc CAM_CC_CSIPHY0_CLK>,
++				 <&camcc CAM_CC_CSI0PHYTIMER_CLK>,
++				 <&camcc CAM_CC_CORE_AHB_CLK>;
++			clock-names = "core", "timer", "ahb";
++			interrupts = <GIC_SPI 477 IRQ_TYPE_EDGE_RISING>;
++			power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>,
++					<&rpmhpd RPMHPD_MMCX>, <&rpmhpd RPMHPD_MXC>;
++			power-domain-names = "top", "mmcx", "mx";
++			operating-points-v2 = <&csiphy_opp_table>;
++			#phy-cells = <1>;
++			status = "disabled";
++		};
++
++		csiphy1: phy@adab000 {
++			compatible = "qcom,sm8750-csi2-phy", "qcom,kaanapali-csi2-phy";
++			reg = <0x0 0x0adab000 0x0 0x2000>;
++			clocks = <&camcc CAM_CC_CSIPHY1_CLK>,
++				 <&camcc CAM_CC_CSI1PHYTIMER_CLK>,
++				 <&camcc CAM_CC_CORE_AHB_CLK>;
++			clock-names = "core", "timer", "ahb";
++			interrupts = <GIC_SPI 478 IRQ_TYPE_EDGE_RISING>;
++			power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>,
++					<&rpmhpd RPMHPD_MMCX>, <&rpmhpd RPMHPD_MXC>;
++			power-domain-names = "top", "mmcx", "mx";
++			operating-points-v2 = <&csiphy_opp_table>;
++			#phy-cells = <1>;
++			status = "disabled";
++		};
++
++		csiphy2: phy@adad000 {
++			compatible = "qcom,sm8750-csi2-phy", "qcom,kaanapali-csi2-phy";
++			reg = <0x0 0x0adad000 0x0 0x2000>;
++			clocks = <&camcc CAM_CC_CSIPHY2_CLK>,
++				 <&camcc CAM_CC_CSI2PHYTIMER_CLK>,
++				 <&camcc CAM_CC_CORE_AHB_CLK>;
++			clock-names = "core", "timer", "ahb";
++			interrupts = <GIC_SPI 479 IRQ_TYPE_EDGE_RISING>;
++			power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>,
++					<&rpmhpd RPMHPD_MMCX>, <&rpmhpd RPMHPD_MXC>;
++			power-domain-names = "top", "mmcx", "mx";
++			operating-points-v2 = <&csiphy_opp_table>;
++			#phy-cells = <1>;
++			status = "disabled";
++		};
++
++		csiphy3: phy@adaf000 {
++			compatible = "qcom,sm8750-csi2-phy", "qcom,kaanapali-csi2-phy";
++			reg = <0x0 0x0adaf000 0x0 0x2000>;
++			clocks = <&camcc CAM_CC_CSIPHY3_CLK>,
++				 <&camcc CAM_CC_CSI3PHYTIMER_CLK>,
++				 <&camcc CAM_CC_CORE_AHB_CLK>;
++			clock-names = "core", "timer", "ahb";
++			interrupts = <GIC_SPI 448 IRQ_TYPE_EDGE_RISING>;
++			power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>,
++					<&rpmhpd RPMHPD_MMCX>, <&rpmhpd RPMHPD_MXC>;
++			power-domain-names = "top", "mmcx", "mx";
++			operating-points-v2 = <&csiphy_opp_table>;
++			#phy-cells = <1>;
++			status = "disabled";
++		};
++
++		csiphy4: phy@adb1000 {
++			compatible = "qcom,sm8750-csi2-phy", "qcom,kaanapali-csi2-phy";
++			reg = <0x0 0x0adb1000 0x0 0x2000>;
++			clocks = <&camcc CAM_CC_CSIPHY4_CLK>,
++				 <&camcc CAM_CC_CSI4PHYTIMER_CLK>,
++				 <&camcc CAM_CC_CORE_AHB_CLK>;
++			clock-names = "core", "timer", "ahb";
++			interrupts = <GIC_SPI 122 IRQ_TYPE_EDGE_RISING>;
++			power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>,
++					<&rpmhpd RPMHPD_MMCX>, <&rpmhpd RPMHPD_MXC>;
++			power-domain-names = "top", "mmcx", "mx";
++			operating-points-v2 = <&csiphy_opp_table>;
++			#phy-cells = <1>;
++			status = "disabled";
++		};
++
++		csiphy5: phy@adb3000 {
++			compatible = "qcom,sm8750-csi2-phy", "qcom,kaanapali-csi2-phy";
++			reg = <0x0 0x0adb3000 0x0 0x2000>;
++			clocks = <&camcc CAM_CC_CSIPHY5_CLK>,
++				 <&camcc CAM_CC_CSI5PHYTIMER_CLK>,
++				 <&camcc CAM_CC_CORE_AHB_CLK>;
++			clock-names = "core", "timer", "ahb";
++			interrupts = <GIC_SPI 89 IRQ_TYPE_EDGE_RISING>;
++			power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>,
++					<&rpmhpd RPMHPD_MMCX>, <&rpmhpd RPMHPD_MXC>;
++			power-domain-names = "top", "mmcx", "mx";
++			operating-points-v2 = <&csiphy_opp_table>;
++			#phy-cells = <1>;
++			status = "disabled";
++		};
++
+ 		camcc: clock-controller@ade0000 {
+ 			compatible = "qcom,sm8750-camcc";
+ 			reg = <0x0 0xade0000 0x0 0x20000>;
+@@ -8158,3 +8207,21 @@ tpdm_modem1_out: endpoint {
+ 		};
+ 	};
+ };
++
++/ {
++	csiphy_opp_table: opp-table-csiphy {
++		compatible = "operating-points-v2";
++		opp-266666667 {
++			opp-hz = /bits/ 64 <266666667>;
++			required-opps = <&rpmhpd_opp_low_svs_d1>, <&rpmhpd_opp_low_svs_d1>;
++		};
++		opp-400000000 {
++			opp-hz = /bits/ 64 <400000000>;
++			required-opps = <&rpmhpd_opp_low_svs>, <&rpmhpd_opp_low_svs>;
++		};
++		opp-480000000 {
++			opp-hz = /bits/ 64 <480000000>;
++			required-opps = <&rpmhpd_opp_nom>, <&rpmhpd_opp_nom>;
++		};
++	};
++};
+diff --git a/drivers/media/platform/qcom/camss/Makefile b/drivers/media/platform/qcom/camss/Makefile
+index 1aef426754..d441995608 100644
+--- a/drivers/media/platform/qcom/camss/Makefile
++++ b/drivers/media/platform/qcom/camss/Makefile
+@@ -34,3 +34,5 @@ qcom-camss-objs += \
+ 		camss-video.o
+ 
+ obj-$(CONFIG_VIDEO_QCOM_CAMSS) += qcom-camss.o
++
++obj-$(CONFIG_VIDEO_QCOM_CAMSS) += camss-aon-mux.o
+diff --git a/drivers/media/platform/qcom/camss/camss-aon-mux.c b/drivers/media/platform/qcom/camss/camss-aon-mux.c
+new file mode 100644
+index 0000000000..4222a0991a
+--- /dev/null
++++ b/drivers/media/platform/qcom/camss/camss-aon-mux.c
+@@ -0,0 +1,127 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* SM8750 camera/AON MCLK and CSI ownership, held while MCLK is prepared. */
++#include <linux/clk.h>
++#include <linux/clk-provider.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++
++#define CAM_AON_SELECT_MASK (BIT(0) | BIT(8))
++
++struct camss_aon_mux {
++	struct clk_hw hw;
++	struct device *dev;
++	void __iomem *base;
++	struct clk_bulk_data clocks[2];
++	u32 saved;
++};
++
++static int camss_aon_prepare(struct clk_hw *hw)
++{
++	struct camss_aon_mux *mux = container_of(hw, struct camss_aon_mux, hw);
++	u32 val;
++	int ret;
++
++	ret = pm_runtime_resume_and_get(mux->dev);
++	if (ret < 0)
++		return ret;
++	ret = clk_bulk_prepare_enable(ARRAY_SIZE(mux->clocks), mux->clocks);
++	if (ret) {
++		pm_runtime_put(mux->dev);
++		return ret;
++	}
++	val = readl(mux->base);
++	mux->saved = val & CAM_AON_SELECT_MASK;
++	writel(val & ~CAM_AON_SELECT_MASK, mux->base);
++	/* Flush before the parent MCLK is enabled and the sensor leaves reset. */
++	readl(mux->base);
++	return 0;
++}
++
++static void camss_aon_unprepare(struct clk_hw *hw)
++{
++	struct camss_aon_mux *mux = container_of(hw, struct camss_aon_mux, hw);
++	u32 val = readl(mux->base);
++
++	/* CCF has already disabled the parent MCLK at this point. */
++	writel((val & ~CAM_AON_SELECT_MASK) | mux->saved, mux->base);
++	readl(mux->base);
++	clk_bulk_disable_unprepare(ARRAY_SIZE(mux->clocks), mux->clocks);
++	pm_runtime_put(mux->dev);
++}
++
++static unsigned long camss_aon_recalc_rate(struct clk_hw *hw,
++					unsigned long parent_rate)
++{
++	return parent_rate;
++}
++
++static const struct clk_ops camss_aon_ops = {
++	.prepare = camss_aon_prepare,
++	.unprepare = camss_aon_unprepare,
++	.recalc_rate = camss_aon_recalc_rate,
++};
++
++static void camss_aon_disable_pm(void *data)
++{
++	pm_runtime_disable(data);
++}
++
++static int camss_aon_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct clk_parent_data parent = { .fw_name = "mclk" };
++	struct clk_init_data init = {
++		.name = dev_name(dev),
++		.ops = &camss_aon_ops,
++		.parent_data = &parent,
++		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
++	};
++	struct camss_aon_mux *mux;
++	struct clk *mclk;
++	int ret;
++
++	mux = devm_kzalloc(dev, sizeof(*mux), GFP_KERNEL);
++	if (!mux)
++		return -ENOMEM;
++	mux->dev = dev;
++	mux->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(mux->base))
++		return PTR_ERR(mux->base);
++	/* Resolve the parent now, rather than registering an orphan output. */
++	mclk = devm_clk_get(dev, "mclk");
++	if (IS_ERR(mclk))
++		return dev_err_probe(dev, PTR_ERR(mclk), "MCLK unavailable\n");
++	mux->clocks[0].id = "ahb";
++	mux->clocks[1].id = "fast-ahb";
++	ret = devm_clk_bulk_get(dev, ARRAY_SIZE(mux->clocks), mux->clocks);
++	if (ret)
++		return dev_err_probe(dev, ret, "CPAS clocks unavailable\n");
++	pm_runtime_enable(dev);
++	ret = devm_add_action_or_reset(dev, camss_aon_disable_pm, dev);
++	if (ret)
++		return ret;
++	mux->hw.init = &init;
++	ret = devm_clk_hw_register(dev, &mux->hw);
++	if (ret)
++		return ret;
++	return devm_of_clk_add_hw_provider(dev, of_clk_hw_simple_get, &mux->hw);
++}
++
++static const struct of_device_id camss_aon_match[] = {
++	{ .compatible = "qcom,sm8750-camera-aon-mux" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, camss_aon_match);
++static struct platform_driver camss_aon_driver = {
++	.probe = camss_aon_probe,
++	.driver = {
++		.name = "qcom-camera-aon-mux",
++		.of_match_table = camss_aon_match,
++	},
++};
++module_platform_driver(camss_aon_driver);
++MODULE_DESCRIPTION("Qualcomm SM8750 camera/AON MCLK and CSI ownership");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/media/platform/qcom/camss/camss.c b/drivers/media/platform/qcom/camss/camss.c
+index 6c226dd3ab..09165d0cb3 100644
+--- a/drivers/media/platform/qcom/camss/camss.c
++++ b/drivers/media/platform/qcom/camss/camss.c
+@@ -245,7 +245,7 @@ static const struct camss_subdev_resources vfe_res_sm8750[] = {
+ 		.reg = { "vfe0" },
+ 		.interrupt = { "vfe0" },
+ 		.vfe = {
+-			.line_num = 5,
++			.line_num = 3,
+ 			.has_pd = true,
+ 			.pd_name = "ife0",
+ 			.hw_ops = &vfe_ops_1080,
+@@ -270,7 +270,7 @@ static const struct camss_subdev_resources vfe_res_sm8750[] = {
+ 		.reg = { "vfe1" },
+ 		.interrupt = { "vfe1" },
+ 		.vfe = {
+-			.line_num = 5,
++			.line_num = 3,
+ 			.has_pd = true,
+ 			.pd_name = "ife1",
+ 			.hw_ops = &vfe_ops_1080,
+@@ -295,7 +295,7 @@ static const struct camss_subdev_resources vfe_res_sm8750[] = {
+ 		.reg = { "vfe2" },
+ 		.interrupt = { "vfe2" },
+ 		.vfe = {
+-			.line_num = 5,
++			.line_num = 3,
+ 			.has_pd = true,
+ 			.pd_name = "ife2",
+ 			.hw_ops = &vfe_ops_1080,
+@@ -316,7 +316,7 @@ static const struct camss_subdev_resources vfe_res_sm8750[] = {
+ 		.reg = { "vfe_lite0" },
+ 		.interrupt = { "vfe_lite0" },
+ 		.vfe = {
+-			.line_num = 4,
++			.line_num = 3,
+ 			.is_lite = true,
+ 			.hw_ops = &vfe_ops_1080,
+ 			.formats_rdi = &vfe_formats_rdi_845,
+@@ -336,7 +336,7 @@ static const struct camss_subdev_resources vfe_res_sm8750[] = {
+ 		.reg = { "vfe_lite1" },
+ 		.interrupt = { "vfe_lite1" },
+ 		.vfe = {
+-			.line_num = 4,
++			.line_num = 3,
+ 			.is_lite = true,
+ 			.hw_ops = &vfe_ops_1080,
+ 			.formats_rdi = &vfe_formats_rdi_845,
+@@ -6298,6 +6298,7 @@ static const struct camss_resources sm8650_resources = {
+ static const struct camss_resources sm8750_resources = {
+ 	.version = CAMSS_8750,
+ 	.pd_name = "top",
++	.pm_clks = { "cpas_fast_ahb", "cpas_ahb", "gcc_axi_hf" },
+ 	.tpg_res = tpg_res_x1e80100,
+ 	.csid_res = csid_res_sm8750,
+ 	.vfe_res = vfe_res_sm8750,
+diff --git a/drivers/phy/qualcomm/phy-qcom-mipi-csi2-3ph-dphy.c b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-3ph-dphy.c
+index ed40934d67..d806a649ac 100644
+--- a/drivers/phy/qualcomm/phy-qcom-mipi-csi2-3ph-dphy.c
++++ b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-3ph-dphy.c
+@@ -357,6 +357,119 @@ static const struct mipi_csi2phy_hw_ops phy_qcom_mipi_csi2_ops_3ph_1_0 = {
+ 	.lanes_disable = phy_qcom_mipi_csi2_lanes_disable,
+ };
+ 
++/* SM8750 two-phase values, Qualcomm Innovation Center 2023-2024.
++ * Source: OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8750
++ * d50b305f7da9e14715a25120a4ac7b1a4b8b97c3, cam_csiphy_2_3_0_hwreg.h.
++ * Common power-up entries precede the 103 unchanged lane entries.
++ */
++static const struct mipi_csi2phy_lane_regs lane_regs_sm8750[] = {
++	{ .reg_addr = 0x101c, .reg_data = 0x7a },
++	{ .reg_addr = 0x1018, .reg_data = 0x01 },
++	{ .reg_addr = 0x0e94, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0ea0, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0e90, .reg_data = 0x0f, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0e98, .reg_data = 0x08, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0e94, .reg_data = 0x07, .delay_us = 0xd1, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0094, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x00a0, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0090, .reg_data = 0x0f, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0098, .reg_data = 0x08, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0094, .reg_data = 0x07, .delay_us = 0xd1, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0494, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x04a0, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0490, .reg_data = 0x0f, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0498, .reg_data = 0x08, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0494, .reg_data = 0x07, .delay_us = 0xd1, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0894, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x08a0, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0890, .reg_data = 0x0f, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0898, .reg_data = 0x08, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0894, .reg_data = 0x07, .delay_us = 0xd1, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0c94, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0ca0, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0c90, .reg_data = 0x0f, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0c98, .reg_data = 0x08, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0c94, .reg_data = 0x07, .delay_us = 0xd1, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0e30, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0e28, .reg_data = 0x04, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0e00, .reg_data = 0x80, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0e0c, .reg_data = 0xff, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0e38, .reg_data = 0x1f, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0e2c, .reg_data = 0x01, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0e34, .reg_data = 0x0f, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0e1c, .reg_data = 0x0a, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0e14, .reg_data = 0x60, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0e3c, .reg_data = 0xb8, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0e04, .reg_data = 0x0c, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0e20, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0e08, .reg_data = 0x19, .delay_us = 0x00, .param_type = CSIPHY_SETTLE_CNT_LOWER_BYTE },
++	{ .reg_addr = 0x0e10, .reg_data = 0x52, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0030, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0000, .reg_data = 0x8c, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0038, .reg_data = 0xfe, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x002c, .reg_data = 0x01, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0034, .reg_data = 0x0f, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x001c, .reg_data = 0x0a, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0014, .reg_data = 0x60, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x003c, .reg_data = 0xb8, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0004, .reg_data = 0x0c, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0020, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0008, .reg_data = 0x19, .delay_us = 0x00, .param_type = CSIPHY_SETTLE_CNT_LOWER_BYTE },
++	{ .reg_addr = 0x0010, .reg_data = 0x52, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0430, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0400, .reg_data = 0x8c, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0438, .reg_data = 0xfe, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x042c, .reg_data = 0x01, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0434, .reg_data = 0x0f, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x041c, .reg_data = 0x0a, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0414, .reg_data = 0x60, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x043c, .reg_data = 0xb8, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0404, .reg_data = 0x0c, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0420, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0408, .reg_data = 0x19, .delay_us = 0x00, .param_type = CSIPHY_SETTLE_CNT_LOWER_BYTE },
++	{ .reg_addr = 0x0410, .reg_data = 0x52, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0830, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0800, .reg_data = 0x8c, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0838, .reg_data = 0xfe, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x082c, .reg_data = 0x01, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0834, .reg_data = 0x0f, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x081c, .reg_data = 0x0a, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0814, .reg_data = 0x60, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x083c, .reg_data = 0xb8, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0804, .reg_data = 0x0c, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0820, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0808, .reg_data = 0x19, .delay_us = 0x00, .param_type = CSIPHY_SETTLE_CNT_LOWER_BYTE },
++	{ .reg_addr = 0x0810, .reg_data = 0x52, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0c30, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0c00, .reg_data = 0x8c, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0c38, .reg_data = 0xfe, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0c2c, .reg_data = 0x01, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0c34, .reg_data = 0x0f, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0c1c, .reg_data = 0x0a, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0c14, .reg_data = 0x60, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0c3c, .reg_data = 0xb8, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0c04, .reg_data = 0x0c, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0c20, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0c08, .reg_data = 0x19, .delay_us = 0x00, .param_type = CSIPHY_SETTLE_CNT_LOWER_BYTE },
++	{ .reg_addr = 0x0c10, .reg_data = 0x52, .delay_us = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS },
++	{ .reg_addr = 0x0094, .reg_data = 0xd7, .delay_us = 0x00, .param_type = CSIPHY_SKEW_CAL },
++	{ .reg_addr = 0x005c, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_SKEW_CAL },
++	{ .reg_addr = 0x0060, .reg_data = 0xfd, .delay_us = 0x00, .param_type = CSIPHY_SKEW_CAL },
++	{ .reg_addr = 0x0064, .reg_data = 0x7f, .delay_us = 0x00, .param_type = CSIPHY_SKEW_CAL },
++	{ .reg_addr = 0x0494, .reg_data = 0xd7, .delay_us = 0x00, .param_type = CSIPHY_SKEW_CAL },
++	{ .reg_addr = 0x045c, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_SKEW_CAL },
++	{ .reg_addr = 0x0460, .reg_data = 0xfd, .delay_us = 0x00, .param_type = CSIPHY_SKEW_CAL },
++	{ .reg_addr = 0x0464, .reg_data = 0x7f, .delay_us = 0x00, .param_type = CSIPHY_SKEW_CAL },
++	{ .reg_addr = 0x0894, .reg_data = 0xd7, .delay_us = 0x00, .param_type = CSIPHY_SKEW_CAL },
++	{ .reg_addr = 0x085c, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_SKEW_CAL },
++	{ .reg_addr = 0x0860, .reg_data = 0xfd, .delay_us = 0x00, .param_type = CSIPHY_SKEW_CAL },
++	{ .reg_addr = 0x0864, .reg_data = 0x7f, .delay_us = 0x00, .param_type = CSIPHY_SKEW_CAL },
++	{ .reg_addr = 0x0c94, .reg_data = 0xd7, .delay_us = 0x00, .param_type = CSIPHY_SKEW_CAL },
++	{ .reg_addr = 0x0c5c, .reg_data = 0x00, .delay_us = 0x00, .param_type = CSIPHY_SKEW_CAL },
++	{ .reg_addr = 0x0c60, .reg_data = 0xfd, .delay_us = 0x00, .param_type = CSIPHY_SKEW_CAL },
++	{ .reg_addr = 0x0c64, .reg_data = 0x7f, .delay_us = 0x00, .param_type = CSIPHY_SKEW_CAL },
++};
++
+ static const char * const x1e_clks[] = {
+ 	"core",
+ 	"timer",
+@@ -390,6 +503,22 @@ const struct mipi_csi2phy_soc_cfg mipi_csi2_dphy_3nm_kaanapali = {
+ 	.num_genpds = ARRAY_SIZE(x1e_genpds),
+ };
+ 
++const struct mipi_csi2phy_soc_cfg mipi_csi2_dphy_sm8750 = {
++	.ops = &phy_qcom_mipi_csi2_ops_3ph_1_0,
++	.reg_info = {
++		.init_seq = lane_regs_sm8750,
++		.lane_array_size = ARRAY_SIZE(lane_regs_sm8750),
++		.common_regs_offset = 0x1000,
++		.common_status_offset = 0x138,
++	},
++	.supply_names = (const char **)x1e_supplies,
++	.num_supplies = ARRAY_SIZE(x1e_supplies),
++	.clk_names = (const char **)x1e_clks,
++	.num_clk = ARRAY_SIZE(x1e_clks),
++	.genpds = x1e_genpds,
++	.num_genpds = ARRAY_SIZE(x1e_genpds),
++};
++
+ const struct mipi_csi2phy_soc_cfg mipi_csi2_dphy_4nm_x1e = {
+ 	.ops = &phy_qcom_mipi_csi2_ops_3ph_1_0,
+ 	.reg_info = {
+diff --git a/drivers/phy/qualcomm/phy-qcom-mipi-csi2-core.c b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-core.c
+index 941f8b920b..ad472ba54f 100644
+--- a/drivers/phy/qualcomm/phy-qcom-mipi-csi2-core.c
++++ b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-core.c
+@@ -443,6 +443,7 @@ static int phy_qcom_mipi_csi2_probe(struct platform_device *pdev)
+ }
+ 
+ static const struct of_device_id phy_qcom_mipi_csi2_of_match_table[] = {
++	{ .compatible = "qcom,sm8750-csi2-phy", .data = &mipi_csi2_dphy_sm8750 },
+ 	{ .compatible	= "qcom,kaanapali-csi2-phy", .data = &mipi_csi2_dphy_3nm_kaanapali },
+ 	{ .compatible	= "qcom,x1e80100-csi2-phy", .data = &mipi_csi2_dphy_4nm_x1e },
+ 	{ }
+diff --git a/drivers/phy/qualcomm/phy-qcom-mipi-csi2.h b/drivers/phy/qualcomm/phy-qcom-mipi-csi2.h
+index 832c8d048b..7f69755b69 100644
+--- a/drivers/phy/qualcomm/phy-qcom-mipi-csi2.h
++++ b/drivers/phy/qualcomm/phy-qcom-mipi-csi2.h
+@@ -93,6 +93,7 @@ struct mipi_csi2phy_device {
+ 	u32 hw_version;
+ };
+ 
++extern const struct mipi_csi2phy_soc_cfg mipi_csi2_dphy_sm8750;
+ extern const struct mipi_csi2phy_soc_cfg mipi_csi2_dphy_3nm_kaanapali;
+ extern const struct mipi_csi2phy_soc_cfg mipi_csi2_dphy_4nm_x1e;
+ 

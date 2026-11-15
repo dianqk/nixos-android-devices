@@ -1,0 +1,82 @@
+From 8ec1abb4210cb28b0738bb85b78477744a43023e Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] workaround: mfd: mt6375: preserve firmware protection
+ settings
+
+Restrict writes to the retained TCPC, interrupt and measurement whitelist,
+with the bounded opt-in charger exceptions. Preserve firmware protection
+configuration and exclude the software-reset register.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-16T01:47:11+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T18:23:57+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T20:29:20+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T21:53:56+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+(cherry picked from commit b701a05e07cc1353b295b1c358aa517dae3fccf6)
+Link: https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/power/supply/mt6375-charger.c
+---
+ drivers/mfd/mt6375.c | 33 +++++++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/drivers/mfd/mt6375.c b/drivers/mfd/mt6375.c
+index aaab9dacf4..61cce3ac58 100644
+--- a/drivers/mfd/mt6375.c
++++ b/drivers/mfd/mt6375.c
+@@ -232,11 +232,44 @@ static bool mt6375_is_accessible_reg(struct device *dev, unsigned int reg)
+ 	return false;
+ }
+ 
++/*
++ * Writes are limited to the TCPC bank, the charger/PD interrupt event and
++ * mask registers, and the three measurement triggers of the read-only
++ * reporting (charger ADC one-shot, gauge current latch, HK2 AUXADC
++ * request). Charger, gauge and AUXADC configuration (including the
++ * battery ship mode in CORE_CTRL2 0x106 / CHG_TOP1 0x120) stays as the
++ * bootloader left it. The TCPC's SYSCTRL3 (software reset) is not
++ * written; its SYSCTRL1 (0x8f, shipping bit 5) may only gain bits 7 and 5,
++ * checked at the bus write.
++ */
++static bool mt6375_is_writeable_reg(struct device *dev, unsigned int reg)
++{
++	struct mt6375_data *ddata = dev_get_drvdata(dev);
++
++	if (ddata && ddata->charger.enabled &&
++	    (reg == 0x120 || reg == 0x122 || reg == 0x123 ||
++	     reg == 0x125 || reg == 0x126 || reg == 0x128))
++		return true;
++	switch (reg) {
++	case 0x0b0:	/* TCPC SYSCTRL3 */
++		return false;
++	case 0x1a6:	/* ADC_CFG3: one-shot request */
++	case 0x270:	/* FGADC_CON3: current latch */
++	case 0x438:	/* HK2 RQST0 */
++		return true;
++	}
++	if (reg <= 0xff)
++		return true;
++	return reg >= MT6375_REG_CHG_IRQ0 &&
++	       reg < MT6375_REG_CHG_MSK0 + MT6375_IRQ_REGS;
++}
++
+ static const struct regmap_config mt6375_regmap_config = {
+ 	.reg_bits = 16,
+ 	.val_bits = 8,
+ 	.reg_format_endian = REGMAP_ENDIAN_BIG,
+ 	.max_register = MT6375_REG_RT2_END,
++	.writeable_reg = mt6375_is_writeable_reg,
+ 	.readable_reg = mt6375_is_accessible_reg,
+ };
+ 
+-- 
+2.56.0
+

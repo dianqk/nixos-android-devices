@@ -1,0 +1,48 @@
+From a705e54d7d9a90d4680bf83c08bc80c1743aac79 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 21 Oct 2026 22:41:39 +0800
+Subject: [PATCH] arm64: dts: qcom: aurora: Keep oops records in a
+ write-combined ramoops
+
+The stock ramoops layout (2 MiB console, 2 MiB pmsg, cached mapping, no
+dump records) left /sys/fs/pstore empty after cold reboots, a reset
+during s2idle and a PSCI warm reset: the cached mapping can keep the
+zone headers in the CPU caches across the reset, and without
+record-size a panic is not stored at all.
+
+Keep the stock region and map it write-combined (the ramoops default),
+add 256 KiB oops/panic records with ECC, and shrink the console to
+1 MiB and pmsg to 64 KiB (no Android logger writes it).
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts b/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
+index 5026480840ce..11a392f3707c 100644
+--- a/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
++++ b/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
+@@ -85,12 +85,19 @@ reserved-memory {
+ 		oem-vm-shm@fb400000 { reg = <0 0xfb400000 0 0x400000>; no-map; };
+ 		/* Preserve the bootloader's framebuffer allocation and node name. */
+ 		splash_region { reg = <0 0xfc400000 0 0x2b00000>; no-map; };
++		/*
++		 * The stock 4 MiB region, mapped write-combined so the zone
++		 * headers reach DRAM before a reset, with oops/panic records
++		 * and ECC; nothing here uses Android's large pmsg zone.
++		 */
+ 		ramoops@a7000000 {
+ 			compatible = "ramoops";
+ 			reg = <0 0xa7000000 0 0x400000>;
+-			console-size = <0x200000>;
+-			pmsg-size = <0x200000>;
+-			mem-type = <2>;
++			record-size = <0x40000>;
++			console-size = <0x100000>;
++			pmsg-size = <0x10000>;
++			ecc-size = <16>;
++			mem-type = <0>;
+ 			no-map;
+ 		};
+ 	};

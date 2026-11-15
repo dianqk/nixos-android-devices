@@ -1,0 +1,50 @@
+From a70724494d8d19209a704851905ace3afedaf470 Mon Sep 17 00:00:00 2001
+From: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Date: Tue, 14 Jul 2026 13:43:43 +0200
+Subject: [PATCH] drm/mediatek: ovl_adaptor: Add special MERGE component check
+
+On the legacy ovl_adaptor for MT8195 and MT8188, four MERGE IPs
+from VPPSYS are used, and those shall be exclusive to the OVL
+Adaptor driver.
+
+For this reason, add a branch in mtk_ovl_adaptor_is_comp_present()
+to check if the component that is being checked is MERGE and, if
+so, iterate through the list of component matches to understand if
+it is one of those that must be exclusive to OVL Adaptor.
+
+This resolves a corner case happening when mediatek-drm retries to
+probe after a probe deferral, where all MERGE components would get
+added to both "normal" and OVL Adaptor pipelines.
+
+Signed-off-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Link: https://patchwork.kernel.org/project/linux-mediatek/list/?series=1127365
+[dianqk: from the Huge Restructuring v2 series, applied to v7.3-rc6; rc6 drift resolved]
+---
+ drivers/gpu/drm/mediatek/mtk_disp_ovl_adaptor.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_ovl_adaptor.c b/drivers/gpu/drm/mediatek/mtk_disp_ovl_adaptor.c
+index 5947143f89..8165ab3458 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_ovl_adaptor.c
++++ b/drivers/gpu/drm/mediatek/mtk_disp_ovl_adaptor.c
+@@ -519,6 +519,17 @@ bool mtk_ovl_adaptor_is_comp_present(struct device_node *node)
+ 	if (type >= OVL_ADAPTOR_TYPE_NUM)
+ 		return false;
+ 
++	/* Check if this is one of the MERGE components used in OVL Adaptor */
++	if (type == OVL_ADAPTOR_TYPE_MERGE) {
++		int id = of_alias_get_id(node, private_comp_stem[type]);
++
++		for (int i = OVL_ADAPTOR_MERGE0; i <= OVL_ADAPTOR_MERGE3; i++)
++			if (comp_matches[i].alias_id == id)
++				return true;
++
++		return false;
++	}
++
+ 	/*
+ 	 * In the context of mediatek-drm, ETHDR, MDP_RDMA and Padding are
+ 	 * used exclusively by OVL Adaptor: if this component is not one of
+-- 
+2.56.0
+

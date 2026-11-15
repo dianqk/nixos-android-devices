@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Thu, 15 Oct 2026 16:53:12 +0800
+Subject: [PATCH] board: mediatek-mobile: clear the overlay buffers LK leaves
+ on screen
+
+LK keeps three buffers in its video memory (atag,videolfb-vramSize) and
+leaves a second display overlay layer enabled that alpha-blends its
+second buffer over the first. Its warning screens (for an unlocked
+device the "Orange State" text) stay in that buffer, so they remain
+visible over everything the OS draws into the first buffer through
+simple-framebuffer; Android's display driver reprograms the pipeline,
+simpledrm does not.
+
+Make the video memory after the simplefb buffer transparent black early
+in misc_init_r and clean it to memory. The display hardware itself is
+not touched.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../mediatek-mobile/mediatek-mobile.c         | 33 +++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/board/mediatek/mediatek-mobile/mediatek-mobile.c b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+index ff400cc47ec..0256d35ffb2 100644
+--- a/board/mediatek/mediatek-mobile/mediatek-mobile.c
++++ b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+@@ -1470,6 +1470,38 @@ static void mtk_idle_init(void)
+ 	cyclic_register(&mtk_idle, mtk_idle_wait, 0, "idle");
+ }
+ 
++/*
++ * LK keeps three buffers in its video memory and leaves a second overlay
++ * layer enabled that blends its second buffer over the first; the
++ * bootloader's warning screen (e.g. the unlocked "Orange State" text) stays
++ * there. The OS shows its picture in the first buffer only (simplefb), so
++ * make everything after it transparent black. The display hardware itself
++ * is not touched.
++ */
++static void mtk_clear_lk_overlays(void)
++{
++	const fdt32_t *cell;
++	u64 visible;
++	void *spare;
++	int node;
++
++	node = fdt_node_offset_by_compatible(gd->fdt_blob, -1, "simple-framebuffer");
++	if (node < 0 || !mtk_fb_size)
++		return;
++	cell = fdt_getprop(gd->fdt_blob, node, "stride", NULL);
++	visible = cell ? fdt32_to_cpu(*cell) : 0;
++	cell = fdt_getprop(gd->fdt_blob, node, "height", NULL);
++	visible *= cell ? fdt32_to_cpu(*cell) : 0;
++	if (!visible || visible >= mtk_fb_size)
++		return;
++	spare = map_sysmem(mtk_fb_start + visible, mtk_fb_size - visible);
++	memset(spare, 0, mtk_fb_size - visible);
++	flush_dcache_range((ulong)spare, (ulong)spare + mtk_fb_size - visible);
++	unmap_sysmem(spare);
++	mtk_trace("U-Boot: cleared LK overlay buffers 0x%llx+0x%llx\n",
++		  mtk_fb_start + visible, mtk_fb_size - visible);
++}
++
+ int misc_init_r(void)
+ {
+ 	phys_addr_t fastboot;
+@@ -1477,6 +1509,7 @@ int misc_init_r(void)
+ 	mtk_trace("U-Boot: misc_init_r\n");
+ 	mtk_pstore_console();
+ 
++	mtk_clear_lk_overlays();
+ 	mtk_set_serial();
+ 	mtk_find_payload();
+ 	mtk_trace("U-Boot: payload %s\n", env_get("payload_addr") ?: "none");
+-- 
+2.55.0
+

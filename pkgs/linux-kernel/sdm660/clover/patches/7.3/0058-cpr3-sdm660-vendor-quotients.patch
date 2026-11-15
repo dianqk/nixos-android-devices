@@ -1,0 +1,179 @@
+From da0115430137902868bb9fe296e8b4e866ddedd0 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 1 Nov 2026 04:10:53 +0800
+Subject: [PATCH] soc: qcom: cpr3: Compute the SDM660 target quotients as the
+ vendor driver
+
+The closed-loop target quotient of each corner comes from the common CPR3
+scaling model, which rounds the per-MHz scaling factor and caps it with
+max_quot_scale. For the SDM660 corner plan, compute it as
+cprh_kbss_calculate_target_quotients() of the vendor CPRh driver does
+with quotient interpolation: the fused quotient of a fuse corner plus its
+closed-loop voltage adjustment (RO scaling factor x adjustment) is the
+target of its highest corner, lower corners are interpolated by frequency
+from the previous fuse corner (or from the quotient offset fuse when the
+ring oscillator changes), and targets never decrease on the same ring
+oscillator. The base quotient is the lowest target, as before.
+
+With the fuses of a tested Clover both models give the same targets; the
+change makes the result follow the vendor driver for every part. The corner log now
+shows the target quotient. Closed-loop operation stays off.
+
+Scope: SDM630/660 common
+Porting notes: Local addition to the CPR3 driver (not upstream), from the vendor crDroid 4.19 drivers/regulator/cprh-kbss-regulator.c.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/pmdomain/qcom/cpr3.c | 114 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 112 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/pmdomain/qcom/cpr3.c b/drivers/pmdomain/qcom/cpr3.c
+index 980392bf87..2a51a6e884 100644
+--- a/drivers/pmdomain/qcom/cpr3.c
++++ b/drivers/pmdomain/qcom/cpr3.c
+@@ -1268,6 +1268,108 @@ static int cprh_interpolate(u64 f_low, int uV_low, u64 f_high, int uV_high,
+ 	return uV_high - (int)temp;
+ }
+ 
++/**
++ * cprh_vendor_target_quotients() - Compute target quotients like the vendor driver
++ * @thread: Structure holding CPR thread-specific parameters
++ * @cdata:  Fuse corner and frequency of each corner, read from the OPP tables
++ * @fmax:   Highest corner mapped to each fuse corner
++ *
++ * This follows cprh_kbss_calculate_target_quotients() of the vendor CPRh
++ * driver with quotient interpolation: the fused quotient of each fuse corner,
++ * shifted by its closed-loop voltage adjustment, is the target of its highest
++ * corner; lower corners are interpolated by frequency from the previous fuse
++ * corner, or from the quotient offset fuse when the ring oscillator changes.
++ * The result is stored as the quotient adjustment of each corner.
++ *
++ * Return: Zero for success, negative number on error
++ */
++static int cprh_vendor_target_quotients(struct cpr_thread *thread,
++					const struct corner_data *cdata,
++					const int *fmax)
++{
++	const struct cpr_thread_desc *tdesc = thread->desc;
++	struct device *dev = thread->drv->dev;
++	int nfc = tdesc->num_fuse_corners, n = thread->num_corners;
++	int raw[CPRH_MAX_FUSE_CORNERS], scale[CPRH_MAX_FUSE_CORNERS];
++	int qh[CPRH_MAX_FUSE_CORNERS], ql[CPRH_MAX_FUSE_CORNERS];
++	int ro[CPRH_MAX_FUSE_CORNERS];
++	int i, j, ret;
++	u32 val;
++
++	for (i = 0; i < nfc; i++) {
++		const struct fuse_corner_data *fdata = &tdesc->fuse_corner_data[i];
++
++		ret = nvmem_cell_read_variable_le_u32(dev,
++					thread->cpr_fuses[i].quotient, &val);
++		if (ret)
++			return ret;
++		raw[i] = val * fdata->quot_scale + fdata->quot_offset +
++			 fdata->quot_adjust;
++		ro[i] = thread->fuse_corners[i].ring_osc_idx;
++		scale[i] = tdesc->ro_scaling_factor[tdesc->ro_scaling_factor_common ?
++						     0 : i][ro[i]];
++	}
++
++	qh[0] = raw[0] + cpr3_adjust_quot(scale[0], tdesc->fuse_corner_data[0].volt_cloop_adjust);
++	ql[0] = qh[0];
++
++	for (i = 1; i < nfc; i++) {
++		qh[i] = raw[i];
++		if (ro[i] == ro[i - 1]) {
++			ql[i] = qh[i - 1];
++		} else {
++			ret = nvmem_cell_read_variable_le_u32(dev,
++					thread->cpr_fuses[i].quotient_offset, &val);
++			if (ret)
++				return ret;
++			ql[i] = qh[i] - val * tdesc->fuse_corner_data[i].quot_offset_scale;
++		}
++		if (qh[i] < ql[i])
++			qh[i] = ql[i];
++	}
++
++	for (i = 1; i < nfc; i++) {
++		qh[i] += cpr3_adjust_quot(scale[i],
++				tdesc->fuse_corner_data[i].volt_cloop_adjust);
++		if (ro[i] == ro[i - 1])
++			ql[i] = qh[i - 1];
++		else
++			ql[i] += cpr3_adjust_quot(scale[i],
++				tdesc->fuse_corner_data[i - 1].volt_cloop_adjust);
++		if (qh[i] < ql[i])
++			qh[i] = ql[i];
++	}
++
++	for (i = 0; i < n; i++) {
++		struct corner *corner = &thread->corners[i];
++		int fc = cdata[i].fuse_corner;
++		int target;
++
++		if (i <= fmax[0])
++			target = qh[0];
++		else
++			target = cprh_interpolate(cdata[fmax[fc - 1]].freq, ql[fc],
++						  cdata[fmax[fc]].freq, qh[fc],
++						  cdata[i].freq);
++
++		/* Monotonic for corners on the same ring oscillator */
++		j = i - 1;
++		if (i && ro[cdata[j].fuse_corner] == ro[fc]) {
++			int prev = thread->fuse_corners[cdata[j].fuse_corner].quot -
++				   thread->corners[j].quot_adjust;
++
++			target = max(target, prev);
++		}
++
++		if (target < 0)
++			return -EINVAL;
++
++		corner->quot_adjust = thread->fuse_corners[fc].quot - target;
++	}
++
++	return 0;
++}
++
+ /**
+  * cprh_vendor_corner_voltages() - Compute corner voltages like the vendor driver
+  * @thread: Structure holding CPR thread-specific parameters
+@@ -1394,7 +1496,7 @@ static int cprh_vendor_corner_voltages(struct cpr_thread *thread,
+ 		corner->max_uV = ceiling;
+ 	}
+ 
+-	return 0;
++	return cprh_vendor_target_quotients(thread, cdata, fmax);
+ }
+ 
+ /**
+@@ -1650,6 +1752,12 @@ static int cpr3_corner_init(struct cpr_thread *thread)
+ 		ret = cprh_vendor_corner_voltages(thread, cdata);
+ 		if (ret)
+ 			return ret;
++
++		min_quotient = U32_MAX;
++		for (i = 0; i < thread->num_corners; i++)
++			min_quotient = min(min_quotient,
++					   (u32)(thread->corners[i].fuse_corner->quot -
++						 thread->corners[i].quot_adjust));
+ 	}
+ 
+ 	if (desc->open_loop_only)
+@@ -1657,11 +1765,13 @@ static int cpr3_corner_init(struct cpr_thread *thread)
+ 			thread->corners[i].is_open_loop = true;
+ 
+ 	for (i = 0; i < thread->num_corners; i++)
+-		dev_info(drv->dev, "%s corner %d: %llu kHz open-loop %d mV floor %d mV ceiling %d mV%s\n",
++		dev_info(drv->dev, "%s corner %d: %llu kHz open-loop %d mV floor %d mV ceiling %d mV quotient %d%s\n",
+ 			 tdesc->name, i + 1, div_u64(thread->corners[i].freq, 1000),
+ 			 thread->corners[i].uV / 1000,
+ 			 thread->corners[i].min_uV / 1000,
+ 			 thread->corners[i].max_uV / 1000,
++			 thread->corners[i].fuse_corner->quot -
++			 thread->corners[i].quot_adjust,
+ 			 thread->corners[i].is_open_loop ? ", closed loop off" : "");
+ 
+ 	/* If the OPPs can't be adjusted, programming the CPRh is useless */

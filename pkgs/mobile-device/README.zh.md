@@ -45,6 +45,8 @@ Asphalt/Sheng/Aurora 要求当前 B 槽并明确使用 `boot_b`/`recovery_b`。R
 不在此命令的支持范围内。机型识别不依赖文件名或个人序列号白名单。
 检查与执行都会重新校验，只有 `--execute` 才发送最终 boot/flash 命令。
 打印的大小、SHA-256 和结构检查不构成发布者身份认证。
+T880 与 marble 镜像可被识别，但在发送任何 fastboot 命令前即被拒绝：其原厂 fastboot
+product 尚未验证。
 
 
 部分 Asphalt 原厂 bootloader 的 product 仅为 SoC 名称 `taro`，单凭它无法识别机型。
@@ -114,6 +116,14 @@ mobile-device --serial SERIAL fastboot erase --device asphalt --partition dtbo_b
 [Aurora](../../docs/aurora/README.zh.md)、
 [Clover](../../docs/clover/first-install.zh.md)。
 
+A/B 设备使用 `recovery prepare-install` 拆分 userdata 范围（见
+[recovery](../../docs/recovery.zh.md) 与 [T880 安装指南](../../docs/t880/install.zh.md)）：
+不指定大小时列出可选的 Android userdata 大小；`--android-userdata SIZE` 打印计划；
+`--android-userdata SIZE --execute` 进行分区；recovery 在重启前会在内存中保留原始 GPT。
+加上 `--gpt-backup DIR`（推荐）会先把它下载到主机上的新目录作为永久副本。
+`recovery restore-gpt [--gpt-backup DIR] [--execute]` 写回主机副本；不带
+`--gpt-backup` 时写回内存副本。
+
 单槽设备 Polaris 和 Clover 将物理 `system` 用作 FAT32 `/boot`。执行 `format-root`
 后，先运行 `recovery prepare-boot` 检查，再执行 `recovery prepare-boot --execute`。
 GPT 位置和大小不变。
@@ -150,7 +160,7 @@ mobile-device recovery --target HOST install-image ./recovery.img \
 ```
 
 `--partition` 是 `boot` 或 `recovery` 的 `/dev/disk/by-partlabel/` 路径（A/B 设备为
-`boot_b`/`recovery_b`）。守护进程在写入前校验
+`boot_b`/`recovery_b`；T880 仅有 `boot_a` 固件更新，RAM recovery 由主机经 U-Boot USB fastboot 提供）。守护进程在写入前校验
 镜像身份、大小和目标分区，写入后回读核对。
 
 ## 已安装系统中的脚本

@@ -2,7 +2,7 @@ use crate::canvas::Canvas;
 use crate::device;
 use crate::display::{font_width, VarScreen};
 use crate::input::{poll_inputs, Input, InputEvent, EV_KEY};
-use crate::menu::{Menu, KEY_POWER, KEY_VOLUMEDOWN, KEY_VOLUMEUP};
+use crate::menu::{KeyResult, Menu, KEY_POWER, KEY_VOLUMEDOWN, KEY_VOLUMEUP};
 use crate::render::{log_tail, render, wrap_log};
 use crate::status::UpdateStatus;
 use std::fs::File;
@@ -13,8 +13,18 @@ use std::time::{Duration, Instant};
 
 fn press(m: &mut Menu, key: u16, count: usize) -> Option<usize> {
     let start = Instant::now();
-    m.key(key, 1, start, count);
-    m.key(key, 0, start + Duration::from_millis(100), count)
+    m.key(key, 1, start, count, false, false);
+    match m.key(
+        key,
+        0,
+        start + Duration::from_millis(100),
+        count,
+        false,
+        false,
+    ) {
+        KeyResult::Action(index) => Some(index),
+        _ => None,
+    }
 }
 #[test]
 fn confirmations_and_log() {
@@ -31,17 +41,102 @@ fn confirmations_and_log() {
     assert!(m.busy);
 }
 #[test]
+fn choice_item_asks_for_a_size_before_confirming() {
+    let mut m = Menu {
+        choice_item: Some(2),
+        ..Default::default()
+    };
+    press(&mut m, KEY_VOLUMEDOWN, 4);
+    press(&mut m, KEY_VOLUMEDOWN, 4);
+    assert_eq!(press(&mut m, KEY_POWER, 4), None);
+    assert!(m.choosing && !m.confirming && m.choices.is_empty());
+    m.choices = vec!["64G".into(), "128G".into()];
+    // Cancel leaves the picker without an action.
+    press(&mut m, KEY_VOLUMEUP, 4);
+    assert_eq!(m.choice, 2);
+    press(&mut m, KEY_POWER, 4);
+    assert!(!m.choosing && !m.confirming);
+    press(&mut m, KEY_POWER, 4);
+    m.choices = vec!["64G".into(), "128G".into()];
+    press(&mut m, KEY_VOLUMEDOWN, 4);
+    assert_eq!(press(&mut m, KEY_POWER, 4), None);
+    assert!(m.confirming && !m.yes);
+    assert_eq!(m.chosen(), Some("128G"));
+    // Declining the destructive confirmation returns to the menu.
+    press(&mut m, KEY_POWER, 4);
+    assert!(!m.choosing && !m.confirming && m.chosen().is_none());
+    press(&mut m, KEY_POWER, 4);
+    m.choices = vec!["64G".into(), "128G".into()];
+    press(&mut m, KEY_POWER, 4);
+    press(&mut m, KEY_VOLUMEUP, 4);
+    assert_eq!(press(&mut m, KEY_POWER, 4), Some(2));
+    assert_eq!(m.chosen(), Some("64G"));
+    assert!(m.busy);
+}
+#[test]
+fn userdata_check_fills_the_picker_without_closing_it() {
+    use crate::app::{parse_userdata_check, task_takes_over};
+    // `recovery prepare-install --check`: result on stdout, task on stderr.
+    let text = "Android userdata choices: 32G 64G 128G\n(sizes that leave the Linux ESP and root at least 64G of the 224.6 GiB userdata allocation)\nCheck only. Show the plan with prepare-install --android-userdata SIZE --check.\nRecovery task 7\n";
+    let check = parse_userdata_check(text, true);
+    assert_eq!(check.choices.clone().unwrap(), ["32G", "64G", "128G"]);
+    assert_eq!(check.task, Some(7));
+    let refused = parse_userdata_check(
+        "Android userdata choices: none\nCheck only. The userdata split is refused on this disk.\nRecovery task 8\n",
+        true,
+    );
+    assert!(refused.choices.is_err());
+    let failed = parse_userdata_check(
+        "Recovery task 9\nrecovery: task 9: unmount all block filesystems first\n",
+        false,
+    );
+    assert_eq!(
+        failed.choices.unwrap_err(),
+        "recovery: task 9: unmount all block filesystems first"
+    );
+    // The picker is open; the status watch then reports the check's own
+    // task. That must not switch to the update view and close the picker.
+    let mut m = Menu {
+        choice_item: Some(2),
+        ..Default::default()
+    };
+    press(&mut m, KEY_VOLUMEDOWN, 4);
+    press(&mut m, KEY_VOLUMEDOWN, 4);
+    press(&mut m, KEY_POWER, 4);
+    assert!(m.choosing && m.choices.is_empty());
+    m.choices = check.choices.unwrap();
+    assert!(!task_takes_over(7, 6, check.task));
+    assert!(m.choosing && m.choices.len() == 3);
+    // Any other new task (an action, a host-side operation) still takes over.
+    assert!(task_takes_over(10, 7, check.task));
+    assert!(!task_takes_over(7, 7, None));
+}
+#[test]
 fn long_chord_and_repeat_do_not_act() {
     let mut m = Menu::default();
     let t = Instant::now();
-    m.key(KEY_POWER, 1, t, 4);
-    m.key(KEY_POWER, 2, t, 4);
-    m.key(KEY_POWER, 0, t + Duration::from_secs(2), 4);
+    m.key(KEY_POWER, 1, t, 4, false, false);
+    m.key(KEY_POWER, 2, t, 4, false, false);
+    m.key(KEY_POWER, 0, t + Duration::from_secs(2), 4, false, false);
     assert!(!m.logs);
-    m.key(KEY_POWER, 1, t, 4);
-    m.key(KEY_VOLUMEUP, 1, t, 4);
-    m.key(KEY_POWER, 0, t + Duration::from_millis(100), 4);
-    m.key(KEY_VOLUMEUP, 0, t + Duration::from_millis(100), 4);
+    m.key(KEY_POWER, 1, t, 4, false, false);
+    m.key(KEY_VOLUMEUP, 1, t, 4, false, false);
+    m.key(
+        KEY_POWER,
+        0,
+        t + Duration::from_millis(100),
+        4,
+        false,
+        false,
+    );
+    m.key(
+        KEY_VOLUMEUP,
+        0,
+        t + Duration::from_millis(100),
+        4,
+        false,
+        false,
+    );
     assert!(!m.logs && m.selected == 0);
 }
 
@@ -91,7 +186,7 @@ fn fixed_column_log_wrapping() {
 fn idle_input_does_not_request_a_redraw() {
     let mut inputs = Vec::new();
     let mut menu = Menu::default();
-    let result = poll_inputs(&mut inputs, &mut menu, 4, 0, &[], false);
+    let result = poll_inputs(&mut inputs, &mut menu, 4, 0, &[], false, || Ok(false)).unwrap();
     assert!(!result.redraw);
     assert!(result.action.is_none());
 }
@@ -134,7 +229,7 @@ fn active_update_discards_pending_confirmation_key() {
         },
         size_of::<InputEvent>() as isize
     );
-    let result = poll_inputs(&mut inputs, &mut menu, 4, 0, &[], true);
+    let result = poll_inputs(&mut inputs, &mut menu, 4, 0, &[], true, || Ok(false)).unwrap();
     assert!(result.action.is_none());
     assert!(!menu.busy);
     assert_eq!(menu.held, 0);
@@ -186,9 +281,11 @@ fn all_pages_roundtrip_through_incremental_vt_output() {
             .map(|i| format!("warning {i}: {}", "x".repeat(90)))
             .collect::<Vec<_>>()
             .join("\n");
-        for state in 0..8 {
+        for state in 0..10 {
             menu.logs = state == 1;
-            menu.confirming = state == 2 || state == 3;
+            menu.confirming = state == 2 || state == 3 || state == 9;
+            menu.choosing = state >= 8;
+            menu.choices = vec!["64G".into(), "128G".into()];
             menu.yes = state == 3;
             menu.busy = state == 4;
             menu.error = state == 5;
@@ -216,6 +313,33 @@ fn all_pages_roundtrip_through_incremental_vt_output() {
             assert!(text.contains("SSH/ACM: recovery help"));
             if menu.confirming {
                 assert!(text.contains(if menu.yes { "> Confirm" } else { "> Cancel" }));
+            }
+            if state == 8 {
+                assert!(text.contains("> 64G") && text.contains("  128G"));
+            }
+            if state == 9 {
+                assert!(text.contains("keep 64G for Android"));
+                // The confirmation waits for the plan of the chosen size.
+                assert!(text.contains("Reading the plan..."));
+                menu.plan = vec!["userdata 224.6 -> 64.0 GiB (Android, erased)".into()];
+                render(
+                    &mut canvas,
+                    cfg,
+                    &menu,
+                    "",
+                    &log,
+                    "USB link: configured",
+                    true,
+                    &update,
+                );
+                let text = canvas.text();
+                assert!(text.contains("userdata 224.6 -> 64.0 GiB"));
+                assert!(text.find("userdata 224.6").unwrap() < text.find("> Cancel").unwrap());
+                menu.plan.clear();
+                canvas
+                    .write_changes(&mut previous, &mut Vec::new())
+                    .unwrap();
+                screen.clone_from(&canvas.cells);
             }
             if update.active {
                 assert!(text.contains("controls locked"));
@@ -259,4 +383,295 @@ fn failed_console_write_can_be_retried() {
     let mut output = Vec::new();
     canvas.write_changes(&mut previous, &mut output).unwrap();
     assert!(output.ends_with(b"recovery"));
+}
+#[test]
+fn sized_check_plan_and_split_result_are_shown() {
+    use crate::app::{action_result, parse_plan_check};
+    // `recovery prepare-install --android-userdata 64G --check` on an A/B device.
+    let text = "Android userdata choices: 32G 64G 128G\n[]\nPlan: userdata 224.6 -> 64.0 GiB (Android, erased)\nPlan: new linux-boot 1.0 GiB\nPlan: new linux 159.6 GiB\nCheck only; no partition or filesystem writes.\nRecovery task 11\n";
+    let check = parse_plan_check(text, true);
+    assert_eq!(check.choices.unwrap().len(), 3);
+    assert_eq!(check.task, Some(11));
+    let failed = parse_plan_check(
+        "Recovery task 12\nrecovery: task 12: Android userdata is too small\n",
+        false,
+    );
+    assert_eq!(
+        failed.choices.unwrap_err(),
+        "recovery: task 12: Android userdata is too small"
+    );
+    // A successful split shows its output (undo and factory reset notes).
+    let done = "Recovery task 13\nPrepared ext4 root and FAT ESP.\nUndo during this recovery session: recovery restore-gpt --check, then --confirm.\nAndroid needs a factory reset (wipe data) before it boots again.\n";
+    let shown = action_result(done, true, "exit status: 0");
+    assert!(shown.contains("restore-gpt") && shown.contains("factory reset"));
+    assert!(!shown.contains("Recovery task"));
+    assert_eq!(
+        action_result(
+            "Recovery task 14\nrecovery: task 14: no\n",
+            false,
+            "exit status: 1"
+        ),
+        "recovery: task 14: no"
+    );
+    let mut m = Menu {
+        error: true,
+        succeeded: true,
+        ..Default::default()
+    };
+    press(&mut m, KEY_POWER, 4);
+    assert!(!m.error && !m.succeeded);
+}
+
+#[test]
+fn power_wakes_without_confirming_and_next_visible_press_selects() {
+    let mut menu = Menu {
+        selected: 1,
+        confirming: true,
+        yes: true,
+        ..Menu::default()
+    };
+    let now = Instant::now();
+    assert_eq!(menu.key(KEY_POWER, 1, now, 4, true, false), KeyResult::None);
+    // An external unblank before release must not turn this into confirmation.
+    assert_eq!(
+        menu.key(
+            KEY_POWER,
+            0,
+            now + Duration::from_millis(100),
+            4,
+            false,
+            false
+        ),
+        KeyResult::Wake
+    );
+    assert!(menu.confirming && menu.yes && !menu.busy);
+    assert_eq!(press(&mut menu, KEY_POWER, 4), Some(1));
+}
+
+#[test]
+fn power_wake_survives_busy_and_status_transition() {
+    let mut menu = Menu {
+        busy: true,
+        ..Menu::default()
+    };
+    let now = Instant::now();
+    menu.key(KEY_POWER, 1, now, 4, true, true);
+    menu.suppress_actions();
+    assert_eq!(menu.key(KEY_POWER, 2, now, 4, true, true), KeyResult::None);
+    assert_eq!(
+        menu.key(
+            KEY_POWER,
+            0,
+            now + Duration::from_millis(100),
+            4,
+            true,
+            true
+        ),
+        KeyResult::Wake
+    );
+    assert!(menu.busy && !menu.logs);
+}
+
+#[test]
+fn locked_press_cannot_select_after_unlock() {
+    let mut menu = Menu {
+        selected: 1,
+        confirming: true,
+        yes: true,
+        ..Menu::default()
+    };
+    let now = Instant::now();
+    menu.key(KEY_POWER, 1, now, 4, false, true);
+    assert_eq!(
+        menu.key(
+            KEY_POWER,
+            0,
+            now + Duration::from_millis(100),
+            4,
+            false,
+            false
+        ),
+        KeyResult::None
+    );
+    assert!(!menu.busy && menu.confirming && menu.yes);
+}
+
+#[test]
+fn wake_rejects_chords_long_press_and_dropped_state() {
+    let mut menu = Menu::default();
+    let now = Instant::now();
+    menu.key(KEY_POWER, 1, now, 4, true, false);
+    menu.key(KEY_VOLUMEDOWN, 1, now, 4, true, false);
+    assert_eq!(
+        menu.key(
+            KEY_POWER,
+            0,
+            now + Duration::from_millis(100),
+            4,
+            true,
+            false
+        ),
+        KeyResult::None
+    );
+    menu.key(
+        KEY_VOLUMEDOWN,
+        0,
+        now + Duration::from_millis(100),
+        4,
+        true,
+        false,
+    );
+    menu.key(KEY_POWER, 1, now, 4, true, false);
+    assert_eq!(
+        menu.key(KEY_POWER, 0, now + Duration::from_secs(2), 4, true, false),
+        KeyResult::None
+    );
+    menu.key(KEY_POWER, 1, now, 4, true, false);
+    menu.reset_keys(); // SYN_DROPPED/device loss cancels every pending gesture.
+    assert_eq!(
+        menu.key(
+            KEY_POWER,
+            0,
+            now + Duration::from_millis(100),
+            4,
+            true,
+            false
+        ),
+        KeyResult::None
+    );
+}
+
+fn input_pipe(events: &[(u16, u16, i32)]) -> (Vec<Input>, File) {
+    let mut pipe = [0; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_NONBLOCK) },
+        0
+    );
+    let input = unsafe { File::from_raw_fd(pipe[0]) };
+    let output = unsafe { File::from_raw_fd(pipe[1]) };
+    for &(kind, code, value) in events {
+        let event = InputEvent {
+            time: unsafe { zeroed() },
+            kind,
+            code,
+            value,
+        };
+        assert_eq!(
+            unsafe {
+                libc::write(
+                    output.as_raw_fd(),
+                    (&event as *const InputEvent).cast(),
+                    size_of::<InputEvent>(),
+                )
+            },
+            size_of::<InputEvent>() as isize
+        );
+    }
+    (
+        vec![Input {
+            file: input,
+            path: PathBuf::from("test-input"),
+            dropped: false,
+        }],
+        output,
+    )
+}
+
+#[test]
+fn busy_poll_keeps_wake_and_blocks_later_actions_in_same_batch() {
+    let mut menu = Menu {
+        selected: 1,
+        confirming: true,
+        yes: true,
+        ..Menu::default()
+    };
+    menu.key(
+        KEY_POWER,
+        1,
+        Instant::now() - Duration::from_millis(100),
+        4,
+        true,
+        true,
+    );
+    let (mut inputs, _writer) = input_pipe(&[
+        (EV_KEY, KEY_POWER, 0),
+        (EV_KEY, KEY_VOLUMEDOWN, 1),
+        (EV_KEY, KEY_VOLUMEDOWN, 0),
+    ]);
+    let result = poll_inputs(&mut inputs, &mut menu, 4, 0, &[], true, || Ok(true)).unwrap();
+    assert!(result.wake && result.action.is_none());
+    assert_eq!(menu.selected, 1);
+    assert!(menu.confirming && menu.yes && !menu.busy);
+}
+
+#[test]
+fn poll_dropped_events_cancel_pending_wake() {
+    let mut menu = Menu::default();
+    menu.key(
+        KEY_POWER,
+        1,
+        Instant::now() - Duration::from_millis(100),
+        4,
+        true,
+        false,
+    );
+    let (mut inputs, _writer) = input_pipe(&[
+        (0, 3, 0),
+        (EV_KEY, KEY_POWER, 0),
+        (0, 0, 0),
+        (EV_KEY, KEY_POWER, 0),
+    ]);
+    let result = poll_inputs(&mut inputs, &mut menu, 4, 0, &[], false, || Ok(true)).unwrap();
+    assert!(!result.wake && result.action.is_none());
+}
+
+#[test]
+fn blank_state_error_cannot_confirm() {
+    let mut menu = Menu {
+        selected: 1,
+        confirming: true,
+        yes: true,
+        ..Menu::default()
+    };
+    menu.key(
+        KEY_POWER,
+        1,
+        Instant::now() - Duration::from_millis(100),
+        4,
+        false,
+        false,
+    );
+    let (mut inputs, _writer) = input_pipe(&[(EV_KEY, KEY_POWER, 0)]);
+    assert!(
+        poll_inputs(&mut inputs, &mut menu, 4, 0, &[], false, || Err(
+            std::io::Error::other("VT unavailable")
+        ))
+        .is_err()
+    );
+    assert!(!menu.busy);
+}
+
+#[test]
+fn lock_without_events_invalidates_an_existing_confirmation_press() {
+    let mut menu = Menu {
+        selected: 1,
+        confirming: true,
+        yes: true,
+        ..Menu::default()
+    };
+    let now = Instant::now();
+    menu.key(KEY_POWER, 1, now, 4, false, false);
+    poll_inputs(&mut Vec::new(), &mut menu, 4, 0, &[], true, || Ok(false)).unwrap();
+    assert_eq!(
+        menu.key(
+            KEY_POWER,
+            0,
+            now + Duration::from_millis(100),
+            4,
+            false,
+            false
+        ),
+        KeyResult::None
+    );
+    assert!(!menu.busy && menu.confirming && menu.yes);
 }

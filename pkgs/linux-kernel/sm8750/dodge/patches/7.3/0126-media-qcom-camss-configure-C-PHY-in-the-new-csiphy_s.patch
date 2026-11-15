@@ -1,0 +1,119 @@
+From 2a44953ac8c91963f5833246e2ee5040ad99c2d2 Mon Sep 17 00:00:00 2001
+From: Anusha Arun Nandi <anusha.nandi@oss.qualcomm.com>
+Date: Fri, 16 Oct 2026 21:05:29 -0700
+Subject: [PATCH 131/144] media: qcom: camss: configure C-PHY in the new
+ csiphy_stream_on()
+
+The new (non-legacy) csiphy_stream_on() introduced by the PHY API
+devices support only built a MIPI D-PHY configuration and
+unconditionally called phy_set_mode(PHY_MODE_MIPI_DPHY). For a C-PHY
+sensor this makes phy_configure() dispatch to the C-PHY handler with a
+D-PHY opts union, which fails validation.
+
+Branch on the recorded PHY type: for C-PHY build the opts via
+phy_mipi_cphy_get_default_config_for_hsclk(), populate the per-trio
+lane positions and polarities and select PHY_MODE_MIPI_CPHY;
+keep the existing D-PHY path otherwise. The shared
+phy_configure()/phy_power_on() tail handles both.
+
+Depends-on: https://lore.kernel.org/all/20261017035221.3816464-1-anusha.nandi@oss.qualcomm.com/
+
+Signed-off-by: Anusha Arun Nandi <anusha.nandi@oss.qualcomm.com>
+Link: https://lore.kernel.org/r/20261017040529.3832120-1-anusha.nandi@oss.qualcomm.com
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0167-media-qcom-camss-configure-C-PHY-in-the-new-csiphy_s.patch
+Import-SHA256: 9dbceb8cde993aa10b8d3b3a80a3b6ca8f6c08b3c414f1e0885d7c498fcdef5c
+Import-Provenance: mail headers
+(cherry picked from commit 5045d21e7ff4d35eb8f405e99301ea291640f88d)
+---
+ .../media/platform/qcom/camss/camss-csiphy.c  | 61 +++++++++++++------
+ 1 file changed, 43 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/media/platform/qcom/camss/camss-csiphy.c b/drivers/media/platform/qcom/camss/camss-csiphy.c
+index 58c08b8f25..a69c2e659c 100644
+--- a/drivers/media/platform/qcom/camss/camss-csiphy.c
++++ b/drivers/media/platform/qcom/camss/camss-csiphy.c
+@@ -329,16 +329,15 @@ static int csiphy_stream_on(struct csiphy_device *csiphy)
+ 	u8 bpp = csiphy_get_bpp(csiphy->res->formats->formats, csiphy->res->formats->nformats,
+ 				csiphy->fmt[MSM_CSIPHY_PAD_SINK].code);
+ 	struct csiphy_lanes_cfg *lncfg = &csiphy->cfg.csi2->lane_cfg;
+-	struct phy_configure_opts_mipi_dphy *dphy_cfg;
+-	union phy_configure_opts dphy_opts = { 0 };
++	union phy_configure_opts phy_opts = { 0 };
+ 	struct device *dev = csiphy->camss->dev;
+ 	u8 num_lanes = lncfg->num_data;
++	const bool cphy = (lncfg->phy_cfg == V4L2_MBUS_CSI2_CPHY);
+ 	s64 link_freq;
++	int i;
+ 	int ret;
+ 
+-	dphy_cfg = &dphy_opts.mipi_dphy;
+-
+-	link_freq = camss_get_link_freq(&csiphy->subdev.entity, bpp, num_lanes, false);
++	link_freq = camss_get_link_freq(&csiphy->subdev.entity, bpp, num_lanes, cphy);
+ 
+ 	if (link_freq <= 0) {
+ 		dev_err(dev,
+@@ -346,23 +345,49 @@ static int csiphy_stream_on(struct csiphy_device *csiphy)
+ 		return -EINVAL;
+ 	}
+ 
+-	ret = phy_mipi_dphy_get_default_config_for_hsclk(link_freq, num_lanes,
+-							 dphy_cfg);
+-	if (ret < 0) {
+-		dev_err(dev, "Invalid config for link frequency %lld\n",
+-			link_freq);
+-		return ret;
+-	}
++	if (cphy) {
++		struct phy_configure_opts_mipi_cphy *cphy_cfg = &phy_opts.mipi_cphy;
+ 
+-	ret = phy_set_mode(csiphy->phy, PHY_MODE_MIPI_DPHY);
+-	if (ret) {
+-		dev_err(dev, "Failed to set phy mode\n");
+-		return ret;
++		ret = phy_mipi_cphy_get_default_config_for_hsclk(link_freq, num_lanes,
++								 cphy_cfg);
++		if (ret < 0) {
++			dev_err(dev, "Invalid config for link frequency %lld\n",
++				link_freq);
++			return ret;
++		}
++
++		/* Set data trio lane positions and polarities (no clock lane) */
++		for (i = 0; i < num_lanes; i++) {
++			cphy_cfg->lane_positions[i] = lncfg->data[i].pos;
++			cphy_cfg->lane_polarities[i] = lncfg->data[i].pol;
++		}
++
++		ret = phy_set_mode(csiphy->phy, PHY_MODE_MIPI_CPHY);
++		if (ret) {
++			dev_err(dev, "Failed to set phy mode\n");
++			return ret;
++		}
++	} else {
++		struct phy_configure_opts_mipi_dphy *dphy_cfg = &phy_opts.mipi_dphy;
++
++		ret = phy_mipi_dphy_get_default_config_for_hsclk(link_freq, num_lanes,
++								 dphy_cfg);
++		if (ret < 0) {
++			dev_err(dev, "Invalid config for link frequency %lld\n",
++				link_freq);
++			return ret;
++		}
++
++		ret = phy_set_mode(csiphy->phy, PHY_MODE_MIPI_DPHY);
++		if (ret) {
++			dev_err(dev, "Failed to set phy mode\n");
++			return ret;
++		}
+ 	}
+ 
+-	ret = phy_configure(csiphy->phy, &dphy_opts);
++	ret = phy_configure(csiphy->phy, &phy_opts);
+ 	if (ret) {
+-		dev_err(dev, "failed to configure MIPI D-PHY\n");
++		dev_err(dev, "failed to configure MIPI %s\n", cphy ? "C-PHY" : "D-PHY");
+ 		goto error;
+ 	}
+ 

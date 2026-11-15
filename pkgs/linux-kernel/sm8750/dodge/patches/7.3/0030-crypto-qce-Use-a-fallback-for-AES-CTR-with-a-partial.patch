@@ -1,0 +1,49 @@
+From 7566f5131c80c7b441ea879afec944d4ea8f612c Mon Sep 17 00:00:00 2001
+From: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Date: Mon, 19 Oct 2026 16:46:06 +0200
+Subject: [PATCH 030/144] crypto: qce - Use a fallback for AES-CTR with a
+ partial final block
+
+ctr(aes) is registered with a block size of 1, so the crypto API hands
+the driver requests whose length is not a multiple of the AES block
+size. The crypto engine, however, stalls waiting for a full block of
+input in that case, leaving the operation incomplete and failing the
+request (and the crypto self-tests) with a hardware operation error.
+
+Route AES-CTR requests with a partial final block to the software
+fallback, which already handles the other cases the engine cannot.
+
+Cc: stable@vger.kernel.org
+Fixes: bb5c863b3d3c ("crypto: qce - fix ctr-aes-qce block, chunk sizes")
+Tested-by: Kuldeep Singh <kuldeep.singh@oss.qualcomm.com>
+Tested-by: Pankaj Patil <pankaj.patil@oss.qualcomm.com>
+Signed-off-by: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Message-ID: <20261019-qce-fixes-skcipher-v12-2-046e6be9bd83@oss.qualcomm.com>
+Link: https://lore.kernel.org/r/20261019-qce-fixes-skcipher-v12-2-046e6be9bd83@oss.qualcomm.com
+(cherry picked from commit e472b43a4d16cf1b9266b8398e47d6ffc63b5f49)
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0048-crypto-qce-Use-a-fallback-for-AES-CTR-with-a-partial.patch
+Import-SHA256: 6aaed7dbdb72cb05b02e8b5b5b4e8205befc0db9ba08b3c2bced1ece3def2573
+Import-Provenance: mail headers
+(cherry picked from commit 2e06615d15ba503561a56e2828bdbf67302c1316)
+---
+ drivers/crypto/qce/skcipher.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/crypto/qce/skcipher.c b/drivers/crypto/qce/skcipher.c
+index da9393aed9..80a53db508 100644
+--- a/drivers/crypto/qce/skcipher.c
++++ b/drivers/crypto/qce/skcipher.c
+@@ -248,9 +248,12 @@ static int qce_skcipher_crypt(struct skcipher_request *req, int encrypt)
+ 	 * AES-XTS request with len > QCE_SECTOR_SIZE and
+ 	 * is not a multiple of it.(Revisit this condition to check if it is
+ 	 * needed in all versions of CE)
++	 * AES-CTR with a partial final block (the CE stalls waiting for a full
++	 * block of input).
+ 	 */
+ 	if (IS_AES(rctx->flags) &&
+ 	    ((keylen != AES_KEYSIZE_128 && keylen != AES_KEYSIZE_256) ||
++	    (IS_CTR(rctx->flags) && !IS_ALIGNED(req->cryptlen, AES_BLOCK_SIZE)) ||
+ 	    (IS_XTS(rctx->flags) && ((req->cryptlen <= aes_sw_max_len) ||
+ 	    (req->cryptlen > QCE_SECTOR_SIZE &&
+ 	    req->cryptlen % QCE_SECTOR_SIZE))))) {

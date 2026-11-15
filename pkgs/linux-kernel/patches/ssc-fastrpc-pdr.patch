@@ -10,9 +10,31 @@ freeing the channel context on removal and after failed lookups.
 
 This is an acknowledgement subscription, not static-PD restart handling.
 
+diff --git a/Documentation/devicetree/bindings/misc/qcom,fastrpc.yaml b/Documentation/devicetree/bindings/misc/qcom,fastrpc.yaml
+index 49d2a5e8ba..72b5c96572 100644
+--- a/Documentation/devicetree/bindings/misc/qcom,fastrpc.yaml
++++ b/Documentation/devicetree/bindings/misc/qcom,fastrpc.yaml
+@@ -60,6 +60,15 @@ properties:
+       Used to mark the current domain as non-secure.
+     type: boolean
+ 
++  qcom,protection-domain:
++    $ref: /schemas/types.yaml#/definitions/string-array
++    description:
++      Service name and protection domain path to subscribe to through the
++      service registry. Notifications are acknowledged by the PDR helper.
++    items:
++      - description: Service name, for example tms/servreg.
++      - description: Protection domain path, for example msm/slpi/sensor_pd.
++
+   qcom,smd-channels:
+     description:
+       Channel name used for the RPM communication
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 7364931dad..4ae394fbe4 100644
 --- a/drivers/misc/Kconfig
 +++ b/drivers/misc/Kconfig
-@@ -266,9 +266,11 @@
+@@ -266,9 +266,11 @@ config QCOM_COINCELL
  config QCOM_FASTRPC
  	tristate "Qualcomm FastRPC"
  	depends on ARCH_QCOM || COMPILE_TEST
@@ -24,24 +46,8 @@ This is an acknowledgement subscription, not static-PD restart handling.
  	help
  	  Provides a communication mechanism that allows for clients to
  	  make remote method invocations across processor boundary to
---- a/Documentation/devicetree/bindings/misc/qcom,fastrpc.yaml
-+++ b/Documentation/devicetree/bindings/misc/qcom,fastrpc.yaml
-@@ -59,6 +59,15 @@
-     description:
-       Used to mark the current domain as non-secure.
-     type: boolean
-+
-+  qcom,protection-domain:
-+    $ref: /schemas/types.yaml#/definitions/string-array
-+    description:
-+      Service name and protection domain path to subscribe to through the
-+      service registry. Notifications are acknowledged by the PDR helper.
-+    items:
-+      - description: Service name, for example tms/servreg.
-+      - description: Protection domain path, for example msm/slpi/sensor_pd.
- 
-   qcom,smd-channels:
-     description:
+diff --git a/drivers/misc/fastrpc.c b/drivers/misc/fastrpc.c
+index adc6f850e7..2493112fda 100644
 --- a/drivers/misc/fastrpc.c
 +++ b/drivers/misc/fastrpc.c
 @@ -17,6 +17,7 @@
@@ -52,7 +58,7 @@ This is an acknowledgement subscription, not static-PD restart handling.
  #include <linux/scatterlist.h>
  #include <linux/slab.h>
  #include <linux/firmware/qcom/qcom_scm.h>
-@@ -302,6 +303,7 @@
+@@ -300,6 +301,7 @@ struct fastrpc_soc_data {
  };
  
  struct fastrpc_channel_ctx {
@@ -60,9 +66,9 @@ This is an acknowledgement subscription, not static-PD restart handling.
  	int domain_id;
  	int sesscount;
  	int vmcount;
-@@ -2533,6 +2535,54 @@
- 	{},
- };
+@@ -2542,6 +2544,54 @@ static int fastrpc_init_reserved_mem(struct fastrpc_channel_ctx *cctx,
+ 				  cctx->vmperms, cctx->vmcount);
+ }
  
 +/* The listener owns static-PD recovery; this subscription provides the
 + * service registry acknowledgement required by the sensor firmware.
@@ -115,7 +121,7 @@ This is an acknowledgement subscription, not static-PD restart handling.
  static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
  {
  	struct device *rdev = &rpdev->dev;
-@@ -2646,6 +2696,12 @@
+@@ -2643,6 +2693,12 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
  	if (err)
  		goto err_deregister_fdev;
  
@@ -128,14 +134,14 @@ This is an acknowledgement subscription, not static-PD restart handling.
  	return 0;
  
  err_deregister_fdev:
-@@ -2677,6 +2733,10 @@
- 	struct fastrpc_buf *buf, *b;
+@@ -2675,6 +2731,10 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
  	struct fastrpc_user *user;
  	unsigned long flags;
-+
+ 
 +	/* Stop PDR work while the device and channel context are still alive. */
 +	if (cctx->pdr)
 +		pdr_handle_release(cctx->pdr);
- 
++
  	/* No invocations past this point */
  	spin_lock_irqsave(&cctx->lock, flags);
+ 	cctx->rpdev = NULL;

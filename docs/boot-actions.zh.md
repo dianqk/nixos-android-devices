@@ -2,7 +2,7 @@
 
 [English](boot-actions.md)
 
-全部五个设备模块都在 systemd-boot 中启用 **Reboot The System**、**Power Off The System**、
+各设备模块可在 systemd-boot 中启用 **Reboot The System**、**Power Off The System**、
 **Reboot to bootloader** 和 **Reboot to recovery**。Asphalt、Sheng 和
 Aurora 还启用 **Reboot to Android**。这些操作在 Linux 之前执行。更新固件时，
 请保留可用的独立 RAM recovery。
@@ -40,7 +40,7 @@ Aurora 还启用 **Reboot to Android**。这些操作在 Linux 之前执行。�
 <a id="automatic-slot-b-confirmation"></a>
 ## 自动确认 B 槽
 
-Sheng、Asphalt 和 Aurora 共用一个 U-Boot 补丁以及 Qualcomm GPT/UFS 后端。
+Sheng、Asphalt、Aurora 与实验性的 Marble 共用一个 U-Boot 补丁以及 Qualcomm GPT/UFS 后端。
 `fatload` / `bootefi` 从唯一的 `linux-boot` ESP 成功加载
 `/EFI/BOOT/BOOTAA64.EFI` 并设置其加载选项后，U-Boot 会在启动该 EFI 镜像前
 将 **`boot_b` 标记为成功**。这确认的是固件/存储/EFI 加载阶段；并不保证系统代
@@ -52,10 +52,23 @@ GUID、活动标志、优先级、重试计数、UFS boot LUN、BCB 以及分区
 B 已标记为成功时无需写入。剩余重试次数为零的最后一次允许尝试仍可被确认；
 Android A 可启动、BCB 为空以及 `recovery_b` 都不是前提条件。
 
+部分 ABL（Marble）每次启动只改写主 GPT：重试计数递减，以及切换槽位后槽位对的
+类型 GUID，因此备份分区表数组与主表不同，其 CRC 也可能过期。仅确认操作（Android
+与 recovery 操作仍要求两份副本完全相同）接受这样的备份：主表头和数组 CRC 有效，
+备份表头 CRC 有效且几何参数相同，并且每个不同的条目都是已使用的
+`<name>_a`/`<name>_b` 条目、其配对分区存在，且只在类型 GUID（不能变为零）和
+属性位 48–55、60 上不同——与 `recovery repair-backup-gpt` 的范围一致。LBA、
+唯一 GUID、名称、其他属性、未使用条目和其他分区必须完全相同；其他差异一律拒绝并
+打印原因。以主表为准：在 `boot_b` 所在 LUN 上于主表中设置成功位，并据此在原位置
+重建备份数组和表头。其他带此类备份的 LUN 只校验不写入。写入顺序不变，先写备份并
+回读校验，再写主表：备份写完后断电，留下旧主表和仅槽位元数据不同的备份，下次启动
+接受并完成确认；主表写入中断时，备份已是最新内容。
+
 通用固件配置显式启用确认，并提供 ESP 名称和 EFI 路径。Polaris 和 Clover
 不启用此功能。不同的分区/LUN 位置在运行时探测；此 Qualcomm 后端不适用于使用
 AOSP `misc` boot-control 元数据的设备。Asphalt 已有此最小成功位更新的真机
-证据；新钩子以及 Sheng 的 OEM 行为仍需真机验证。
+证据；新钩子以及 Sheng 的 OEM 行为仍需真机验证。Marble 编译同一配置，但仅用于确认
+B 槽；在其他操作于该设备上验证之前，其菜单只提供重启和关机。
 
 Asphalt 仅为 **B 槽成功确认** 允许 LUN6 和 LUN7 上存在零元数据布局。该兼容
 设置来自一台实测设备，并不代表所有 Asphalt 的出厂布局。每个启用的候选 LUN
@@ -185,3 +198,13 @@ GPT、boot LUN 和原始原因值，尝试所有恢复步骤，并报告汇总�
 
 看门狗设置失败时会立即返回上级菜单。完全无法加载的条目遵循 systemd-boot 配置的
 `reboot-on-error` 策略。
+
+### 从运行中的系统重启
+
+`systemctl reboot --reboot-argument=bootloader`（或 `recovery`）会把参数交给
+内核的 reboot-mode 驱动，而不是启动菜单。每个设备模块都会安装 `reboot-param`
+system-shutdown 钩子，在 systemd 切换到 shutdown ramfs 之前把
+`/run/systemd/reboot-param` 复制进去；否则最终的重启只是普通重启。如果这类重启
+回到了正常启动路径，请检查当前代中是否存在
+`/etc/systemd/system-shutdown/reboot-param`，以及内核的 reboot-mode 驱动是否
+列出了所请求的模式。

@@ -1,0 +1,61 @@
+From a8ac63cf2b8f3a698253c7adc97ef4af26c8ceaa Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 11 Nov 2026 04:32:57 +0800
+Subject: [PATCH 125/144] media: i2c: imx615: finish the Dodge sensor tuning
+
+Keep test-pattern/Bayer selection and the measured RGGB phase report together.
+
+Consolidated from local follow-ups:
+  0423fbc038568bff707c832fe3a4b333d2870072 media: imx615: expose test-pattern levels and use vendor Bayer order
+  0e68677829383bf07b236e576bc3dd9d391ba12a media: imx615: report the measured RGGB output phase
+---
+ drivers/media/i2c/imx615.c | 22 +++++++++++++++++++++-
+ 1 file changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/i2c/imx615.c b/drivers/media/i2c/imx615.c
+index d3c18138ed..57facd3844 100644
+--- a/drivers/media/i2c/imx615.c
++++ b/drivers/media/i2c/imx615.c
+@@ -126,6 +126,18 @@ static int imx615_set_ctrl(struct v4l2_ctrl *ctrl)
+ 	case V4L2_CID_TEST_PATTERN:
+ 		cci_write(s->regmap, CCI_REG16(0x0600), ctrl->val, &ret);
+ 		break;
++	case V4L2_CID_TEST_PATTERN_RED:
++		cci_write(s->regmap, CCI_REG16(0x0602), ctrl->val, &ret);
++		break;
++	case V4L2_CID_TEST_PATTERN_GREENR:
++		cci_write(s->regmap, CCI_REG16(0x0604), ctrl->val, &ret);
++		break;
++	case V4L2_CID_TEST_PATTERN_BLUE:
++		cci_write(s->regmap, CCI_REG16(0x0606), ctrl->val, &ret);
++		break;
++	case V4L2_CID_TEST_PATTERN_GREENB:
++		cci_write(s->regmap, CCI_REG16(0x0608), ctrl->val, &ret);
++		break;
+ 	default:
+ 		ret = -EINVAL;
+ 	}
+@@ -342,7 +354,7 @@ static int imx615_probe(struct i2c_client *client)
+ 	ret = media_entity_pads_init(&s->sd.entity, 1, &s->pad);
+ 	if (ret)
+ 		goto destroy_mutex;
+-	v4l2_ctrl_handler_init(&s->ctrls, 8);
++	v4l2_ctrl_handler_init(&s->ctrls, 14);
+ 	s->ctrls.lock = &s->lock;
+ 	ctrl = v4l2_ctrl_new_int_menu(&s->ctrls, NULL, V4L2_CID_LINK_FREQ,
+ 				    0, 0, imx615_link_freq);
+@@ -367,6 +379,14 @@ static int imx615_probe(struct i2c_client *client)
+ 	v4l2_ctrl_new_std_menu_items(&s->ctrls, &imx615_ctrl_ops,
+ 			V4L2_CID_TEST_PATTERN, ARRAY_SIZE(imx615_patterns) - 1,
+ 			0, 0, imx615_patterns);
++	v4l2_ctrl_new_std(&s->ctrls, &imx615_ctrl_ops,
++			 V4L2_CID_TEST_PATTERN_RED, 0, 1023, 1, 256);
++	v4l2_ctrl_new_std(&s->ctrls, &imx615_ctrl_ops,
++			 V4L2_CID_TEST_PATTERN_GREENR, 0, 1023, 1, 512);
++	v4l2_ctrl_new_std(&s->ctrls, &imx615_ctrl_ops,
++			 V4L2_CID_TEST_PATTERN_BLUE, 0, 1023, 1, 768);
++	v4l2_ctrl_new_std(&s->ctrls, &imx615_ctrl_ops,
++			 V4L2_CID_TEST_PATTERN_GREENB, 0, 1023, 1, 512);
+ 	ret = v4l2_fwnode_device_parse(dev, &props);
+ 	if (ret)
+ 		goto free_controls;

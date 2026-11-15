@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Thu, 15 Oct 2026 08:36:42 +0800
+Subject: [PATCH 22/24] board: mediatek-mobile: optional bring-up autoreset
+ through the watchdog
+
+When the environment sets "autoreset_s" and no USB host has addressed
+the device controller within that many seconds, save the console record
+and stop servicing the watchdog. MediaTek LK counts the watchdog reset as
+a failed boot (it does not count a software reset), so its A/B retry
+falls back to the other slot after a few attempts. A host connection or
+clearing "autoreset_s" keeps U-Boot running.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../mediatek-mobile/mediatek-mobile.c         | 67 +++++++++++++++++++
+ 1 file changed, 67 insertions(+)
+
+diff --git a/board/mediatek/mediatek-mobile/mediatek-mobile.c b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+index 377852df258..78a99c9bf9e 100644
+--- a/board/mediatek/mediatek-mobile/mediatek-mobile.c
++++ b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+@@ -19,6 +19,11 @@
+ #include <asm/sections.h>
+ #include <asm/system.h>
+ #include <asm/unaligned.h>
++#include <cyclic.h>
++#include <dm/device.h>
++#include <dm/read.h>
++#include <dm/uclass.h>
++#include <dm/uclass-internal.h>
+ #include <env.h>
+ #include <fdt_support.h>
+ #include <fdtdec.h>
+@@ -728,6 +733,65 @@ void lmb_arch_add_memory(void)
+ 		  mtk_bank_count, mtk_reserved_count);
+ }
+ 
++void mediatek_mobile_reset_notify(void);
++
++/* U3D_DEVICE_CONF in the mtu3 "mac" registers: the address the host set. */
++#define MTU3_DEVICE_CONF	0x800
++#define MTU3_DEV_ADDR		GENMASK(30, 24)
++
++/* Whether a USB host has addressed the (probed) device controller. */
++static bool mtk_usb_addressed(bool verbose)
++{
++	struct udevice *dev = NULL;
++	fdt_addr_t mac = FDT_ADDR_T_NONE;
++	u32 conf = 0;
++	int ret;
++
++	ret = uclass_find_first_device(UCLASS_USB_GADGET_GENERIC, &dev);
++	if (!ret && dev && device_active(dev)) {
++		/* The mtu3 glue (the gadget's parent) owns the "mac" registers. */
++		mac = dev_read_addr_name(dev_get_parent(dev), "mac");
++		if (mac != FDT_ADDR_T_NONE)
++			conf = readl((void *)mac + MTU3_DEVICE_CONF);
++	}
++	if (verbose)
++		printf("autoreset: gadget %s (%d, %s) mac 0x%llx conf 0x%08x\n",
++		       dev ? dev->name : "none", ret,
++		       dev && device_active(dev) ? "active" : "inactive",
++		       (unsigned long long)mac, conf);
++	return conf & MTU3_DEV_ADDR;
++}
++
++/*
++ * Bring-up safety net: when "autoreset_s" is set (by the environment) and no
++ * USB host has addressed the device within that many seconds, stop
++ * servicing the watchdog. The stock bootloader counts the watchdog reset
++ * (unlike a software reset) as a failed boot, so its A/B retry falls back
++ * to the other slot; the console record is saved for the next boot. Once a
++ * host connects, or "autoreset_s" is cleared, the device stays.
++ */
++static struct cyclic_info mtk_autoreset;
++static ulong mtk_autoreset_start;
++
++static void mtk_autoreset_check(struct cyclic_info *c)
++{
++	ulong limit = env_get_ulong("autoreset_s", 10, 0);
++
++	if (!limit || mtk_usb_addressed(false)) {
++		cyclic_unregister(c);
++		return;
++	}
++	if (get_timer(mtk_autoreset_start) < limit * 1000)
++		return;
++	cyclic_unregister(c);
++	mtk_usb_addressed(true);
++	printf("autoreset: no USB host for %lu s, waiting for the watchdog\n",
++	       limit);
++	mediatek_mobile_reset_notify();
++	for (;;)
++		;
++}
++
+ int misc_init_r(void)
+ {
+ 	phys_addr_t fastboot;
+@@ -749,6 +813,9 @@ int misc_init_r(void)
+ 	    !mtk_alloc_low(CONFIG_FASTBOOT_BUF_SIZE, SZ_2M, &fastboot))
+ 		env_set_hex("fastboot_addr_r", fastboot);
+ 
++	mtk_autoreset_start = get_timer(0);
++	cyclic_register(&mtk_autoreset, mtk_autoreset_check, 1000000,
++			"autoreset");
+ 	mtk_trace("U-Boot: misc_init_r done\n");
+ 	mtk_probe(5);
+ 	return 0;
+-- 
+2.55.0
+

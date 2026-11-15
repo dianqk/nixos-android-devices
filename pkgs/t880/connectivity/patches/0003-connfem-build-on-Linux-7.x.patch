@@ -1,0 +1,150 @@
+From 7abf83f4aebb330e8c2c6b12da1ab11613211671 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 16 Oct 2026 12:20:49 +0800
+Subject: [PATCH] connfem: build on Linux 7.x
+
+Use the GPIO descriptor API instead of the removed of_gpio helpers, a
+void platform remove callback, class_create() without the module, and
+import the IIO_CONSUMER symbol namespace.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ connectivity/connfem/Kbuild              |  2 +-
+ connectivity/connfem/connfem_dt_parser.c | 17 ++++++++++++-----
+ connectivity/connfem/connfem_epaelna.c   |  1 +
+ connectivity/connfem/connfem_module.c    | 11 +++++++++--
+ 4 files changed, 23 insertions(+), 8 deletions(-)
+
+diff --git a/connectivity/connfem/Kbuild b/connectivity/connfem/Kbuild
+index 44d6965..b0ee14d 100644
+--- a/connectivity/connfem/Kbuild
++++ b/connectivity/connfem/Kbuild
+@@ -25,7 +25,7 @@ KBUILD_MODPOST_FAIL_ON_WARNINGS := y
+ # GCC Options
+ ###############################################################################
+ ccflags-y += -Wall
+-ccflags-y += -Werror
++ccflags-y += -Wno-error -include $(KO_CODE_PATH)/../../compat/t880_compat.h -I$(KO_CODE_PATH)/../../compat/include -Wno-missing-prototypes -Wno-missing-declarations
+ 
+ 
+ ###############################################################################
+diff --git a/connectivity/connfem/connfem_dt_parser.c b/connectivity/connfem/connfem_dt_parser.c
+index 3bb8bd2..90e2906 100644
+--- a/connectivity/connfem/connfem_dt_parser.c
++++ b/connectivity/connfem/connfem_dt_parser.c
+@@ -6,7 +6,9 @@
+ #include <linux/kernel.h>
+ #include <linux/of_platform.h>
+ #include <linux/of_device.h>
+-#include <linux/of_gpio.h>
++#include <linux/gpio/consumer.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
+ #include <linux/pinctrl/consumer.h>
+ #include <linux/iio/consumer.h>
+ #include <linux/slab.h>
+@@ -532,11 +534,12 @@ static int cfm_dt_epaelna_hwid_gpio_parse(struct device_node *np,
+ 				     unsigned int *nbits_out)
+ {
+ 	int i, cnt, gpio_num;
++	struct gpio_desc *desc;
+ 	unsigned int hwid = 0;
+ 	unsigned int consumed_bits = 0;
+ 	unsigned int gpio_value = 0;
+ 
+-	cnt = of_gpio_named_count(np, CFM_DT_PROP_GPIO);
++	cnt = of_count_phandle_with_args(np, CFM_DT_PROP_GPIO, "#gpio-cells");
+ 	if (cnt <= 0 && cnt != -ENOENT) {
+ 		pr_info("[WARN] Invalid '%s' property", CFM_DT_PROP_GPIO);
+ 		return -EINVAL;
+@@ -551,10 +554,13 @@ static int cfm_dt_epaelna_hwid_gpio_parse(struct device_node *np,
+ 	/* Retrieve hardware ID based on GPIO PIN(s) value */
+ 	for (i = 0; i < cnt; i++) {
+ 		/* Retrieve GPIO PIN number */
+-		gpio_num = of_get_named_gpio(np, CFM_DT_PROP_GPIO, i);
++		/* T880 port: gpiod replaces the removed of_gpio API */
++		desc = fwnode_gpiod_get_index(of_fwnode_handle(np), NULL, i,
++					      GPIOD_ASIS, "connfem-hwid");
++		gpio_num = IS_ERR(desc) ? PTR_ERR(desc) : desc_to_gpio(desc);
+ 
+ 		/* Abort if it's not valid */
+-		if (!gpio_is_valid(gpio_num)) {
++		if (IS_ERR(desc)) {
+ 			pr_info("[WARN] Invalid '%s' property: idx(%d)err(%d)",
+ 				CFM_DT_NODE_HWID,
+ 				i, gpio_num);
+@@ -563,7 +569,8 @@ static int cfm_dt_epaelna_hwid_gpio_parse(struct device_node *np,
+ 		}
+ 
+ 		/* Read GPIO PIN */
+-		gpio_value = gpio_get_value(gpio_num);
++		gpio_value = gpiod_get_raw_value_cansleep(desc);
++		gpiod_put(desc);
+ 		hwid |= ((gpio_value & 0x1) << i);
+ 		pr_info("%s[%d]: GPIO(%d)=%d, hwid(%u)",
+ 			CFM_DT_NODE_HWID, i,
+diff --git a/connectivity/connfem/connfem_epaelna.c b/connectivity/connfem/connfem_epaelna.c
+index 1040f33..905864f 100644
+--- a/connectivity/connfem/connfem_epaelna.c
++++ b/connectivity/connfem/connfem_epaelna.c
+@@ -8,6 +8,7 @@
+ #include <linux/string.h>
+ #include <linux/of_platform.h>
+ #include <linux/of_device.h>
++#include <linux/of.h>
+ #include "connfem.h"
+ 
+ /*******************************************************************************
+diff --git a/connectivity/connfem/connfem_module.c b/connectivity/connfem/connfem_module.c
+index 4366a14..5ac1204 100644
+--- a/connectivity/connfem/connfem_module.c
++++ b/connectivity/connfem/connfem_module.c
+@@ -8,6 +8,8 @@
+ #include <linux/errno.h>
+ #include <linux/of_platform.h>
+ #include <linux/of_device.h>
++#include <linux/platform_device.h>
++#include <linux/of.h>
+ #include <linux/cdev.h>
+ #include <linux/uaccess.h>
+ #include <linux/fs.h>
+@@ -40,6 +42,10 @@ struct connfem_cdev_context {
+  ******************************************************************************/
+ static int connfem_plat_probe(struct platform_device *pdev);
+ static int connfem_plat_remove(struct platform_device *pdev);
++static void connfem_plat_remove_void(struct platform_device *pdev)
++{
++	connfem_plat_remove(pdev);
++}
+ 
+ static long connfem_dev_unlocked_ioctl(struct file *filp, unsigned int cmd,
+ 					unsigned long arg);
+@@ -123,7 +129,7 @@ static const struct of_device_id connfem_of_ids[] = {
+ 
+ static struct platform_driver connfem_plat_drv = {
+ 	.probe = connfem_plat_probe,
+-	.remove = connfem_plat_remove,
++	.remove = connfem_plat_remove_void,
+ 	.driver = {
+ 		   .name = "mtk_connfem",
+ 		   .owner = THIS_MODULE,
+@@ -716,7 +722,7 @@ static int __init connfem_mod_init(void)
+ 	pr_info("ConnFem DevID major %d", connfem_major);
+ 
+ 	/* Char Device: Create class */
+-	connfem_cdev_ctx.class = class_create(THIS_MODULE, CONNFEM_DRIVER_NAME);
++	connfem_cdev_ctx.class = class_create(CONNFEM_DRIVER_NAME);
+ 	if (IS_ERR(connfem_cdev_ctx.class)) {
+ 		pr_info("[WARN] ConnFem create class failed");
+ 		ret = -30;
+@@ -791,6 +797,7 @@ static void __exit connfem_mod_exit(void)
+ module_init(connfem_mod_init);
+ module_exit(connfem_mod_exit);
+ 
++MODULE_IMPORT_NS("IIO_CONSUMER");
+ MODULE_LICENSE("GPL");
+ MODULE_DESCRIPTION("Connsys FEM (Front-End-Module) Driver");
+ MODULE_AUTHOR("Dennis Lin <dennis.lin@mediatek.com>");
+-- 
+2.55.0
+

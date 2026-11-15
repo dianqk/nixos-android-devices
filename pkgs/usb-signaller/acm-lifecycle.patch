@@ -1,0 +1,77 @@
+Serialize ACM console lifetime with gadget mode changes.
+Upstream: https://codeberg.org/DylanVanAssche/usb-signaller/src/tag/v0.4.2
+
+--- a/src/dbus.rs
++++ b/src/dbus.rs
+@@ -54,6 +54,13 @@
+                 "USB data role is managed externally".into(),
+             ));
+         }
++        // Closing ACM users is mandatory before any role switch or configfs
++        // mutation: deleting an open gserial port can wait indefinitely.
++        let console_service = std::env::var("USB_SIGNALLER_ACM_SERVICE").ok();
++        if let Some(service) = console_service.as_deref() {
++            crate::service::service_stop(service)
++                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
++        }
+         /* USB Role Switcher */
+         for name in discover_urss().iter().filter(|_| manage_role) {
+             if URS::load(name).is_ok() {
+@@ -108,6 +115,14 @@
+                             println!("  Mode: {:?}", udc.mode);
+                             if let Some(gadget) = udc.gadget {
+                                 println!("  Gadget: {}", gadget.name);
++                            }
++                            if mode == "developer_mode" {
++                                if let Some(service) = console_service.as_deref() {
++                                    // Never wait for enumeration or getty's ordering
++                                    // against this daemon's own startup transaction.
++                                    crate::service::service_start_async(service)
++                                        .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
++                                }
+                             }
+                             let return_str = udcmode_to_string(target_mode);
+ 
+--- a/src/service.rs
++++ b/src/service.rs
+@@ -19,19 +19,21 @@
+ use std::path::PathBuf;
+ use std::process::Command;
+ 
+-fn service_run(service: &str, command: &str) -> anyhow::Result<()> {
++fn service_run(service: &str, command: &str, wait: bool) -> anyhow::Result<()> {
+     let result;
+ 
+     /* Systemd */
+     if PathBuf::from("/usr/bin/systemctl").exists() {
+-        result = Command::new("systemctl").args([command, service]).output();
++        result = Command::new("systemctl").args([command, service])
++            .args(if wait { vec![] } else { vec!["--no-block"] }).output();
+         if result.is_err() || !result?.status.success() {
+             return Err(anyhow::anyhow!(
+-                "Failed to start systemd service: {service}"
++                "Failed to {command} systemd service: {service}"
+             ));
+         }
+     /* OpenRC */
+     } else if PathBuf::from("/sbin/rc-service").exists() {
++        anyhow::ensure!(wait, "Asynchronous service startup requires systemd");
+         result = Command::new("rc-service").args([service, command]).output();
+         if result.is_err() || !result?.status.success() {
+             return Err(anyhow::anyhow!("Failed to start OpenRC service: {service}"));
+@@ -46,9 +48,13 @@
+ }
+ 
+ pub fn service_start(service: &str) -> anyhow::Result<()> {
+-    return service_run(service, "start");
++    return service_run(service, "start", true);
+ }
+ 
+ pub fn service_stop(service: &str) -> anyhow::Result<()> {
+-    return service_run(service, "stop");
++    return service_run(service, "stop", true);
+ }
++
++pub fn service_start_async(service: &str) -> anyhow::Result<()> {
++    service_run(service, "start", false)
++}

@@ -83,7 +83,112 @@ fn preview_dimensions() -> io::Result<(usize, usize)> {
     }
     Ok((width, height))
 }
-fn start_action(cfg: &Profile, action: &str, id: u64) -> io::Result<(Child, PathBuf)> {
+/// The result of the read-only `prepare-install --check` the screen runs to
+/// list the Android userdata sizes.
+pub(crate) struct UserdataCheck {
+    pub choices: Result<Vec<String>, String>,
+    /// The daemon task of the check ("Recovery task N" on stderr).
+    pub task: Option<u64>,
+}
+/// The daemon task of a client run ("Recovery task N" on stderr).
+fn client_task(text: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("Recovery task "))
+        .and_then(|id| id.trim().parse().ok())
+}
+/// The last error line of a client run.
+fn client_error(text: &str) -> Option<&str> {
+    text.lines()
+        .rev()
+        .find(|l| l.starts_with("ERROR:") || l.starts_with("recovery:"))
+}
+/// Android userdata sizes the daemon offers for this disk
+/// ("Android userdata choices: 64G 128G", or "none").
+pub(crate) fn parse_userdata_check(text: &str, success: bool) -> UserdataCheck {
+    let task = client_task(text);
+    let choices: Vec<String> = text
+        .lines()
+        .find_map(|l| l.strip_prefix("Android userdata choices:"))
+        .map(|l| {
+            l.split_whitespace()
+                .filter(|c| *c != "none")
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let choices = if success && !choices.is_empty() {
+        Ok(choices)
+    } else {
+        Err(client_error(text)
+            .unwrap_or("No Android userdata size is available")
+            .into())
+    };
+    UserdataCheck { choices, task }
+}
+/// The plan of the chosen size from `prepare-install --android-userdata
+/// SIZE --check` (its "Plan: " lines), shown before the final confirmation.
+pub(crate) fn parse_plan_check(text: &str, success: bool) -> UserdataCheck {
+    let plan: Vec<String> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("Plan: "))
+        .map(String::from)
+        .collect();
+    UserdataCheck {
+        choices: if success && !plan.is_empty() {
+            Ok(plan)
+        } else {
+            Err(client_error(text)
+                .unwrap_or("The recovery did not report a plan for this size")
+                .into())
+        },
+        task: client_task(text),
+    }
+}
+fn run_check(args: &[&str], parse: fn(&str, bool) -> UserdataCheck) -> UserdataCheck {
+    match Command::new("/bin/recovery").args(args).output() {
+        Ok(output) => parse(
+            &(String::from_utf8_lossy(&output.stdout).into_owned()
+                + &String::from_utf8_lossy(&output.stderr)),
+            output.status.success(),
+        ),
+        Err(e) => UserdataCheck {
+            choices: Err(e.to_string()),
+            task: None,
+        },
+    }
+}
+/// What the result view shows after an action exits: its output tail on
+/// success (the next steps), else its error line.
+pub(crate) fn action_result(contents: &str, success: bool, status: &str) -> String {
+    if success {
+        let lines: Vec<&str> = contents
+            .lines()
+            .filter(|l| !l.starts_with("Recovery task ") && !l.trim().is_empty())
+            .collect();
+        if lines.is_empty() {
+            format!("Action returned: {status}")
+        } else {
+            lines.join("\n")
+        }
+    } else {
+        client_error(contents)
+            .map(String::from)
+            .unwrap_or_else(|| format!("Action returned: {status}"))
+    }
+}
+/// Whether a daemon task shown by the status watch takes over the screen
+/// (the update view, cancelling a pending choice or confirmation). The
+/// screen's own read-only size check is a daemon task too; it must not
+/// close the size picker it is filling.
+pub(crate) fn task_takes_over(session: u64, last: u64, own_check: Option<u64>) -> bool {
+    session != last && Some(session) != own_check
+}
+fn start_action(
+    cfg: &Profile,
+    action: &str,
+    chosen: Option<&str>,
+    id: u64,
+) -> io::Result<(Child, PathBuf)> {
     let path = PathBuf::from(format!(
         "/tmp/{}-recovery-action.{}.{}",
         cfg.id,
@@ -95,9 +200,15 @@ fn start_action(cfg: &Profile, action: &str, id: u64) -> io::Result<(Child, Path
         .create_new(true)
         .mode(0o600)
         .open(&path)?;
-    let child = Command::new("/bin/recovery")
-        .arg(action)
-        .arg("--confirm")
+    let mut command = Command::new("/bin/recovery");
+    command.arg(action);
+    if action == device::PREPARE_INSTALL {
+        let size = chosen.ok_or_else(|| io::Error::other("no Android userdata size chosen"))?;
+        command.args(["--android-userdata", size, "--confirm-erase-userdata"]);
+    } else {
+        command.arg("--confirm");
+    }
+    let child = command
         .stdout(Stdio::from(output.try_clone()?))
         .stderr(Stdio::from(output))
         .spawn()?;
@@ -116,14 +227,37 @@ pub(crate) fn run() -> io::Result<()> {
         ));
     };
     let cfg = device::profile();
-    let mut menu = Menu::default();
+    let mut menu = Menu {
+        choice_item: cfg
+            .items
+            .iter()
+            .position(|i| i.action == Some(device::PREPARE_INSTALL)),
+        ..Default::default()
+    };
     if preview {
         match std::env::var("MOBILE_RECOVERY_PREVIEW_STATE").as_deref() {
             Ok("confirm") => {
                 menu.selected = 1.min(cfg.items.len() - 1);
                 menu.confirming = true;
             }
+            Ok(state @ ("choose" | "confirm-choice")) if menu.choice_item.is_some() => {
+                menu.selected = menu.choice_item.unwrap();
+                menu.choosing = true;
+                menu.choices = vec!["64G".into(), "128G".into()];
+                menu.confirming = state == "confirm-choice";
+                if menu.confirming {
+                    menu.plan = vec![
+                        "userdata 224.6 -> 64.0 GiB (Android, erased)".into(),
+                        "new linux-boot 1.0 GiB".into(),
+                        "new linux 159.6 GiB".into(),
+                    ];
+                }
+            }
             Ok("error") => menu.error = true,
+            Ok("done") => {
+                menu.error = true;
+                menu.succeeded = true;
+            }
             Ok("log") => menu.logs = true,
             Ok("update") => menu.updates = true,
             _ => {}
@@ -188,6 +322,7 @@ pub(crate) fn run() -> io::Result<()> {
     let mut redraw = true;
     let mut status_socket = StatusSocket::open()?;
     let mut last_update_session = status_socket.status.session_id;
+    let mut own_check = None;
     while !STOP.load(Ordering::Relaxed) {
         redraw |= discover_inputs(&mut inputs);
         let current_usb = usb_state();
@@ -239,22 +374,74 @@ pub(crate) fn run() -> io::Result<()> {
             if child.is_some() { 100 } else { 1000 },
             &status_socket.fds(),
             status_socket.status.active,
-        );
+            || console.blanked(),
+        )?;
+        if event.wake {
+            console.unblank()?;
+            redraw = true;
+        }
         redraw |= event.redraw;
         redraw |= status_socket.handle(&event.extra_ready)?;
-        if status_socket.status.session_id != last_update_session {
+        if task_takes_over(
+            status_socket.status.session_id,
+            last_update_session,
+            own_check,
+        ) {
             menu.updates = true;
             menu.logs = false;
             menu.confirming = false;
+            menu.choosing = false;
             menu.yes = false;
             menu.error = false;
-            menu.reset_keys();
-            last_update_session = status_socket.status.session_id;
+            menu.suppress_actions();
+        }
+        last_update_session = status_socket.status.session_id;
+        if menu.choosing && menu.choices.is_empty() && !menu.error {
+            let check = run_check(&[device::PREPARE_INSTALL, "--check"], parse_userdata_check);
+            own_check = check.task.or(own_check);
+            match check.choices {
+                Ok(choices) => menu.choices = choices,
+                Err(err) => {
+                    failure = err;
+                    menu.choosing = false;
+                    menu.error = true;
+                }
+            }
+            redraw = true;
+        }
+        if !menu.confirming {
+            menu.plan.clear();
+        }
+        if let Some(size) = menu.chosen().map(String::from) {
+            if menu.plan.is_empty() && !menu.error {
+                let check = run_check(
+                    &[
+                        device::PREPARE_INSTALL,
+                        "--android-userdata",
+                        &size,
+                        "--check",
+                    ],
+                    parse_plan_check,
+                );
+                own_check = check.task.or(own_check);
+                match check.choices {
+                    Ok(plan) => menu.plan = plan,
+                    Err(err) => {
+                        failure = err;
+                        menu.choosing = false;
+                        menu.confirming = false;
+                        menu.error = true;
+                    }
+                }
+                redraw = true;
+            }
         }
         if let Some(index) = event.action {
             if let Some(action) = cfg.items[index].action {
                 action_id += 1;
-                match start_action(cfg, action, action_id) {
+                let chosen = menu.chosen().map(String::from);
+                menu.choosing = false;
+                match start_action(cfg, action, chosen.as_deref(), action_id) {
                     Ok(started) => child = Some(started),
                     Err(err) => {
                         failure = err.to_string();
@@ -267,20 +454,16 @@ pub(crate) fn run() -> io::Result<()> {
         }
         if let Some((running, path)) = child.as_mut() {
             if let Some(status) = running.try_wait()? {
-                failure = format!("Action returned: {status}");
-                if let Ok(contents) = fs::read_to_string(path) {
-                    if let Some(line) = contents
-                        .lines()
-                        .rev()
-                        .find(|line| line.starts_with("ERROR:"))
-                    {
-                        failure = line.into();
-                    }
-                }
+                failure = action_result(
+                    &fs::read_to_string(path).unwrap_or_default(),
+                    status.success(),
+                    &status.to_string(),
+                );
                 child = None;
                 menu.busy = false;
                 menu.error = true;
-                menu.reset_keys();
+                menu.succeeded = status.success();
+                menu.suppress_actions();
                 redraw = true;
             }
         }

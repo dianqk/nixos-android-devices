@@ -127,9 +127,9 @@ kernel.overrideAttrs (old: {
   postConfigure = postConfigure + ''
     # Check resolved Kconfig, not just the input fragment. Catch dependencies or
     # new defaults that resurrect unrelated drivers, and missing boot drivers.
-    grep -E '^CONFIG_PINCTRL(_[A-Za-z0-9_]+)?=[ym]$' build/.config | sort > build/pinctrl.config
-    sort ${expectedPinctrlFile} > build/pinctrl-expected.config
-    diff -u build/pinctrl-expected.config build/pinctrl.config
+    grep -E '^CONFIG_PINCTRL(_[A-Za-z0-9_]+)?=[ym]$' "$buildRoot"/.config | sort > "$buildRoot"/pinctrl.config
+    sort ${expectedPinctrlFile} > "$buildRoot"/pinctrl-expected.config
+    diff -u "$buildRoot"/pinctrl-expected.config "$buildRoot"/pinctrl.config
     # A dependency may select a driver back on, or make a retained driver
     # unavailable. Verify every layered override after olddefconfig.
     awk -F= '
@@ -145,43 +145,56 @@ kernel.overrideAttrs (old: {
         }
         exit failed
       }
-    ' ${expectedOverridesFile} build/.config
+    ' ${expectedOverridesFile} "$buildRoot"/.config
   '';
   buildInputs = (old.buildInputs or [ ]) ++ buildInputs;
   nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ nativeBuildInputs;
   dontStrip = true;
   # Linux 7.x gives arm64 zinstall an EFI-specific meaning. Keep nixpkgs'
-  # ordinary install lifecycle and add the proven Android Image.gz ourselves.
-  # Nixpkgs builds/installs modules when CONFIG_MODULES is enabled and puts
-  # them in its separate `modules` output. Do not redirect INSTALL_MOD_PATH:
-  # the inherited postInstall also removes the build link from that output.
-  installTargets = [ "install" ];
+  # ordinary install lifecycle (install, modules_install into the separate
+  # `modules` output, dtbs_install when building all DTBs) and add the proven
+  # Android Image.gz ourselves.
+  installTargets = map (target: if target == "zinstall" then "install" else target) old.installTargets;
   buildFlags = (old.buildFlags or [ ]) ++ dtbs;
+  # Nixpkgs signs modules with per-module kmodigest certificates and then
+  # concatenates them into modules.cer. Our configs either leave MODULE_SIG
+  # unset (no certificates are produced, so the concatenation fails) or sign
+  # with the kernel's own build key (Clover); keep Kbuild's own signing rule.
+  makeFlags = builtins.filter (flag: !(lib.hasPrefix "cmd_sign=" flag)) old.makeFlags;
   postInstall =
-    (old.postInstall or "")
+    # Before the inherited postInstall: it runs `make clean` on the build tree
+    # and repoints $buildRoot at the retained $dev tree.
+    ''
+      gzip -n -c "$buildRoot/arch/arm64/boot/Image" > "$out/Image.gz"
+      cp "$buildRoot/.config" "$out/build.config"
+      ${lib.concatMapStringsSep "\n" (dtb: ''
+        install -Dm0644 "$buildRoot/arch/arm64/boot/dts/${dtb}" "$out/dtbs/${dtb}"
+      '') dtbs}
+    ''
+    + (
+      let
+        concatenation = [
+          "sed 's/$/\\.cer/' modules.order | xargs -d'\\n' cat > modules.cer"
+          "sed 's/$/\\.cer/' modules.order | xargs -d'\\n' rm"
+        ];
+        inherited = old.postInstall or "";
+        stripped = builtins.replaceStrings concatenation [
+          ":"
+          ":"
+        ] inherited;
+      in
+      assert lib.assertMsg (
+        !(lib.hasInfix "modules.cer" inherited) || stripped != inherited
+      ) "kernel-compat: the nixpkgs modules.cer concatenation changed; update kernel-compat.nix";
+      stripped
+    )
     + lib.optionalString (builtins.elem "modules" (old.outputs or [ "out" ])) ''
       test -d "$modules/lib/modules/${modDirVersion}"
       test ! -L "$modules/lib/modules/${modDirVersion}/build"
     ''
-    + (
-      if dtbs == [ ] then
-        ''
-          gzip -n -c "$buildRoot/arch/arm64/boot/Image" > "$out/Image.gz"
-          cp "$buildRoot/.config" "$out/build.config"
-          test -s "$out/Image.gz"
-          test -s "$out/System.map"
-          test -d "$out/dtbs"
-        ''
-      else
-        ''
-          gzip -n -c "$buildRoot/arch/arm64/boot/Image" > "$out/Image.gz"
-          cp "$buildRoot/.config" "$out/build.config"
-          ${lib.concatMapStringsSep "\n" (dtb: ''
-            install -Dm0644 "$buildRoot/arch/arm64/boot/dts/${dtb}" "$out/dtbs/${dtb}"
-          '') dtbs}
-          test -s "$out/Image.gz"
-          test -s "$out/System.map"
-          test -d "$out/dtbs"
-        ''
-    );
+    + ''
+      test -s "$out/Image.gz"
+      test -s "$out/System.map"
+      test -d "$out/dtbs"
+    '';
 })

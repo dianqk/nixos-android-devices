@@ -1,0 +1,53 @@
+From b627af86058320a4fb922d15d6516fef492752fe Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] Bluetooth: tolerate unsupported sync train parameters
+
+Bluetooth: tolerate unsupported sync train parameters.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-16T11:27:45+08:00
+Link: https://github.com/MT6895-Mainline/linux/commit/d00468298df83555d5157f37a39d84e242dbd5ee
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ include/net/bluetooth/hci.h | 8 ++++++++
+ net/bluetooth/hci_sync.c    | 3 ++-
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/include/net/bluetooth/hci.h b/include/net/bluetooth/hci.h
+index 1641d879db..48a978f73b 100644
+--- a/include/net/bluetooth/hci.h
++++ b/include/net/bluetooth/hci.h
+@@ -375,6 +375,14 @@ enum {
+ 	 */
+ 	HCI_QUIRK_BROKEN_READ_PAGE_SCAN_TYPE,
+ 
++	/* When this quirk is set, the HCI_OP_READ_SYNC_TRAIN_PARAMS command is
++	 * skipped. This is required for MediaTek connsys controllers that
++	 * advertise the synchronization train feature but reject the command.
++	 *
++	 * This quirk must be set before hci_register_dev is called.
++	 */
++	HCI_QUIRK_BROKEN_READ_SYNC_TRAIN_PARAMS,
++
+ 	__HCI_NUM_QUIRKS,
+ };
+ 
+diff --git a/net/bluetooth/hci_sync.c b/net/bluetooth/hci_sync.c
+index a92a81846e..6a8b6b955d 100644
+--- a/net/bluetooth/hci_sync.c
++++ b/net/bluetooth/hci_sync.c
+@@ -5027,7 +5027,8 @@ static int hci_get_mws_transport_config_sync(struct hci_dev *hdev)
+ /* Check for Synchronization Train support */
+ static int hci_read_sync_train_params_sync(struct hci_dev *hdev)
+ {
+-	if (!lmp_sync_train_capable(hdev))
++	if (!lmp_sync_train_capable(hdev) ||
++	    hci_test_quirk(hdev, HCI_QUIRK_BROKEN_READ_SYNC_TRAIN_PARAMS))
+ 		return 0;
+ 
+ 	return __hci_cmd_sync_status(hdev, HCI_OP_READ_SYNC_TRAIN_PARAMS,
+-- 
+2.56.0
+

@@ -2,7 +2,7 @@
 
 [中文](PATCHES.zh.md) · [Sheng guide](../../../../docs/sheng/README.md)
 
-The queue targets Linux 7.3-rc6; the hardware results below were obtained
+The queue targets Linux 7.3; the hardware results below were obtained
 with earlier 7.3 kernels. See the [shared kernel status](../../README.md).
 
 `devices.sheng.kernel` applies the ordered [patch series](series.nix).
@@ -10,7 +10,7 @@ Installed systems and RAM recovery use the same kernel package. The package uses
 `sm8550-xiaomi-sheng.dtb`.
 
 Each patch names its source commits and local 7.3 adaptations;
-[ORIGINS.md](patches/ORIGINS.md) retains original authors, dates, messages and
+Patch headers retain original authors, dates, messages and
 trailers. Display and WCN7850 Wi-Fi work on the installed system; other peripheral
 limitations are listed in the
 [hardware reference](../../../../docs/sheng/hardware.md).
@@ -23,7 +23,7 @@ The patch is carried unchanged with its original author and upstream link.
 It does not change the panel, DSI PLL rate calculation, DTB or kernel config.
 Without it the display starts black with an MDP RCG update timeout. See [hardware status](../../../../docs/sheng/hardware.md).
 
-The 7.3-rc6 series also carries the Lucid OLE guard and the upstream
+The 7.3 series also carries the Lucid OLE guard and the upstream
 [Qualcomm PCIe IOMMU-cell parser fix](../../patches/pcie-qcom-iommu-cells.patch).
 The latter makes the BDF-to-SID table consume the provider's actual cell count;
 SM8550's valid five-cell maps otherwise get parsed with a four-cell stride.

@@ -15,7 +15,8 @@ remoteproc、NV 存储和固件由设备模块提供；通常只需启用设备�
 
 | 设备 | 启用方式 | 说明 |
 | --- | --- | --- |
-| Aurora | `hardware.aurora.modem.enable = true;` | 实验性。支持注册网络、移动数据和短信；需要 Android 14 底包和许可服务。见 [Aurora 蜂窝基带](aurora/connectivity.zh.md#cellular-modem-experimental)。 |
+| Aurora | `hardware.aurora.modem.enable = true;` | 实验性。支持注册网络、移动数据和短信；需要 Android 16 底包 OS3.0.308.0.WNACNXM 和许可服务。见 [Aurora 蜂窝基带](aurora/connectivity.zh.md#cellular-modem-experimental)。 |
+| Marble | `hardware.marble.modem.enable = true;` | 实验性，尚未在实机验证。rmtfs 读取 `modemst1`、`modemst2`、`fsg` 与 `fsc`（默认只读）、tqftpserv、内核 pd-mapper 与 ModemManager；不需要 QTEE 许可服务。 |
 | Polaris | `hardware.polaris.radio.snapshotDirectory = "/path";` | 由 `rmtfs -s` 从已核验的只读校准快照启动 MPSS；不等待时钟同步，不做 SIM 激活，不集成 ModemManager。见 [Polaris](polaris/README.zh.md)。 |
 
 ## `androidDevices.modem`
@@ -30,9 +31,10 @@ remoteproc、NV 存储和固件由设备模块提供；通常只需启用设备�
 | `allowNvWrites` | `false` | 允许 rmtfs 写回 NV 数据。为 false 时基带写入只保留在内存中，服务只能读取块设备。 |
 | `startAtBoot` | `false` | 开机时启动 MPSS；否则手动启动 `modem-mpss.service`。 |
 | `crashRecovery` | `false` | 基带崩溃后由内核自动重启 MPSS。 |
-| `timeSyncTimeout` | `120` | 启动 MPSS 前等待 NTP 同步的秒数；`0` 关闭等待。 |
+| `timeSyncTimeout` | `120` | 启动 MPSS 前等待 NTP 同步（启用 [`androidDevices.clock.rtcOffset`](configuration.zh.md#只读-rtc-的系统时钟) 时也接受已恢复的时钟）的秒数；`0` 关闭等待。 |
 | `simProvisioning` | `true` | 若基带未自行激活，为第一张 USIM 激活主 GW provisioning 会话。 |
-| `modemManager` | `true` | 启用 ModemManager 并随 MPSS 启动。打包的守护进程带两个本地修复：netlink 事务 use-after-free（第一次 QMAP 数据连接会崩），以及 SDM845 及之后固件在 `Start Network` 之前必须的 `WDS Bind Subscription`（否则每次数据呼叫都以 `cm error: no-service` 结束）。 |
+| `modemManager` | `true` | 启用 ModemManager 并随 MPSS 启动。打包的守护进程带三个本地修复：netlink 事务 use-after-free（第一次 QMAP 数据连接会崩）、IPA 基带上的 multiplexed-bearer 清理断言，以及 SDM845 及之后固件在 `Start Network` 之前必须的 `WDS Bind Subscription`（否则每次数据呼叫都以 `cm error: no-service` 结束）。 |
+| `ims.enable`、`ims.package` | `false`、`pkgs._81voltd` | 通过 81voltd 和 ModemManager 提供基带请求的 IMS 数据连接，不修改 IMS 注册设置。 |
 | `firmware` | `[ ]` | 基带固件包，只安装在根文件系统中。 |
 | `rmtfsPackage`、`tqftpservPackage` | 打包的默认值 | 替换 rmtfs 或 tqftpserv。 |
 | `rmtfsVerbose`、`rmtfsMemoryDevice` | `true`、`/dev/qcom_rmtfs_mem1` | rmtfs 日志与共享内存设备。 |
@@ -41,6 +43,16 @@ remoteproc、NV 存储和固件由设备模块提供；通常只需启用设备�
 方式）和 `modem-sim-provision`（启用 `simProvisioning` 时）。rmtfs 和 tqftpserv
 不会自行重启，`nixos-rebuild switch` 也不会重启基带服务；需重启系统使改动生效。
 崩溃的 MPSS 保持原状，不会被停止。
+
+对于需要由 AP 提供 IMS 数据服务的基带固件，设置
+`androidDevices.modem.ims.enable = true`。`modem-ims.service` 随 MPSS 启动，
+排在 ModemManager 之后，提供 QRTR 服务 770。基带请求 IMS APN 和 IP 协议族；
+普通数据连接保持独立。此服务提供 IMS 数据连接，注册和短信可用性仍取决于
+基带固件和运营商。
+
+停止 81voltd 不会断开已创建的 ModemManager bearer。手动重启前，记录其 IMS
+bearer 路径，停止 `modem-ims`，再用 `mmcli` 仅断开、删除这些 bearer，保留普通
+数据连接。重启系统可在应用配置改动时重新建立 bearer。
 
 设置 `allowNvWrites = true` 前先备份 NV 分区，切勿恢复其他手机的 NV 数据。
 

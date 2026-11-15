@@ -1,0 +1,465 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Thu, 15 Oct 2026 14:13:04 +0800
+Subject: [PATCH] board: mediatek-mobile: mark the booted slot successful after
+ the ESP entry loads
+
+MediaTek LK decrements the retry counter of a slot that is not marked
+successful on every boot and falls back to the other slot when it runs
+out. Android's boot control HAL marks the slot from userspace; a Linux
+system started through U-Boot has no such service.
+
+Add a weak efi_board_image_loaded() hook that bootefi calls after the
+image loaded and its load options are set, and implement it for the
+mediatek-mobile board (CONFIG_MEDIATEK_MOBILE_AB_CONFIRM): when the image
+is the configured file (/EFI/BOOT/BOOTAA64.EFI) on the configured ESP (a
+unique SCSI partition by name with the ESP type GUID), read the slot LK
+booted from the bootconfig LK appends to its initrd
+(androidboot.slot_suffix); if it is the slot this firmware is configured
+for (CONFIG_MEDIATEK_MOBILE_AB_CONFIRM_SLOT, default "a"), set that
+slot's successful_boot in the AOSP bootloader_control at misc offset
+2048. Priority, retries and every byte of the other slots stay; only that
+bit and the CRC32 change, the block is read back and restored on a
+mismatch. An unknown or other slot marks nothing. A failure is logged and
+the EFI boot continues. Images started with bootm (RAM recovery FITs,
+fastboot boot) never mark a slot.
+
+"abslot" prints the slot LK reports.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm/mach-mediatek/Kconfig                |  37 +++
+ .../mediatek-mobile/mediatek-mobile.c         | 285 +++++++++++++++++-
+ include/efi_loader.h                          |   3 +
+ lib/efi_loader/efi_bootbin.c                  |  17 ++
+ 4 files changed, 338 insertions(+), 4 deletions(-)
+
+diff --git a/arch/arm/mach-mediatek/Kconfig b/arch/arm/mach-mediatek/Kconfig
+index 3ad961ec388..58dc879988d 100644
+--- a/arch/arm/mach-mediatek/Kconfig
++++ b/arch/arm/mach-mediatek/Kconfig
+@@ -246,6 +246,43 @@ config MEDIATEK_MOBILE_ENTRY_WDT_RESTART_KEY
+ 	depends on MEDIATEK_MOBILE_ENTRY_TRACE
+ 	default 0x1971
+ 
++config MEDIATEK_MOBILE_AB_CONFIRM
++	bool "Mark the booted A/B slot successful after loading the ESP entry"
++	depends on TARGET_MEDIATEK_MOBILE && CMD_BOOTEFI && PARTITIONS
++	help
++	  After bootefi loaded the configured EFI file from the configured
++	  ESP partition (a unique SCSI partition with the ESP type), set
++	  successful_boot of the slot LK booted (androidboot.slot_suffix in
++	  LK's bootconfig) in the AOSP bootloader_control block of misc, so
++	  that LK stops counting down that slot's retries. Only that bit and
++	  the CRC change; the write is read back and undone on a mismatch.
++	  Images started with bootm (recovery FITs) never mark the slot.
++
++config MEDIATEK_MOBILE_AB_CONFIRM_ESP
++	string "GPT name of the ESP whose EFI entry confirms the slot"
++	depends on MEDIATEK_MOBILE_AB_CONFIRM
++	default "linux-boot"
++
++config MEDIATEK_MOBILE_AB_CONFIRM_PATH
++	string "EFI file that confirms the slot"
++	depends on MEDIATEK_MOBILE_AB_CONFIRM
++	default "/EFI/BOOT/BOOTAA64.EFI"
++	help
++	  ASCII absolute path; FAT letter case and slash direction are ignored.
++
++config MEDIATEK_MOBILE_AB_CONFIRM_SLOT
++	string "Slot this firmware is installed for (a or b)"
++	depends on MEDIATEK_MOBILE_AB_CONFIRM
++	default "a"
++	help
++	  The slot is never assumed: it is read from LK's bootconfig. A boot
++	  LK reports for any other slot, or an unknown slot, marks nothing.
++
++config MEDIATEK_MOBILE_AB_CONFIRM_MISC
++	string "GPT name of the partition holding the AOSP bootloader_control"
++	depends on MEDIATEK_MOBILE_AB_CONFIRM
++	default "misc"
++
+ config LNX_KRNL_IMG_TEXT_OFFSET_BASE
+ 	default 0x40000000 if TARGET_MEDIATEK_MOBILE
+ 
+diff --git a/board/mediatek/mediatek-mobile/mediatek-mobile.c b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+index afbe0c66ab3..ff400cc47ec 100644
+--- a/board/mediatek/mediatek-mobile/mediatek-mobile.c
++++ b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+@@ -17,6 +17,9 @@
+ #include <asm/armv8/mmu.h>
+ #include <asm/cache.h>
+ #include <blk.h>
++#include <efi_device_path.h>
++#include <efi_loader.h>
++#include <u-boot/crc.h>
+ #include <malloc.h>
+ #include <part.h>
+ #include <asm/global_data.h>
+@@ -915,17 +918,21 @@ static int mtk_lk_boot_mode(void)
+  * The one SCSI (UFS) partition with this name; a name found on several
+  * logical units is refused rather than guessed.
+  */
+-static struct blk_desc *mtk_find_part(const char *name,
+-				      struct disk_partition *info)
++static struct blk_desc *mtk_find_part_number(const char *name,
++					     struct disk_partition *info,
++					     int *number)
+ {
+ 	struct blk_desc *found = NULL, *desc;
+ 	struct disk_partition part;
+ 	struct udevice *dev;
++	int n;
+ 
+ 	uclass_foreach_dev_probe(UCLASS_BLK, dev) {
+ 		desc = dev_get_uclass_plat(dev);
+-		if (desc->uclass_id != UCLASS_SCSI ||
+-		    part_get_info_by_name(desc, name, &part) < 0)
++		if (desc->uclass_id != UCLASS_SCSI)
++			continue;
++		n = part_get_info_by_name(desc, name, &part);
++		if (n < 0)
+ 			continue;
+ 		if (found) {
+ 			printf("Partition %s exists on more than one SCSI device\n",
+@@ -934,12 +941,20 @@ static struct blk_desc *mtk_find_part(const char *name,
+ 		}
+ 		found = desc;
+ 		*info = part;
++		if (number)
++			*number = n;
+ 	}
+ 	if (!found)
+ 		printf("No SCSI partition named %s\n", name);
+ 	return found;
+ }
+ 
++static struct blk_desc *mtk_find_part(const char *name,
++				      struct disk_partition *info)
++{
++	return mtk_find_part_number(name, info, NULL);
++}
++
+ /* Whether the AOSP bootloader message in misc asks for recovery (read only). */
+ static bool mtk_misc_requests_recovery(const char *misc)
+ {
+@@ -1092,5 +1107,267 @@ U_BOOT_CMD(recoveryrequest, 2, 0, do_recoveryrequest,
+ 	   "test whether USB RAM recovery was requested",
+ 	   "<misc> - test LK's boot mode or the misc command (read only)");
++
++#if IS_ENABLED(CONFIG_MEDIATEK_MOBILE_AB_CONFIRM)
++/*
++ * The slot LK booted, from the Android bootconfig it appends to the initrd
++ * it passes (androidboot.slot_suffix): 0 for "_a", 1 for "_b".
++ */
++static int mtk_lk_slot(void)
++{
++	static const char magic[] = "#BOOTCONFIG\n";
++	static const char key[] = "androidboot.slot_suffix";
++	const u8 *base, *end, *data = NULL;
++	const char *text, *line, *next, *p;
++	u32 size, csum, sum = 0;
++	u64 len;
++	int i, slot = -ENOENT;
++
++	len = mtk_initrd_end - mtk_initrd_start;
++	if (!mtk_initrd_start || len < sizeof(magic) + 8)
++		return -ENOENT;
++	base = map_sysmem(mtk_initrd_start, len);
++	end = base + len;
++	/* Like Linux: the trailer may be followed by up to 3 alignment bytes. */
++	for (i = 0; i < 4; i++) {
++		const u8 *d = end - (sizeof(magic) - 1) - i;
++
++		if (d - 8 >= base && !memcmp(d, magic, sizeof(magic) - 1)) {
++			data = d;
++			break;
++		}
++	}
++	if (!data)
++		goto out;
++	size = get_unaligned_le32(data - 8);
++	csum = get_unaligned_le32(data - 4);
++	if (size > (u64)(data - 8 - base)) {
++		slot = -EINVAL;
++		goto out;
++	}
++	text = (const char *)(data - 8 - size);
++	for (i = 0; i < size; i++)
++		sum += (u8)text[i];
++	if (sum != csum) {
++		slot = -EINVAL;
++		goto out;
++	}
++	for (line = text; line < text + size; line = next + 1) {
++		next = memchr(line, '\n', text + size - line);
++		if (!next)
++			next = text + size;
++		p = line;
++		while (p < next && (*p == ' ' || *p == '\t'))
++			p++;
++		if (next - p < sizeof(key) - 1 || memcmp(p, key, sizeof(key) - 1))
++			continue;
++		p += sizeof(key) - 1;
++		while (p < next && (*p == ' ' || *p == '\t'))
++			p++;
++		if (p >= next || *p++ != '=')
++			continue;
++		while (p < next && (*p == ' ' || *p == '\t' || *p == '"'))
++			p++;
++		if (next - p >= 2 && p[0] == '_' && (p[1] == 'a' || p[1] == 'b') &&
++		    (next - p == 2 || p[2] == '"' || p[2] == ' ' || p[2] == ';'))
++			slot = p[1] - 'a';
++		else
++			slot = -EINVAL;
++	}
++out:
++	unmap_sysmem(base);
++	return slot;
++}
++
++#define MTK_AB_OFFSET	2048
++#define MTK_AB_MAGIC	0x42414342	/* "BCAB" */
++#define MTK_AB_SUCCESS	0x80		/* slot_metadata bit 7 */
++
++/*
++ * Set successful_boot of one slot in the AOSP bootloader_control at misc
++ * offset 2048 that MediaTek LK reads: {slot_suffix[4], magic, version 1,
++ * nb_slot:3 ..., reserved[2], slot_metadata[4] (priority:4,
++ * tries_remaining:3, successful_boot:1, ...), reserved[8], crc32_le over
++ * the 28 bytes before it}. Priority, tries and every byte of the other
++ * slots stay; the block is read back and restored on a mismatch.
++ */
++static int mtk_ab_mark_successful(const char *misc, int slot)
++{
++	struct disk_partition info;
++	struct blk_desc *desc;
++	u8 *buf, *orig, *back, *bc;
++	lbaint_t lba;
++	ulong off;
++	u16 meta;
++	int i, ret = -EINVAL;
++
++	desc = mtk_find_part(misc, &info);
++	if (!desc)
++		return -ENOENT;
++	if (info.blksz < 512 || (u64)info.size * info.blksz < MTK_AB_OFFSET + 32)
++		return -EINVAL;
++	lba = info.start + MTK_AB_OFFSET / info.blksz;
++	off = MTK_AB_OFFSET % info.blksz;
++	if (off + 32 > info.blksz)
++		return -EINVAL;
++	buf = memalign(ARCH_DMA_MINALIGN, 3 * info.blksz);
++	if (!buf)
++		return -ENOMEM;
++	orig = buf + info.blksz;
++	back = orig + info.blksz;
++	if (blk_dread(desc, lba, 1, buf) != 1) {
++		ret = -EIO;
++		goto out;
++	}
++	bc = buf + off;
++	if (get_unaligned_le32(bc + 4) != MTK_AB_MAGIC || bc[8] != 1 ||
++	    (bc[9] & 7) <= slot || (bc[9] & 7) > 4 ||
++	    crc32(0, bc, 28) != get_unaligned_le32(bc + 28)) {
++		printf("misc: no valid AOSP boot control\n");
++		goto out;
++	}
++	meta = get_unaligned_le16(bc + 12 + 2 * slot);
++	if (meta & MTK_AB_SUCCESS) {
++		printf("misc: slot %c already successful (0x%04x)\n", 'a' + slot,
++		       meta);
++		ret = 0;
++		goto out;
++	}
++	if (!(meta & 0xf)) {
++		printf("misc: slot %c has priority 0; not marking it\n",
++		       'a' + slot);
++		goto out;
++	}
++	memcpy(orig, buf, info.blksz);
++	bc[12 + 2 * slot] |= MTK_AB_SUCCESS;
++	put_unaligned_le32(crc32(0, bc, 28), bc + 28);
++	/* Only the slot byte and the CRC may differ. */
++	for (i = 0; i < info.blksz; i++) {
++		if (buf[i] != orig[i] && i != off + 12 + 2 * slot &&
++		    (i < off + 28 || i >= off + 32)) {
++			ret = -EFAULT;
++			goto out;
++		}
++	}
++	if (blk_dwrite(desc, lba, 1, buf) != 1 ||
++	    blk_dread(desc, lba, 1, back) != 1 ||
++	    memcmp(back, buf, info.blksz)) {
++		printf("misc: write or readback failed; restoring\n");
++		if (blk_dwrite(desc, lba, 1, orig) != 1 ||
++		    blk_dread(desc, lba, 1, back) != 1 ||
++		    memcmp(back, orig, info.blksz))
++			printf("misc: RESTORE FAILED\n");
++		ret = -EIO;
++		goto out;
++	}
++	printf("misc: slot %c marked successful (0x%04x -> 0x%04x)\n",
++	       'a' + slot, meta, get_unaligned_le16(bc + 12 + 2 * slot));
++	ret = 0;
++out:
++	free(buf);
++	return ret;
++}
++
++static unsigned int mtk_path_char(unsigned int c)
++{
++	if (c == '\\')
++		return '/';
++	return c >= 'a' && c <= 'z' ? c - 'a' + 'A' : c;
++}
++
++/* A single file-path node equal to @wanted, followed by the end node. */
++static bool mtk_efi_path_is(struct efi_device_path *path, const char *wanted)
++{
++	struct efi_device_path_file_path *file = (void *)path;
++	struct efi_device_path *end;
++	unsigned int i, length = strlen(wanted);
++
++	if (!length || !path || path->type != DEVICE_PATH_TYPE_MEDIA_DEVICE ||
++	    path->sub_type != DEVICE_PATH_SUB_TYPE_FILE_PATH ||
++	    path->length != sizeof(*path) + 2 * (length + 1))
++		return false;
++	for (i = 0; i < length; i++)
++		if (mtk_path_char(file->str[i]) !=
++		    mtk_path_char((unsigned char)wanted[i]))
++			return false;
++	if (file->str[length])
++		return false;
++	end = (void *)((u8 *)path + path->length);
++	return end->type == DEVICE_PATH_TYPE_END &&
++	       end->sub_type == DEVICE_PATH_SUB_TYPE_END &&
++	       end->length == sizeof(*end);
++}
++
++/* The device path is the configured ESP: unique by name, ESP type. */
++static bool mtk_efi_dev_is_esp(struct efi_device_path *dev)
++{
++	struct efi_device_path *expected;
++	struct disk_partition info;
++	struct blk_desc *desc;
++	bool match;
++	int number;
++
++	desc = mtk_find_part_number(CONFIG_MEDIATEK_MOBILE_AB_CONFIRM_ESP, &info,
++				    &number);
++	if (!desc || !dev)
++		return false;
++#if IS_ENABLED(CONFIG_PARTITION_TYPE_GUID)
++	if (strcasecmp(info.type_guid, "c12a7328-f81f-11d2-ba4b-00a0c93ec93b")) {
++		printf("%s is not an EFI system partition\n",
++		       CONFIG_MEDIATEK_MOBILE_AB_CONFIRM_ESP);
++		return false;
++	}
++#endif
++	expected = efi_dp_from_part(desc, number);
++	if (!expected)
++		return false;
++	match = efi_dp_size(dev) == efi_dp_size(expected) &&
++		!memcmp(dev, expected, efi_dp_size(expected) + sizeof(*expected));
++	efi_free_pool(expected);
++	return match;
++}
++
++void efi_board_image_loaded(struct efi_device_path *dp_dev,
++			    struct efi_device_path *dp_img)
++{
++	int slot, ret;
++
++	if (!mtk_efi_path_is(dp_img, CONFIG_MEDIATEK_MOBILE_AB_CONFIRM_PATH))
++		return;
++	if (!mtk_efi_dev_is_esp(dp_dev)) {
++		printf("Slot confirmation: image not from %s; slot left as is\n",
++		       CONFIG_MEDIATEK_MOBILE_AB_CONFIRM_ESP);
++		return;
++	}
++	slot = mtk_lk_slot();
++	if (slot < 0) {
++		printf("Slot confirmation: LK's slot unknown (%d); slot left as is\n",
++		       slot);
++		return;
++	}
++	if (strlen(CONFIG_MEDIATEK_MOBILE_AB_CONFIRM_SLOT) != 1 ||
++	    CONFIG_MEDIATEK_MOBILE_AB_CONFIRM_SLOT[0] != 'a' + slot) {
++		printf("Slot confirmation: LK booted slot %c, firmware is for slot %s; slot left as is\n",
++		       'a' + slot, CONFIG_MEDIATEK_MOBILE_AB_CONFIRM_SLOT);
++		return;
++	}
++	ret = mtk_ab_mark_successful(CONFIG_MEDIATEK_MOBILE_AB_CONFIRM_MISC,
++				     slot);
++	if (ret)
++		printf("Slot confirmation failed: %d; continuing EFI boot\n",
++		       ret);
++}
++
++static int do_abstatus(struct cmd_tbl *cmdtp, int flag, int argc,
++		       char *const argv[])
++{
++	printf("LK slot: %d (0 = a, 1 = b, negative = unknown)\n",
++	       mtk_lk_slot());
++	return CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(abslot, 1, 0, do_abstatus,
++	   "show the A/B slot LK booted (from its bootconfig)", "");
++#endif
+ #endif
+ 
+ /*
+diff --git a/include/efi_loader.h b/include/efi_loader.h
+index ef25124fd84..eb3c8a665de 100644
+--- a/include/efi_loader.h
++++ b/include/efi_loader.h
+@@ -647,6 +647,9 @@ efi_status_t efi_tcg2_measure_efi_app_exit(void);
+ efi_status_t efi_tcg2_measure_dtb(void *dtb);
+ /* Called by bootefi to initialize root node */
+ efi_status_t efi_root_node_register(void);
++/* Board hook: an image was loaded and its load options are set. */
++void efi_board_image_loaded(struct efi_device_path *dp_dev,
++			    struct efi_device_path *dp_img);
+ /* Called by bootefi to initialize runtime */
+ efi_status_t efi_initialize_system_table(void);
+ /* Called by bootefi to initialize debug */
+diff --git a/lib/efi_loader/efi_bootbin.c b/lib/efi_loader/efi_bootbin.c
+index 12db8f517c7..89643ce7af3 100644
+--- a/lib/efi_loader/efi_bootbin.c
++++ b/lib/efi_loader/efi_bootbin.c
+@@ -157,6 +157,21 @@ void efi_set_bootdev(const char *dev, const char *devnr, const char *path,
+ 	}
+ }
+ 
++/**
++ * efi_board_image_loaded() - board hook before an image started by bootefi
++ *
++ * Called after efi_load_image() succeeded and the load options were set,
++ * before the image starts. A board may record that it got this far (for
++ * example mark an A/B slot as booted); the image starts either way.
++ *
++ * @dp_dev:		EFI device-path of the image's device
++ * @dp_img:		EFI image-path
++ */
++__weak void efi_board_image_loaded(struct efi_device_path *dp_dev,
++				   struct efi_device_path *dp_img)
++{
++}
++
+ /**
+  * efi_run_image() - run loaded UEFI image
+  *
+@@ -192,6 +207,8 @@ static efi_status_t efi_run_image(void *source_buffer, efi_uintn_t source_size,
+ 	if (ret != EFI_SUCCESS)
+ 		goto out;
+ 
++	efi_board_image_loaded(dp_dev, dp_img);
++
+ 	ret = do_bootefi_exec(handle, load_options);
+ 
+ out:
+-- 
+2.55.0
+

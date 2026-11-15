@@ -40,6 +40,9 @@ let
     printf '%s' ${lib.escapeShellArg "${mobile.deviceName} ${phase}"} > "$g/strings/0x409/product"
     printf '%s' ${lib.escapeShellArg mobile.usbSerial} > "$g/strings/0x409/serialnumber"
     printf recovery > "$g/configs/c.1/strings/0x409/configuration"
+    # Request 900 mA (500 mA below SuperSpeed) rather than the 2 mA default;
+    # boards that report the gadget current to their charger use it as input limit.
+    printf 900 > "$g/configs/c.1/MaxPower"
     ${lib.optionalString cfg.acm.enable ''
       mkdir -p "$g/functions/acm.console"
       test -L "$g/configs/c.1/acm" || ln -s "$g/functions/acm.console" "$g/configs/c.1/acm"
@@ -163,8 +166,8 @@ in
         message = "initrdUsb needs ACM or NCM enabled; both may be enabled together.";
       }
       {
-        assertion = mobile.usb.enable && config.boot.initrd.systemd.enable;
-        message = "initrdUsb requires androidDevices.usb.enable and a systemd initrd.";
+        assertion = mobile.usb.enable && config.boot.initrd.enable;
+        message = "initrdUsb requires androidDevices.usb.enable and boot.initrd.enable.";
       }
       {
         assertion = !(config.boot.initrd.systemd.services ? mobile-usb-gadget);

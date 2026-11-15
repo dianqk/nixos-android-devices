@@ -1,0 +1,45 @@
+From f5cd2ab7237e23aeb70daa3606395d51001bc8a6 Mon Sep 17 00:00:00 2001
+From: Hecheng Yu <kde-yyds@qq.com>
+Date: Sat, 29 Aug 2026 18:54:10 +0800
+Subject: [PATCH] spmi: mtk-pmif: clear observed slave EINT status bits
+
+The chained handler read the SPMI slave interrupt status registers but
+never wrote the observed bits back to clear them.  If the PMIC top-level
+status read returned 0 (spurious or already-handled interrupt), the
+parent SPMI IRQ remained asserted, causing an endless
+"top_irq_sts:0x0" loop and a watchdog reboot.
+
+Clear each status register after reading it, before dispatching to the
+PMIC IRQ domain.
+
+(cherry picked from commit befbdef3943ec7b1fc4a3d14240aecceaa5c2330)
+Link: https://github.com/MT6895-Mainline/linux/commit/befbdef3943ec7b1fc4a3d14240aecceaa5c2330
+---
+ drivers/spmi/spmi-mtk-pmif.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/drivers/spmi/spmi-mtk-pmif.c b/drivers/spmi/spmi-mtk-pmif.c
+index 1048420b5a..7967eafe2e 100644
+--- a/drivers/spmi/spmi-mtk-pmif.c
++++ b/drivers/spmi/spmi-mtk-pmif.c
+@@ -491,6 +491,17 @@ static void mtk_spmi_handle_chained_irq(struct irq_desc *desc)
+ 	for (i = regidx_min; i <= regidx_max; i++) {
+ 		u32 val = mtk_spmi_readl(arb, pbus, i);
+ 
++		if (!val)
++			continue;
++
++		/*
++		 * Clear the observed status bits before handling them.  If a
++		 * spurious/unhandled bit is left set, the parent IRQ stays asserted
++		 * and we get an interrupt storm (seen on MT6895 as endless
++		 * "top_irq_sts:0x0" from the PMIC MFD).
++		 */
++		mtk_spmi_writel(arb, pbus, val, i);
++
+ 		while (val) {
+ 			u8 bit = __ffs(val);
+ 			u8 bank = bit / 7;
+-- 
+2.56.0
+

@@ -1,0 +1,24 @@
+From b29b427ff5d628dff9a93a46fcb5caeac342c8f7 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 31 Oct 2026 17:59:00 +0800
+Subject: [PATCH] media: iris: apply gen2 capture pool limit to VPU2 firmware
+
+Marble uses a separate HFI gen2 VPU2 firmware descriptor. Include it in the decoder CAPTURE pool check so the shared upstream 64-buffer allowance is effective; encoder and other firmware queues stay unchanged.
+---
+ drivers/media/platform/qcom/iris/iris_vidc.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/platform/qcom/iris/iris_vidc.c b/drivers/media/platform/qcom/iris/iris_vidc.c
+index 4555b2228083..14b0a32782b0 100644
+--- a/drivers/media/platform/qcom/iris/iris_vidc.c
++++ b/drivers/media/platform/qcom/iris/iris_vidc.c
+@@ -123,7 +123,8 @@ iris_m2m_queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_
+ 	dst_vq->buf_struct_size = sizeof(struct iris_buffer);
+ 	dst_vq->min_reqbufs_allocation = MIN_BUFFERS;
+ 	if (inst->domain == DECODER &&
+-	    inst->core->iris_firmware_data == &iris_hfi_gen2_data)
++	    (inst->core->iris_firmware_data == &iris_hfi_gen2_data ||
++	     inst->core->iris_firmware_data == &iris_hfi_gen2_vpu2_data))
+ 		dst_vq->max_num_buffers = DEFAULT_MAX_HOST_BUF_COUNT;
+ 	dst_vq->dev = inst->core->dev;
+ 	dst_vq->lock = &inst->ctx_q_lock;

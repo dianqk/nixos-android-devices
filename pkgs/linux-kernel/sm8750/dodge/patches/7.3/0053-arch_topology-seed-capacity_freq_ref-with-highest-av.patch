@@ -1,0 +1,72 @@
+From 5792238d276be0ffb73325b89d9c4fa4a18941c9 Mon Sep 17 00:00:00 2001
+From: Ananthu C V <ananthu.cv@oss.qualcomm.com>
+Date: Tue, 29 Sep 2026 17:08:06 +0530
+Subject: [PATCH 058/144] arch_topology: seed capacity_freq_ref with highest
+ available frequency
+
+capacity_freq_ref, the per-CPU frequency-invariance reference used by
+schedutil, is seeded from policy->cpuinfo.max_freq at policy creation.
+If boost isn't enabled yet at boot, max_freq reflects only the
+non-boost ceiling, so capacity_freq_ref never learns about boost
+frequencies for the policy's lifetime. Enabling boost later raises
+policy->max, but capacity_freq_ref stays stale, leaving schedutil
+unable to scale utilization or target a frequency above the non-boost
+maximum.
+
+Seed capacity_freq_ref with the highest available frequency regardless
+of whether boost is enabled. Runtime enforcement, still handled by
+policy->max, is unaffected.
+
+Suggested-by: Vincent Guittot <vincent.guittot@linaro.org>
+Signed-off-by: Ananthu C V <ananthu.cv@oss.qualcomm.com>
+
+Link: https://lore.kernel.org/r/20260929-schedutil-boost-frequency-handling-v3-1-68de169498c7@oss.qualcomm.com
+(cherry picked from commit 8c5d72502cc716e7714578872edf10724a107798)
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0077-arch_topology-seed-capacity-reference-with-highest-frequency.patch
+Import-SHA256: 6a0b6abc2abe3385183085fd758e435d03b582b547da9fd92c01b5c847debafd
+Import-Provenance: mail headers
+(cherry picked from commit 2c4fbc0cfa6c53cdbe8b3bfe6b13434d03313421)
+---
+ drivers/base/arch_topology.c |  3 ++-
+ include/linux/cpufreq.h      | 13 +++++++++++++
+ 2 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/base/arch_topology.c b/drivers/base/arch_topology.c
+index 8c5e47c28d..92966be712 100644
+--- a/drivers/base/arch_topology.c
++++ b/drivers/base/arch_topology.c
+@@ -404,7 +404,8 @@ init_cpu_capacity_callback(struct notifier_block *nb,
+ 	cpumask_andnot(cpus_to_visit, cpus_to_visit, policy->related_cpus);
+ 
+ 	for_each_cpu(cpu, policy->related_cpus) {
+-		per_cpu(capacity_freq_ref, cpu) = policy->cpuinfo.max_freq;
++		per_cpu(capacity_freq_ref, cpu) = max(policy->cpuinfo.max_freq,
++						      cpufreq_frequency_table_max(policy));
+ 		freq_inv_set_max_ratio(cpu,
+ 				       per_cpu(capacity_freq_ref, cpu) * HZ_PER_KHZ);
+ 	}
+diff --git a/include/linux/cpufreq.h b/include/linux/cpufreq.h
+index d3d0d9d02a..a571b35071 100644
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@ -1110,6 +1110,19 @@ static inline int cpufreq_frequency_table_target(struct cpufreq_policy *policy,
+ 	return idx;
+ }
+ 
++static inline unsigned int cpufreq_frequency_table_max(struct cpufreq_policy *policy)
++{
++	int idx;
++
++	if (!policy->freq_table)
++		return policy->cpuinfo.max_freq;
++
++	idx = cpufreq_frequency_table_target(policy, UINT_MAX, 0, UINT_MAX,
++					 CPUFREQ_RELATION_H);
++
++	return policy->freq_table[idx].frequency;
++}
++
+ static inline int cpufreq_table_count_valid_entries(const struct cpufreq_policy *policy)
+ {
+ 	struct cpufreq_frequency_table *pos;

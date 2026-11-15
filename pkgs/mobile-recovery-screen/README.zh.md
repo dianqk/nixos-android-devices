@@ -24,6 +24,6 @@ Boot NixOS、Restart recovery、Enter fastboot 和 Power off。设备操作需�
 `MOBILE_RECOVERY_PREVIEW_STATE=confirm|error|log|update` 预览其他页面，
 `MOBILE_RECOVERY_PREVIEW_LOG=PATH` 指定日志文件。预览不访问设备或执行恢复操作。
 
-所有设备均使用 [Rust recovery daemon 与交互 shell](daemon.md)：UI 与 CLI
+所有设备均使用 Rust recovery daemon 与交互 shell：UI 与 CLI
 订阅同一任务状态，设备端操作由 daemon 管理。initrd 不包含 Python 运行时及
 Shell 分区/安装后端。

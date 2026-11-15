@@ -1,0 +1,288 @@
+From d37a4811965a0510c06f59b56000fa52e6725422 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] usb: typec: adapt MT6375 TCPC and charger coordination
+
+Use the MT6375 vendor initialization and coordinate Type-C/PD current
+with the guarded charger controls.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T18:23:57+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T20:29:20+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-19T23:19:18+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Link: https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/usb/typec/tcpm/Kconfig        |   2 +
+ drivers/usb/typec/tcpm/tcpci.c        |   9 +++
+ drivers/usb/typec/tcpm/tcpci_mt6375.c | 110 ++++++++++++++++----------
+ include/linux/usb/tcpci.h             |   2 +
+ 4 files changed, 83 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/usb/typec/tcpm/Kconfig b/drivers/usb/typec/tcpm/Kconfig
+index 11f3831278..06bcd1936a 100644
+--- a/drivers/usb/typec/tcpm/Kconfig
++++ b/drivers/usb/typec/tcpm/Kconfig
+@@ -49,6 +49,8 @@ config TYPEC_TCPCI_MT6370
+ config TYPEC_TCPCI_MT6375
+ 	tristate "MediaTek MT6375 Type-C driver"
+ 	depends on MFD_MT6375
++	depends on DRM || DRM=n
++	select DRM_AUX_HPD_BRIDGE if DRM_BRIDGE && OF
+ 	help
+ 	  MediaTek MT6375 is a multi-functional IC that includes a
+ 	  USB Type-C controller. It works with Type-C Port Controller
+diff --git a/drivers/usb/typec/tcpm/tcpci.c b/drivers/usb/typec/tcpm/tcpci.c
+index 6717ac914c..c41222637a 100644
+--- a/drivers/usb/typec/tcpm/tcpci.c
++++ b/drivers/usb/typec/tcpm/tcpci.c
+@@ -842,6 +842,13 @@ static int tcpci_parse_config(struct tcpci *tcpci)
+ 	return 0;
+ }
+ 
++static int tcpci_set_current_limit(struct tcpc_dev *tcpc, u32 ma, u32 mv)
++{
++	struct tcpci *tcpci = tcpc_to_tcpci(tcpc);
++
++	return tcpci->data->set_current_limit(tcpci, tcpci->data, ma, mv);
++}
++
+ struct tcpci *tcpci_register_port(struct device *dev, struct tcpci_data *data)
+ {
+ 	struct tcpci *tcpci;
+@@ -855,6 +862,8 @@ struct tcpci *tcpci_register_port(struct device *dev, struct tcpci_data *data)
+ 	tcpci->data = data;
+ 	tcpci->regmap = data->regmap;
+ 
++	if (data->set_current_limit)
++		tcpci->tcpc.set_current_limit = tcpci_set_current_limit;
+ 	tcpci->tcpc.init = tcpci_init;
+ 	tcpci->tcpc.get_vbus = tcpci_get_vbus;
+ 	tcpci->tcpc.set_vbus = tcpci_set_vbus;
+diff --git a/drivers/usb/typec/tcpm/tcpci_mt6375.c b/drivers/usb/typec/tcpm/tcpci_mt6375.c
+index dcb1a346d3..6c93d18422 100644
+--- a/drivers/usb/typec/tcpm/tcpci_mt6375.c
++++ b/drivers/usb/typec/tcpm/tcpci_mt6375.c
+@@ -9,11 +9,14 @@
+  *   Author: Gene Chen <gene_chen@richtek.com>
+  */
+ 
++#include <drm/bridge/aux-bridge.h>
+ #include <linux/bits.h>
+ #include <linux/interrupt.h>
+ #include <linux/kernel.h>
+ #include <linux/mod_devicetable.h>
+ #include <linux/module.h>
++#include <linux/of.h>
++#include <linux/mfd/mt6375-charger.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_wakeirq.h>
+ #include <linux/regmap.h>
+@@ -29,21 +32,16 @@
+ #define MT6375_REG_VCONCTRL3 0x8C
+ #define MT6375_REG_SYSCTRL1 0x8F
+ #define MT6375_REG_PHYCTRL9 0xAC
+-#define MT6375_REG_SYSCTRL3 0xB0
+ #define MT6375_REG_TCPCCTRL1 0xB1
+ #define MT6375_REG_TCPCCTRL2 0xB2
+ #define MT6375_REG_TCPCCTRL3 0xB3
+ #define MT6375_REG_LPWRCTRL3 0xBB
+ #define MT6375_REG_HILOCTRL9 0xC8
+ #define MT6375_REG_SHIELDCTRL1 0xCA
+-#define MT6375_REG_TYPECOTPCTRL 0xCD
+ 
+-#define MT6375_MSK_SHIPPING_OFF BIT(5)
+-#define MT6375_MSK_AUTOIDLE_EN BIT(3)
+ #define MT6375_MSK_OPEN40MS_EN BIT(4)
+-#define MT6375_MSK_VREFTS_EN BIT(7)
+ 
+-#define MT6375_NORMAL_RP_DUTY 330
++#define MT6375_NORMAL_RP_DUTY 0x134
+ 
+ struct mt6375_priv {
+     struct device *dev;
+@@ -64,24 +62,15 @@ static int mt6375_tcpc_init(struct tcpci *tcpci, struct tcpci_data *data)
+     struct regmap *regmap = data->regmap;
+     int ret;
+ 
+-    /* Software reset */
+-    ret = regmap_write(regmap, MT6375_REG_SYSCTRL3, 0x01);
++    /*
++     * No software reset (SYSCTRL3); SYSCTRL1 only gains bits 7 and 5
++     * below.
++     */
++    /* TCPC filter / DRP timing (values of the T880 vendor module) */
++    ret = regmap_write(regmap, MT6375_REG_TCPCCTRL1, 0x14);
+     if (ret)
+         return ret;
+-    usleep_range(1000, 2000);
+-
+-    /* PD_IRQB path + shipping off + autoidle on */
+-    ret = regmap_write(regmap, MT6375_REG_SYSCTRL1,
+-                       0x80 | MT6375_MSK_SHIPPING_OFF |
+-                       MT6375_MSK_AUTOIDLE_EN);
+-    if (ret)
+-        return ret;
+-
+-    /* TCPC filter / DRP timing */
+-    ret = regmap_write(regmap, MT6375_REG_TCPCCTRL1, 0x0A);
+-    if (ret)
+-        return ret;
+-    ret = regmap_write(regmap, MT6375_REG_TCPCCTRL2, 0x04);
++    ret = regmap_write(regmap, MT6375_REG_TCPCCTRL2, 0x00);
+     if (ret)
+         return ret;
+     ret = mt6375_write16(regmap, MT6375_REG_TCPCCTRL3,
+@@ -106,23 +95,17 @@ static int mt6375_tcpc_init(struct tcpci *tcpci, struct tcpci_data *data)
+     if (ret)
+         return ret;
+ 
+-    /* VCONN current limit / CC filter */
+-    ret = regmap_write(regmap, MT6375_REG_VCONCTRL3, 0x41);
++    /* PD VCONN current limit mode, OCP 100 mA, analog OVP */
++    ret = regmap_write(regmap, MT6375_REG_VCONCTRL3, 0x11);
+     if (ret)
+         return ret;
+-    ret = regmap_write(regmap, MT6375_REG_HILOCTRL9, 0x0A);
++    ret = regmap_write(regmap, MT6375_REG_HILOCTRL9, 0x8A);
+     if (ret)
+         return ret;
+ 
+-    /* Enable CC open 40ms and VREFTS */
+-    ret = regmap_update_bits(regmap, MT6375_REG_SHIELDCTRL1,
+-                             MT6375_MSK_OPEN40MS_EN,
+-                             MT6375_MSK_OPEN40MS_EN);
+-    if (ret)
+-        return ret;
+-    ret = regmap_update_bits(regmap, MT6375_REG_TYPECOTPCTRL,
+-                             MT6375_MSK_VREFTS_EN,
+-                             MT6375_MSK_VREFTS_EN);
++    /* CC open 40 ms on PMIC SYSUV */
++    ret = regmap_set_bits(regmap, MT6375_REG_SHIELDCTRL1,
++                          MT6375_MSK_OPEN40MS_EN);
+     if (ret)
+         return ret;
+ 
+@@ -133,9 +116,19 @@ static int mt6375_tcpc_init(struct tcpci *tcpci, struct tcpci_data *data)
+     if (ret)
+         return ret;
+ 
+-    /* Clear bleed discharge */
+-    ret = regmap_update_bits(regmap, TCPC_POWER_CTRL,
+-                             TCPC_POWER_CTRL_BLEED_DISCHARGE, 0);
++    /*
++     * SYSCTRL1: bit 5 (SHIPPING_OFF) takes the TCPC out of its shipping
++     * state, which is what lets the alert reach PD_IRQB; bit 7 as on
++     * Android (0xb8). Only these two bits are set; the rest stays as the
++     * bootloader left it.
++     */
++    ret = regmap_set_bits(regmap, MT6375_REG_SYSCTRL1, BIT(7) | BIT(5));
++    if (ret)
++        return ret;
++
++    /* No bleed discharge (about 2 mA) */
++    ret = regmap_clear_bits(regmap, TCPC_POWER_CTRL,
++                            TCPC_POWER_CTRL_BLEED_DISCHARGE);
+     if (ret)
+         return ret;
+ 
+@@ -166,7 +159,12 @@ static int mt6375_set_vbus(struct tcpci *tcpci, struct tcpci_data *data,
+                                             tcpci_data);
+     int ret;
+ 
+-    if (!priv->vbus)
++    if (!sink) {
++        ret = mt6375_charger_contract(priv->dev->parent, 0, 0);
++        if (ret)
++            dev_err(priv->dev, "charger stop failed: %d; still disabling TCPCI sink\n", ret);
++    }
++    if (IS_ERR_OR_NULL(priv->vbus))
+         return 0;
+ 
+     ret = regulator_is_enabled(priv->vbus);
+@@ -194,8 +192,18 @@ static void mt6375_unregister_tcpci_port(void *tcpci)
+     tcpci_unregister_port(tcpci);
+ }
+ 
++static int mt6375_set_current_limit(struct tcpci *tcpci, struct tcpci_data *data,
++                                    unsigned int ma, unsigned int mv)
++{
++    struct mt6375_priv *priv = container_of(data, struct mt6375_priv, tcpci_data);
++
++    return mt6375_charger_contract(priv->dev->parent, ma, mv);
++}
++
+ static int mt6375_tcpc_probe(struct platform_device *pdev)
+ {
++    struct auxiliary_device *bridge_dev = NULL;
++    struct device_node *connector;
+     struct mt6375_priv *priv;
+     struct device *dev = &pdev->dev;
+     int irq, ret;
+@@ -214,13 +222,29 @@ static int mt6375_tcpc_probe(struct platform_device *pdev)
+     if (irq < 0)
+         return irq;
+ 
+-    priv->tcpci_data.auto_discharge_disconnect = 1;
+     priv->tcpci_data.init = mt6375_tcpc_init;
+     priv->tcpci_data.start_drp_toggling = mt6375_start_drp_toggling;
+ 
+     priv->vbus = devm_regulator_get_optional(dev, "vbus");
+-    if (!IS_ERR(priv->vbus))
++    if (IS_ERR(priv->vbus) && PTR_ERR(priv->vbus) != -ENODEV)
++        return dev_err_probe(dev, PTR_ERR(priv->vbus), "Failed to get VBUS regulator\n");
++    if (!IS_ERR(priv->vbus) || mt6375_charger_get(dev->parent))
+         priv->tcpci_data.set_vbus = mt6375_set_vbus;
++    if (mt6375_charger_get(dev->parent))
++        priv->tcpci_data.set_current_limit = mt6375_set_current_limit;
++
++    /*
++     * The connector is a DRM bridge that reports DisplayPort HPD from the
++     * alt mode (the board has no HPD pin), as fusb302 does.
++     */
++    connector = of_get_child_by_name(dev->of_node, "connector");
++    if (connector) {
++        bridge_dev = devm_drm_dp_hpd_bridge_alloc(dev, connector);
++        of_node_put(connector);
++        if (IS_ERR(bridge_dev))
++            return dev_err_probe(dev, PTR_ERR(bridge_dev),
++                                 "Failed to allocate the HPD bridge\n");
++    }
+ 
+     priv->tcpci = tcpci_register_port(dev, &priv->tcpci_data);
+     if (IS_ERR(priv->tcpci))
+@@ -232,6 +256,12 @@ static int mt6375_tcpc_probe(struct platform_device *pdev)
+     if (ret)
+         return ret;
+ 
++    if (bridge_dev) {
++        ret = devm_drm_dp_hpd_bridge_add(dev, bridge_dev);
++        if (ret)
++            return ret;
++    }
++
+     ret = devm_request_threaded_irq(dev, irq, NULL, mt6375_irq_handler,
+                                     IRQF_ONESHOT, dev_name(dev), priv);
+     if (ret)
+diff --git a/include/linux/usb/tcpci.h b/include/linux/usb/tcpci.h
+index 9b46a6bc76..a486307b77 100644
+--- a/include/linux/usb/tcpci.h
++++ b/include/linux/usb/tcpci.h
+@@ -217,6 +217,8 @@ struct tcpci_data {
+ 	unsigned char cable_comm_capable:1;
+ 	unsigned char set_orientation:1;
+ 
++	int (*set_current_limit)(struct tcpci *tcpci, struct tcpci_data *data,
++				 unsigned int ma, unsigned int mv);
+ 	int (*init)(struct tcpci *tcpci, struct tcpci_data *data);
+ 	int (*set_vconn)(struct tcpci *tcpci, struct tcpci_data *data,
+ 			 bool enable);
+-- 
+2.56.0
+

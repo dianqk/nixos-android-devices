@@ -2,7 +2,10 @@
 
 [中文](audio.zh.md)
 
-Use the OS1.0.3.0.UNACNXM Android 14 firmware baseline. The Aurora module
+Use the required OS3.0.308.0.WNACNXM (Android 16) baseline. The results below
+were measured on the former Android 14 base (OS1.0.3.0.UNACNXM); the packaged
+audio files are unchanged in the Android 16 release, but its ADSP firmware
+differs and speaker playback has not been re-verified on it. The Aurora module
 installs AudioReach topology, UCM and the OEM dual-CS35L43 protection firmware
 when `hardware.aurora.audio.enable` is enabled (the installed-system default).
 Audio firmware and userspace routing are excluded from RAM recovery.
@@ -26,7 +29,6 @@ The existing firmware override accepts `speakerCalibration` alongside
   hardware.aurora.firmwarePackage =
     inputs.androidDevices.legacyPackages.${pkgs.stdenv.buildPlatform.system}
       .devices.aurora.firmware.override {
-        firmwareVariant = "android14";
         bluetoothNvm = ./hmtnv20.b2e;
         speakerCalibration = builtins.fromJSON
           (builtins.readFile ./aurora-speaker-calibration.json);

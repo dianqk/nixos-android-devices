@@ -1,8 +1,8 @@
 # 小米平板 6S Pro 12.4（sheng）
 
-[English](README.md) · [全部设备](../README.zh.md) · [硬件支持](hardware.zh.md)
+[English](README.md) · [全部设备](../README.zh.md) · [支持状态](status.zh.md) · [硬件支持](hardware.zh.md)
 
-支持等级：Tier 2。具体含义见[支持范围](../README.zh.md#支持等级)。
+状态：见[硬件页](hardware.zh.md)和[支持状态](status.zh.md)。
 
 可选的 `boot-kernel` 镜像直接启动固定的一代 Linux 系统；默认使用 U-Boot。
 见[配置与使用说明](../configuration.zh.md#额外的内核直启镜像sheng--clover)及
@@ -19,8 +19,6 @@
 
 ```nix
 {
-  androidDevices.usbSerial = "my-sheng-01";
-  androidDevices.persistentImage.rootfs.label = "NIXOS";
   # Use this tablet's verified factory addresses when needed:
   # hardware.sheng.wifiMacAddress = "YOUR_FACTORY_WIFI_ADDRESS";
   # hardware.sheng.bluetoothAddress = "YOUR_FACTORY_BLUETOOTH_ADDRESS";
@@ -34,7 +32,7 @@
 唤醒源与 Wi-Fi 重载 workaround，不代表休眠已经验证。recovery 的 ADSP 固件同时支持
 Type-C/USB，不能为了精简而随意替换整份固件列表。
 
-Sheng 安装系统与 RAM recovery 打包 Nixpkgs Linux 7.3-rc6 内核。
+Sheng 安装系统与 RAM recovery 打包 Nixpkgs Linux 7.3 内核。
 内核输出为 `devices.sheng.kernel`；下文硬件结果基于 7.3-rc5 取得。
 来源记录和构建命令见[内核说明](../../pkgs/linux-kernel/sm8550/sheng/PATCHES.zh.md)。
 
@@ -60,7 +58,7 @@ RAM 启动已验证 U-Boot 菜单显示和音量/电源选择，请保留可用�
 
 设备专用固件从固定的上游提交获取，本仓库不保存其二进制副本。
 
-- 来源：[code002-2/sheng-firmware 的 `14a4d70` 提交](https://github.com/code002-2/sheng-firmware/tree/14a4d70b0759bd0746264dc145f2d51a5a94902c)。
+- 来源：[每设备固件归档](https://github.com/dianqk/nixos-android-devices/releases/download/firmware/sheng-firmware-14a4d70-20261115.tar.zst)，由 code002-2/sheng-firmware 的 `14a4d70` 与 ianchb/sheng-firmware 的 `053da477` 汇总。
 - 用途：GPU、Wi-Fi、音频、触摸、ADSP，以及可选的指纹与传感器服务。
 
 通用固件来源及许可证说明见[文档索引](../README.zh.md#固件来源与许可证)。

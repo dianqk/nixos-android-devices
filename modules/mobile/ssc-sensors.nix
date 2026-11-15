@@ -7,7 +7,7 @@
 }:
 let
   cfg = config.androidDevices.sensors;
-  deviceUnit = "dev-fastrpc\\x2d${cfg.rpcDomain}.device";
+  deviceUnit = "dev-${lib.replaceStrings [ "-" ] [ "\\x2d" ] cfg.rpcDevice}.device";
   ready = androidPackages.packaging.writeShellScript "wait-for-ssc-accelerometer" ''
     for _ in $(${pkgs.coreutils}/bin/seq 1 6); do
       if samples=$(${pkgs.coreutils}/bin/timeout 8 \
@@ -34,7 +34,13 @@ in
         "adsp"
         "sdsp"
       ];
-      description = "FastRPC transport domain; selects the native RPC daemon and device.";
+      description = "FastRPC transport domain selecting the native RPC daemon and default misc device.";
+    };
+    rpcDevice = lib.mkOption {
+      type = lib.types.strMatching "fastrpc-[a-z-]+";
+      default = "fastrpc-${cfg.rpcDomain}";
+      defaultText = lib.literalExpression ''"fastrpc-''${config.androidDevices.sensors.rpcDomain}"'';
+      description = "FastRPC misc device providing the selected sensor domain.";
     };
     stateDirectory = lib.mkOption {
       type = lib.types.strMatching "/var/lib/[A-Za-z0-9/_-]+";
@@ -79,7 +85,7 @@ in
       "z ${cfg.stateDirectory} 0750 root root - -"
     ];
     services.udev.extraRules = ''
-      SUBSYSTEM=="misc", KERNEL=="fastrpc-${cfg.rpcDomain}", TAG+="systemd", ENV{SYSTEMD_WANTS}+="android-ssc-sensors.service iio-sensor-proxy.service", ENV{IIO_SENSOR_PROXY_TYPE}+="ssc-accel ssc-proximity", ENV{ACCEL_MOUNT_MATRIX}="${cfg.mountMatrix}"
+      SUBSYSTEM=="misc", KERNEL=="${cfg.rpcDevice}", TAG+="systemd", ENV{SYSTEMD_WANTS}+="android-ssc-sensors.service iio-sensor-proxy.service", ENV{IIO_SENSOR_PROXY_TYPE}+="ssc-accel ssc-proximity", ENV{ACCEL_MOUNT_MATRIX}="${cfg.mountMatrix}"
     '';
     systemd.services.android-ssc-sensors = {
       description = "SSC sensor-domain FastRPC listener";
@@ -89,8 +95,16 @@ in
         deviceUnit
       ]
       ++ cfg.dependencies;
-      requires = [ "systemd-tmpfiles-setup.service" ] ++ cfg.dependencies;
-      bindsTo = [ deviceUnit ];
+      # Requires, not BindsTo: when the DSP restarts (for example after a
+      # firmware crash in suspend) the device is removed and added again.
+      # A BindsTo stop job conflicts with the udev start request queued for
+      # the re-added device, leaving both services stopped. The listener
+      # exits when the device goes away and Restart= starts it again.
+      requires = [
+        "systemd-tmpfiles-setup.service"
+      ]
+      ++ cfg.dependencies
+      ++ [ deviceUnit ];
       before = [ "iio-sensor-proxy.service" ];
       upholds = [ "iio-sensor-proxy.service" ];
       # Repair field ordering in older generated state while retaining every

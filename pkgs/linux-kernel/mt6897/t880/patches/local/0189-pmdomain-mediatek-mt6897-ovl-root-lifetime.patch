@@ -1,0 +1,1238 @@
+From c1e857b6d052d0bf2f4772e9c75118a923432b09 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 23:58:08 +0800
+Subject: [PATCH 189/189] pmdomain: mediatek: keep MT6897 OVL root clocks ready
+ across runtime PM
+
+Prepare distinct ordinary CCF root references for both OVL domains before
+any domain initialization or hardware request. OVL0 uses ovl0; OVL1 uses
+both ovl0 (its gate ancestry) and its vendor functional root ovl1. Validate
+the complete required pair, providers, IDs and shared voter before prepare.
+Runtime callbacks enable prepared roots before HWV-on, and release only
+after successful off acknowledgement. Preserve earlier successful root
+enables if a later enable fails.
+
+Scope the lifecycle through explicit MT6897 SoC/domain data. Keep parent
+readiness and successful clock enables on uncertain transition failures,
+and quarantine all controller callbacks to prevent ancestor unwind. After
+initialization failure, keep the controller bound without a consumer
+provider, retaining its state and rejecting global unused-domain work;
+pure preparation failures unwind before hardware access. Check genpd
+initialization errors before adding domains to the provider state.
+
+Retain inherited mux boot ownership. An off acknowledgement does not prove
+physical off and does not transfer boot ownership. Add portable tests for
+preflight cleanup, root sharing, transition errors and quarantine behavior.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/soc/mediatek/mtk-scpsys-mt6897.c
+---
+ .../mt6897-alldocube-t880-mtkdrm.dtsi         |   5 +
+ drivers/pmdomain/mediatek/mt6897-pm-domains.h |  21 +-
+ drivers/pmdomain/mediatek/mtk-pm-domains.c    | 346 +++++++++++++++---
+ drivers/pmdomain/mediatek/mtk-pm-domains.h    |   8 +
+ tools/testing/selftests/mtk_clk/Makefile      |   4 +-
+ .../testing/selftests/mtk_clk/domain_cases.c  | 239 ++++++++++++
+ .../testing/selftests/mtk_clk/domain_stubs.h  | 306 ++++++++++++++++
+ .../testing/selftests/mtk_clk/test_domains.py |  49 +++
+ 8 files changed, 924 insertions(+), 54 deletions(-)
+ create mode 100644 tools/testing/selftests/mtk_clk/domain_cases.c
+ create mode 100644 tools/testing/selftests/mtk_clk/domain_stubs.h
+ create mode 100755 tools/testing/selftests/mtk_clk/test_domains.py
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-mtkdrm.dtsi b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-mtkdrm.dtsi
+index 301bfec0fd..b2e5c25146 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-mtkdrm.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-mtkdrm.dtsi
+@@ -110,6 +110,8 @@ dis0_pd: power-domain@MT6897_POWER_DOMAIN_HWV_DIS0 {
+ 
+ 					power-domain@MT6897_POWER_DOMAIN_HWV_OVL0 {
+ 						reg = <MT6897_POWER_DOMAIN_HWV_OVL0>;
++						clocks = <&topckgen CLK_TOP_OVL0>;
++						clock-names = "ovl";
+ 						#power-domain-cells = <0>;
+ 					};
+ 				};
+@@ -122,6 +124,9 @@ dis1_pd: power-domain@MT6897_POWER_DOMAIN_HWV_DIS1 {
+ 
+ 					power-domain@MT6897_POWER_DOMAIN_HWV_OVL1 {
+ 						reg = <MT6897_POWER_DOMAIN_HWV_OVL1>;
++						clocks = <&topckgen CLK_TOP_OVL0>,
++							 <&topckgen CLK_TOP_OVL1>;
++						clock-names = "ovl", "ovl1";
+ 						#power-domain-cells = <0>;
+ 					};
+ 				};
+diff --git a/drivers/pmdomain/mediatek/mt6897-pm-domains.h b/drivers/pmdomain/mediatek/mt6897-pm-domains.h
+index ba4aca2849..7b9f133e27 100644
+--- a/drivers/pmdomain/mediatek/mt6897-pm-domains.h
++++ b/drivers/pmdomain/mediatek/mt6897-pm-domains.h
+@@ -12,6 +12,7 @@
+ #define __SOC_MEDIATEK_MT6897_PM_DOMAINS_H
+ 
+ #include "mtk-pm-domains.h"
++#include <dt-bindings/clock/mediatek,mt6897-clock.h>
+ #include <dt-bindings/power/mediatek,mt6897-power.h>
+ 
+ #define MT6897_PWR_ACK				BIT(30)
+@@ -536,7 +537,7 @@ static const struct scpsys_soc_data mt6897_scpsys_data = {
+  * the running display off. VDE0/1 stay default-off; voting them would wake
+  * the decoders.
+  */
+-#define MT6897_HWV_DOMAIN(_name, _bit, _caps)	{	\
++#define MT6897_HWV_DOMAIN(_name, _bit, _caps, _roots)	{	\
+ 		.name = _name,			\
+ 		.set = 0x0198,			\
+ 		.clr = 0x019c,			\
+@@ -545,20 +546,24 @@ static const struct scpsys_soc_data mt6897_scpsys_data = {
+ 		.set_sta = 0x146c,		\
+ 		.clr_sta = 0x1470,		\
+ 		.setclr_bit = _bit,		\
++		.num_prepared_clks = _roots,	\
++		.prepared_clk_ids = { CLK_TOP_OVL0, CLK_TOP_OVL1 }, \
+ 		.caps = _caps,			\
+ 	}
+ 
+ static const struct scpsys_hwv_domain_data scpsys_hwv_domain_data_mt6897[] = {
+-	[MT6897_POWER_DOMAIN_HWV_MM_INFRA] = MT6897_HWV_DOMAIN("mm-infra", 0, 0),
+-	[MT6897_POWER_DOMAIN_HWV_VDE0] = MT6897_HWV_DOMAIN("vde0", 1, MTK_SCPD_KEEP_DEFAULT_OFF),
+-	[MT6897_POWER_DOMAIN_HWV_VDE1] = MT6897_HWV_DOMAIN("vde1", 2, MTK_SCPD_KEEP_DEFAULT_OFF),
+-	[MT6897_POWER_DOMAIN_HWV_DIS0] = MT6897_HWV_DOMAIN("dis0", 3, 0),
+-	[MT6897_POWER_DOMAIN_HWV_DIS1] = MT6897_HWV_DOMAIN("dis1", 4, 0),
+-	[MT6897_POWER_DOMAIN_HWV_OVL0] = MT6897_HWV_DOMAIN("ovl0", 5, 0),
+-	[MT6897_POWER_DOMAIN_HWV_OVL1] = MT6897_HWV_DOMAIN("ovl1", 6, 0),
++	[MT6897_POWER_DOMAIN_HWV_MM_INFRA] = MT6897_HWV_DOMAIN("mm-infra", 0, 0, 0),
++	[MT6897_POWER_DOMAIN_HWV_VDE0] = MT6897_HWV_DOMAIN("vde0", 1, MTK_SCPD_KEEP_DEFAULT_OFF, 0),
++	[MT6897_POWER_DOMAIN_HWV_VDE1] = MT6897_HWV_DOMAIN("vde1", 2, MTK_SCPD_KEEP_DEFAULT_OFF, 0),
++	[MT6897_POWER_DOMAIN_HWV_DIS0] = MT6897_HWV_DOMAIN("dis0", 3, 0, 0),
++	[MT6897_POWER_DOMAIN_HWV_DIS1] = MT6897_HWV_DOMAIN("dis1", 4, 0, 0),
++	[MT6897_POWER_DOMAIN_HWV_OVL0] = MT6897_HWV_DOMAIN("ovl0", 5, 0, 1),
++	[MT6897_POWER_DOMAIN_HWV_OVL1] = MT6897_HWV_DOMAIN("ovl1", 6, 0, 2),
+ };
+ 
+ static const struct scpsys_soc_data mt6897_scpsys_hwv_data = {
++	.quarantine_init_failure = true,
++	.prepared_clk_compatible = "mediatek,mt6897-topckgen",
+ 	.hwv_domains_data = scpsys_hwv_domain_data_mt6897,
+ 	.num_hwv_domains = ARRAY_SIZE(scpsys_hwv_domain_data_mt6897),
+ 	.type = SCPSYS_MTCMOS_TYPE_HW_VOTER,
+diff --git a/drivers/pmdomain/mediatek/mtk-pm-domains.c b/drivers/pmdomain/mediatek/mtk-pm-domains.c
+index f30f5fb2d1..b763c00e82 100644
+--- a/drivers/pmdomain/mediatek/mtk-pm-domains.c
++++ b/drivers/pmdomain/mediatek/mtk-pm-domains.c
+@@ -63,6 +63,15 @@
+ #define MTK_MD_MTCMOS_ENABLE		18
+ #define MTK_MD_MTCMOS_DISABLE		19
+ 
++struct scpsys_root_clocks {
++	struct clk_bulk_data *clks;
++	int num_clks;
++	bool seen;
++	bool prepared;
++	unsigned int enabled_count;
++	bool failed;
++};
++
+ struct scpsys_domain {
+ 	struct generic_pm_domain genpd;
+ 	const struct scpsys_domain_data *data;
+@@ -73,15 +82,20 @@ struct scpsys_domain {
+ 	int num_subsys_clks;
+ 	struct clk_bulk_data *subsys_clks;
+ 	struct regulator *supply;
++	struct scpsys_root_clocks *roots;
+ };
+ 
+ struct scpsys {
+ 	struct device *dev;
+ 	struct regmap *base;
++	struct device_node *hwv_node;
+ 	const struct scpsys_soc_data *soc_data;
+ 	u8 bus_prot_index[BUS_PROT_BLOCK_COUNT];
+ 	struct regmap **bus_prot;
+ 	struct genpd_onecell_data pd_data;
++	struct scpsys_root_clocks *roots;
++	bool quarantined;
++	bool initializing;
+ 	struct generic_pm_domain *domains[];
+ };
+ 
+@@ -315,6 +329,193 @@ static int scpsys_regulator_disable(struct regulator *supply)
+ 	return supply ? regulator_disable(supply) : 0;
+ }
+ 
++/* Root readiness is established before genpd initialization or publication. */
++static int scpsys_collect_root_clocks(struct scpsys *scpsys, struct device_node *node)
++{
++	struct scpsys_root_clocks *roots;
++	struct of_phandle_args args;
++	struct device_node *expected, *voter;
++	const struct scpsys_hwv_domain_data *data;
++	u32 id;
++	int i, ret, count;
++
++	for_each_child_of_node_scoped(node, child) {
++		if (!of_device_is_available(child))
++			return -EINVAL;
++		ret = of_property_read_u32(child, "reg", &id);
++		if (ret || id >= scpsys->soc_data->num_hwv_domains)
++			return -EINVAL;
++		data = &scpsys->soc_data->hwv_domains_data[id];
++		roots = &scpsys->roots[id];
++		if (roots->seen)
++			return -EINVAL;
++		roots->seen = true;
++		if (data->num_prepared_clks) {
++			count = of_clk_get_parent_count(child);
++			if (count != data->num_prepared_clks ||
++			    count > ARRAY_SIZE(data->prepared_clk_ids) ||
++			    of_property_count_strings(child, "clock-names") != count ||
++			    data->caps & (MTK_SCPD_DOMAIN_SUPPLY | MTK_SCPD_INFRA_PWR_CTL |
++					  MTK_SCPD_KEEP_DEFAULT_OFF))
++				return -EINVAL;
++			roots->clks = devm_kcalloc(scpsys->dev, count,
++						 sizeof(*roots->clks), GFP_KERNEL);
++			if (!roots->clks)
++				return -ENOMEM;
++			for (i = 0; i < count; i++) {
++				const char *name;
++
++				ret = of_property_read_string_index(child, "clock-names", i, &name);
++				if (ret || strchr(name, '-'))
++					return -EINVAL;
++				ret = of_parse_phandle_with_args(child, "clocks", "#clock-cells", i, &args);
++				if (ret)
++					return ret;
++				expected = of_find_compatible_node(NULL, NULL,
++						 scpsys->soc_data->prepared_clk_compatible);
++				voter = of_parse_phandle(args.np, "mediatek,hardware-voter", 0);
++				ret = args.np == expected && voter && voter == scpsys->hwv_node &&
++					args.args_count == 1 &&
++					args.args[0] == data->prepared_clk_ids[i] ? 0 : -EINVAL;
++				of_node_put(voter);
++				of_node_put(expected);
++				of_node_put(args.np);
++				if (ret)
++					return ret;
++				roots->clks[i].clk = of_clk_get(child, i);
++				if (IS_ERR(roots->clks[i].clk))
++					return PTR_ERR(roots->clks[i].clk);
++				roots->num_clks++;
++			}
++			ret = clk_bulk_prepare(roots->num_clks, roots->clks);
++			if (ret)
++				return ret;
++			roots->prepared = true;
++		}
++		ret = scpsys_collect_root_clocks(scpsys, child);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++static int scpsys_prepare_root_clocks(struct scpsys *scpsys, struct device_node *node)
++{
++	int i, ret;
++
++	ret = scpsys_collect_root_clocks(scpsys, node);
++	if (ret)
++		return ret;
++	for (i = 0; i < scpsys->soc_data->num_hwv_domains; i++)
++		if (scpsys->soc_data->hwv_domains_data[i].num_prepared_clks &&
++		    (!scpsys->roots[i].seen || !scpsys->roots[i].prepared))
++			return -EINVAL;
++	return 0;
++}
++
++static void scpsys_unprepare_root_clocks(struct scpsys *scpsys)
++{
++	int i;
++
++	for (i = scpsys->soc_data->num_hwv_domains - 1; i >= 0; i--) {
++		struct scpsys_root_clocks *roots = &scpsys->roots[i];
++
++		if (roots->prepared)
++			clk_bulk_unprepare(roots->num_clks, roots->clks);
++		clk_bulk_put(roots->num_clks, roots->clks);
++	}
++}
++
++static int scpsys_hwv_root_done(struct scpsys_domain *pd, bool on)
++{
++	const struct scpsys_hwv_domain_data *hwv = pd->hwv_data;
++	u32 regs[3] = { hwv->done, on ? hwv->set_sta : hwv->clr_sta, hwv->en };
++	u32 val[3], mask = BIT(hwv->setclr_bit);
++	int ret;
++
++	ret = regmap_multi_reg_read(pd->scpsys->base, regs, val, on ? 3 : 2);
++	if (ret)
++		return ret;
++	return (val[0] & mask) && !(val[1] & mask) && (!on || (val[2] & mask));
++}
++
++static int scpsys_hwv_root_vote(struct scpsys_domain *pd, bool on)
++{
++	const struct scpsys_hwv_domain_data *hwv = pd->hwv_data;
++	struct regmap *map = pd->scpsys->base;
++	u32 val, ofs = on ? hwv->set : hwv->clr, mask = BIT(hwv->setclr_bit);
++	int ret, done;
++
++	ret = regmap_read_poll_timeout_atomic(map, hwv->done, val, val & mask,
++					      MTK_HWV_POLL_DELAY_US, MTK_HWV_POLL_TIMEOUT);
++	if (ret)
++		return ret;
++	ret = regmap_write(map, ofs, mask);
++	if (ret)
++		return ret;
++	ret = regmap_read_poll_timeout_atomic(map, ofs, val,
++					      on ? (val & mask) : !(val & mask),
++					      MTK_HWV_PREPARE_DELAY_US, MTK_HWV_PREPARE_TIMEOUT);
++	if (ret)
++		return ret;
++	if (!on)
++		udelay(100);
++	ret = read_poll_timeout_atomic(scpsys_hwv_root_done, done, done,
++				       MTK_HWV_POLL_DELAY_US, MTK_HWV_POLL_TIMEOUT,
++				       false, pd, on);
++	return ret ? ret : (done < 0 ? done : 0);
++}
++
++static int scpsys_hwv_root_power_on(struct generic_pm_domain *genpd)
++{
++	struct scpsys_domain *pd = to_scpsys_domain(genpd);
++	struct scpsys_root_clocks *roots = pd->roots;
++	int ret;
++
++	if (READ_ONCE(pd->scpsys->quarantined) || roots->failed)
++		return -EIO;
++	while (roots->enabled_count < roots->num_clks) {
++		ret = clk_enable(roots->clks[roots->enabled_count].clk);
++		if (ret)
++			goto quarantine;
++		roots->enabled_count++;
++	}
++	ret = scpsys_hwv_root_vote(pd, true);
++	if (!ret)
++		return 0;
++quarantine:
++	/* Unknown transition state: retain every successful enable and prepare. */
++	roots->failed = true;
++	WRITE_ONCE(pd->scpsys->quarantined, true);
++	dev_err(pd->scpsys->dev, "%s: power-on failed (%d), roots quarantined\n",
++		genpd->name, ret);
++	return ret;
++}
++
++static int scpsys_hwv_root_power_off(struct generic_pm_domain *genpd)
++{
++	struct scpsys_domain *pd = to_scpsys_domain(genpd);
++	struct scpsys_root_clocks *roots = pd->roots;
++	int ret;
++
++	if (READ_ONCE(pd->scpsys->initializing))
++		return -EBUSY;
++
++	if (READ_ONCE(pd->scpsys->quarantined) || roots->failed)
++		return -EIO;
++	ret = scpsys_hwv_root_vote(pd, false);
++	if (ret) {
++		roots->failed = true;
++		WRITE_ONCE(pd->scpsys->quarantined, true);
++		dev_err(pd->scpsys->dev, "%s: power-off failed (%d), roots quarantined\n",
++			genpd->name, ret);
++		return ret;
++	}
++	while (roots->enabled_count)
++		clk_disable(roots->clks[--roots->enabled_count].clk);
++	return 0;
++}
++
+ static int scpsys_hwv_power_on(struct generic_pm_domain *genpd)
+ {
+ 	struct scpsys_domain *pd = container_of(genpd, struct scpsys_domain, genpd);
+@@ -323,6 +524,9 @@ static int scpsys_hwv_power_on(struct generic_pm_domain *genpd)
+ 	u32 val;
+ 	int ret;
+ 
++	if (READ_ONCE(scpsys->quarantined))
++		return -EIO;
++
+ 	if (MTK_SCPD_CAPS(pd, MTK_SCPD_INFRA_PWR_CTL)) {
+ 		ret = scpsys_sec_infra_power_on(true);
+ 		if (ret)
+@@ -406,6 +610,12 @@ static int scpsys_hwv_power_off_internal(struct scpsys_domain *pd)
+ 	u32 val;
+ 	int ret;
+ 
++	if (READ_ONCE(pd->scpsys->initializing))
++		return -EBUSY;
++
++	if (READ_ONCE(scpsys->quarantined))
++		return -EIO;
++
+ 	if (MTK_SCPD_CAPS(pd, MTK_SCPD_INFRA_PWR_CTL)) {
+ 		ret = scpsys_sec_infra_power_on(true);
+ 		if (ret)
+@@ -918,53 +1128,62 @@ generic_pm_domain *scpsys_add_one_domain(struct scpsys *scpsys, struct device_no
+ 				      node);
+ 	}
+ 
+-	num_clks = of_clk_get_parent_count(node);
+-	if (num_clks > 0) {
+-		/* Calculate number of subsys_clks */
+-		of_property_for_each_string(node, "clock-names", prop, clk_name) {
+-			char *subsys;
+-
+-			subsys = strchr(clk_name, '-');
+-			if (subsys)
+-				pd->num_subsys_clks++;
+-			else
+-				pd->num_clks++;
+-		}
+-
+-		pd->clks = devm_kcalloc(scpsys->dev, pd->num_clks, sizeof(*pd->clks), GFP_KERNEL);
+-		if (!pd->clks)
+-			return ERR_PTR(-ENOMEM);
++	if (hwv_domain_data && hwv_domain_data->num_prepared_clks) {
++		if (!scpsys->roots || !scpsys->roots[id].prepared)
++			return ERR_PTR(-EINVAL);
++		pd->roots = &scpsys->roots[id];
++		pd->num_clks = pd->roots->num_clks;
++		pd->clks = pd->roots->clks;
++	} else {
++		num_clks = of_clk_get_parent_count(node);
++		if (num_clks > 0) {
++			/* Calculate number of subsys_clks */
++			of_property_for_each_string(node, "clock-names", prop, clk_name) {
++				char *subsys;
++
++				subsys = strchr(clk_name, '-');
++				if (subsys)
++					pd->num_subsys_clks++;
++				else
++					pd->num_clks++;
++			}
++
++			pd->clks = devm_kcalloc(scpsys->dev, pd->num_clks, sizeof(*pd->clks), GFP_KERNEL);
++			if (!pd->clks)
++				return ERR_PTR(-ENOMEM);
++
++			pd->subsys_clks = devm_kcalloc(scpsys->dev, pd->num_subsys_clks,
++						       sizeof(*pd->subsys_clks), GFP_KERNEL);
++			if (!pd->subsys_clks)
++				return ERR_PTR(-ENOMEM);
+ 
+-		pd->subsys_clks = devm_kcalloc(scpsys->dev, pd->num_subsys_clks,
+-					       sizeof(*pd->subsys_clks), GFP_KERNEL);
+-		if (!pd->subsys_clks)
+-			return ERR_PTR(-ENOMEM);
++		}
+ 
+-	}
++		for (i = 0; i < pd->num_clks; i++) {
++			clk = of_clk_get(node, i);
++			if (IS_ERR(clk)) {
++				ret = PTR_ERR(clk);
++				dev_err_probe(scpsys->dev, ret,
++					      "%pOF: failed to get clk at index %d\n", node, i);
++				goto err_put_clocks;
++			}
+ 
+-	for (i = 0; i < pd->num_clks; i++) {
+-		clk = of_clk_get(node, i);
+-		if (IS_ERR(clk)) {
+-			ret = PTR_ERR(clk);
+-			dev_err_probe(scpsys->dev, ret,
+-				      "%pOF: failed to get clk at index %d\n", node, i);
+-			goto err_put_clocks;
++			pd->clks[clk_ind++].clk = clk;
+ 		}
+ 
+-		pd->clks[clk_ind++].clk = clk;
+-	}
+-
+-	for (i = 0; i < pd->num_subsys_clks; i++) {
+-		clk = of_clk_get(node, i + clk_ind);
+-		if (IS_ERR(clk)) {
+-			ret = PTR_ERR(clk);
+-			dev_err_probe(scpsys->dev, ret,
+-				      "%pOF: failed to get clk at index %d\n", node,
+-				      i + clk_ind);
+-			goto err_put_subsys_clocks;
++		for (i = 0; i < pd->num_subsys_clks; i++) {
++			clk = of_clk_get(node, i + clk_ind);
++			if (IS_ERR(clk)) {
++				ret = PTR_ERR(clk);
++				dev_err_probe(scpsys->dev, ret,
++					      "%pOF: failed to get clk at index %d\n", node,
++					      i + clk_ind);
++				goto err_put_subsys_clocks;
++			}
++
++			pd->subsys_clks[i].clk = clk;
+ 		}
+ 
+-		pd->subsys_clks[i].clk = clk;
+ 	}
+ 
+ 	if (scpsys->domains[id]) {
+@@ -985,8 +1204,8 @@ generic_pm_domain *scpsys_add_one_domain(struct scpsys *scpsys, struct device_no
+ 		pd->genpd.power_off = scpsys_power_off;
+ 		pd->genpd.power_on = scpsys_power_on;
+ 	} else {
+-		pd->genpd.power_off = scpsys_hwv_power_off;
+-		pd->genpd.power_on = scpsys_hwv_power_on;
++		pd->genpd.power_off = pd->roots ? scpsys_hwv_root_power_off : scpsys_hwv_power_off;
++		pd->genpd.power_on = pd->roots ? scpsys_hwv_root_power_on : scpsys_hwv_power_on;
+ 
+ 		/* HW-Voter code can be invoked in atomic context */
+ 		pd->genpd.flags |= GENPD_FLAG_IRQ_SAFE;
+@@ -1024,9 +1243,12 @@ generic_pm_domain *scpsys_add_one_domain(struct scpsys *scpsys, struct device_no
+ 		pd->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
+ 
+ 	if (MTK_SCPD_CAPS(pd, MTK_SCPD_KEEP_DEFAULT_OFF))
+-		pm_genpd_init(&pd->genpd, NULL, true);
++		ret = pm_genpd_init(&pd->genpd, NULL, true);
+ 	else
+-		pm_genpd_init(&pd->genpd, NULL, false);
++		ret = pm_genpd_init(&pd->genpd, NULL, false);
++
++	if (ret && scpsys->soc_data->quarantine_init_failure)
++		return ERR_PTR(ret);
+ 
+ 	domains_idx[(*num_domains)++] = (u8) id;
+ 	scpsys->domains[id] = &pd->genpd;
+@@ -1034,6 +1256,8 @@ generic_pm_domain *scpsys_add_one_domain(struct scpsys *scpsys, struct device_no
+ 	return scpsys->pd_data.domains[id];
+ 
+ err_put_subsys_clocks:
++	if (pd->roots)
++		return ERR_PTR(ret);
+ 	clk_bulk_put(pd->num_subsys_clks, pd->subsys_clks);
+ err_put_clocks:
+ 	clk_bulk_put(pd->num_clks, pd->clks);
+@@ -1370,6 +1594,17 @@ static const struct of_device_id scpsys_of_match[] = {
+ 	{ }
+ };
+ 
++static int scpsys_quarantine_initialization(struct scpsys *scpsys, int error)
++{
++	/* Retain devm state and leases, reject global idle callbacks and avoid
++	 * retries with forgotten ownership. There is no consumer provider.
++	 */
++	WRITE_ONCE(scpsys->quarantined, true);
++	dev_err(scpsys->dev, "power controller unavailable after initialization error %d; "
++		"hardware and root clocks quarantined until reboot\n", error);
++	return 0;
++}
++
+ static int scpsys_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -1418,6 +1653,7 @@ static int scpsys_probe(struct platform_device *pdev)
+ 		return -ENODEV;
+ 	}
+ 
++	scpsys->hwv_node = parent->of_node;
+ 	scpsys->base = syscon_node_to_regmap(parent->of_node);
+ 	if (IS_ERR(scpsys->base)) {
+ 		dev_err(dev, "no regmap available\n");
+@@ -1432,6 +1668,25 @@ static int scpsys_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
++	if (soc->quarantine_init_failure) {
++		if (regmap_might_sleep(scpsys->base) ||
++		    of_property_present(parent->of_node, "clocks") ||
++		    of_property_present(parent->of_node, "hwlocks"))
++			return dev_err_probe(dev, -EINVAL, "HWV roots require unclocked atomic MMIO\n");
++		if (soc->type != SCPSYS_MTCMOS_TYPE_HW_VOTER)
++			return -EINVAL;
++		scpsys->roots = devm_kcalloc(dev, soc->num_hwv_domains,
++					  sizeof(*scpsys->roots), GFP_KERNEL);
++		if (!scpsys->roots)
++			return -ENOMEM;
++		ret = scpsys_prepare_root_clocks(scpsys, np);
++		if (ret) {
++			scpsys_unprepare_root_clocks(scpsys);
++			return dev_err_probe(dev, ret, "failed to prepare domain roots\n");
++		}
++	}
++
++	WRITE_ONCE(scpsys->initializing, soc->quarantine_init_failure);
+ 	ret = -ENODEV;
+ 	for_each_available_child_of_node_scoped(np, node) {
+ 		struct generic_pm_domain *domain;
+@@ -1487,10 +1742,13 @@ static int scpsys_probe(struct platform_device *pdev)
+ 		goto err_cleanup_domains;
+ 	}
+ 
++	WRITE_ONCE(scpsys->initializing, false);
+ 	devm_kfree(dev, added_pds_idx);
+ 	return 0;
+ 
+ err_cleanup_domains:
++	if (soc->quarantine_init_failure)
++		return scpsys_quarantine_initialization(scpsys, ret);
+ 	scpsys_domain_cleanup(scpsys, added_pds_idx, num_added_pds);
+ 	return ret;
+ }
+diff --git a/drivers/pmdomain/mediatek/mtk-pm-domains.h b/drivers/pmdomain/mediatek/mtk-pm-domains.h
+index 1472f649e8..1b0c97edb7 100644
+--- a/drivers/pmdomain/mediatek/mtk-pm-domains.h
++++ b/drivers/pmdomain/mediatek/mtk-pm-domains.h
+@@ -194,6 +194,8 @@ struct scpsys_domain_data {
+  * @clr_sta:    Offset of the HWV CLEAR STATUS register
+  * @setclr_bit: The SET/CLR bit to enable/disable the power domain
+  * @sta_bit:    The SET/CLR STA bit to check for on/off ACK
++ * @num_prepared_clks: Roots to prepare once before domain initialization
++ * @prepared_clk_ids: Exact provider clock IDs, checked before preparing
+  * @caps:       The flag for active wake-up action
+  */
+ struct scpsys_hwv_domain_data {
+@@ -206,6 +208,9 @@ struct scpsys_hwv_domain_data {
+ 	u16 clr_sta;
+ 	u8 setclr_bit;
+ 	u8 sta_bit;
++	/* Prepare these domain roots once, before any domain initialization. */
++	u8 num_prepared_clks;
++	u16 prepared_clk_ids[2];
+ 	u16 caps;
+ };
+ 
+@@ -217,6 +222,9 @@ struct scpsys_soc_data {
+ 	enum scpsys_bus_prot_block *bus_prot_blocks;
+ 	int num_bus_prot_blocks;
+ 	enum scpsys_mtcmos_type type;
++	/* Keep partially initialized HWV hardware live after a probe failure. */
++	bool quarantine_init_failure;
++	const char *prepared_clk_compatible;
+ };
+ 
+ #endif /* __SOC_MEDIATEK_MTK_PM_DOMAINS_H */
+diff --git a/tools/testing/selftests/mtk_clk/Makefile b/tools/testing/selftests/mtk_clk/Makefile
+index 7e28089190..b36bb93355 100644
+--- a/tools/testing/selftests/mtk_clk/Makefile
++++ b/tools/testing/selftests/mtk_clk/Makefile
+@@ -1,4 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-TEST_PROGS := test_mt6897.py
+-TEST_FILES := mt6897_stubs.h mt6897_cases.c
++TEST_PROGS := test_mt6897.py test_domains.py
++TEST_FILES := mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c
+ include ../lib.mk
+diff --git a/tools/testing/selftests/mtk_clk/domain_cases.c b/tools/testing/selftests/mtk_clk/domain_cases.c
+new file mode 100644
+index 0000000000..5062910fc5
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/domain_cases.c
+@@ -0,0 +1,239 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++static struct scpsys_hwv_domain_data data[2] = {
++    {.num_prepared_clks = 1,
++     .set = 1,
++     .clr = 2,
++     .done = 3,
++     .en = 4,
++     .set_sta = 5,
++     .clr_sta = 6,
++     .setclr_bit = 0},
++    {.num_prepared_clks = 2,
++     .prepared_clk_ids = {0, 1},
++     .set = 1,
++     .clr = 2,
++     .done = 3,
++     .en = 4,
++     .set_sta = 5,
++     .clr_sta = 6,
++     .setclr_bit = 1},
++};
++static struct scpsys_soc_data soc = {.num_hwv_domains = 2,
++				     .hwv_domains_data = data};
++static struct core shared, functional;
++static struct device_node ovl1 = {.id = 1,
++				  .count = 2,
++				  .names = {"ovl", "ovl1"},
++				  .clks = {&shared, &functional}};
++static struct device_node ovl0 = {
++    .id = 0, .count = 1, .names = {"ovl"}, .clks = {&shared}, .next = &ovl1};
++static struct device_node parent = {.child = &ovl0};
++static struct scpsys_root_clocks roots[2];
++static struct regmap map;
++static struct scpsys controller;
++static void reset(void)
++{
++	for (unsigned i = 0; i < num_allocations; i++)
++		free(allocations[i]);
++	num_allocations = 0;
++	shared = (struct core){0};
++	functional = (struct core){0};
++	memset(roots, 0, sizeof(roots));
++	map = (struct regmap){.done = 3, .en = 3};
++	controller = (struct scpsys){.base = &map,
++				     .hwv_node = &hwv_node,
++				     .soc_data = &soc,
++				     .roots = roots};
++	acquire_calls = prepare_calls = enable_calls = 0;
++	fail_acquire = fail_prepare = fail_enable = 0;
++	invalid_provider = invalid_clock_id = invalid_voter = 0;
++	ovl0.disabled = false;
++	parent.child = &ovl0;
++	ovl0.next = &ovl1;
++}
++static struct scpsys_domain domain(unsigned n)
++{
++	return (struct scpsys_domain){.genpd = {.name = "ovl"},
++				      .hwv_data = &data[n],
++				      .scpsys = &controller,
++				      .roots = &roots[n]};
++}
++static void test_preflight_failures(void)
++{
++	for (int kind = 0; kind < 2; kind++)
++		for (int nth = 1; nth <= 3; nth++) {
++			reset();
++			if (kind)
++				fail_prepare = nth;
++			else
++				fail_acquire = nth;
++			assert(scpsys_prepare_root_clocks(&controller,
++							  &parent) < 0);
++			scpsys_unprepare_root_clocks(&controller);
++			assert(!map.writes && !shared.prepared &&
++			       !functional.prepared && !shared.handles &&
++			       !functional.handles);
++		}
++}
++static void test_invalid_roots(void)
++{
++	for (int mode = 0; mode < 4; mode++) {
++		reset();
++		invalid_voter = mode == 3;
++		invalid_provider = mode == 0;
++		invalid_clock_id = mode == 1;
++		ovl0.disabled = mode == 2;
++		assert(scpsys_prepare_root_clocks(&controller, &parent) ==
++		       -EINVAL);
++		scpsys_unprepare_root_clocks(&controller);
++		assert(!map.writes && !shared.prepared);
++	}
++	reset();
++	assert(!scpsys_prepare_root_clocks(&controller, &parent));
++	struct scpsys_domain b = domain(1);
++	fail_enable = 2;
++	assert(scpsys_hwv_root_power_on(&b.genpd) == -EIO);
++	assert(roots[1].enabled_count == 1 && shared.enabled == 1 &&
++	       !functional.enabled);
++	assert(roots[1].failed && !map.writes && shared.prepared == 2);
++}
++static void test_missing_required_domains(void)
++{
++	for (int missing = 0; missing < 2; missing++) {
++		reset();
++		if (missing)
++			ovl0.next = NULL;
++		else
++			parent.child = &ovl1;
++		assert(scpsys_prepare_root_clocks(&controller, &parent) ==
++		       -EINVAL);
++		scpsys_unprepare_root_clocks(&controller);
++		assert(!map.writes && !shared.prepared && !functional.prepared);
++		assert(!shared.handles && !functional.handles);
++	}
++}
++
++static void test_shared_lifetime(void)
++{
++	reset();
++	assert(!scpsys_prepare_root_clocks(&controller, &parent));
++	assert(shared.prepared == 2 && functional.prepared == 1 &&
++	       shared.handles == 2);
++	struct scpsys_domain a = domain(0), b = domain(1);
++	int prepared = prepare_calls;
++	assert(!scpsys_hwv_root_power_on(&a.genpd));
++	assert(!scpsys_hwv_root_power_on(&b.genpd));
++	assert(shared.enabled == 2 && functional.enabled == 1 &&
++	       prepare_calls == prepared);
++	assert(!scpsys_hwv_root_power_off(&a.genpd));
++	assert(shared.enabled == 1 && functional.enabled == 1);
++	assert(!scpsys_hwv_root_power_off(&b.genpd));
++	assert(!shared.enabled && !functional.enabled && shared.prepared == 2);
++	scpsys_unprepare_root_clocks(&controller);
++	assert(!shared.prepared && !functional.prepared && !shared.handles);
++}
++static void test_transition_failures(void)
++{
++	for (int on = 0; on < 2; on++)
++		for (int nth = 1; nth <= 10; nth++) {
++			reset();
++			assert(
++			    !scpsys_prepare_root_clocks(&controller, &parent));
++			struct scpsys_domain a = domain(0);
++			if (!on)
++				assert(!scpsys_hwv_root_power_on(&a.genpd));
++			map.calls = 0;
++			map.fail = nth;
++			int ret = on ? scpsys_hwv_root_power_on(&a.genpd)
++				     : scpsys_hwv_root_power_off(&a.genpd);
++			if (ret) {
++				assert(ret == -EIO);
++				assert(roots[0].failed &&
++				       roots[0].enabled_count &&
++				       shared.enabled == 1 &&
++				       shared.prepared == 2);
++				int writes = map.writes;
++				assert(scpsys_hwv_root_power_on(&a.genpd) ==
++				       -EIO);
++				assert(scpsys_hwv_root_power_off(&a.genpd) ==
++				       -EIO);
++				assert(map.writes == writes);
++			}
++		}
++	for (int mode = 0; mode < 3; mode++) {
++		reset();
++		assert(!scpsys_prepare_root_clocks(&controller, &parent));
++		struct scpsys_domain a = domain(0);
++		if (mode == 0)
++			map.done = 0;
++		else if (mode == 1)
++			map.stuck = 1;
++		else
++			map.sta = 1;
++		assert(scpsys_hwv_root_power_on(&a.genpd) == -ETIMEDOUT);
++		assert(roots[0].failed && roots[0].enabled_count &&
++		       shared.enabled == 1);
++	}
++}
++static void test_initialization_quarantine(void)
++{
++	reset();
++	assert(!scpsys_prepare_root_clocks(&controller, &parent));
++	struct scpsys_domain a = domain(0), b = domain(1);
++	controller.initializing = true;
++	assert(scpsys_hwv_root_power_off(&a.genpd) == -EBUSY);
++	assert(!map.writes);
++	assert(!scpsys_hwv_root_power_on(&a.genpd));
++	map.fail = map.calls + 2;
++	assert(scpsys_hwv_root_power_on(&b.genpd) == -EIO);
++	assert(!scpsys_quarantine_initialization(&controller, -EIO));
++	int writes = map.writes;
++	controller.initializing = false;
++	assert(scpsys_hwv_root_power_off(&a.genpd) == -EIO);
++	assert(scpsys_hwv_root_power_on(&a.genpd) == -EIO);
++	/* All ordinary ancestor callbacks are guarded as well as OVL callbacks.
++	 */
++	struct scpsys_domain ancestor = {.scpsys = &controller,
++					 .hwv_data = &data[0]};
++	assert(scpsys_hwv_power_on(&ancestor.genpd) == -EIO);
++	assert(scpsys_hwv_power_off_internal(&ancestor) == -EIO);
++	assert(map.writes == writes && shared.prepared == 2 &&
++	       shared.enabled == 2 && functional.enabled == 1);
++}
++static void test_off_timeouts_and_ancestor_guard(void)
++{
++	for (int mode = 0; mode < 3; mode++) {
++		reset();
++		assert(!scpsys_prepare_root_clocks(&controller, &parent));
++		struct scpsys_domain a = domain(0);
++		assert(!scpsys_hwv_root_power_on(&a.genpd));
++		if (mode == 0)
++			map.done = 0;
++		else if (mode == 1)
++			map.stuck = 1;
++		else
++			map.drop_done = 1;
++		assert(scpsys_hwv_root_power_off(&a.genpd) == -ETIMEDOUT);
++		assert(controller.quarantined && roots[0].enabled_count == 1 &&
++		       shared.enabled == 1);
++		struct scpsys_domain ancestor = {.scpsys = &controller,
++						 .hwv_data = &data[0]};
++		int writes = map.writes;
++		assert(scpsys_hwv_power_off_internal(&ancestor) == -EIO);
++		assert(scpsys_hwv_power_on(&ancestor.genpd) == -EIO);
++		assert(map.writes == writes && shared.prepared == 2);
++	}
++}
++
++int main(void)
++{
++	test_preflight_failures();
++	test_invalid_roots();
++	test_missing_required_domains();
++	test_shared_lifetime();
++	test_transition_failures();
++	test_initialization_quarantine();
++	test_off_timeouts_and_ancestor_guard();
++	reset();
++	puts("domain preflight, shared roots and failure quarantine passed");
++}
+diff --git a/tools/testing/selftests/mtk_clk/domain_stubs.h b/tools/testing/selftests/mtk_clk/domain_stubs.h
+new file mode 100644
+index 0000000000..28032fad09
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/domain_stubs.h
+@@ -0,0 +1,306 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#include <assert.h>
++#include <errno.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++typedef uint32_t u32;
++#define BIT(x) (1U << (x))
++#define EPROBE_DEFER 517
++#define GFP_KERNEL 0
++#define ERR_PTR(e) ((void *)(intptr_t)(e))
++#define PTR_ERR(p) ((int)(intptr_t)(p))
++#define IS_ERR(p) ((uintptr_t)(p) >= (uintptr_t)-4095)
++#define dev_err(...) ((void)0)
++#define MTK_SCPD_DOMAIN_SUPPLY 1
++#define MTK_SCPD_INFRA_PWR_CTL 2
++#define MTK_SCPD_KEEP_DEFAULT_OFF 4
++#define MTK_SCPD_CAPS(pd, cap) (0)
++#define MTK_HWV_POLL_DELAY_US 1
++#define MTK_HWV_POLL_TIMEOUT 3
++#define MTK_HWV_PREPARE_DELAY_US 1
++#define MTK_HWV_PREPARE_TIMEOUT 3
++#define udelay(x) ((void)0)
++#define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
++#include <stddef.h>
++struct core {
++	int prepared, enabled, handles;
++};
++struct clk {
++	struct core *core;
++};
++struct clk_bulk_data {
++	struct clk *clk;
++};
++struct device_node {
++	bool disabled;
++	u32 id;
++	int count;
++	const char *names[2];
++	struct core *clks[2];
++	struct device_node *child, *next;
++};
++struct scpsys_hwv_domain_data {
++	unsigned num_prepared_clks, caps;
++	u32 prepared_clk_ids[2];
++	u32 set, clr, done, en, set_sta, clr_sta, setclr_bit;
++};
++struct scpsys_soc_data {
++	unsigned num_hwv_domains;
++	const char *prepared_clk_compatible;
++	const struct scpsys_hwv_domain_data *hwv_domains_data;
++};
++struct generic_pm_domain {
++	const char *name;
++};
++struct regmap {
++	u32 vote, done, en, sta;
++	int calls, fail, stuck, writes, drop_done;
++	u32 pending_clr;
++};
++struct scpsys_root_clocks {
++	struct clk_bulk_data *clks;
++	int num_clks;
++	bool seen, prepared, failed;
++	unsigned enabled_count;
++};
++struct scpsys {
++	void *dev;
++	struct device_node *hwv_node;
++	struct regmap *base;
++	const struct scpsys_soc_data *soc_data;
++	struct scpsys_root_clocks *roots;
++	bool initializing, quarantined;
++};
++struct scpsys_domain {
++	struct generic_pm_domain genpd;
++	const struct scpsys_hwv_domain_data *hwv_data;
++	struct scpsys *scpsys;
++	struct scpsys_root_clocks *roots;
++	int num_clks, num_subsys_clks;
++	struct clk_bulk_data *clks, *subsys_clks;
++	void *supply;
++};
++#define to_scpsys_domain(g) container_of(g, struct scpsys_domain, genpd)
++static int acquire_calls, fail_acquire, prepare_calls, fail_prepare,
++    enable_calls, fail_enable;
++static void *allocations[128];
++static unsigned num_allocations;
++static void *allocate(size_t n)
++{
++	void *p = calloc(1, n);
++	assert(p);
++	allocations[num_allocations++] = p;
++	return p;
++}
++#define devm_kcalloc(d, n, s, f) allocate((n) * (s))
++#define for_each_available_child_of_node_scoped(n, c)                          \
++	for (struct device_node *c = (n)->child; c; c = c->next)
++static int of_property_read_u32(struct device_node *n, const char *k, u32 *v)
++{
++	*v = n->id;
++	return 0;
++}
++static int of_clk_get_parent_count(struct device_node *n) { return n->count; }
++static int of_property_count_strings(struct device_node *n, const char *k)
++{
++	return n->count;
++}
++static int of_property_read_string_index(struct device_node *n, const char *k,
++					 int i, const char **v)
++{
++	*v = n->names[i];
++	return 0;
++}
++static struct clk *of_clk_get(struct device_node *n, int i)
++{
++	if (++acquire_calls == fail_acquire)
++		return ERR_PTR(-EPROBE_DEFER);
++	struct clk *c = allocate(sizeof(*c));
++	c->core = n->clks[i];
++	c->core->handles++;
++	return c;
++}
++static void clk_bulk_put(int n, struct clk_bulk_data *c)
++{
++	for (int i = 0; i < n; i++)
++		c[i].clk->core->handles--;
++}
++static void clk_bulk_unprepare(int n, struct clk_bulk_data *c)
++{
++	for (int i = 0; i < n; i++) {
++		assert(c[i].clk->core->prepared > 0);
++		c[i].clk->core->prepared--;
++	}
++}
++static int clk_bulk_prepare(int n, struct clk_bulk_data *c)
++{
++	for (int i = 0; i < n; i++) {
++		if (++prepare_calls == fail_prepare) {
++			clk_bulk_unprepare(i, c);
++			return -EIO;
++		}
++		c[i].clk->core->prepared++;
++	}
++	return 0;
++}
++static void clk_bulk_disable(int n, struct clk_bulk_data *c)
++{
++	for (int i = 0; i < n; i++) {
++		assert(c[i].clk->core->enabled > 0);
++		c[i].clk->core->enabled--;
++	}
++}
++static int clk_bulk_enable(int n, struct clk_bulk_data *c)
++{
++	for (int i = 0; i < n; i++) {
++		assert(c[i].clk->core->prepared > 0);
++		if (++enable_calls == fail_enable) {
++			clk_bulk_disable(i, c);
++			return -EIO;
++		}
++		c[i].clk->core->enabled++;
++	}
++	return 0;
++}
++static int clk_bulk_prepare_enable(int n, struct clk_bulk_data *c)
++{
++	assert(n == 0);
++	return 0;
++}
++static void clk_bulk_disable_unprepare(int n, struct clk_bulk_data *c)
++{
++	assert(n == 0);
++}
++static int scpsys_regulator_enable(void *p) { return 0; }
++static void scpsys_regulator_disable(void *p) {}
++static int scpsys_sec_infra_power_on(bool b) { return 0; }
++static int regmap_read(struct regmap *m, u32 r, u32 *v)
++{
++	if (++m->calls == m->fail)
++		return -EIO;
++	*v = r == 1   ? m->vote
++	     : r == 2 ? m->pending_clr
++	     : r == 3 ? m->done
++	     : r == 4 ? m->en
++		      : m->sta;
++	return 0;
++}
++static int regmap_write(struct regmap *m, u32 r, u32 v)
++{
++	m->writes++;
++	if (m->drop_done)
++		m->done = 0;
++	if (m->stuck && r == 2)
++		m->pending_clr = v;
++	if (++m->calls == m->fail)
++		return -EIO;
++	if (!m->stuck) {
++		if (r == 1) {
++			m->vote |= v;
++			m->en |= v;
++		} else {
++			assert(r == 2);
++			m->vote &= ~v;
++			m->en &= ~v;
++		}
++	}
++	return 0;
++}
++static int regmap_multi_reg_read(struct regmap *m, u32 *r, u32 *v, int n)
++{
++	for (int i = 0; i < n; i++) {
++		int ret = regmap_read(m, r[i], v + i);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++static bool scpsys_hwv_domain_is_enable_done(struct scpsys_domain *p)
++{
++	assert(0);
++	return false;
++}
++static bool scpsys_hwv_domain_is_disable_done(struct scpsys_domain *p)
++{
++	assert(0);
++	return false;
++}
++#define regmap_read_poll_timeout_atomic(m, r, v, c, d, t)                      \
++	({                                                                     \
++		int _r = 0, _i;                                                \
++		for (_i = 0; _i < 3; _i++) {                                   \
++			_r = regmap_read(m, r, &v);                            \
++			if (_r || (c))                                         \
++				break;                                         \
++		}                                                              \
++		if (!_r && _i == 3)                                            \
++			_r = -ETIMEDOUT;                                       \
++		_r;                                                            \
++	})
++#define read_poll_timeout_atomic(fn, v, c, d, t, s, ...)                       \
++	({                                                                     \
++		int _r = 0, _i;                                                \
++		for (_i = 0; _i < 3; _i++) {                                   \
++			v = fn(__VA_ARGS__);                                   \
++			if (c)                                                 \
++				break;                                         \
++		}                                                              \
++		if (_i == 3)                                                   \
++			_r = -ETIMEDOUT;                                       \
++		_r;                                                            \
++	})
++#define readx_poll_timeout_atomic(fn, a, v, c, d, t)                           \
++	read_poll_timeout_atomic(fn, v, c, d, t, false, a)
++
++#define READ_ONCE(x) (x)
++#define WRITE_ONCE(x, v) ((x) = (v))
++#define for_each_child_of_node_scoped for_each_available_child_of_node_scoped
++struct of_phandle_args {
++	struct device_node *np;
++	int args_count;
++	u32 args[2];
++};
++static struct device_node clock_provider;
++static int invalid_provider, invalid_clock_id, invalid_voter;
++static bool of_device_is_available(struct device_node *n)
++{
++	return !n->disabled;
++}
++static int of_parse_phandle_with_args(struct device_node *n, const char *a,
++				      const char *b, int i,
++				      struct of_phandle_args *out)
++{
++	*out = (struct of_phandle_args){
++	    .np = invalid_provider ? n : &clock_provider,
++	    .args_count = 1,
++	    .args = {invalid_clock_id ? 42 : (u32)i}};
++	return 0;
++}
++static struct device_node *of_find_compatible_node(void *a, void *b,
++						   const char *c)
++{
++	return &clock_provider;
++}
++static void of_node_put(struct device_node *n) {}
++static int clk_enable(struct clk *c)
++{
++	struct clk_bulk_data b = {.clk = c};
++	return clk_bulk_enable(1, &b);
++}
++static void clk_disable(struct clk *c)
++{
++	struct clk_bulk_data b = {.clk = c};
++	clk_bulk_disable(1, &b);
++}
++
++#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
++
++static struct device_node hwv_node;
++static struct device_node *of_parse_phandle(struct device_node *n,
++					    const char *k, int i)
++{
++	return invalid_voter ? NULL : &hwv_node;
++}
+diff --git a/tools/testing/selftests/mtk_clk/test_domains.py b/tools/testing/selftests/mtk_clk/test_domains.py
+new file mode 100755
+index 0000000000..3d0800b8ac
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/test_domains.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Exercise production root-preflight and HWV domain functions with host mocks."""
++from pathlib import Path
++import os
++import subprocess
++import tempfile
++
++assets = Path(__file__).resolve().parent
++repo = Path(os.environ.get('KERNEL_SRC', str(assets.parents[3])))
++source = (repo / 'drivers/pmdomain/mediatek/mtk-pm-domains.c').read_text()
++
++def function(name):
++    start = source.index('static int ' + name + '(')
++    brace = source.index('{', start)
++    end = brace + 1
++    depth = 1
++    while depth:
++        depth += (source[end] == '{') - (source[end] == '}')
++        end += 1
++    return source[start:end]
++
++start = source.index('/* Root readiness is established')
++end = source.index('static int scpsys_hwv_power_on', start)
++production = source[start:end]
++for name in ['scpsys_hwv_power_on', 'scpsys_hwv_power_off_internal',
++             'scpsys_quarantine_initialization']:
++    production += function(name)
++for name in ['scpsys_hwv_root_power_on', 'scpsys_hwv_root_power_off']:
++    assert 'clk_bulk_prepare' not in function(name)
++    assert 'clk_bulk_unprepare' not in function(name)
++probe = function('scpsys_probe')
++assert probe.index('scpsys_prepare_root_clocks') < probe.index('scpsys_add_one_domain')
++assert probe.index('scpsys_prepare_root_clocks') < probe.index('of_genpd_add_provider_onecell')
++assert 'return scpsys_quarantine_initialization(scpsys, ret)' in probe
++add_start = source.index('generic_pm_domain *scpsys_add_one_domain')
++add_end = source.index('static int scpsys_add_subdomain', add_start)
++add_domain = source[add_start:add_end]
++assert add_domain.count('ret = pm_genpd_init(') == 2
++assert add_domain.index('if (ret && scpsys->soc_data->quarantine_init_failure)') < add_domain.index('domains_idx[(*num_domains)++]')
++assert add_domain.index('if (ret && scpsys->soc_data->quarantine_init_failure)') < add_domain.index('scpsys->domains[id] =')
++
++with tempfile.TemporaryDirectory(prefix='mtk-domain-') as temporary:
++    out = Path(temporary)
++    (out / 'test.c').write_text((assets / 'domain_stubs.h').read_text() + production +
++                              (assets / 'domain_cases.c').read_text())
++    subprocess.run([os.environ.get('CC', 'cc'), '-g', '-fsanitize=address,undefined',
++                    '-o', str(out / 'test'), str(out / 'test.c')], check=True)
++    subprocess.run([str(out / 'test')], check=True)
+-- 
+2.56.0
+

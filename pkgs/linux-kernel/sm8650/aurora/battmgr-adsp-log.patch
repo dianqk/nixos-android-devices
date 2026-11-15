@@ -1,0 +1,81 @@
+From 7f5f85df1c2150337bddad61245084686b194f76 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 21 Oct 2026 09:56:58 +0800
+Subject: [PATCH] power: supply: qcom_battmgr: Print the Aurora ADSP charger
+ log on demand
+
+The Xiaomi Aurora firmware sends unrequested vendor status reports
+(BC_XM_STATUS_GET, opcode 0x50). The property quirk drops them so they
+cannot acknowledge a pending standard read. Some of them carry the ADSP
+charger log (struct chg_debug_msg type CHG_ADSP_LOG in the OEM
+qti_battery_charger.c, MiCode Xiaomi_Kernel_OpenSource c7841217725a):
+the stock kernel prints them as "[ADSP] fg_update_status:: ... fcc: ...,
+icl: chg_det-500", which is the only view of the firmware's current
+votes.
+
+Print that text through rate-limited dynamic debug. The reports are still
+not acknowledged and other 0x50 payloads are still dropped.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/power/supply/qcom_battmgr.c | 32 +++++++++++++++++++++++++++--
+ 1 file changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 1711340ef057..8565b2833fd5 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -103,6 +103,11 @@ enum qcom_battmgr_variant {
+ #define BATTMGR_CHG_CTRL_LIMIT_EN	0x48
+ /* Xiaomi battery wire ID inserted before BATT_TEMP (see the property quirk). */
+ #define XIAOMI_BATT_CONSTANT_CURRENT	12
++
++/* Xiaomi vendor status message (BC_XM_STATUS_GET) and its debug payload. */
++#define XIAOMI_XM_STATUS_GET		0x50
++#define XIAOMI_CHG_ADSP_LOG		1
++#define XIAOMI_CHG_DEBUG_DATA_LEN	200
+ #define CHARGE_CTRL_START_THR_MIN	50
+ #define CHARGE_CTRL_START_THR_MAX	95
+ #define CHARGE_CTRL_END_THR_MIN		55
+@@ -150,6 +155,14 @@ struct qcom_battmgr_charge_ctrl_request {
+ 	__le32 delta_soc;
+ };
+ 
++/* OEM struct chg_debug_msg, natural alignment (220 bytes). */
++struct qcom_battmgr_xiaomi_debug_msg {
++	struct pmic_glink_hdr hdr;
++	__le32 property_id;
++	u8 type;
++	char data[XIAOMI_CHG_DEBUG_DATA_LEN];
++};
++
+ struct qcom_battmgr_message {
+ 	struct pmic_glink_hdr hdr;
+ 	union {
+@@ -1850,9 +1863,24 @@ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
+ 	struct qcom_battmgr *battmgr = priv;
+ 	unsigned int opcode = le32_to_cpu(hdr->opcode);
+ 
+-	/* Unrequested Xiaomi reports must not acknowledge a standard read. */
+-	if (battmgr->xiaomi_battery_property_ids && opcode == 0x50)
++	/*
++	 * Unrequested Xiaomi reports must not acknowledge a standard read. The
++	 * ADSP sends its charger log (fg_update_status: SOC, currents, fcc and
++	 * icl votes) as such reports, about every 10 s; print it on demand
++	 * through dynamic debug.
++	 */
++	if (battmgr->xiaomi_battery_property_ids && opcode == XIAOMI_XM_STATUS_GET) {
++		const struct qcom_battmgr_xiaomi_debug_msg *msg = data;
++
++		if (len == sizeof(*msg) && msg->type == XIAOMI_CHG_ADSP_LOG) {
++			int n = strnlen(msg->data, sizeof(msg->data));
++
++			while (n && (msg->data[n - 1] == '\n' || msg->data[n - 1] == '\r'))
++				n--;
++			dev_dbg_ratelimited(battmgr->dev, "ADSP: %.*s\n", n, msg->data);
++		}
+ 		return;
++	}
+ 
+ 	if (opcode == BATTMGR_NOTIFICATION)
+ 		qcom_battmgr_notification(battmgr, data, len);

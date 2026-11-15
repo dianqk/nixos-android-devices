@@ -1,0 +1,192 @@
+From 7b90e2fe1ba893dba56b502bd7e5e562284105eb Mon Sep 17 00:00:00 2001
+From: Fan Wu <fanwu01@zju.edu.cn>
+Date: Wed, 17 Jun 2026 13:20:05 +0000
+Subject: [PATCH 078/144] drm/msm/adreno: sync preempt watchdog timer on
+ teardown
+
+The A5XX and A6XX preemption watchdog timer is registered with
+timer_setup() and armed via mod_timer() on every preemption trigger. Its
+callback (a5xx_preempt_timer / a6xx_preempt_timer) recovers the owning
+a5xx_gpu/a6xx_gpu through timer_container_of(preempt_timer) and then
+dereferences gpu->dev and queues gpu->recover_work.
+
+Neither destroy path waits for a possibly in-flight callback:
+
+  * a5xx_destroy() calls a5xx_preempt_fini(), which only frees the
+    preempt_bo GEM buffers and performs no timer synchronization;
+  * a6xx_destroy() performs no preempt cleanup at all.
+
+The only timer cancellation in the driver is timer_delete()
+on the preemption-IRQ success path, which is unreachable from teardown
+and does not wait for a concurrently running callback. If the 10s
+preemption watchdog fires while the GPU is being torn down, the callback
+races against kfree(a5xx_gpu)/kfree(a6xx_gpu) and dereferences the freed
+container, leading to a use-after-free.
+
+Fix this by adding timer_shutdown_sync() for the preempt timer to
+a5xx_preempt_fini() -- which a5xx_destroy() already calls on teardown --
+and, since a6xx_destroy() performs no preempt cleanup, by adding it
+inline to a6xx_destroy() as well. timer_shutdown_sync() is used instead
+of timer_delete_sync() because the timer is re-armed by mod_timer() from
+the trigger path, so teardown must also block rearming.
+
+Because timer_shutdown_sync() may run on any teardown path -- including
+single-ring configurations where *_preempt_init() returns early and
+*_gpu_init() error paths that precede *_preempt_init() -- the timer_list
+must already be valid on all of them. Initialize it at GPU allocation
+via a new *_preempt_init_timer() helper, called from *_gpu_init() before
+adreno_gpu_init() (the first failure path that reaches *_destroy()), so
+timer_setup() always precedes any timer_shutdown_sync().
+
+This bug was found by static analysis.
+
+Fixes: b1fc2839d2f9 ("drm/msm: Implement preemption for A5XX targets")
+Fixes: e7ae83da4a28 ("drm/msm/a6xx: Implement preemption for a7xx targets")
+Cc: stable@vger.kernel.org
+Signed-off-by: Fan Wu <fanwu01@zju.edu.cn>
+Message-ID: <20260617132007.131079-2-fanwu01@zju.edu.cn>
+Link: https://lore.kernel.org/r/20260617132007.131079-2-fanwu01@zju.edu.cn
+
+Local context: retain Linux 7.3.1 info->funcs initialization and the
+existing a6xx_gmu_sysprof_setup force_on argument around the unchanged
+preemption timer additions.
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0100-drm-msm-adreno-sync-preempt-watchdog-timer-on-teardo.patch
+Import-SHA256: 6f2892fa600292246ea3f878473a4d692657139406977986bb7e7c8cb44f3f91
+Import-Provenance: mail headers
+(cherry picked from commit 59efa96f52b1ded5edcb0d2f16bcfcd5f9754cf8)
+---
+ drivers/gpu/drm/msm/adreno/a5xx_gpu.c     |  2 ++
+ drivers/gpu/drm/msm/adreno/a5xx_gpu.h     |  1 +
+ drivers/gpu/drm/msm/adreno/a5xx_preempt.c | 14 +++++++++++++-
+ drivers/gpu/drm/msm/adreno/a6xx_gpu.c     |  4 ++++
+ drivers/gpu/drm/msm/adreno/a6xx_gpu.h     |  1 +
+ drivers/gpu/drm/msm/adreno/a6xx_preempt.c | 13 +++++++++++--
+ 6 files changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/adreno/a5xx_gpu.c b/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
+index 5d96b8f631..dcb1438306 100644
+--- a/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
+@@ -1749,6 +1749,8 @@ static struct msm_gpu *a5xx_gpu_init(struct drm_device *dev)
+ 	if (config->info->revn == 510)
+ 		nr_rings = 1;
+ 
++	a5xx_preempt_init_timer(gpu);
++
+ 	ret = adreno_gpu_init(dev, pdev, adreno_gpu, config->info->funcs, nr_rings);
+ 	if (ret) {
+ 		a5xx_destroy(&(a5xx_gpu->base.base));
+diff --git a/drivers/gpu/drm/msm/adreno/a5xx_gpu.h b/drivers/gpu/drm/msm/adreno/a5xx_gpu.h
+index 407bb950d3..4bf2588306 100644
+--- a/drivers/gpu/drm/msm/adreno/a5xx_gpu.h
++++ b/drivers/gpu/drm/msm/adreno/a5xx_gpu.h
+@@ -158,6 +158,7 @@ bool a5xx_idle(struct msm_gpu *gpu, struct msm_ringbuffer *ring);
+ void a5xx_set_hwcg(struct msm_gpu *gpu, bool state);
+ 
+ void a5xx_preempt_init(struct msm_gpu *gpu);
++void a5xx_preempt_init_timer(struct msm_gpu *gpu);
+ void a5xx_preempt_hw_init(struct msm_gpu *gpu);
+ void a5xx_preempt_trigger(struct msm_gpu *gpu);
+ void a5xx_preempt_irq(struct msm_gpu *gpu);
+diff --git a/drivers/gpu/drm/msm/adreno/a5xx_preempt.c b/drivers/gpu/drm/msm/adreno/a5xx_preempt.c
+index e4924b5e1c..96ade4936e 100644
+--- a/drivers/gpu/drm/msm/adreno/a5xx_preempt.c
++++ b/drivers/gpu/drm/msm/adreno/a5xx_preempt.c
+@@ -295,12 +295,25 @@ void a5xx_preempt_fini(struct msm_gpu *gpu)
+ 	struct a5xx_gpu *a5xx_gpu = to_a5xx_gpu(adreno_gpu);
+ 	int i;
+ 
++	timer_shutdown_sync(&a5xx_gpu->preempt_timer);
++
+ 	for (i = 0; i < gpu->nr_rings; i++) {
+ 		msm_gem_kernel_put(a5xx_gpu->preempt_bo[i], gpu->vm);
+ 		msm_gem_kernel_put(a5xx_gpu->preempt_counters_bo[i], gpu->vm);
+ 	}
+ }
+ 
++/* Initialize the preemption watchdog timer at GPU allocation so that it is
++ * valid on every teardown path that may call timer_shutdown_sync().
++ */
++void a5xx_preempt_init_timer(struct msm_gpu *gpu)
++{
++	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	struct a5xx_gpu *a5xx_gpu = to_a5xx_gpu(adreno_gpu);
++
++	timer_setup(&a5xx_gpu->preempt_timer, a5xx_preempt_timer, 0);
++}
++
+ void a5xx_preempt_init(struct msm_gpu *gpu)
+ {
+ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+@@ -325,5 +338,4 @@ void a5xx_preempt_init(struct msm_gpu *gpu)
+ 	}
+ 
+ 	spin_lock_init(&a5xx_gpu->preempt_start_lock);
+-	timer_setup(&a5xx_gpu->preempt_timer, a5xx_preempt_timer, 0);
+ }
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+index 081e79ea46..9b13cba358 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -2306,6 +2306,8 @@ static void a6xx_destroy(struct msm_gpu *gpu)
+ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+ 	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
+ 
++	timer_shutdown_sync(&a6xx_gpu->preempt_timer);
++
+ 	if (a6xx_gpu->sqe_bo) {
+ 		msm_gem_unpin_iova(a6xx_gpu->sqe_bo, gpu->vm);
+ 		drm_gem_object_put(a6xx_gpu->sqe_bo);
+@@ -2747,6 +2749,8 @@ static struct msm_gpu *a6xx_gpu_init(struct drm_device *dev)
+ 	    (info->quirks & ADRENO_QUIRK_PREEMPTION)))
+ 		nr_rings = 4;
+ 
++	a6xx_preempt_init_timer(gpu);
++
+ 	ret = adreno_gpu_init(dev, pdev, adreno_gpu, info->funcs, nr_rings);
+ 	if (ret) {
+ 		a6xx_destroy(&(a6xx_gpu->base.base));
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gpu.h b/drivers/gpu/drm/msm/adreno/a6xx_gpu.h
+index b50c57f427..7e5a53b06b 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.h
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.h
+@@ -284,6 +284,7 @@ void a6xx_gmu_remove(struct a6xx_gpu *a6xx_gpu);
+ void a6xx_gmu_sysprof_setup(struct msm_gpu *gpu, bool force_on);
+ 
+ void a6xx_preempt_init(struct msm_gpu *gpu);
++void a6xx_preempt_init_timer(struct msm_gpu *gpu);
+ void a6xx_preempt_hw_init(struct msm_gpu *gpu);
+ void a6xx_preempt_trigger(struct msm_gpu *gpu);
+ void a6xx_preempt_irq(struct msm_gpu *gpu);
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_preempt.c b/drivers/gpu/drm/msm/adreno/a6xx_preempt.c
+index 1e599d4dde..033ef8ec9f 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_preempt.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_preempt.c
+@@ -353,6 +353,17 @@ void a6xx_preempt_fini(struct msm_gpu *gpu)
+ 		msm_gem_kernel_put(a6xx_gpu->preempt_bo[i], gpu->vm);
+ }
+ 
++/* Initialize the preemption watchdog timer at GPU allocation so that it is
++ * valid on every teardown path that may call timer_shutdown_sync().
++ */
++void a6xx_preempt_init_timer(struct msm_gpu *gpu)
++{
++	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
++
++	timer_setup(&a6xx_gpu->preempt_timer, a6xx_preempt_timer, 0);
++}
++
+ void a6xx_preempt_init(struct msm_gpu *gpu)
+ {
+ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+@@ -384,8 +395,6 @@ void a6xx_preempt_init(struct msm_gpu *gpu)
+ 
+ 	preempt_prepare_postamble(a6xx_gpu);
+ 
+-	timer_setup(&a6xx_gpu->preempt_timer, a6xx_preempt_timer, 0);
+-
+ 	return;
+ fail:
+ 	/*

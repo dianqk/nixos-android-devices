@@ -1,5 +1,7 @@
 # Touch source provenance
 
+[中文](ORIGINS.zh.md)
+
 The SPI transport and native adapter derive from
 [yoni13/armada-houji](https://github.com/yoni13/armada-houji/tree/5d6156dbb0ce23d0156040219be38bbc28aa15c8/ports/houji/touch),
 pinned at `5d6156dbb0ce23d0156040219be38bbc28aa15c8`.
@@ -7,16 +9,19 @@ pinned at `5d6156dbb0ce23d0156040219be38bbc28aa15c8`.
 LibTomCrypt implementation from iw 6.17; the accompanying iw notice is in
 [COPYING](COPYING). The kernel transport is GPL-2.0-only.
 The OEM library and configuration are proprietary and retain their owners' rights.
-Their unchanged payloads are maintained in
-[firmware-xiaomi-aurora](https://github.com/dianqk/firmware-xiaomi-aurora/tree/60febc4751f8b939468bd57879d6831635d520d7/android14/touch),
+Their unchanged payloads are in `touch/` of the
+[Aurora firmware release archive](../../../docs/aurora/firmware.md#firmware-source),
 separately from this adapter source.
 
 Local changes: Aurora regulator wiring and geometry, Android 14 library/config
 hashes, function addresses, three-argument decoded-frame allocation, 1722-byte
 raw frame validation and checksum, output metadata offsets, and the temporal
-update already performed inside Android 14's compute entry. Kernel input comes
-only from the userspace processor; the transport checks the known controller
-identity and geometry, enables raw reports, and quiesces recovery during removal.
+update already performed inside Android 14's compute entry. In this mode kernel
+input comes only from the userspace processor; the driver checks the known
+controller identity and geometry, enables raw reports, and quiesces recovery
+during removal. The default firmware touch report decoder in `aurora-tcm`
+follows the TouchCom report config format of Synaptics' TouchComm driver; it
+uses no OEM library.
 See [the runtime interface](README.md).
 
 The following original commit metadata is retained verbatim. The initial

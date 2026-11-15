@@ -1,0 +1,868 @@
+From c8a8833315b51bc52a26b1aecc6d0706c515391c Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 7 Nov 2026 02:43:18 +0800
+Subject: [PATCH] drm/mediatek: serialize MT6897 DP_INTF runtime ownership
+
+Opt MT6897 DP_INTF into managed runtime PM before bridge publication. Serialize full PM and engine/TVD/pixel clock references, with separate successful component and bridge owners. Failed enable cannot disable or release another owner, and dirty unbind state cannot be revived by rebind.
+
+Debug register transactions may borrow a full reference only while an output is already active. Serialize their hardware access with last-off and unbind, mark the device dead before removing its debug file, and pin the bridge allocation across open files. Copy and parse user input before taking the power transition lock. Unbind does not force-drain retained power references.
+
+Keep non-MT6897 DPI and DVO clock behavior unchanged. Add extracted-function tests for PM/clock failures, dual owners, reference balance, debug concurrency and bridge lifetime. These tests do not establish hardware-fault DMA or framebuffer lifetime safety.
+---
+ drivers/gpu/drm/mediatek/mtk_dpi.c            | 160 ++++++++++-
+ drivers/gpu/drm/mediatek/mtk_dpi_common.c     | 114 ++++++++
+ drivers/gpu/drm/mediatek/mtk_dpi_common.h     |  12 +
+ tools/testing/selftests/mtk_clk/Makefile      |   4 +-
+ .../selftests/mtk_clk/dpintf_pm_cases.c       | 262 ++++++++++++++++++
+ .../selftests/mtk_clk/test_dpintf_pm.py       |  57 ++++
+ 6 files changed, 597 insertions(+), 12 deletions(-)
+ create mode 100644 tools/testing/selftests/mtk_clk/dpintf_pm_cases.c
+ create mode 100755 tools/testing/selftests/mtk_clk/test_dpintf_pm.py
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_dpi.c b/drivers/gpu/drm/mediatek/mtk_dpi.c
+index d38cf5d7e9..3c587da04a 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dpi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dpi.c
+@@ -387,11 +387,25 @@ static void mtk_dpi_bridge_disable(struct drm_bridge *bridge,
+ {
+ 	struct mtk_dpi *dpi = bridge_to_dpi(bridge);
+ 
++	if (dpi->conf->runtime_pm) {
++		mutex_lock(&dpi->power_lock);
++		if (dpi->power_dead || !dpi->bridge_powered)
++			goto out;
++	}
++
+ 	mtk_dpi_disable(dpi);
+-	mtk_dpi_power_off(dpi);
++	if (dpi->conf->runtime_pm) {
++		dpi->bridge_powered = false;
++		mtk_dpi_runtime_put_locked(dpi);
++	} else {
++		mtk_dpi_power_off(dpi);
++	}
+ 
+ 	if (dpi->pinctrl && dpi->pins_gpio)
+ 		pinctrl_select_state(dpi->pinctrl, dpi->pins_gpio);
++out:
++	if (dpi->conf->runtime_pm)
++		mutex_unlock(&dpi->power_lock);
+ }
+ 
+ static void mtk_dpi_bridge_enable(struct drm_bridge *bridge,
+@@ -402,11 +416,25 @@ static void mtk_dpi_bridge_enable(struct drm_bridge *bridge,
+ 	struct mtk_dpi_sync sync = { 0 };
+ 	struct mtk_dpi_yc_limit limit;
+ 	struct videomode vm;
++	int ret;
++
++	if (dpi->conf->runtime_pm) {
++		mutex_lock(&dpi->power_lock);
++		if (dpi->power_dead || dpi->bridge_powered)
++			goto out;
++		ret = mtk_dpi_runtime_get_locked(dpi);
++		if (ret) {
++			dev_err(dpi->dev, "Failed to power DP_INTF bridge: %d\n", ret);
++			goto out;
++		}
++		dpi->bridge_powered = true;
++	}
+ 
+ 	if (dpi->pinctrl && dpi->pins_dpi)
+ 		pinctrl_select_state(dpi->pinctrl, dpi->pins_dpi);
+ 
+-	mtk_dpi_power_on(dpi);
++	if (!dpi->conf->runtime_pm)
++		mtk_dpi_power_on(dpi);
+ 
+ 	/* Set pixel clock and initialize parameters to send to the HW */
+ 	mtk_dpi_set_display_mode(dpi, &vm, &sync, &dpi_pol, &limit);
+@@ -415,6 +443,9 @@ static void mtk_dpi_bridge_enable(struct drm_bridge *bridge,
+ 	mtk_dpi_config_hw(dpi, &vm, &sync, &dpi_pol, &limit);
+ 
+ 	mtk_dpi_enable(dpi);
++out:
++	if (dpi->conf->runtime_pm)
++		mutex_unlock(&dpi->power_lock);
+ }
+ 
+ static enum drm_mode_status
+@@ -430,41 +461,113 @@ mtk_dpi_bridge_mode_valid(struct drm_bridge *bridge,
+ 	return MODE_OK;
+ }
+ 
++static int mtk_dpi_debug_begin(struct mtk_dpi *dpi)
++{
++	int ret;
++
++	if (!dpi->conf->runtime_pm)
++		return 0;
++	mutex_lock(&dpi->power_lock);
++	if (dpi->power_dead) {
++		ret = -ENODEV;
++		goto err_unlock;
++	}
++	/* Diagnostics must not wake an otherwise inactive external output. */
++	if (!dpi->refcount) {
++		ret = -EAGAIN;
++		goto err_unlock;
++	}
++	ret = mtk_dpi_runtime_get_locked(dpi);
++	if (ret)
++		goto err_unlock;
++	return 0;
++err_unlock:
++	mutex_unlock(&dpi->power_lock);
++	return ret;
++}
++
++static void mtk_dpi_debug_end(struct mtk_dpi *dpi)
++{
++	if (!dpi->conf->runtime_pm)
++		return;
++	mtk_dpi_runtime_put_locked(dpi);
++	mutex_unlock(&dpi->power_lock);
++}
++
+ static int mtk_dpi_debug_tp_show(struct seq_file *m, void *arg)
+ {
+ 	struct mtk_dpi *dpi = m->private;
+ 	bool en;
+ 	u32 val;
++	int ret;
+ 
+ 	if (!dpi)
+ 		return -EINVAL;
+-
++	ret = mtk_dpi_debug_begin(dpi);
++	if (ret)
++		return ret;
+ 	val = readl(dpi->regs + DPI_PATTERN0);
+ 	en = val & DPI_PAT_EN;
+ 	val = FIELD_GET(DPI_PAT_SEL, val);
+-
+-	return mtk_dpi_common_debug_tp_show(m, en, val);
++	ret = mtk_dpi_common_debug_tp_show(m, en, val);
++	mtk_dpi_debug_end(dpi);
++	return ret;
+ }
+ 
+ static ssize_t mtk_dpi_debug_tp_write(struct file *file, const char __user *ubuf,
+ 				      size_t len, loff_t *offp)
+ {
+ 	struct seq_file *m = file->private_data;
++	struct mtk_dpi *dpi;
+ 	u32 en, type;
+ 	ssize_t ret;
++	int power_ret;
+ 
+-	/* seq_file and dpi pointers are checked by mtk_dpi_common_debug_tp_write() */
++	if (!m || !m->private)
++		return -EINVAL;
+ 	ret = mtk_dpi_common_debug_tp_write(file, ubuf, len, offp, &en, &type);
+ 	if (ret < 0)
+ 		return ret;
+-
+-	mtk_dpi_test_pattern_en((struct mtk_dpi *)m->private, type, en);
++	dpi = m->private;
++	power_ret = mtk_dpi_debug_begin(dpi);
++	if (power_ret)
++		return power_ret;
++	mtk_dpi_test_pattern_en(dpi, type, en);
++	mtk_dpi_debug_end(dpi);
+ 	return ret;
+ }
+ 
+ static int mtk_dpi_debug_tp_open(struct inode *inode, struct file *file)
+ {
+-	return single_open(file, mtk_dpi_debug_tp_show, inode->i_private);
++	struct mtk_dpi *dpi = inode->i_private;
++	int ret;
++
++	if (!dpi->conf->runtime_pm)
++		return single_open(file, mtk_dpi_debug_tp_show, dpi);
++	mutex_lock(&dpi->power_lock);
++	if (dpi->power_dead) {
++		mutex_unlock(&dpi->power_lock);
++		return -ENODEV;
++	}
++	drm_bridge_get(&dpi->bridge);
++	mutex_unlock(&dpi->power_lock);
++	ret = single_open(file, mtk_dpi_debug_tp_show, dpi);
++	if (ret)
++		drm_bridge_put(&dpi->bridge);
++	return ret;
++}
++
++static int mtk_dpi_debug_tp_release(struct inode *inode, struct file *file)
++{
++	struct seq_file *m = file->private_data;
++	struct mtk_dpi *dpi = m->private;
++	bool runtime_pm = dpi->conf->runtime_pm;
++	int ret;
++
++	ret = single_release(inode, file);
++	if (runtime_pm)
++		drm_bridge_put(&dpi->bridge);
++	return ret;
+ }
+ 
+ static const struct file_operations mtk_dpi_debug_tp_fops = {
+@@ -476,11 +579,24 @@ static const struct file_operations mtk_dpi_debug_tp_fops = {
+ 	.release = single_release,
+ };
+ 
++static const struct file_operations mtk_dpi_runtime_debug_tp_fops = {
++	.owner = THIS_MODULE,
++	.open = mtk_dpi_debug_tp_open,
++	.read = seq_read,
++	.write = mtk_dpi_debug_tp_write,
++	.llseek = seq_lseek,
++	.release = mtk_dpi_debug_tp_release,
++};
++
+ static void mtk_dpi_debugfs_init(struct drm_bridge *bridge, struct dentry *root)
+ {
+ 	struct mtk_dpi *dpi = bridge_to_dpi(bridge);
+ 
+-	debugfs_create_file("dpi_test_pattern", 0640, root, dpi, &mtk_dpi_debug_tp_fops);
++	if (dpi->conf->runtime_pm)
++		dpi->debugfs_tp = debugfs_create_file("dpi_test_pattern", 0640, root, dpi,
++						 &mtk_dpi_runtime_debug_tp_fops);
++	else
++		debugfs_create_file("dpi_test_pattern", 0640, root, dpi, &mtk_dpi_debug_tp_fops);
+ }
+ 
+ static const struct drm_bridge_funcs mtk_dpi_bridge_funcs = {
+@@ -501,9 +617,22 @@ static const struct drm_bridge_funcs mtk_dpi_bridge_funcs = {
+ void mtk_dpi_start(struct device *dev)
+ {
+ 	struct mtk_dpi *dpi = dev_get_drvdata(dev);
++	int ret;
+ 
+ 	if (dpi->conf->clocked_by_hdmi)
+ 		return;
++	if (dpi->conf->runtime_pm) {
++		mutex_lock(&dpi->power_lock);
++		if (!dpi->power_dead && !dpi->component_powered) {
++			ret = mtk_dpi_runtime_get_locked(dpi);
++			if (!ret)
++				dpi->component_powered = true;
++			else
++				dev_err(dev, "Failed to power DP_INTF component: %d\n", ret);
++		}
++		mutex_unlock(&dpi->power_lock);
++		return;
++	}
+ 
+ 	mtk_dpi_power_on(dpi);
+ }
+@@ -514,6 +643,16 @@ void mtk_dpi_stop(struct device *dev)
+ 
+ 	if (dpi->conf->clocked_by_hdmi)
+ 		return;
++	if (dpi->conf->runtime_pm) {
++		mutex_lock(&dpi->power_lock);
++		if (!dpi->power_dead && dpi->component_powered) {
++			mtk_dpi_disable(dpi);
++			dpi->component_powered = false;
++			mtk_dpi_runtime_put_locked(dpi);
++		}
++		mutex_unlock(&dpi->power_lock);
++		return;
++	}
+ 
+ 	mtk_dpi_disable(dpi);
+ 	mtk_dpi_power_off(dpi);
+@@ -714,6 +853,7 @@ static const struct mtk_dpi_conf mt8195_dpintf_conf = {
+  * mt6897_dp_intf_driver_data: np_sel 0).
+  */
+ static const struct mtk_dpi_conf mt6897_dpintf_conf = {
++	.runtime_pm = true,
+ 	.dpi_factor = dpi_factor_mt8195_dp_intf,
+ 	.num_dpi_factor = ARRAY_SIZE(dpi_factor_mt8195_dp_intf),
+ 	.max_clock_khz = 600000,
+diff --git a/drivers/gpu/drm/mediatek/mtk_dpi_common.c b/drivers/gpu/drm/mediatek/mtk_dpi_common.c
+index cd56cc61ad..eedb46db9b 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dpi_common.c
++++ b/drivers/gpu/drm/mediatek/mtk_dpi_common.c
+@@ -13,6 +13,7 @@
+ #include <linux/of_graph.h>
+ #include <linux/pinctrl/consumer.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ 
+ #include <drm/drm_bridge.h>
+ #include <drm/drm_bridge_connector.h>
+@@ -27,6 +28,13 @@
+ 
+ void mtk_dpi_power_off(struct mtk_dpi *dpi)
+ {
++	if (dpi->conf->runtime_pm) {
++		mutex_lock(&dpi->power_lock);
++		mtk_dpi_runtime_put_locked(dpi);
++		mutex_unlock(&dpi->power_lock);
++		return;
++	}
++
+ 	if (WARN_ON(dpi->refcount == 0))
+ 		return;
+ 
+@@ -43,6 +51,13 @@ int mtk_dpi_power_on(struct mtk_dpi *dpi)
+ {
+ 	int ret;
+ 
++	if (dpi->conf->runtime_pm) {
++		mutex_lock(&dpi->power_lock);
++		ret = mtk_dpi_runtime_get_locked(dpi);
++		mutex_unlock(&dpi->power_lock);
++		return ret;
++	}
++
+ 	if (++dpi->refcount != 1)
+ 		return 0;
+ 
+@@ -76,6 +91,58 @@ int mtk_dpi_power_on(struct mtk_dpi *dpi)
+ }
+ EXPORT_SYMBOL_NS_GPL(mtk_dpi_power_on, "DRM_MTK_DPI");
+ 
++int mtk_dpi_runtime_get_locked(struct mtk_dpi *dpi)
++{
++	int ret;
++
++	lockdep_assert_held(&dpi->power_lock);
++	if (dpi->power_dead)
++		return -ENODEV;
++	if (dpi->refcount) {
++		dpi->refcount++;
++		return 0;
++	}
++
++	ret = pm_runtime_resume_and_get(dpi->dev);
++	if (ret < 0)
++		return ret;
++	ret = clk_prepare_enable(dpi->engine_clk);
++	if (ret)
++		goto err_pm;
++	ret = clk_prepare_enable(dpi->tvd_clk);
++	if (ret)
++		goto err_engine;
++	ret = clk_prepare_enable(dpi->pixel_clk);
++	if (ret)
++		goto err_tvd;
++
++	dpi->refcount = 1;
++	return 0;
++err_tvd:
++	clk_disable_unprepare(dpi->tvd_clk);
++err_engine:
++	clk_disable_unprepare(dpi->engine_clk);
++err_pm:
++	pm_runtime_put(dpi->dev);
++	return ret;
++}
++EXPORT_SYMBOL_NS_GPL(mtk_dpi_runtime_get_locked, "DRM_MTK_DPI");
++
++void mtk_dpi_runtime_put_locked(struct mtk_dpi *dpi)
++{
++	lockdep_assert_held(&dpi->power_lock);
++	if (WARN_ON(!dpi->refcount))
++		return;
++	if (--dpi->refcount)
++		return;
++
++	clk_disable_unprepare(dpi->pixel_clk);
++	clk_disable_unprepare(dpi->tvd_clk);
++	clk_disable_unprepare(dpi->engine_clk);
++	pm_runtime_put(dpi->dev);
++}
++EXPORT_SYMBOL_NS_GPL(mtk_dpi_runtime_put_locked, "DRM_MTK_DPI");
++
+ static unsigned int mtk_dpi_calculate_factor(struct mtk_dpi *dpi, int mode_clk)
+ {
+ 	const struct mtk_dpi_factor *dpi_factor = dpi->conf->dpi_factor;
+@@ -281,6 +348,28 @@ static const struct drm_encoder_funcs mtk_dpi_encoder_funcs = {
+ 	.destroy = drm_encoder_cleanup,
+ };
+ 
++static int mtk_dpi_runtime_bind_check(struct mtk_dpi *dpi)
++{
++	int ret;
++
++	if (!dpi->conf->runtime_pm)
++		return 0;
++	mutex_lock(&dpi->power_lock);
++	ret = (!dpi->power_dead || dpi->refcount || dpi->component_powered ||
++	       dpi->bridge_powered) ? -EBUSY : 0;
++	mutex_unlock(&dpi->power_lock);
++	return ret;
++}
++
++static void mtk_dpi_runtime_bound(struct mtk_dpi *dpi)
++{
++	if (!dpi->conf->runtime_pm)
++		return;
++	mutex_lock(&dpi->power_lock);
++	dpi->power_dead = false;
++	mutex_unlock(&dpi->power_lock);
++}
++
+ int mtk_dpi_common_bind(struct device *dev, struct device *master, void *data)
+ {
+ 	struct mtk_dpi *dpi = dev_get_drvdata(dev);
+@@ -288,6 +377,10 @@ int mtk_dpi_common_bind(struct device *dev, struct device *master, void *data)
+ 	struct mtk_drm_private *priv = drm_dev->dev_private;
+ 	int ret;
+ 
++	ret = mtk_dpi_runtime_bind_check(dpi);
++	if (ret)
++		return ret;
++
+ 	dpi->mmsys_dev = priv->mmsys_dev;
+ 	ret = drm_encoder_init(drm_dev, &dpi->encoder, &mtk_dpi_encoder_funcs,
+ 			       DRM_MODE_ENCODER_TMDS, NULL);
+@@ -313,6 +406,7 @@ int mtk_dpi_common_bind(struct device *dev, struct device *master, void *data)
+ 		goto err_output;
+ 	}
+ 
++	mtk_dpi_runtime_bound(dpi);
+ 	return 0;
+ 
+ err_output:
+@@ -322,6 +416,7 @@ int mtk_dpi_common_bind(struct device *dev, struct device *master, void *data)
+ 	 */
+ 	if (dpi->conf->output_optional) {
+ 		dev_warn(dev, "output unavailable: %d\n", ret);
++		mtk_dpi_runtime_bound(dpi);
+ 		return 0;
+ 	}
+ err_cleanup:
+@@ -334,6 +429,17 @@ void mtk_dpi_common_unbind(struct device *dev, struct device *master, void *data
+ {
+ 	struct mtk_dpi *dpi = dev_get_drvdata(dev);
+ 
++	if (dpi->conf->runtime_pm) {
++		mutex_lock(&dpi->power_lock);
++		dpi->power_dead = true;
++		if (dpi->refcount)
++			dev_warn(dev, "unbinding with %d retained power references\n", dpi->refcount);
++		mutex_unlock(&dpi->power_lock);
++		/* Never wait for debugfs callbacks while holding power_lock. */
++		debugfs_remove(dpi->debugfs_tp);
++		dpi->debugfs_tp = NULL;
++	}
++
+ 	drm_encoder_cleanup(&dpi->encoder);
+ }
+ EXPORT_SYMBOL_NS_GPL(mtk_dpi_common_unbind, "DRM_MTK_DPI");
+@@ -414,6 +520,8 @@ struct mtk_dpi *mtk_dpi_common_probe(struct platform_device *pdev,
+ 	dpi->dev = dev;
+ 	dpi->conf = (struct mtk_dpi_conf *)of_device_get_match_data(dev);
+ 	dpi->output_fmt = MEDIA_BUS_FMT_RGB888_1X24;
++	mutex_init(&dpi->power_lock);
++	dpi->power_dead = true;
+ 
+ 	dpi->pinctrl = devm_pinctrl_get(dev);
+ 	if (IS_ERR_OR_NULL(dpi->pinctrl)) {
+@@ -470,6 +578,12 @@ struct mtk_dpi *mtk_dpi_common_probe(struct platform_device *pdev,
+ 
+ 	platform_set_drvdata(pdev, dpi);
+ 
++	if (dpi->conf->runtime_pm) {
++		ret = devm_pm_runtime_enable(dev);
++		if (ret)
++			return ERR_PTR(ret);
++	}
++
+ 	dpi->bridge.of_node = dev->of_node;
+ 	dpi->bridge.type = DRM_MODE_CONNECTOR_DPI;
+ 
+diff --git a/drivers/gpu/drm/mediatek/mtk_dpi_common.h b/drivers/gpu/drm/mediatek/mtk_dpi_common.h
+index bf8feeceee..4cb88ef736 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dpi_common.h
++++ b/drivers/gpu/drm/mediatek/mtk_dpi_common.h
+@@ -9,6 +9,7 @@
+ #define _MTK_DPI_COMMON_H
+ 
+ #include <linux/clk.h>
++#include <linux/mutex.h>
+ #include <linux/pinctrl/consumer.h>
+ #include <uapi/linux/media-bus-format.h>
+ #include <drm/drm_bridge.h>
+@@ -90,6 +91,12 @@ struct mtk_dpi {
+ 	struct pinctrl_state *pins_dpi;
+ 	u32 output_fmt;
+ 	s8 refcount;
++	/* MT6897 full PM/clock transitions and complete debug transactions. */
++	struct mutex power_lock;
++	bool power_dead;
++	bool component_powered;
++	bool bridge_powered;
++	struct dentry *debugfs_tp;
+ };
+ 
+ enum mtk_dpi_polarity {
+@@ -185,6 +192,8 @@ struct mtk_dpi_conf {
+ 	bool buf_ctrl;
+ 	/* An external output whose failure must not stop the display */
+ 	bool output_optional;
++	/* MT6897 DP_INTF participates in its genpd through full references. */
++	bool runtime_pm;
+ };
+ 
+ static inline struct mtk_dpi *bridge_to_dpi(struct drm_bridge *b)
+@@ -285,6 +294,9 @@ void mtk_dpi_bridge_mode_set(struct drm_bridge *bridge,
+ int mtk_dpi_common_bind(struct device *dev, struct device *master, void *data);
+ void mtk_dpi_common_unbind(struct device *dev, struct device *master, void *data);
+ 
++/* These helpers require power_lock; no caller may wake an inactive debug path. */
++int mtk_dpi_runtime_get_locked(struct mtk_dpi *dpi);
++void mtk_dpi_runtime_put_locked(struct mtk_dpi *dpi);
+ void mtk_dpi_power_off(struct mtk_dpi *dpi);
+ int mtk_dpi_power_on(struct mtk_dpi *dpi);
+ int mtk_dpi_set_display_mode(struct mtk_dpi *dpi, struct videomode *vm,
+diff --git a/tools/testing/selftests/mtk_clk/Makefile b/tools/testing/selftests/mtk_clk/Makefile
+index 5dbde15742..5c3f31fa7e 100644
+--- a/tools/testing/selftests/mtk_clk/Makefile
++++ b/tools/testing/selftests/mtk_clk/Makefile
+@@ -1,4 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-TEST_PROGS := test_mt6897.py test_domains.py test_boot_owner.py test_directlink.py test_display_pm.py
+-TEST_FILES := mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c ven_cases.c boot_stubs.h boot_cases.c directlink_cases.c display_pm_cases.c mmsys_pm_cases.c
++TEST_PROGS := test_mt6897.py test_domains.py test_boot_owner.py test_directlink.py test_display_pm.py test_dpintf_pm.py
++TEST_FILES := mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c ven_cases.c boot_stubs.h boot_cases.c directlink_cases.c display_pm_cases.c mmsys_pm_cases.c dpintf_pm_cases.c
+ include ../lib.mk
+diff --git a/tools/testing/selftests/mtk_clk/dpintf_pm_cases.c b/tools/testing/selftests/mtk_clk/dpintf_pm_cases.c
+new file mode 100644
+index 0000000000..edcfde2c41
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/dpintf_pm_cases.c
+@@ -0,0 +1,262 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <errno.h>
++#define mutex pthread_mutex_t
++#define mutex_lock(p) assert(pthread_mutex_lock(p) == 0)
++#define mutex_unlock(p) assert(pthread_mutex_unlock(p) == 0)
++#define lockdep_assert_held(p) assert(pthread_mutex_trylock(p) == EBUSY)
++#define WARN_ON(x) (assert(!(x)), 0)
++#define dev_err(...) ((void)0)
++#define dev_warn(...) ((void)0)
++struct device { void *data; int refs, error; };
++struct clk { int refs, error; };
++struct drm_bridge { int refs; };
++struct drm_atomic_commit { int unused; };
++struct videomode { int unused; };
++struct mtk_dpi_polarities { int unused; };
++struct mtk_dpi_sync { int unused; };
++struct mtk_dpi_yc_limit { int unused; };
++struct mtk_dpi_conf { bool runtime_pm, clocked_by_hdmi; };
++struct mtk_dpi {
++	struct drm_bridge bridge;
++	struct device *dev;
++	struct clk *engine_clk, *tvd_clk, *pixel_clk;
++	const struct mtk_dpi_conf *conf;
++	pthread_mutex_t power_lock;
++	int8_t refcount;
++	bool power_dead, component_powered, bridge_powered;
++	void *pinctrl, *pins_gpio, *pins_dpi, *debugfs_tp;
++	int encoder;
++};
++struct seq_file { void *private; };
++struct inode { void *i_private; };
++struct file { void *private_data; };
++static struct mtk_dpi dpi;
++static struct device device;
++static struct clk clocks[3];
++static struct mtk_dpi_conf selected = { true, false }, other = { false, false };
++static int mmio, events[64], count, single_error, removed, encoder_cleaned;
++static void *dev_get_drvdata(struct device *dev) { return dev->data; }
++static struct mtk_dpi *bridge_to_dpi(struct drm_bridge *bridge)
++{
++	return (struct mtk_dpi *)((char *)bridge - offsetof(struct mtk_dpi, bridge));
++}
++static int pm_runtime_resume_and_get(struct device *dev)
++{
++	events[count++] = 1;
++	if (dev->error)
++		return dev->error;
++	dev->refs++;
++	return 0;
++}
++static void pm_runtime_put(struct device *dev)
++{
++	events[count++] = -1;
++	assert(dev->refs > 0);
++	dev->refs--;
++}
++static int clk_prepare_enable(struct clk *clk)
++{
++	events[count++] = 2 + (int)(clk - clocks);
++	if (clk->error)
++		return clk->error;
++	clk->refs++;
++	return 0;
++}
++static void clk_disable_unprepare(struct clk *clk)
++{
++	events[count++] = -2 - (int)(clk - clocks);
++	assert(clk->refs > 0);
++	clk->refs--;
++}
++static void check_power(void)
++{
++	assert(!dpi.conf->runtime_pm || device.refs == 1);
++	for (int i = 0; i < 3; i++)
++		assert(clocks[i].refs == 1);
++	mmio++;
++}
++static void mtk_dpi_disable(struct mtk_dpi *p) { assert(p == &dpi); check_power(); }
++static void mtk_dpi_enable(struct mtk_dpi *p) { assert(p == &dpi); check_power(); }
++static int mtk_dpi_set_display_mode(struct mtk_dpi *p, struct videomode *v,
++	struct mtk_dpi_sync *s, struct mtk_dpi_polarities *pol, struct mtk_dpi_yc_limit *l)
++{
++	check_power();
++	return 0;
++}
++static void mtk_dpi_config_hw(struct mtk_dpi *p, struct videomode *v,
++	struct mtk_dpi_sync *s, struct mtk_dpi_polarities *pol, struct mtk_dpi_yc_limit *l)
++{
++	check_power();
++}
++static void pinctrl_select_state(void *p, void *s) { }
++static void drm_encoder_cleanup(int *encoder) { encoder_cleaned++; }
++static void debugfs_remove(void *entry) { removed++; }
++static void drm_bridge_get(struct drm_bridge *bridge) { bridge->refs++; }
++static void drm_bridge_put(struct drm_bridge *bridge) { assert(bridge->refs > 0); bridge->refs--; }
++static int mtk_dpi_debug_tp_show(struct seq_file *m, void *arg) { return 0; }
++static int single_open(struct file *file, int (*show)(struct seq_file *, void *), void *p)
++{
++	static struct seq_file seq;
++	if (single_error)
++		return single_error;
++	seq.private = p;
++	file->private_data = &seq;
++	return 0;
++}
++static int single_release(struct inode *inode, struct file *file) { return 0; }
++int mtk_dpi_runtime_get_locked(struct mtk_dpi *p);
++void mtk_dpi_runtime_put_locked(struct mtk_dpi *p);
++/* PRODUCTION */
++
++static void idle(void)
++{
++	assert(dpi.refcount == 0 && device.refs == 0);
++	for (int i = 0; i < 3; i++)
++		assert(clocks[i].refs == 0);
++}
++static void reset(void)
++{
++	idle();
++	count = mmio = removed = encoder_cleaned = 0;
++	dpi.power_dead = false;
++	dpi.component_powered = dpi.bridge_powered = false;
++	device.error = single_error = 0;
++	for (int i = 0; i < 3; i++)
++		clocks[i].error = 0;
++}
++static atomic_bool worker_started, worker_done;
++static void *stop_worker(void *arg)
++{
++	atomic_store(&worker_started, true);
++	mtk_dpi_stop(&device);
++	atomic_store(&worker_done, true);
++	return NULL;
++}
++static void *unbind_worker(void *arg)
++{
++	atomic_store(&worker_started, true);
++	mtk_dpi_common_unbind(&device, NULL, NULL);
++	atomic_store(&worker_done, true);
++	return NULL;
++}
++static void race(void *(*worker)(void *))
++{
++	pthread_t thread;
++	assert(mtk_dpi_debug_begin(&dpi) == 0);
++	assert(dpi.refcount == 2);
++	atomic_store(&worker_started, false);
++	atomic_store(&worker_done, false);
++	assert(pthread_create(&thread, NULL, worker, NULL) == 0);
++	while (!atomic_load(&worker_started)) { }
++	assert(!atomic_load(&worker_done));
++	check_power();
++	mtk_dpi_debug_end(&dpi);
++	assert(pthread_join(thread, NULL) == 0);
++	assert(atomic_load(&worker_done));
++}
++int main(void)
++{
++	device.data = &dpi;
++	dpi.dev = &device;
++	dpi.conf = &selected;
++	dpi.engine_clk = &clocks[0]; dpi.tvd_clk = &clocks[1]; dpi.pixel_clk = &clocks[2];
++	assert(pthread_mutex_init(&dpi.power_lock, NULL) == 0);
++	for (int bridge_owner = 0; bridge_owner < 2; bridge_owner++) {
++		for (int fail = 0; fail < 4; fail++) {
++			reset();
++			if (fail == 0)
++				device.error = -EIO;
++			else
++				clocks[fail - 1].error = -EIO;
++			if (bridge_owner)
++				mtk_dpi_bridge_enable(&dpi.bridge, NULL);
++			else
++				mtk_dpi_start(&device);
++			assert(!dpi.component_powered && !dpi.bridge_powered);
++			idle();
++			int before = mmio;
++			if (bridge_owner)
++				mtk_dpi_bridge_disable(&dpi.bridge, NULL);
++			else
++				mtk_dpi_stop(&device);
++			assert(mmio == before);
++			assert(events[0] == 1);
++			if (fail)
++				assert(events[count - 1] == -1);
++		}
++	}
++	reset();
++	device.error = -EIO;
++	mtk_dpi_bridge_enable(&dpi.bridge, NULL);
++	idle();
++	assert(!dpi.bridge_powered && mmio == 0);
++	device.error = 0;
++	mtk_dpi_start(&device);
++	mtk_dpi_bridge_disable(&dpi.bridge, NULL);
++	assert(dpi.component_powered && dpi.refcount == 1 && mmio == 0);
++	mtk_dpi_stop(&device);
++	reset();
++	device.error = -EIO;
++	mtk_dpi_start(&device);
++	device.error = 0;
++	mtk_dpi_bridge_enable(&dpi.bridge, NULL);
++	int before = mmio;
++	mtk_dpi_stop(&device);
++	assert(dpi.bridge_powered && dpi.refcount == 1 && mmio == before);
++	mtk_dpi_bridge_disable(&dpi.bridge, NULL);
++	reset();
++	mtk_dpi_start(&device);
++	mtk_dpi_bridge_enable(&dpi.bridge, NULL);
++	assert(dpi.refcount == 2 && device.refs == 1 && count == 4);
++	mtk_dpi_start(&device);
++	mtk_dpi_bridge_enable(&dpi.bridge, NULL);
++	assert(dpi.refcount == 2);
++	mtk_dpi_stop(&device);
++	assert(dpi.refcount == 1 && dpi.bridge_powered);
++	mtk_dpi_bridge_disable(&dpi.bridge, NULL);
++	idle();
++	assert(events[count - 4] == -4 && events[count - 3] == -3 && events[count - 2] == -2 && events[count - 1] == -1);
++	reset();
++	assert(mtk_dpi_debug_begin(&dpi) == -EAGAIN && count == 0);
++	mtk_dpi_start(&device);
++	race(stop_worker);
++	idle();
++	reset();
++	mtk_dpi_start(&device);
++	race(unbind_worker);
++	assert(dpi.power_dead && dpi.refcount == 1 && removed == 1 && encoder_cleaned == 1);
++	assert(mtk_dpi_debug_begin(&dpi) == -ENODEV);
++	assert(mtk_dpi_runtime_bind_check(&dpi) == -EBUSY);
++	mtk_dpi_bridge_enable(&dpi.bridge, NULL);
++	assert(!dpi.bridge_powered && dpi.refcount == 1);
++	/* Test-only disposal of the retained mock lease, never production unbind. */
++	mtk_dpi_power_off(&dpi);
++	dpi.component_powered = false;
++	assert(mtk_dpi_runtime_bind_check(&dpi) == 0);
++	mtk_dpi_runtime_bound(&dpi);
++	assert(!dpi.power_dead);
++	struct inode inode = { .i_private = &dpi };
++	struct file file = { 0 };
++	single_error = -ENOMEM;
++	assert(mtk_dpi_debug_tp_open(&inode, &file) == -ENOMEM && dpi.bridge.refs == 0);
++	single_error = 0;
++	assert(mtk_dpi_debug_tp_open(&inode, &file) == 0 && dpi.bridge.refs == 1);
++	mtk_dpi_common_unbind(&device, NULL, NULL);
++	assert(mtk_dpi_debug_tp_release(&inode, &file) == 0 && dpi.bridge.refs == 0);
++	reset();
++	dpi.conf = &other;
++	assert(mtk_dpi_power_on(&dpi) == 0);
++	assert(device.refs == 0 && count == 3);
++	mtk_dpi_power_off(&dpi);
++	idle();
++	assert(pthread_mutex_destroy(&dpi.power_lock) == 0);
++	puts("MT6897 DP_INTF power failures, dual owners, debug/stop/unbind ordering and bridge lifetime passed");
++	return 0;
++}
+diff --git a/tools/testing/selftests/mtk_clk/test_dpintf_pm.py b/tools/testing/selftests/mtk_clk/test_dpintf_pm.py
+new file mode 100755
+index 0000000000..fed393d7a7
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/test_dpintf_pm.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Check production MT6897 DP_INTF power, owner and debug serialization."""
++from pathlib import Path
++import os
++import re
++import subprocess
++import tempfile
++
++assets = Path(__file__).resolve().parent
++repo = Path(os.environ.get('KERNEL_SRC', str(assets.parents[3])))
++common = (repo / 'drivers/gpu/drm/mediatek/mtk_dpi_common.c').read_text()
++dpi = (repo / 'drivers/gpu/drm/mediatek/mtk_dpi.c').read_text()
++
++
++def function(source, name):
++    match = re.search(r'^(?:static )?(?:int|void) ' + name + r'\(', source, re.M)
++    start = match.start()
++    end = source.index('{', start) + 1
++    depth = 1
++    while depth:
++        depth += (source[end] == '{') - (source[end] == '}')
++        end += 1
++    return source[start:end]
++
++
++assert dpi.count('.runtime_pm = true') == 1
++assert '.runtime_pm = true' in dpi.split('mt6897_dpintf_conf = {', 1)[1].split('};', 1)[0]
++probe = common[common.index('struct mtk_dpi *mtk_dpi_common_probe'):]
++assert probe.index('mutex_init') < probe.index('devm_pm_runtime_enable') < probe.index('devm_drm_bridge_add')
++unbind = function(common, 'mtk_dpi_common_unbind')
++assert unbind.index('power_dead = true') < unbind.index('mutex_unlock') < unbind.index('debugfs_remove')
++assert 'runtime_put' not in unbind
++assert 'drm_bridge_get' in function(dpi, 'mtk_dpi_debug_tp_open')
++assert 'drm_bridge_put' in function(dpi, 'mtk_dpi_debug_tp_release')
++for name, mmio in [('mtk_dpi_debug_tp_show', 'readl('),
++                   ('mtk_dpi_debug_tp_write', 'mtk_dpi_test_pattern_en(')]:
++    start = dpi.index('static ' + ('int ' if name.endswith('show') else 'ssize_t ') + name)
++    body = dpi[start:dpi.index('\n}\n', start)]
++    assert body.index('mtk_dpi_debug_begin') < body.index(mmio) < body.index('mtk_dpi_debug_end')
++production = '\n'.join(function(common, name) for name in [
++    'mtk_dpi_runtime_get_locked', 'mtk_dpi_runtime_put_locked',
++    'mtk_dpi_power_on', 'mtk_dpi_power_off', 'mtk_dpi_runtime_bind_check',
++    'mtk_dpi_runtime_bound', 'mtk_dpi_common_unbind'])
++production += '\n' + '\n'.join(function(dpi, name) for name in [
++    'mtk_dpi_bridge_enable', 'mtk_dpi_bridge_disable', 'mtk_dpi_start',
++    'mtk_dpi_stop', 'mtk_dpi_debug_begin', 'mtk_dpi_debug_end',
++    'mtk_dpi_debug_tp_open', 'mtk_dpi_debug_tp_release'])
++with tempfile.TemporaryDirectory(prefix='mtk-dpintf-pm-') as tmp:
++    tmp = Path(tmp)
++    c = tmp / 'test.c'
++    c.write_text((assets / 'dpintf_pm_cases.c').read_text().replace('/* PRODUCTION */', production))
++    binary = tmp / 'test'
++    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
++                    '-Wno-unused-parameter', '-Werror', '-g', '-pthread',
++                    '-fsanitize=address,undefined', str(c), '-o', str(binary)], check=True)
++    subprocess.run([str(binary)], check=True)
+-- 
+2.56.0
+

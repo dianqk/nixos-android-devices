@@ -1,0 +1,93 @@
+From ac94876249911ae0dd5d9ada8c750ffb0a63d3e4 Mon Sep 17 00:00:00 2001
+From: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Date: Thu, 22 Oct 2026 10:58:00 +0200
+Subject: [PATCH 027/144] Revert "crypto: qce - Mark QCE as BROKEN"
+
+The self-tests for this driver have been fixed. The crypto algorithms
+are only registered if the user explicitly requests it with the provided
+module parameter defaulting to false. There's no reason to further keep
+it unbuildable with the BROKEN label so revert commit df373d39c6f0
+("crypto: qce - Mark QCE as BROKEN").
+
+While at it: update the Kconfig description by saying this is an
+"offloader" and not an "accelerator".
+
+Cc: stable@vger.kernel.org
+Fixes: df373d39c6f0 ("crypto: qce - Mark QCE as BROKEN")
+Tested-by: Kuldeep Singh <kuldeep.singh@oss.qualcomm.com>
+Tested-by: Pankaj Patil <pankaj.patil@oss.qualcomm.com>
+Tested-by: Birk Skyum <birk.skyum@pm.me> # X1E80100, Lenovo Yoga Slim 7x
+Signed-off-by: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Message-ID: <20261022-qce-fixes-broken-label-v11-2-0d33c34fd0c3@oss.qualcomm.com>
+Link: https://lore.kernel.org/r/20261022-qce-fixes-broken-label-v11-2-0d33c34fd0c3@oss.qualcomm.com
+(cherry picked from commit dea0c2d5f76fe70116434b5e3b897a62c8fb49ab)
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0045-Revert-crypto-qce-Mark-QCE-as-BROKEN.patch
+Import-SHA256: 6ac7be1f8ace0b53c197bc68b3d233185469f1a5a8a0688297bdb04c8b7b0518
+Import-Provenance: mail headers
+(cherry picked from commit 5d27082ea975b8af4bde6efbfc8e55bb45954f83)
+---
+ arch/arm/configs/multi_v7_defconfig |  1 +
+ arch/arm64/configs/defconfig        |  1 +
+ drivers/crypto/Kconfig              | 22 +++++++++++++---------
+ 3 files changed, 15 insertions(+), 9 deletions(-)
+
+diff --git a/arch/arm/configs/multi_v7_defconfig b/arch/arm/configs/multi_v7_defconfig
+index f9b8dbf931..2d6292f8ca 100644
+--- a/arch/arm/configs/multi_v7_defconfig
++++ b/arch/arm/configs/multi_v7_defconfig
+@@ -1323,6 +1323,7 @@ CONFIG_CRYPTO_DEV_ATMEL_AES=m
+ CONFIG_CRYPTO_DEV_ATMEL_TDES=m
+ CONFIG_CRYPTO_DEV_ATMEL_SHA=m
+ CONFIG_CRYPTO_DEV_MARVELL_CESA=m
++CONFIG_CRYPTO_DEV_QCE=m
+ CONFIG_CRYPTO_DEV_ROCKCHIP=m
+ CONFIG_CRYPTO_DEV_STM32_HASH=m
+ CONFIG_CRYPTO_DEV_STM32_CRYP=m
+diff --git a/arch/arm64/configs/defconfig b/arch/arm64/configs/defconfig
+index 6ec8d3a69c..e80927f87f 100644
+--- a/arch/arm64/configs/defconfig
++++ b/arch/arm64/configs/defconfig
+@@ -1949,6 +1949,7 @@ CONFIG_CRYPTO_AES_ARM64_CE_CCM=y
+ CONFIG_CRYPTO_DEV_SUN8I_CE=m
+ CONFIG_CRYPTO_DEV_FSL_CAAM=m
+ CONFIG_CRYPTO_DEV_FSL_DPAA2_CAAM=m
++CONFIG_CRYPTO_DEV_QCE=m
+ CONFIG_CRYPTO_DEV_TEGRA=m
+ CONFIG_CRYPTO_DEV_ZYNQMP_AES=m
+ CONFIG_CRYPTO_DEV_ZYNQMP_SHA3=m
+diff --git a/drivers/crypto/Kconfig b/drivers/crypto/Kconfig
+index 0189dfdcbb..adcbe15851 100644
+--- a/drivers/crypto/Kconfig
++++ b/drivers/crypto/Kconfig
+@@ -527,17 +527,21 @@ source "drivers/crypto/marvell/Kconfig"
+ source "drivers/crypto/intel/Kconfig"
+ 
+ config CRYPTO_DEV_QCE
+-	tristate "Qualcomm crypto engine accelerator"
+-	depends on (BROKEN && ARCH_QCOM) || COMPILE_TEST
++	tristate "Qualcomm crypto engine offloader"
++	depends on ARCH_QCOM || COMPILE_TEST
+ 	depends on HAS_IOMEM
+ 	help
+-	  This driver supports Qualcomm crypto engine accelerator
+-	  hardware. To compile this driver as a module, choose M here. The
+-	  module will be called qcrypto.
+-
+-	  This driver does not have exclusive access to the
+-	  hardware, causing races with the secure world.  It
+-	  is also slower than the CPU.
++	  This driver supports Qualcomm crypto engine offloader hardware. To
++	  compile this driver as a module, choose M here. The module will be
++	  called qcrypto.
++
++	  NOTE: With qcrypto.do_register_algos module parameter set to true,
++	  this driver does not have exclusive access to the hardware, and may
++	  cause races with the secure world. It is also *slower* than the
++	  CPU for the same algorithms. By default it will not register crypto
++	  algorithms and only scale down the interconnect bandwidth and disable
++	  the relevant clocks. Use qcrypto.do_register_algos=1 at your own
++	  risk!
+ 
+ config CRYPTO_DEV_QCE_SKCIPHER
+ 	bool

@@ -1,0 +1,109 @@
+From c1fb557145cae83a8434c2f5dee6bd67e8aea663 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 11 Nov 2026 06:46:44 +0800
+Subject: [PATCH] pmdomain: mediatek: reject root-managed resume after
+ quarantine
+
+Runtime suspend can leave a failed domain logically on. Check existing quarantine metadata in dev_ops.start so a subsequent genpd resume cannot bypass admission through the logical-on path. Preserve the original start callback and leave the existing hardware fault handling intact.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/pmdomain/mediatek/mtk-pm-domains.c    | 26 ++++++++++++++++---
+ .../testing/selftests/mtk_clk/test_domains.py |  2 +-
+ 2 files changed, 23 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/pmdomain/mediatek/mtk-pm-domains.c b/drivers/pmdomain/mediatek/mtk-pm-domains.c
+index 046480f271..d6094044c9 100644
+--- a/drivers/pmdomain/mediatek/mtk-pm-domains.c
++++ b/drivers/pmdomain/mediatek/mtk-pm-domains.c
+@@ -95,6 +95,7 @@ struct scpsys_domain {
+ 	struct clk_bulk_data *subsys_clks;
+ 	struct regulator *supply;
+ 	struct scpsys_root_clocks *roots;
++	int (*root_dev_start)(struct device *dev);
+ };
+ 
+ struct scpsys {
+@@ -379,6 +380,18 @@ static bool scpsys_root_faulted(struct scpsys *scpsys)
+ 	return failed || READ_ONCE(scpsys->quarantined);
+ }
+ 
++/* genpd may leave the domain logically on after a failed power-off. */
++static int scpsys_root_dev_start(struct device *dev)
++{
++	struct generic_pm_domain *genpd = pd_to_genpd(dev->pm_domain);
++	struct scpsys_domain *pd = to_scpsys_domain(genpd);
++
++	if (scpsys_root_faulted(pd->scpsys) || READ_ONCE(pd->roots->failed))
++		return -EIO;
++
++	return pd->root_dev_start ? pd->root_dev_start(dev) : 0;
++}
++
+ static void scpsys_root_set_fault(struct scpsys *scpsys)
+ {
+ 	unsigned long flags;
+@@ -966,7 +979,7 @@ static int scpsys_direct_root_power_on(struct generic_pm_domain *genpd)
+ 	if (!ret)
+ 		return 0;
+ quarantine:
+-	pd->roots->failed = true;
++	WRITE_ONCE(pd->roots->failed, true);
+ 	scpsys_root_set_fault(pd->scpsys);
+ 	dev_err(pd->scpsys->dev, "%s: power-on failed (%d), MM roots quarantined\n",
+ 		genpd->name, ret);
+@@ -995,7 +1008,7 @@ static int scpsys_direct_root_power_off(struct generic_pm_domain *genpd)
+ 	scpsys_root_disable(pd);
+ 	return 0;
+ quarantine:
+-	pd->roots->failed = true;
++	WRITE_ONCE(pd->roots->failed, true);
+ 	scpsys_root_set_fault(pd->scpsys);
+ 	dev_err(pd->scpsys->dev, "%s: power-off failed (%d), MM roots quarantined\n",
+ 		genpd->name, ret);
+@@ -1018,7 +1031,7 @@ static int scpsys_hwv_root_power_on(struct generic_pm_domain *genpd)
+ 		return 0;
+ quarantine:
+ 	/* Unknown transition state: retain every successful enable and prepare. */
+-	roots->failed = true;
++	WRITE_ONCE(roots->failed, true);
+ 	scpsys_root_set_fault(pd->scpsys);
+ 	dev_err(pd->scpsys->dev, "%s: power-on failed (%d), roots quarantined\n",
+ 		genpd->name, ret);
+@@ -1053,7 +1066,7 @@ static int scpsys_hwv_root_power_off(struct generic_pm_domain *genpd)
+ 		 scpsys_root_faulted(pd->scpsys), roots->enabled_count,
+ 		 roots->num_clks);
+ 	if (ret) {
+-		roots->failed = true;
++		WRITE_ONCE(roots->failed, true);
+ 		scpsys_root_set_fault(pd->scpsys);
+ 		dev_err(pd->scpsys->dev, "%s: power-off failed (%d), roots quarantined\n",
+ 			genpd->name, ret);
+@@ -1807,6 +1820,11 @@ generic_pm_domain *scpsys_add_one_domain(struct scpsys *scpsys, struct device_no
+ 
+ 	if (ret && scpsys->soc_data->quarantine_init_failure)
+ 		return ERR_PTR(ret);
++	if (!ret && pd->roots) {
++		/* Keep any PM_CLK start installed by pm_genpd_init(). */
++		pd->root_dev_start = pd->genpd.dev_ops.start;
++		pd->genpd.dev_ops.start = scpsys_root_dev_start;
++	}
+ 
+ 	domains_idx[(*num_domains)++] = (u8) id;
+ 	scpsys->domains[id] = &pd->genpd;
+diff --git a/tools/testing/selftests/mtk_clk/test_domains.py b/tools/testing/selftests/mtk_clk/test_domains.py
+index f22470c191..bf6376ac22 100755
+--- a/tools/testing/selftests/mtk_clk/test_domains.py
++++ b/tools/testing/selftests/mtk_clk/test_domains.py
+@@ -23,7 +23,7 @@ def function(name):
+ 
+ start = source.index('static const struct scpsys_root_data *scpsys_root_data')
+ end = source.index('static int scpsys_hwv_power_on', start)
+-production = source[start:end]
++production = source[start:end].replace(function('scpsys_root_dev_start'), '')
+ # Selected direct callbacks use the production bus-protection loops.
+ production = '\n'.join(function(name) for name in [
+     'scpsys_bus_protect_clear', 'scpsys_bus_protect_set',
+-- 
+2.56.0
+

@@ -1,0 +1,474 @@
+From 1c930c16de5b595249efcac346d8c477ebf8d71d Mon Sep 17 00:00:00 2001
+From: Villode <villode@localhost>
+Date: Mon, 14 Sep 2026 15:59:11 +0800
+Subject: [PATCH] chore: checkpoint before branching touch-fix
+
+[dianqk: path-limited pick of arch/arm64/boot/dts/mediatek/mt6897.dtsi from
+this TB375FC snapshot (https://github.com/u0n0u/tb375fc-linux, MT6895-Mainline
+based, Linux 7.2); the snapshot's other files are not taken.]
+(cherry picked from commit aef99312cbe5619b83857e71efe6f0afe7d2c39b)
+---
+ arch/arm64/boot/dts/mediatek/mt6897.dtsi | 451 +++++++++++++++++++++++
+ 1 file changed, 451 insertions(+)
+ create mode 100755 arch/arm64/boot/dts/mediatek/mt6897.dtsi
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6897.dtsi b/arch/arm64/boot/dts/mediatek/mt6897.dtsi
+new file mode 100755
+index 0000000000..754d0b6bed
+--- /dev/null
++++ b/arch/arm64/boot/dts/mediatek/mt6897.dtsi
+@@ -0,0 +1,451 @@
++// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
++/*
++ * MediaTek MT6897 (MT8792) SoC — mainline bring-up, stage S1.
++ *
++ * 每一个数值都取自设备 bootloader 实际传入的 FDT
++ * (reports/20260910-recovery/board.dtb)，那是最可信的硬件事实源。
++ * 不确定的（时钟树编号、引脚表、电源域编号）先不写，等驱动落地再补。
++ *
++ * 单元数：厂商 DTB 的 / 与 /soc 都是 #address-cells=2 / #size-cells=2
++ * （MT6895 主线移植用 1/1，直接套到这颗 SoC 上会错），本文件跟随厂商。
++ * 中断单元数同理是 4（末位是 0），不是主线的 3。
++ *
++ * ⚠️ GIC 基址有家族惯例与本机的冲突，见下方 gic 节点的注释。
++ */
++
++#include <dt-bindings/interrupt-controller/arm-gic.h>
++#include <dt-bindings/interrupt-controller/irq.h>
++#include <dt-bindings/phy/phy.h>
++#include <dt-bindings/gpio/gpio.h>
++
++/ {
++	compatible = "mediatek,mt6897";
++	#address-cells = <2>;
++	#size-cells = <2>;
++
++	interrupt-parent = <&gic>;
++
++	/* 没有时钟驱动前的临时时钟源：给 UART 用，让早期控制台能出字 */
++	clk26m: clock-26m {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <26000000>;
++	};
++
++	/*
++	 * I2C 模块时钟占位（主线暂无 MT6897 topckgen 驱动）。
++	 * i2c-mt65xx 用 clk_get_rate("main") 算分频：SCL = f_real / (2 * div)，
++	 * 而 div 是按 f_assumed 算出来的 ⇒ SCL_actual = 目标频率 × f_real / f_assumed。
++	 * 故意把 f_assumed 取大：真实模块时钟若比它低，实际 SCL 只会更慢（安全方向）。
++	 * 真实频率待 recovery 侧 /sys/kernel/debug/clk/clk_summary 实测后修正。
++	 */
++	i2c_mclk: i2c-mclk {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <26000000>;
++	};
++
++	cpus {
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		cpu-map {
++			cluster0 {
++				core0 { cpu = <&cpu0>; };
++				core1 { cpu = <&cpu1>; };
++				core2 { cpu = <&cpu2>; };
++				core3 { cpu = <&cpu3>; };
++			};
++			cluster1 {
++				core0 { cpu = <&cpu4>; };
++				core1 { cpu = <&cpu5>; };
++				core2 { cpu = <&cpu6>; };
++			};
++			cluster2 {
++				core0 { cpu = <&cpu7>; };
++			};
++		};
++
++		/* 4x Cortex-A510（厂商 DTB 里每个核各占一个 cluster 位） */
++		cpu0: cpu@0 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a510";
++			reg = <0x0>;
++			enable-method = "psci";
++		};
++		cpu1: cpu@1 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a510";
++			reg = <0x100>;
++			enable-method = "psci";
++		};
++		cpu2: cpu@2 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a510";
++			reg = <0x200>;
++			enable-method = "psci";
++		};
++		cpu3: cpu@3 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a510";
++			reg = <0x300>;
++			enable-method = "psci";
++		};
++
++		/* 3x + 1x Cortex-A715 */
++		cpu4: cpu@100 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a715";
++			reg = <0x400>;
++			enable-method = "psci";
++		};
++		cpu5: cpu@101 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a715";
++			reg = <0x500>;
++			enable-method = "psci";
++		};
++		cpu6: cpu@102 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a715";
++			reg = <0x600>;
++			enable-method = "psci";
++		};
++		cpu7: cpu@200 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a715";
++			reg = <0x700>;
++			enable-method = "psci";
++		};
++	};
++
++	psci {
++		compatible = "arm,psci-1.0";
++		method = "smc";
++	};
++
++	timer {
++		compatible = "arm,armv8-timer";
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_PPI 13 IRQ_TYPE_LEVEL_LOW 0>,
++			     <GIC_PPI 14 IRQ_TYPE_LEVEL_LOW 0>,
++			     <GIC_PPI 11 IRQ_TYPE_LEVEL_LOW 0>,
++			     <GIC_PPI 10 IRQ_TYPE_LEVEL_LOW 0>;
++		clock-frequency = <13000000>;
++	};
++
++	/*
++	 * ⚠️ GIC 基址：厂商 DTB 的 /interrupt-controller 是
++	 *      0x0c400000 (dist, 0x40000) + 0x0c440000 (redist, 0x200000)
++	 *    而主线 MTK 全家族（mt6895 / mt8195 / mt8192 / mt8183）都在 0x0c000000，
++	 *    本机另有一个 mediatek,gic500 节点占着 0x0c000000+0x400000。
++	 *
++	 *    这里以厂商 DTB 为准（那是设备真在跑的配置）。
++	 *    若内核起不来（卡在 Calibrating / no timer），把下面两行换成：
++	 *        <0x0 0x0c000000 0x0 0x40000>,
++	 *        <0x0 0x0c040000 0x0 0x200000>;
++	 *    这两种各出一个 dtb 去试，是最经济的排查方式。
++	 */
++	gic: interrupt-controller@c400000 {
++		compatible = "arm,gic-v3";
++		reg = <0x0 0x0c400000 0x0 0x40000>,
++		      <0x0 0x0c440000 0x0 0x200000>;
++		#interrupt-cells = <4>;
++		#address-cells = <2>;
++		#size-cells = <2>;
++		#redistributor-regions = <1>;
++		interrupt-controller;
++		interrupts = <GIC_PPI 9 IRQ_TYPE_LEVEL_HIGH 0>;
++	};
++
++	soc: soc@0 {
++		compatible = "simple-bus";
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		/*
++		 * 串口：兼容 "mediatek,mt6577-uart"，主线 8250_mtk 直接支持。
++		 * 但物理上 UART0 接在键盘底座排线上，且厂商 cmdline 有
++		 * mtk_printk_ctrl.disable_uart=1 —— 所以 S1 不指望串口，
++		 * 真正的控制台走 simple-framebuffer + fbcon（见板级 DTS）。
++		 * IRQ：厂商 DTB 是 SPI 250/251/252/253，不是 MT6895 的 141。
++		 */
++		uart0: serial@11001000 {
++			compatible = "mediatek,mt6577-uart";
++			reg = <0x0 0x11001000 0x0 0x1000>;
++			interrupts = <GIC_SPI 250 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&clk26m>, <&clk26m>;
++			clock-names = "baud", "bus";
++			status = "disabled";
++		};
++		uart1: serial@11002000 {
++			compatible = "mediatek,mt6577-uart";
++			reg = <0x0 0x11002000 0x0 0x1000>;
++			interrupts = <GIC_SPI 251 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&clk26m>, <&clk26m>;
++			clock-names = "baud", "bus";
++			status = "disabled";
++		};
++		uart2: serial@11003000 {
++			compatible = "mediatek,mt6577-uart";
++			reg = <0x0 0x11003000 0x0 0x1000>;
++			interrupts = <GIC_SPI 252 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&clk26m>, <&clk26m>;
++			clock-names = "baud", "bus";
++			status = "disabled";
++		};
++		uart3: serial@11004000 {
++			compatible = "mediatek,mt6577-uart";
++			reg = <0x0 0x11004000 0x0 0x1000>;
++			interrupts = <GIC_SPI 253 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&clk26m>, <&clk26m>;
++			clock-names = "baud", "bus";
++			status = "disabled";
++		};
++
++		/* 看门狗：厂商 compatible 含 mediatek,mt6589-wdt，主线 mtk_wdt 已支持 */
++		watchdog: watchdog@1c00a000 {
++			compatible = "mediatek,mt6589-wdt";
++			reg = <0x0 0x1c00a000 0x0 0x100>;
++			status = "disabled";
++		};
++
++		/*
++		 * 以下节点先把「地址事实」登记下来，全部 status = "disabled"。
++		 * 等 clk-mt6897 / pinctrl-mt6897 落地后再逐个启用。
++		 */
++
++		/* 引脚控制器（厂商 DTB 10 段 reg） */
++		pio: pinctrl@10005000 {
++			compatible = "mediatek,mt6897-pinctrl";
++			reg = <0x0 0x10005000 0x0 0x1000>,
++			      <0x0 0x11b20000 0x0 0x1000>,
++			      <0x0 0x11c00000 0x0 0x1000>,
++			      <0x0 0x11d30000 0x0 0x1000>,
++			      <0x0 0x11d40000 0x0 0x1000>,
++			      <0x0 0x11d50000 0x0 0x1000>,
++			      <0x0 0x11ea0000 0x0 0x1000>,
++			      <0x0 0x11eb0000 0x0 0x1000>,
++			      <0x0 0x11f20000 0x0 0x1000>,
++			      <0x0 0x11f30000 0x0 0x1000>;
++			gpio-controller;
++			#gpio-cells = <2>;
++			interrupt-controller;
++			#interrupt-cells = <2>;
++			/* Required by SPI touch GPIO descriptors and GPIO9 EINT. */
++			status = "okay";
++		};
++
++		/* 时钟/系统控制寄存器（先登记，等 clk-mt6897） */
++		topckgen: syscon@10000000 {
++			compatible = "mediatek,mt6897-topckgen", "syscon";
++			reg = <0x0 0x10000000 0x0 0x1000>;
++			#clock-cells = <1>;
++		};
++		infracfg: syscon@10001000 {
++			compatible = "mediatek,mt6897-infracfg_ao", "syscon";
++			reg = <0x0 0x10001000 0x0 0x1000>;
++			#clock-cells = <1>;
++		};
++		apmixedsys: syscon@1000c000 {
++			compatible = "mediatek,mt6897-apmixedsys", "syscon";
++			reg = <0x0 0x1000c000 0x0 0x1000>;
++			#clock-cells = <1>;
++		};
++		pericfg: syscon@11036000 {
++			compatible = "mediatek,mt6897-pericfg_ao", "syscon";
++			reg = <0x0 0x11036000 0x0 0x1000>;
++			#clock-cells = <1>;
++		};
++		scpsys: syscon@1c001000 {
++			compatible = "mediatek,mt6897-scpsys", "syscon";
++			reg = <0x0 0x1c001000 0x0 0x1000>;
++			#power-domain-cells = <1>;
++		};
++
++		disp_pwm0: pwm@1100e000 {
++			compatible = "mediatek,mt6897-disp-pwm";
++			reg = <0x0 0x1100e000 0x0 0x1000>;
++			interrupts = <GIC_SPI 254 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&clk26m>, <&clk26m>;
++			clock-names = "main", "mm";
++			#pwm-cells = <2>;
++			status = "disabled";
++		};
++
++		/*
++		 * UFS —— 厂商直接用主线的 "mediatek,mt8183-ufshci" / "-ufsphy"，
++		 * 也就是 drivers/ufs/host/ufs-mediatek.c 已经是正确驱动，
++		 * 我们要做的只是补时钟/电源域，不必新写 UFS 驱动。
++		 */
++		ufsphy: ufsphy@112a0000 {
++			compatible = "mediatek,mt8183-ufsphy";
++			reg = <0x0 0x112a0000 0x0 0x10000>;
++			#phy-cells = <0>;
++			status = "disabled";
++		};
++		ufshci: ufshci@112b0000 {
++			compatible = "mediatek,mt8183-ufshci";
++			reg = <0x0 0x112b0000 0x0 0x3000>;
++			interrupts = <GIC_SPI 168 IRQ_TYPE_LEVEL_HIGH 0>;
++			phys = <&ufsphy>;
++			phy-names = "ufsphy";
++			status = "disabled";
++		};
++
++		/* I2C（厂商 compatible 是 mt6897-i2c，主线需补 of_device_id） */
++		i2c0: i2c@11d00000 {
++			compatible = "mediatek,mt6897-i2c";
++			reg = <0x0 0x11d00000 0x0 0x1000>,
++			      <0x0 0x11300200 0x0 0x80>;
++			interrupts = <GIC_SPI 186 IRQ_TYPE_LEVEL_HIGH 0>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			status = "disabled";
++		};
++		/*
++		 * i2c5 = 0x11f01000：外置充电 IC mt6375@0x34（厂商同名 i2c5）
++		 * i2c7 = 0x11d02000：电量计 mm8013@0x55（厂商同名 i2c7）+ fsa4480@0x43
++		 * 第二个 reg 是 APDMA 同步寄存器 —— mt6895_compat.apdma_sync = 1，必需。
++		 */
++			i2c5: i2c@11f01000 {
++			compatible = "mediatek,mt6897-i2c";
++			reg = <0x0 0x11f01000 0x0 0x1000>,
++			      <0x0 0x11300580 0x0 0x80>;
++			interrupts = <GIC_SPI 191 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&i2c_mclk>, <&i2c_mclk>;
++				clock-names = "main", "dma";
++				clock-div = <1>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			status = "disabled";
++		};
++
++			i2c7: i2c@11d02000 {
++			compatible = "mediatek,mt6897-i2c";
++			reg = <0x0 0x11d02000 0x0 0x1000>,
++			      <0x0 0x11300680 0x0 0x100>;
++			interrupts = <GIC_SPI 193 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&i2c_mclk>, <&i2c_mclk>;
++				clock-names = "main", "dma";
++				clock-div = <1>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			status = "disabled";
++		};
++
++		/* SPMI（MT6363 PMIC 挂这条总线：按键/电量计/温控全在这上面） */
++		spmi: spmi@1cc04000 {
++			compatible = "mediatek,mt6897-spmi";
++			reg = <0x0 0x1cc04000 0x0 0x8ff>,
++			      <0x0 0x1cc01000 0x0 0x100>,
++			      <0x0 0x1cc06000 0x0 0x8ff>,
++			      <0x0 0x1cc00000 0x0 0x100>;
++			reg-names = "pmif", "spmimst", "pmif-p", "spmimst-p";
++			clocks = <&clk26m>, <&clk26m>, <&clk26m>;
++			clock-names = "pmif_sys_ck", "pmif_tmr_ck", "spmimst_clk_mux";
++			/* PMIC INT 线接在 GPIO EINT 248 上（原厂 DTB 实测） */
++			interrupts-extended = <&pio 248 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "rcs_irq";
++			interrupt-controller;
++			#interrupt-cells = <1>;
++			#address-cells = <2>;
++			#size-cells = <0>;
++			status = "okay";
++
++			mt6363: pmic@4 {
++				compatible = "mediatek,mt6363";
++				reg = <4 0>;
++
++				mt6363keys: mt6363keys {
++					compatible = "mediatek,mt6363-keys";
++					power {
++						linux,keycodes = <116>;
++						wakeup-source;
++					};
++
++					home {
++						linux,keycodes = <115>;
++					};
++				};
++			};
++		};
++
++		/* Keypad 控制器（音量键等） */
++		keypad: kp@1c00e000 {
++			compatible = "mediatek,kp";
++			reg = <0x0 0x1c00e000 0x0 0x1000>;
++			interrupts = <GIC_SPI 138 IRQ_TYPE_EDGE_RISING 0>;
++			mediatek,key-debounce-ms = <1024>;
++			mediatek,hw-map-num = <72>;
++			mediatek,hw-init-map = <
++				114 249 0 0 0 0 0 0 0
++				0 0 0 0 0 0 0 0 0
++				0 0 0 0 0 0 0 0 0
++				0 0 0 0 0 0 0 0 0
++				0 0 0 0 0 0 0 0 0
++				0 0 0 0 0 0 0 0 0
++				0 0 0 0 0 0 0 0 0
++				0 0 0 0 0 0 0 0 0
++			>;
++			clocks = <&clk26m>;
++			clock-names = "kpd";
++			status = "okay";
++		};
++
++		u2phy0: usb-phy@11e40000 {
++			compatible = "mediatek,xsphy";
++			reg = <0x0 0x11e43000 0x0 0x200>;
++			#address-cells = <2>;
++			#size-cells = <2>;
++			ranges;
++			status = "disabled";
++
++			u2port0: usb2-phy0@11e40000 {
++				reg = <0x0 0x11e40000 0x0 0x400>;
++				#phy-cells = <1>;
++			};
++
++			u3port0: usb3-phy0@11e43000 {
++				reg = <0x0 0x11e43400 0x0 0x500>;
++				#phy-cells = <1>;
++			};
++		};
++
++		spi2: spi@11012000 {
++			compatible = "mediatek,mt6985-spi", "mediatek,mt6983-spi";
++			reg = <0x0 0x11012000 0x0 0x100>;
++			interrupts = <GIC_SPI 244 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&clk26m>, <&clk26m>, <&clk26m>;
++			clock-names = "parent-clk", "sel-clk", "spi-clk";
++			mediatek,pad-select = <0x00>;
++			mediatek,tickdly = <0x03 0x00>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			status = "disabled";
++		};
++
++		ssusb: usb@11201000 {
++			compatible = "mediatek,mtu3";
++			reg = <0x0 0x11201000 0x0 0x2e00>,
++			      <0x0 0x11203e00 0x0 0x100>;
++			reg-names = "mac", "ippc";
++			interrupts = <GIC_SPI 160 IRQ_TYPE_LEVEL_HIGH 0>;
++			phys = <&u2port0 PHY_TYPE_USB2>, <&u3port0 PHY_TYPE_USB3>;
++			#address-cells = <2>;
++			#size-cells = <2>;
++			ranges;
++			dr_mode = "host";
++			status = "disabled";
++
++			xhci0: usb@11200000 {
++				compatible = "mediatek,mtk-xhci";
++				reg = <0x0 0x11200000 0x0 0x1000>;
++				reg-names = "mac";
++				interrupts = <GIC_SPI 161 IRQ_TYPE_LEVEL_HIGH 0>;
++				status = "disabled";
++			};
++		};
++	};
++};
+-- 
+2.56.0
+

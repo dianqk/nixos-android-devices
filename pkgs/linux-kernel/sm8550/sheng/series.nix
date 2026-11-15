@@ -38,4 +38,7 @@
   ./patches/upstream/0002-gcc-sm8550-cx-binding.patch
   ./patches/upstream/0003-gcc-sm8550-cx-runtime-pm.patch
   ./patches/upstream/0004-sm8550-gcc-cx-domain.patch
+  ../../patches/iris-hfi-gen2-deblocking.patch
+  ../../patches/iris-hfi-gen2-error-timestamps.patch
+  ../../patches/iris-hfi-gen2-noshow.patch
 ]

@@ -265,9 +265,73 @@ static unsigned int charger_tests(void)
 	charger_confirmation_path = valid;
 	return count;
 }
+/* Marble's ABL updates only the primary GPT: the primary is confirmed and the
+ * backup on boot_b's LU rebuilt from it; another stale LU is only validated. */
+static unsigned int marble_tests(void)
+{
+	unsigned int count = 0, normal_reads, normal_writes;
+	unsigned char expected[12 * 128];
+	for (unsigned int i = 0; i < 4; i++) {
+		prepare_confirmation(); marble_stale(i & 1, i >> 1);
+		boot(); assert(writes == 4 && !logged_errors);
+		memcpy(expected, original[0] + 2 * AB_BLOCK, sizeof(expected));
+		expected[128 + 54] |= 0x40;
+		assert_synced(expected, 0);
+		assert(!memcmp(media[0] + 3 * AB_BLOCK, original[0] + 3 * AB_BLOCK, (BLOCKS - 5) * AB_BLOCK));
+		assert(!memcmp(media[1], original[1], sizeof(media[1])));
+		/* Retry stays 6: ABL stops decrementing once successful. */
+		assert(ab_get(media[0] + (BLOCKS - 2) * AB_BLOCK + 128 + 48, 8) ==
+		       ((6ULL << 51) | AB_ACTIVE | AB_PRIORITY | AB_SUCCESS));
+		writes = starts = 0; boot(); assert(!writes && !logged_errors); count += 2;
+	}
+	prepare_confirmation(); marble_stale(1, 0); boot();
+	normal_reads = reads; normal_writes = writes;
+	for (unsigned int i = 1; i <= normal_writes; i++) {
+		prepare_confirmation(); marble_stale(1, 0); fail_write = i; boot();
+		assert(logged_errors && active && !memcmp(media, original, sizeof(media))); count++;
+	}
+	for (unsigned int i = 1; i <= normal_reads; i++) {
+		prepare_confirmation(); marble_stale(1, 0); fail_read = i; boot();
+		assert(logged_errors && active && !memcmp(media, original, sizeof(media))); count++;
+		prepare_confirmation(); marble_stale(1, 0); mismatch_read = i; boot();
+		assert(logged_errors && active && !memcmp(media, original, sizeof(media))); count++;
+	}
+	/* Out-of-scope backup differences still refuse and boot on. */
+	for (unsigned int i = 0; i < 4; i++) {
+		prepare_confirmation(); marble_stale(1, i == 3);
+		switch (i) {
+		case 0: ab_put(slot_entry(0, 1, 1) + 32, 9, 8); break;
+		case 1: slot_entry(0, 1, 1)[16] ^= 1; break;
+		case 2: slot_entry(0, 1, 5)[48] ^= 1; break; /* linux-boot (ESP) */
+		case 3: slot_entry(1, 1, 1)[56] = 'X'; break; /* LU 1 abl_b name */
+		}
+		memcpy(original, media, sizeof(media)); boot();
+		assert(logged_errors); assert_unchanged(); count++;
+	}
+	/* Android and recovery switches keep requiring identical copies. */
+	for (unsigned int purpose = AB_ANDROID; purpose <= AB_RECOVERY; purpose++) {
+		struct ab_state state;
+		prepare_confirmation(); marble_stale(0, 0);
+		assert(ab_open(&state, purpose) == -EINVAL);
+		ab_free(&state); assert_unchanged(); count++;
+	}
+	return count;
+}
 int main(void)
 {
 	unsigned int count = charger_tests(), normal_reads, normal_writes;
+	for (unsigned int kinds = 1; kinds <= 3; kinds++) {
+		prepare_confirmation(); unrelated_oem_metadata(kinds);
+		boot(); assert(writes == 4 && !logged_errors);
+		/* Only the normal boot_b success/CRC transaction may change bytes. */
+		unsigned char confirmed[sizeof(media)];
+		memcpy(confirmed, media, sizeof(media));
+		memcpy(media, original, sizeof(media));
+		media[0][2 * AB_BLOCK + 128 + 54] |= 0x40;
+		sync_tables(); assert(!memcmp(media, confirmed, sizeof(media)));
+		count++;
+	}
+
 	static unsigned char expected[sizeof(media)];
 	prepare_confirmation(); boot();
 	normal_reads = reads; normal_writes = writes;
@@ -340,6 +404,7 @@ int main(void)
 	boot(); assert(!active && ab_confirmation_disabled && logged_errors >= 2);
 	int saved_writes = writes; starts = 0; boot(); assert(writes == saved_writes); count++;
 	printf("PASS: %u EFI-load confirmation and fault cases\n", count);
+	printf("PASS: %u stale-backup (Marble) confirmation cases\n", marble_tests());
 	printf("PASS: %u explicit non-GPT confirmation cases\n", non_gpt_tests());
 	return 0;
 }

@@ -1,0 +1,76 @@
+From c74ecfa2d863c85b1ae252ce1d63c1c51b0ac964 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 31 Oct 2026 19:42:19 +0800
+Subject: [PATCH] cpufreq: qcom-hw: Count the frequency domains by name
+
+When the OSM is programmed by the kernel, the node also describes the
+OSM sequencer and other programming regions after the frequency domain
+registers. Counting every memory resource then turns these regions into
+extra frequency domains with their own clocks.
+
+When the node has reg-names, count and map only the "freq-domainN"
+regions. Nodes without reg-names keep the previous behaviour. This
+replaces the hardcoded domain count of the SoMainline tree (a905deed0bf
+"osm hardcode num freq dom").
+
+Scope: SDM630/660 common
+Porting notes: Local replacement for SoMainline topic/cpr3hh a905deed0bf (not upstream).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/cpufreq/qcom-cpufreq-hw.c | 27 ++++++++++++++++++++++++---
+ 1 file changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/cpufreq/qcom-cpufreq-hw.c b/drivers/cpufreq/qcom-cpufreq-hw.c
+index c0c1ffbc40..c7672c3736 100644
+--- a/drivers/cpufreq/qcom-cpufreq-hw.c
++++ b/drivers/cpufreq/qcom-cpufreq-hw.c
+@@ -1714,6 +1714,7 @@ static int qcom_cpufreq_hw_driver_probe(struct platform_device *pdev)
+ 	struct device *cpu_dev;
+ 	struct clk *clk;
+ 	int clk_div, i, num_domains, ret;
++	bool by_name;
+ 
+ 	cpu_dev = get_cpu_device(0);
+ 	if (!cpu_dev)
+@@ -1776,9 +1777,22 @@ static int qcom_cpufreq_hw_driver_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "Failed to find icc paths\n");
+ 
+-	for (num_domains = 0; num_domains < MAX_FREQ_DOMAINS; num_domains++)
+-		if (!platform_get_resource(pdev, IORESOURCE_MEM, num_domains))
++	/*
++	 * With reg-names, only the "freq-domainN" regions are frequency
++	 * domains: the OSM programming regions follow them.
++	 */
++	by_name = of_property_present(dev->of_node, "reg-names");
++	for (num_domains = 0; num_domains < MAX_FREQ_DOMAINS; num_domains++) {
++		char name[] = "freq-domainX";
++
++		snprintf(name, sizeof(name), "freq-domain%d", num_domains);
++		if (by_name ?
++		    !platform_get_resource_byname(pdev, IORESOURCE_MEM, name) :
++		    !platform_get_resource(pdev, IORESOURCE_MEM, num_domains))
+ 			break;
++	}
++	if (!num_domains)
++		return dev_err_probe(dev, -ENODEV, "No frequency domains\n");
+ 
+ 	qcom_cpufreq.data = devm_kzalloc(dev, sizeof(struct qcom_cpufreq_data) * num_domains,
+ 					 GFP_KERNEL);
+@@ -1800,7 +1814,14 @@ static int qcom_cpufreq_hw_driver_probe(struct platform_device *pdev)
+ 		struct clk_init_data clk_init = {};
+ 		void __iomem *base;
+ 
+-		base = devm_platform_ioremap_resource(pdev, i);
++		if (by_name) {
++			char name[] = "freq-domainX";
++
++			snprintf(name, sizeof(name), "freq-domain%d", i);
++			base = devm_platform_ioremap_resource_byname(pdev, name);
++		} else {
++			base = devm_platform_ioremap_resource(pdev, i);
++		}
+ 		if (IS_ERR(base)) {
+ 			dev_err(dev, "Failed to map resource index %d\n", i);
+ 			return PTR_ERR(base);

@@ -1,0 +1,860 @@
+From: dianqk <dianqk@dianqk.net>
+Subject: [PATCH] t880: convert tiled decoder output on the GPU
+
+Use a bounded shared Panthor DMA-BUF for the negotiated tiled Y/UV extents.
+Keep V4L2 plane offsets and stable linear VA presentation identity explicit.
+A GLES shader reads the tiled bytes directly and writes linear NV12 planes;
+wait for its completion fence before publishing pixels or requeueing input
+storage. Preserve caller EGL state, immutable imports, original deadlines
+and sticky failures. Do not fall back to CPU decoding or pixel copying.
+
+Explicit upload/download APIs retain their CPU access semantics. The kernel's
+separately requested linear V4L2 formats remain available to other clients.
+
+--- a/meson.build
++++ b/meson.build
+@@ -9,6 +9,7 @@
+ va = dependency('libva', version: '>=1.10')
+ drm = dependency('libdrm')
+ threads = dependency('threads')
++t880_gpu_deps = [dependency('egl'), dependency('glesv2', version: '>=3.0'), dependency('gbm')]
+ gpu_copy_option = get_option('gpu_copy')
+ egl = dependency('egl', required: gpu_copy_option)
+ gles = dependency('glesv2', version: '>=3.2', required: gpu_copy_option)
+@@ -66,6 +67,7 @@
+   'src/decoder.cpp',
+   'src/t880-decoder.cpp',
+   'src/t880-presentation.cpp',
++  'src/t880-gpu.cpp',
+   'src/encoder.cpp',
+   'src/h264.cpp',
+   'src/hevc.cpp',
+@@ -87,7 +89,7 @@
+ shared_library(
+   'qcom_drv_video',
+   sources + copy_source + vulkan_sources,
+-  dependencies: [va, drm, threads] + copy_dependencies + vpp_dependencies,
++  dependencies: [va, drm, threads] + copy_dependencies + vpp_dependencies + t880_gpu_deps,
+   cpp_args: vpp_args,
+   name_prefix: '',
+   install: true,
+--- a/src/t880-decoder.hpp
++++ b/src/t880-decoder.hpp
+@@ -1,16 +1,20 @@
+ // SPDX-License-Identifier: MIT
+ #pragma once
+ #include "internal.hpp"
++#include "t880-gpu.hpp"
+ #include <linux/videodev2.h>
+ 
+ namespace irisva {
+ // One serialized V4L2 owner. Scratch mappings never escape this object; CLIENT
+-// surfaces own independent DMA-heap memory. Wire tokens identify submissions,
++// surfaces own independent linear presentation memory; GPU conversion reads
++// exported tiled CAPTURE storage only until its completion fence. Wire tokens identify submissions,
+ // not VA surface IDs or recycled CAPTURE indices.
+ class T880Decoder {
+     struct Plane {
+         void *address = nullptr;
++        int fd = -1;
+         size_t size = 0;
++        size_t offset = 0;
+         Plane() = default;
+         Plane(const Plane &) = delete;
+         Plane &operator=(const Plane &) = delete;
+@@ -38,7 +42,9 @@
+     using Clock = std::chrono::steady_clock;
+ #endif
+     int fd_ = -1, render_fd_;
++    std::unique_ptr<T880GpuDetiler> gpu_;
+     unsigned width_, height_, stride_[2]{}, storage_height_ = 0;
++    size_t tiled_size_[2]{};
+     std::mutex mutex_;
+     bool display_without_lookahead_;
+     bool output_on_ = false, capture_on_ = false, drained_ = false, last_ = false;
+--- a/src/t880-decoder.cpp
++++ b/src/t880-decoder.cpp
+@@ -11,26 +11,6 @@
+ 
+ namespace irisva {
+ namespace {
+-struct CpuWrite {
+-    int fd; bool active = false;
+-    explicit CpuWrite(Memory &m) : fd(m.fd) {
+-        wait_surface_access(m, POLLOUT);
+-        dma_buf_sync sync{DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE};
+-        checked_begin(sync); active = true;
+-    }
+-    void checked_begin(dma_buf_sync &sync) {
+-        int r; do { r = ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync); } while (r < 0 && errno == EINTR);
+-        check(r == 0, "T880 CPU write cache access");
+-    }
+-    void finish() {
+-        dma_buf_sync sync{DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE};
+-        checked_begin(sync); active = false;
+-    }
+-    ~CpuWrite() {
+-        if (active) { dma_buf_sync sync{DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE};
+-            while (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) < 0 && errno == EINTR) {} }
+-    }
+-};
+ constexpr unsigned OUT = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+ constexpr unsigned CAP = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+ constexpr size_t AU_LIMIT = 4u * 1024 * 1024;
+@@ -48,7 +28,8 @@
+     v4l2_plane planes[VIDEO_MAX_PLANES]{};
+     v4l2_buffer value{};
+     T880Buffer(unsigned type, unsigned index = 0) {
+-        value.type = type; value.index = index; value.memory = V4L2_MEMORY_MMAP;
++        value.type = type; value.index = index;
++        value.memory = type == CAP ? V4L2_MEMORY_DMABUF : V4L2_MEMORY_MMAP;
+         value.length = VIDEO_MAX_PLANES; value.m.planes = planes;
+     }
+ };
+@@ -59,10 +40,10 @@
+     return uint64_t(t.tv_sec) * 1000000 + t.tv_usec;
+ }
+ }
+-T880Decoder::Plane::Plane(Plane &&p) noexcept : address(p.address), size(p.size) {
+-    p.address = nullptr; p.size = 0;
+-}
+-T880Decoder::Plane::~Plane() { if (address) munmap(address, size); }
++T880Decoder::Plane::Plane(Plane &&p) noexcept : address(p.address), fd(p.fd), size(p.size), offset(p.offset) {
++    p.address = nullptr; p.fd = -1; p.size = 0;
++}
++T880Decoder::Plane::~Plane() { if (address) munmap(address, size); if (fd >= 0) close(fd); }
+ T880Decoder::T880Decoder(const std::string &device, unsigned width, unsigned height,
+                          VAProfile profile, unsigned rt_format, int render_fd)
+     : render_fd_(render_fd), width_(width), height_(height),
+@@ -98,6 +79,14 @@
+         checked(fd_, VIDIOC_S_FMT, &fmt, "S_FMT OUTPUT");
+         check(p.pixelformat == codec && p.num_planes == 1 &&
+               p.plane_fmt[0].sizeimage >= AU_LIMIT, "T880 OUTPUT capacity mismatch");
++        // Select tiled transport before header parsing; the SOURCE_CHANGE
++        // minimum then includes firmware references, not the linear scratch pool.
++        v4l2_format capture{}; capture.type = CAP;
++        capture.fmt.pix_mp.width = width; capture.fmt.pix_mp.height = height;
++        capture.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_MM21;
++        checked(fd_, VIDIOC_S_FMT, &capture, "select MM21 CAPTURE");
++        check(capture.fmt.pix_mp.pixelformat == V4L2_PIX_FMT_MM21 &&
++              capture.fmt.pix_mp.num_planes == 2, "T880 MM21 CAPTURE unavailable");
+         allocate(OUT, 4, output_);
+         unsigned type = OUT;
+         checked(fd_, VIDIOC_STREAMON, &type, "STREAMON OUTPUT"); output_on_ = true;
+@@ -113,6 +102,7 @@
+     }
+     output_on_ = capture_on_ = false;
+     for (auto &[id, s] : pending_) { s->status = status; s->pending = false; }
++    gpu_.reset();
+     pending_.clear(); wire_.clear(); capture_.clear(); output_.clear();
+ }
+ void T880Decoder::check_deadline() {
+@@ -120,10 +110,36 @@
+     check(Clock::now() < deadline_, "T880 operation deadline", VA_STATUS_ERROR_TIMEDOUT);
+ }
+ void T880Decoder::allocate(unsigned type, unsigned count, std::vector<Slot> &slots) {
+-    v4l2_requestbuffers req{}; req.type = type; req.memory = V4L2_MEMORY_MMAP; req.count = count;
++    v4l2_requestbuffers req{}; req.type = type; req.memory = type == CAP ? V4L2_MEMORY_DMABUF : V4L2_MEMORY_MMAP; req.count = count;
+     checked(fd_, VIDIOC_REQBUFS, &req, "REQBUFS");
+     check(req.count >= count && req.count <= 64, "T880 invalid pool size");
+     slots.resize(req.count);
++    if (type == CAP) {
++        long page = sysconf(_SC_PAGESIZE);
++        check(page > 0 && size_t(page) <= 16u * 1024 * 1024 &&
++              tiled_size_[0] && tiled_size_[1] &&
++              tiled_size_[0] <= 16u * 1024 * 1024 &&
++              tiled_size_[1] <= 16u * 1024 * 1024 - tiled_size_[0],
++              "T880 tiled pool extents");
++        size_t bytes = tiled_size_[0] + tiled_size_[1];
++        size_t per_buffer = (bytes + size_t(page) - 1) / size_t(page) * size_t(page);
++        check(per_buffer <= 16u * 1024 * 1024 &&
++              req.count <= 256u * 1024 * 1024 / per_buffer,
++              "T880 CAPTURE allocation budget");
++        size_t total = 0;
++        for (unsigned i = 0; i < req.count; ++i) {
++            Plane y, uv;
++            y.fd = allocate_t880_tiled_backing(render_fd_, tiled_size_[0], tiled_size_[1], y.size);
++            check(y.size == per_buffer && y.size <= (256u * 1024 * 1024 - total), "T880 CAPTURE allocation budget");
++            total += y.size;
++            uv.fd = fcntl(y.fd, F_DUPFD_CLOEXEC, 0);
++            check(uv.fd >= 0, "T880 duplicate tiled plane view");
++            uv.size = y.size; uv.offset = tiled_size_[0];
++            slots[i].planes.push_back(std::move(y));
++            slots[i].planes.push_back(std::move(uv));
++        }
++        return;
++    }
+     for (unsigned i = 0; i < req.count; ++i) {
+         T880Buffer q(type, i); checked(fd_, VIDIOC_QUERYBUF, &q.value, "QUERYBUF");
+         check(q.value.length == (type == CAP ? 2u : 1u), "T880 plane count");
+@@ -132,7 +148,7 @@
+             check(p.size && p.size <= 16u * 1024 * 1024, "T880 plane allocation budget");
+             void *mapping = mmap(nullptr, p.size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                                  fd_, q.planes[j].m.mem_offset);
+-            check(mapping != MAP_FAILED, "T880 mmap"); p.address = mapping;
++            check(mapping != MAP_FAILED, "T880 mmap OUTPUT"); p.address = mapping;
+             slots[i].planes.push_back(std::move(p));
+         }
+     }
+@@ -140,7 +156,11 @@
+ void T880Decoder::queue_capture(unsigned index) {
+     auto &slot = capture_.at(index); check(!slot.queued, "T880 double CAPTURE QBUF");
+     T880Buffer q(CAP, index); q.value.length = 2;
+-    for (unsigned p = 0; p < 2; ++p) q.planes[p].length = slot.planes[p].size;
++    for (unsigned p = 0; p < 2; ++p) {
++        q.planes[p].length = slot.planes[p].size;
++        q.planes[p].m.fd = slot.planes[p].fd;
++        // CAPTURE offsets are driver output, not input accepted by vb2.
++    }
+     checked(fd_, VIDIOC_QBUF, &q.value, "QBUF CAPTURE"); slot.queued = true;
+ }
+ void T880Decoder::configure_capture() {
+@@ -148,10 +168,10 @@
+           VA_STATUS_ERROR_UNIMPLEMENTED);
+     v4l2_format fmt{}; fmt.type = CAP;
+     checked(fd_, VIDIOC_G_FMT, &fmt, "G_FMT CAPTURE");
+-    fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12M;
++    fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_MM21;
+     checked(fd_, VIDIOC_S_FMT, &fmt, "S_FMT CAPTURE");
+     auto &p = fmt.fmt.pix_mp;
+-    check(p.pixelformat == V4L2_PIX_FMT_NV12M && p.num_planes == 2 &&
++    check(p.pixelformat == V4L2_PIX_FMT_MM21 && p.num_planes == 2 &&
+           p.width >= width_ && p.height >= height_ && p.width <= 4096 && p.height <= 2176,
+           "T880 unsupported CAPTURE geometry");
+     v4l2_selection selection{}; selection.type = CAP; selection.target = V4L2_SEL_TGT_COMPOSE;
+@@ -162,6 +182,7 @@
+     storage_height_ = p.height;
+     for (unsigned i = 0; i < 2; ++i) {
+         stride_[i] = p.plane_fmt[i].bytesperline;
++        tiled_size_[i] = p.plane_fmt[i].sizeimage;
+         check(stride_[i] >= width_ && stride_[i] <= 16384 &&
+               uint64_t(stride_[i]) * (i ? (p.height + 1) / 2 : p.height) <=
+                   p.plane_fmt[i].sizeimage, "T880 invalid plane layout");
+@@ -173,7 +194,7 @@
+     for (const auto &slot : capture_)
+         for (unsigned i = 0; i < 2; ++i)
+             check(slot.planes[i].size >= p.plane_fmt[i].sizeimage,
+-                  "T880 mapped plane smaller than negotiated layout");
++                  "T880 exported plane smaller than negotiated layout");
+     for (unsigned i = 0; i < capture_.size(); ++i) queue_capture(i);
+     unsigned type = CAP; checked(fd_, VIDIOC_STREAMON, &type, "STREAMON CAPTURE");
+     capture_on_ = true;
+@@ -187,9 +208,10 @@
+     check(bool(m) && m->origin != MemoryOrigin::Iris && m->fourcc == VA_FOURCC_NV12,
+           "T880 stable destination missing");
+     for (unsigned p = 0; p < 2; ++p) {
+-        size_t rows = p ? height_ / 2 : height_;
+-        size_t end = size_t(planes[p].data_offset) + (rows - 1) * stride_[p] + width_;
++        size_t rows = p ? storage_height_ / 2 : storage_height_;
++        size_t end = size_t(planes[p].data_offset) + rows * stride_[p];
+         check(planes[p].bytesused <= capture_[index].planes[p].size &&
++              planes[p].data_offset == capture_[index].planes[p].offset &&
+               planes[p].data_offset <= planes[p].bytesused && end <= planes[p].bytesused,
+               "T880 invalid CAPTURE payload");
+     }
+@@ -202,15 +224,15 @@
+     check(width_ <= available - chroma &&
+           size_t(height_ / 2 - 1) <= (available - chroma - width_) / m->stride,
+           "T880 destination chroma bounds");
+-    auto *dst = m->map();
+-    CpuWrite access(*m);
+-    for (unsigned p = 0; p < 2; ++p) {
+-        auto *src = static_cast<uint8_t *>(capture_[index].planes[p].address) + planes[p].data_offset;
+-        size_t base = m->data_offset + (p ? size_t(m->stride) * m->storage_height : 0);
+-        for (unsigned y = 0; y < (p ? height_ / 2 : height_); ++y)
+-            memcpy(dst + base + size_t(y) * m->stride, src + size_t(y) * stride_[p], width_);
+-    }
+-    access.finish();
++    if (!gpu_) gpu_ = std::make_unique<T880GpuDetiler>(render_fd_);
++    check_deadline();
++    std::array<T880GpuDetiler::Plane, 2> source;
++    for (unsigned p = 0; p < 2; ++p)
++        source[p] = {capture_[index].planes[p].fd, stride_[p],
++                     storage_height_ / (p ? 2u : 1u), planes[p].data_offset,
++                     capture_[index].planes[p].size};
++    gpu_->detile(source, m, width_, height_,
++                 std::chrono::duration_cast<std::chrono::milliseconds>(deadline_ - Clock::now()));
+     s->reconstruction_only = false;
+     ++s->pixel_generation;
+     check_deadline();
+@@ -252,7 +274,12 @@
+               !(q.value.flags & V4L2_BUF_FLAG_ERROR), "T880 CAPTURE error");
+         auto &slot = capture_[q.value.index];
+         check(slot.queued, "T880 duplicate CAPTURE index"); slot.queued = false;
+-        bool payload = q.planes[0].bytesused || q.planes[1].bytesused;
++        for (unsigned plane = 0; plane < 2; ++plane)
++            check(q.planes[plane].data_offset <= q.planes[plane].bytesused &&
++                  q.planes[plane].bytesused <= slot.planes[plane].size,
++                  "T880 CAPTURE offset/payload bounds");
++        bool payload = q.planes[0].bytesused > q.planes[0].data_offset ||
++                       q.planes[1].bytesused > q.planes[1].data_offset;
+         if (payload) {
+             uint64_t id = token(q.value.timestamp);
+             auto it = wire_.find(id);
+@@ -270,10 +297,11 @@
+                 // Replay duplicates never replace stable outputs, but malformed
+                 // scratch payloads are still errors, including byte bounds.
+                 for (unsigned plane = 0; plane < 2; ++plane) {
+-                    size_t rows = plane ? height_ / 2 : height_;
++                    size_t rows = plane ? storage_height_ / 2 : storage_height_;
+                     size_t end = size_t(q.planes[plane].data_offset) +
+-                                 (rows - 1) * stride_[plane] + width_;
+-                    check(end <= q.planes[plane].bytesused &&
++                                 rows * stride_[plane];
++                    check(q.planes[plane].data_offset == slot.planes[plane].offset &&
++                          end <= q.planes[plane].bytesused &&
+                           q.planes[plane].bytesused <= slot.planes[plane].size,
+                           "T880 replay payload bounds");
+                 }
+--- /dev/null
++++ b/src/t880-gpu.hpp
+@@ -0,0 +1,20 @@
++// SPDX-License-Identifier: MIT
++#pragma once
++#include "internal.hpp"
++#include <array>
++namespace irisva {
++class T880GpuDetiler {
++    struct Impl;
++    std::unique_ptr<Impl> impl_;
++  public:
++    struct Plane {
++        int fd = -1;
++        unsigned stride = 0, storage_height = 0;
++        size_t offset = 0, size = 0;
++    };
++    explicit T880GpuDetiler(int render_fd);
++    ~T880GpuDetiler();
++    void detile(const std::array<Plane, 2> &source, const std::shared_ptr<Memory> &target,
++                unsigned width, unsigned height, std::chrono::milliseconds remaining);
++};
++}
+--- /dev/null
++++ b/src/t880-gpu.cpp
+@@ -0,0 +1,306 @@
++// SPDX-License-Identifier: MIT
++#include "t880-gpu.hpp"
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++#include <GLES3/gl3.h>
++#include <GLES2/gl2ext.h>
++#include <gbm.h>
++#include <drm_fourcc.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <unistd.h>
++#include <climits>
++#include <sys/stat.h>
++
++namespace irisva {
++namespace {
++using Clock = std::chrono::steady_clock;
++struct SavedEgl {
++    EGLDisplay display = eglGetCurrentDisplay();
++    EGLContext context = eglGetCurrentContext();
++    EGLSurface draw = eglGetCurrentSurface(EGL_DRAW), read = eglGetCurrentSurface(EGL_READ);
++    EGLenum api = eglQueryAPI();
++    ~SavedEgl() {
++        auto current = eglGetCurrentDisplay();
++        if (current != EGL_NO_DISPLAY)
++            eglMakeCurrent(current, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++        eglBindAPI(api);
++        if (display != EGL_NO_DISPLAY)
++            eglMakeCurrent(display, draw, read, context);
++    }
++};
++unsigned remaining_ms(Clock::time_point deadline) {
++    auto now = Clock::now();
++    check(now < deadline, "T880 GPU conversion deadline", VA_STATUS_ERROR_TIMEDOUT);
++    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
++    return unsigned(std::min<int64_t>(INT_MAX, std::max<int64_t>(1, ms)));
++}
++void wait_dma(int fd, short events, Clock::time_point deadline) {
++    pollfd p{fd, events, 0};
++    int ret;
++    do { ret = poll(&p, 1, remaining_ms(deadline)); } while (ret < 0 && errno == EINTR);
++    check(ret > 0 && (p.revents & events) && !(p.revents & (POLLERR | POLLHUP | POLLNVAL)),
++          "T880 GPU DMA reservation wait", VA_STATUS_ERROR_TIMEDOUT);
++}
++GLuint compile(GLenum type, const char *text) {
++    GLuint shader = glCreateShader(type);
++    check(shader, "T880 GPU shader allocation");
++    glShaderSource(shader, 1, &text, nullptr);
++    glCompileShader(shader);
++    GLint ok = 0;
++    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
++    if (!ok) {
++        glDeleteShader(shader);
++        check(false, "T880 GPU shader compilation");
++    }
++    return shader;
++}
++struct Layout {
++    unsigned width, height, stride;
++    size_t offset, size;
++};
++void validate(const Layout &l, unsigned bytes_per_texel) {
++    check(l.width && l.height && l.width <= 16384 && l.height <= 16384 &&
++          l.stride && l.stride <= 16384 &&
++          uint64_t(l.width) * bytes_per_texel <= l.stride &&
++          l.offset <= INT_MAX && l.offset <= l.size &&
++          uint64_t(l.stride) * l.height <= l.size - l.offset,
++          "T880 GPU plane bounds", VA_STATUS_ERROR_INVALID_PARAMETER);
++}
++}
++struct T880GpuDetiler::Impl {
++    int fd = -1;
++    gbm_device *gbm = nullptr;
++    EGLDisplay display = EGL_NO_DISPLAY;
++    EGLContext context = EGL_NO_CONTEXT;
++    bool initialized = false;
++    GLuint program = 0, vao = 0, fbo = 0;
++    GLint max_texture = 0;
++    PFNEGLCREATEIMAGEKHRPROC create = nullptr;
++    PFNEGLDESTROYIMAGEKHRPROC destroy = nullptr;
++    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC bind = nullptr;
++    struct View {
++        Impl *owner;
++        EGLImageKHR image = EGL_NO_IMAGE_KHR;
++        GLuint texture = 0;
++        explicit View(Impl &o) : owner(&o) {}
++        View(const View &) = delete;
++        ~View() {
++            if (texture) glDeleteTextures(1, &texture);
++            if (image != EGL_NO_IMAGE_KHR) owner->destroy(owner->display, image);
++        }
++    };
++    // Cache owns only imported views; VA surface ownership stays with its caller.
++    struct TargetViews {
++        std::weak_ptr<Memory> memory;
++        unsigned width, height, stride, storage_height;
++        size_t offset, size;
++        std::unique_ptr<View> plane[2];
++    };
++    std::map<Memory *, TargetViews> targets;
++    struct SourceViews {
++        std::array<Plane, 2> layout;
++        struct stat identity[2]{};
++        int fd[2] = {-1, -1}; // duplicate descriptors identify and pin imported storage
++        std::unique_ptr<View> plane[2];
++        ~SourceViews() { for (auto f : fd) if (f >= 0) close(f); }
++    };
++    std::vector<std::unique_ptr<SourceViews>> sources;
++    void current() {
++        check(eglBindAPI(EGL_OPENGL_ES_API) &&
++              eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, context),
++              "T880 GPU current context");
++    }
++    std::unique_ptr<View> view(int dma, unsigned fourcc, const Layout &l) {
++        validate(l, fourcc == DRM_FORMAT_GR88 ? 2 : 1);
++        check(dma >= 0, "T880 GPU invalid DMA fd");
++        auto v = std::make_unique<View>(*this);
++        EGLint a[] = {EGL_WIDTH, EGLint(l.width), EGL_HEIGHT, EGLint(l.height),
++            EGL_LINUX_DRM_FOURCC_EXT, EGLint(fourcc), EGL_DMA_BUF_PLANE0_FD_EXT, dma,
++            EGL_DMA_BUF_PLANE0_OFFSET_EXT, EGLint(l.offset),
++            EGL_DMA_BUF_PLANE0_PITCH_EXT, EGLint(l.stride),
++            EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, 0, EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, 0,
++            EGL_NONE};
++        v->image = create(display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, a);
++        check(v->image != EGL_NO_IMAGE_KHR, "T880 GPU linear plane import");
++        glGenTextures(1, &v->texture);
++        glBindTexture(GL_TEXTURE_2D, v->texture);
++        bind(GL_TEXTURE_2D, v->image);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++        check(glGetError() == GL_NO_ERROR, "T880 GPU texture binding");
++        return v;
++    }
++    explicit Impl(int render_fd) {
++        SavedEgl saved;
++        try {
++            fd = fcntl(render_fd, F_DUPFD_CLOEXEC, 0);
++            check(fd >= 0, "T880 GPU duplicate render fd");
++            gbm = gbm_create_device(fd);
++            check(gbm, "T880 GPU private GBM device");
++            auto platform = reinterpret_cast<PFNEGLGETPLATFORMDISPLAYEXTPROC>(eglGetProcAddress("eglGetPlatformDisplayEXT"));
++            create = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(eglGetProcAddress("eglCreateImageKHR"));
++            destroy = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(eglGetProcAddress("eglDestroyImageKHR"));
++            bind = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(eglGetProcAddress("glEGLImageTargetTexture2DOES"));
++            check(platform && create && destroy && bind, "T880 GPU EGL entrypoints");
++            display = platform(EGL_PLATFORM_GBM_KHR, gbm, nullptr);
++            check(display != EGL_NO_DISPLAY && eglInitialize(display, nullptr, nullptr), "T880 GPU EGL initialize");
++            initialized = true;
++            check(eglBindAPI(EGL_OPENGL_ES_API), "T880 GPU GLES API");
++            EGLint a[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
++            context = eglCreateContext(display, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, a);
++            check(context != EGL_NO_CONTEXT, "T880 GPU GLES context");
++            current();
++            glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_texture);
++            check(max_texture >= 4096, "T880 GPU texture limit");
++            const char *renderer = reinterpret_cast<const char *>(glGetString(GL_RENDERER));
++            check(renderer && !strstr(renderer, "llvmpipe") && !strstr(renderer, "softpipe") &&
++                  !strstr(renderer, "Software"), "T880 GPU requires hardware rendering");
++            constexpr const char *vs = "#version 300 es\nvoid main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);gl_Position=vec4(p*2.-1.,0,1);}";
++            constexpr const char *fs = "#version 300 es\nprecision highp float;precision highp int;uniform sampler2D s;uniform int pitch;uniform int th;uniform int ch;uniform int base_offset;out vec4 o;float samplebyte(int bx,int y){int off=base_offset+(y/th)*pitch*th+(bx/16)*16*th+(y%th)*16+bx%16;return texelFetch(s,ivec2(off%4096,off/4096),0).r;}void main(){ivec2 p=ivec2(gl_FragCoord.xy);int bx=p.x*ch;o=vec4(samplebyte(bx,p.y),ch==2?samplebyte(bx+1,p.y):0.,0.,1.);}";
++            GLuint vert = compile(GL_VERTEX_SHADER, vs), frag = 0;
++            try { frag = compile(GL_FRAGMENT_SHADER, fs); }
++            catch (...) { glDeleteShader(vert); throw; }
++            program = glCreateProgram(); glAttachShader(program, vert); glAttachShader(program, frag);
++            glLinkProgram(program); glDeleteShader(vert); glDeleteShader(frag);
++            GLint ok = 0; glGetProgramiv(program, GL_LINK_STATUS, &ok);
++            check(ok, "T880 GPU link program");
++            glGenVertexArrays(1, &vao); glGenFramebuffers(1, &fbo);
++            check(glGetError() == GL_NO_ERROR, "T880 GPU setup");
++        } catch (...) { cleanup(); throw; }
++    }
++    void cleanup() noexcept {
++        bool bound = context != EGL_NO_CONTEXT &&
++            eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, context);
++        if (!bound) {
++            // Context destruction owns GL object retirement if it cannot be
++            // rebound. Never delete numeric GL names in the caller's context.
++            for (auto &entry : targets)
++                for (auto &p : entry.second.plane) if (p) p->texture = 0;
++            for (auto &entry : sources)
++                for (auto &p : entry->plane) if (p) p->texture = 0;
++        }
++        targets.clear(); sources.clear();
++        if (bound) {
++            glDeleteFramebuffers(1, &fbo); glDeleteVertexArrays(1, &vao);
++            if (program) glDeleteProgram(program);
++            eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++        }
++        if (context != EGL_NO_CONTEXT) eglDestroyContext(display, context);
++        if (initialized) eglTerminate(display);
++        if (gbm) gbm_device_destroy(gbm);
++        if (fd >= 0) close(fd);
++        context = EGL_NO_CONTEXT; display = EGL_NO_DISPLAY; initialized = false;
++        gbm = nullptr; fd = -1;
++    }
++    ~Impl() { SavedEgl saved; cleanup(); }
++    SourceViews &source(const std::array<Plane, 2> &p) {
++        struct stat identity[2]{};
++        for (unsigned i = 0; i < 2; ++i)
++            check(p[i].fd >= 0 && fstat(p[i].fd, &identity[i]) == 0,
++                  "T880 GPU source identity");
++        for (auto &s : sources) {
++            bool same = true;
++            for (unsigned i = 0; i < 2; ++i)
++                same &= s->identity[i].st_dev == identity[i].st_dev &&
++                        s->identity[i].st_ino == identity[i].st_ino &&
++                        s->layout[i].offset == p[i].offset &&
++                        s->layout[i].size == p[i].size && s->layout[i].stride == p[i].stride &&
++                        s->layout[i].storage_height == p[i].storage_height;
++            if (same) return *s;
++        }
++        check(sources.size() < 64, "T880 GPU CAPTURE view budget");
++        auto s = std::make_unique<SourceViews>(); s->layout = p;
++        for (unsigned i = 0; i < 2; ++i) s->identity[i] = identity[i];
++        for (unsigned i = 0; i < 2; ++i) {
++            check(p[i].stride % 16 == 0 && p[i].storage_height % (i ? 16 : 32) == 0,
++                  "T880 GPU MM21 tile alignment");
++            s->fd[i] = fcntl(p[i].fd, F_DUPFD_CLOEXEC, 0);
++            check(s->fd[i] >= 0, "T880 GPU pin CAPTURE fd");
++            check(p[i].size && p[i].size <= 16u * 1024 * 1024 &&
++                  p[i].size % 4096 == 0 && p[i].size / 4096 <= unsigned(max_texture) &&
++                  p[i].offset <= p[i].size &&
++                  uint64_t(p[i].stride) * p[i].storage_height <= p[i].size - p[i].offset,
++                  "T880 GPU raw backing bounds");
++            // Import the page-aligned whole BO at a GPU-compatible pitch.
++            // Firmware's tile stride and the UV byte offset remain unchanged
++            // and are applied by the shader, not by EGL image row layout.
++            s->plane[i] = view(s->fd[i], DRM_FORMAT_R8,
++                {4096, unsigned(p[i].size / 4096), 4096, 0, p[i].size});
++        }
++        auto &result = *s; sources.push_back(std::move(s)); return result;
++    }
++    TargetViews &target(const std::shared_ptr<Memory> &m, unsigned w, unsigned h) {
++        for (auto it = targets.begin(); it != targets.end();)
++            if (it->second.memory.expired()) it = targets.erase(it); else ++it;
++        auto it = targets.find(m.get());
++        if (it != targets.end()) {
++            auto &v = it->second;
++            check(v.memory.lock() == m && v.width == w && v.height == h &&
++                  v.stride == m->stride && v.storage_height == m->storage_height &&
++                  v.offset == m->data_offset && v.size == m->size,
++                  "T880 GPU exported target identity changed");
++            return v;
++        }
++        check(targets.size() < 256, "T880 GPU target view budget");
++        check(m && m->fd >= 0 && m->fourcc == VA_FOURCC_NV12 &&
++              m->origin != MemoryOrigin::Iris && m->origin != MemoryOrigin::V4l2Mmap &&
++              m->stride >= w &&
++              m->storage_height >= h, "T880 GPU destination layout");
++        TargetViews v{m, w, h, m->stride, m->storage_height, m->data_offset, m->size, {}};
++        for (unsigned i = 0; i < 2; ++i)
++            v.plane[i] = view(m->fd, i ? DRM_FORMAT_GR88 : DRM_FORMAT_R8,
++                {w / (i ? 2 : 1), h / (i ? 2 : 1), m->stride,
++                 m->data_offset + (i ? size_t(m->stride) * m->storage_height : 0), m->size});
++        return targets.emplace(m.get(), std::move(v)).first->second;
++    }
++    void detile(const std::array<Plane, 2> &p, const std::shared_ptr<Memory> &m,
++                unsigned w, unsigned h, Clock::time_point deadline) {
++        check(w && h && !(w & 1) && !(h & 1) && w <= 4096 && h <= 2176,
++              "T880 GPU visible geometry");
++        for (unsigned i = 0; i < 2; ++i)
++            check(p[i].stride >= w && p[i].storage_height >= h / (i ? 2 : 1),
++                  "T880 GPU source extent");
++        SavedEgl saved; current();
++        auto &s = source(p); auto &d = target(m, w, h);
++        wait_dma(m->fd, POLLOUT, deadline);
++        glDisable(GL_DITHER);
++        glUseProgram(program); glBindVertexArray(vao); glBindFramebuffer(GL_FRAMEBUFFER, fbo);
++        glActiveTexture(GL_TEXTURE0); glUniform1i(glGetUniformLocation(program, "s"), 0);
++        for (unsigned i = 0; i < 2; ++i) {
++            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, d.plane[i]->texture, 0);
++            check(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE, "T880 GPU destination framebuffer");
++            glBindTexture(GL_TEXTURE_2D, s.plane[i]->texture);
++            glUniform1i(glGetUniformLocation(program, "pitch"), p[i].stride);
++            glUniform1i(glGetUniformLocation(program, "th"), i ? 16 : 32);
++            glUniform1i(glGetUniformLocation(program, "ch"), i ? 2 : 1);
++            glUniform1i(glGetUniformLocation(program, "base_offset"), p[i].offset);
++            glViewport(0, 0, w / (i ? 2 : 1), h / (i ? 2 : 1));
++            glDrawArrays(GL_TRIANGLES, 0, 3);
++        }
++        check(glGetError() == GL_NO_ERROR, "T880 GPU MM21 conversion");
++        GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++        check(fence, "T880 GPU conversion fence"); glFlush();
++        try {
++            for (;;) {
++                unsigned ms = remaining_ms(deadline);
++                GLenum result = glClientWaitSync(fence, 0, std::min<unsigned>(ms, 1) * 1000000ULL);
++                if (result == GL_ALREADY_SIGNALED || result == GL_CONDITION_SATISFIED) break;
++                check(result == GL_TIMEOUT_EXPIRED, "T880 GPU conversion wait failure");
++            }
++        } catch (...) { glDeleteSync(fence); throw; }
++        glDeleteSync(fence);
++        check(glGetError() == GL_NO_ERROR, "T880 GPU conversion completion");
++    }
++};
++T880GpuDetiler::T880GpuDetiler(int render_fd) : impl_(std::make_unique<Impl>(render_fd)) {}
++T880GpuDetiler::~T880GpuDetiler() = default;
++void T880GpuDetiler::detile(const std::array<Plane, 2> &s, const std::shared_ptr<Memory> &m,
++                           unsigned w, unsigned h, std::chrono::milliseconds remaining) {
++    check(remaining.count() > 0 && remaining <= std::chrono::seconds(30),
++          "T880 GPU conversion deadline", VA_STATUS_ERROR_TIMEDOUT);
++    impl_->detile(s, m, w, h, Clock::now() + remaining);
++}
++}
+--- a/src/internal.hpp
++++ b/src/internal.hpp
+@@ -66,6 +66,7 @@
+         std::fprintf(stderr, "\n");
+     }
+ }
++int allocate_t880_tiled_backing(int render_fd, size_t y_size, size_t uv_size, size_t &allocation_size);
+ enum class MemoryOrigin { Unknown, MsmWriteCombined, MsmCoherent, PanthorPresentation, DmaHeap, Imported, Iris, V4l2Mmap };
+ struct Memory {
+     MemoryOrigin origin = MemoryOrigin::Unknown;
+--- a/src/t880-presentation.cpp
++++ b/src/t880-presentation.cpp
+@@ -23,6 +23,33 @@
+     ~BoHandle() { if (handle) release(); }
+ };
+ constexpr size_t PRESENTATION_LIMIT = 16u * 1024 * 1024;
++}
++int allocate_t880_tiled_backing(int render_fd, size_t y_size, size_t uv_size,
++                                 size_t &allocation_size) {
++    check(render_fd >= 0 && y_size && uv_size && y_size <= PRESENTATION_LIMIT &&
++          uv_size <= PRESENTATION_LIMIT - y_size,
++          "T880 tiled backing extents", VA_STATUS_ERROR_INVALID_PARAMETER);
++    auto version = drmGetVersion(render_fd);
++    bool panthor = version && version->name && !std::strcmp(version->name, "panthor");
++    if (version) drmFreeVersion(version);
++    check(panthor, "T880 tiled backing requires Panthor", VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE);
++    long page = sysconf(_SC_PAGESIZE);
++    check(page > 0 && size_t(page) <= PRESENTATION_LIMIT, "T880 backing page size");
++    size_t bytes = y_size + uv_size;
++    allocation_size = (bytes + size_t(page) - 1) / size_t(page) * size_t(page);
++    check(allocation_size <= PRESENTATION_LIMIT, "T880 tiled backing allocation limit",
++          VA_STATUS_ERROR_ALLOCATION_FAILED);
++    drm_panthor_bo_create create{}; create.size = allocation_size;
++    check(ioctl(render_fd, DRM_IOCTL_PANTHOR_BO_CREATE, &create) == 0,
++          "create Panthor tiled backing", VA_STATUS_ERROR_ALLOCATION_FAILED);
++    BoHandle handle{render_fd, create.handle};
++    check(create.handle && create.size >= allocation_size && create.size <= PRESENTATION_LIMIT,
++          "invalid Panthor tiled backing", VA_STATUS_ERROR_ALLOCATION_FAILED);
++    int dma = -1;
++    check(drmPrimeHandleToFD(render_fd, create.handle, DRM_CLOEXEC | DRM_RDWR, &dma) == 0,
++          "export Panthor tiled backing", VA_STATUS_ERROR_ALLOCATION_FAILED);
++    if (handle.release() != 0) { close(dma); check(false, "close Panthor tiled handle"); }
++    return dma;
+ }
+ std::shared_ptr<Memory> allocate_t880_presentation_surface(int render_fd, unsigned width,
+                                                          unsigned height, unsigned fourcc) {
+--- a/tests/t880/replay.cpp
++++ b/tests/t880/replay.cpp
+@@ -27,16 +27,23 @@
+     bool event = false, configured = false, last = false;
+     bool duplicate = false, wrong_output = false, bad_alloc = false, bad_payload = false;
+     unsigned resets = 0, stops = 0, accepted = 0, display_after_polls = 0, polls = 0;
+-    bool expire = false;
++    bool expire = false, gpu_fail = false, selected_direct = false, no_generated = false, wrong_offset = false;
++    unsigned gpu_calls = 0, capture_qbufs = 0;
+     std::deque<std::pair<unsigned, timeval>> output;
+     std::deque<timeval> decoded, display;
+     std::deque<unsigned> capture;
+     std::map<unsigned, uint8_t *> mapped;
+     std::vector<uint64_t> submitted;
++    int next_fd = 1000;
++    std::map<int, std::shared_ptr<std::vector<uint8_t>>> backing;
++    std::map<unsigned, std::array<int,2>> capture_fd;
+ } f;
+ int fake_open(const char *, int, ...) { return 900; }
+-int fake_close(int) { return 0; }
++int fake_close(int fd) { f.backing.erase(fd); return 0; }
++int fake_fcntl(int fd, int cmd, ...) { assert(cmd == F_DUPFD_CLOEXEC); int copy = f.next_fd++; f.backing[copy] = f.backing.at(fd); return copy; }
++
+ void *fake_mmap(void *, size_t n, int, int, int, off_t offset) {
++    assert(offset < 100); // CAPTURE must never be CPU mapped.
+     auto p = static_cast<uint8_t *>(calloc(1, n));
+     f.mapped[unsigned(offset)] = p; return p;
+ }
+@@ -60,7 +67,7 @@
+     if (request == VIDIOC_S_FMT || request == VIDIOC_G_FMT) {
+         auto &p = static_cast<v4l2_format *>(arg)->fmt.pix_mp;
+         if (static_cast<v4l2_format *>(arg)->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+-            p.pixelformat = V4L2_PIX_FMT_NV12M; p.num_planes = 2;
++            p.pixelformat = V4L2_PIX_FMT_MM21; p.num_planes = 2; f.selected_direct = true;
+             p.width = 160; p.height = 128;
+             for (unsigned i = 0; i < 2; ++i) {
+                 p.plane_fmt[i].bytesperline = 160;
+@@ -73,8 +80,12 @@
+         auto &r = static_cast<v4l2_selection *>(arg)->r;
+         r.width = 160; r.height = 128; return 0;
+     }
+-    if (request == VIDIOC_G_CTRL) { static_cast<v4l2_control *>(arg)->value = 1; return 0; }
+-    if (request == VIDIOC_REQBUFS) return 0;
++    if (request == VIDIOC_G_CTRL) { static_cast<v4l2_control *>(arg)->value = 11; return 0; }
++    if (request == VIDIOC_REQBUFS) {
++        auto &q = *static_cast<v4l2_requestbuffers *>(arg);
++        if (q.type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) assert(q.count >= 15);
++        return 0;
++    }
+     if (request == VIDIOC_QUERYBUF) {
+         auto &q = *static_cast<v4l2_buffer *>(arg);
+         bool cap = q.type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+@@ -85,7 +96,7 @@
+         }
+         return 0;
+     }
+-    if (request == VIDIOC_STREAMON) return 0;
++    if (request == VIDIOC_STREAMON) { assert(f.selected_direct); return 0; }
+     if (request == VIDIOC_STREAMOFF) {
+         if (*static_cast<unsigned *>(arg) == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+             f.capture.clear(); f.decoded.clear(); f.last = false; ++f.resets;
+@@ -94,7 +105,12 @@
+     }
+     if (request == VIDIOC_QBUF) {
+         auto &q = *static_cast<v4l2_buffer *>(arg);
+-        if (q.type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) f.capture.push_back(q.index);
++        if (q.type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
++            assert(q.memory == V4L2_MEMORY_DMABUF);
++            assert(f.backing.at(q.m.planes[0].m.fd) == f.backing.at(q.m.planes[1].m.fd));
++            f.capture_fd[q.index] = {q.m.planes[0].m.fd, q.m.planes[1].m.fd};
++            ++f.capture_qbufs; f.capture.push_back(q.index);
++        }
+         else {
+             if (!f.configured) { f.event = true; f.configured = true; }
+             f.output.emplace_back(q.index, q.timestamp);
+@@ -129,10 +145,13 @@
+         else {
+             q.timestamp = f.display.front(); f.display.pop_front();
+             for (unsigned p = 0; p < 2; ++p) {
+-                q.m.planes[p].bytesused = p ? 10240 : 20480;
+-                if (f.bad_payload) ++q.m.planes[p].bytesused;
+-                memset(f.mapped.at(100 + q.index * 2 + p), q.timestamp.tv_usec & 255,
+-                       p ? 10240 : 20480);
++                q.m.planes[p].data_offset = p ? 20480 : 0;
++                q.m.planes[p].bytesused = p ? 30720 : 20480;
++                if (f.bad_payload) q.m.planes[p].bytesused = unsigned(f.backing.at(f.capture_fd.at(q.index)[p])->size()) + 1;
++                memset(f.backing.at(f.capture_fd.at(q.index)[p])->data() + q.m.planes[p].data_offset,
++                       q.timestamp.tv_usec & 255, p ? 10240 : 20480);
++                if (f.wrong_offset && p) ++q.m.planes[p].data_offset;
++                if (f.no_generated) q.m.planes[p].bytesused = q.m.planes[p].data_offset = 0;
+             }
+         }
+         return 0;
+@@ -146,6 +165,7 @@
+ #define munmap fake_munmap
+ #define ioctl fake_ioctl
+ #define poll fake_poll
++#define fcntl fake_fcntl
+ #include "../../src/t880-decoder.cpp"
+ #undef open
+ #undef close
+@@ -153,7 +173,28 @@
+ #undef munmap
+ #undef ioctl
+ #undef poll
++#undef fcntl
+ namespace irisva {
++struct T880GpuDetiler::Impl {};
++T880GpuDetiler::T880GpuDetiler(int) : impl_(std::make_unique<Impl>()) {}
++T880GpuDetiler::~T880GpuDetiler() = default;
++void T880GpuDetiler::detile(const std::array<Plane, 2> &source,
++                           const std::shared_ptr<Memory> &target, unsigned w, unsigned h,
++                           std::chrono::milliseconds remaining) {
++    assert(remaining.count() > 0); ++f.gpu_calls;
++    if (f.gpu_fail) throw Error(VA_STATUS_ERROR_TIMEDOUT, "model GPU fence timeout");
++    // GPU transport model only: real shader addressing has its own pixel oracle.
++    for (unsigned p = 0; p < 2; ++p) {
++        auto src = f.backing.at(source[p].fd)->data() + source[p].offset;
++        auto dst = target->map() + (p ? target->stride * target->storage_height : 0);
++        for (unsigned y = 0; y < h / (p ? 2 : 1); ++y)
++            memcpy(dst + y * target->stride, src + y * source[p].stride, w);
++    }
++}
++int allocate_t880_tiled_backing(int, size_t y, size_t uv, size_t &size) {
++    size_t page = size_t(sysconf(_SC_PAGESIZE)); size = (y + uv + page - 1) / page * page;
++    int fd = f.next_fd++; f.backing[fd] = std::make_shared<std::vector<uint8_t>>(size); return fd;
++}
+ Memory::~Memory() { free(mapping); }
+ uint8_t *Memory::map() { return static_cast<uint8_t *>(mapping); }
+ void wait_surface_access(const Memory &, short) {}
+@@ -263,6 +304,27 @@
+         assert(!a->pending && a->status == VA_STATUS_ERROR_TIMEDOUT);
+         rejects([&] { d.submit({2}, surface(), {}); });
+     }
++    f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
++    {
++        T880Decoder d("fake", 160, 128, VAProfileAV1Profile0, VA_RT_FORMAT_YUV420, -1);
++        auto a = surface(); d.submit({1}, a, {1});
++        f.display_after_polls = f.polls + 1; f.gpu_fail = true;
++        unsigned before = f.capture_qbufs;
++        rejects([&] { d.sync(a); });
++        assert(f.gpu_calls == 1 && f.capture_qbufs == before);
++        assert(!a->pending && a->status == VA_STATUS_ERROR_TIMEDOUT && a->pixel_generation == 0);
++        rejects([&] { d.submit({2}, surface(), {}); });
++    }
++    for (bool no_generated : {false, true}) {
++        f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
++        T880Decoder d("fake", 160, 128, VAProfileAV1Profile0, VA_RT_FORMAT_YUV420, -1);
++        auto a = surface(); d.submit({1}, a, {1});
++        f.display_after_polls = f.polls + 1; f.no_generated = no_generated; f.wrong_offset = !no_generated;
++        unsigned before = f.capture_qbufs;
++        rejects([&] { d.sync(a); });
++        assert(f.gpu_calls == 0 && f.capture_qbufs == before && a->pixel_generation == 0);
++        assert(!a->pending && a->status != VA_STATUS_SUCCESS);
++    }
+     rejects([] { token(timeval{std::numeric_limits<long>::max(), 999999}); });
+     std::cout << "T880 replay ownership, stable pixels, fresh anchor, limits and sticky faults passed\n";
+ }
+--- a/tests/t880/presentation.cpp
++++ b/tests/t880/presentation.cpp
+@@ -71,5 +71,13 @@
+   rejects([&]{allocate_t880_presentation_surface(100,size.first,size.second,VA_FOURCC_NV12);});
+  rejects([]{allocate_t880_presentation_surface(100,1920,1080,VA_FOURCC_P010);});assert(!f.creates);
+  auto max=allocate_t880_presentation_surface(100,4096,2176,VA_FOURCC_NV12);assert(max->size<=16u*1024*1024&&f.closes==1);
++ f={};size_t tiled_size=0;int tiled=allocate_t880_tiled_backing(100,10240,5120,tiled_size);
++ assert(tiled>=0&&tiled_size%size_t(sysconf(_SC_PAGESIZE))==0&&tiled_size>=15360&&f.closes==1&&!f.live);close(tiled);
++ for(int mode=0;mode<4;mode++){
++  f={};f.create_fail=mode==0;f.export_fail=mode==1;f.close_fail=mode==2;f.bad_size=mode==3;
++  rejects([&]{allocate_t880_tiled_backing(100,10240,5120,tiled_size);});assert(!f.live&&f.closes==(mode==0?0u:1u));
++  if(f.last_fd>=0)assert(fcntl(f.last_fd,F_GETFD)==-1&&errno==EBADF);
++ }
++ f={};rejects([&]{allocate_t880_tiled_backing(100,0,5120,tiled_size);});rejects([&]{allocate_t880_tiled_backing(100,16u*1024*1024,1,tiled_size);});assert(!f.creates);
+  std::cout<<"T880 read-only/early presentation, upload policy, PRIME lifetime, failures and bounds passed\n";
+ }

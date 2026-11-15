@@ -1,0 +1,1240 @@
+From dcb7f098b3a3172148054d8db9bff4bccf1d15bc Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 10 Nov 2026 13:30:00 +0800
+Subject: [PATCH 090/144] power: supply: qcom_battmgr: complete Dodge Type-C
+ and PD handling
+
+Consolidate the external OTG, DRP, PMIC supply, cable detection, PD source/sink and startup reconciliation changes.
+
+Consolidated from local follow-ups:
+  0c0f76f665f8003ac89cad71c64d826e1f2ef186 power: supply: qcom_battmgr: control Dodge external OTG power
+  2bb825aa90aaf9d6a204d6707f76181e7332a3d9 power: supply: qcom_battmgr: restore Dodge DRP on cable detect
+  a3ca1cd3e962980c3834f451f008bff63e0ca169 power: supply: qcom_battmgr: use Dodge PMIC OTG supply
+  49e073e0376f3fa74a3883092fae14164d4db390 power: supply: qcom_battmgr: complete Dodge cable detection
+  edcb831eeb3c340fab0bad6af89ac87e4afd6157 power: supply: qcom_battmgr: read Dodge PD source capabilities
+  e731c2ebcaf0a992c934af9c9ae1af1600c4eda5 power: supply: qcom_battmgr: support bounded Dodge PD sink requests
+  c8e5be5af1e29675569c8de9c2bd0528ab0bfe10 power: supply: qcom_battmgr: reconcile Dodge cable state at startup
+---
+ drivers/power/supply/qcom_battmgr.c | 1070 ++++++++++++++++++++++++++-
+ 1 file changed, 1064 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 9c1a584780..8baf6e1b1b 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -6,6 +6,7 @@
+  */
+ #include <linux/auxiliary_bus.h>
+ #include <linux/devm-helpers.h>
++#include <linux/spinlock.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/nvmem-consumer.h>
+@@ -15,6 +16,7 @@
+ #include <linux/soc/qcom/pdr.h>
+ #include <linux/soc/qcom/pmic_glink.h>
+ #include <linux/math.h>
++#include <linux/delay.h>
+ #include <linux/units.h>
+ 
+ #define BATTMGR_CHEMISTRY_LEN	4
+@@ -32,6 +34,22 @@ enum qcom_battmgr_variant {
+ 
+ #define BATTMGR_REQUEST_NOTIFICATION	0x4
+ 
++/* OnePlus ADSP USB properties and notifications (non-SoCCP protocol). */
++#define DODGE_USB_OTG_AP_ENABLE		17
++#define DODGE_USB_OTG_VBUS_ENABLE		24
++#define DODGE_USB_OTG_BOOST_CURRENT	64
++#define DODGE_USB_CID_STATUS		21
++#define DODGE_USB_TYPEC_MODE		22
++#define DODGE_USB_CCDETECT_HAPPENED	31
++#define DODGE_TYPEC_MODE_DRP		0
++#define DODGE_NOTIF_OTG_ENABLE		0x50
++#define DODGE_NOTIF_OTG_DISABLE		0x51
++#define DODGE_NOTIF_CID_DETECT		0x53
++#define DODGE_NOTIF_PD_SOFT_RESET	0x5a
++#define DODGE_NOTIF_PD_SOURCECAP_DONE	0x79
++#define DODGE_BATT_SET_PDO		25
++#define DODGE_USB_TYPE_PD_SDP		17
++
+ #define BATTMGR_NOTIFICATION		0x7
+ #define NOTIF_BAT_PROPERTY		0x30
+ #define NOTIF_USB_PROPERTY		0x32
+@@ -309,6 +327,34 @@ struct qcom_battmgr_wireless {
+ 	unsigned int current_max;
+ };
+ 
++#define DODGE_PD_READ_BUFFER		0x10004
++#define DODGE_PD_BUFFER_WORDS		128
++#define DODGE_PD_MAX_PDOS		7
++
++struct qcom_battmgr_dodge_pd_request {
++	struct pmic_glink_hdr hdr;
++	__le32 data_size;
++};
++
++struct qcom_battmgr_dodge_pd_response {
++	struct pmic_glink_hdr hdr;
++	__le32 data[DODGE_PD_BUFFER_WORDS];
++	__le32 data_size;
++};
++
++struct qcom_battmgr_dodge_pd_caps {
++	u32 max_ma;
++	u32 max_mv;
++	u32 pdo[DODGE_PD_MAX_PDOS];
++	unsigned int count;
++};
++
++enum qcom_battmgr_dodge_power_state {
++	DODGE_POWER_UNKNOWN,
++	DODGE_POWER_OFF,
++	DODGE_POWER_ON,
++};
++
+ struct qcom_battmgr {
+ 	struct device *dev;
+ 	struct pmic_glink_client *client;
+@@ -341,6 +387,49 @@ struct qcom_battmgr {
+ 	bool dodge_gauge_valid;
+ 	bool dodge_gauge_pending;
+ 
++	/* Callbacks cannot sleep; firmware requests are serialized by lock. */
++	spinlock_t dodge_otg_lock;
++	struct delayed_work dodge_otg_work;
++	struct work_struct dodge_cid_work;
++	u32 dodge_cid_sequence;
++	bool dodge_cid_pending;
++	bool dodge_cid_retried;
++	u32 dodge_otg_epoch;
++	struct completion dodge_otg_ack;
++	u32 dodge_otg_opcode;
++	u32 dodge_otg_property;
++	u32 dodge_otg_value;
++	int dodge_otg_error;
++	bool dodge_otg_pending;
++	bool dodge_otg_broken;
++	bool dodge_otg_ready;
++	bool dodge_otg_requested;
++	bool dodge_otg_stopping;
++	bool dodge_otg_prohibited;
++	bool dodge_power_ambiguous;
++	/* Power state below is owned by lock, never changed by callbacks. */
++	enum qcom_battmgr_dodge_power_state dodge_power_state;
++	u32 dodge_power_generation;
++	u32 dodge_power_epoch;
++	u32 dodge_power_emergency_generation;
++	bool dodge_power_emergency_sent;
++	u32 dodge_power_current_ma;
++	unsigned int dodge_power_protect_count;
++	unsigned long dodge_power_checked;
++	u32 dodge_request_opcode;
++	u32 dodge_request_property;
++	bool dodge_request_pending;
++
++	struct qcom_battmgr_dodge_pd_caps dodge_pd_caps;
++	u32 dodge_pd_revision;
++	u32 dodge_pd_caps_revision;
++	u32 dodge_pd_generation;
++	u32 dodge_pd_epoch;
++	u32 dodge_pd_sequence;
++	int dodge_pd_error;
++	bool dodge_pd_attempted;
++	bool dodge_pd_broken;
++
+ 	struct work_struct enable_work;
+ 
+ 	/*
+@@ -352,22 +441,176 @@ struct qcom_battmgr {
+ 
+ static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t len)
+ {
+-	unsigned long left;
++	const struct qcom_battmgr_property_request *req = data;
++	unsigned long left, flags;
++	u32 generation = 0;
+ 	int ret;
+ 
+ 	reinit_completion(&battmgr->ack);
+-
+ 	battmgr->error = 0;
++	if (battmgr->variant == QCOM_BATTMGR_DODGE) {
++		spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++		if (!battmgr->service_up || battmgr->dodge_otg_stopping ||
++		    (battmgr->dodge_otg_broken &&
++		     le32_to_cpu(req->hdr.opcode) == BATTMGR_WLS_PROPERTY_GET &&
++		     len == sizeof(*req) && le32_to_cpu(req->property) == WLS_ONLINE)) {
++			spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++			return -ENOTCONN;
++		}
++		generation = battmgr->dodge_service_generation;
++		battmgr->dodge_request_opcode = le32_to_cpu(req->hdr.opcode);
++		battmgr->dodge_request_property = len == sizeof(*req) ?
++			le32_to_cpu(req->property) : 0;
++		battmgr->dodge_request_pending = true;
++		spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	}
+ 
+ 	ret = pmic_glink_send(battmgr->client, data, len);
+ 	if (ret < 0)
+-		return ret;
++		goto out;
+ 
+ 	left = wait_for_completion_timeout(&battmgr->ack, HZ);
+-	if (!left)
+-		return -ETIMEDOUT;
++	ret = left ? battmgr->error : -ETIMEDOUT;
++out:
++	if (battmgr->variant == QCOM_BATTMGR_DODGE) {
++		spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++		battmgr->dodge_request_pending = false;
++		if (ret == -ETIMEDOUT && generation == battmgr->dodge_service_generation &&
++		    battmgr->dodge_request_opcode == BATTMGR_WLS_PROPERTY_GET &&
++		    battmgr->dodge_request_property == WLS_ONLINE) {
++			battmgr->dodge_otg_broken = true;
++			battmgr->dodge_otg_epoch++;
++			if (!battmgr->dodge_otg_stopping)
++				mod_delayed_work(system_percpu_wq, &battmgr->dodge_otg_work, 0);
++		}
++		if (!battmgr->service_up || battmgr->dodge_otg_stopping ||
++		    generation != battmgr->dodge_service_generation)
++			ret = -ENOTCONN;
++		spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	}
++	return ret;
++}
++
++static int qcom_battmgr_dodge_pd_decode(const void *data, size_t len,
++				      struct qcom_battmgr_dodge_pd_caps *caps)
++{
++	const struct qcom_battmgr_dodge_pd_response *resp = data;
++	unsigned int bytes, words, i;
++
++	if (len != sizeof(*resp))
++		return -EMSGSIZE;
++	if (le32_to_cpu(resp->hdr.owner) != PMIC_GLINK_OWNER_BATTMGR ||
++	    le32_to_cpu(resp->hdr.type) != PMIC_GLINK_REQ_RESP ||
++	    le32_to_cpu(resp->hdr.opcode) != DODGE_PD_READ_BUFFER)
++		return -EPROTO;
++	bytes = le32_to_cpu(resp->data_size);
++	if (bytes < 2 * sizeof(__le32) || bytes > sizeof(resp->data) ||
++	    bytes % sizeof(__le32))
++		return -EPROTO;
++
++	memset(caps, 0, sizeof(*caps));
++	/* OEM metadata precedes the source PDOs; it is not a pair of PDOs. */
++	caps->max_ma = le32_to_cpu(resp->data[0]);
++	caps->max_mv = le32_to_cpu(resp->data[1]);
++	words = min_t(unsigned int, bytes / sizeof(__le32) - 2, DODGE_PD_MAX_PDOS);
++	for (i = 0; i < words; i++) {
++		u32 pdo = le32_to_cpu(resp->data[i + 2]);
++
++		if (!pdo)
++			break;
++		/* Preserve the wire type, including APDOs; do not assume fixed PDOs. */
++		caps->pdo[caps->count++] = pdo;
++	}
++	return 0;
++}
+ 
+-	return battmgr->error;
++/* Caller holds dodge_otg_lock. */
++static bool qcom_battmgr_dodge_pd_current(struct qcom_battmgr *battmgr)
++{
++	return battmgr->service_up && !battmgr->dodge_otg_stopping &&
++		!battmgr->dodge_otg_requested &&
++		battmgr->dodge_pd_caps_revision == battmgr->dodge_pd_revision &&
++		battmgr->dodge_pd_generation == battmgr->dodge_service_generation &&
++		battmgr->dodge_pd_epoch == battmgr->dodge_otg_epoch &&
++		battmgr->dodge_pd_sequence == battmgr->dodge_cid_sequence;
++}
++
++static void qcom_battmgr_dodge_pd_reply(struct qcom_battmgr *battmgr,
++				      const void *data, size_t len)
++{
++	const struct pmic_glink_hdr *hdr = data;
++	unsigned long flags;
++
++	if (len < sizeof(*hdr) ||
++	    le32_to_cpu(hdr->owner) != PMIC_GLINK_OWNER_BATTMGR ||
++	    le32_to_cpu(hdr->type) != PMIC_GLINK_REQ_RESP ||
++	    le32_to_cpu(hdr->opcode) != DODGE_PD_READ_BUFFER)
++		return;
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	if (battmgr->dodge_request_pending &&
++	    battmgr->dodge_request_opcode == DODGE_PD_READ_BUFFER) {
++		battmgr->dodge_request_pending = false;
++		battmgr->error = qcom_battmgr_dodge_pd_current(battmgr) ?
++			qcom_battmgr_dodge_pd_decode(data, len, &battmgr->dodge_pd_caps) :
++			-EAGAIN;
++		complete(&battmgr->ack);
++	}
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++}
++
++/* Caller holds lock, shared with gauge, ordinary properties and OTG requests. */
++static int qcom_battmgr_dodge_pd_read_caps(struct qcom_battmgr *battmgr)
++{
++	struct qcom_battmgr_dodge_pd_request req = {
++		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
++		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
++		.hdr.opcode = cpu_to_le32(DODGE_PD_READ_BUFFER),
++		.data_size = cpu_to_le32(DODGE_PD_BUFFER_WORDS * sizeof(__le32)),
++	};
++	unsigned long flags;
++	unsigned int i;
++	int ret;
++
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	if (!battmgr->service_up || battmgr->dodge_otg_stopping ||
++	    battmgr->dodge_otg_requested || battmgr->dodge_pd_broken) {
++		spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++		return -ENOTCONN;
++	}
++	if (battmgr->dodge_pd_attempted && qcom_battmgr_dodge_pd_current(battmgr)) {
++		ret = battmgr->dodge_pd_error;
++		spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++		return ret;
++	}
++	battmgr->dodge_pd_caps_revision = battmgr->dodge_pd_revision;
++	battmgr->dodge_pd_generation = battmgr->dodge_service_generation;
++	battmgr->dodge_pd_epoch = battmgr->dodge_otg_epoch;
++	battmgr->dodge_pd_sequence = battmgr->dodge_cid_sequence;
++	battmgr->dodge_pd_attempted = true;
++	battmgr->dodge_pd_error = -EINPROGRESS;
++	memset(&battmgr->dodge_pd_caps, 0, sizeof(battmgr->dodge_pd_caps));
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++
++	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	/* There is no wire transaction ID: do not retry an ambiguous read. */
++	if (ret == -ETIMEDOUT &&
++	    battmgr->dodge_pd_generation == battmgr->dodge_service_generation)
++		battmgr->dodge_pd_broken = true;
++	if (!ret && !qcom_battmgr_dodge_pd_current(battmgr))
++		ret = -EAGAIN;
++	battmgr->dodge_pd_error = ret;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	if (ret)
++		return ret;
++
++	dev_info(battmgr->dev, "PD source limits: %u mA, %u mV; %u PDOs\n",
++		 battmgr->dodge_pd_caps.max_ma, battmgr->dodge_pd_caps.max_mv,
++		 battmgr->dodge_pd_caps.count);
++	for (i = 0; i < battmgr->dodge_pd_caps.count; i++)
++		dev_info(battmgr->dev, "PD source PDO[%u] = %#010x\n",
++			 i, battmgr->dodge_pd_caps.pdo[i]);
++	return 0;
+ }
+ 
+ static int qcom_battmgr_request_property(struct qcom_battmgr *battmgr, int opcode,
+@@ -1131,9 +1374,21 @@ static int qcom_battmgr_usb_sm8350_update(struct qcom_battmgr *battmgr,
+ 		return -EINVAL;
+ 
+ 	prop = sm8350_usb_prop_map[psp];
++	if (battmgr->variant == QCOM_BATTMGR_DODGE && psp == POWER_SUPPLY_PROP_USB_TYPE)
++		prop = USB_ADAP_TYPE;
+ 
+ 	mutex_lock(&battmgr->lock);
+ 	ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET, prop, 0);
++	if (!ret && battmgr->variant == QCOM_BATTMGR_DODGE &&
++	    psp == POWER_SUPPLY_PROP_USB_TYPE &&
++	    (battmgr->usb.usb_type == POWER_SUPPLY_USB_TYPE_PD ||
++	     battmgr->usb.usb_type == POWER_SUPPLY_USB_TYPE_PD_DRP ||
++	     battmgr->usb.usb_type == POWER_SUPPLY_USB_TYPE_PD_PPS)) {
++		int caps_ret = qcom_battmgr_dodge_pd_read_caps(battmgr);
++
++		if (caps_ret)
++			dev_dbg(battmgr->dev, "PD source capabilities unavailable: %d\n", caps_ret);
++	}
+ 	mutex_unlock(&battmgr->lock);
+ 
+ 	return ret;
+@@ -1186,6 +1441,19 @@ static int qcom_battmgr_usb_get_property(struct power_supply *psy,
+ 	return 0;
+ }
+ 
++static int qcom_battmgr_dodge_usb_set_property(struct power_supply *psy,
++					    enum power_supply_property psp,
++					    const union power_supply_propval *val);
++
++static int qcom_battmgr_dodge_usb_is_writeable(struct power_supply *psy,
++					    enum power_supply_property psp)
++{
++	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
++
++	return battmgr->variant == QCOM_BATTMGR_DODGE &&
++		psp == POWER_SUPPLY_PROP_VOLTAGE_MAX;
++}
++
+ static const enum power_supply_property sc8280xp_usb_props[] = {
+ 	POWER_SUPPLY_PROP_ONLINE,
+ };
+@@ -1224,6 +1492,8 @@ static const struct power_supply_desc sm8350_usb_psy_desc = {
+ 	.properties = sm8350_usb_props,
+ 	.num_properties = ARRAY_SIZE(sm8350_usb_props),
+ 	.get_property = qcom_battmgr_usb_get_property,
++	.set_property = qcom_battmgr_dodge_usb_set_property,
++	.property_is_writeable = qcom_battmgr_dodge_usb_is_writeable,
+ 	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN) |
+ 		     BIT(POWER_SUPPLY_USB_TYPE_SDP)     |
+ 		     BIT(POWER_SUPPLY_USB_TYPE_DCP)     |
+@@ -1680,7 +1950,15 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
+ 			battmgr->usb.current_limit = le32_to_cpu(resp->intval.value);
+ 			break;
+ 		case USB_TYPE:
++		case USB_ADAP_TYPE:
+ 			battmgr->usb.usb_type = le32_to_cpu(resp->intval.value);
++			if (battmgr->variant == QCOM_BATTMGR_DODGE) {
++				if (battmgr->usb.usb_type == DODGE_USB_TYPE_PD_SDP)
++					battmgr->usb.usb_type = POWER_SUPPLY_USB_TYPE_PD;
++				else if (battmgr->usb.usb_type >
++					 POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID)
++					battmgr->usb.usb_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
++			}
+ 			break;
+ 		default:
+ 			dev_warn(battmgr->dev, "unknown property %#x\n", property);
+@@ -1735,6 +2013,650 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
+ 	complete(&battmgr->ack);
+ }
+ 
++/* Caller serializes firmware requests with battmgr->lock. */
++static int qcom_battmgr_dodge_otg_request(struct qcom_battmgr *battmgr,
++				       u32 opcode, u32 property, u32 value,
++				       u32 generation)
++{
++	struct qcom_battmgr_property_request req = {
++		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
++		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
++		.hdr.opcode = cpu_to_le32(opcode),
++		.property = cpu_to_le32(property),
++		.value = cpu_to_le32(value),
++	};
++	bool power = opcode == BATTMGR_USB_PROPERTY_SET &&
++		     property == DODGE_USB_OTG_VBUS_ENABLE;
++	bool power_off = power && !value;
++	unsigned long flags, left;
++	int ret;
++
++	reinit_completion(&battmgr->dodge_otg_ack);
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	if (!battmgr->service_up ||
++	    (battmgr->dodge_otg_stopping && !power_off) ||
++	    (battmgr->dodge_otg_broken && !power_off) ||
++	    (power && battmgr->dodge_power_ambiguous) ||
++	    generation != battmgr->dodge_service_generation) {
++		spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++		return -ENOTCONN;
++	}
++	battmgr->dodge_otg_opcode = opcode;
++	battmgr->dodge_otg_property = property;
++	battmgr->dodge_otg_pending = true;
++	battmgr->dodge_otg_error = -ETIMEDOUT;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++
++	ret = pmic_glink_send(battmgr->client, &req, sizeof(req));
++	if (!ret) {
++		left = wait_for_completion_timeout(&battmgr->dodge_otg_ack, HZ);
++		ret = left ? battmgr->dodge_otg_error : -ETIMEDOUT;
++	}
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	battmgr->dodge_otg_pending = false;
++	/* No transaction ID: never retry an ambiguous write in this service. */
++	if ((ret == -ETIMEDOUT || (power && ret)) &&
++	    generation == battmgr->dodge_service_generation) {
++		battmgr->dodge_otg_broken = true;
++		if (power && ret == -ETIMEDOUT)
++			battmgr->dodge_power_ambiguous = true;
++		if (!battmgr->dodge_otg_stopping)
++			mod_delayed_work(system_percpu_wq, &battmgr->dodge_otg_work, 0);
++	}
++	if (!battmgr->service_up ||
++	    generation != battmgr->dodge_service_generation)
++		ret = -ENOTCONN;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	return ret;
++}
++
++/* Caller holds lock; all checks and requests belong to the cached attachment. */
++static bool qcom_battmgr_dodge_pd_valid(struct qcom_battmgr *battmgr)
++{
++	unsigned long flags;
++	bool valid;
++
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	valid = qcom_battmgr_dodge_pd_current(battmgr) &&
++		!battmgr->dodge_otg_broken;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	return valid;
++}
++
++static unsigned int qcom_battmgr_dodge_pd_fixed_ma(
++		const struct qcom_battmgr_dodge_pd_caps *caps, unsigned int mv)
++{
++	unsigned int i;
++
++	for (i = 0; i < caps->count; i++) {
++		u32 pdo = caps->pdo[i];
++
++		if (!(pdo >> 30) && ((pdo >> 10) & 0x3ff) * 50 == mv)
++			return (pdo & 0x3ff) * 10;
++	}
++	return 0;
++}
++
++static int qcom_battmgr_dodge_pd_property(struct qcom_battmgr *battmgr,
++					u32 opcode, u32 property, u32 value)
++{
++	int ret;
++
++	if (!qcom_battmgr_dodge_pd_valid(battmgr))
++		return -ENOTCONN;
++	ret = qcom_battmgr_dodge_otg_request(battmgr, opcode, property, value,
++					   battmgr->dodge_pd_generation);
++	if (!ret && !qcom_battmgr_dodge_pd_valid(battmgr))
++		ret = -ENOTCONN;
++	return ret;
++}
++
++/* A conservative request gate, not a replacement for the OEM thermal policy. */
++static int qcom_battmgr_dodge_pd_check_battery(struct qcom_battmgr *battmgr)
++{
++	struct qcom_battmgr_dodge_request req = {
++		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
++		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
++		.hdr.opcode = cpu_to_le32(DODGE_GAUGE_OPCODE),
++		.data_size = cpu_to_le32(DODGE_GAUGE_WORDS * sizeof(__le32)),
++	};
++	int ret;
++
++	ret = qcom_battmgr_dodge_pd_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
++					   BATT_HEALTH, 0);
++	if (ret)
++		return ret;
++	if (battmgr->dodge_otg_value != POWER_SUPPLY_HEALTH_GOOD)
++		return -EAGAIN;
++	WRITE_ONCE(battmgr->dodge_gauge_pending, true);
++	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
++	WRITE_ONCE(battmgr->dodge_gauge_pending, false);
++	if (ret)
++		return ret;
++	/* Do not infer individual cell voltage from the ambiguous pack field. */
++	if (!qcom_battmgr_dodge_pd_valid(battmgr) ||
++	    (s32)battmgr->dodge_gauge[0] < 0 || battmgr->dodge_gauge[0] > 430 ||
++	    battmgr->dodge_gauge[3] >= 9500)
++		return -EAGAIN;
++	return 0;
++}
++
++static int qcom_battmgr_dodge_pd_wait_voltage(struct qcom_battmgr *battmgr,
++					    unsigned int mv)
++{
++	unsigned int i, uv;
++	int ret;
++
++	for (i = 0; i < 10; i++) {
++		ret = qcom_battmgr_dodge_pd_property(battmgr, BATTMGR_USB_PROPERTY_GET,
++						   USB_VOLT_NOW, 0);
++		if (ret)
++			return ret;
++		uv = battmgr->dodge_otg_value;
++		if ((mv == 9000 && uv >= 8000000 && uv <= 10000000) ||
++		    (mv == 5000 && uv >= 4000000 && uv <= 5500000))
++			return 0;
++		msleep(200);
++	}
++	return -ETIMEDOUT;
++}
++
++static int qcom_battmgr_dodge_usb_set_property(struct power_supply *psy,
++					    enum power_supply_property psp,
++					    const union power_supply_propval *val)
++{
++	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
++	unsigned int mv, current_ua;
++	int ret, fallback_ret;
++
++	if (battmgr->variant != QCOM_BATTMGR_DODGE || psp != POWER_SUPPLY_PROP_VOLTAGE_MAX)
++		return -EOPNOTSUPP;
++	if (val->intval != 5000000 && val->intval != 9000000)
++		return -EINVAL;
++	mv = val->intval / 1000;
++	mutex_lock(&battmgr->lock);
++	ret = qcom_battmgr_dodge_pd_read_caps(battmgr);
++	if (ret)
++		goto out;
++	/* Use an actual fixed PDO, never an APDO or a proprietary label rating. */
++	current_ua = min(qcom_battmgr_dodge_pd_fixed_ma(&battmgr->dodge_pd_caps, mv),
++			 2000U) * 1000;
++	if (current_ua < 500000 || (mv == 9000 && current_ua < 2000000)) {
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
++	ret = qcom_battmgr_dodge_pd_property(battmgr, BATTMGR_USB_PROPERTY_GET,
++					   USB_ONLINE, 0);
++	if (ret || !battmgr->dodge_otg_value) {
++		ret = ret ?: -ENODEV;
++		goto out;
++	}
++	ret = qcom_battmgr_dodge_pd_property(battmgr, BATTMGR_WLS_PROPERTY_GET,
++					   WLS_ONLINE, 0);
++	if (ret || battmgr->dodge_otg_value) {
++		ret = ret ?: -EBUSY;
++		goto out;
++	}
++	ret = qcom_battmgr_dodge_pd_property(battmgr, BATTMGR_USB_PROPERTY_GET,
++					   USB_ADAP_TYPE, 0);
++	if (ret)
++		goto out;
++	if (battmgr->dodge_otg_value != POWER_SUPPLY_USB_TYPE_PD &&
++	    battmgr->dodge_otg_value != POWER_SUPPLY_USB_TYPE_PD_DRP &&
++	    battmgr->dodge_otg_value != POWER_SUPPLY_USB_TYPE_PD_PPS &&
++	    battmgr->dodge_otg_value != DODGE_USB_TYPE_PD_SDP) {
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
++	if (mv == 9000) {
++		ret = qcom_battmgr_dodge_pd_check_battery(battmgr);
++		if (ret)
++			goto out;
++	}
++	/* OEM: lower input current before either voltage transition. */
++	ret = qcom_battmgr_dodge_pd_property(battmgr, BATTMGR_USB_PROPERTY_SET,
++					   USB_INPUT_CURR_LIMIT, 500000);
++	if (ret)
++		goto out;
++	/* Dodge's OEM battery property25 is SET_PDO, in millivolts. */
++	ret = qcom_battmgr_dodge_pd_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
++					   DODGE_BATT_SET_PDO, mv);
++	if (ret)
++		goto fallback;
++	ret = qcom_battmgr_dodge_pd_wait_voltage(battmgr, mv);
++	if (ret)
++		goto fallback;
++	if (mv == 9000) {
++		ret = qcom_battmgr_dodge_pd_property(battmgr, BATTMGR_USB_PROPERTY_SET,
++						   USB_INPUT_CURR_LIMIT, 1500000);
++		if (ret)
++			goto fallback;
++		msleep(3000);
++		ret = qcom_battmgr_dodge_pd_check_battery(battmgr);
++		if (ret)
++			goto fallback;
++	}
++	ret = qcom_battmgr_dodge_pd_property(battmgr, BATTMGR_USB_PROPERTY_SET,
++					   USB_INPUT_CURR_LIMIT, current_ua);
++	if (!ret) {
++		dev_info(battmgr->dev, "PD sink requested %u mV at up to %u mA\n",
++			 mv, current_ua / 1000);
++		goto out;
++	}
++fallback:
++	/* Never replay an ambiguous command or act on a different attachment. */
++	if (qcom_battmgr_dodge_pd_valid(battmgr)) {
++		fallback_ret = qcom_battmgr_dodge_pd_property(battmgr, BATTMGR_USB_PROPERTY_SET,
++							    USB_INPUT_CURR_LIMIT, 500000);
++		if (!fallback_ret)
++			fallback_ret = qcom_battmgr_dodge_pd_property(battmgr,
++						BATTMGR_BAT_PROPERTY_SET, DODGE_BATT_SET_PDO, 5000);
++		if (!fallback_ret)
++			fallback_ret = qcom_battmgr_dodge_pd_wait_voltage(battmgr, 5000);
++		dev_warn(battmgr->dev, "PD sink transition failed (%d), 5 V fallback: %d\n",
++			 ret, fallback_ret);
++	}
++out:
++	mutex_unlock(&battmgr->lock);
++	if (!ret)
++		power_supply_changed(psy);
++	return ret;
++}
++
++/* Caller owns lock. Never claim OFF from an ambiguous same-property reply. */
++static int qcom_battmgr_dodge_power_off(struct qcom_battmgr *battmgr, u32 generation)
++{
++	struct qcom_battmgr_property_request req = {
++		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
++		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
++		.hdr.opcode = cpu_to_le32(BATTMGR_USB_PROPERTY_SET),
++		.property = cpu_to_le32(DODGE_USB_OTG_VBUS_ENABLE),
++	};
++	unsigned long flags;
++	bool ambiguous, connected;
++	int ret;
++
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	ambiguous = battmgr->dodge_power_ambiguous;
++	connected = battmgr->service_up &&
++		generation == battmgr->dodge_service_generation;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	if (!connected) {
++		battmgr->dodge_power_state = DODGE_POWER_UNKNOWN;
++		return -ENOTCONN;
++	}
++	if (battmgr->dodge_power_generation != generation)
++		battmgr->dodge_power_state = DODGE_POWER_UNKNOWN;
++	if (battmgr->dodge_power_state == DODGE_POWER_OFF && !ambiguous)
++		return 0;
++	if (battmgr->dodge_power_emergency_sent &&
++	    battmgr->dodge_power_emergency_generation == generation)
++		return -EIO;
++	if (!ambiguous) {
++		ret = qcom_battmgr_dodge_otg_request(battmgr,
++			BATTMGR_USB_PROPERTY_SET, DODGE_USB_OTG_VBUS_ENABLE, 0,
++			generation);
++		if (!ret) {
++			battmgr->dodge_power_state = DODGE_POWER_OFF;
++			battmgr->dodge_power_generation = generation;
++			battmgr->dodge_power_current_ma = 0;
++			battmgr->dodge_power_protect_count = 0;
++			return 0;
++		}
++	}
++	battmgr->dodge_power_state = DODGE_POWER_UNKNOWN;
++	/* A timed-out ON ack could match OFF: send once, without trusting an ack. */
++	if (battmgr->dodge_power_emergency_sent &&
++	    battmgr->dodge_power_emergency_generation == generation)
++		return -EIO;
++	battmgr->dodge_power_emergency_sent = true;
++	battmgr->dodge_power_emergency_generation = generation;
++	ret = pmic_glink_send(battmgr->client, &req, sizeof(req));
++	dev_warn_ratelimited(battmgr->dev,
++		"OTG state unknown; best-effort disable sent (%d), awaiting service restart\n", ret);
++	return ret ? ret : -EIO;
++}
++
++static int qcom_battmgr_dodge_otg_init(struct qcom_battmgr *battmgr, u32 generation)
++{
++	int ret;
++
++	/* The stock board selects PMIC boost, not its unused external GPIO path. */
++	ret = qcom_battmgr_dodge_power_off(battmgr, generation);
++	if (ret)
++		return ret;
++	ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_USB_PROPERTY_SET,
++				DODGE_USB_OTG_AP_ENABLE, 1, generation);
++	if (ret)
++		return ret;
++	ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_USB_PROPERTY_GET,
++				DODGE_USB_CID_STATUS, 0, generation);
++	if (ret || !battmgr->dodge_otg_value)
++		return ret;
++	/* Match OEM CID initialization: restore DRP for an attached cable. */
++	ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_USB_PROPERTY_GET,
++				DODGE_USB_TYPEC_MODE, 0, generation);
++	if (ret)
++		return ret;
++	ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_USB_PROPERTY_SET,
++				DODGE_USB_TYPEC_MODE, DODGE_TYPEC_MODE_DRP, generation);
++	if (ret)
++		return ret;
++	ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_USB_PROPERTY_GET,
++				DODGE_USB_TYPEC_MODE, 0, generation);
++	if (!ret && (battmgr->dodge_otg_value & 7) != DODGE_TYPEC_MODE_DRP)
++		ret = -EPROTO;
++	return ret;
++}
++
++static bool qcom_battmgr_dodge_cid_current(struct qcom_battmgr *battmgr,
++					 u32 generation, u32 epoch, u32 sequence)
++{
++	unsigned long flags;
++	bool valid;
++
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	valid = battmgr->service_up && battmgr->dodge_otg_ready &&
++		!battmgr->dodge_otg_stopping && !battmgr->dodge_otg_broken &&
++		generation == battmgr->dodge_service_generation &&
++		epoch == battmgr->dodge_otg_epoch &&
++		sequence == battmgr->dodge_cid_sequence;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	return valid;
++}
++
++static void qcom_battmgr_dodge_cid_worker(struct work_struct *work)
++{
++	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr,
++						 dodge_cid_work);
++	unsigned long flags;
++	u32 generation, epoch, sequence, cid, mode;
++	int ret = 0, ack_ret;
++
++	mutex_lock(&battmgr->lock);
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	generation = battmgr->dodge_service_generation;
++	epoch = battmgr->dodge_otg_epoch;
++	sequence = battmgr->dodge_cid_sequence;
++	if (!battmgr->dodge_cid_pending || !battmgr->dodge_otg_ready ||
++	    !battmgr->service_up || battmgr->dodge_otg_stopping ||
++	    battmgr->dodge_otg_broken) {
++		spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++		goto out;
++	}
++	battmgr->dodge_cid_pending = false;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++
++	ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_USB_PROPERTY_GET,
++				DODGE_USB_CID_STATUS, 0, generation);
++	if (ret)
++		goto out;
++	cid = battmgr->dodge_otg_value;
++	dev_info_ratelimited(battmgr->dev, "CID detect state %u\n", cid);
++	/* The OEM runtime cable-detect path restores DRP only for CID == 1. */
++	if (cid > 1 || !qcom_battmgr_dodge_cid_current(battmgr,
++						generation, epoch, sequence))
++		goto out;
++	if (!cid)
++		goto acknowledge;
++	ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_USB_PROPERTY_GET,
++				DODGE_USB_TYPEC_MODE, 0, generation);
++	if (ret)
++		goto acknowledge;
++	mode = battmgr->dodge_otg_value;
++	/* A fresh attach needs the command even when the reported mode is DRP. */
++	if (!qcom_battmgr_dodge_cid_current(battmgr, generation, epoch, sequence))
++		goto out;
++	ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_USB_PROPERTY_SET,
++				DODGE_USB_TYPEC_MODE, DODGE_TYPEC_MODE_DRP, generation);
++	if (ret || !qcom_battmgr_dodge_cid_current(battmgr,
++						generation, epoch, sequence))
++		goto acknowledge;
++	ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_USB_PROPERTY_GET,
++				DODGE_USB_TYPEC_MODE, 0, generation);
++	if (!ret && (battmgr->dodge_otg_value & 7) != DODGE_TYPEC_MODE_DRP)
++		ret = -EPROTO;
++	if (!ret && qcom_battmgr_dodge_cid_current(battmgr,
++						generation, epoch, sequence))
++		dev_info_ratelimited(battmgr->dev,
++				     "restored Type-C DRP after CID attach (from mode %#x)\n", mode);
++acknowledge:
++	/* The OEM completes either CID state even if the mode command failed. */
++	if (qcom_battmgr_dodge_cid_current(battmgr, generation, epoch, sequence)) {
++		ack_ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_USB_PROPERTY_SET,
++					DODGE_USB_CCDETECT_HAPPENED, 1, generation);
++		if (!ret)
++			ret = ack_ret;
++	}
++out:
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	/* An unrelated power event may race detection. Re-read CID once. */
++	if (!ret && generation == battmgr->dodge_service_generation &&
++	    sequence == battmgr->dodge_cid_sequence &&
++	    epoch != battmgr->dodge_otg_epoch && battmgr->service_up &&
++	    battmgr->dodge_otg_ready && !battmgr->dodge_otg_stopping &&
++	    !battmgr->dodge_otg_broken && !battmgr->dodge_cid_retried) {
++		battmgr->dodge_cid_pending = true;
++		battmgr->dodge_cid_retried = true;
++		schedule_work(&battmgr->dodge_cid_work);
++	}
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	mutex_unlock(&battmgr->lock);
++	if (ret)
++		dev_warn_ratelimited(battmgr->dev, "CID attach handling failed: %d\n", ret);
++}
++
++static bool qcom_battmgr_dodge_otg_allowed(struct qcom_battmgr *battmgr,
++					 u32 generation, u32 epoch)
++{
++	unsigned long flags;
++	bool allowed;
++
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	allowed = battmgr->service_up && battmgr->dodge_otg_ready &&
++		battmgr->dodge_otg_requested && !battmgr->dodge_otg_stopping &&
++		!battmgr->dodge_otg_broken && !battmgr->dodge_otg_prohibited &&
++		generation == battmgr->dodge_service_generation &&
++		epoch == battmgr->dodge_otg_epoch;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	return allowed;
++}
++
++/* Standard POWER_SUPPLY CURRENT_NOW is negative during discharge. */
++static bool qcom_battmgr_dodge_power_protect(struct qcom_battmgr *battmgr,
++					   int soc, int current_ua)
++{
++	s64 discharge_ua = max_t(s64, -(s64)current_ua, 0);
++	unsigned long flags;
++	bool excessive;
++
++	if (time_before(jiffies, battmgr->dodge_power_checked + HZ))
++		return false;
++	battmgr->dodge_power_checked = jiffies;
++	excessive = discharge_ua > 3000000 || (soc < 10 && discharge_ua > 1700000);
++	if (excessive)
++		battmgr->dodge_power_protect_count++;
++	else
++		battmgr->dodge_power_protect_count = 0;
++	if (battmgr->dodge_power_protect_count < 2)
++		return false;
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	battmgr->dodge_otg_prohibited = true;
++	battmgr->dodge_otg_epoch++;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	dev_warn_ratelimited(battmgr->dev, "OTG disabled by current/SOC protection\n");
++	return true;
++}
++
++static void qcom_battmgr_dodge_otg_worker(struct work_struct *work)
++{
++	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
++					struct qcom_battmgr, dodge_otg_work);
++	union power_supply_propval soc, current_sample;
++	unsigned long flags;
++	u32 generation, epoch, limit;
++	int ret = 0;
++
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	generation = battmgr->dodge_service_generation;
++	epoch = battmgr->dodge_otg_epoch;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	mutex_lock(&battmgr->lock);
++	if (!qcom_battmgr_dodge_otg_allowed(battmgr, generation, epoch))
++		goto off;
++	/* Drain a raced OFF before honoring a later ON or wireless recheck. */
++	if (battmgr->dodge_power_generation != generation ||
++	    (battmgr->dodge_power_state == DODGE_POWER_ON &&
++	     battmgr->dodge_power_epoch != epoch)) {
++		ret = qcom_battmgr_dodge_power_off(battmgr, generation);
++		if (ret)
++			goto out;
++	}
++	mutex_unlock(&battmgr->lock);
++
++	ret = qcom_battmgr_dodge_get_property(battmgr->bat_psy,
++					    POWER_SUPPLY_PROP_CAPACITY, &soc);
++	if (!ret)
++		ret = qcom_battmgr_dodge_get_property(battmgr->bat_psy,
++					POWER_SUPPLY_PROP_CURRENT_NOW, &current_sample);
++	mutex_lock(&battmgr->lock);
++	if (ret)
++		goto off;
++	if (soc.intval < 0 || soc.intval > 100 || current_sample.intval == S32_MIN) {
++		ret = -ERANGE;
++		goto off;
++	}
++	if (!qcom_battmgr_dodge_otg_allowed(battmgr, generation, epoch))
++		goto off;
++	if (battmgr->dodge_power_state == DODGE_POWER_ON &&
++	    qcom_battmgr_dodge_power_protect(battmgr, soc.intval, current_sample.intval))
++		goto off;
++	ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_WLS_PROPERTY_GET,
++					   WLS_ONLINE, 0, generation);
++	if (ret || battmgr->dodge_otg_value)
++		goto off;
++	limit = soc.intval <= 1 ? 500 : 1250;
++	if (battmgr->dodge_power_current_ma != limit) {
++		ret = qcom_battmgr_dodge_otg_request(battmgr, BATTMGR_USB_PROPERTY_SET,
++				DODGE_USB_OTG_BOOST_CURRENT, limit, generation);
++		if (ret)
++			goto off;
++		battmgr->dodge_power_current_ma = limit;
++	}
++	if (!qcom_battmgr_dodge_otg_allowed(battmgr, generation, epoch))
++		goto off;
++	if (battmgr->dodge_power_state != DODGE_POWER_ON) {
++		battmgr->dodge_power_state = DODGE_POWER_UNKNOWN;
++		ret = qcom_battmgr_dodge_otg_request(battmgr,
++			BATTMGR_USB_PROPERTY_SET, DODGE_USB_OTG_VBUS_ENABLE, 1,
++			generation);
++		if (ret)
++			goto off;
++		battmgr->dodge_power_state = DODGE_POWER_ON;
++		battmgr->dodge_power_generation = generation;
++		battmgr->dodge_power_epoch = epoch;
++		battmgr->dodge_power_checked = jiffies;
++		if (!qcom_battmgr_dodge_otg_allowed(battmgr, generation, epoch))
++			goto off;
++		dev_info_ratelimited(battmgr->dev, "PMIC OTG source enabled\n");
++	}
++	mutex_unlock(&battmgr->lock);
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	if (!battmgr->dodge_otg_stopping)
++		schedule_delayed_work(&battmgr->dodge_otg_work, HZ);
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	return;
++
++off:
++	{
++		int disable_ret = qcom_battmgr_dodge_power_off(battmgr, generation);
++
++		if (!ret)
++			ret = disable_ret;
++	}
++out:
++	mutex_unlock(&battmgr->lock);
++	if (ret)
++		dev_warn_ratelimited(battmgr->dev, "OTG source unavailable: %d\n", ret);
++}
++
++/* Return true for all dedicated replies, including stale/unexpected ones. */
++static bool qcom_battmgr_dodge_otg_reply(struct qcom_battmgr *battmgr,
++				       const struct qcom_battmgr_message *msg,
++				       size_t len)
++{
++	u32 opcode = le32_to_cpu(msg->hdr.opcode);
++	unsigned long flags;
++	bool handled;
++
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	handled = battmgr->dodge_otg_pending || opcode == BATTMGR_USB_PROPERTY_SET;
++	if (!battmgr->dodge_otg_pending ||
++	    opcode != battmgr->dodge_otg_opcode ||
++	    len != sizeof(msg->hdr) + sizeof(msg->intval) ||
++	    le32_to_cpu(msg->hdr.type) != PMIC_GLINK_REQ_RESP ||
++	    le32_to_cpu(msg->intval.property) != battmgr->dodge_otg_property)
++		goto out;
++	battmgr->dodge_otg_pending = false;
++	battmgr->dodge_otg_value = le32_to_cpu(msg->intval.value);
++	battmgr->dodge_otg_error = le32_to_cpu(msg->intval.result) ? -EREMOTEIO : 0;
++	complete(&battmgr->dodge_otg_ack);
++out:
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	return handled;
++}
++
++static bool qcom_battmgr_dodge_otg_notification(struct qcom_battmgr *battmgr,
++					      const struct qcom_battmgr_message *msg,
++					      size_t len)
++{
++	unsigned long flags;
++	u32 notification;
++	bool handled = false;
++
++	if (len != sizeof(msg->hdr) + sizeof(msg->notification) ||
++	    le32_to_cpu(msg->hdr.type) != PMIC_GLINK_NOTIFY)
++		return true;
++	notification = le32_to_cpu(msg->notification);
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	if (battmgr->dodge_otg_stopping || !battmgr->service_up)
++		goto out;
++	switch (notification) {
++	case DODGE_NOTIF_PD_SOURCECAP_DONE:
++	case DODGE_NOTIF_PD_SOFT_RESET:
++		battmgr->dodge_pd_revision++;
++		break;
++	case DODGE_NOTIF_CID_DETECT:
++		battmgr->dodge_cid_sequence++;
++		battmgr->dodge_cid_pending = true;
++		battmgr->dodge_cid_retried = false;
++		schedule_work(&battmgr->dodge_cid_work);
++		handled = true;
++		break;
++	case DODGE_NOTIF_OTG_ENABLE:
++	case DODGE_NOTIF_OTG_DISABLE:
++		battmgr->dodge_otg_requested = notification == DODGE_NOTIF_OTG_ENABLE;
++		if (!battmgr->dodge_otg_requested) {
++			battmgr->dodge_otg_prohibited = false;
++			battmgr->dodge_otg_epoch++;
++		}
++		handled = true;
++		mod_delayed_work(system_percpu_wq, &battmgr->dodge_otg_work, 0);
++		break;
++	case NOTIF_WLS_PROPERTY:
++		battmgr->dodge_otg_epoch++;
++		fallthrough;
++	case NOTIF_BAT_PROPERTY:
++	case NOTIF_BAT_STATUS:
++	case NOTIF_BAT_CHARGING_STATE:
++		mod_delayed_work(system_percpu_wq, &battmgr->dodge_otg_work, 0);
++		break;
++	}
++out:
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	return handled;
++}
++
+ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
+ {
+ 	const struct pmic_glink_hdr *hdr = data;
+@@ -1744,6 +2666,45 @@ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
+ 	if (len < sizeof(*hdr))
+ 		return;
+ 	opcode = le32_to_cpu(hdr->opcode);
++	if (battmgr->variant == QCOM_BATTMGR_DODGE) {
++		if (opcode == DODGE_PD_READ_BUFFER) {
++			qcom_battmgr_dodge_pd_reply(battmgr, data, len);
++			return;
++		}
++
++		if (le32_to_cpu(hdr->owner) != PMIC_GLINK_OWNER_BATTMGR)
++			return;
++		if (opcode == BATTMGR_NOTIFICATION) {
++			if (qcom_battmgr_dodge_otg_notification(battmgr, data, len))
++				return;
++		} else if (qcom_battmgr_dodge_otg_reply(battmgr, data, len)) {
++			return;
++		}
++	}
++	if (battmgr->variant == QCOM_BATTMGR_DODGE &&
++	    opcode != BATTMGR_NOTIFICATION) {
++		const struct qcom_battmgr_message *msg = data;
++		unsigned long flags;
++		bool expected;
++
++		spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++		expected = battmgr->dodge_request_pending &&
++			opcode == battmgr->dodge_request_opcode &&
++			(le32_to_cpu(hdr->type) == PMIC_GLINK_REQ_RESP ||
++			 (opcode == BATTMGR_REQUEST_NOTIFICATION &&
++			  le32_to_cpu(hdr->type) == PMIC_GLINK_NOTIFY));
++		if (expected && (opcode == BATTMGR_BAT_PROPERTY_GET ||
++				 opcode == BATTMGR_USB_PROPERTY_GET ||
++				 opcode == BATTMGR_WLS_PROPERTY_GET))
++			expected = len >= sizeof(*hdr) + sizeof(__le32) &&
++				le32_to_cpu(msg->intval.property) ==
++				battmgr->dodge_request_property;
++		if (expected)
++			battmgr->dodge_request_pending = false;
++		spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++		if (!expected)
++			return;
++	}
+ 	if (battmgr->variant == QCOM_BATTMGR_DODGE &&
+ 	    READ_ONCE(battmgr->dodge_gauge_pending) &&
+ 	    opcode != DODGE_GAUGE_OPCODE && opcode != BATTMGR_NOTIFICATION)
+@@ -1777,7 +2738,29 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
+ 	int ret;
+ 
+ 	mutex_lock(&battmgr->lock);
++	if (READ_ONCE(battmgr->dodge_otg_stopping)) {
++		mutex_unlock(&battmgr->lock);
++		return;
++	}
+ 	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
++	if (!ret && battmgr->variant == QCOM_BATTMGR_DODGE) {
++		u32 generation = READ_ONCE(battmgr->dodge_service_generation);
++		unsigned long flags;
++
++		ret = qcom_battmgr_dodge_otg_init(battmgr, generation);
++		spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++		if (!ret && battmgr->service_up &&
++		    generation == battmgr->dodge_service_generation &&
++		    !battmgr->dodge_otg_stopping) {
++			battmgr->dodge_otg_ready = true;
++			/* A cable present before subscription may not emit a fresh CID event. */
++			battmgr->dodge_cid_pending = true;
++			battmgr->dodge_cid_retried = false;
++			schedule_work(&battmgr->dodge_cid_work);
++			mod_delayed_work(system_percpu_wq, &battmgr->dodge_otg_work, 0);
++		}
++		spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	}
+ 	mutex_unlock(&battmgr->lock);
+ 	if (ret)
+ 		dev_err(battmgr->dev, "failed to request power notifications\n");
+@@ -1786,6 +2769,45 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
+ static void qcom_battmgr_pdr_notify(void *priv, int state)
+ {
+ 	struct qcom_battmgr *battmgr = priv;
++	unsigned long flags;
++
++	if (battmgr->variant == QCOM_BATTMGR_DODGE) {
++		spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++		battmgr->service_up = state == SERVREG_SERVICE_STATE_UP;
++		if (!battmgr->service_up) {
++			battmgr->dodge_service_generation++;
++			battmgr->dodge_gauge_valid = false;
++			battmgr->dodge_pd_attempted = false;
++			battmgr->dodge_pd_broken = false;
++			battmgr->dodge_otg_ready = false;
++			battmgr->dodge_cid_pending = false;
++			battmgr->dodge_cid_sequence++;
++			battmgr->dodge_otg_epoch++;
++			battmgr->dodge_otg_requested = false;
++			battmgr->dodge_otg_broken = false;
++			battmgr->dodge_power_ambiguous = false;
++			battmgr->dodge_otg_prohibited = false;
++			if (battmgr->dodge_request_pending) {
++				battmgr->dodge_request_pending = false;
++				battmgr->dodge_gauge_pending = false;
++				battmgr->error = -ENOTCONN;
++				complete(&battmgr->ack);
++			}
++			if (battmgr->dodge_otg_pending) {
++				battmgr->dodge_otg_pending = false;
++				battmgr->dodge_otg_error = -ENOTCONN;
++				complete(&battmgr->dodge_otg_ack);
++			}
++		}
++		if (!battmgr->dodge_otg_stopping) {
++			if (battmgr->service_up)
++				schedule_work(&battmgr->enable_work);
++			else
++				mod_delayed_work(system_percpu_wq, &battmgr->dodge_otg_work, 0);
++		}
++		spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++		return;
++	}
+ 
+ 	if (state == SERVREG_SERVICE_STATE_UP) {
+ 		battmgr->service_up = true;
+@@ -1840,6 +2862,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	psy_cfg_supply.supplied_to = qcom_battmgr_battery;
+ 	psy_cfg_supply.num_supplicants = 1;
+ 
++	spin_lock_init(&battmgr->dodge_otg_lock);
+ 	mutex_init(&battmgr->lock);
+ 	init_completion(&battmgr->ack);
+ 
+@@ -1909,6 +2932,13 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	if (ret)
+ 		return ret;
+ 
++	if (battmgr->variant == QCOM_BATTMGR_DODGE) {
++		init_completion(&battmgr->dodge_otg_ack);
++		INIT_WORK(&battmgr->dodge_cid_work, qcom_battmgr_dodge_cid_worker);
++		INIT_DELAYED_WORK(&battmgr->dodge_otg_work,
++				  qcom_battmgr_dodge_otg_worker);
++	}
++
+ 	battmgr->client = devm_pmic_glink_client_alloc(dev, PMIC_GLINK_OWNER_BATTMGR,
+ 						       qcom_battmgr_callback,
+ 						       qcom_battmgr_pdr_notify,
+@@ -1916,11 +2946,37 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	if (IS_ERR(battmgr->client))
+ 		return PTR_ERR(battmgr->client);
+ 
++	dev_set_drvdata(dev, battmgr);
+ 	pmic_glink_client_register(battmgr->client);
+ 
+ 	return 0;
+ }
+ 
++static void qcom_battmgr_remove(struct auxiliary_device *adev)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(&adev->dev);
++	unsigned long flags;
++
++	if (battmgr->variant != QCOM_BATTMGR_DODGE)
++		return;
++	/* Keep the client alive while in-flight requests drain and OFF is sent. */
++	spin_lock_irqsave(&battmgr->dodge_otg_lock, flags);
++	battmgr->dodge_otg_stopping = true;
++	battmgr->dodge_cid_pending = false;
++	battmgr->dodge_cid_sequence++;
++	battmgr->dodge_otg_ready = false;
++	battmgr->dodge_otg_requested = false;
++	battmgr->dodge_otg_epoch++;
++	spin_unlock_irqrestore(&battmgr->dodge_otg_lock, flags);
++	cancel_work_sync(&battmgr->enable_work);
++	cancel_work_sync(&battmgr->dodge_cid_work);
++	cancel_delayed_work_sync(&battmgr->dodge_otg_work);
++	mutex_lock(&battmgr->lock);
++	qcom_battmgr_dodge_power_off(battmgr,
++				 READ_ONCE(battmgr->dodge_service_generation));
++	mutex_unlock(&battmgr->lock);
++}
++
+ static const struct auxiliary_device_id qcom_battmgr_id_table[] = {
+ 	{ .name = "pmic_glink.power-supply", },
+ 	{},
+@@ -1930,6 +2986,8 @@ MODULE_DEVICE_TABLE(auxiliary, qcom_battmgr_id_table);
+ static struct auxiliary_driver qcom_battmgr_driver = {
+ 	.name = "pmic_glink_power_supply",
+ 	.probe = qcom_battmgr_probe,
++	.remove = qcom_battmgr_remove,
++	.shutdown = qcom_battmgr_remove,
+ 	.id_table = qcom_battmgr_id_table,
+ };
+ 

@@ -9,7 +9,8 @@ hardware.asphalt.sensors.enable = true;
 # Or: hardware.polaris.sensors.enable = true;
 ```
 
-本页适用于 Asphalt 和 Polaris。Aurora 的传感器见
+本页适用于 Asphalt 和 Polaris。Marble 的 SLPI 传感器（实验性）见
+[Marble 传感器](marble/README.zh.md#传感器)。Aurora 的传感器见
 [Aurora 传感器](aurora/sensors.zh.md)；Sheng 可选的 `hardware.sheng.sensors`
 服务列在 [Sheng 硬件](sheng/hardware.zh.md)中。
 

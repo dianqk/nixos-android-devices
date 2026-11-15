@@ -1,0 +1,42 @@
+From d4c46dc74f8b39634fd4cfbe1b16f79511a2fb54 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 31 Oct 2026 19:46:33 +0800
+Subject: [PATCH] opp: debugfs: Drop the reference of an existing link
+
+debugfs_lookup() returns the dentry with a reference held. When the
+link of the device already exists, drop that reference instead of
+leaking it.
+
+Scope: SDM630/660 common
+Porting notes: Local fix for the SoMainline OPP debugfs change (not upstream).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/opp/debugfs.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/opp/debugfs.c b/drivers/opp/debugfs.c
+index 169e141b84..7b72526a5d 100644
+--- a/drivers/opp/debugfs.c
++++ b/drivers/opp/debugfs.c
+@@ -188,6 +188,7 @@ static void opp_list_debug_create_dir(struct opp_device *opp_dev,
+ static void opp_list_debug_create_link(struct opp_device *opp_dev,
+ 				       struct opp_table *opp_table)
+ {
++	struct dentry *d;
+ 	char name[NAME_MAX];
+ 
+ 	opp_set_dev_name(opp_dev->dev, name);
+@@ -196,8 +197,11 @@ static void opp_list_debug_create_link(struct opp_device *opp_dev,
+ 	 * In some rare cases (e.g. pmdomain consumer's OPP table being initialized
+ 	 * in pmdomain->attach), the link may have already been created.
+ 	 */
+-	if (unlikely(debugfs_lookup(name, rootdir)))
++	d = debugfs_lookup(name, rootdir);
++	if (unlikely(d)) {
++		dput(d);
+ 		return;
++	}
+ 
+ 	/* Create device specific directory link */
+ 	opp_dev->dentry = debugfs_create_symlink(name, rootdir,

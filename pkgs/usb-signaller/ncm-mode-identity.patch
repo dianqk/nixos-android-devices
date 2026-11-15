@@ -1,0 +1,91 @@
+Identify NCM mode from the owned gadget rather than global IP forwarding.
+Upstream: https://codeberg.org/DylanVanAssche/usb-signaller/src/tag/v0.4.2
+
+Other network interfaces may need IP forwarding while the USB gadget stays in
+developer mode. Misclassifying it as tethering makes default-mode startup fail
+and repeated initialization can delete the newly recreated same-name gadget.
+Preserve connected-NBD netboot protection regardless of forwarding policy.
+
+--- a/src/udc.rs
++++ b/src/udc.rs
+@@ -26,10 +26,6 @@
+ 
+ const DEVICE_TREE_BASE_PATH: &str = "/proc/device-tree";
+ const SYSFS_CLASS_BASE_PATH: &str = "/sys/class";
+-const SYSFS_PROC_BASE_PATH: &str = "/proc/sys";
+-const NET_PATH: &str = "net";
+-const IPV4_PATH: &str = "ipv4";
+-const FORWARD_NODE: &str = "ip_forward";
+ const UDC_PATH: &str = "udc";
+ const STATE_NODE: &str = "state";
+ const COMPATIBLE_NODE: &str = "compatible";
+@@ -74,21 +70,16 @@
+         return PathBuf::from("/sys/block/nbd0/pid").exists();
+     }
+ 
+-    fn detect_tethering_mode() -> anyhow::Result<bool> {
+-        /* Tethering mode enables IP forwarding */
+-        let state = sysfs_read(
+-            PathBuf::from(SYSFS_PROC_BASE_PATH)
+-                .join(NET_PATH)
+-                .join(IPV4_PATH)
+-                .join(FORWARD_NODE),
+-        )?;
+-        if state == "0" {
+-            return Ok(false);
+-        } else if state == "1" {
+-            return Ok(true);
+-        }
+-
+-        unreachable!("IP forwarding state is either 0 or 1");
++    fn ncm_mode(gadget_name: &str, netboot: bool) -> UDCMode {
++        // Global IP forwarding can serve other interfaces and does not identify
++        // this gadget's mode. Keep the read-only netboot protection first.
++        if netboot {
++            UDCMode::Netboot
++        } else if gadget_name == "usb-signaller-tethering" {
++            UDCMode::Tethering
++        } else {
++            UDCMode::Developer
++        }
+     }
+ 
+     fn is_enabled(udc_name: &str) -> anyhow::Result<bool> {
+@@ -465,16 +456,7 @@
+                 if entry.enabled {
+                     /* USB Ethernet NCM gadget */
+                     if entry.configs[0].functions.iter().any(|function| function.name.starts_with("ncm.")) {
+-                        /* Tethering mode allows IP forwarding such as using mobile data */
+-                        if Self::detect_tethering_mode()? {
+-                            mode = UDCMode::Tethering;
+-                        /* Netboot enforces the USB port into an readonly state */
+-                        } else if Self::detect_netboot_mode() {
+-                            mode = UDCMode::Netboot;
+-                        /* Developer mode only allows local data transfer */
+-                        } else {
+-                            mode = UDCMode::Developer;
+-                        }
++                        mode = Self::ncm_mode(&entry.name, Self::detect_netboot_mode());
+                     /* USB FunctionFS MTP gadget */
+                     } else if entry.configs[0].functions[0].name.starts_with("ffs.mtp") {
+                         mode = UDCMode::MTP;
+@@ -533,6 +515,19 @@
+     use super::*;
+ 
+     #[test]
++    fn ncm_mode_follows_gadget_identity() {
++        assert_eq!(UDC::ncm_mode("usb-signaller-developer", false), UDCMode::Developer);
++        assert_eq!(UDC::ncm_mode("usb-signaller-tethering", false), UDCMode::Tethering);
++    }
++
++    #[test]
++    fn netboot_protection_precedes_ncm_mode() {
++        for name in ["usb-signaller-developer", "usb-signaller-tethering"] {
++            assert_eq!(UDC::ncm_mode(name, true), UDCMode::Netboot);
++        }
++    }
++
++    #[test]
+     #[ignore = "Requires hardware with an UDC, use ./scripts/run-tests"]
+     fn load_udc() {
+         let names = discover_udcs();

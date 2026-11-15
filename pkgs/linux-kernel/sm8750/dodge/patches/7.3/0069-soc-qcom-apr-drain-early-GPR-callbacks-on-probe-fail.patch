@@ -1,0 +1,82 @@
+From 1458d8aa4ffe5d9f3d5394bf9e429ba57c7a2257 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 8 Nov 2026 20:25:13 +0800
+Subject: [PATCH 074/144] soc: qcom: apr: drain early GPR callbacks on probe
+ failure
+
+Publish and revoke the early callback under svcs_lock, and snapshot it with its context on RX under that same lock. On failed probe, revoke the callback and drain the dedicated RX worker before driver-core devres cleanup can free its state. Clear driver data after draining so a later probe cannot expose stale state.
+
+Link: https://lore.kernel.org/all/20261022144130.2443667-3-mohit.sharma@oss.qualcomm.com/
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0096-soc-qcom-apr-drain-early-GPR-callbacks-on-probe-fail.patch
+Import-SHA256: c3c3b155d2c1182d906feba01bca6c6cd1754e39e429699109a023d814615eac
+Import-Provenance: mail headers
+(cherry picked from commit c4dfe17707d5e4689b26603acb4d8a74bf9fac1a)
+---
+ drivers/soc/qcom/apr.c | 25 +++++++++++++++++++++----
+ 1 file changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/soc/qcom/apr.c b/drivers/soc/qcom/apr.c
+index 829e5c8fdf..a825e2ba47 100644
+--- a/drivers/soc/qcom/apr.c
++++ b/drivers/soc/qcom/apr.c
+@@ -263,6 +263,8 @@ static int gpr_do_rx_callback(struct packet_router *gpr, struct apr_rx_buf *abuf
+ {
+ 	uint16_t hdr_size, ver;
+ 	struct pkt_router_svc *svc = NULL;
++	gpr_port_cb callback = NULL;
++	void *priv = NULL;
+ 	struct gpr_resp_pkt resp;
+ 	struct gpr_hdr *hdr;
+ 	unsigned long flags;
+@@ -298,6 +300,10 @@ static int gpr_do_rx_callback(struct packet_router *gpr, struct apr_rx_buf *abuf
+ 
+ 	spin_lock_irqsave(&gpr->svcs_lock, flags);
+ 	svc = idr_find(&gpr->svcs_idr, hdr->dest_port);
++	if (svc) {
++		callback = svc->callback;
++		priv = svc->priv;
++	}
+ 	spin_unlock_irqrestore(&gpr->svcs_lock, flags);
+ 
+ 	if (!svc) {
+@@ -306,8 +312,8 @@ static int gpr_do_rx_callback(struct packet_router *gpr, struct apr_rx_buf *abuf
+ 		return -EINVAL;
+ 	}
+ 
+-	if (svc->callback)
+-		svc->callback(&resp, svc->priv, 0);
++	if (callback)
++		callback(&resp, priv, 0);
+ 
+ 	return 0;
+ }
+@@ -366,15 +372,26 @@ static int apr_device_probe(struct device *dev)
+ 	struct apr_device *adev = to_apr_device(dev);
+ 	struct apr_driver *adrv = to_apr_driver(dev->driver);
+ 	struct packet_router *apr = dev_get_drvdata(dev->parent);
++	unsigned long flags;
+ 	int ret;
+ 
+-	if (apr->type == PR_TYPE_GPR)
++	if (apr->type == PR_TYPE_GPR) {
++		dev_set_drvdata(dev, NULL);
++		spin_lock_irqsave(&apr->svcs_lock, flags);
+ 		adev->svc.callback = adrv->gpr_callback;
++		spin_unlock_irqrestore(&apr->svcs_lock, flags);
++	}
+ 
+ 	ret = adrv->probe(adev);
+ 	if (ret) {
+-		if (apr->type == PR_TYPE_GPR)
++		if (apr->type == PR_TYPE_GPR) {
++			spin_lock_irqsave(&apr->svcs_lock, flags);
+ 			adev->svc.callback = NULL;
++			spin_unlock_irqrestore(&apr->svcs_lock, flags);
++			/* Probe does not run on the router's dedicated RX worker. */
++			flush_workqueue(apr->rxwq);
++			dev_set_drvdata(dev, NULL);
++		}
+ 
+ 		return ret;
+ 	}

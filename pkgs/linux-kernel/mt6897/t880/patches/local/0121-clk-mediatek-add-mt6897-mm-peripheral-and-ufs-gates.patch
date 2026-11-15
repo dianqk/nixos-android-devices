@@ -1,0 +1,747 @@
+From 634ae73ee368adf3a3802c52acac1ddd3dcb2771 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] clk: mediatek: add MT6897 MM, peripheral and UFS gates
+
+Describe direct and hardware-voter gates for MM, infrastructure,
+peripheral and UFS resources, including UFS clock scaling.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-16T17:16:18+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-16T18:36:54+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T14:13:45+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-19T20:51:18+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T03:12:01+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T07:08:26+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T02:47:59+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T15:50:44+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T20:25:46+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/clk/mediatek/clk-mt6897-peri.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec
+Link: https://github.com/MT6895-Mainline/linux/tree/f1c0c8245d163fece46699612b8322d11e26348d
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/clk/mediatek/clk-mt6897-vcodec.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/soc/mediatek/mtk-scpsys-mt6897.c
+---
+ drivers/clk/mediatek/clk-mt6897-infra-ao.c |  67 +++
+ drivers/clk/mediatek/clk-mt6897-mm.c       | 454 +++++++++++++++++++++
+ drivers/clk/mediatek/clk-mt6897-peri.c     | 154 +++++++
+ 3 files changed, 675 insertions(+)
+ create mode 100644 drivers/clk/mediatek/clk-mt6897-infra-ao.c
+ create mode 100644 drivers/clk/mediatek/clk-mt6897-mm.c
+ create mode 100644 drivers/clk/mediatek/clk-mt6897-peri.c
+
+diff --git a/drivers/clk/mediatek/clk-mt6897-infra-ao.c b/drivers/clk/mediatek/clk-mt6897-infra-ao.c
+new file mode 100644
+index 0000000000..a133d53c56
+--- /dev/null
++++ b/drivers/clk/mediatek/clk-mt6897-infra-ao.c
+@@ -0,0 +1,67 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek MT6897 infracfg_ao clock gates: the modem interfaces (CCIF,
++ * CLDMA, DPMAIF) and the CQ DMA.
++ *
++ * Data from the MediaTek vendor driver (MiCode MTK_kernel_device_modules
++ * 3c4ccd07, drivers/clk/mediatek/clk-mt6897-bus.c).
++ */
++
++#include <dt-bindings/clock/mediatek,mt6897-clock.h>
++#include <linux/clk-provider.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++
++#include "clk-gate.h"
++#include "clk-mtk.h"
++
++static const struct mtk_gate_regs ifrao_cg_regs = {
++	.set_ofs = 0x80,
++	.clr_ofs = 0x84,
++	.sta_ofs = 0x90,
++};
++
++#define GATE_IFRAO(_id, _name, _parent, _shift)				\
++	GATE_MTK(_id, _name, _parent, &ifrao_cg_regs, _shift,		\
++		 &mtk_clk_gate_ops_setclr)
++
++static const struct mtk_gate ifrao_clks[] = {
++	GATE_IFRAO(CLK_IFRAO_CQ_DMA_FPC, "ifrao_dma", "f26m_ck", 1),
++	GATE_IFRAO(CLK_IFRAO_CCIF1_AP, "ifrao_ccif1_ap", "axi_ck", 4),
++	GATE_IFRAO(CLK_IFRAO_CCIF1_MD, "ifrao_ccif1_md", "axi_ck", 5),
++	GATE_IFRAO(CLK_IFRAO_CCIF_AP, "ifrao_ccif_ap", "axi_ck", 6),
++	GATE_IFRAO(CLK_IFRAO_CCIF_MD, "ifrao_ccif_md", "axi_ck", 8),
++	GATE_IFRAO(CLK_IFRAO_CLDMA_BCLK, "ifrao_cldmabclk", "axi_ck", 12),
++	GATE_IFRAO(CLK_IFRAO_CQ_DMA, "ifrao_cq_dma", "axi_ck", 13),
++	GATE_IFRAO(CLK_IFRAO_CCIF5_MD, "ifrao_ccif5_md", "axi_ck", 15),
++	GATE_IFRAO(CLK_IFRAO_CCIF2_AP, "ifrao_ccif2_ap", "axi_ck", 16),
++	GATE_IFRAO(CLK_IFRAO_CCIF2_MD, "ifrao_ccif2_md", "axi_ck", 17),
++	GATE_IFRAO(CLK_IFRAO_DPMAIF_MAIN, "ifrao_dpmaif_main", "dpmaif_main_ck", 22),
++	GATE_IFRAO(CLK_IFRAO_CCIF4_MD, "ifrao_ccif4_md", "axi_ck", 24),
++	GATE_IFRAO(CLK_IFRAO_RG_MMW_DPMAIF26M_CK, "ifrao_dpmaif_26m", "f26m_ck", 25),
++};
++
++static const struct mtk_clk_desc ifrao_mcd = {
++	.clks = ifrao_clks,
++	.num_clks = ARRAY_SIZE(ifrao_clks),
++};
++
++static const struct of_device_id of_match_clk_mt6897_infra_ao[] = {
++	{ .compatible = "mediatek,mt6897-infracfg-ao", .data = &ifrao_mcd },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, of_match_clk_mt6897_infra_ao);
++
++static struct platform_driver clk_mt6897_infra_ao_drv = {
++	.probe = mtk_clk_simple_probe,
++	.remove = mtk_clk_simple_remove,
++	.driver = {
++		.name = "clk-mt6897-infra-ao",
++		.of_match_table = of_match_clk_mt6897_infra_ao,
++	},
++};
++module_platform_driver(clk_mt6897_infra_ao_drv);
++
++MODULE_DESCRIPTION("MediaTek MT6897 infracfg_ao clock gates");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/clk/mediatek/clk-mt6897-mm.c b/drivers/clk/mediatek/clk-mt6897-mm.c
+new file mode 100644
+index 0000000000..846d452bc6
+--- /dev/null
++++ b/drivers/clk/mediatek/clk-mt6897-mm.c
+@@ -0,0 +1,454 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek MT6897 MM clock gates (dispsys0/1, ovlsys0/1, mminfra).
++ *
++ * Gates marked HWV are switched through the hardware voter (infra HW_CCF):
++ * the AP votes in its SET/CLR bank and waits for the voter's DONE bit. The
++ * others use the subsystem's own CG set/clr registers. The blocks sit in
++ * the MM power domains. Data from the MediaTek vendor driver (MiCode
++ * MTK_kernel_device_modules 3c4ccd07, drivers/clk/mediatek/clk-mt6897-mmsys.c).
++ */
++
++#include <dt-bindings/clock/mediatek,mt6897-clock.h>
++#include <linux/clk-provider.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++
++#include "clk-gate.h"
++#include "clk-mtk.h"
++
++static const struct mtk_gate_regs dispsys0_config0_cg_regs = {
++	.set_ofs = 0x104,
++	.clr_ofs = 0x108,
++	.sta_ofs = 0x100,
++};
++
++static const struct mtk_gate_regs dispsys0_config0_hwv_regs = {
++	.set_ofs = 0x0018,
++	.clr_ofs = 0x001c,
++	.sta_ofs = 0x1c0c,
++};
++
++static const struct mtk_gate_regs dispsys0_config1_cg_regs = {
++	.set_ofs = 0x114,
++	.clr_ofs = 0x118,
++	.sta_ofs = 0x110,
++};
++
++static const struct mtk_gate_regs dispsys0_config1_hwv_regs = {
++	.set_ofs = 0x0020,
++	.clr_ofs = 0x0024,
++	.sta_ofs = 0x1c10,
++};
++
++static const struct mtk_gate_regs dispsys0_config2_cg_regs = {
++	.set_ofs = 0x1a4,
++	.clr_ofs = 0x1a8,
++	.sta_ofs = 0x1a0,
++};
++
++static const struct mtk_gate_regs dispsys0_config2_hwv_regs = {
++	.set_ofs = 0x0028,
++	.clr_ofs = 0x002c,
++	.sta_ofs = 0x1c14,
++};
++
++static const struct mtk_gate_regs dispsys1_config0_cg_regs = {
++	.set_ofs = 0x104,
++	.clr_ofs = 0x108,
++	.sta_ofs = 0x100,
++};
++
++static const struct mtk_gate_regs dispsys1_config0_hwv_regs = {
++	.set_ofs = 0x0030,
++	.clr_ofs = 0x0034,
++	.sta_ofs = 0x1c18,
++};
++
++static const struct mtk_gate_regs dispsys1_config1_cg_regs = {
++	.set_ofs = 0x114,
++	.clr_ofs = 0x118,
++	.sta_ofs = 0x110,
++};
++
++static const struct mtk_gate_regs dispsys1_config1_hwv_regs = {
++	.set_ofs = 0x0038,
++	.clr_ofs = 0x003c,
++	.sta_ofs = 0x1c1c,
++};
++
++static const struct mtk_gate_regs dispsys1_config2_cg_regs = {
++	.set_ofs = 0x1a4,
++	.clr_ofs = 0x1a8,
++	.sta_ofs = 0x1a0,
++};
++
++static const struct mtk_gate_regs dispsys1_config2_hwv_regs = {
++	.set_ofs = 0x0040,
++	.clr_ofs = 0x0044,
++	.sta_ofs = 0x1c20,
++};
++
++static const struct mtk_gate_regs mminfra_config0_cg_regs = {
++	.set_ofs = 0x104,
++	.clr_ofs = 0x108,
++	.sta_ofs = 0x100,
++};
++
++static const struct mtk_gate_regs mminfra_config0_hwv_regs = {
++	.set_ofs = 0x0058,
++	.clr_ofs = 0x005c,
++	.sta_ofs = 0x1c2c,
++};
++
++static const struct mtk_gate_regs mminfra_config1_cg_regs = {
++	.set_ofs = 0x114,
++	.clr_ofs = 0x118,
++	.sta_ofs = 0x110,
++};
++
++static const struct mtk_gate_regs mminfra_config1_hwv_regs = {
++	.set_ofs = 0x0060,
++	.clr_ofs = 0x0064,
++	.sta_ofs = 0x1c30,
++};
++
++static const struct mtk_gate_regs ovlsys0_config_cg_regs = {
++	.set_ofs = 0x104,
++	.clr_ofs = 0x108,
++	.sta_ofs = 0x100,
++};
++
++static const struct mtk_gate_regs ovlsys0_config_hwv_regs = {
++	.set_ofs = 0x0068,
++	.clr_ofs = 0x006c,
++	.sta_ofs = 0x1c34,
++};
++
++static const struct mtk_gate_regs ovlsys1_config_cg_regs = {
++	.set_ofs = 0x104,
++	.clr_ofs = 0x108,
++	.sta_ofs = 0x100,
++};
++
++static const struct mtk_gate_regs ovlsys1_config_hwv_regs = {
++	.set_ofs = 0x0070,
++	.clr_ofs = 0x0074,
++	.sta_ofs = 0x1c38,
++};
++
++#define G(_id, _name, _parent, _regs, _shift)			\
++	GATE_MTK_FLAGS(_id, _name, _parent, &_regs, _shift,		\
++		       &mtk_clk_gate_ops_setclr, CLK_OPS_PARENT_ENABLE)
++
++#define G_HWV(_id, _name, _parent, _regs, _hwv_regs, _shift) {		\
++		.id = _id,						\
++		.name = _name,						\
++		.parent_name = _parent,					\
++		.regs = &_regs,						\
++		.hwv_regs = &_hwv_regs,					\
++		.shift = _shift,					\
++		.ops = &mtk_clk_gate_hwv_ops_setclr,			\
++		.flags = CLK_OPS_PARENT_ENABLE,				\
++	}
++
++static const struct mtk_gate dispsys0_config_clks[] = {
++	G_HWV(CLK_DISPSYS0_DISPSYS_CONFIG, "dispsys0_disp_cfg", "disp0_ck", dispsys0_config0_cg_regs, dispsys0_config0_hwv_regs, 0),
++	G_HWV(CLK_DISPSYS0_DISP_MUTEX0, "dispsys0_disp_mutex0", "disp0_ck", dispsys0_config0_cg_regs, dispsys0_config0_hwv_regs, 1),
++	G(CLK_DISPSYS0_DISP_AAL0, "dispsys0_disp_aal0", "disp0_ck", dispsys0_config0_cg_regs, 2),
++	G(CLK_DISPSYS0_DISP_C3D0, "dispsys0_disp_c3d0", "disp0_ck", dispsys0_config0_cg_regs, 3),
++	G(CLK_DISPSYS0_DISP_CCORR0, "dispsys0_disp_ccorr0", "disp0_ck", dispsys0_config0_cg_regs, 4),
++	G(CLK_DISPSYS0_DISP_CCORR1, "dispsys0_disp_ccorr1", "disp0_ck", dispsys0_config0_cg_regs, 5),
++	G(CLK_DISPSYS0_DISP_CHIST0, "dispsys0_disp_chist0", "disp0_ck", dispsys0_config0_cg_regs, 6),
++	G(CLK_DISPSYS0_DISP_CHIST1, "dispsys0_disp_chist1", "disp0_ck", dispsys0_config0_cg_regs, 7),
++	G(CLK_DISPSYS0_DISP_COLOR0, "dispsys0_disp_color0", "disp0_ck", dispsys0_config0_cg_regs, 8),
++	G(CLK_DISPSYS0_DISP_DITHER0, "dispsys0_di0", "disp0_ck", dispsys0_config0_cg_regs, 9),
++	G(CLK_DISPSYS0_DISP_DITHER1, "dispsys0_di1", "disp0_ck", dispsys0_config0_cg_regs, 10),
++	G_HWV(CLK_DISPSYS0_DISP_DLI_ASYNC0, "dispsys0_dli0", "disp0_ck", dispsys0_config0_cg_regs, dispsys0_config0_hwv_regs, 11),
++	G_HWV(CLK_DISPSYS0_DISP_DLI_ASYNC1, "dispsys0_dli1", "disp0_ck", dispsys0_config0_cg_regs, dispsys0_config0_hwv_regs, 12),
++	G_HWV(CLK_DISPSYS0_DISP_DLI_ASYNC2, "dispsys0_dli2", "disp0_ck", dispsys0_config0_cg_regs, dispsys0_config0_hwv_regs, 13),
++	G_HWV(CLK_DISPSYS0_DISP_DLI_ASYNC3, "dispsys0_dli3", "disp0_ck", dispsys0_config0_cg_regs, dispsys0_config0_hwv_regs, 14),
++	G_HWV(CLK_DISPSYS0_DISP_DLI_ASYNC4, "dispsys0_dli4", "disp0_ck", dispsys0_config0_cg_regs, dispsys0_config0_hwv_regs, 15),
++	G_HWV(CLK_DISPSYS0_DISP_DLI_ASYNC5, "dispsys0_dli5", "disp0_ck", dispsys0_config0_cg_regs, dispsys0_config0_hwv_regs, 16),
++	G_HWV(CLK_DISPSYS0_DISP_DLO_ASYNC0, "dispsys0_dlo0", "disp0_ck", dispsys0_config0_cg_regs, dispsys0_config0_hwv_regs, 17),
++	G_HWV(CLK_DISPSYS0_DISP_DLO_ASYNC1, "dispsys0_dlo1", "disp0_ck", dispsys0_config0_cg_regs, dispsys0_config0_hwv_regs, 18),
++	G(CLK_DISPSYS0_DISP_DP_INTF0, "dispsys0_dp_intclk", "disp0_ck", dispsys0_config0_cg_regs, 19),
++	G_HWV(CLK_DISPSYS0_DISP_DSC_WRAP0, "dispsys0_dscw0", "disp0_ck", dispsys0_config0_cg_regs, dispsys0_config0_hwv_regs, 20),
++	G_HWV(CLK_DISPSYS0_DISP_DSI0, "dispsys0_clk0", "disp0_ck", dispsys0_config0_cg_regs, dispsys0_config0_hwv_regs, 21),
++	G(CLK_DISPSYS0_DISP_GAMMA0, "dispsys0_disp_gamma0", "disp0_ck", dispsys0_config0_cg_regs, 22),
++	G(CLK_DISPSYS0_MDP_AAL0, "dispsys0_mdp_aal0", "disp0_ck", dispsys0_config0_cg_regs, 23),
++	G(CLK_DISPSYS0_MDP_RDMA0, "dispsys0_mdp_rdma0", "disp0_ck", dispsys0_config0_cg_regs, 24),
++	G_HWV(CLK_DISPSYS0_DISP_MERGE0, "dispsys0_disp_merge0", "disp0_ck", dispsys0_config0_cg_regs, dispsys0_config0_hwv_regs, 25),
++	G_HWV(CLK_DISPSYS0_DISP_MERGE1, "dispsys0_disp_merge1", "disp0_ck", dispsys0_config0_cg_regs, dispsys0_config0_hwv_regs, 26),
++	G(CLK_DISPSYS0_DISP_ODDMR0, "dispsys0_disp_oddmr0", "disp0_ck", dispsys0_config0_cg_regs, 27),
++	G(CLK_DISPSYS0_DISP_POSTALIGN0, "dispsys0_palign0", "disp0_ck", dispsys0_config0_cg_regs, 28),
++	G(CLK_DISPSYS0_DISP_POSTMASK0, "dispsys0_pmask0", "disp0_ck", dispsys0_config0_cg_regs, 29),
++	G(CLK_DISPSYS0_DISP_RELAY0, "dispsys0_disp_relay0", "disp0_ck", dispsys0_config0_cg_regs, 30),
++	G_HWV(CLK_DISPSYS0_DISP_RSZ0, "dispsys0_disp_rsz0", "disp0_ck", dispsys0_config0_cg_regs, dispsys0_config0_hwv_regs, 31),
++	G(CLK_DISPSYS0_DISP_SPR0, "dispsys0_disp_spr0", "disp0_ck", dispsys0_config1_cg_regs, 0),
++	G(CLK_DISPSYS0_DISP_TDSHP0, "dispsys0_disp_tdshp0", "disp0_ck", dispsys0_config1_cg_regs, 1),
++	G(CLK_DISPSYS0_DISP_TDSHP1, "dispsys0_disp_tdshp1", "disp0_ck", dispsys0_config1_cg_regs, 2),
++	G(CLK_DISPSYS0_DISP_UFBC_WDMA1, "dispsys0_wdma1", "disp0_ck", dispsys0_config1_cg_regs, 3),
++	G(CLK_DISPSYS0_DISP_VDCM0, "dispsys0_disp_vdcm0", "disp0_ck", dispsys0_config1_cg_regs, 4),
++	G_HWV(CLK_DISPSYS0_DISP_WDMA1, "dispsys0_disp_wdma1", "disp0_ck", dispsys0_config1_cg_regs, dispsys0_config1_hwv_regs, 5),
++	G_HWV(CLK_DISPSYS0_SMI_SUB_COMM0, "dispsys0_smi_comm0", "disp0_ck", dispsys0_config1_cg_regs, dispsys0_config1_hwv_regs, 6),
++	G(CLK_DISPSYS0_DISP_Y2R0, "dispsys0_disp_y2r0", "disp0_ck", dispsys0_config1_cg_regs, 7),
++	G(CLK_DISPSYS0_DISP_CCORR2, "dispsys0_disp_ccorr2", "disp0_ck", dispsys0_config1_cg_regs, 8),
++	G(CLK_DISPSYS0_DISP_CCORR3, "dispsys0_disp_ccorr3", "disp0_ck", dispsys0_config1_cg_regs, 9),
++	G(CLK_DISPSYS0_DISP_GAMMA1, "dispsys0_disp_gamma1", "disp0_ck", dispsys0_config1_cg_regs, 10),
++	G_HWV(CLK_DISPSYS0_DSI_CLK, "dispsys0_dsi_clk", "disp0_ck", dispsys0_config2_cg_regs, dispsys0_config2_hwv_regs, 0),
++	/* the DisplayPort pixel clock: fed by dp_sel, gated here */
++	G(CLK_DISPSYS0_DP_CLK, "dispsys0_dp_clk", "dp_ck", dispsys0_config2_cg_regs, 1),
++	G_HWV(CLK_DISPSYS0_26M_CLK, "dispsys0_26m_clk", "disp0_ck", dispsys0_config2_cg_regs, dispsys0_config2_hwv_regs, 10),
++};
++
++static const struct mtk_clk_desc dispsys0_config_desc = {
++	.clks = dispsys0_config_clks,
++	.num_clks = ARRAY_SIZE(dispsys0_config_clks),
++	.need_runtime_pm = true,
++};
++
++static const struct mtk_gate dispsys1_config_clks[] = {
++	G_HWV(CLK_DISPSYS1_DISPSYS_CONFIG, "dispsys1_disp_cfg", "disp0_ck", dispsys1_config0_cg_regs, dispsys1_config0_hwv_regs, 0),
++	G_HWV(CLK_DISPSYS1_DISP_MUTEX0, "dispsys1_disp_mutex0", "disp0_ck", dispsys1_config0_cg_regs, dispsys1_config0_hwv_regs, 1),
++	G(CLK_DISPSYS1_DISP_AAL0, "dispsys1_disp_aal0", "disp0_ck", dispsys1_config0_cg_regs, 2),
++	G(CLK_DISPSYS1_DISP_C3D0, "dispsys1_disp_c3d0", "disp0_ck", dispsys1_config0_cg_regs, 3),
++	G(CLK_DISPSYS1_DISP_CCORR0, "dispsys1_disp_ccorr0", "disp0_ck", dispsys1_config0_cg_regs, 4),
++	G(CLK_DISPSYS1_DISP_CCORR1, "dispsys1_disp_ccorr1", "disp0_ck", dispsys1_config0_cg_regs, 5),
++	G(CLK_DISPSYS1_DISP_CHIST0, "dispsys1_disp_chist0", "disp0_ck", dispsys1_config0_cg_regs, 6),
++	G(CLK_DISPSYS1_DISP_CHIST1, "dispsys1_disp_chist1", "disp0_ck", dispsys1_config0_cg_regs, 7),
++	G(CLK_DISPSYS1_DISP_COLOR0, "dispsys1_disp_color0", "disp0_ck", dispsys1_config0_cg_regs, 8),
++	G(CLK_DISPSYS1_DISP_DITHER0, "dispsys1_di0", "disp0_ck", dispsys1_config0_cg_regs, 9),
++	G(CLK_DISPSYS1_DISP_DITHER1, "dispsys1_di1", "disp0_ck", dispsys1_config0_cg_regs, 10),
++	G_HWV(CLK_DISPSYS1_DISP_DLI_ASYNC0, "dispsys1_dli0", "disp0_ck", dispsys1_config0_cg_regs, dispsys1_config0_hwv_regs, 11),
++	G_HWV(CLK_DISPSYS1_DISP_DLI_ASYNC1, "dispsys1_dli1", "disp0_ck", dispsys1_config0_cg_regs, dispsys1_config0_hwv_regs, 12),
++	G_HWV(CLK_DISPSYS1_DISP_DLI_ASYNC2, "dispsys1_dli2", "disp0_ck", dispsys1_config0_cg_regs, dispsys1_config0_hwv_regs, 13),
++	G_HWV(CLK_DISPSYS1_DISP_DLI_ASYNC3, "dispsys1_dli3", "disp0_ck", dispsys1_config0_cg_regs, dispsys1_config0_hwv_regs, 14),
++	G_HWV(CLK_DISPSYS1_DISP_DLI_ASYNC4, "dispsys1_dli4", "disp0_ck", dispsys1_config0_cg_regs, dispsys1_config0_hwv_regs, 15),
++	G_HWV(CLK_DISPSYS1_DISP_DLI_ASYNC5, "dispsys1_dli5", "disp0_ck", dispsys1_config0_cg_regs, dispsys1_config0_hwv_regs, 16),
++	G_HWV(CLK_DISPSYS1_DISP_DLO_ASYNC0, "dispsys1_dlo0", "disp0_ck", dispsys1_config0_cg_regs, dispsys1_config0_hwv_regs, 17),
++	G_HWV(CLK_DISPSYS1_DISP_DLO_ASYNC1, "dispsys1_dlo1", "disp0_ck", dispsys1_config0_cg_regs, dispsys1_config0_hwv_regs, 18),
++	G(CLK_DISPSYS1_DISP_DP_INTF0, "dispsys1_dp_intclk", "disp0_ck", dispsys1_config0_cg_regs, 19),
++	G_HWV(CLK_DISPSYS1_DISP_DSC_WRAP0, "dispsys1_dscw0", "disp0_ck", dispsys1_config0_cg_regs, dispsys1_config0_hwv_regs, 20),
++	G_HWV(CLK_DISPSYS1_DISP_DSI0, "dispsys1_clk0", "disp0_ck", dispsys1_config0_cg_regs, dispsys1_config0_hwv_regs, 21),
++	G(CLK_DISPSYS1_DISP_GAMMA0, "dispsys1_disp_gamma0", "disp0_ck", dispsys1_config0_cg_regs, 22),
++	G(CLK_DISPSYS1_MDP_AAL0, "dispsys1_mdp_aal0", "disp0_ck", dispsys1_config0_cg_regs, 23),
++	G(CLK_DISPSYS1_MDP_RDMA0, "dispsys1_mdp_rdma0", "disp0_ck", dispsys1_config0_cg_regs, 24),
++	G_HWV(CLK_DISPSYS1_DISP_MERGE0, "dispsys1_disp_merge0", "disp0_ck", dispsys1_config0_cg_regs, dispsys1_config0_hwv_regs, 25),
++	G_HWV(CLK_DISPSYS1_DISP_MERGE1, "dispsys1_disp_merge1", "disp0_ck", dispsys1_config0_cg_regs, dispsys1_config0_hwv_regs, 26),
++	G(CLK_DISPSYS1_DISP_ODDMR0, "dispsys1_disp_oddmr0", "disp0_ck", dispsys1_config0_cg_regs, 27),
++	G(CLK_DISPSYS1_DISP_POSTALIGN0, "dispsys1_palign0", "disp0_ck", dispsys1_config0_cg_regs, 28),
++	G(CLK_DISPSYS1_DISP_POSTMASK0, "dispsys1_pmask0", "disp0_ck", dispsys1_config0_cg_regs, 29),
++	G(CLK_DISPSYS1_DISP_RELAY0, "dispsys1_disp_relay0", "disp0_ck", dispsys1_config0_cg_regs, 30),
++	G_HWV(CLK_DISPSYS1_DISP_RSZ0, "dispsys1_disp_rsz0", "disp0_ck", dispsys1_config0_cg_regs, dispsys1_config0_hwv_regs, 31),
++	G(CLK_DISPSYS1_DISP_SPR0, "dispsys1_disp_spr0", "disp0_ck", dispsys1_config1_cg_regs, 0),
++	G(CLK_DISPSYS1_DISP_TDSHP0, "dispsys1_disp_tdshp0", "disp0_ck", dispsys1_config1_cg_regs, 1),
++	G(CLK_DISPSYS1_DISP_TDSHP1, "dispsys1_disp_tdshp1", "disp0_ck", dispsys1_config1_cg_regs, 2),
++	G(CLK_DISPSYS1_DISP_UFBC_WDMA1, "dispsys1_wdma1", "disp0_ck", dispsys1_config1_cg_regs, 3),
++	G(CLK_DISPSYS1_DISP_VDCM0, "dispsys1_disp_vdcm0", "disp0_ck", dispsys1_config1_cg_regs, 4),
++	G_HWV(CLK_DISPSYS1_DISP_WDMA1, "dispsys1_disp_wdma1", "disp0_ck", dispsys1_config1_cg_regs, dispsys1_config1_hwv_regs, 5),
++	G_HWV(CLK_DISPSYS1_SMI_SUB_COMM0, "dispsys1_smi_comm0", "disp0_ck", dispsys1_config1_cg_regs, dispsys1_config1_hwv_regs, 6),
++	G(CLK_DISPSYS1_DISP_Y2R0, "dispsys1_disp_y2r0", "disp0_ck", dispsys1_config1_cg_regs, 7),
++	G(CLK_DISPSYS1_DISP_CCORR2, "dispsys1_disp_ccorr2", "disp0_ck", dispsys1_config1_cg_regs, 8),
++	G(CLK_DISPSYS1_DISP_CCORR3, "dispsys1_disp_ccorr3", "disp0_ck", dispsys1_config1_cg_regs, 9),
++	G(CLK_DISPSYS1_DISP_GAMMA1, "dispsys1_disp_gamma1", "disp0_ck", dispsys1_config1_cg_regs, 10),
++	G_HWV(CLK_DISPSYS1_DSI_CLK, "dispsys1_dsi_clk", "disp0_ck", dispsys1_config2_cg_regs, dispsys1_config2_hwv_regs, 0),
++	G(CLK_DISPSYS1_DP_CLK, "dispsys1_dp_clk", "disp0_ck", dispsys1_config2_cg_regs, 1),
++	G_HWV(CLK_DISPSYS1_26M_CLK, "dispsys1_26m_clk", "disp0_ck", dispsys1_config2_cg_regs, dispsys1_config2_hwv_regs, 10),
++};
++
++static const struct mtk_clk_desc dispsys1_config_desc = {
++	.clks = dispsys1_config_clks,
++	.num_clks = ARRAY_SIZE(dispsys1_config_clks),
++	.need_runtime_pm = true,
++};
++
++static const struct mtk_gate mminfra_config_clks[] = {
++	G_HWV(CLK_MMINFRA_GCE_D, "mminfra_gce_d", "mminfra_ck", mminfra_config0_cg_regs, mminfra_config0_hwv_regs, 0),
++	G_HWV(CLK_MMINFRA_GCE_M, "mminfra_gce_m", "mminfra_ck", mminfra_config0_cg_regs, mminfra_config0_hwv_regs, 1),
++	G_HWV(CLK_MMINFRA_SMI, "mminfra_smi", "mminfra_ck", mminfra_config0_cg_regs, mminfra_config0_hwv_regs, 2),
++	G_HWV(CLK_MMINFRA_GCE_26M, "mminfra_gce_26m", "mminfra_ck", mminfra_config1_cg_regs, mminfra_config1_hwv_regs, 17),
++};
++
++static const struct mtk_clk_desc mminfra_config_desc = {
++	.clks = mminfra_config_clks,
++	.num_clks = ARRAY_SIZE(mminfra_config_clks),
++	.need_runtime_pm = true,
++};
++
++static const struct mtk_gate ovlsys0_config_clks[] = {
++	G_HWV(CLK_OVLSYS0_CONFIG, "ovlsys0_ovl_config", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 0),
++	G(CLK_OVLSYS0_DISP_FAKE_ENG0, "ovlsys0_ovl_fake_e0", "ovl0_ck", ovlsys0_config_cg_regs, 1),
++	G(CLK_OVLSYS0_DISP_FAKE_ENG1, "ovlsys0_ovl_fake_e1", "ovl0_ck", ovlsys0_config_cg_regs, 2),
++	G_HWV(CLK_OVLSYS0_DISP_MUTEX0, "ovlsys0_ovl_mutex0", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 3),
++	G_HWV(CLK_OVLSYS0_OVL0_2L, "ovlsys0_disp_ovl0_2l", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 4),
++	G_HWV(CLK_OVLSYS0_OVL1_2L, "ovlsys0_disp_ovl1_2l", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 5),
++	G_HWV(CLK_OVLSYS0_OVL2_2L, "ovlsys0_disp_ovl2_2l", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 6),
++	G_HWV(CLK_OVLSYS0_OVL3_2L, "ovlsys0_disp_ovl3_2l", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 7),
++	G_HWV(CLK_OVLSYS0_DISP_RSZ1, "ovlsys0_ovl_rsz1", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 8),
++	G_HWV(CLK_OVLSYS0_MDP_RSZ0, "ovlsys0_ovl_mdp", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 9),
++	G_HWV(CLK_OVLSYS0_DISP_WDMA0, "ovlsys0_ovl_wdma0", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 10),
++	G(CLK_OVLSYS0_DISP_UFBC_WDMA0, "ovlsys0_wdma0", "ovl0_ck", ovlsys0_config_cg_regs, 11),
++	G_HWV(CLK_OVLSYS0_DISP_WDMA2, "ovlsys0_ovl_wdma2", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 12),
++	G_HWV(CLK_OVLSYS0_DISP_DLI_ASYNC0, "ovlsys0_dli0", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 13),
++	G_HWV(CLK_OVLSYS0_DISP_DLI_ASYNC1, "ovlsys0_dli1", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 14),
++	G_HWV(CLK_OVLSYS0_DISP_DLI_ASYNC2, "ovlsys0_dli2", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 15),
++	G_HWV(CLK_OVLSYS0_DISP_DLO_ASYNC0, "ovlsys0_dlo0", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 16),
++	G_HWV(CLK_OVLSYS0_DISP_DLO_ASYNC1, "ovlsys0_dlo1", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 17),
++	G_HWV(CLK_OVLSYS0_DISP_DLO_ASYNC2, "ovlsys0_dlo2", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 18),
++	G_HWV(CLK_OVLSYS0_DISP_DLO_ASYNC3, "ovlsys0_dlo3", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 19),
++	G_HWV(CLK_OVLSYS0_DISP_DLO_ASYNC4, "ovlsys0_dlo4", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 20),
++	G_HWV(CLK_OVLSYS0_DISP_DLO_ASYNC5, "ovlsys0_dlo5", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 21),
++	G_HWV(CLK_OVLSYS0_DISP_DLO_ASYNC6, "ovlsys0_dlo6", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 22),
++	G_HWV(CLK_OVLSYS0_INLINEROT, "ovlsys0_ovl_irot", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 23),
++	G_HWV(CLK_OVLSYS0_SMI_SUB_COMMON0, "ovlsys0_cg0_smi_com0", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 24),
++	G_HWV(CLK_OVLSYS0_DISP_Y2R0, "ovlsys0_ovl_y2r0", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 25),
++	G_HWV(CLK_OVLSYS0_DISP_Y2R1, "ovlsys0_ovl_y2r1", "ovl0_ck", ovlsys0_config_cg_regs, ovlsys0_config_hwv_regs, 26),
++};
++
++static const struct mtk_clk_desc ovlsys0_config_desc = {
++	.clks = ovlsys0_config_clks,
++	.num_clks = ARRAY_SIZE(ovlsys0_config_clks),
++	.need_runtime_pm = true,
++};
++
++static const struct mtk_gate ovlsys1_config_clks[] = {
++	G_HWV(CLK_OVLSYS1_CONFIG, "ovlsys1_ovl_config", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 0),
++	G(CLK_OVLSYS1_DISP_FAKE_ENG0, "ovlsys1_ovl_fake_e0", "ovl0_ck", ovlsys1_config_cg_regs, 1),
++	G(CLK_OVLSYS1_DISP_FAKE_ENG1, "ovlsys1_ovl_fake_e1", "ovl0_ck", ovlsys1_config_cg_regs, 2),
++	G_HWV(CLK_OVLSYS1_DISP_MUTEX0, "ovlsys1_ovl_mutex0", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 3),
++	G_HWV(CLK_OVLSYS1_OVL0_2L, "ovlsys1_disp_ovl0_2l", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 4),
++	G_HWV(CLK_OVLSYS1_OVL1_2L, "ovlsys1_disp_ovl1_2l", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 5),
++	G_HWV(CLK_OVLSYS1_OVL2_2L, "ovlsys1_disp_ovl2_2l", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 6),
++	G_HWV(CLK_OVLSYS1_OVL3_2L, "ovlsys1_disp_ovl3_2l", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 7),
++	G_HWV(CLK_OVLSYS1_DISP_RSZ1, "ovlsys1_ovl_rsz1", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 8),
++	G_HWV(CLK_OVLSYS1_MDP_RSZ0, "ovlsys1_ovl_mdp", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 9),
++	G_HWV(CLK_OVLSYS1_DISP_WDMA0, "ovlsys1_ovl_wdma0", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 10),
++	G(CLK_OVLSYS1_DISP_UFBC_WDMA0, "ovlsys1_wdma0", "ovl0_ck", ovlsys1_config_cg_regs, 11),
++	G_HWV(CLK_OVLSYS1_DISP_WDMA2, "ovlsys1_ovl_wdma2", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 12),
++	G_HWV(CLK_OVLSYS1_DISP_DLI_ASYNC0, "ovlsys1_dli0", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 13),
++	G_HWV(CLK_OVLSYS1_DISP_DLI_ASYNC1, "ovlsys1_dli1", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 14),
++	G_HWV(CLK_OVLSYS1_DISP_DLI_ASYNC2, "ovlsys1_dli2", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 15),
++	G_HWV(CLK_OVLSYS1_DISP_DLO_ASYNC0, "ovlsys1_dlo0", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 16),
++	G_HWV(CLK_OVLSYS1_DISP_DLO_ASYNC1, "ovlsys1_dlo1", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 17),
++	G_HWV(CLK_OVLSYS1_DISP_DLO_ASYNC2, "ovlsys1_dlo2", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 18),
++	G_HWV(CLK_OVLSYS1_DISP_DLO_ASYNC3, "ovlsys1_dlo3", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 19),
++	G_HWV(CLK_OVLSYS1_DISP_DLO_ASYNC4, "ovlsys1_dlo4", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 20),
++	G_HWV(CLK_OVLSYS1_DISP_DLO_ASYNC5, "ovlsys1_dlo5", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 21),
++	G_HWV(CLK_OVLSYS1_DISP_DLO_ASYNC6, "ovlsys1_dlo6", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 22),
++	G_HWV(CLK_OVLSYS1_INLINEROT, "ovlsys1_ovl_irot", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 23),
++	G_HWV(CLK_OVLSYS1_SMI_SUB_COMMON0, "ovlsys1_cg0_smi_com0", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 24),
++	G_HWV(CLK_OVLSYS1_DISP_Y2R0, "ovlsys1_ovl_y2r0", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 25),
++	G_HWV(CLK_OVLSYS1_DISP_Y2R1, "ovlsys1_ovl_y2r1", "ovl0_ck", ovlsys1_config_cg_regs, ovlsys1_config_hwv_regs, 26),
++};
++
++static const struct mtk_clk_desc ovlsys1_config_desc = {
++	.clks = ovlsys1_config_clks,
++	.num_clks = ARRAY_SIZE(ovlsys1_config_clks),
++	.need_runtime_pm = true,
++};
++
++/* Copyright (c) 2023 MediaTek Inc.
++ * Author: Benjamin Chao <benjamin.chao@mediatek.com>
++ * Gate data adapted from clk-mt6897-vcodec.c, MiCode device modules
++ * 3c4ccd07d5624879555ec710c11bb8818e5cb5c6. These gates are not HW voters.
++ */
++static const struct mtk_gate_regs vdec_cg_regs = {
++	.set_ofs = 0, .clr_ofs = 4, .sta_ofs = 0,
++};
++static const struct mtk_gate_regs vdec_lat_cg_regs = {
++	.set_ofs = 0x200, .clr_ofs = 0x204, .sta_ofs = 0x200,
++};
++#define VDEC_GATE(_id, _name, _regs, _shift) { \
++	.id = _id, .name = _name, .parent_name = "vdec_ck", \
++	.regs = &_regs, .shift = _shift, .ops = &mtk_clk_gate_ops_setclr_inv, \
++}
++static const struct mtk_gate vde1_clks[] = {
++	VDEC_GATE(CLK_VDE1_LAT_CKEN, "vde1_lat_cken", vdec_lat_cg_regs, 0),
++	VDEC_GATE(CLK_VDE1_LAT_ACTIVE, "vde1_lat_active", vdec_lat_cg_regs, 4),
++	VDEC_GATE(CLK_VDE1_LAT_CKEN_ENG, "vde1_lat_cken_eng", vdec_lat_cg_regs, 8),
++	VDEC_GATE(CLK_VDE1_VDEC_CKEN, "vde1_vdec_cken", vdec_cg_regs, 0),
++	VDEC_GATE(CLK_VDE1_VDEC_ACTIVE, "vde1_vdec_active", vdec_cg_regs, 4),
++	VDEC_GATE(CLK_VDE1_VDEC_CKEN_ENG, "vde1_vdec_cken_eng", vdec_cg_regs, 8),
++};
++static const struct mtk_gate vde2_clks[] = {
++	VDEC_GATE(CLK_VDE2_VDEC_CKEN, "vde2_vdec_cken", vdec_cg_regs, 0),
++	VDEC_GATE(CLK_VDE2_VDEC_ACTIVE, "vde2_vdec_active", vdec_cg_regs, 4),
++	VDEC_GATE(CLK_VDE2_VDEC_CKEN_ENG, "vde2_vdec_cken_eng", vdec_cg_regs, 8),
++	VDEC_GATE(CLK_VDE2_LAT_CKEN, "vde2_lat_cken", vdec_lat_cg_regs, 0),
++	VDEC_GATE(CLK_VDE2_LAT_ACTIVE, "vde2_lat_active", vdec_lat_cg_regs, 4),
++	VDEC_GATE(CLK_VDE2_LAT_CKEN_ENG, "vde2_lat_cken_eng", vdec_lat_cg_regs, 8),
++};
++static const struct mtk_clk_desc vde1_desc = {
++	.clks = vde1_clks, .num_clks = ARRAY_SIZE(vde1_clks), .need_runtime_pm = true,
++};
++static const struct mtk_clk_desc vde2_desc = {
++	.clks = vde2_clks, .num_clks = ARRAY_SIZE(vde2_clks), .need_runtime_pm = true,
++};
++
++/* VENC gate data adapted from clk-mt6897-vcodec.c, MiCode revision
++ * 3c4ccd07d5624879555ec710c11bb8818e5cb5c6.
++ * Copyright (c) 2023 MediaTek Inc.
++ * Author: Benjamin Chao <benjamin.chao@mediatek.com>
++ * These banks use separate SET/CLR/status offsets 4/8/0.
++ */
++static const struct mtk_gate_regs venc_cg_regs = {
++	.set_ofs = 4, .clr_ofs = 8, .sta_ofs = 0,
++};
++#define VENC_GATE(_id, _name, _shift) { \
++	.id = _id, .name = _name, .parent_name = "venc_ck", \
++	.regs = &venc_cg_regs, .shift = _shift, .ops = &mtk_clk_gate_ops_setclr_inv, \
++}
++static const struct mtk_gate ven1_clks[] = {
++	VENC_GATE(CLK_VEN1_CKE0_LARB, "ven1_cke0_larb", 0),
++	VENC_GATE(CLK_VEN1_CKE1_VENC, "ven1_cke1_venc", 4),
++	VENC_GATE(CLK_VEN1_CKE2_JPGENC, "ven1_cke2_jpgenc", 8),
++	VENC_GATE(CLK_VEN1_CKE3_JPGDEC, "ven1_cke3_jpgdec", 12),
++	VENC_GATE(CLK_VEN1_CKE4_JPGDEC_C1, "ven1_cke4_jpgdec_c1", 16),
++	VENC_GATE(CLK_VEN1_CKE5_GALS, "ven1_cke5_gals", 28),
++	VENC_GATE(CLK_VEN1_CKE6_GALS_SRAM, "ven1_cke6_gals_sram", 31),
++};
++static const struct mtk_clk_desc ven1_desc = {
++	.clks = ven1_clks, .num_clks = ARRAY_SIZE(ven1_clks), .need_runtime_pm = true,
++};
++static const struct mtk_gate ven2_clks[] = {
++	VENC_GATE(CLK_VEN2_CKE0_LARB, "ven2_cke0_larb", 0),
++	VENC_GATE(CLK_VEN2_CKE1_VENC, "ven2_cke1_venc", 4),
++	VENC_GATE(CLK_VEN2_CKE2_JPGENC, "ven2_cke2_jpgenc", 8),
++	VENC_GATE(CLK_VEN2_CKE3_JPGDEC, "ven2_cke3_jpgdec", 12),
++	VENC_GATE(CLK_VEN2_CKE4_JPGDEC_C1, "ven2_cke4_jpgdec_c1", 16),
++	VENC_GATE(CLK_VEN2_CKE5_GALS, "ven2_cke5_gals", 28),
++	VENC_GATE(CLK_VEN2_CKE6_GALS_SRAM, "ven2_cke6_gals_sram", 31),
++};
++static const struct mtk_clk_desc ven2_desc = {
++	.clks = ven2_clks, .num_clks = ARRAY_SIZE(ven2_clks), .need_runtime_pm = true,
++};
++
++static const struct of_device_id of_match_clk_mt6897_mm[] = {
++	{ .compatible = "mediatek,mt6897-vencsys", .data = &ven1_desc },
++	{ .compatible = "mediatek,mt6897-vencsys_c1", .data = &ven2_desc },
++	{ .compatible = "mediatek,mt6897-vdecsys_soc", .data = &vde1_desc },
++	{ .compatible = "mediatek,mt6897-vdecsys", .data = &vde2_desc },
++	{ .compatible = "mediatek,mt6897-dispsys0-config", .data = &dispsys0_config_desc },
++	{ .compatible = "mediatek,mt6897-dispsys1-config", .data = &dispsys1_config_desc },
++	{ .compatible = "mediatek,mt6897-mminfra-config", .data = &mminfra_config_desc },
++	{ .compatible = "mediatek,mt6897-ovlsys0-config", .data = &ovlsys0_config_desc },
++	{ .compatible = "mediatek,mt6897-ovlsys1-config", .data = &ovlsys1_config_desc },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, of_match_clk_mt6897_mm);
++
++static struct platform_driver clk_mt6897_mm_drv = {
++	.probe = mtk_clk_simple_probe,
++	.remove = mtk_clk_simple_remove,
++	.driver = {
++		.name = "clk-mt6897-mm",
++		.of_match_table = of_match_clk_mt6897_mm,
++	},
++};
++module_platform_driver(clk_mt6897_mm_drv);
++
++MODULE_DESCRIPTION("MediaTek MT6897 MM clock gates");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/clk/mediatek/clk-mt6897-peri.c b/drivers/clk/mediatek/clk-mt6897-peri.c
+new file mode 100644
+index 0000000000..5a2e001bcb
+--- /dev/null
++++ b/drivers/clk/mediatek/clk-mt6897-peri.c
+@@ -0,0 +1,154 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek MT6897 pericfg_ao clock gates.
++ *
++ * Data from the MediaTek vendor driver (MiCode MTK_kernel_device_modules
++ * 3c4ccd07, drivers/clk/mediatek/clk-mt6897-peri.c). The gates that go
++ * through the hardware voter (disp_pwm0/1, spi0) are only passed through
++ * here: they are never written, so the voter's state is left alone.
++ */
++
++#include <dt-bindings/clock/mediatek,mt6897-clock.h>
++#include <linux/clk-provider.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++
++#include "clk-gate.h"
++#include "clk-mtk.h"
++
++static const struct mtk_gate_regs perao0_cg_regs = {
++	.set_ofs = 0x24,
++	.clr_ofs = 0x28,
++	.sta_ofs = 0x10,
++};
++
++static const struct mtk_gate_regs perao1_cg_regs = {
++	.set_ofs = 0x2c,
++	.clr_ofs = 0x30,
++	.sta_ofs = 0x14,
++};
++
++static const struct mtk_gate_regs perao2_cg_regs = {
++	.set_ofs = 0x34,
++	.clr_ofs = 0x38,
++	.sta_ofs = 0x18,
++};
++
++#define GATE_PERAO0(_id, _name, _parent, _shift)			\
++	GATE_MTK(_id, _name, _parent, &perao0_cg_regs, _shift,		\
++		 &mtk_clk_gate_ops_setclr)
++#define GATE_PERAO1(_id, _name, _parent, _shift)			\
++	GATE_MTK(_id, _name, _parent, &perao1_cg_regs, _shift,		\
++		 &mtk_clk_gate_ops_setclr)
++#define GATE_PERAO2(_id, _name, _parent, _shift)			\
++	GATE_MTK(_id, _name, _parent, &perao2_cg_regs, _shift,		\
++		 &mtk_clk_gate_ops_setclr)
++
++static const struct mtk_gate perao_clks[] = {
++	/* PERAO0 */
++	GATE_PERAO0(CLK_PERAOP_UART0, "peraop_uart0", "uart_ck", 0),
++	GATE_PERAO0(CLK_PERAOP_UART1, "peraop_uart1", "uart_ck", 1),
++	GATE_PERAO0(CLK_PERAOP_UART2, "peraop_uart2", "uart_ck", 2),
++	GATE_PERAO0(CLK_PERAOP_UART3, "peraop_uart3", "uart_ck", 3),
++	GATE_PERAO0(CLK_PERAOP_PWM_HCLK, "peraop_pwm_hclk", "peri_faxi_ck", 4),
++	GATE_PERAO0(CLK_PERAOP_PWM_BCLK, "peraop_pwm_bclk", "pwm_ck", 5),
++	GATE_PERAO0(CLK_PERAOP_PWM_FBCLK1, "peraop_pwm_fbclk1", "pwm_ck", 6),
++	GATE_PERAO0(CLK_PERAOP_PWM_FBCLK2, "peraop_pwm_fbclk2", "pwm_ck", 7),
++	GATE_PERAO0(CLK_PERAOP_PWM_FBCLK3, "peraop_pwm_fbclk3", "pwm_ck", 8),
++	GATE_PERAO0(CLK_PERAOP_PWM_FBCLK4, "peraop_pwm_fbclk4", "pwm_ck", 9),
++	GATE_PERAO0(CLK_PERAOP_SPI1_BCLK, "peraop_spi1_bclk", "spi1_ck", 13),
++	GATE_PERAO0(CLK_PERAOP_SPI2_BCLK, "peraop_spi2_bclk", "spi2_ck", 14),
++	GATE_PERAO0(CLK_PERAOP_SPI3_BCLK, "peraop_spi3_bclk", "spi3_ck", 15),
++	GATE_PERAO0(CLK_PERAOP_SPI4_BCLK, "peraop_spi4_bclk", "spi4_ck", 16),
++	GATE_PERAO0(CLK_PERAOP_SPI5_BCLK, "peraop_spi5_bclk", "spi5_ck", 17),
++	GATE_PERAO0(CLK_PERAOP_SPI6_BCLK, "peraop_spi6_bclk", "spi6_ck", 18),
++	GATE_PERAO0(CLK_PERAOP_SPI7_BCLK, "peraop_spi7_bclk", "spi7_ck", 19),
++	/* PERAO1 */
++	GATE_PERAO1(CLK_PERAOP_DMA_BCLK, "peraop_dma_bclk", "peri_faxi_ck", 1),
++	GATE_PERAO1(CLK_PERAOP_SSUSB0_FRMCNT, "peraop_ssusb0_frmcnt",
++		    "ssusb_fmcnt_ck", 4),
++	GATE_PERAO1(CLK_PERAOP_MSDC1, "peraop_msdc1", "msdc30_1_ck", 10),
++	GATE_PERAO1(CLK_PERAOP_MSDC1_FCLK, "peraop_msdc1_fclk", "peri_faxi_ck", 11),
++	GATE_PERAO1(CLK_PERAOP_MSDC1_HCLK, "peraop_msdc1_hclk", "peri_faxi_ck", 12),
++	GATE_PERAO1(CLK_PERAOP_MSDC2, "peraop_msdc2", "msdc30_2_ck", 13),
++	GATE_PERAO1(CLK_PERAOP_MSDC2_FCLK, "peraop_msdc2_fclk", "peri_faxi_ck", 14),
++	GATE_PERAO1(CLK_PERAOP_MSDC2_HCLK, "peraop_msdc2_hclk", "peri_faxi_ck", 15),
++	/* PERAO2 */
++	GATE_PERAO2(CLK_PERAOP_AUDIO_SLV_CK, "peraop_audio_slv_ck", "peri_faxi_ck", 0),
++	GATE_PERAO2(CLK_PERAOP_AUDIO_MST_CK, "peraop_audio_mst_ck", "peri_faxi_ck", 1),
++	GATE_PERAO2(CLK_PERAOP_AUDIO_INTBUS_CK, "peraop_aud_intbusck",
++		    "aud_intbus_ck", 2),
++};
++
++/* Voter-owned gates: pass-through only, never written */
++static const struct mtk_fixed_factor perao_hwv_passthrough[] = {
++	FACTOR(CLK_PERAOP_DISP_PWM0, "peraop_disp_pwm0", "disp_pwm_ck", 1, 1),
++	FACTOR(CLK_PERAOP_DISP_PWM1, "peraop_disp_pwm1", "disp_pwm_ck", 1, 1),
++	FACTOR(CLK_PERAOP_SPI0_BCLK, "peraop_spi0_bclk", "spi0_ck", 1, 1),
++};
++
++static const struct mtk_clk_desc perao_mcd = {
++	.clks = perao_clks,
++	.num_clks = ARRAY_SIZE(perao_clks),
++	.factor_clks = perao_hwv_passthrough,
++	.num_factor_clks = ARRAY_SIZE(perao_hwv_passthrough),
++};
++
++/* UFSCFG_AO and UFSCFG_PDN: the UFS UniPro and host controller gates. */
++static const struct mtk_gate_regs ufscfg_cg_regs = {
++	.set_ofs = 0x8,
++	.clr_ofs = 0xc,
++	.sta_ofs = 0x4,
++};
++
++#define GATE_UFSCFG(_id, _name, _parent, _shift)			\
++	GATE_MTK(_id, _name, _parent, &ufscfg_cg_regs, _shift,		\
++		 &mtk_clk_gate_ops_setclr)
++
++static const struct mtk_gate ufscfg_ao_clks[] = {
++	GATE_UFSCFG(CLK_UFSCFG_AO_UNIPRO_TX_SYMBOLCLK, "ufscfg_ao_unipro_tx_sym",
++		    "f26m_ck", 0),
++	GATE_UFSCFG(CLK_UFSCFG_AO_UNIPRO_RX_SYMBOLCLK0, "ufscfg_ao_unipro_rx_sym0",
++		    "f26m_ck", 1),
++	GATE_UFSCFG(CLK_UFSCFG_AO_UNIPRO_RX_SYMBOLCLK1, "ufscfg_ao_unipro_rx_sym1",
++		    "f26m_ck", 2),
++	GATE_UFSCFG(CLK_UFSCFG_AO_UNIPRO_SYSCLK, "ufscfg_ao_unipro_sys",
++		    "ufs_ck", 3),
++};
++
++static const struct mtk_clk_desc ufscfg_ao_mcd = {
++	.clks = ufscfg_ao_clks,
++	.num_clks = ARRAY_SIZE(ufscfg_ao_clks),
++};
++
++static const struct mtk_gate ufscfg_pdn_clks[] = {
++	GATE_UFSCFG(CLK_UFSCFG_UFSHCI_UFS, "ufscfg_ufshci_ufs", "ufs_ck", 0),
++	GATE_UFSCFG(CLK_UFSCFG_UFSHCI_AES, "ufscfg_ufshci_aes", "aes_ufsfde_ck", 1),
++};
++
++static const struct mtk_clk_desc ufscfg_pdn_mcd = {
++	.clks = ufscfg_pdn_clks,
++	.num_clks = ARRAY_SIZE(ufscfg_pdn_clks),
++};
++
++static const struct of_device_id of_match_clk_mt6897_peri[] = {
++	{ .compatible = "mediatek,mt6897-pericfg-ao", .data = &perao_mcd },
++	{ .compatible = "mediatek,mt6897-ufscfg-ao", .data = &ufscfg_ao_mcd },
++	{ .compatible = "mediatek,mt6897-ufscfg-pdn", .data = &ufscfg_pdn_mcd },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, of_match_clk_mt6897_peri);
++
++static struct platform_driver clk_mt6897_peri_drv = {
++	.probe = mtk_clk_simple_probe,
++	.remove = mtk_clk_simple_remove,
++	.driver = {
++		.name = "clk-mt6897-peri",
++		.of_match_table = of_match_clk_mt6897_peri,
++	},
++};
++module_platform_driver(clk_mt6897_peri_drv);
++
++MODULE_DESCRIPTION("MediaTek MT6897 pericfg_ao and ufscfg clock gates");
++MODULE_LICENSE("GPL");
+-- 
+2.56.0
+

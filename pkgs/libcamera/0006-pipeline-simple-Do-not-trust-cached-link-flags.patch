@@ -1,0 +1,53 @@
+From: dianqk <jufaye2014@gmail.com>
+Date: Mon, 2 Nov 2026 06:40:00 +0800
+Subject: [PATCH] pipeline: simple: Do not trust cached link flags
+
+MediaLink flags are read when the media graph is enumerated and are only
+updated by the current process. When another process (for example cam
+while PipeWire holds the camera manager) routes a different sensor to a
+shared receiver, the cached flags of that link still read disabled.
+setupLinks() then skips disabling it and enabling the new link fails with
+-EBUSY on receivers that accept a single source, such as the Qualcomm
+CAMSS CSID.
+
+Disable every mutable link on the pipeline pads and enable the pipeline
+link without consulting the cache. The media core returns early for
+requests that do not change the link state, so this costs one ioctl per
+link.
+
+---
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -795,8 +795,15 @@
+ 				if (link == sinkLink)
+ 					continue;
+ 
+-				if ((link->flags() & MEDIA_LNK_FL_ENABLED) &&
+-				    !(link->flags() & MEDIA_LNK_FL_IMMUTABLE)) {
++				/*
++				 * The cached link flags are only updated by this
++				 * process. Another process may have enabled a link
++				 * since the media graph was enumerated, so disable
++				 * every mutable link instead of trusting the cache.
++				 * The kernel ignores requests that do not change the
++				 * link state.
++				 */
++				if (!(link->flags() & MEDIA_LNK_FL_IMMUTABLE)) {
+ 					ret = link->setEnabled(false);
+ 					if (ret < 0)
+ 						return ret;
+@@ -804,11 +811,9 @@
+ 			}
+ 		}
+ 
+-		if (!(sinkLink->flags() & MEDIA_LNK_FL_ENABLED)) {
+-			ret = sinkLink->setEnabled(true);
+-			if (ret < 0)
+-				return ret;
+-		}
++		ret = sinkLink->setEnabled(true);
++		if (ret < 0)
++			return ret;
+ 
+ 		sinkLink = e.sourceLink;
+ 	}

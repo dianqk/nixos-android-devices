@@ -5,224 +5,152 @@ Subject: [PATCH] Add optional fixed-orientation GLES RGB to NV12 VPP
 Local extension of https://github.com/radxa-pkg/libva-v4l2/tree/0e4ce1e05da1d0a92b342efc2090b9e4987035e1
 Keep the upstream FFmpeg and recorder unchanged. Support static orientation; no in-recording rotation, mirroring or HDR.
 
+
+Adapted to qcom-va-driver 0980a1decf26: keep RGB base conversion on the original GLES path; preserve upstream YUV scaling, HDR and overlays on Vulkan. Extend the current RGB/DRM format handling to BGRX/RGBX and retain encoder VUI metadata.
+
+diff --git a/meson.build b/meson.build
+index 04c6b6e..3f4abb1 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -57,8 +57,13 @@
-   'src/msm.c',
+@@ -10,6 +10,7 @@ va = dependency('libva', version: '>=1.10')
+ drm = dependency('libdrm')
+ threads = dependency('threads')
+ gpu_copy_option = get_option('gpu_copy')
++assert(gpu_copy_option.enabled(), 'RGB VPP requires GPU surface-copy dependencies')
+ egl = dependency('egl', required: gpu_copy_option)
+ gles = dependency('glesv2', version: '>=3.2', required: gpu_copy_option)
+ gbm = dependency('gbm', required: gpu_copy_option)
+@@ -71,6 +72,7 @@ sources = files(
    'src/surface-copy.cpp',
    'src/vp9.cpp',
--  'src/vpp.cpp',
+   'src/vpp.cpp',
++  'src/gles-rgb-vpp.cpp',
  )
-+if get_option('gpu-vpp')
-+  add_project_arguments('-DHAVE_GPU_VPP=1', language: 'cpp')
-+  sources += files('src/gpu-vpp.cpp')
-+else
-+  sources += files('src/vpp.cpp')
-+endif
  headers = files('src/internal.hpp')
+ msm_allocation_test = executable('msm-allocation-test',
+@@ -82,7 +84,7 @@ capture_pool_test = executable('capture-pool-test', 'tests/decoder/capture-pool.
+ test('Decoder CAPTURE memory budget', capture_pool_test)
  driver_install_dir = get_option('libdir') / 'dri'
  
---- a/meson_options.txt
-+++ b/meson_options.txt
-@@ -1 +1,3 @@
- option('fastcv', type: 'feature', value: 'disabled', description: 'VA-API scaling with FastCV on CDSP')
-+
-+option('gpu-vpp', type: 'boolean', value: false, description: 'GLES RGB to NV12 video processing')
---- a/src/internal.hpp
-+++ b/src/internal.hpp
-@@ -53,6 +53,7 @@
-     size_t size = 0;
-     unsigned index = 0, stride = 0, storage_height = 0, width = 0, height = 0;
-     unsigned data_offset = 0, fourcc = VA_FOURCC_NV12;
-+    unsigned drm_fourcc = 0;
-     bool queued = false;
-     ~Memory();
-     uint8_t *map();
-@@ -80,6 +81,8 @@
-     std::shared_ptr<EncodeTask> encode_task;
-     unsigned width, height, fourcc = VA_FOURCC_NV12;
-     unsigned allocation_count = 1;
-+    VAProcColorStandardType color_standard = VAProcColorStandardNone;
-+    bool full_range = false;
-     std::shared_ptr<Memory> memory;
-     // An export before the first picture may be cached by the consumer for
-     // this surface's whole lifetime (Chromium's NativePixmap frame pool).
-@@ -210,6 +213,8 @@
-     unsigned rate_control = VA_RC_CQP;
-     unsigned bitrate = 0, peak_bitrate = 0, min_qp = 1, max_qp = 51;
-     unsigned fps_num = 30, fps_den = 1;
-+    VAProcColorStandardType color_standard = VAProcColorStandardNone;
-+    bool full_range = false;
- };
- void render_encode_buffer(EncodeSettings &settings, EncodePicture &picture, const Buffer &buffer);
- class Encoder {
-@@ -229,17 +234,29 @@
- };
- void copy_surface(Memory &destination, Memory &source, unsigned width, unsigned height);
- void wait_surface_access(const Memory &memory, short events);
-+inline bool rgb_format(unsigned f) {
-+#ifdef HAVE_GPU_VPP
-+    return f == VA_FOURCC_BGRA || f == VA_FOURCC_BGRX ||
-+           f == VA_FOURCC_RGBA || f == VA_FOURCC_RGBX;
-+#else
-+    (void)f;
-+    return false;
-+#endif
-+}
- bool vpp_supported(VAProfile profile, VAEntrypoint entrypoint);
- void vpp_caps(VAProcPipelineCaps &caps);
- struct VppPicture {
-     std::shared_ptr<Surface> source;
-     VARectangle region{};
-+    unsigned rotation = VA_ROTATION_NONE;
-+    bool bt709 = true;
-+    bool full_range = false;
- };
- class Vpp {
-     std::shared_ptr<void> runtime_;
+-shared_library(
++driver = shared_library(
+   'qcom_drv_video',
+   sources + copy_source + vulkan_sources,
+   dependencies: [va, drm, threads] + copy_dependencies + vpp_dependencies,
+@@ -92,6 +94,11 @@ shared_library(
+   install_dir: driver_install_dir,
+ )
  
-   public:
--    Vpp();
-+    explicit Vpp(int render_fd = -1);
-     void scale(const VppPicture &picture, const std::shared_ptr<Surface> &target);
- };
- VppPicture vpp_picture(const Buffer &buffer, const std::shared_ptr<Surface> &source,
++rgb_parameters_test = executable('rgb-vpp-parameters-test', 'tests/rgb-vpp-parameters.cpp',
++  include_directories: include_directories('src'), dependencies: [va, drm],
++  link_with: driver, cpp_args: ['-UNDEBUG'], build_by_default: false)
++test('RGB VPP explicit SDR parameter boundaries', rgb_parameters_test)
++
+ # libva falls back to the DRM driver name on Qualcomm MSM devices.
+ install_symlink(
+   'msm_drv_video.so',
+diff --git a/src/backend.cpp b/src/backend.cpp
+index 56fc3e6..8d90b8e 100644
 --- a/src/backend.cpp
 +++ b/src/backend.cpp
-@@ -243,12 +243,16 @@
-     m->width = s.width;
-     m->height = s.height;
-     m->fourcc = s.fourcc;
--    unsigned bytes_per_sample = s.fourcc == VA_FOURCC_P010 ? 2 : 1;
-+    unsigned bytes_per_sample = rgb_format(s.fourcc) ? 4 : s.fourcc == VA_FOURCC_P010 ? 2 : 1;
-     m->stride = (s.width * bytes_per_sample + 127) & ~127u;
-     m->storage_height = (s.height + 31) & ~31u;
-     long page_size = sysconf(_SC_PAGESIZE);
-     check(page_size > 0, "cannot determine page size");
--    size_t size = size_t(m->stride) * m->storage_height * 3 / 2;
-+    size_t size = size_t(m->stride) * m->storage_height;
-+    if (!rgb_format(s.fourcc)) size = size * 3 / 2;
-+    if (rgb_format(s.fourcc)) m->drm_fourcc = s.fourcc == VA_FOURCC_BGRA ? DRM_FORMAT_ARGB8888 :
-+        s.fourcc == VA_FOURCC_BGRX ? DRM_FORMAT_XRGB8888 :
-+        s.fourcc == VA_FOURCC_RGBA ? DRM_FORMAT_ABGR8888 : DRM_FORMAT_XBGR8888;
-     m->size = (size + size_t(page_size) - 1) / size_t(page_size) * size_t(page_size);
-     int coherent = 0;
-     m->fd = irisva_msm_allocate(fd, m->size, &coherent);
-@@ -446,12 +450,15 @@
-     create_surfaces,
-     (VADriverContextP ctx, unsigned format, unsigned w, unsigned h, VASurfaceID *ids,
-      unsigned count, VASurfaceAttrib *attrs, unsigned nattrs),
--    check(format == VA_RT_FORMAT_YUV420 || format == VA_RT_FORMAT_YUV420_10,
-+    check(format == VA_RT_FORMAT_YUV420 || format == VA_RT_FORMAT_YUV420_10 ||
-+              (format == VA_RT_FORMAT_RGB32 && rgb_format(VA_FOURCC_BGRA)),
-           "unsupported surface RT format", VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
-     check(w && h && w <= 8192 && h <= 8192 && ids && count <= 256, "invalid surfaces",
-           VA_STATUS_ERROR_INVALID_PARAMETER);
-     check(!nattrs || attrs, "null surface attributes", VA_STATUS_ERROR_INVALID_PARAMETER);
-     unsigned memory_type = VA_SURFACE_ATTRIB_MEM_TYPE_VA;
-+    unsigned pixel_format = format == VA_RT_FORMAT_RGB32 ? VA_FOURCC_BGRX :
-+        format == VA_RT_FORMAT_YUV420_10 ? VA_FOURCC_P010 : VA_FOURCC_NV12;
-     const VADRMPRIMESurfaceDescriptor *external = nullptr; bool explicit_modifier = false;
-     for (unsigned i = 0; i < nattrs; ++i) {
-         if (!(attrs[i].flags & VA_SURFACE_ATTRIB_SETTABLE))
-@@ -479,11 +486,13 @@
-         }
-         check(attrs[i].value.type == VAGenericValueTypeInteger, "unsupported surface attribute",
-               VA_STATUS_ERROR_ATTR_NOT_SUPPORTED);
--        if (attrs[i].type == VASurfaceAttribPixelFormat)
--            check(unsigned(attrs[i].value.value.i) ==
-+        if (attrs[i].type == VASurfaceAttribPixelFormat) {
-+            pixel_format = unsigned(attrs[i].value.value.i);
-+            check(format == VA_RT_FORMAT_RGB32 ? rgb_format(pixel_format) : pixel_format ==
-                       (format == VA_RT_FORMAT_YUV420_10 ? VA_FOURCC_P010 : VA_FOURCC_NV12),
-                   "surface pixel format does not match RT format",
-                   VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
-+        }
-         else if (attrs[i].type == VASurfaceAttribMemoryType)
-             memory_type = attrs[i].value.value.i;
-         else if (attrs[i].type != VASurfaceAttribUsageHint)
-@@ -495,6 +504,7 @@
-         check(external && !explicit_modifier && count == 1 && format == VA_RT_FORMAT_YUV420,
-               "PRIME2 import requires one NV12 descriptor/surface",
-               VA_STATUS_ERROR_INVALID_PARAMETER);
-+        check(external->fourcc == pixel_format, "import format mismatch", VA_STATUS_ERROR_INVALID_PARAMETER);
-         imported = import_prime(*external, w, h);
-     } else check(!external, "external descriptor without PRIME2 memory type",
-                  VA_STATUS_ERROR_INVALID_PARAMETER);
-@@ -505,7 +515,7 @@
-         s->width = w;
-         s->height = h;
-         s->allocation_count = count;
--        s->fourcc = format == VA_RT_FORMAT_YUV420_10 ? VA_FOURCC_P010 : VA_FOURCC_NV12;
-+        s->fourcc = pixel_format;
-         ids[i] = d.next_id++;
-         d.surfaces[ids[i]] = s;
-     } return VA_STATUS_SUCCESS;)
-@@ -535,7 +545,7 @@
-     if (c->entrypoint == VAEntrypointVLD)
-         c->decoder = std::make_shared<Decoder>(d.device, w, h, std::max(0, count), c->profile,
-                                                render_fd);
--    if (processing) c->vpp = std::make_unique<Vpp>(); *result = d.next_id++;
-+    if (processing) c->vpp = std::make_unique<Vpp>(render_fd); *result = d.next_id++;
-     d.contexts[*result] = c; return VA_STATUS_SUCCESS;)
- API(
-     destroy_context, (VADriverContextP ctx, VAContextID id), auto c = context(d, id);
-@@ -724,6 +734,8 @@
-               "invalid encode output buffer", VA_STATUS_ERROR_INVALID_BUFFER);
-         auto reconstruction = surface(d, c->encode_picture.reconstruction(c->encode_settings.hevc));
-         synchronize_encode(reconstruction->encode_task);
-+        c->encode_settings.color_standard = target->color_standard;
-+        c->encode_settings.full_range = target->full_range;
-         if (!c->encoder) {
-             check(ctx->drm_state, "encoding requires a DRM display");
-             c->encoder = std::make_shared<Encoder>(
-@@ -797,6 +809,7 @@
-     derive_image, (VADriverContextP ctx, VASurfaceID id, VAImage *image),
-     check(image, "null derived image", VA_STATUS_ERROR_INVALID_PARAMETER);
-     auto s = surface(d, id); synchronize(d, s);
-+    check(!rgb_format(s->fourcc), "RGB CPU image access unsupported", VA_STATUS_ERROR_UNIMPLEMENTED);
-     check(!s->acquired_handles, "surface handle acquired", VA_STATUS_ERROR_SURFACE_BUSY);
-     if (!s->memory) s->memory = allocate_undecoded_surface(ctx, *s); auto m = s->memory;
-     VAImage result{}; result.image_id = d.next_id++; result.buf = d.next_id++;
-@@ -817,6 +830,7 @@
-     (VADriverContextP ctx, VASurfaceID id, VAImageID image_id, int sx, int sy, unsigned sw,
-      unsigned sh, int dx, int dy, unsigned dw, unsigned dh),
-     auto s = surface(d, id);
-+    check(!rgb_format(s->fourcc), "RGB CPU image access unsupported", VA_STATUS_ERROR_UNIMPLEMENTED);
-     synchronize(d, s); auto image = lookup(d.images, image_id, VA_STATUS_ERROR_INVALID_IMAGE);
-     check(sw == dw && sh == dh, "image scaling unsupported", VA_STATUS_ERROR_UNIMPLEMENTED);
-     check(sw && sh && sx >= 0 && sy >= 0 && dx >= 0 && dy >= 0 &&
-@@ -883,6 +897,7 @@
-     (VADriverContextP ctx, VASurfaceID id, int x, int y, unsigned w, unsigned h,
-      VAImageID image_id),
-     auto s = surface(d, id);
-+    check(!rgb_format(s->fourcc), "RGB CPU image access unsupported", VA_STATUS_ERROR_UNIMPLEMENTED);
-     synchronize(d, s);
-     check(!s->derived_images, "surface has derived images", VA_STATUS_ERROR_SURFACE_BUSY);
-     auto image = lookup(d.images, image_id, VA_STATUS_ERROR_INVALID_IMAGE);
-@@ -947,6 +962,14 @@
-     } desc.objects[0]
-                                                                 .size = m->size;
-     desc.objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
-+    if (rgb_format(m->fourcc)) {
-+        desc.num_layers = 1;
-+        desc.layers[0].drm_format = m->drm_fourcc;
-+        desc.layers[0].num_planes = 1;
-+        desc.layers[0].pitch[0] = m->stride;
-+        desc.layers[0].offset[0] = m->data_offset;
-+        return VA_STATUS_SUCCESS;
-+    }
-     if (!(flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS)) {
-         desc.num_layers = 2;
-         desc.layers[0].drm_format = m->fourcc == VA_FOURCC_P010 ? DRM_FORMAT_R16 : DRM_FORMAT_R8;
+@@ -207,11 +207,12 @@ static VAImageFormat image_format(unsigned fourcc) {
+     f.byte_order = VA_LSB_FIRST;
+     f.bits_per_pixel = fourcc == VA_FOURCC_P010 ? 24 : 12;
+     if (is_rgb(fourcc)) {
+-        f.bits_per_pixel = f.depth = 32;
+-        f.red_mask = fourcc == VA_FOURCC_BGRA ? 0xff0000 : 0xff;
++        f.bits_per_pixel = 32;
++        f.depth = (fourcc == VA_FOURCC_BGRX || fourcc == VA_FOURCC_RGBX) ? 24 : 32;
++        f.red_mask = (fourcc == VA_FOURCC_BGRA || fourcc == VA_FOURCC_BGRX) ? 0xff0000 : 0xff;
+         f.green_mask = 0xff00;
+-        f.blue_mask = fourcc == VA_FOURCC_BGRA ? 0xff : 0xff0000;
+-        f.alpha_mask = 0xff000000;
++        f.blue_mask = (fourcc == VA_FOURCC_BGRA || fourcc == VA_FOURCC_BGRX) ? 0xff : 0xff0000;
++        f.alpha_mask = (fourcc == VA_FOURCC_BGRX || fourcc == VA_FOURCC_RGBX) ? 0 : 0xff000000;
+     }
+     return f;
+ }
+@@ -377,7 +378,7 @@ API(
+     auto config = lookup(d.configs, id, VA_STATUS_ERROR_INVALID_CONFIG);
+     auto profile = config.profile;
+     check(count, "null surface attribute count", VA_STATUS_ERROR_INVALID_PARAMETER);
+-    VASurfaceAttrib a[9]{};
++    VASurfaceAttrib a[11]{};
+     VASurfaceAttribType types[] = {VASurfaceAttribPixelFormat, VASurfaceAttribMinWidth,
+                                    VASurfaceAttribMinHeight, VASurfaceAttribMaxWidth,
+                                    VASurfaceAttribMaxHeight, VASurfaceAttribMemoryType};
+@@ -405,6 +406,8 @@ API(
+         a[n++].value.value.i = VA_FOURCC_BGRA;
+         a[n] = a[0];
+         a[n++].value.value.i = VA_FOURCC_RGBA;
++        a[n] = a[0]; a[n++].value.value.i = VA_FOURCC_BGRX;
++        a[n] = a[0]; a[n++].value.value.i = VA_FOURCC_RGBX;
+     } else if (values[0] != VA_FOURCC_NV12 && (profile_format(profile) & VA_RT_FORMAT_YUV420)) {
+         a[n] = a[0];
+         a[n++].value.value.i = VA_FOURCC_NV12;
+@@ -436,7 +439,7 @@ prime_descriptor(const VASurfaceAttribExternalBuffers &external) {
+     layer.drm_format = external.pixel_format == VA_FOURCC_P010 ? DRM_FORMAT_P010 : DRM_FORMAT_NV12;
+     if (rgb)
+         layer.drm_format =
+-            external.pixel_format == VA_FOURCC_BGRA ? DRM_FORMAT_ARGB8888 : DRM_FORMAT_ABGR8888;
++            rgb_drm_format(external.pixel_format);
+     layer.num_planes = rgb ? 1 : 2;
+     for (unsigned i = 0; i < layer.num_planes; ++i) {
+         layer.offset[i] = external.offsets[i];
+@@ -458,7 +461,7 @@ static std::shared_ptr<Memory> import_prime(const VADRMPRIMESurfaceDescriptor &d
+         const auto &l = desc.layers[0];
+         check(desc.num_layers == 1 && l.num_planes == 1 && !l.object_index[0] &&
+                   l.drm_format ==
+-                      (fourcc == VA_FOURCC_BGRA ? DRM_FORMAT_ARGB8888 : DRM_FORMAT_ABGR8888) &&
++                      rgb_drm_format(fourcc) &&
+                   !(l.offset[0] & 3) && !(l.pitch[0] & 3) && l.pitch[0] >= width * 4 &&
+                   uint64_t(l.offset[0]) + uint64_t(height - 1) * l.pitch[0] + width * 4 <=
+                       desc.objects[0].size,
+@@ -711,6 +714,8 @@ API(
+         check(bool(s->memory), "encode input has no image data", VA_STATUS_ERROR_INVALID_SURFACE);
+         c->target = s;
+         c->encode_picture = EncodePicture{};
++        c->encode_settings.color_standard = c->target->color_standard;
++        c->encode_settings.full_range = c->target->full_range;
+         return VA_STATUS_SUCCESS;
+     } if (c->entrypoint == VAEntrypointVideoProc) {
+         check(!s->acquired_handles && !s->mapped_images, "VPP target is in use",
+@@ -957,7 +962,8 @@ API(query_error, (VADriverContextP ctx, VASurfaceID id, VAStatus status, void **
+ API(query_images, (VADriverContextP ctx, VAImageFormat *out, int *count), (void)d;
+     out[0] = image_format(VA_FOURCC_NV12); out[1] = image_format(VA_FOURCC_I420);
+     out[2] = image_format(VA_FOURCC_P010); out[3] = image_format(VA_FOURCC_BGRA);
+-    out[4] = image_format(VA_FOURCC_RGBA); *count = 5; return VA_STATUS_SUCCESS;)
++    out[4] = image_format(VA_FOURCC_RGBA);
++    out[5] = image_format(VA_FOURCC_BGRX); out[6] = image_format(VA_FOURCC_RGBX); *count = 7; return VA_STATUS_SUCCESS;)
+ API(new_image, (VADriverContextP ctx, VAImageFormat *f, int w, int h, VAImage *out),
+     *out = create_image(d, f->fourcc, w, h);
+     return VA_STATUS_SUCCESS;)
+@@ -1133,7 +1139,7 @@ API(
+     desc.objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR; if (is_rgb(m->fourcc)) {
+         desc.num_layers = 1;
+         desc.layers[0].drm_format =
+-            m->fourcc == VA_FOURCC_BGRA ? DRM_FORMAT_ARGB8888 : DRM_FORMAT_ABGR8888;
++            rgb_drm_format(m->fourcc);
+         desc.layers[0].num_planes = 1;
+         desc.layers[0].pitch[0] = m->stride;
+         desc.layers[0].offset[0] = m->data_offset;
+@@ -1210,7 +1216,7 @@ extern "C" VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
+         ctx->max_entrypoints = 2;
+         ctx->max_attributes = 16;
+         // libva validates nonzero allocation bounds even when queries return no entries.
+-        ctx->max_image_formats = 5;
++        ctx->max_image_formats = 7;
+         ctx->max_subpic_formats = 1;
+         ctx->max_display_attributes = 1;
+         ctx->str_vendor = "Iris V4L2 stateful VA-API backend";
+diff --git a/src/encoder.cpp b/src/encoder.cpp
+index d0619d3..ad397aa 100644
 --- a/src/encoder.cpp
 +++ b/src/encoder.cpp
-@@ -588,11 +588,22 @@
-     e.import = coherent;
-     e.fd = open(device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
-     check(e.fd >= 0, "open Iris encoder");
-+    // VPP knows the actual RGB conversion. Pass it to firmware so SPS VUI and
-+    // container tags agree. Uploaded/decoded surfaces retain upstream defaults.
+@@ -592,11 +592,20 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
+     v4l2_capability caps{};
+     checked(e.fd, VIDIOC_QUERYCAP, &caps, "encoder QUERYCAP");
+     bool venus = !strcmp(reinterpret_cast<char *>(caps.driver), "qcom-venus");
 +    auto set_color = [&](v4l2_pix_format_mplane &f) {
 +        if (s.color_standard == VAProcColorStandardNone) return;
 +        bool bt709 = s.color_standard == VAProcColorStandardBT709;
@@ -240,7 +168,7 @@ Keep the upstream FFmpeg and recorder unchanged. Support static orientation; no 
      checked(e.fd, VIDIOC_S_FMT, &fmt, "encoder S_FMT coded format");
      check(fmt.fmt.pix_mp.pixelformat == (s.hevc ? V4L2_PIX_FMT_HEVC : V4L2_PIX_FMT_H264),
            "Iris does not support the requested encode format", VA_STATUS_ERROR_UNSUPPORTED_PROFILE);
-@@ -602,6 +613,7 @@
+@@ -606,6 +615,7 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
      fmt.fmt.pix_mp.height = height;
      fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
      fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
@@ -248,15 +176,15 @@ Keep the upstream FFmpeg and recorder unchanged. Support static orientation; no 
      checked(e.fd, VIDIOC_S_FMT, &fmt, "encoder S_FMT NV12");
      check(fmt.fmt.pix_mp.pixelformat == V4L2_PIX_FMT_NV12 && fmt.fmt.pix_mp.num_planes == 1,
            "unsupported Iris encoder input layout");
-@@ -667,6 +679,7 @@
-     fmt.fmt.pix_mp.width = width;
-     fmt.fmt.pix_mp.height = height;
+@@ -675,6 +685,7 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
      fmt.fmt.pix_mp.pixelformat = s.hevc ? V4L2_PIX_FMT_HEVC : V4L2_PIX_FMT_H264;
+     if (venus)
+         fmt.fmt.pix_mp.plane_fmt[0].sizeimage = e.stride * e.storage_height;
 +    set_color(fmt.fmt.pix_mp);
      checked(e.fd, VIDIOC_S_FMT, &fmt, "encoder refresh CAPTURE format");
-     for (unsigned type : {OUTPUT, CAPTURE}) {
-         v4l2_requestbuffers req{};
-@@ -738,6 +751,7 @@
+     if (venus)
+         checked(e.fd, VIDIOC_S_SELECTION, &crop, "encoder restore crop");
+@@ -748,6 +759,7 @@ std::shared_ptr<EncodeTask> Encoder::encode(const EncodeSettings &s, const Encod
                       s.hevc_sequence.general_tier_flag == e.settings.hevc_sequence.general_tier_flag
                 : s.sequence.level_idc == e.settings.sequence.level_idc &&
                       p.params.pic_fields.bits.entropy_coding_mode_flag == e.entropy) &&
@@ -264,29 +192,12 @@ Keep the upstream FFmpeg and recorder unchanged. Support static orientation; no 
                s.fps_num == e.settings.fps_num && s.fps_den == e.settings.fps_den &&
                s.bitrate == e.settings.bitrate && s.peak_bitrate == e.settings.peak_bitrate &&
                s.min_qp == e.settings.min_qp && s.max_qp == e.settings.max_qp,
---- a/src/vpp.cpp
-+++ b/src/vpp.cpp
-@@ -225,7 +225,7 @@
-     m.fastcv_registration = std::move(registration);
- }
- } // namespace
--Vpp::Vpp() {
-+Vpp::Vpp(int) {
-     std::lock_guard<std::mutex> lock(fastcv_mutex);
-     runtime_ = fastcv_runtime;
-     if (!runtime_) {
-@@ -281,7 +281,7 @@
-           target->height, src.fd, dst.fd);
- }
- #else
--Vpp::Vpp() {
-+Vpp::Vpp(int) {
-     throw Error(VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT, "FastCV was disabled at build time");
- }
- void Vpp::scale(const VppPicture &, const std::shared_ptr<Surface> &) {
+diff --git a/src/gles-rgb-vpp.cpp b/src/gles-rgb-vpp.cpp
+new file mode 100644
+index 0000000..563369c
 --- /dev/null
-+++ b/src/gpu-vpp.cpp
-@@ -0,0 +1,321 @@
++++ b/src/gles-rgb-vpp.cpp
+@@ -0,0 +1,324 @@
 +// SPDX-License-Identifier: MIT
 +// Fixed-orientation, SDR RGB DMA-BUF -> linear NV12 for screen recording.
 +#include "internal.hpp"
@@ -298,32 +209,13 @@ Keep the upstream FFmpeg and recorder unchanged. Support static orientation; no 
 +#include <drm_fourcc.h>
 +#include <linux/dma-heap.h>
 +#include <sys/ioctl.h>
++#include <sys/stat.h>
 +#include <unistd.h>
 +#include <fcntl.h>
 +#include <poll.h>
 +
 +namespace irisva {
-+bool vpp_supported(VAProfile p, VAEntrypoint e) {
-+    return p == VAProfileNone && e == VAEntrypointVideoProc;
-+}
-+void vpp_caps(VAProcPipelineCaps &c) {
-+    static uint32_t input[] = {VA_FOURCC_BGRA, VA_FOURCC_BGRX, VA_FOURCC_RGBA, VA_FOURCC_RGBX, VA_FOURCC_NV12};
-+    static uint32_t output[] = {VA_FOURCC_NV12};
-+    static VAProcColorStandardType colors[] = {VAProcColorStandardNone, VAProcColorStandardBT601,
-+                                              VAProcColorStandardBT709};
-+    c = {};
-+    c.input_pixel_format = input; c.num_input_pixel_formats = 5;
-+    c.rotation_flags = (1 << VA_ROTATION_NONE) | (1 << VA_ROTATION_90) |
-+                       (1 << VA_ROTATION_180) | (1 << VA_ROTATION_270);
-+    c.output_pixel_format = output; c.num_output_pixel_formats = 1;
-+    c.input_color_standards = c.output_color_standards = colors;
-+    c.num_input_color_standards = c.num_output_color_standards = 3;
-+    c.min_input_width = c.min_input_height = 2;
-+    c.min_output_width = c.min_output_height = 2;
-+    c.max_input_width = c.max_input_height = 8192;
-+    c.max_output_width = c.max_output_height = 8192;
-+}
-+VppPicture vpp_picture(const Buffer &b, const std::shared_ptr<Surface> &src, const Surface &dst) {
++VppPicture gles_rgb_picture(const Buffer &b, const std::shared_ptr<Surface> &src, const Surface &dst) {
 +    check(b.data.size() >= sizeof(VAProcPipelineParameterBuffer), "short VPP parameters",
 +          VA_STATUS_ERROR_INVALID_PARAMETER);
 +    VAProcPipelineParameterBuffer p{};
@@ -334,7 +226,7 @@ Keep the upstream FFmpeg and recorder unchanged. Support static orientation; no 
 +          !(p.pipeline_flags & ~VA_PROC_PIPELINE_FAST) &&
 +          !(p.filter_flags & ~VA_FILTER_SCALING_MASK),
 +          "GPU VPP supports fixed-orientation SDR conversion only", VA_STATUS_ERROR_UNIMPLEMENTED);
-+    check(src && src->memory && (rgb_format(src->fourcc) || src->fourcc == VA_FOURCC_NV12) && dst.fourcc == VA_FOURCC_NV12 &&
++    check(src && src->memory && (is_rgb(src->fourcc) || src->fourcc == VA_FOURCC_NV12) && dst.fourcc == VA_FOURCC_NV12 &&
 +          src.get() != &dst, "GPU VPP requires RGB/NV12 input and distinct NV12 output",
 +          VA_STATUS_ERROR_INVALID_SURFACE);
 +    check(!p.output_region || (!p.output_region->x && !p.output_region->y &&
@@ -350,13 +242,30 @@ Keep the upstream FFmpeg and recorder unchanged. Support static orientation; no 
 +          uint64_t(r.x) + r.width <= src->width && uint64_t(r.y) + r.height <= src->height &&
 +          dst.width && dst.height && !(dst.width & 1) && !(dst.height & 1),
 +          "invalid GPU VPP rectangle", VA_STATUS_ERROR_INVALID_PARAMETER);
++    bool explicit_color = p.output_color_standard == VAProcColorStandardExplicit;
 +    check(p.output_color_standard == VAProcColorStandardNone ||
 +          p.output_color_standard == VAProcColorStandardBT601 ||
-+          p.output_color_standard == VAProcColorStandardBT709,
++          p.output_color_standard == VAProcColorStandardBT709 || explicit_color,
 +          "unsupported GPU VPP output color standard", VA_STATUS_ERROR_UNIMPLEMENTED);
-+    check(!rgb_format(src->fourcc) || p.input_color_properties.color_range != VA_SOURCE_RANGE_REDUCED,
++    const auto &in = p.input_color_properties;
++    const auto &out = p.output_color_properties;
++    auto sdr_transfer = [](unsigned value) {
++        return value == 0 || value == 1 || value == 2 || value == 4 || value == 5 ||
++               value == 6 || value == 13;
++    };
++    auto sdr_primaries = [](unsigned value) {
++        return value == 0 || value == 1 || value == 2 || value == 5 || value == 6;
++    };
++    check(sdr_transfer(in.transfer_characteristics) && sdr_transfer(out.transfer_characteristics) &&
++          sdr_primaries(in.colour_primaries) && sdr_primaries(out.colour_primaries),
++          "RGB VPP supports SDR BT.601/BT.709 only", VA_STATUS_ERROR_UNIMPLEMENTED);
++    unsigned matrix = out.matrix_coefficients;
++    check(!explicit_color || matrix == 0 || matrix == 1 || matrix == 2 || matrix == 5 || matrix == 6,
++          "unsupported explicit RGB VPP output matrix", VA_STATUS_ERROR_UNIMPLEMENTED);
++    check(!is_rgb(src->fourcc) || in.color_range != VA_SOURCE_RANGE_REDUCED,
 +          "GPU VPP requires full-range RGB", VA_STATUS_ERROR_UNIMPLEMENTED);
-+    result.bt709 = p.output_color_standard != VAProcColorStandardBT601;
++    result.bt709 = explicit_color ? (matrix != 5 && matrix != 6)
++                                 : p.output_color_standard != VAProcColorStandardBT601;
 +    result.full_range = p.output_color_properties.color_range == VA_SOURCE_RANGE_FULL;
 +    if (src->fourcc == VA_FOURCC_NV12) {
 +        bool swap = result.rotation == VA_ROTATION_90 || result.rotation == VA_ROTATION_270;
@@ -547,7 +456,7 @@ Keep the upstream FFmpeg and recorder unchanged. Support static orientation; no 
 +        wait_surface_access(s, POLLIN); wait_surface_access(d, POLLOUT);
 +        bool nv12 = s.fourcc == VA_FOURCC_NV12;
 +        Image input(*this, s, nv12 ? (s.width+3)/4 : s.width, s.height,
-+                    nv12 ? DRM_FORMAT_ABGR8888 : s.drm_fourcc, s.data_offset, 0, !nv12);
++                    nv12 ? DRM_FORMAT_ABGR8888 : rgb_drm_format(s.fourcc), s.data_offset, 0, !nv12);
 +        std::unique_ptr<Image> input_uv;
 +        if (nv12) input_uv = std::make_unique<Image>(*this, s, (s.width+3)/4, s.height/2,
 +            DRM_FORMAT_ABGR8888, s.data_offset+s.stride*s.storage_height, 0, false);
@@ -595,12 +504,17 @@ Keep the upstream FFmpeg and recorder unchanged. Support static orientation; no 
 +    return m;
 +}
 +}
-+Vpp::Vpp(int fd) : runtime_(std::make_shared<Engine>(fd)) {}
-+void Vpp::scale(const VppPicture &p, const std::shared_ptr<Surface> &dst) {
++void gles_rgb_process(std::shared_ptr<void> &runtime, int render_fd, const VppPicture &p, const std::shared_ptr<Surface> &dst) {
++    if (!runtime) runtime = std::make_shared<Engine>(render_fd);
 +    if (!dst->memory) dst->memory = allocate(*dst);
 +    check(dst->memory->origin == MemoryOrigin::DmaHeap && dst->memory != p.source->memory,
 +          "GPU VPP needs independent DMA heap output", VA_STATUS_ERROR_INVALID_SURFACE);
-+    std::static_pointer_cast<Engine>(runtime_)->process(p, *dst);
++    struct stat source_stat{}, target_stat{};
++    check(fstat(p.source->memory->fd, &source_stat) == 0 &&
++          fstat(dst->memory->fd, &target_stat) == 0 &&
++          (source_stat.st_dev != target_stat.st_dev || source_stat.st_ino != target_stat.st_ino),
++          "RGB VPP source and output DMA-BUF alias", VA_STATUS_ERROR_INVALID_SURFACE);
++    std::static_pointer_cast<Engine>(runtime)->process(p, *dst);
 +    // Retain the conversion matrix/range across a separate transpose pass.
 +    dst->color_standard = p.source->fourcc == VA_FOURCC_NV12 ? p.source->color_standard :
 +        p.bt709 ? VAProcColorStandardBT709 : VAProcColorStandardBT601;
@@ -608,3 +522,200 @@ Keep the upstream FFmpeg and recorder unchanged. Support static orientation; no 
 +    dst->status = VA_STATUS_SUCCESS;
 +}
 +} // namespace irisva
+diff --git a/src/internal.hpp b/src/internal.hpp
+index 1744f55..5396d41 100644
+--- a/src/internal.hpp
++++ b/src/internal.hpp
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: MIT
+ #pragma once
+ #include <va/va.h>
++#include <drm_fourcc.h>
+ #include <va/va_backend.h>
+ #include <va/va_backend_vpp.h>
+ #include <va/va_drmcommon.h>
+@@ -30,7 +31,17 @@ extern "C" int irisva_msm_allocate_coherent(int drm_fd, uint64_t size);
+ 
+ namespace irisva {
+ inline bool is_rgb(unsigned fourcc) {
+-    return fourcc == VA_FOURCC_BGRA || fourcc == VA_FOURCC_RGBA;
++    return fourcc == VA_FOURCC_BGRA || fourcc == VA_FOURCC_BGRX ||
++           fourcc == VA_FOURCC_RGBA || fourcc == VA_FOURCC_RGBX;
++}
++inline unsigned rgb_drm_format(unsigned fourcc) {
++    switch (fourcc) {
++    case VA_FOURCC_BGRA: return DRM_FORMAT_ARGB8888;
++    case VA_FOURCC_BGRX: return DRM_FORMAT_XRGB8888;
++    case VA_FOURCC_RGBA: return DRM_FORMAT_ABGR8888;
++    case VA_FOURCC_RGBX: return DRM_FORMAT_XBGR8888;
++    default: return 0;
++    }
+ }
+ struct Error : std::runtime_error {
+     VAStatus status;
+@@ -88,6 +99,8 @@ struct Surface {
+     std::shared_ptr<EncodeTask> encode_task;
+     unsigned width, height, fourcc = VA_FOURCC_NV12;
+     unsigned allocation_count = 1;
++    VAProcColorStandardType color_standard = VAProcColorStandardNone;
++    bool full_range = false;
+     std::shared_ptr<Memory> memory;
+     // An export before the first picture may be cached by the consumer for
+     // this surface's whole lifetime (Chromium's NativePixmap frame pool).
+@@ -256,6 +269,8 @@ struct EncodeSettings {
+     unsigned rate_control = VA_RC_CQP;
+     unsigned bitrate = 0, peak_bitrate = 0, min_qp = 1, max_qp = 51;
+     unsigned fps_num = 30, fps_den = 1;
++    VAProcColorStandardType color_standard = VAProcColorStandardNone;
++    bool full_range = false;
+ };
+ void render_encode_buffer(EncodeSettings &settings, EncodePicture &picture, const Buffer &buffer);
+ class Encoder {
+@@ -290,7 +305,11 @@ struct VppPicture {
+     unsigned rotation = VA_ROTATION_NONE;
+     bool tone_mapping = false;
+     float source_peak = 1000.0f;
++    bool bt709 = true, full_range = false;
+ };
++VppPicture gles_rgb_picture(const Buffer &, const std::shared_ptr<Surface> &, const Surface &);
++void gles_rgb_process(std::shared_ptr<void> &, int render_fd, const VppPicture &,
++                      const std::shared_ptr<Surface> &);
+ class Vpp {
+     struct Impl;
+     std::unique_ptr<Impl> impl_;
+diff --git a/src/vpp.cpp b/src/vpp.cpp
+index 2feff2c..7905e02 100644
+--- a/src/vpp.cpp
++++ b/src/vpp.cpp
+@@ -82,13 +82,14 @@ void vpp_caps(VAProcPipelineCaps &caps, bool tone_mapping) {
+     static VAProcColorStandardType colors[] = {VAProcColorStandardNone, VAProcColorStandardBT601,
+                                                VAProcColorStandardBT709, VAProcColorStandardBT2020,
+                                                VAProcColorStandardExplicit};
+-    static uint32_t formats[] = {VA_FOURCC_NV12, VA_FOURCC_P010, VA_FOURCC_BGRA, VA_FOURCC_RGBA};
++    static uint32_t formats[] = {VA_FOURCC_NV12, VA_FOURCC_P010, VA_FOURCC_BGRA, VA_FOURCC_RGBA,
++                                 VA_FOURCC_BGRX, VA_FOURCC_RGBX};
+     caps = {};
+     caps.input_color_standards = caps.output_color_standards = colors;
+     caps.num_input_color_standards = caps.num_output_color_standards =
+         sizeof(colors) / sizeof(colors[0]);
+     caps.input_pixel_format = caps.output_pixel_format = formats;
+-    caps.num_input_pixel_formats = 4;
++    caps.num_input_pixel_formats = sizeof(formats) / sizeof(formats[0]);
+     caps.num_output_pixel_formats = 2;
+     caps.blend_flags = VA_BLEND_GLOBAL_ALPHA | VA_BLEND_PREMULTIPLIED_ALPHA;
+     if (tone_mapping) {
+@@ -121,6 +122,10 @@ VppPicture vpp_picture(const Buffer &buffer, const std::shared_ptr<Surface> &sou
+                        const Surface &target, const Buffer *filter, bool overlay) {
+     VAProcPipelineParameterBuffer p{};
+     std::memcpy(&p, buffer.data.data(), sizeof(p));
++    if (source && is_rgb(source->fourcc) && !overlay) {
++        check(!filter, "RGB VPP does not support HDR filters", VA_STATUS_ERROR_UNIMPLEMENTED);
++        return gles_rgb_picture(buffer, source, target);
++    }
+     check(!p.num_forward_references && !p.num_backward_references && !p.mirror_state &&
+               !p.num_additional_outputs && !(p.pipeline_flags & ~VA_PROC_PIPELINE_FAST) &&
+               !(p.filter_flags & ~VA_FILTER_SCALING_MASK) && !p.input_surface_flag &&
+@@ -170,7 +175,9 @@ VppPicture vpp_picture(const Buffer &buffer, const std::shared_ptr<Surface> &sou
+     if (p.blend_state)
+         picture.blend = *p.blend_state;
+     if (overlay) {
+-        check(!filter && !p.rotation_state && is_rgb(source->fourcc) && source.get() != &target,
++        check(!filter && !p.rotation_state &&
++                  (source->fourcc == VA_FOURCC_BGRA || source->fourcc == VA_FOURCC_RGBA) &&
++                  source.get() != &target,
+               "overlay requires a distinct BGRA/RGBA surface without filters or rotation",
+               VA_STATUS_ERROR_UNIMPLEMENTED);
+         check(!(picture.blend.flags & ~(VA_BLEND_GLOBAL_ALPHA | VA_BLEND_PREMULTIPLIED_ALPHA)) &&
+@@ -314,6 +321,7 @@ cdsp_vpp_frame import_vpp_frame(Memory &memory, const Surface &surface,
+ } // namespace
+ struct Vpp::Impl {
+     int render_fd;
++    std::shared_ptr<void> rgb_runtime;
+     std::shared_ptr<Surface> intermediate;
+ #ifdef HAVE_VULKAN_VPP
+     bool vulkan_probed = false;
+@@ -399,6 +407,15 @@ bool Vpp::tone_mapping_supported() {
+ }
+ void Vpp::process_single(const VppPicture &picture, const std::shared_ptr<Surface> &target) {
+     auto source = picture.source;
++    if (source && is_rgb(source->fourcc)) {
++        gles_rgb_process(impl_->rgb_runtime, impl_->render_fd, picture, target);
++        return;
++    }
++    // Preserve the RGB conversion VUI through an independent YUV transpose.
++    if (source) {
++        target->color_standard = source->color_standard;
++        target->full_range = source->full_range;
++    }
+     auto region = picture.region;
+     check(source && source->memory, "VPP source has no storage", VA_STATUS_ERROR_INVALID_SURFACE);
+     if (!target->memory)
+@@ -544,6 +561,8 @@ OverlayParams overlay_parameters(const VppPicture &layer, const Surface &base,
+ }
+ } // namespace
+ void Vpp::process(const std::vector<VppPicture> &pictures, const std::shared_ptr<Surface> &target) {
++    check(pictures.size() <= 1 || !is_rgb(pictures.front().source->fourcc),
++          "RGB base VPP does not support overlays", VA_STATUS_ERROR_UNIMPLEMENTED);
+     check(!pictures.empty(), "missing VPP base layer", VA_STATUS_ERROR_INVALID_PARAMETER);
+     if (!target->memory)
+         target->memory = allocate_vpp_memory(impl_->render_fd, *target);
+diff --git a/tests/rgb-vpp-parameters.cpp b/tests/rgb-vpp-parameters.cpp
+new file mode 100644
+index 0000000..40ea6e4
+--- /dev/null
++++ b/tests/rgb-vpp-parameters.cpp
+@@ -0,0 +1,54 @@
++// SPDX-License-Identifier: MIT
++#include "internal.hpp"
++#include <cassert>
++using namespace irisva;
++int main() {
++    auto source = std::make_shared<Surface>();
++    source->width = source->height = 64;
++    source->fourcc = VA_FOURCC_BGRA;
++    source->memory = std::make_shared<Memory>();
++    Surface target;
++    target.width = target.height = 64;
++    target.fourcc = VA_FOURCC_NV12;
++    VAProcPipelineParameterBuffer p{};
++    p.output_color_standard = VAProcColorStandardExplicit;
++    auto parse = [&] {
++        Buffer b{};
++        b.data.resize(sizeof(p));
++        std::memcpy(b.data.data(), &p, sizeof(p));
++        return gles_rgb_picture(b, source, target);
++    };
++    auto reject = [&] {
++        try { parse(); assert(false); }
++        catch (const Error &e) { assert(e.status == VA_STATUS_ERROR_UNIMPLEMENTED); }
++    };
++    for (unsigned matrix : {0u, 1u, 2u, 5u, 6u}) {
++        p.output_color_properties.matrix_coefficients = matrix;
++        assert(parse().bt709 == (matrix != 5 && matrix != 6));
++    }
++    p.output_color_properties.matrix_coefficients = 1;
++    p.output_color_properties.color_range = VA_SOURCE_RANGE_FULL;
++    assert(parse().full_range);
++    p.output_color_properties.color_range = VA_SOURCE_RANGE_REDUCED;
++    assert(!parse().full_range);
++    for (unsigned matrix : {9u, 10u}) {
++        p.output_color_properties.matrix_coefficients = matrix;
++        reject();
++    }
++    p.output_color_properties.matrix_coefficients = 1;
++    p.output_color_properties.colour_primaries = 9;
++    reject();
++    p.output_color_properties.colour_primaries = 1;
++    for (unsigned hdr : {16u, 18u}) {
++        p.input_color_properties.transfer_characteristics = hdr;
++        reject();
++        p.input_color_properties.transfer_characteristics = 0;
++        p.output_color_properties.transfer_characteristics = hdr;
++        reject();
++        p.output_color_properties.transfer_characteristics = 0;
++    }
++    p.output_color_standard = VAProcColorStandardBT601;
++    assert(!parse().bt709);
++    p.output_color_standard = VAProcColorStandardBT709;
++    assert(parse().bt709);
++}

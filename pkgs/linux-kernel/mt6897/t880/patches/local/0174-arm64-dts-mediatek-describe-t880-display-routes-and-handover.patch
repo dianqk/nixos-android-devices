@@ -1,0 +1,1261 @@
+From 99675b8dddf12086b9ea1f5bea3463cc8457885e Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] arm64: dts: mediatek: describe T880 display routes and
+ handover
+
+Describe T880 dual-pipe display routes, IOMMU/GCE resources and the
+firmware handover/shared scanout reservation.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T14:13:47+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T04:46:11+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T07:23:43+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T08:40:58+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T08:47:37+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T10:27:55+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T11:30:42+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T13:01:03+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T14:18:03+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T17:48:34+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-18T19:51:38+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-19T20:51:18+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T02:41:23+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T03:13:51+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T03:37:06+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T17:04:08+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-05T13:24:15+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Link: https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_drm_crtc.c#L8990
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/soc/mediatek/mtk-scpsys-mt6897.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_drm_crtc.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/misc/mediatek/cmdq/mailbox/cmdq-util.c
+---
+ .../mediatek/mt6897-alldocube-t880-cmdq.dtsi  |   28 +
+ .../mt6897-alldocube-t880-display-va.dtsi     |   53 +
+ .../mt6897-alldocube-t880-mtkdrm.dtsi         | 1021 +++++++++++++++++
+ .../mt6897-alldocube-t880-ovl-iommus.dtsi     |   54 +
+ 4 files changed, 1156 insertions(+)
+ create mode 100644 arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-cmdq.dtsi
+ create mode 100644 arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-display-va.dtsi
+ create mode 100644 arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-mtkdrm.dtsi
+ create mode 100644 arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-ovl-iommus.dtsi
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-cmdq.dtsi b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-cmdq.dtsi
+new file mode 100644
+index 0000000000..0d4db7847e
+--- /dev/null
++++ b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-cmdq.dtsi
+@@ -0,0 +1,28 @@
++// SPDX-License-Identifier: (GPL-2.0 OR MIT)
++/*
++ * Alldocube iPlay 80 mini Ultra (T880): mediatek-drm applies plane and
++ * size updates through the GCE-D (CMDQ) in the vertical blank. Without
++ * this file mediatek-drm writes the registers from the vblank interrupt.
++ *
++ * CRTC 0 (both pipes) is created by DISPSYS0, so its channel is the first
++ * "mboxes" entry of dispsys0 and its event the first "mediatek,gce-events"
++ * entry of the DISPSYS0 MuteX node. Thread 0 at priority 4 is the thread
++ * Android gives to the primary display configuration (CLIENT_CFG0).
++ * In video mode Android waits for the DSI0 frame done ("disp_dsi0_eof",
++ * event 451) before it applies the primary display configuration.
++ * The OVLSYS blocks have no GCE subsys: their writes go by address.
++ */
++
++#include <dt-bindings/gce/mediatek,mt6897-gce.h>
++
++&gce {
++	status = "okay";
++};
++
++&dispsys0 {
++	mboxes = <&gce 0 CMDQ_THR_PRIO_4>;
++};
++
++&dispsys0_mutex {
++	mediatek,gce-events = <CMDQ_EVENT_DISPSYS_DISP_DSI0_FRAME_DONE>;
++};
+diff --git a/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-display-va.dtsi b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-display-va.dtsi
+new file mode 100644
+index 0000000000..af203e0eb7
+--- /dev/null
++++ b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-display-va.dtsi
+@@ -0,0 +1,53 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++#include <dt-bindings/memory/mediatek,mt6897-memory-port.h>
++#include <dt-bindings/gce/mediatek,mt6897-gce.h>
++
++&{/reserved-memory} {
++	cmdq_reserved: lk-reserved@33fe00000 {
++		reg = <0x3 0x3fe00000 0x0 0x100000>;
++		no-map;
++	};
++};
++
++&{/soc} {
++	display_va: display-va-bootstrap@14405000 {
++		compatible = "mediatek,mt6897-display-va-bootstrap";
++		reg = <0x0 0x14405000 0x0 0x1000>,
++		      <0x0 0x14605000 0x0 0x1000>,
++		      <0x0 0x14015000 0x0 0x1000>,
++		      <0x0 0x14215000 0x0 0x1000>;
++		reg-names = "ovl3", "ovl7", "postmask0", "postmask1";
++		mboxes = <&gce 2 CMDQ_THR_PRIO_4>;
++		power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_MM_INFRA>;
++		clocks = <&mminfra_config CLK_MMINFRA_GCE_D>,
++			 <&mminfra_config CLK_MMINFRA_GCE_26M>,
++			 <&ovlsys0_config CLK_OVLSYS0_OVL0_2L>,
++			 <&ovlsys0_config CLK_OVLSYS0_OVL1_2L>,
++			 <&ovlsys0_config CLK_OVLSYS0_OVL2_2L>,
++			 <&ovlsys0_config CLK_OVLSYS0_OVL3_2L>,
++			 <&ovlsys1_config CLK_OVLSYS1_OVL0_2L>,
++			 <&ovlsys1_config CLK_OVLSYS1_OVL1_2L>,
++			 <&ovlsys1_config CLK_OVLSYS1_OVL2_2L>,
++			 <&ovlsys1_config CLK_OVLSYS1_OVL3_2L>,
++			 <&dispsys0_config CLK_DISPSYS0_DISP_POSTMASK0>,
++			 <&dispsys1_config CLK_DISPSYS1_DISP_POSTMASK0>;
++		clock-names = "gce", "gce-timer", "ovl0", "ovl1", "ovl2", "ovl3",
++			      "ovl4", "ovl5", "ovl6", "ovl7", "postmask0", "postmask1";
++		memory-region = <&lk_framebuffer>, <&cmdq_reserved>;
++		memory-region-names = "framebuffer", "cmdq";
++		mediatek,ovls = <&ovlsys0_ovl0>, <&ovlsys0_ovl1>, <&ovlsys0_ovl2>,
++			       <&ovlsys1_ovl0>, <&ovlsys1_ovl1>, <&ovlsys1_ovl2>;
++		mediatek,suppliers = <&disp_iommu>, <&mdp_iommu>,
++			<&smi_larb0>, <&smi_larb1>, <&smi_larb20>, <&smi_larb21>,
++			<&smi_larb32>, <&smi_larb33>,
++			<&smi_disp_common>, <&smi_mdp_common>,
++			<&smi_disp0_dram>, <&smi_disp1_dram>;
++	};
++};
++
++&dispsys0 { mediatek,display-va-bootstrap = <&display_va>; };
++&dispsys1 { mediatek,display-va-bootstrap = <&display_va>; };
++&ovlsys0 { mediatek,display-va-bootstrap = <&display_va>; };
++&ovlsys1 { mediatek,display-va-bootstrap = <&display_va>; };
++
++#include "mt6897-alldocube-t880-ovl-iommus.dtsi"
+diff --git a/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-mtkdrm.dtsi b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-mtkdrm.dtsi
+new file mode 100644
+index 0000000000..a6bef2edb8
+--- /dev/null
++++ b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-mtkdrm.dtsi
+@@ -0,0 +1,1021 @@
++// SPDX-License-Identifier: (GPL-2.0 OR MIT)
++/*
++ * Alldocube iPlay 80 mini Ultra (T880): mediatek-drm on both display pipes
++ * simple-framebuffer stays as the boot console; mediatek-drm takes it over
++ * through the aperture helpers.
++ *
++ * Paths (endpoint number = CRTC path):
++ *  0  OVLSYS0 [OVL0_2L, OVL1_2L, OVL2_2L, DLO relay 3]
++ *     -> DISPSYS0 [DLI 0, (PQ bypass), DSC core 0, DSI0]
++ *  1  OVLSYS1 [OVL4_2L, OVL5_2L, OVL6_2L, DLO relay 3]
++ *     -> DISPSYS1 [DLI 0, (PQ bypass), DLO 0]
++ *     -> DISPSYS0 [DLI 4, DSC core 1, DLO 1]
++ *  2  DISPSYS1 [DLI 5, DSI1]
++ *  3  OVLSYS0 [OVL3_2L, DLO relay 5]
++ *     -> DISPSYS0 [DLI 2, (PQ bypass), DP_INTF0] -> DP TX (Type-C)
++ * Paths 1 and 2 are shadow paths of CRTC 0: OVL4 is OVL0's twin, DSI1 is
++ * DSI0's dual-DSI slave. Path 3 is CRTC 1, DisplayPort.
++ *
++ * Without IOMMU: the larbs stay in the bypass LK leaves, so the OVLs scan
++ * physical addresses (34-bit).
++ */
++
++#include <dt-bindings/phy/phy.h>
++#include <dt-bindings/power/mediatek,mt6897-power.h>
++
++/ {
++	aliases {
++		ovl-2l0 = &ovlsys0_ovl0;
++		ovl-2l1 = &ovlsys0_ovl1;
++		ovl-2l2 = &ovlsys0_ovl2;
++		ovl-2l4 = &ovlsys1_ovl0;
++		ovl-2l5 = &ovlsys1_ovl1;
++		ovl-2l6 = &ovlsys1_ovl2;
++		dsc0 = &disp_dsc0;
++		dsc1 = &disp_dsc1;
++		dsi0 = &dsi0;
++		dsi1 = &dsi1;
++		ovl-2l3 = &ovlsys0_ovl3;
++		dp-intf0 = &dp_intf0;
++	};
++
++	/* Panel supplies: GPIO-switched, on as LK leaves them */
++	panel_vddio: regulator-panel-vddio {
++		compatible = "regulator-fixed";
++		regulator-name = "panel_vddio";
++		regulator-min-microvolt = <1800000>;
++		regulator-max-microvolt = <1800000>;
++		gpio = <&pio 49 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		regulator-boot-on;
++	};
++
++	panel_vsp: regulator-panel-vsp {
++		compatible = "regulator-fixed";
++		regulator-name = "panel_vsp";
++		regulator-min-microvolt = <5700000>;
++		regulator-max-microvolt = <5700000>;
++		gpio = <&pio 25 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		regulator-boot-on;
++	};
++
++	panel_vsn: regulator-panel-vsn {
++		compatible = "regulator-fixed";
++		regulator-name = "panel_vsn";
++		regulator-min-microvolt = <5700000>;
++		regulator-max-microvolt = <5700000>;
++		gpio = <&pio 26 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		regulator-boot-on;
++	};
++};
++
++&{/soc} {
++	/* Hardware voter (infra HW_CCF): MM power domains and HWV gates */
++	hwv: syscon@10320000 {
++		compatible = "mediatek,mt6897-hwv", "syscon", "simple-mfd";
++		reg = <0x0 0x10320000 0x0 0x2000>;
++
++		hwv_pd: power-controller {
++			compatible = "mediatek,mt6897-hwv-power-controller";
++			#address-cells = <1>;
++			#size-cells = <0>;
++			#power-domain-cells = <1>;
++
++			mm_infra_pd: power-domain@MT6897_POWER_DOMAIN_HWV_MM_INFRA {
++				reg = <MT6897_POWER_DOMAIN_HWV_MM_INFRA>;
++				#address-cells = <1>;
++				#size-cells = <0>;
++				#power-domain-cells = <1>;
++
++				/* Shipping MT6897 scpsys: MM_INFRA -> VDE0 -> VDE1. */
++				power-domain@MT6897_POWER_DOMAIN_HWV_VDE0 {
++					reg = <MT6897_POWER_DOMAIN_HWV_VDE0>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++					#power-domain-cells = <1>;
++
++					power-domain@MT6897_POWER_DOMAIN_HWV_VDE1 {
++						reg = <MT6897_POWER_DOMAIN_HWV_VDE1>;
++						#power-domain-cells = <0>;
++					};
++				};
++
++				dis0_pd: power-domain@MT6897_POWER_DOMAIN_HWV_DIS0 {
++					reg = <MT6897_POWER_DOMAIN_HWV_DIS0>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++					#power-domain-cells = <1>;
++
++					power-domain@MT6897_POWER_DOMAIN_HWV_OVL0 {
++						reg = <MT6897_POWER_DOMAIN_HWV_OVL0>;
++						#power-domain-cells = <0>;
++					};
++				};
++
++				dis1_pd: power-domain@MT6897_POWER_DOMAIN_HWV_DIS1 {
++					reg = <MT6897_POWER_DOMAIN_HWV_DIS1>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++					#power-domain-cells = <1>;
++
++					power-domain@MT6897_POWER_DOMAIN_HWV_OVL1 {
++						reg = <MT6897_POWER_DOMAIN_HWV_OVL1>;
++						#power-domain-cells = <0>;
++					};
++				};
++			};
++		};
++	};
++
++	mipi_tx0: dsi-phy@11e50000 {
++		compatible = "mediatek,mt6897-mipi-tx", "mediatek,mt8196-mipi-tx";
++		reg = <0x0 0x11e50000 0x0 0x1000>;
++		clocks = <&clk26m>;
++		clock-output-names = "mipi_tx0_pll";
++		#clock-cells = <0>;
++		#phy-cells = <0>;
++		phy-type = <PHY_TYPE_CPHY>;
++	};
++
++	mipi_tx1: dsi-phy@11e60000 {
++		compatible = "mediatek,mt6897-mipi-tx", "mediatek,mt8196-mipi-tx";
++		reg = <0x0 0x11e60000 0x0 0x1000>;
++		clocks = <&clk26m>;
++		clock-output-names = "mipi_tx1_pll";
++		#clock-cells = <0>;
++		#phy-cells = <0>;
++		phy-type = <PHY_TYPE_CPHY>;
++	};
++
++	/* ---------------- OVLSYS0: leader of path 0 ---------------- */
++	ovlsys0: syscon@14400000 {
++		compatible = "mediatek,mt6897-ovlsys0", "syscon";
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++		reg = <0x0 0x14400000 0x0 0x1000>;
++		power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_OVL0>;
++
++		ports {
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			port@0 {
++				reg = <0>;
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				ovlsys0_root0: endpoint@0 {
++					reg = <0>;
++					remote-endpoint = <&ovl0_in>;
++				};
++
++				ovlsys0_root3: endpoint@3 {
++					reg = <3>;
++					remote-endpoint = <&ovl3_in>;
++				};
++			};
++		};
++
++		ovlsys0_mutex: mutex@14401000 {
++			compatible = "mediatek,mt6897-ovlsys-mutex";
++			reg = <0x0 0x14401000 0x0 0x1000>;
++			interrupts = <GIC_SPI 354 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&ovlsys0_config CLK_OVLSYS0_DISP_MUTEX0>;
++			power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_OVL0>;
++			#trigger-source-cells = <1>;
++		};
++
++		ovlsys0_ovl0: ovl@14402000 {
++			compatible = "mediatek,mt6897-disp-ovl-2l";
++			reg = <0x0 0x14402000 0x0 0x1000>;
++			interrupts = <GIC_SPI 387 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&ovlsys0_config CLK_OVLSYS0_OVL0_2L>;
++			power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_OVL0>;
++			trigger-sources = <&ovlsys0_mutex 0>;
++			mediatek,dual-pipe-twin = <&ovlsys1_ovl0>;
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					ovl0_in: endpoint@0 {
++						reg = <0>;
++						remote-endpoint = <&ovlsys0_root0>;
++					};
++				};
++
++				port@1 {
++					reg = <1>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					ovl0_out: endpoint@0 {
++						reg = <0>;
++						remote-endpoint = <&ovl1_in>;
++					};
++				};
++			};
++		};
++
++		ovlsys0_ovl1: ovl@14403000 {
++			compatible = "mediatek,mt6897-disp-ovl-2l";
++			reg = <0x0 0x14403000 0x0 0x1000>;
++			interrupts = <GIC_SPI 388 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&ovlsys0_config CLK_OVLSYS0_OVL1_2L>;
++			power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_OVL0>;
++			trigger-sources = <&ovlsys0_mutex 1>;
++			mediatek,dual-pipe-twin = <&ovlsys1_ovl1>;
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					ovl1_in: endpoint@0 {
++						reg = <0>;
++						remote-endpoint = <&ovl0_out>;
++					};
++				};
++
++				port@1 {
++					reg = <1>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					ovl1_out: endpoint@0 {
++						reg = <0>;
++						remote-endpoint = <&ovl2_in>;
++					};
++				};
++			};
++		};
++
++		ovlsys0_ovl2: ovl@14404000 {
++			compatible = "mediatek,mt6897-disp-ovl-2l";
++			reg = <0x0 0x14404000 0x0 0x1000>;
++			interrupts = <GIC_SPI 389 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&ovlsys0_config CLK_OVLSYS0_OVL2_2L>;
++			power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_OVL0>;
++			trigger-sources = <&ovlsys0_mutex 2>;
++			mediatek,dual-pipe-twin = <&ovlsys1_ovl2>;
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					ovl2_in: endpoint@0 {
++						reg = <0>;
++						remote-endpoint = <&ovl1_out>;
++					};
++				};
++
++				port@1 {
++					reg = <1>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					ovl2_out: endpoint@0 {
++						reg = <0>;
++						remote-endpoint = <&ovlsys0_dl_relay_out0>;
++					};
++				};
++			};
++		};
++
++		/* DisplayPort CRTC; no dual-pipe twin */
++		ovlsys0_ovl3: ovl@14405000 {
++			compatible = "mediatek,mt6897-disp-ovl-2l";
++			reg = <0x0 0x14405000 0x0 0x1000>;
++			interrupts = <GIC_SPI 390 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&ovlsys0_config CLK_OVLSYS0_OVL3_2L>;
++			power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_OVL0>;
++			trigger-sources = <&ovlsys0_mutex 3>;
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					ovl3_in: endpoint@3 {
++						reg = <3>;
++						remote-endpoint = <&ovlsys0_root3>;
++					};
++				};
++
++				port@1 {
++					reg = <1>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					ovl3_out: endpoint@3 {
++						reg = <3>;
++						remote-endpoint = <&ovlsys0_dl_relay_out3>;
++					};
++				};
++			};
++		};
++
++		direct-link {
++			compatible = "mediatek,mt6897-ovl-direct-link";
++			clocks = <&ovlsys0_config CLK_OVLSYS0_CONFIG>;
++			/* DLI 0 and DLO 0 MuteX modules; the others follow */
++			trigger-sources = <&ovlsys0_mutex 9>, <&ovlsys0_mutex 12>;
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++				};
++
++				port@1 {
++					reg = <1>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					ovlsys0_dl_out0: endpoint@0 {
++						reg = <0>;
++						mediatek,port-id = <3>;
++						clocks = <&ovlsys0_config CLK_OVLSYS0_DISP_DLO_ASYNC3>;
++						remote-endpoint = <&dispsys0_dl_in0>;
++					};
++
++					ovlsys0_dl_out3: endpoint@3 {
++						reg = <3>;
++						mediatek,port-id = <5>;
++						clocks = <&ovlsys0_config CLK_OVLSYS0_DISP_DLO_ASYNC5>;
++						remote-endpoint = <&dispsys0_dl_in3>;
++					};
++				};
++
++				port@3 {
++					reg = <3>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					ovlsys0_dl_relay_out0: endpoint@0 {
++						reg = <0>;
++						remote-endpoint = <&ovl2_out>;
++					};
++
++					ovlsys0_dl_relay_out3: endpoint@3 {
++						reg = <3>;
++						remote-endpoint = <&ovl3_out>;
++					};
++				};
++			};
++		};
++	};
++
++	/* ---------------- OVLSYS1: leader of path 1 ---------------- */
++	ovlsys1: syscon@14600000 {
++		compatible = "mediatek,mt6897-ovlsys1", "syscon";
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++		reg = <0x0 0x14600000 0x0 0x1000>;
++		power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_OVL1>;
++
++		ports {
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			port@0 {
++				reg = <0>;
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				ovlsys1_root1: endpoint@1 {
++					reg = <1>;
++					remote-endpoint = <&ovl4_in>;
++				};
++			};
++		};
++
++		ovlsys1_mutex: mutex@14601000 {
++			compatible = "mediatek,mt6897-ovlsys-mutex";
++			reg = <0x0 0x14601000 0x0 0x1000>;
++			interrupts = <GIC_SPI 386 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&ovlsys1_config CLK_OVLSYS1_DISP_MUTEX0>;
++			power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_OVL1>;
++			#trigger-source-cells = <1>;
++		};
++
++		ovlsys1_ovl0: ovl@14602000 {
++			compatible = "mediatek,mt6897-disp-ovl-2l";
++			reg = <0x0 0x14602000 0x0 0x1000>;
++			interrupts = <GIC_SPI 431 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&ovlsys1_config CLK_OVLSYS1_OVL0_2L>;
++			power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_OVL1>;
++			trigger-sources = <&ovlsys1_mutex 0>;
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					ovl4_in: endpoint@1 {
++						reg = <1>;
++						remote-endpoint = <&ovlsys1_root1>;
++					};
++				};
++
++				port@1 {
++					reg = <1>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					ovl4_out: endpoint@1 {
++						reg = <1>;
++						remote-endpoint = <&ovl5_in>;
++					};
++				};
++			};
++		};
++
++		ovlsys1_ovl1: ovl@14603000 {
++			compatible = "mediatek,mt6897-disp-ovl-2l";
++			reg = <0x0 0x14603000 0x0 0x1000>;
++			interrupts = <GIC_SPI 432 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&ovlsys1_config CLK_OVLSYS1_OVL1_2L>;
++			power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_OVL1>;
++			trigger-sources = <&ovlsys1_mutex 1>;
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					ovl5_in: endpoint@1 {
++						reg = <1>;
++						remote-endpoint = <&ovl4_out>;
++					};
++				};
++
++				port@1 {
++					reg = <1>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					ovl5_out: endpoint@1 {
++						reg = <1>;
++						remote-endpoint = <&ovl6_in>;
++					};
++				};
++			};
++		};
++
++		ovlsys1_ovl2: ovl@14604000 {
++			compatible = "mediatek,mt6897-disp-ovl-2l";
++			reg = <0x0 0x14604000 0x0 0x1000>;
++			interrupts = <GIC_SPI 433 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&ovlsys1_config CLK_OVLSYS1_OVL2_2L>;
++			power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_OVL1>;
++			trigger-sources = <&ovlsys1_mutex 2>;
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					ovl6_in: endpoint@1 {
++						reg = <1>;
++						remote-endpoint = <&ovl5_out>;
++					};
++				};
++
++				port@1 {
++					reg = <1>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					ovl6_out: endpoint@1 {
++						reg = <1>;
++						remote-endpoint = <&ovlsys1_dl_relay_out1>;
++					};
++				};
++			};
++		};
++
++		direct-link {
++			compatible = "mediatek,mt6897-ovl-direct-link";
++			clocks = <&ovlsys1_config CLK_OVLSYS1_CONFIG>;
++			trigger-sources = <&ovlsys1_mutex 9>, <&ovlsys1_mutex 12>;
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++				};
++
++				port@1 {
++					reg = <1>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					ovlsys1_dl_out1: endpoint@1 {
++						reg = <1>;
++						mediatek,port-id = <3>;
++						clocks = <&ovlsys1_config CLK_OVLSYS1_DISP_DLO_ASYNC3>;
++						remote-endpoint = <&dispsys1_dl_in1>;
++					};
++				};
++
++				port@3 {
++					reg = <3>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					ovlsys1_dl_relay_out1: endpoint@1 {
++						reg = <1>;
++						remote-endpoint = <&ovl6_out>;
++					};
++				};
++			};
++		};
++	};
++
++	/* ---------------- DISPSYS0: paths 0 and 1 ---------------- */
++	dispsys0: syscon@14000000 {
++		compatible = "mediatek,mt6897-dispsys0", "syscon";
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++		reg = <0x0 0x14000000 0x0 0x1000>;
++		power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_DIS0>;
++
++		dispsys0_mutex: mutex@14001000 {
++			compatible = "mediatek,mt6897-dispsys0-mutex";
++			reg = <0x0 0x14001000 0x0 0x1000>;
++			interrupts = <GIC_SPI 354 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&dispsys0_config CLK_DISPSYS0_DISP_MUTEX0>;
++			power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_DIS0>;
++			#trigger-source-cells = <1>;
++		};
++
++		direct-link {
++			compatible = "mediatek,mt6897-disp-direct-link";
++			clocks = <&dispsys0_config CLK_DISPSYS0_DISPSYS_CONFIG>;
++			trigger-sources = <&dispsys0_mutex 9>, <&dispsys0_mutex 15>;
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					dispsys0_dl_in0: endpoint@0 {
++						reg = <0>;
++						mediatek,port-id = <0>;
++						clocks = <&dispsys0_config CLK_DISPSYS0_DISP_DLI_ASYNC0>;
++						remote-endpoint = <&ovlsys0_dl_out0>;
++					};
++
++					dispsys0_dl_in1: endpoint@1 {
++						reg = <1>;
++						mediatek,port-id = <4>;
++						clocks = <&dispsys0_config CLK_DISPSYS0_DISP_DLI_ASYNC4>;
++						remote-endpoint = <&dispsys1_dl_out1>;
++					};
++
++					dispsys0_dl_in3: endpoint@3 {
++						reg = <3>;
++						mediatek,port-id = <2>;
++						clocks = <&dispsys0_config CLK_DISPSYS0_DISP_DLI_ASYNC2>;
++						remote-endpoint = <&ovlsys0_dl_out3>;
++					};
++				};
++
++				port@1 {
++					reg = <1>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					dispsys0_dl_out1: endpoint@1 {
++						reg = <1>;
++						mediatek,port-id = <1>;
++						clocks = <&dispsys0_config CLK_DISPSYS0_DISP_DLO_ASYNC1>;
++						remote-endpoint = <&dispsys1_dl_in2>;
++					};
++				};
++
++				port@2 {
++					reg = <2>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					dispsys0_dl_relay_in0: endpoint@0 {
++						reg = <0>;
++						remote-endpoint = <&dsc0_in>;
++					};
++
++					dispsys0_dl_relay_in1: endpoint@1 {
++						reg = <1>;
++						remote-endpoint = <&dsc1_in>;
++					};
++
++					dispsys0_dl_relay_in3: endpoint@3 {
++						reg = <3>;
++						remote-endpoint = <&dp_intf0_in>;
++					};
++				};
++
++				port@3 {
++					reg = <3>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					dispsys0_dl_relay_out1: endpoint@1 {
++						reg = <1>;
++						remote-endpoint = <&dsc1_out>;
++					};
++				};
++			};
++		};
++
++		disp_dsc0: dsc@1400c000 {
++			compatible = "mediatek,mt6897-disp-dsc";
++			reg = <0x0 0x1400c000 0x0 0x400>;
++			interrupts = <GIC_SPI 366 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&dispsys0_config CLK_DISPSYS0_DISP_DSC_WRAP0>;
++			power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_DIS0>;
++			trigger-sources = <&dispsys0_mutex 18>;
++			mediatek,dual-pipe-twin = <&disp_dsc1>;
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					dsc0_in: endpoint@0 {
++						reg = <0>;
++						remote-endpoint = <&dispsys0_dl_relay_in0>;
++					};
++				};
++
++				port@1 {
++					reg = <1>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					dsc0_out: endpoint@0 {
++						reg = <0>;
++						remote-endpoint = <&dsi0_in>;
++					};
++				};
++			};
++		};
++
++		disp_dsc1: dsc@1400c400 {
++			compatible = "mediatek,mt6897-disp-dsc";
++			reg = <0x0 0x1400c400 0x0 0x400>;
++			interrupts = <GIC_SPI 366 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&dispsys0_config CLK_DISPSYS0_DISP_DSC_WRAP0>;
++			power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_DIS0>;
++			trigger-sources = <&dispsys0_mutex 19>;
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					dsc1_in: endpoint@1 {
++						reg = <1>;
++						remote-endpoint = <&dispsys0_dl_relay_in1>;
++					};
++				};
++
++				port@1 {
++					reg = <1>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					dsc1_out: endpoint@1 {
++						reg = <1>;
++						remote-endpoint = <&dispsys0_dl_relay_out1>;
++					};
++				};
++			};
++		};
++
++		/* DisplayPort interface, feeding the DP TX (Type-C alt mode) */
++		dp_intf0: dp-intf@1400b000 {
++			compatible = "mediatek,mt6897-dp-intf";
++			reg = <0x0 0x1400b000 0x0 0x1000>;
++			interrupts = <GIC_SPI 365 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&dispsys0_config CLK_DISPSYS0_DP_CLK>,
++				 <&dispsys0_config CLK_DISPSYS0_DISP_DP_INTF0>,
++				 <&apmixedsys CLK_APMIXED_TVDPLL>;
++			clock-names = "pixel", "engine", "pll";
++			power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_DIS0>;
++			trigger-sources = <&dispsys0_mutex 17>;
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					dp_intf0_in: endpoint@3 {
++						reg = <3>;
++						remote-endpoint = <&dispsys0_dl_relay_in3>;
++					};
++				};
++
++				port@1 {
++					reg = <1>;
++
++					dp_intf0_out: endpoint {
++						remote-endpoint = <&dp_tx_in>;
++					};
++				};
++			};
++		};
++
++		dsi0: dsi@1400d000 {
++			compatible = "mediatek,mt6897-dsi";
++			reg = <0x0 0x1400d000 0x0 0x1000>;
++			interrupts = <GIC_SPI 368 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&dispsys0_config CLK_DISPSYS0_DISP_DSI0>,
++				 <&dispsys0_config CLK_DISPSYS0_DSI_CLK>,
++				 <&mipi_tx0>;
++			clock-names = "engine", "digital", "hs";
++			power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_DIS0>;
++			phys = <&mipi_tx0>;
++			phy-names = "dphy";
++			trigger-sources = <&dispsys0_mutex 20>;
++			mediatek,dual-dsi-slave = <&dsi1>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			dsi_panel: panel@0 {
++				compatible = "alldocube,t880-wandeqi-nt36523n";
++				reg = <0>;
++				reset-gpios = <&pio 41 GPIO_ACTIVE_LOW>;
++				vddio-supply = <&panel_vddio>;
++				vsp-supply = <&panel_vsp>;
++				vsn-supply = <&panel_vsn>;
++				backlight = <&backlight>;
++				/* 8.8-inch, 118.0 x 190.0 mm (stock DT) */
++				width-mm = <118>;
++				height-mm = <190>;
++
++				ports {
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					port@0 {
++						reg = <0>;
++
++						panel_in0: endpoint {
++							remote-endpoint = <&dsi0_out>;
++						};
++					};
++
++					port@1 {
++						reg = <1>;
++
++						panel_in1: endpoint {
++							remote-endpoint = <&dsi1_out>;
++						};
++					};
++				};
++			};
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					dsi0_in: endpoint@0 {
++						reg = <0>;
++						remote-endpoint = <&dsc0_out>;
++					};
++				};
++
++				port@1 {
++					reg = <1>;
++
++					dsi0_out: endpoint {
++						remote-endpoint = <&panel_in0>;
++					};
++				};
++			};
++		};
++	};
++
++	/* ---------------- DISPSYS1: paths 1 and 2 ---------------- */
++	dispsys1: syscon@14200000 {
++		compatible = "mediatek,mt6897-dispsys1", "syscon";
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++		reg = <0x0 0x14200000 0x0 0x1000>;
++		power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_DIS1>;
++
++		dispsys1_mutex: mutex@14201000 {
++			compatible = "mediatek,mt6897-dispsys1-mutex";
++			reg = <0x0 0x14201000 0x0 0x1000>;
++			interrupts = <GIC_SPI 386 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&dispsys1_config CLK_DISPSYS1_DISP_MUTEX0>;
++			power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_DIS1>;
++			#trigger-source-cells = <1>;
++		};
++
++		direct-link {
++			compatible = "mediatek,mt6897-disp-direct-link";
++			clocks = <&dispsys1_config CLK_DISPSYS1_DISPSYS_CONFIG>;
++			trigger-sources = <&dispsys1_mutex 9>, <&dispsys1_mutex 15>;
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					dispsys1_dl_in1: endpoint@1 {
++						reg = <1>;
++						mediatek,port-id = <0>;
++						clocks = <&dispsys1_config CLK_DISPSYS1_DISP_DLI_ASYNC0>;
++						remote-endpoint = <&ovlsys1_dl_out1>;
++					};
++
++					dispsys1_dl_in2: endpoint@2 {
++						reg = <2>;
++						mediatek,port-id = <5>;
++						clocks = <&dispsys1_config CLK_DISPSYS1_DISP_DLI_ASYNC5>;
++						remote-endpoint = <&dispsys0_dl_out1>;
++					};
++				};
++
++				port@1 {
++					reg = <1>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					dispsys1_dl_out1: endpoint@1 {
++						reg = <1>;
++						mediatek,port-id = <0>;
++						clocks = <&dispsys1_config CLK_DISPSYS1_DISP_DLO_ASYNC0>;
++						remote-endpoint = <&dispsys0_dl_in1>;
++					};
++				};
++
++				port@2 {
++					reg = <2>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					/* path 1: straight through the PQ bypass to DLO 0 */
++					dispsys1_dl_relay_in1: endpoint@1 {
++						reg = <1>;
++						remote-endpoint = <&dispsys1_dl_relay_out1>;
++					};
++
++					dispsys1_dl_relay_in2: endpoint@2 {
++						reg = <2>;
++						remote-endpoint = <&dsi1_in>;
++					};
++				};
++
++				port@3 {
++					reg = <3>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					dispsys1_dl_relay_out1: endpoint@1 {
++						reg = <1>;
++						remote-endpoint = <&dispsys1_dl_relay_in1>;
++					};
++				};
++			};
++		};
++
++		dsi1: dsi@1420d000 {
++			compatible = "mediatek,mt6897-dsi";
++			reg = <0x0 0x1420d000 0x0 0x1000>;
++			interrupts = <GIC_SPI 412 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&dispsys1_config CLK_DISPSYS1_DISP_DSI0>,
++				 <&dispsys1_config CLK_DISPSYS1_DSI_CLK>,
++				 <&mipi_tx1>;
++			clock-names = "engine", "digital", "hs";
++			power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_DIS1>;
++			phys = <&mipi_tx1>;
++			phy-names = "dphy";
++			trigger-sources = <&dispsys1_mutex 20>;
++			mediatek,dual-dsi-master = <&dsi0>;
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					dsi1_in: endpoint@2 {
++						reg = <2>;
++						remote-endpoint = <&dispsys1_dl_relay_in2>;
++					};
++				};
++
++				port@1 {
++					reg = <1>;
++
++					dsi1_out: endpoint {
++						remote-endpoint = <&panel_in1>;
++					};
++				};
++			};
++		};
++	};
++};
++
++/* The MM gate controllers vote through the hardware voter */
++&dispsys0_config {
++	mediatek,hardware-voter = <&hwv>;
++	power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_DIS0>;
++};
++
++&dispsys1_config {
++	mediatek,hardware-voter = <&hwv>;
++	power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_DIS1>;
++};
++
++&ovlsys0_config {
++	mediatek,hardware-voter = <&hwv>;
++	power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_OVL0>;
++};
++
++&ovlsys1_config {
++	mediatek,hardware-voter = <&hwv>;
++	power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_OVL1>;
++};
++
++&mminfra_config {
++	mediatek,hardware-voter = <&hwv>;
++	power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_MM_INFRA>;
++};
++
++/* TVDPLL, the DisplayPort pixel clock source, is voted through it too */
++&apmixedsys {
++	mediatek,hardware-voter = <&hwv>;
++};
+diff --git a/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-ovl-iommus.dtsi b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-ovl-iommus.dtsi
+new file mode 100644
+index 0000000000..1b31fbf74d
+--- /dev/null
++++ b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-ovl-iommus.dtsi
+@@ -0,0 +1,54 @@
++// SPDX-License-Identifier: (GPL-2.0 OR MIT)
++/*
++ * Alldocube iPlay 80 mini Ultra (T880): OVL_2L ports on the MM IOMMUs.
++ *
++ * Do not include this from the default board DTS until translated scanout
++ * is verified. Nonidentity software mappings alone do not establish correct
++ * display fetching; whether a display address-mode transition is needed
++ * remains unverified.
++ *
++ * The disp and mdp IOMMUs share one page table and IOVA space. disp owns
++ * larb0 and larb21, mdp owns larb1 and larb20. Each OVL lists only ports
++ * behind one IOMMU: the layer-1 (RDMA1) port behind the other IOMMU is
++ * listed on a sibling OVL of the same OVLSYS instead of its own fetcher.
++ */
++
++#include <dt-bindings/memory/mediatek,mt6897-memory-port.h>
++
++/* OVLSYS0 */
++&ovlsys0_ovl0 {
++	iommus = <&disp_iommu M4U_L0_P0_DISP_OVL0_2L_HDR>,
++		 <&disp_iommu M4U_L0_P1_DISP_OVL0_2L_RDMA0>,
++		 <&disp_iommu M4U_L0_P2_DISP_OVL1_2L_RDMA1>;
++};
++
++&ovlsys0_ovl1 {
++	iommus = <&mdp_iommu M4U_L1_P0_DISP_OVL0_2L_RDMA1>,
++		 <&mdp_iommu M4U_L1_P1_DISP_OVL1_2L_HDR>,
++		 <&mdp_iommu M4U_L1_P2_DISP_OVL1_2L_RDMA0>,
++		 <&mdp_iommu M4U_L1_P3_DISP_OVL2_2L_RDMA1>;
++};
++
++&ovlsys0_ovl2 {
++	iommus = <&disp_iommu M4U_L0_P3_DISP_OVL2_2L_HDR>,
++		 <&disp_iommu M4U_L0_P4_DISP_OVL2_2L_RDMA0>;
++};
++
++/* OVLSYS1 */
++&ovlsys1_ovl0 {
++	iommus = <&mdp_iommu M4U_L20_P0_DISP1_OVL0_2L_HDR>,
++		 <&mdp_iommu M4U_L20_P1_DISP1_OVL0_2L_RDMA0>,
++		 <&mdp_iommu M4U_L20_P2_DISP1_OVL1_2L_RDMA1>;
++};
++
++&ovlsys1_ovl1 {
++	iommus = <&disp_iommu M4U_L21_P0_DISP1_OVL0_2L_RDMA1>,
++		 <&disp_iommu M4U_L21_P1_DISP1_OVL1_2L_HDR>,
++		 <&disp_iommu M4U_L21_P2_DISP1_OVL1_2L_RDMA0>,
++		 <&disp_iommu M4U_L21_P3_DISP1_OVL2_2L_RDMA1>;
++};
++
++&ovlsys1_ovl2 {
++	iommus = <&mdp_iommu M4U_L20_P3_DISP1_OVL2_2L_HDR>,
++		 <&mdp_iommu M4U_L20_P4_DISP1_OVL2_2L_RDMA0>;
++};
+-- 
+2.56.0
+

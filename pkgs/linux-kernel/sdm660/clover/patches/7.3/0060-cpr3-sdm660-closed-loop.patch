@@ -1,0 +1,35 @@
+From a091755fa00cc93bd01bf1ead191374550eb9b94 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 1 Nov 2026 04:11:44 +0800
+Subject: [PATCH] soc: qcom: cpr3: Enable SDM660 CPRh closed-loop operation
+
+Turn on the hardware closed loop of the SDM660 CPRh controllers, as the
+vendor device tree does (qcom,cpr-hw-closed-loop), and stop disabling
+closed-loop operation on the CPU corners. The CPRh then starts every
+corner at its open-loop voltage and steps it down, 4 mV at a time, while
+the ring oscillator quotient stays above the target, never below the
+corner floor; the open-loop voltage remains the ceiling. The APM
+crossover corner keeps closed-loop operation disabled.
+
+Scope: SDM630/660 common
+Porting notes: Local change to the SDM660 descriptor (not upstream); revert it alone to return to open-loop operation.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/pmdomain/qcom/cpr3.c | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/drivers/pmdomain/qcom/cpr3.c b/drivers/pmdomain/qcom/cpr3.c
+index bfc66d4629..7d1fd5f214 100644
+--- a/drivers/pmdomain/qcom/cpr3.c
++++ b/drivers/pmdomain/qcom/cpr3.c
+@@ -2650,8 +2650,7 @@ static const struct cpr_desc sdm660_cpr_desc = {
+ 	.vdd_settle_time_us = 33,
+ 	.corner_settle_time_us = 5,
+ 	.reduce_to_corner_uV = true,
+-	.hw_closed_loop_en = false,
+-	.open_loop_only = true,
++	.hw_closed_loop_en = true,
+ 	.reset_step_quot_loop_en = true,
+ 	.cprh_fixed_layout = true,
+ 	.fuse_check = true,

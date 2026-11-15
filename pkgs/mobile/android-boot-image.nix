@@ -31,6 +31,14 @@ assert lib.assertMsg (
 assert lib.assertMsg (
   dtbPlacement != "boot-image" || dtbs != [ ]
 ) "Android boot-image DTB placement requires at least one DTB";
+# Header v3/v4 boot images carry only the kernel, ramdisk and command line;
+# load addresses and page size come from the stock vendor_boot.
+assert lib.assertMsg (
+  headerVersion < 3 || dtbPlacement == "append-to-kernel"
+) "Android boot header v${toString headerVersion} has no DTB section";
+assert lib.assertMsg (
+  headerVersion >= 3 || initrd != null
+) "Android boot headers before v3 require a ramdisk";
 runCommand name
   {
     nativeBuildInputs = [
@@ -76,10 +84,15 @@ runCommand name
         lib.optionalString (osPatchLevel != null) "--os_patch_level ${lib.escapeShellArg osPatchLevel} "
       }--header_version ${toString headerVersion} \
       --kernel "$kernel_image" \
-      --ramdisk ${initrd} \
+      ${if initrd == null then "" else "--ramdisk ${initrd}"} \
       --cmdline ${lib.escapeShellArg cmdline} \
       -o "$out"
-    test "$(head -c 8 "$out")" = 'ANDROID!'
+    test "$(head -c 8 "$out")" = 'ANDROID!'${
+      # The v3/v4 header stores its version at byte 40.
+      lib.optionalString (
+        headerVersion >= 3
+      ) "\ntest \"$(od -An -tu4 -j40 -N4 \"$out\" | tr -d ' ')\" = ${toString headerVersion}"
+    }
     ${lib.optionalString (avbFooter != null) ''
       # Replace the entire partition, including any old footer. A short raw
       # flash can otherwise leave a footer pointing inside the new payload.

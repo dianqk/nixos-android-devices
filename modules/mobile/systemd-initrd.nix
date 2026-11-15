@@ -42,7 +42,7 @@ in
       enable = true;
       includeDefaultModules = false;
       availableKernelModules = lib.mkForce [ ];
-      kernelModules = lib.mkForce [ ];
+      kernelModules = lib.mkForce cfg.initrdKernelModules;
       supportedFilesystems = [
         "ext4"
       ];
@@ -52,7 +52,6 @@ in
         "-6"
       ];
       systemd = {
-        enable = true;
         emergencyAccess = true;
         managerEnvironment.SYSTEMD_SYSROOT_FSTAB = lib.mkIf ramOnly (
           lib.mkForce (androidPackages.packaging.writeText "mobile-recovery-fstab" "")
@@ -76,9 +75,12 @@ in
           journalctl = "${config.boot.initrd.systemd.package}/bin/journalctl";
         };
         contents."/lib/firmware".source = "${firmware}/lib/firmware";
-        # The boot contract requires built-in storage and USB. Keep stage-2
-        # modules out of the initrd before device firmware is available.
+        # Storage and the USB transport are built in. Boards may explicitly
+        # include module dependencies needed to configure that transport.
         contents."/lib".enable = lib.mkForce false;
+        contents."/lib/modules" = lib.mkIf (cfg.initrdKernelModules != [ ]) {
+          source = "${config.system.build.modulesClosure}/lib/modules";
+        };
         targets.initrd.aliases = lib.mkIf ramOnly (lib.mkForce [ ]);
         targets.mobile-recovery = lib.mkIf ramOnly {
           description = "RAM-only mobile recovery";

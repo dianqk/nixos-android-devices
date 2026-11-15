@@ -1,0 +1,302 @@
+From 1a4fe86b3cfe3f5ce49a6483c1dd4c412c5a6885 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 20 Oct 2026 10:44:38 +0800
+Subject: [PATCH] Serve the modem's AMMS DRDI copy requests
+
+The modem asks the AP (IPC_RPC_AMMS_DRDI_CONTROL, 0x4014) to copy pieces
+of the "md1drdi" entry of the modem partition into the DRDI shared memory
+mapped through /dev/ccci_rpc; without them MT6897 modems assert in their
+memory manager right after the runtime data. Add an independent responder
+written from the request/reply and file traffic observed on a running
+Android (no vendor code): a start request answered with the DRDI version,
+copy requests carrying up to 15 (source, destination, size) triples, the
+last one flagged.
+
+The partition (MTK_CCCI_MODEM_IMAGE) is opened read-only and every copy
+is checked against the entry and the 64 KiB window. Offline test with a
+synthetic container.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ README.md                             |  1 +
+ meson.build                           |  1 +
+ src/mtk_ccci_userspace/mtk_drdi.py    | 84 +++++++++++++++++++++++++++
+ src/mtk_ccci_userspace/qqc_rpc_sar.py | 24 +++++++-
+ tests/test_drdi.py                    | 69 ++++++++++++++++++++++
+ tests/test_runner.py                  |  4 +-
+ 6 files changed, 180 insertions(+), 3 deletions(-)
+ create mode 100644 src/mtk_ccci_userspace/mtk_drdi.py
+ create mode 100644 tests/test_drdi.py
+
+diff --git a/README.md b/README.md
+index 6e648f6..ec5083b 100644
+--- a/README.md
++++ b/README.md
+@@ -50,6 +50,7 @@ The owner uses environment variables instead of hard-coded private paths:
+ - `MTK_CCCI_PROPERTY_TABLE`
+ - `MTK_CCCI_BOARD` (`qqcandy` or `t880`)
+ - `MTK_CCCI_DRIVE_ROOTS` (optional per-drive root overrides)
++- `MTK_CCCI_MODEM_IMAGE` (modem partition for the AMMS DRDI copy service)
+ - `MTK_CCCI_EXPECTED_KERNEL`
+ - `MTK_CCCI_EXPECTED_NOTES_SHA256`
+ - `MTK_CCCI_ENABLE_MDLOG` (disabled by default)
+diff --git a/meson.build b/meson.build
+index 2388f49..39519bf 100644
+--- a/meson.build
++++ b/meson.build
+@@ -2,6 +2,7 @@ project('mtk-ccci-userspace', version: '0.1.0')
+ 
+ install_data(
+   'src/mtk_ccci_userspace/mdinit.py',
++  'src/mtk_ccci_userspace/mtk_drdi.py',
+   'src/mtk_ccci_userspace/qqc_rpc_sar.py',
+   'src/mtk_ccci_userspace/start_owner.py',
+   install_dir: get_option('libexecdir') / 'mtk-ccci',
+diff --git a/src/mtk_ccci_userspace/mtk_drdi.py b/src/mtk_ccci_userspace/mtk_drdi.py
+new file mode 100644
+index 0000000..976451a
+--- /dev/null
++++ b/src/mtk_ccci_userspace/mtk_drdi.py
+@@ -0,0 +1,84 @@
++# SPDX-License-Identifier: GPL-2.0-or-later
++"""AMMS DRDI copy service (IPC_RPC_AMMS_DRDI_CONTROL, 0x4014).
++
++The modem's dynamic radio settings (DRDI) are not part of the image LK
++loads: the modem asks the AP to copy pieces of the "md1drdi" entry of the
++modem partition into the DRDI shared memory, which the AP maps through
++/dev/ccci_rpc. Protocol as observed on a running Android (file and port
++traffic of its RPC daemon only):
++
++request: one 188-byte block, u8 type, u8 sequence, u16 0, then u32 words
++  type 1 (start): byte 4 carries the DRDI version; reply {0, seq<<8, version}
++  type 2 (copy):  word 1 = last-request flag, then 15 triples
++                  (source offset in md1drdi, destination offset in the
++                  shared memory, size); size 0 = unused; reply
++                  {0, seq<<8, 0xff (more) or 0 (last)}
++Both replies are two blocks: int32 status, 8 bytes.
++
++The partition is only read. Offsets are checked against the entry and the
++shared memory window.
++"""
++import mmap
++import os
++import struct
++
++DRDI_CONTROL = 0x4014
++SMEM_SIZE = 0x10000
++ENTRY_MAGIC = 0x58881688
++ENTRY_HEADER = 0x200
++TRIPLES = 15
++
++
++def find_entry(fd, name, limit=64):
++    """(data offset, size) of a named entry of the MediaTek partition container."""
++    off = 0
++    for _ in range(limit):
++        hdr = os.pread(fd, ENTRY_HEADER, off)
++        if len(hdr) < 40:
++            break
++        magic, size = struct.unpack_from('<II', hdr)
++        if magic != ENTRY_MAGIC:
++            break
++        entry = hdr[8:40].split(b'\0', 1)[0].decode('ascii', 'replace')
++        if entry == name:
++            return off + ENTRY_HEADER, size
++        off = (off + ENTRY_HEADER + size + 15) & ~15
++    raise ValueError('no %s entry in the modem partition' % name)
++
++
++class DrdiService:
++    def __init__(self, rpc_fd, image, log):
++        self.log = log
++        self.image = os.open(image, os.O_RDONLY | os.O_CLOEXEC)
++        self.base, self.size = find_entry(self.image, 'md1drdi')
++        self.smem = mmap.mmap(rpc_fd, SMEM_SIZE, mmap.MAP_SHARED,
++                              mmap.PROT_READ | mmap.PROT_WRITE)
++        log('DRDI: %s md1drdi at %#x size %#x, shared memory mapped'
++            % (image, self.base, self.size))
++
++    def handle(self, block):
++        if len(block) < 8 + 12 * TRIPLES:
++            raise ValueError('short DRDI request (%d bytes)' % len(block))
++        kind, seq = block[0], block[1]
++        if kind == 1:
++            version = block[4]
++            return struct.pack('<II', seq << 8, version), \
++                'start seq=%d version=%d' % (seq, version)
++        if kind != 2:
++            raise ValueError('unknown DRDI request type %d' % kind)
++        last = struct.unpack_from('<I', block, 4)[0]
++        copied = []
++        for i in range(TRIPLES):
++            src, dst, n = struct.unpack_from('<III', block, 8 + 12 * i)
++            if not n:
++                continue
++            if src + n > self.size or dst + n > SMEM_SIZE:
++                raise ValueError('DRDI copy out of range: %#x->%#x+%#x' % (src, dst, n))
++            data = os.pread(self.image, n, self.base + src)
++            if len(data) != n:
++                raise ValueError('short read at %#x' % (self.base + src))
++            self.smem[dst:dst + n] = data
++            copied.append('%#x->%#x+%#x' % (src, dst, n))
++        status = 0 if last else 0xff
++        return struct.pack('<II', seq << 8, status), \
++            'copy seq=%d last=%d %s' % (seq, last, ' '.join(copied))
+diff --git a/src/mtk_ccci_userspace/qqc_rpc_sar.py b/src/mtk_ccci_userspace/qqc_rpc_sar.py
+index dc1da30..aa4d361 100644
+--- a/src/mtk_ccci_userspace/qqc_rpc_sar.py
++++ b/src/mtk_ccci_userspace/qqc_rpc_sar.py
+@@ -29,6 +29,7 @@ import os
+ import struct
+ 
+ QUERY_PROP = 0x400F
++DRDI_CONTROL = 0x4014
+ SAR_QUERY = 0x4010
+ SAR_NO_OPERATOR = 0xffff
+ PROP_TABLE = os.environ.get(
+@@ -106,9 +107,20 @@ def _sar_reply(request, data0, channel, reserved, op, blocks):
+     return hdr + body, 'status=0 index=0xffff stock_hw=22823 no-table-match'
+ 
+ 
+-def rpc_reply(request):
++def _drdi_reply(drdi, request, data0, channel, reserved, op, blocks):
++    if len(blocks) != 1:
++        raise ValueError('DRDI request must carry exactly one block')
++    data, note = drdi.handle(blocks[0])
++    reply = _frame(request, channel, data0, reserved, op,
++                   [struct.pack('<i', 0), data])
++    return reply, 'DRDI ' + note
++
++
++def rpc_reply(request, drdi=None):
+     """Return (reply_bytes, note) or None when the opcode is not serviced."""
+     data0, channel, reserved, op, count, blocks = _parse_rpc(request)
++    if op == DRDI_CONTROL and drdi is not None:
++        return _drdi_reply(drdi, request, data0, channel, reserved, op, blocks)
+     if op == SAR_QUERY:
+         return _sar_reply(request, data0, channel, reserved, op, blocks)
+     if op == QUERY_PROP:
+@@ -118,6 +130,14 @@ def rpc_reply(request):
+ 
+ def rpc_reader(fd, evidence_dir, log):
+     n = 0
++    drdi = None
++    image = os.environ.get('MTK_CCCI_MODEM_IMAGE', '')
++    if image:
++        try:
++            from mtk_drdi import DrdiService
++            drdi = DrdiService(fd, image, log)
++        except (OSError, ValueError) as exc:
++            log('DRDI service unavailable: %r' % exc)
+     while True:
+         try:
+             raw = os.read(fd, 4096)
+@@ -136,7 +156,7 @@ def rpc_reader(fd, evidence_dir, log):
+         op = struct.unpack_from('<I', raw, 16)[0] if len(raw) >= 20 else -1
+         log('RPC-REQ #%d len=%d op=0x%x raw=%s' % (n, len(raw), op, raw.hex()))
+         try:
+-            result = rpc_reply(raw)
++            result = rpc_reply(raw, drdi)
+         except ValueError as exc:
+             log('RPC-REJECT #%d %s' % (n, exc))
+             continue
+diff --git a/tests/test_drdi.py b/tests/test_drdi.py
+new file mode 100644
+index 0000000..694e916
+--- /dev/null
++++ b/tests/test_drdi.py
+@@ -0,0 +1,69 @@
++import importlib.util
++import os
++from pathlib import Path
++import struct
++import sys
++import tempfile
++
++SRC = Path(__file__).parents[1] / "src/mtk_ccci_userspace"
++sys.path.insert(0, str(SRC))
++spec = importlib.util.spec_from_file_location("rpc_sar_drdi", SRC / "qqc_rpc_sar.py")
++rpc_sar = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(rpc_sar)
++import mtk_drdi  # noqa: E402
++
++
++def entry(name, data):
++    hdr = struct.pack("<II", mtk_drdi.ENTRY_MAGIC, len(data)) + name.encode().ljust(32, b"\0")
++    hdr = hdr.ljust(mtk_drdi.ENTRY_HEADER, b"\xff")
++    blob = hdr + data
++    return blob + b"\0" * ((-len(blob)) & 15)
++
++
++def frame(block, seq=1):
++    body = struct.pack("<II", 0x4014, 1) + struct.pack("<I", len(block)) + block
++    return struct.pack("<4I", 0, 16 + len(body), 0x80000020 | (seq << 16), 0) + body
++
++
++def request(kind, seq, words):
++    block = bytes([kind, seq, 0, 0]) + b"".join(struct.pack("<I", w) for w in words)
++    return block.ljust(188, b"\0")
++
++
++def test_drdi_start_and_copies():
++    drdi_data = bytes(range(256)) * 64
++    image = entry("md1rom", b"r" * 777) + entry("cert1md", b"c" * 33) + entry("md1drdi", drdi_data)
++    with tempfile.TemporaryDirectory() as d:
++        img = os.path.join(d, "modem")
++        Path(img).write_bytes(image)
++        smem_path = os.path.join(d, "smem")
++        Path(smem_path).write_bytes(b"\0" * mtk_drdi.SMEM_SIZE)
++        fd = os.open(smem_path, os.O_RDWR)
++        svc = mtk_drdi.DrdiService(fd, img, lambda m: None)
++        start = bytes([1, 1, 0x47, 0x50, 3]).ljust(188, b"\0")
++        reply, note = rpc_sar.rpc_reply(frame(start), svc)
++        assert reply[-8:] == struct.pack("<II", 0x100, 3), note
++        words = [0] * 46
++        words[0] = 0                      # not last
++        words[19:22] = [0x100, 0x0, 0x40]  # triple 6
++        reply, note = rpc_sar.rpc_reply(frame(request(2, 2, words), 2), svc)
++        assert reply[-8:] == struct.pack("<II", 0x200, 0xFF), note
++        words = [0] * 46
++        words[0] = 1                      # last
++        words[1:4] = [0x10, 0x40, 0x20]
++        words[4:7] = [0x200, 0x60, 0x10]
++        reply, note = rpc_sar.rpc_reply(frame(request(2, 3, words), 3), svc)
++        assert reply[-8:] == struct.pack("<II", 0x300, 0), note
++        os.close(fd)
++        smem = Path(smem_path).read_bytes()
++        assert smem[0:0x40] == drdi_data[0x100:0x140]
++        assert smem[0x40:0x60] == drdi_data[0x10:0x30]
++        assert smem[0x60:0x70] == drdi_data[0x200:0x210]
++        bad = [0] * 46
++        bad[1:4] = [len(drdi_data) - 4, 0, 0x10]
++        try:
++            rpc_sar.rpc_reply(frame(request(2, 4, bad), 4), svc)
++        except ValueError:
++            pass
++        else:
++            raise AssertionError("out-of-range copy accepted")
+diff --git a/tests/test_runner.py b/tests/test_runner.py
+index ff00822..3c19cfb 100644
+--- a/tests/test_runner.py
++++ b/tests/test_runner.py
+@@ -2,6 +2,7 @@ import test_rpc_sar
+ import test_source_safety
+ import test_launcher
+ import test_fs_contract
++import test_drdi
+ 
+ 
+ def main():
+@@ -17,7 +18,8 @@ def main():
+     test_fs_contract.test_frames_and_path_guards()
+     test_fs_contract.test_cmpt_writes_only_overlay()
+     test_fs_contract.test_private_drive_and_missing_ota()
+-    print("PASS: 12 userspace source, RPC, FS, and launcher checks")
++    test_drdi.test_drdi_start_and_copies()
++    print("PASS: 13 userspace source, RPC, FS, and launcher checks")
+ 
+ 
+ if __name__ == "__main__":
+-- 
+2.55.0
+

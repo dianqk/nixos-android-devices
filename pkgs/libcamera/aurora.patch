@@ -1,0 +1,109 @@
+Subject: [PATCH] libcamera: add Xiaomi 14 Ultra camera sensor helpers
+
+Sony IMX858 (ultra-wide and tele): 0.7 um pixels, 64 (10-bit) black
+level from the module data, Sony analogue gain 1024 / (1024 - code),
+SMIA test patterns and the sensor delays of the other group-hold Sony
+sensors. Sony LYT-900 (wide): 1.6 um pixels, gain 16384 / (16384 -
+code), otherwise as the IMX858. OmniVision OV32B40 (front): 0.7 um
+pixels, 8.8 analogue gain, 64 (10-bit) black level and its colour bar
+pattern.
+
+---
+diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -677,6 +677,39 @@
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("imx708", CameraSensorHelperImx708)
+ 
++class CameraSensorHelperImx858 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperImx858()
++	{
++		blackLevel_ = 4096;
++		gain_ = AnalogueGainLinear{ 0, 1024, -1, 1024 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("imx858", CameraSensorHelperImx858)
++
++class CameraSensorHelperLyt900 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperLyt900()
++	{
++		blackLevel_ = 4096;
++		gain_ = AnalogueGainLinear{ 0, 16384, -1, 16384 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("lyt900", CameraSensorHelperLyt900)
++
++class CameraSensorHelperOv32b40 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperOv32b40()
++	{
++		blackLevel_ = 4096;
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 256 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("ov32b40", CameraSensorHelperOv32b40)
++
+ class CameraSensorHelperHi1339 : public CameraSensorHelper
+ {
+ public:
+diff --git a/src/libcamera/sensor/camera_sensor_properties.cpp b/src/libcamera/sensor/camera_sensor_properties.cpp
+--- a/src/libcamera/sensor/camera_sensor_properties.cpp
++++ b/src/libcamera/sensor/camera_sensor_properties.cpp
+@@ -381,6 +381,51 @@
+ 				.hblankDelay = 3
+ 			},
+ 		} },
++		{ "imx858", {
++			.unitCellSize = { 700, 700 },
++			.testPatternModes = {
++				{ controls::draft::TestPatternModeOff, 0 },
++				{ controls::draft::TestPatternModeSolidColor, 1 },
++				{ controls::draft::TestPatternModeColorBars, 2 },
++				{ controls::draft::TestPatternModeColorBarsFadeToGray, 3 },
++				{ controls::draft::TestPatternModePn9, 4 },
++			},
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 3,
++				.hblankDelay = 3
++			},
++		} },
++		{ "ov32b40", {
++			.unitCellSize = { 700, 700 },
++			.testPatternModes = {
++				{ controls::draft::TestPatternModeOff, 0 },
++				{ controls::draft::TestPatternModeColorBars, 1 },
++			},
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 2,
++				.hblankDelay = 2
++			},
++		} },
++		{ "lyt900", {
++			.unitCellSize = { 1600, 1600 },
++			.testPatternModes = {
++				{ controls::draft::TestPatternModeOff, 0 },
++				{ controls::draft::TestPatternModeSolidColor, 1 },
++				{ controls::draft::TestPatternModeColorBars, 2 },
++				{ controls::draft::TestPatternModeColorBarsFadeToGray, 3 },
++				{ controls::draft::TestPatternModePn9, 4 },
++			},
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 3,
++				.hblankDelay = 3
++			},
++		} },
+ 		{ "ov2685", {
+ 			.unitCellSize = { 1750, 1750 },
+ 			.testPatternModes = {

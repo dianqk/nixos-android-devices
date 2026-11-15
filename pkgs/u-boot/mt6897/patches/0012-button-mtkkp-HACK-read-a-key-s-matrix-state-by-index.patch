@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 14 Oct 2026 20:54:36 +0800
+Subject: [PATCH 12/13] button: mtkkp-HACK: read a key's matrix state by index
+
+The raw keypad driver treated any non-zero key status as a press of every
+key. Add an optional mediatek,kp-index per key: read that key's bit in the
+KP_MEM matrix registers (16 keys per register, cleared bit = pressed), the
+layout the vendor mediatek,hw-init-map describes. Keys without an index
+keep the old behaviour.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/button/button-mtkkp-HACK.c | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/button/button-mtkkp-HACK.c b/drivers/button/button-mtkkp-HACK.c
+index af8834ab849..7c3362d37ff 100644
+--- a/drivers/button/button-mtkkp-HACK.c
++++ b/drivers/button/button-mtkkp-HACK.c
+@@ -17,8 +17,12 @@
+ // Worse than MediaTek?
+ #define BASE 0x1c00e000
+ 
++/* Key matrix state: 16 keys per register, a cleared bit means pressed. */
++#define KP_MEM			0x4
++
+ struct button_mtkkp_priv {
+ 	int linux_code;
++	int index;
+ };
+ 
+ /* This... is a bit less awful, but still needs a rewrite for multiple btns. */
+@@ -30,6 +34,12 @@ static enum button_state_t button_mtkkp_get_state(struct udevice *dev)
+ 	if (!priv)
+ 		return -ENODATA;
+ 
++	if (priv->index >= 0) {
++		u32 mem = readl((uintptr_t)BASE + KP_MEM + (priv->index / 16) * 4);
++
++		return mem & BIT(priv->index % 16) ? BUTTON_OFF : BUTTON_ON;
++	}
++
+ 	// Read data
+ 	ret = readl(BASE);
+ 
+@@ -63,8 +73,15 @@ static int button_mtkkp_probe(struct udevice *dev)
+ 		return 0;
+ 
+ 	ret = dev_read_u32(dev, "linux,code", &priv->linux_code);
++	if (ret)
++		return ret;
++
++	/* Optional matrix index (the vendor mediatek,hw-init-map position). */
++	priv->index = dev_read_u32_default(dev, "mediatek,kp-index", -1);
++	if (priv->index >= 5 * 16)
++		return -EINVAL;
+ 
+-	return ret;
++	return 0;
+ }
+ 
+ static int button_mtkkp_remove(struct udevice *dev)

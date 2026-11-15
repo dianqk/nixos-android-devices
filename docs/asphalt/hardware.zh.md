@@ -18,6 +18,7 @@
 | microSD | 设备树支持 | 已配置；端到端使用未验证 |
 | 相机 | HI1339 主后摄、S5K4H7 前摄、SC202CS 后置微距；CAMSS 与 libcamera 软件 ISP | 三摄配置、RAW 采集及重复启停通过；三摄实景照片已验证 |
 | 电池读数 | 经 pmic_glink 的 ADSP 电池管理器（`qcom-battmgr-bat`） | Linux 7.3.0-rc6 上状态、电量、电压和电流可读，且与放电过程一致。`power_now` 与电压 × 电流不符，不应显示；请用 `voltage_now` × `current_now` 计算功率。`charge_counter` 按电量百分比 × `charge_full` 量化；`charge_full` 与 `state_of_health` 的关系、上报的 USB 类型及充放电循环行为待验证（[充电](charging.zh.md)） |
+| 挂起 | s2idle（`mem_sleep_default`）、UFS `spm_lvl` 5、具名唤醒源 | s2idle 进入、深度睡眠与唤醒已验证；电源键可唤醒，USB/电池事件暂不能唤醒（[详情](#挂起与唤醒)） |
 | 传感器 | SLPI、FastRPC、libssc/proxy 与旋转客户端 | 已配置；持续读数、物理方向与休眠恢复待验证（[配置方法](../sensors.zh.md)） |
 
 内屏支持 2560×1600、120 Hz。当前 U-Boot 从经检查的 ESP 加载指定 EFI 镜像后，
@@ -64,11 +65,54 @@ Recovery 不运行这些初始化服务。
 ## UFS 时钟上限
 
 `hardware.asphalt.ufs.maxFrequency` 默认 75 MHz。udev 规则在 initrd 与已安装系统中
-限制 UFS 时钟缩放，同时使链路保持在最低 HS gear。启动期 interconnect 与电源投票
-释放后（所有 fw_devlink `sync_state()` 完成），较高时钟和 gear 下的持续写入在
-Linux 7.3.0-rc6 上出现 UFS PHY／数据链路错误和控制器复位，并发生过一次意外重启。
-启用该上限后，同样的写入负载和启动均无错误，但存储吞吐会降低。仅在排查原因时
-将其设为 `null`。
+限制 UFS 时钟缩放，同时使链路保持在 HS-G1。设为 `null` 后，内核在两个 UFS
+operating point 之间缩放。
+
+内核声明与原厂相同的两个 operating point：75 MHz（RPMh CX LOW_SVS，HS-G1）与
+850 MHz（TURBO_L1，HS-G4）。850 MHz 下控制器使用 Qualcomm 的 turbo 配置
+（`qcom,sm8475-ufshc`），与联想固件一致；HS-G4 不会在更低时钟下使用。使用该内核
+且不设上限时，持续写入负载（4 GiB 直接写入、三次复制约 1000 个文件、回读）
+连续十次未出现 PHY、数据链路、致命错误或主机复位，负载期间 CX 处于 TURBO_L1。
+1 GiB 写入约 450–1200 MB/s（随设备写缓存填满而下降），O_DIRECT 读取约
+1.7 GB/s；75 MHz 时读取约 180 MB/s。
+
+此前未实现 turbo 配置的内核，在启动期 interconnect 与电源投票释放后（所有
+fw_devlink `sync_state()` 完成），同样负载在 850 MHz 与 300 MHz/HS-G4 下均出现
+PHY／数据链路错误和控制器复位，并发生过一次意外重启。在 850 MHz 下验证系统挂起
+与唤醒之前保留默认上限：UFS 主机复位和唤醒后会从最高 operating point 开始，
+不受 udev 上限约束。
+
+## 挂起与唤醒
+
+`hardware.asphalt.suspend.memSleep` 默认为 `"s2idle"`，会在内核命令行加入
+`mem_sleep_default=s2idle`；固件也提供 `"deep"`，但未经测试；设为 `null` 则保留
+内核默认值（`deep`）。s2idle 同时也是联想原厂的默认模式。
+
+已在 Linux 7.3.0-rc6、不设 UFS 时钟上限（850 MHz turbo）且 UFS `spm_lvl` 为 5
+（设备断电、链路关闭、唤醒时完整重新初始化）的条件下验证：SoC 进入深度睡眠
+（114 秒挂起中约 80 % 时间 AOSS/CX/DDR 处于塌缩状态），唤醒后无 UFS 错误且直接
+读取成功，Wi-Fi 重新关联，触摸重新初始化。`spm_lvl` 3 在一次试验中也正常唤醒。
+
+已知限制：
+
+- 电源键可以唤醒设备。插入 USB 以及其他电池管理器或 Type-C（pmic_glink）事件
+  目前还不能唤醒，即使这些唤醒源处于启用状态。
+- 两次试验中有一次，蓝牙 UART 中断（`qcom_geni_serial`）在进入挂起后不久持续
+  触发并被内核禁用，此后蓝牙在重启前不可用。
+- 进入挂起时，若仍有未处理的 Type-C/UCSI 连接变化设置 FSA4480 mux，内核可能
+  警告 `i2c ... Transfer while suspended`。
+
+设备模块为共享的[唤醒源策略](../configuration.zh.md#挂起唤醒源)声明了唤醒源：
+`powerKey`、`volumeKeys`、`battery`（电池管理器及承载它的 ADSP remoteproc）与
+`usbPower`（USB 供电与 UCSI source 供电）。例如只保留电源键，并为将来可用的电池
+事件保留电池源：
+
+```nix
+androidDevices.power.wakeup = {
+  enable = true;
+  keep = [ "powerKey" "battery" ];
+};
+```
 
 ## 未使用的时钟与电源域
 

@@ -18,6 +18,7 @@ class FakeSsh:
     def __init__(self, query=""):
         self.calls = []
         self.query = query
+        self.capabilities = ["install-initial-system"]
 
     def recovery(self):
         self.calls.append(("recovery",))
@@ -28,6 +29,10 @@ class FakeSsh:
     def push(self, source, target):
         self.calls.append(("push", target))
 
+    def pull(self, source, target):
+        self.calls.append(("pull", source))
+        Path(target).write_bytes(b"")
+
     def shell(self, *args, **kwargs):
         self.calls.append(("shell", *map(str, args)))
         # Every supported recovery runs the Rust daemon protocol.
@@ -37,10 +42,109 @@ class FakeSsh:
 
     def text(self, *args):
         self.calls.append(("text", *map(str, args)))
+        if args == ("recovery", "capabilities"):
+            return cli.json.dumps({"capabilities": self.capabilities})
         return self.query
 
 
 class MobileDeviceTests(unittest.TestCase):
+    def test_prepare_install_saves_the_original_gpt_before_erasing(self):
+        names = "header-1 header-62480383 table-2 table-62480376"
+        transport = FakeSsh(names)
+        with patch.object(cli, "Ssh", return_value=transport):
+            self.assertEqual(cli.main(["recovery", "--target", "t", "prepare-install", "--execute"]), 1)
+        self.assertNotIn(("shell", "recovery", "prepare-install", "--confirm-erase-userdata"), transport.calls)
+        # Without --gpt-backup the recovery keeps the original in RAM only.
+        transport = FakeSsh(names)
+        with patch.object(cli, "Ssh", return_value=transport):
+            self.assertEqual(cli.main(["recovery", "--target", "t", "prepare-install",
+                                       "--android-userdata", "64G", "--execute"]), 0)
+        self.assertFalse([c for c in transport.calls if c[0] == "pull"])
+        self.assertIn(("shell", "recovery", "prepare-install", "--android-userdata", "64G",
+                       "--confirm-erase-userdata"), transport.calls)
+        with tempfile.TemporaryDirectory() as tmp:
+            backup = Path(tmp) / "gpt"
+            transport = FakeSsh(names)
+            with patch.object(cli, "Ssh", return_value=transport):
+                # The Android userdata size is never chosen implicitly.
+                self.assertEqual(cli.main(["recovery", "--target", "t", "prepare-install",
+                                           "--gpt-backup", str(backup), "--execute"]), 1)
+            self.assertFalse(backup.exists())
+            transport = FakeSsh(names)
+            with patch.object(cli, "Ssh", return_value=transport):
+                self.assertEqual(cli.main(["recovery", "--target", "t", "prepare-install",
+                                           "--android-userdata", "64G",
+                                           "--gpt-backup", str(backup), "--execute"]), 0)
+            calls = transport.calls
+            check = calls.index(("shell", "recovery", "prepare-install", "--android-userdata", "64G", "--check"))
+            pulls = [i for i, c in enumerate(calls) if c[0] == "pull"]
+            erase = calls.index(("shell", "recovery", "prepare-install", "--android-userdata", "64G",
+                                 "--confirm-erase-userdata"))
+            self.assertEqual(len(pulls), 4)
+            self.assertTrue(check < min(pulls) and max(pulls) < erase)
+            self.assertEqual(sorted(p.name for p in backup.iterdir()), sorted(names.split()))
+            # An existing backup directory is never overwritten.
+            transport = FakeSsh(names)
+            with patch.object(cli, "Ssh", return_value=transport):
+                self.assertEqual(cli.main(["recovery", "--target", "t", "prepare-install",
+                                           "--android-userdata", "64G",
+                                           "--gpt-backup", str(backup), "--execute"]), 1)
+            self.assertNotIn(("shell", "recovery", "prepare-install", "--confirm-erase-userdata"), transport.calls)
+
+    def test_prepare_install_passes_the_chosen_android_userdata_size(self):
+        names = "header-1 header-61880319 table-2 table-61880315"
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = FakeSsh(names)
+            with patch.object(cli, "Ssh", return_value=transport):
+                self.assertEqual(cli.main(["recovery", "--target", "t", "prepare-install",
+                                           "--android-userdata", "64G",
+                                           "--gpt-backup", str(Path(tmp) / "gpt"), "--execute"]), 0)
+            calls = transport.calls
+            check = calls.index(("shell", "recovery", "prepare-install", "--android-userdata", "64G", "--check"))
+            erase = calls.index(("shell", "recovery", "prepare-install", "--android-userdata", "64G",
+                                 "--confirm-erase-userdata"))
+            self.assertTrue(check < erase)
+
+    def test_restore_gpt_pushes_the_backup_before_the_daemon_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            backup = Path(tmp)
+            for name in ("header-1", "header-62480383", "table-2", "table-62480376"):
+                (backup / name).write_bytes(b"x")
+            transport = FakeSsh()
+            with patch.object(cli, "Ssh", return_value=transport):
+                self.assertEqual(cli.main(["recovery", "--target", "t", "restore-gpt",
+                                           "--gpt-backup", str(backup), "--execute"]), 0)
+            pushes = [c for c in transport.calls if c[0] == "push"]
+            self.assertEqual(len(pushes), 4)
+            check = transport.calls.index(("shell", "recovery", "restore-gpt", "--check"))
+            confirm = transport.calls.index(("shell", "recovery", "restore-gpt", "--confirm"))
+            self.assertTrue(transport.calls.index(pushes[-1]) < check < confirm)
+            # Without --gpt-backup a stale pushed copy is removed and the
+            # recovery uses its RAM copy.
+            transport = FakeSsh()
+            with patch.object(cli, "Ssh", return_value=transport):
+                self.assertEqual(cli.main(["recovery", "--target", "t", "restore-gpt", "--execute"]), 0)
+            self.assertFalse([c for c in transport.calls if c[0] == "push"])
+            remove = transport.calls.index(("shell", "rm", "-rf", cli.GPT_RESTORE))
+            self.assertTrue(remove < transport.calls.index(("shell", "recovery", "restore-gpt", "--confirm")))
+            (backup / "table-9").write_bytes(b"x")
+            with patch.object(cli, "Ssh", return_value=FakeSsh()):
+                self.assertEqual(cli.main(["recovery", "--target", "t", "restore-gpt",
+                                           "--gpt-backup", str(backup)]), 1)
+
+    def test_mark_slot_successful_checks_before_confirming(self):
+        transport = FakeSsh()
+        with patch.object(cli, "Ssh", return_value=transport):
+            self.assertEqual(cli.main(["recovery", "--target", "t", "mark-slot-successful"]), 0)
+        self.assertIn(("shell", "recovery", "mark-slot-successful", "--check"), transport.calls)
+        self.assertNotIn(("shell", "recovery", "mark-slot-successful", "--confirm"), transport.calls)
+        transport = FakeSsh()
+        with patch.object(cli, "Ssh", return_value=transport):
+            self.assertEqual(cli.main(["recovery", "--target", "t", "mark-slot-successful", "--execute"]), 0)
+        check = transport.calls.index(("shell", "recovery", "mark-slot-successful", "--check"))
+        confirm = transport.calls.index(("shell", "recovery", "mark-slot-successful", "--confirm"))
+        self.assertLess(check, confirm)
+
     def test_ssh_target_and_argument_quoting(self):
         for target in (None, "", "-oProxyCommand=bad", "root@host command"):
             with self.assertRaises(cli.ToolError):
@@ -141,6 +245,19 @@ class MobileDeviceTests(unittest.TestCase):
                     with self.assertRaises(cli.ToolError):
                         cli.fastboot(args)
                     self.assertFalse(any(c.args[0][3:4] == ["flash"] for c in run.call_args_list))
+
+    def test_unverified_board_is_refused_before_device_access(self):
+        from test_boot_image import fit, make_v4_image
+        with tempfile.TemporaryDirectory() as directory:
+            args, _ = self.fastboot_fixture(directory)
+            for image in [make_v4_image(), make_v4_image(payload=fit()),
+                          make_v4_image('marble', vendor='xiaomi', gzipped=True, empty=True)]:
+                Path(args.image).write_bytes(image)
+                args.execute = True
+                with self.subTest(size=len(image)), patch.object(cli, "run") as run:
+                    with self.assertRaises(cli.ToolError):
+                        cli.fastboot(args)
+                    run.assert_not_called()
 
     def test_invalid_image_is_rejected_before_device_access(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -406,7 +523,13 @@ class MobileDeviceTests(unittest.TestCase):
              patch.object(cli, "stream_closure_tar") as stream:
             cli.recovery_install_initial(args, transport)
         stream.assert_not_called()
-        self.assertTrue(any(call[-1] == "--check" for call in transport.calls if call[0] == "shell"))
+        self.assertEqual([call[1] for call in transport.calls if call[0] == "push"],
+                         ["/tmp/mobile-device.TEST/manifest", "/tmp/mobile-device.TEST/registration"])
+        self.assertIn(("shell", "recovery", "install-initial-system",
+                       "/tmp/mobile-device.TEST/manifest",
+                       "/tmp/mobile-device.TEST/registration", "/nix/store/system",
+                       "4096", "--check"),
+                      transport.calls)
         self.assertFalse(any("--confirm" in call or "format-root" in call for call in transport.calls))
 
     def test_initial_install_parser_has_no_result_file(self):
@@ -414,6 +537,7 @@ class MobileDeviceTests(unittest.TestCase):
             self.assertEqual(cli.main(["recovery", "--target", "test", "install-initial",
                                        "/nix/store/system", "--bootstrap-info", "bootstrap"]), 0)
         self.assertFalse(hasattr(install.call_args.args[0], "result_file"))
+        self.assertFalse(hasattr(install.call_args.args[0], "u_boot"))
 
     def test_initial_install_wrong_device_fails_before_transfer(self):
         transport = FakeSsh(query="sheng")
@@ -425,6 +549,19 @@ class MobileDeviceTests(unittest.TestCase):
             with self.assertRaisesRegex(cli.ToolError, "does not match"):
                 cli.recovery_install_initial(args, transport)
         stream.assert_not_called()
+        self.assertFalse(any(call[0] == "push" for call in transport.calls))
+
+    def test_initial_install_rejects_recovery_that_can_write_firmware(self):
+        transport = FakeSsh(query="polaris")
+        transport.capabilities = ["install-initial"]
+        args = argparse.Namespace(system="ignored", bootstrap_info="ignored", execute=True)
+        with patch.object(cli, "local_system", return_value=Path("/nix/store/system")), \
+             patch.object(Path, "is_file", return_value=True), \
+             patch.object(Path, "read_text", return_value="polaris"), \
+             patch.object(cli, "closure_manifest") as manifest:
+            with self.assertRaisesRegex(cli.ToolError, "does not support system-only"):
+                cli.recovery_install_initial(args, transport)
+        manifest.assert_not_called()
         self.assertFalse(any(call[0] == "push" for call in transport.calls))
 
     def test_initial_install_uncertain_transfer_keeps_remote_inputs(self):

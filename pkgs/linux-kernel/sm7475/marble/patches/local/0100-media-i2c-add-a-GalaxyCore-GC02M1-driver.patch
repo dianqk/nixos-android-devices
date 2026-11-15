@@ -1,0 +1,935 @@
+From 2d7a4e793e10cecf514de8d87e73163f3a4e3a39 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Mon, 2 Nov 2026 08:04:29 +0800
+Subject: [PATCH 132/135] media: i2c: add a GalaxyCore GC02M1 driver
+
+Add a driver for the GalaxyCore GC02M1 2 MP sensor with one fixed mode:
+1600x1200 RAW10 over one D-PHY lane at 672 Mbps from a 19.2 MHz MCLK.
+
+The initialisation table is the vendor sequence of the Xiaomi Redmi Note
+12 Turbo macro module; it ends with the MIPI output off, which stream on
+enables after setting the stock mirror and flip (P0:0x17 = 0x83).
+
+Controls: exposure (0x03/0x04), frame length through vertical blanking
+(0x41/0x42, up to 0x3fff), read-only horizontal blanking (line length
+2192), pixel rate and link frequency, and a total gain in 1/1024 units
+that is split into an analogue step (0xb6) and a digital pre-gain
+(0xb1/0xb2, 1024 = 1x). The analogue steps are those of the Rockchip
+GC02M1 driver (Copyright (C) 2020 Rockchip Electronics Co., Ltd.,
+GPL-2.0), as posted in https://github.com/armbian/linux-rockchip/pull/609.
+
+Power sequencing follows the vendor module: reset asserted, DOVDD and
+AVDD, reset released, MCLK and 6 ms before the first register access.
+Runtime PM autosuspends after 2 s and keeps the sensor off for at least
+1.2 s: a Qualcomm CCI master that stays clocked across a sensor power
+cycle hangs until it reinitialises on runtime resume. The chip ID
+(0xf0/0xf1 = 0x02e0) is checked again at stream start, with one retry.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/media/i2c/Kconfig  |  12 +
+ drivers/media/i2c/Makefile |   1 +
+ drivers/media/i2c/gc02m1.c | 859 +++++++++++++++++++++++++++++++++++++
+ 3 files changed, 872 insertions(+)
+ create mode 100644 drivers/media/i2c/gc02m1.c
+
+diff --git a/drivers/media/i2c/Kconfig b/drivers/media/i2c/Kconfig
+index 5c52007f9c..f27109b735 100644
+--- a/drivers/media/i2c/Kconfig
++++ b/drivers/media/i2c/Kconfig
+@@ -60,6 +60,18 @@ config VIDEO_AR0521
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called ar0521.
+ 
++config VIDEO_GC02M1
++	tristate "GalaxyCore GC02M1 sensor support"
++	depends on OF && GPIOLIB
++	select V4L2_CCI_I2C
++	help
++	  This is a Video4Linux2 sensor driver for the GalaxyCore
++	  GC02M1
++	  camera.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called gc02m1.
++
+ config VIDEO_GC0308
+ 	tristate "GalaxyCore GC0308 sensor support"
+ 	select V4L2_CCI_I2C
+diff --git a/drivers/media/i2c/Makefile b/drivers/media/i2c/Makefile
+index d04bd57245..a183b5e56a 100644
+--- a/drivers/media/i2c/Makefile
++++ b/drivers/media/i2c/Makefile
+@@ -37,6 +37,7 @@ obj-$(CONFIG_VIDEO_DW9719) += dw9719.o
+ obj-$(CONFIG_VIDEO_DW9768) += dw9768.o
+ obj-$(CONFIG_VIDEO_DW9807_VCM) += dw9807-vcm.o
+ obj-$(CONFIG_VIDEO_ET8EK8) += et8ek8/
++obj-$(CONFIG_VIDEO_GC02M1) += gc02m1.o
+ obj-$(CONFIG_VIDEO_GC0308) += gc0308.o
+ obj-$(CONFIG_VIDEO_GC0310) += gc0310.o
+ obj-$(CONFIG_VIDEO_GC05A2) += gc05a2.o
+diff --git a/drivers/media/i2c/gc02m1.c b/drivers/media/i2c/gc02m1.c
+new file mode 100644
+index 0000000000..9cf3c49a3a
+--- /dev/null
++++ b/drivers/media/i2c/gc02m1.c
+@@ -0,0 +1,859 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * GalaxyCore GC02M1 image sensor driver
++ *
++ * One fixed mode: 1600x1200 RAW10, about 30 fps, one D-PHY lane at
++ * 672 Mbps from a 19.2 MHz MCLK. The initialisation table is the vendor
++ * sequence of a production camera module (Xiaomi Redmi Note 12 Turbo
++ * macro camera).
++ */
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/pm_runtime.h>
++#include <linux/regulator/consumer.h>
++#include <linux/units.h>
++
++#include <media/v4l2-cci.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-fwnode.h>
++#include <media/v4l2-subdev.h>
++
++/* Registers on page 0 unless noted; 0xfe selects the page. */
++#define GC02M1_REG_PAGE			CCI_REG8(0xfe)
++#define GC02M1_REG_CHIP_ID		CCI_REG16(0xf0)
++#define GC02M1_CHIP_ID			0x02e0
++#define GC02M1_REG_EXPOSURE		CCI_REG16(0x03)
++#define GC02M1_REG_FRAME_LENGTH		CCI_REG16(0x41)
++#define GC02M1_REG_ANALOG_GAIN		CCI_REG8(0xb6)
++#define GC02M1_REG_PRE_GAIN		CCI_REG16(0xb1)
++#define GC02M1_REG_FLIP			CCI_REG8(0x17)
++#define GC02M1_FLIP			0x83
++#define GC02M1_REG_MIPI_CTRL		CCI_REG8(0x3e)
++#define GC02M1_MIPI_STREAMING		0x90
++#define GC02M1_MIPI_STANDBY		0x00
++
++#define GC02M1_MCLK_FREQ		(19200 * HZ_PER_KHZ)
++#define GC02M1_LINK_FREQ		336000000LL
++/* Line length 2 x 0x0448 = 2192 pixel clocks. */
++#define GC02M1_PIXEL_RATE		84000000LL
++#define GC02M1_LINE_LENGTH		2192
++#define GC02M1_FRAME_LENGTH		1268
++#define GC02M1_FRAME_LENGTH_MAX		0x3fff
++
++#define GC02M1_AUTOSUSPEND_MS		2000
++/*
++ * Minimum time between power-off and power-on. A Qualcomm CCI master that
++ * stays clocked while the sensor's I/O supply is cycled hangs on its next
++ * transfer; the CCI is reinitialised when it runtime-resumes, which it
++ * does after 1 s without traffic.
++ */
++#define GC02M1_MIN_OFF_MS		1200
++
++#define GC02M1_WIDTH			1600
++#define GC02M1_HEIGHT			1200
++#define GC02M1_EXPOSURE_MARGIN		16
++#define GC02M1_EXPOSURE_MIN		4
++#define GC02M1_EXPOSURE_DEFAULT		1000
++
++/* Total gain in 1/1024 units: an analogue step and a digital pre-gain. */
++#define GC02M1_GAIN_MIN			1024
++#define GC02M1_GAIN_MAX			(12 * 1024)
++#define GC02M1_GAIN_DEFAULT		1024
++
++/* In power-up order; powered down in reverse. */
++static const char * const gc02m1_supply_names[] = {
++	"dovdd",	/* Digital I/O (1.8 V) */
++	"avdd",		/* Analogue (2.8 V) */
++};
++
++/*
++ * Analogue gain steps (gain in 1/1024, register value), from the Rockchip
++ * GC02M1 driver.
++ */
++static const u16 gc02m1_again_steps[][2] = {
++	{ 1024, 0 }, { 1536, 1 }, { 2035, 2 }, { 2519, 3 },
++	{ 3165, 4 }, { 3626, 5 }, { 4147, 6 }, { 4593, 7 },
++	{ 5095, 8 }, { 5697, 9 }, { 6270, 10 }, { 6714, 11 },
++	{ 7210, 12 }, { 7686, 13 }, { 8214, 14 }, { 10337, 15 },
++};
++
++static const struct cci_reg_sequence gc02m1_init_regs[] = {
++	{ CCI_REG8(0xfc), 0x01 },
++	{ CCI_REG8(0xf4), 0x41 },
++	{ CCI_REG8(0xf5), 0xc0 },
++	{ CCI_REG8(0xf6), 0x44 },
++	{ CCI_REG8(0xf8), 0x46 },
++	{ CCI_REG8(0xf9), 0x82 },
++	{ CCI_REG8(0xfa), 0x00 },
++	{ CCI_REG8(0xfd), 0x80 },
++	{ CCI_REG8(0xfc), 0x81 },
++	{ CCI_REG8(0xfe), 0x03 },
++	{ CCI_REG8(0x01), 0x0b },
++	{ CCI_REG8(0xf7), 0x01 },
++	{ CCI_REG8(0xfc), 0x80 },
++	{ CCI_REG8(0xfc), 0x80 },
++	{ CCI_REG8(0xfc), 0x80 },
++	{ CCI_REG8(0xfc), 0x8e },
++	{ CCI_REG8(0xfe), 0x00 },
++	{ CCI_REG8(0x87), 0x09 },
++	{ CCI_REG8(0xee), 0x72 },
++	{ CCI_REG8(0xfe), 0x01 },
++	{ CCI_REG8(0x8c), 0x90 },
++	{ CCI_REG8(0xfe), 0x00 },
++	{ CCI_REG8(0x90), 0x00 },
++	{ CCI_REG8(0x03), 0x04 },
++	{ CCI_REG8(0x04), 0x7d },
++	{ CCI_REG8(0x41), 0x04 },
++	{ CCI_REG8(0x42), 0xf4 },
++	{ CCI_REG8(0x05), 0x04 },
++	{ CCI_REG8(0x06), 0x48 },
++	{ CCI_REG8(0x07), 0x00 },
++	{ CCI_REG8(0x08), 0x18 },
++	{ CCI_REG8(0x9d), 0x18 },
++	{ CCI_REG8(0x09), 0x00 },
++	{ CCI_REG8(0x0a), 0x02 },
++	{ CCI_REG8(0x0d), 0x04 },
++	{ CCI_REG8(0x0e), 0xbc },
++	{ CCI_REG8(0x17), 0x83 },
++	{ CCI_REG8(0x19), 0x04 },
++	{ CCI_REG8(0x24), 0x00 },
++	{ CCI_REG8(0x56), 0x20 },
++	{ CCI_REG8(0x5b), 0x00 },
++	{ CCI_REG8(0x5e), 0x01 },
++	{ CCI_REG8(0x21), 0x3c },
++	{ CCI_REG8(0x44), 0x20 },
++	{ CCI_REG8(0xcc), 0x01 },
++	{ CCI_REG8(0x1a), 0x04 },
++	{ CCI_REG8(0x1f), 0x11 },
++	{ CCI_REG8(0x27), 0x30 },
++	{ CCI_REG8(0x2b), 0x00 },
++	{ CCI_REG8(0x33), 0x00 },
++	{ CCI_REG8(0x53), 0x90 },
++	{ CCI_REG8(0xe6), 0x50 },
++	{ CCI_REG8(0x39), 0x07 },
++	{ CCI_REG8(0x43), 0x04 },
++	{ CCI_REG8(0x46), 0x2a },
++	{ CCI_REG8(0x7c), 0xa0 },
++	{ CCI_REG8(0xd0), 0xbe },
++	{ CCI_REG8(0xd1), 0x60 },
++	{ CCI_REG8(0xd2), 0x40 },
++	{ CCI_REG8(0xd3), 0xf3 },
++	{ CCI_REG8(0xde), 0x1d },
++	{ CCI_REG8(0xcd), 0x05 },
++	{ CCI_REG8(0xce), 0x6f },
++	{ CCI_REG8(0xfc), 0x88 },
++	{ CCI_REG8(0xfe), 0x10 },
++	{ CCI_REG8(0xfe), 0x00 },
++	{ CCI_REG8(0xfc), 0x8e },
++	{ CCI_REG8(0xfe), 0x00 },
++	{ CCI_REG8(0xfe), 0x00 },
++	{ CCI_REG8(0xfe), 0x00 },
++	{ CCI_REG8(0xfe), 0x00 },
++	{ CCI_REG8(0xfc), 0x88 },
++	{ CCI_REG8(0xfe), 0x10 },
++	{ CCI_REG8(0xfe), 0x00 },
++	{ CCI_REG8(0xfc), 0x8e },
++	{ CCI_REG8(0xfe), 0x04 },
++	{ CCI_REG8(0xe0), 0x01 },
++	{ CCI_REG8(0xfe), 0x00 },
++	{ CCI_REG8(0xfe), 0x01 },
++	{ CCI_REG8(0x53), 0x44 },
++	{ CCI_REG8(0x87), 0x53 },
++	{ CCI_REG8(0x89), 0x03 },
++	{ CCI_REG8(0xfe), 0x00 },
++	{ CCI_REG8(0xb0), 0x74 },
++	{ CCI_REG8(0xb1), 0x04 },
++	{ CCI_REG8(0xb2), 0x00 },
++	{ CCI_REG8(0xb6), 0x00 },
++	{ CCI_REG8(0xfe), 0x04 },
++	{ CCI_REG8(0xd8), 0x00 },
++	{ CCI_REG8(0xc0), 0x40 },
++	{ CCI_REG8(0xc0), 0x00 },
++	{ CCI_REG8(0xc0), 0x00 },
++	{ CCI_REG8(0xc0), 0x00 },
++	{ CCI_REG8(0xc0), 0x60 },
++	{ CCI_REG8(0xc0), 0x00 },
++	{ CCI_REG8(0xc0), 0xc0 },
++	{ CCI_REG8(0xc0), 0x2a },
++	{ CCI_REG8(0xc0), 0x80 },
++	{ CCI_REG8(0xc0), 0x00 },
++	{ CCI_REG8(0xc0), 0x00 },
++	{ CCI_REG8(0xc0), 0x40 },
++	{ CCI_REG8(0xc0), 0xa0 },
++	{ CCI_REG8(0xc0), 0x00 },
++	{ CCI_REG8(0xc0), 0x90 },
++	{ CCI_REG8(0xc0), 0x19 },
++	{ CCI_REG8(0xc0), 0xc0 },
++	{ CCI_REG8(0xc0), 0x00 },
++	{ CCI_REG8(0xc0), 0xd0 },
++	{ CCI_REG8(0xc0), 0x2f },
++	{ CCI_REG8(0xc0), 0xe0 },
++	{ CCI_REG8(0xc0), 0x00 },
++	{ CCI_REG8(0xc0), 0x90 },
++	{ CCI_REG8(0xc0), 0x39 },
++	{ CCI_REG8(0xc0), 0x00 },
++	{ CCI_REG8(0xc0), 0x01 },
++	{ CCI_REG8(0xc0), 0x20 },
++	{ CCI_REG8(0xc0), 0x04 },
++	{ CCI_REG8(0xc0), 0x20 },
++	{ CCI_REG8(0xc0), 0x01 },
++	{ CCI_REG8(0xc0), 0xe0 },
++	{ CCI_REG8(0xc0), 0x0f },
++	{ CCI_REG8(0xc0), 0x40 },
++	{ CCI_REG8(0xc0), 0x01 },
++	{ CCI_REG8(0xc0), 0xe0 },
++	{ CCI_REG8(0xc0), 0x1a },
++	{ CCI_REG8(0xc0), 0x60 },
++	{ CCI_REG8(0xc0), 0x01 },
++	{ CCI_REG8(0xc0), 0x20 },
++	{ CCI_REG8(0xc0), 0x25 },
++	{ CCI_REG8(0xc0), 0x80 },
++	{ CCI_REG8(0xc0), 0x01 },
++	{ CCI_REG8(0xc0), 0xa0 },
++	{ CCI_REG8(0xc0), 0x2c },
++	{ CCI_REG8(0xc0), 0xa0 },
++	{ CCI_REG8(0xc0), 0x01 },
++	{ CCI_REG8(0xc0), 0xe0 },
++	{ CCI_REG8(0xc0), 0x32 },
++	{ CCI_REG8(0xc0), 0xc0 },
++	{ CCI_REG8(0xc0), 0x01 },
++	{ CCI_REG8(0xc0), 0x20 },
++	{ CCI_REG8(0xc0), 0x38 },
++	{ CCI_REG8(0xc0), 0xe0 },
++	{ CCI_REG8(0xc0), 0x01 },
++	{ CCI_REG8(0xc0), 0x60 },
++	{ CCI_REG8(0xc0), 0x3c },
++	{ CCI_REG8(0xc0), 0x00 },
++	{ CCI_REG8(0xc0), 0x02 },
++	{ CCI_REG8(0xc0), 0xa0 },
++	{ CCI_REG8(0xc0), 0x40 },
++	{ CCI_REG8(0xc0), 0x80 },
++	{ CCI_REG8(0xc0), 0x02 },
++	{ CCI_REG8(0xc0), 0x18 },
++	{ CCI_REG8(0xc0), 0x5c },
++	{ CCI_REG8(0xfe), 0x00 },
++	{ CCI_REG8(0x9f), 0x10 },
++	{ CCI_REG8(0xfe), 0x00 },
++	{ CCI_REG8(0x26), 0x20 },
++	{ CCI_REG8(0xfe), 0x01 },
++	{ CCI_REG8(0x40), 0x22 },
++	{ CCI_REG8(0x46), 0x7f },
++	{ CCI_REG8(0x49), 0x0f },
++	{ CCI_REG8(0x4a), 0xf0 },
++	{ CCI_REG8(0xfe), 0x04 },
++	{ CCI_REG8(0x14), 0x80 },
++	{ CCI_REG8(0x15), 0x80 },
++	{ CCI_REG8(0x16), 0x80 },
++	{ CCI_REG8(0x17), 0x80 },
++	{ CCI_REG8(0xfe), 0x01 },
++	{ CCI_REG8(0x41), 0x20 },
++	{ CCI_REG8(0x4c), 0x00 },
++	{ CCI_REG8(0x4d), 0x0c },
++	{ CCI_REG8(0x44), 0x08 },
++	{ CCI_REG8(0x48), 0x03 },
++	{ CCI_REG8(0xfe), 0x01 },
++	{ CCI_REG8(0x90), 0x01 },
++	{ CCI_REG8(0x91), 0x00 },
++	{ CCI_REG8(0x92), 0x06 },
++	{ CCI_REG8(0x93), 0x00 },
++	{ CCI_REG8(0x94), 0x06 },
++	{ CCI_REG8(0x95), 0x04 },
++	{ CCI_REG8(0x96), 0xb0 },
++	{ CCI_REG8(0x97), 0x06 },
++	{ CCI_REG8(0x98), 0x40 },
++	{ CCI_REG8(0xfe), 0x03 },
++	{ CCI_REG8(0x01), 0x23 },
++	{ CCI_REG8(0x03), 0xce },
++	{ CCI_REG8(0x04), 0x48 },
++	{ CCI_REG8(0x15), 0x00 },
++	{ CCI_REG8(0x21), 0x10 },
++	{ CCI_REG8(0x22), 0x05 },
++	{ CCI_REG8(0x23), 0x20 },
++	{ CCI_REG8(0x25), 0x20 },
++	{ CCI_REG8(0x26), 0x08 },
++	{ CCI_REG8(0x29), 0x06 },
++	{ CCI_REG8(0x2a), 0x0a },
++	{ CCI_REG8(0x2b), 0x08 },
++	{ CCI_REG8(0xfe), 0x01 },
++	{ CCI_REG8(0x8c), 0x10 },
++	{ CCI_REG8(0xfe), 0x00 },
++	{ CCI_REG8(0x3e), 0x00 },
++};
++
++struct gc02m1 {
++	struct device *dev;
++	struct regmap *regmap;
++	struct clk *mclk;
++	struct gpio_desc *reset_gpio;
++	struct regulator_bulk_data supplies[ARRAY_SIZE(gc02m1_supply_names)];
++
++	struct v4l2_subdev sd;
++	struct media_pad pad;
++
++	struct v4l2_ctrl_handler ctrls;
++	struct v4l2_ctrl *exposure;
++	struct v4l2_ctrl *vblank;
++
++	ktime_t power_off_time;
++};
++
++static inline struct gc02m1 *to_gc02m1(struct v4l2_subdev *sd)
++{
++	return container_of(sd, struct gc02m1, sd);
++}
++
++static void gc02m1_write_gain(struct gc02m1 *gc02m1, u32 gain, int *err)
++{
++	unsigned int i;
++	u32 pre;
++
++	for (i = ARRAY_SIZE(gc02m1_again_steps) - 1; i > 0; i--)
++		if (gain >= gc02m1_again_steps[i][0])
++			break;
++
++	/* The remainder as a digital pre-gain, 1024 = 1x. */
++	pre = gain * 1024 / gc02m1_again_steps[i][0];
++
++	cci_write(gc02m1->regmap, GC02M1_REG_ANALOG_GAIN,
++		  gc02m1_again_steps[i][1], err);
++	cci_write(gc02m1->regmap, GC02M1_REG_PRE_GAIN, pre, err);
++}
++
++static int gc02m1_set_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct gc02m1 *gc02m1 = container_of(ctrl->handler, struct gc02m1, ctrls);
++	int ret = 0;
++
++	if (ctrl->id == V4L2_CID_VBLANK) {
++		u32 max = GC02M1_HEIGHT + ctrl->val - GC02M1_EXPOSURE_MARGIN;
++
++		ret = __v4l2_ctrl_modify_range(gc02m1->exposure,
++					       gc02m1->exposure->minimum, max,
++					       gc02m1->exposure->step,
++					       min_t(u32, max,
++						     gc02m1->exposure->default_value));
++		if (ret)
++			return ret;
++	}
++
++	/* Registers are written when streaming starts. */
++	if (pm_runtime_get_if_in_use(gc02m1->dev) <= 0)
++		return 0;
++
++	cci_write(gc02m1->regmap, GC02M1_REG_PAGE, 0, &ret);
++	switch (ctrl->id) {
++	case V4L2_CID_EXPOSURE:
++		cci_write(gc02m1->regmap, GC02M1_REG_EXPOSURE, ctrl->val, &ret);
++		break;
++	case V4L2_CID_ANALOGUE_GAIN:
++		gc02m1_write_gain(gc02m1, ctrl->val, &ret);
++		break;
++	case V4L2_CID_VBLANK:
++		cci_write(gc02m1->regmap, GC02M1_REG_FRAME_LENGTH,
++			  GC02M1_HEIGHT + ctrl->val, &ret);
++		break;
++	default:
++		ret = -EINVAL;
++		break;
++	}
++
++	pm_runtime_put_autosuspend(gc02m1->dev);
++
++	return ret;
++}
++
++static const struct v4l2_ctrl_ops gc02m1_ctrl_ops = {
++	.s_ctrl = gc02m1_set_ctrl,
++};
++
++static const s64 gc02m1_link_freq = GC02M1_LINK_FREQ;
++
++static int gc02m1_init_controls(struct gc02m1 *gc02m1)
++{
++	struct v4l2_ctrl_handler *hdl = &gc02m1->ctrls;
++	struct v4l2_fwnode_device_properties props;
++	struct v4l2_ctrl *ctrl;
++	u32 hblank = GC02M1_LINE_LENGTH - GC02M1_WIDTH;
++	u32 vblank = GC02M1_FRAME_LENGTH - GC02M1_HEIGHT;
++	int ret;
++
++	ret = v4l2_fwnode_device_parse(gc02m1->dev, &props);
++	if (ret)
++		return ret;
++
++	v4l2_ctrl_handler_init(hdl, 8);
++
++	ctrl = v4l2_ctrl_new_int_menu(hdl, NULL, V4L2_CID_LINK_FREQ, 0, 0,
++				      &gc02m1_link_freq);
++	if (ctrl)
++		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_PIXEL_RATE, GC02M1_PIXEL_RATE,
++			  GC02M1_PIXEL_RATE, 1, GC02M1_PIXEL_RATE);
++
++	ctrl = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_HBLANK, hblank, hblank, 1,
++				 hblank);
++	if (ctrl)
++		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	gc02m1->vblank = v4l2_ctrl_new_std(hdl, &gc02m1_ctrl_ops,
++					   V4L2_CID_VBLANK, vblank,
++					   GC02M1_FRAME_LENGTH_MAX - GC02M1_HEIGHT,
++					   1, vblank);
++
++	gc02m1->exposure = v4l2_ctrl_new_std(hdl, &gc02m1_ctrl_ops,
++					     V4L2_CID_EXPOSURE,
++					     GC02M1_EXPOSURE_MIN,
++					     GC02M1_FRAME_LENGTH -
++					     GC02M1_EXPOSURE_MARGIN,
++					     1, GC02M1_EXPOSURE_DEFAULT);
++
++	v4l2_ctrl_new_std(hdl, &gc02m1_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
++			  GC02M1_GAIN_MIN, GC02M1_GAIN_MAX, 1,
++			  GC02M1_GAIN_DEFAULT);
++
++	v4l2_ctrl_new_fwnode_properties(hdl, &gc02m1_ctrl_ops, &props);
++
++	if (hdl->error) {
++		ret = hdl->error;
++		v4l2_ctrl_handler_free(hdl);
++		return dev_err_probe(gc02m1->dev, ret, "control init failed\n");
++	}
++
++	gc02m1->sd.ctrl_handler = hdl;
++
++	return 0;
++}
++
++static int gc02m1_identify(struct gc02m1 *gc02m1)
++{
++	u64 id;
++	int ret;
++
++	ret = cci_write(gc02m1->regmap, GC02M1_REG_PAGE, 0, NULL);
++	/* The CCI resets itself after a timeout; one retry recovers it. */
++	if (ret == -ETIMEDOUT)
++		ret = cci_write(gc02m1->regmap, GC02M1_REG_PAGE, 0, NULL);
++	if (!ret)
++		ret = cci_read(gc02m1->regmap, GC02M1_REG_CHIP_ID, &id, NULL);
++	if (ret)
++		return dev_err_probe(gc02m1->dev, ret, "failed to read chip ID\n");
++	if (id != GC02M1_CHIP_ID)
++		return dev_err_probe(gc02m1->dev, -ENODEV,
++				     "chip ID %#06llx, expected %#06x\n",
++				     id, GC02M1_CHIP_ID);
++
++	return 0;
++}
++
++static int gc02m1_enable_streams(struct v4l2_subdev *sd,
++				 struct v4l2_subdev_state *state, u32 pad,
++				 u64 streams_mask)
++{
++	struct gc02m1 *gc02m1 = to_gc02m1(sd);
++	int ret;
++
++	ret = pm_runtime_resume_and_get(gc02m1->dev);
++	if (ret < 0)
++		return ret;
++
++	ret = gc02m1_identify(gc02m1);
++	if (ret)
++		goto err_rpm_put;
++
++	ret = cci_multi_reg_write(gc02m1->regmap, gc02m1_init_regs,
++				  ARRAY_SIZE(gc02m1_init_regs), NULL);
++	if (ret) {
++		dev_err(gc02m1->dev, "failed to write init registers: %d\n", ret);
++		goto err_rpm_put;
++	}
++
++	ret = __v4l2_ctrl_handler_setup(gc02m1->sd.ctrl_handler);
++	if (ret)
++		goto err_rpm_put;
++
++	cci_write(gc02m1->regmap, GC02M1_REG_PAGE, 0, &ret);
++	cci_write(gc02m1->regmap, GC02M1_REG_FLIP, GC02M1_FLIP, &ret);
++	cci_write(gc02m1->regmap, GC02M1_REG_MIPI_CTRL, GC02M1_MIPI_STREAMING,
++		  &ret);
++	if (ret)
++		goto err_rpm_put;
++
++	return 0;
++
++err_rpm_put:
++	pm_runtime_put_autosuspend(gc02m1->dev);
++	return ret;
++}
++
++static int gc02m1_disable_streams(struct v4l2_subdev *sd,
++				  struct v4l2_subdev_state *state, u32 pad,
++				  u64 streams_mask)
++{
++	struct gc02m1 *gc02m1 = to_gc02m1(sd);
++	int ret = 0;
++
++	cci_write(gc02m1->regmap, GC02M1_REG_PAGE, 0, &ret);
++	cci_write(gc02m1->regmap, GC02M1_REG_MIPI_CTRL, GC02M1_MIPI_STANDBY,
++		  &ret);
++	if (ret)
++		dev_err(gc02m1->dev, "failed to stop streaming: %d\n", ret);
++
++	pm_runtime_put_autosuspend(gc02m1->dev);
++
++	return ret;
++}
++
++static void gc02m1_fill_format(struct v4l2_mbus_framefmt *fmt)
++{
++	fmt->width = GC02M1_WIDTH;
++	fmt->height = GC02M1_HEIGHT;
++	fmt->code = MEDIA_BUS_FMT_SBGGR10_1X10;
++	fmt->field = V4L2_FIELD_NONE;
++	fmt->colorspace = V4L2_COLORSPACE_RAW;
++	fmt->ycbcr_enc = V4L2_YCBCR_ENC_601;
++	fmt->quantization = V4L2_QUANTIZATION_FULL_RANGE;
++	fmt->xfer_func = V4L2_XFER_FUNC_NONE;
++}
++
++static int gc02m1_enum_mbus_code(struct v4l2_subdev *sd,
++				 struct v4l2_subdev_state *state,
++				 struct v4l2_subdev_mbus_code_enum *code)
++{
++	if (code->index)
++		return -EINVAL;
++
++	code->code = MEDIA_BUS_FMT_SBGGR10_1X10;
++
++	return 0;
++}
++
++static int gc02m1_enum_frame_size(struct v4l2_subdev *sd,
++				  struct v4l2_subdev_state *state,
++				  struct v4l2_subdev_frame_size_enum *fse)
++{
++	if (fse->index || fse->code != MEDIA_BUS_FMT_SBGGR10_1X10)
++		return -EINVAL;
++
++	fse->min_width = GC02M1_WIDTH;
++	fse->max_width = GC02M1_WIDTH;
++	fse->min_height = GC02M1_HEIGHT;
++	fse->max_height = GC02M1_HEIGHT;
++
++	return 0;
++}
++
++static int gc02m1_set_format(struct v4l2_subdev *sd,
++			     struct v4l2_subdev_state *state,
++			     struct v4l2_subdev_format *fmt)
++{
++	gc02m1_fill_format(&fmt->format);
++	*v4l2_subdev_state_get_format(state, 0) = fmt->format;
++
++	return 0;
++}
++
++static int gc02m1_get_selection(struct v4l2_subdev *sd,
++				struct v4l2_subdev_state *state,
++				struct v4l2_subdev_selection *sel)
++{
++	switch (sel->target) {
++	case V4L2_SEL_TGT_CROP:
++	case V4L2_SEL_TGT_CROP_DEFAULT:
++	case V4L2_SEL_TGT_CROP_BOUNDS:
++	case V4L2_SEL_TGT_NATIVE_SIZE:
++		sel->r.left = 0;
++		sel->r.top = 0;
++		sel->r.width = GC02M1_WIDTH;
++		sel->r.height = GC02M1_HEIGHT;
++		return 0;
++	}
++
++	return -EINVAL;
++}
++
++static int gc02m1_init_state(struct v4l2_subdev *sd,
++			     struct v4l2_subdev_state *state)
++{
++	gc02m1_fill_format(v4l2_subdev_state_get_format(state, 0));
++
++	return 0;
++}
++
++static const struct v4l2_subdev_video_ops gc02m1_video_ops = {
++	.s_stream = v4l2_subdev_s_stream_helper,
++};
++
++static const struct v4l2_subdev_pad_ops gc02m1_pad_ops = {
++	.enum_mbus_code = gc02m1_enum_mbus_code,
++	.enum_frame_size = gc02m1_enum_frame_size,
++	.get_fmt = v4l2_subdev_get_fmt,
++	.set_fmt = gc02m1_set_format,
++	.get_selection = gc02m1_get_selection,
++	.enable_streams = gc02m1_enable_streams,
++	.disable_streams = gc02m1_disable_streams,
++};
++
++static const struct v4l2_subdev_ops gc02m1_subdev_ops = {
++	.video = &gc02m1_video_ops,
++	.pad = &gc02m1_pad_ops,
++};
++
++static const struct v4l2_subdev_internal_ops gc02m1_internal_ops = {
++	.init_state = gc02m1_init_state,
++};
++
++/*
++ * Power sequencing follows the vendor module: reset asserted, DOVDD and
++ * AVDD, reset released, then MCLK and 6 ms before the first register
++ * access. Power-down stops MCLK, asserts reset 5 ms later and removes the
++ * supplies in reverse.
++ */
++static int gc02m1_power_on(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct gc02m1 *gc02m1 = to_gc02m1(sd);
++	unsigned int i;
++	s64 off;
++	int ret;
++
++	off = ktime_ms_delta(ktime_get(), gc02m1->power_off_time);
++	if (gc02m1->power_off_time && off >= 0 && off < GC02M1_MIN_OFF_MS)
++		msleep(GC02M1_MIN_OFF_MS - off);
++
++	gpiod_set_value_cansleep(gc02m1->reset_gpio, 1);
++
++	for (i = 0; i < ARRAY_SIZE(gc02m1->supplies); i++) {
++		ret = regulator_enable(gc02m1->supplies[i].consumer);
++		if (ret) {
++			dev_err(dev, "failed to enable %s: %d\n",
++				gc02m1->supplies[i].supply, ret);
++			goto err_supplies;
++		}
++		usleep_range(1000, 1500);
++	}
++	usleep_range(3000, 3500);
++
++	gpiod_set_value_cansleep(gc02m1->reset_gpio, 0);
++	usleep_range(1000, 1500);
++
++	ret = clk_prepare_enable(gc02m1->mclk);
++	if (ret) {
++		dev_err(dev, "failed to enable clock: %d\n", ret);
++		goto err_reset;
++	}
++	usleep_range(6000, 7000);
++
++	return 0;
++
++err_reset:
++	gpiod_set_value_cansleep(gc02m1->reset_gpio, 1);
++err_supplies:
++	while (i--)
++		regulator_disable(gc02m1->supplies[i].consumer);
++	gc02m1->power_off_time = ktime_get();
++	return ret;
++}
++
++static int gc02m1_power_off(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct gc02m1 *gc02m1 = to_gc02m1(sd);
++	unsigned int i;
++
++	clk_disable_unprepare(gc02m1->mclk);
++	usleep_range(5000, 5500);
++
++	gpiod_set_value_cansleep(gc02m1->reset_gpio, 1);
++	usleep_range(1000, 1500);
++
++	for (i = ARRAY_SIZE(gc02m1->supplies); i--;)
++		regulator_disable(gc02m1->supplies[i].consumer);
++	gc02m1->power_off_time = ktime_get();
++
++	return 0;
++}
++
++static int gc02m1_parse_endpoint(struct gc02m1 *gc02m1)
++{
++	struct v4l2_fwnode_endpoint ep = { .bus_type = V4L2_MBUS_CSI2_DPHY };
++	struct fwnode_handle *endpoint;
++	unsigned long link_freq_bitmap;
++	int ret;
++
++	endpoint = fwnode_graph_get_endpoint_by_id(dev_fwnode(gc02m1->dev), 0, 0,
++						   FWNODE_GRAPH_ENDPOINT_NEXT);
++	if (!endpoint)
++		return dev_err_probe(gc02m1->dev, -EINVAL, "missing endpoint\n");
++
++	ret = v4l2_fwnode_endpoint_alloc_parse(endpoint, &ep);
++	fwnode_handle_put(endpoint);
++	if (ret)
++		return dev_err_probe(gc02m1->dev, ret, "failed to parse endpoint\n");
++
++	if (ep.bus.mipi_csi2.num_data_lanes != 1) {
++		ret = dev_err_probe(gc02m1->dev, -EINVAL,
++				    "%u data lanes unsupported, need 1\n",
++				    ep.bus.mipi_csi2.num_data_lanes);
++		goto out;
++	}
++
++	ret = v4l2_link_freq_to_bitmap(gc02m1->dev, ep.link_frequencies,
++				       ep.nr_of_link_frequencies,
++				       &gc02m1_link_freq, 1, &link_freq_bitmap);
++out:
++	v4l2_fwnode_endpoint_free(&ep);
++	return ret;
++}
++
++static int gc02m1_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct gc02m1 *gc02m1;
++	unsigned long rate;
++	unsigned int i;
++	int ret;
++
++	gc02m1 = devm_kzalloc(dev, sizeof(*gc02m1), GFP_KERNEL);
++	if (!gc02m1)
++		return -ENOMEM;
++
++	gc02m1->dev = dev;
++	v4l2_i2c_subdev_init(&gc02m1->sd, client, &gc02m1_subdev_ops);
++
++	ret = gc02m1_parse_endpoint(gc02m1);
++	if (ret)
++		return ret;
++
++	gc02m1->regmap = devm_cci_regmap_init_i2c(client, 8);
++	if (IS_ERR(gc02m1->regmap))
++		return dev_err_probe(dev, PTR_ERR(gc02m1->regmap),
++				     "failed to init CCI\n");
++
++	gc02m1->mclk = devm_clk_get(dev, NULL);
++	if (IS_ERR(gc02m1->mclk))
++		return dev_err_probe(dev, PTR_ERR(gc02m1->mclk),
++				     "failed to get clock\n");
++
++	rate = clk_get_rate(gc02m1->mclk);
++	if (rate != GC02M1_MCLK_FREQ)
++		return dev_err_probe(dev, -EINVAL,
++				     "clock %lu Hz unsupported, need %lu Hz\n",
++				     rate, GC02M1_MCLK_FREQ);
++
++	gc02m1->reset_gpio = devm_gpiod_get_optional(dev, "reset",
++						     GPIOD_OUT_HIGH);
++	if (IS_ERR(gc02m1->reset_gpio))
++		return dev_err_probe(dev, PTR_ERR(gc02m1->reset_gpio),
++				     "failed to get reset GPIO\n");
++
++	for (i = 0; i < ARRAY_SIZE(gc02m1_supply_names); i++)
++		gc02m1->supplies[i].supply = gc02m1_supply_names[i];
++	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(gc02m1->supplies),
++				      gc02m1->supplies);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to get regulators\n");
++
++	ret = gc02m1_power_on(dev);
++	if (ret)
++		return ret;
++
++	ret = gc02m1_identify(gc02m1);
++	if (ret)
++		goto err_power_off;
++
++	ret = gc02m1_init_controls(gc02m1);
++	if (ret)
++		goto err_power_off;
++
++	gc02m1->sd.internal_ops = &gc02m1_internal_ops;
++	gc02m1->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
++	gc02m1->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
++	gc02m1->pad.flags = MEDIA_PAD_FL_SOURCE;
++
++	ret = media_entity_pads_init(&gc02m1->sd.entity, 1, &gc02m1->pad);
++	if (ret) {
++		dev_err_probe(dev, ret, "failed to init entity pads\n");
++		goto err_free_ctrls;
++	}
++
++	gc02m1->sd.state_lock = gc02m1->ctrls.lock;
++	ret = v4l2_subdev_init_finalize(&gc02m1->sd);
++	if (ret) {
++		dev_err_probe(dev, ret, "failed to init subdev\n");
++		goto err_entity;
++	}
++
++	pm_runtime_set_active(dev);
++	pm_runtime_get_noresume(dev);
++	pm_runtime_enable(dev);
++	pm_runtime_set_autosuspend_delay(dev, GC02M1_AUTOSUSPEND_MS);
++	pm_runtime_use_autosuspend(dev);
++
++	ret = v4l2_async_register_subdev_sensor(&gc02m1->sd);
++	if (ret) {
++		dev_err_probe(dev, ret, "failed to register subdev\n");
++		goto err_pm;
++	}
++
++	pm_runtime_put_autosuspend(dev);
++
++	return 0;
++
++err_pm:
++	pm_runtime_dont_use_autosuspend(dev);
++	pm_runtime_disable(dev);
++	pm_runtime_set_suspended(dev);
++	pm_runtime_put_noidle(dev);
++	v4l2_subdev_cleanup(&gc02m1->sd);
++err_entity:
++	media_entity_cleanup(&gc02m1->sd.entity);
++err_free_ctrls:
++	v4l2_ctrl_handler_free(&gc02m1->ctrls);
++err_power_off:
++	gc02m1_power_off(dev);
++	return ret;
++}
++
++static void gc02m1_remove(struct i2c_client *client)
++{
++	struct v4l2_subdev *sd = i2c_get_clientdata(client);
++	struct gc02m1 *gc02m1 = to_gc02m1(sd);
++
++	v4l2_async_unregister_subdev(sd);
++	v4l2_subdev_cleanup(sd);
++	media_entity_cleanup(&sd->entity);
++	v4l2_ctrl_handler_free(&gc02m1->ctrls);
++
++	pm_runtime_dont_use_autosuspend(gc02m1->dev);
++	pm_runtime_disable(gc02m1->dev);
++	if (!pm_runtime_status_suspended(gc02m1->dev))
++		gc02m1_power_off(gc02m1->dev);
++	pm_runtime_set_suspended(gc02m1->dev);
++}
++
++static DEFINE_RUNTIME_DEV_PM_OPS(gc02m1_pm_ops, gc02m1_power_off,
++				 gc02m1_power_on, NULL);
++
++static const struct of_device_id gc02m1_of_match[] = {
++	{ .compatible = "galaxycore,gc02m1" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, gc02m1_of_match);
++
++static struct i2c_driver gc02m1_driver = {
++	.driver = {
++		.name = "gc02m1",
++		.of_match_table = gc02m1_of_match,
++		.pm = pm_ptr(&gc02m1_pm_ops),
++	},
++	.probe = gc02m1_probe,
++	.remove = gc02m1_remove,
++};
++module_i2c_driver(gc02m1_driver);
++
++MODULE_DESCRIPTION("GalaxyCore GC02M1 image sensor driver");
++MODULE_LICENSE("GPL");

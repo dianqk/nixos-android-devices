@@ -1,0 +1,275 @@
+From: dianqk <dianqk@dianqk.net>
+Subject: [PATCH] Require completed modem stop before reporting shutdown
+
+A queued stop request is not completion. Retry the kernel's EINPROGRESS
+status within the existing stop deadline, then require the raw GATED state.
+Return failure for a latched stop error, unknown state or deadline, close
+owned descriptors once, and use the same shutdown path on lifetime expiry.
+Module unload and manual unbind remain unsupported.
+
+Link: https://github.com/MT6895-Mainline/mtk-ccci-userspace/tree/f6147b10cf7ef95932674506fbdfb7f3d67a1067
+---
+diff --git a/src/mtk_ccci_userspace/mdinit.py b/src/mtk_ccci_userspace/mdinit.py
+--- a/src/mtk_ccci_userspace/mdinit.py
++++ b/src/mtk_ccci_userspace/mdinit.py
+@@ -74,6 +74,7 @@
+ import time
+ import ctypes, os, fcntl, struct, sys, time, signal, threading, binascii, mmap, select, glob, stat
+ import fnmatch
++import errno
+ 
+ __version__ = "0.1.0"
+ 
+@@ -479,55 +480,60 @@
+ 
+ 
+ def md_stop_hw():
+-    """qqcandy: actually power the modem down before we go away.
+-
+-    The old bye() only closed the fds and printed "modem will be stopped",
+-    which was not true: the MD kept running across a warm reboot, so the next
+-    boot's CCCI handshake met a live modem in an unknown state, hung, and the
+-    15 s hardware watchdog had to recover it.  Cold boot was always fine.
+-    stock's ccci_mdinit stops the modem on the way out; do the same here.
+-
+-    CCCI_IOC_DO_STOP_MD takes an unsigned int *: 0 = normal stop (power off),
+-    non-zero = flight mode.  fsm_append_command(CCCI_COMMAND_STOP) performs the
+-    hardware stop asynchronously, so wait for the state to drop.
+-    """
++    """Request stop once; require completed FSM stop and the raw GATED state."""
+     if mon_fd is None:
+-        return
++        return True
+     try:
+         buf = bytearray(struct.pack("<I", 0))
+-        r = fcntl.ioctl(mon_fd, CCCI_IOC_DO_STOP_MD, buf, True)
+-        log("DO_STOP_MD ioctl -> %d" % r)
+-    except OSError as e:
+-        log("DO_STOP_MD ioctl failed: %s" % e)
+-        return
+-    st = -1
+-    for _ in range(40):                      # up to 4 s for the FSM to finish
++        result = fcntl.ioctl(mon_fd, CCCI_IOC_DO_STOP_MD, buf, True)
++        log("DO_STOP_MD ioctl -> %d" % result)
++        if result != 0:
++            return False
++    except OSError as error:
++        log("DO_STOP_MD ioctl failed: %s" % error)
++        return False
++    deadline = time.monotonic() + 4.0
++    while time.monotonic() < deadline:
+         try:
+-            b = bytearray(struct.pack("<I", 0))
+-            fcntl.ioctl(mon_fd, CCCI_IOC_GET_MD_STATE, b, True)
+-            st = struct.unpack("<I", b)[0]
+-        except OSError:
+-            break
+-        if st in (0, 3):                     # INVALID / EXCEPTION => no longer up
+-            log("modem state now %d; hardware stopped" % st)
+-            return
++            buf = bytearray(struct.pack("<I", 0))
++            result = fcntl.ioctl(mon_fd, CCCI_IOC_GET_MD_STATE, buf, True)
++            state = struct.unpack("<I", buf)[0]
++            if result != 0 or state not in (0, 1, 2, 3):
++                log("stop state query returned unexpected result %r/%r" % (result, state))
++                return False
++            with open("/sys/kernel/ccci/boot", "r") as source:
++                raw = source.read().split("|", 1)[0].strip()
++        except OSError as error:
++            if error.errno == errno.EINPROGRESS:
++                time.sleep(0.1)
++                continue
++            log("stop state query failed: %s" % error)
++            return False
++        if raw == "md1:1":
++            log("GATED stop completion observed")
++            return True
++        if raw not in ("md1:0", "md1:2", "md1:3", "md1:4", "md1:5"):
++            log("stop state is unknown or failed: %r" % raw)
++            return False
+         time.sleep(0.1)
+-    log("modem still state %d after stop wait; closing anyway" % st)
++    log("modem stop was not confirmed before the deadline")
++    return False
+ 
+ 
+ def bye(signum, frame):
+     log("signal %d: stopping modem hardware, then closing fds" % signum)
+-    try:
+-        md_stop_hw()
+-    except Exception as e:
+-        log("md_stop_hw raised: %r" % (e,))
+-    for fd in (rpc_fd, fs_fd, mon_fd):
++    stopped = False
++    try:
++        stopped = md_stop_hw()
++    except Exception as error:
++        log("md_stop_hw raised: %r" % (error,))
++    for fd in dict.fromkeys((rpc_fd, fs_fd, mon_fd)):
+         if fd is not None:
+             try:
+                 os.close(fd)
+             except OSError:
+                 pass
+-    sys.exit(0)
++    sys.exit(0 if stopped else 1)
+ 
+ 
+ # ------------------------------------------------------------------ protocol
+@@ -2789,7 +2795,5 @@
+         hl = {k: v["path"] for k, v in handles.items()}
+     log("alive %ds handles=%r" % (time.time() - start, hl))
+ 
+-log("lifetime done: closing fds, modem will be stopped")
+-os.close(mon_fd)
+-os.close(fs_fd)
+-os.close(rpc_fd)
++log("lifetime done: stopping modem hardware")
++bye(0, None)
+diff --git a/tests/test_runner.py b/tests/test_runner.py
+--- a/tests/test_runner.py
++++ b/tests/test_runner.py
+@@ -3,6 +3,7 @@
+ import test_launcher
+ import test_fs_contract
+ import test_drdi
++import test_stop
+ 
+ 
+ def main():
+@@ -20,7 +21,9 @@
+     test_fs_contract.test_private_drive_and_missing_ota()
+     test_drdi.test_drdi_start_and_copies()
+     test_fs_contract.test_cmpt_read2_and_restore_use_the_working_copy()
+-    print("PASS: 14 userspace source, RPC, FS, and launcher checks")
++    test_stop.test_stop_contract()
++    test_stop.test_bye_status_and_cleanup()
++    print("PASS: 16 userspace source, RPC, FS, launcher, and stop checks")
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tests/test_stop.py b/tests/test_stop.py
+--- /dev/null
++++ b/tests/test_stop.py
+@@ -0,0 +1,121 @@
++"""Run owner shutdown functions without importing its device-serving module."""
++import ast
++import errno
++import io
++from pathlib import Path
++import struct
++import types
++
++SOURCE = Path(__file__).resolve().parents[1] / "src/mtk_ccci_userspace/mdinit.py"
++
++
++def owner(samples=(), request_error=None, raw_error=None):
++    tree = ast.parse(SOURCE.read_text())
++    body = [node for node in tree.body if isinstance(node, ast.FunctionDef)
++            and node.name in ("md_stop_hw", "bye")]
++    body += [node for node in tree.body if isinstance(node, ast.Assign)
++             and any(isinstance(t, ast.Name) and t.id in
++                     ("CCCI_IOC_DO_STOP_MD", "CCCI_IOC_GET_MD_STATE") for t in node.targets)]
++    rows = list(samples) or [(0, "md1:4")]
++    clock = [0.0]
++    logs, closed, requests, queries = [], [], [], []
++    current = [rows[0]]
++
++    def ioctl(fd, command, buf, mutate):
++        if command == namespace["CCCI_IOC_DO_STOP_MD"]:
++            requests.append(command)
++            if request_error:
++                raise request_error
++            return 0
++        queries.append(command)
++        row = rows.pop(0) if len(rows) > 1 else rows[0]
++        current[0] = row
++        if isinstance(row, OSError):
++            raise row
++        buf[:] = struct.pack("<I", row[0])
++        return 0
++
++    def read_raw(path, mode):
++        assert path == "/sys/kernel/ccci/boot" and mode == "r"
++        if raw_error:
++            raise raw_error
++        return io.StringIO(current[0][1] + " | extra diagnostics\n")
++
++    def sleep(seconds):
++        clock[0] += seconds
++
++    def exit_status(status):
++        raise SystemExit(status)
++
++    namespace = {"mon_fd": 10, "fs_fd": 11, "rpc_fd": 12,
++                 "struct": struct, "errno": errno, "log": logs.append,
++                 "fcntl": types.SimpleNamespace(ioctl=ioctl), "open": read_raw,
++                 "time": types.SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep),
++                 "os": types.SimpleNamespace(close=closed.append),
++                 "sys": types.SimpleNamespace(exit=exit_status)}
++    exec(compile(ast.Module(body=body, type_ignores=[]), str(SOURCE), "exec"), namespace)
++    return namespace, logs, closed, requests, queries, clock
++
++
++def test_stop_contract():
++    # Public INVALID/EXCEPTION are not physical stop completion.
++    for sample in [(0, "md1:4"), (3, "md1:5"), (0, "md1:0"),
++                   (9, "md1:1"), (0, "md1:99"), (0, "unknown")]:
++        ns, logs, _, requests, _, _ = owner([sample])
++        assert ns["md_stop_hw"]() is False
++        assert len(requests) == 1 and not any("completion observed" in s for s in logs)
++    for error in [OSError(errno.EIO, "failed"), OSError(errno.ETIMEDOUT, "failed")]:
++        ns, _, _, _, queries, _ = owner(request_error=error)
++        assert ns["md_stop_hw"]() is False and not queries
++        ns, _, _, _, queries, _ = owner([error])
++        assert ns["md_stop_hw"]() is False and len(queries) == 1
++    ns, _, _, _, _, _ = owner([(0, "md1:1")], raw_error=OSError(errno.EIO, "read"))
++    assert ns["md_stop_hw"]() is False
++    # Accepted STOP can be queued behind START while the old raw state is GATED.
++    busy = OSError(errno.EINPROGRESS, "pending stop")
++    ns, logs, _, requests, queries, _ = owner([busy, busy, (0, "md1:1")])
++    assert ns["md_stop_hw"]() is True and len(queries) == 3 and len(requests) == 1
++    assert logs[-1] == "GATED stop completion observed"
++    ns, _, _, _, queries, clock = owner([busy])
++    assert ns["md_stop_hw"]() is False and clock[0] >= 4 and len(queries) <= 41
++    # Request accepted first; the later GET reports the asynchronously latched errno.
++    ns, _, _, requests, queries, _ = owner([(0, "md1:4"), OSError(errno.EBUSY, "stop failed")])
++    assert ns["md_stop_hw"]() is False and len(requests) == 1 and len(queries) == 2
++    ns, _, _, requests, _, _ = owner()
++    ns["mon_fd"] = None
++    assert ns["md_stop_hw"]() is True and not requests
++
++
++def test_bye_status_and_cleanup():
++    for result in [True, False, RuntimeError("failure")]:
++        ns, _, closed, _, _, _ = owner()
++
++        def stop():
++            if isinstance(result, Exception):
++                raise result
++            return result
++
++        ns["md_stop_hw"] = stop
++        ns["rpc_fd"] = ns["fs_fd"]  # Each owned descriptor is closed only once.
++        try:
++            ns["bye"](15, None)
++        except SystemExit as status:
++            assert status.code == (0 if result is True else 1)
++        else:
++            raise AssertionError("bye did not exit")
++        assert closed == [11, 10]
++    # Execute the actual lifetime-expiry tail, not a duplicate shutdown model.
++    tree = ast.parse(SOURCE.read_text())
++    last = tree.body[-1]
++    assert isinstance(last, ast.Expr) and isinstance(last.value, ast.Call)
++    assert isinstance(last.value.func, ast.Name) and last.value.func.id == "bye"
++    calls = []
++    exec(compile(ast.Module(body=[last], type_ignores=[]), str(SOURCE), "exec"),
++         {"bye": lambda signum, frame: calls.append((signum, frame))})
++    assert calls == [(0, None)]
++
++
++if __name__ == "__main__":
++    test_stop_contract()
++    test_bye_status_and_cleanup()
++    print("Owner production AST stop completion/error/cleanup PASS")

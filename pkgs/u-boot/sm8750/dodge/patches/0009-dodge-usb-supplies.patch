@@ -1,0 +1,526 @@
+From df2a15ad94b12859f5452014b0e00e1419d354ed Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 22:41:34 +0800
+Subject: [PATCH] phy: qcom: initialize Dodge USB supply dependencies
+
+Resolve the M31 and PMI H010 repeater supplies through regulator APIs instead of relying on ABL votes. Describe the Dodge USB rails and their complete parent chains using the existing Linux board data, with its SM8750 command database and RPMh RSC layout.
+
+Preserve valid enabled rail settings, retain shared votes during PHY power-off, propagate read and enable failures, and reject unavailable parent settings instead of guessing analog headroom. Round requested regulator settings up to supported selectors without exceeding board constraints. Use the v3 register layout for RSC major versions at least three, matching Linux.
+
+This is a local U-Boot API adaptation. The original imported PHY and board source attribution remains in the preceding patches; no unrelated board regulator values or tuning are imported.
+
+Link: https://github.com/torvalds/linux/tree/c03c1a14507dfaf8b856c2608f9ac216021fc222/drivers/phy/qualcomm
+
+Link: https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/drivers/soc/qcom/rpmh-rsc.c
+
+Link: https://github.com/mrlund/linux-omarchy-mobile/commit/9613d6de1c8c93433250d49b8ce08dafa7a01203
+---
+ drivers/phy/qcom/phy-dodge-eusb2-repeater.c   |  53 ++++++-
+ drivers/phy/qcom/phy-qcom-m31-eusb2.c         |  43 +++++-
+ drivers/power/regulator/qcom-rpmh-regulator.c |  67 ++++++++-
+ drivers/soc/qcom/rpmh-rsc.c                   |   2 +-
+ .../src/arm64/qcom/sm8750-oneplus-dodge.dts   | 134 +++++++++++++++++-
+ 5 files changed, 288 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/phy/qcom/phy-dodge-eusb2-repeater.c b/drivers/phy/qcom/phy-dodge-eusb2-repeater.c
+index ae098234..8808ac8e 100644
+--- a/drivers/phy/qcom/phy-dodge-eusb2-repeater.c
++++ b/drivers/phy/qcom/phy-dodge-eusb2-repeater.c
+@@ -3,12 +3,17 @@
+  * PMI H010 device-mode repeater for OnePlus 13.
+  * Register protocol follows Linux phy-qcom-eusb2-repeater.c (Abel Vesa).
+  * Tuning is the PJZ110 shipped qcom,param-override-seq, not PM8550B defaults.
+- * ABL owns the shared supply votes.
++ * Shared supply votes remain enabled for the operating-system handoff.
+  */
+ #include <dm.h>
+ #include <generic-phy.h>
+ #include <power/pmic.h>
++#include <power/regulator.h>
+ #include <linux/delay.h>
++struct dodge_repeater_priv {
++	struct udevice *supplies[2];
++};
++
+ static int dodge_repeater_init(struct phy *phy)
+ {
+ 	static const struct {
+@@ -19,7 +24,37 @@ static int dodge_repeater_init(struct phy *phy)
+ 		{ 0x55, 0x02 }, { 0x57, 0x04 },
+ 
+ 	};
++	struct dodge_repeater_priv *p = dev_get_priv(phy->dev);
+ 	int i, ret;
++
++	for (i = 0; i < ARRAY_SIZE(p->supplies); i++) {
++		struct dm_regulator_uclass_plat *plat = dev_get_uclass_plat(p->supplies[i]);
++
++		int uv = regulator_get_value(p->supplies[i]);
++		int enabled;
++
++		if (uv < 0 && uv != -ENODATA)
++			return uv;
++		enabled = regulator_get_enable(p->supplies[i]);
++		if (enabled < 0)
++			return enabled;
++		if (enabled && (uv <= 0 || uv < plat->min_uV ||
++				(plat->max_uV > 0 && uv > plat->max_uV)))
++			return -EINVAL;
++		if (!enabled) {
++			if (uv <= 0)
++				uv = plat->min_uV;
++			if (uv < plat->min_uV ||
++			    (plat->max_uV > 0 && uv > plat->max_uV))
++				return -EINVAL;
++			ret = regulator_set_value(p->supplies[i], uv);
++			if (ret)
++				return ret;
++		}
++		ret = regulator_set_enable(p->supplies[i], true);
++		if (ret)
++			return ret;
++	}
+ 	ret = pmic_clrsetbits(phy->dev->parent, 0xfd46, 0x80, 0x80);
+ 	if (ret)
+ 		return ret;
+@@ -46,6 +81,20 @@ static int dodge_repeater_init(struct phy *phy)
+ 	}
+ 	return -ETIMEDOUT;
+ }
++static int dodge_repeater_probe(struct udevice *dev)
++{
++	struct dodge_repeater_priv *p = dev_get_priv(dev);
++	const char * const names[] = { "vdd18-supply", "vdd3-supply" };
++	int i, ret;
++
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		ret = device_get_supply_regulator(dev, names[i], &p->supplies[i]);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
+ static struct phy_ops dodge_repeater_ops = { .init = dodge_repeater_init };
+ static const struct udevice_id dodge_repeater_ids[] = {
+ 	{ .compatible = "oneplus,dodge-eusb2-repeater" },
+@@ -56,4 +105,6 @@ U_BOOT_DRIVER(dodge_eusb2_repeater) = {
+ 	.id = UCLASS_PHY,
+ 	.of_match = dodge_repeater_ids,
+ 	.ops = &dodge_repeater_ops,
++	.probe = dodge_repeater_probe,
++	.priv_auto = sizeof(struct dodge_repeater_priv),
+ };
+diff --git a/drivers/phy/qcom/phy-qcom-m31-eusb2.c b/drivers/phy/qcom/phy-qcom-m31-eusb2.c
+index ed9b0237..f708b197 100644
+--- a/drivers/phy/qcom/phy-qcom-m31-eusb2.c
++++ b/drivers/phy/qcom/phy-qcom-m31-eusb2.c
+@@ -1,12 +1,13 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* Copyright (c) 2024-2025 Qualcomm Innovation Center, Inc. All rights reserved.
+  * Adapted from Wesley Cheng's Linux M31 eUSB2 driver.
+- * ABL retains the shared supply votes; this driver does not change rails.
++ * Shared supply votes remain enabled for the operating-system handoff.
+  */
+ #include <clk.h>
+ #include <dm.h>
+ #include <generic-phy.h>
+ #include <reset.h>
++#include <power/regulator.h>
+ #include <asm/io.h>
+ #include <linux/bitfield.h>
+ #include <linux/delay.h>
+@@ -92,6 +93,7 @@ struct m31_priv {
+ 	struct clk ref;
+ 	struct reset_ctl reset;
+ 	struct phy repeater;
++	struct udevice *supplies[2];
+ };
+ static int m31_write(struct m31_priv *p, u32 off, u32 mask, u32 value)
+ {
+@@ -113,9 +115,37 @@ static int m31_sequence(struct m31_priv *p, const struct m31_phy_tbl_entry *t,
+ static int m31_on(struct phy *phy)
+ {
+ 	struct m31_priv *p = dev_get_priv(phy->dev);
+-	int ret;
++	int ret, i;
+ 	if (clk_get_rate(&p->ref) != 38400000)
+ 		return -EINVAL;
++	for (i = 0; i < ARRAY_SIZE(p->supplies); i++) {
++		struct dm_regulator_uclass_plat *plat = dev_get_uclass_plat(p->supplies[i]);
++
++		int uv = regulator_get_value(p->supplies[i]);
++		int enabled;
++
++		if (uv < 0 && uv != -ENODATA)
++			return uv;
++		enabled = regulator_get_enable(p->supplies[i]);
++		if (enabled < 0)
++			return enabled;
++		if (enabled && (uv <= 0 || uv < plat->min_uV ||
++				(plat->max_uV > 0 && uv > plat->max_uV)))
++			return -EINVAL;
++		if (!enabled) {
++			if (uv <= 0)
++				uv = plat->min_uV;
++			if (uv < plat->min_uV ||
++			    (plat->max_uV > 0 && uv > plat->max_uV))
++				return -EINVAL;
++			ret = regulator_set_value(p->supplies[i], uv);
++			if (ret)
++				return ret;
++		}
++		ret = regulator_set_enable(p->supplies[i], true);
++		if (ret)
++			return ret;
++	}
+ 	ret = generic_phy_init(&p->repeater);
+ 	if (ret)
+ 		return ret;
+@@ -160,7 +190,14 @@ static int m31_off(struct phy *phy)
+ static int m31_probe(struct udevice *dev)
+ {
+ 	struct m31_priv *p = dev_get_priv(dev);
+-	int ret;
++	const char * const names[] = { "vdd-supply", "vdda12-supply" };
++	int ret, i;
++
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		ret = device_get_supply_regulator(dev, names[i], &p->supplies[i]);
++		if (ret)
++			return ret;
++	}
+ 	p->base = dev_read_addr_ptr(dev);
+ 	if (!p->base)
+ 		return -EINVAL;
+diff --git a/drivers/power/regulator/qcom-rpmh-regulator.c b/drivers/power/regulator/qcom-rpmh-regulator.c
+index c458f227..a3a6009d 100644
+--- a/drivers/power/regulator/qcom-rpmh-regulator.c
++++ b/drivers/power/regulator/qcom-rpmh-regulator.c
+@@ -158,6 +158,8 @@ struct rpmh_vreg_hw_data {
+  */
+ struct rpmh_vreg {
+ 	struct udevice			*dev;
++	struct udevice			*supply;
++	bool				enabling_supply;
+ 	u32				addr;
+ 	const struct rpmh_vreg_hw_data	*hw_data;
+ 	bool				always_wait_for_ack;
+@@ -234,9 +236,11 @@ static int rpmh_regulator_vrm_get_voltage(struct udevice *rdev, int *uV)
+ 
+ 	if (!_uV || (_uV >= min_uV && _uV <= max_uV))
+ 		*uV = _uV;
+-	else
++	else {
+ 		dev_info(vreg->dev, "read voltage %d is out-of-range[%d:%d]\n",
+ 			 _uV, min_uV, max_uV);
++		return -ERANGE;
++	}
+ 
+ 	return ret;
+ }
+@@ -248,13 +252,24 @@ static int _rpmh_regulator_vrm_set_value(struct udevice *rdev,
+ 	struct tcs_cmd cmd = {
+ 		.addr = vreg->addr + RPMH_REGULATOR_REG_VRM_VOLTAGE,
+ 	};
++	struct dm_regulator_uclass_plat *plat = dev_get_uclass_plat(rdev);
+ 	int ret;
+ 	unsigned int selector;
+ 
+-	selector = (uv - vreg->hw_data->voltage_range.min) / vreg->hw_data->voltage_range.step;
++	if (uv < vreg->hw_data->voltage_range.min)
++		return -EINVAL;
++
++	selector = DIV_ROUND_UP(uv - vreg->hw_data->voltage_range.min,
++				vreg->hw_data->voltage_range.step);
++	if (selector >= vreg->hw_data->n_voltages)
++		return -EINVAL;
+ 	cmd.data = DIV_ROUND_UP(vreg->hw_data->voltage_range.min +
+ 				selector * vreg->hw_data->voltage_range.step, 1000);
+ 
++	/* Quantization must not exceed the board's upper voltage constraint. */
++	if (plat->max_uV > 0 && cmd.data * 1000 > plat->max_uV)
++		return -EINVAL;
++
+ 	ret = rpmh_regulator_send_request(vreg, &cmd, wait_for_ack);
+ 	if (!ret)
+ 		vreg->uv = cmd.data * 1000;
+@@ -285,12 +300,15 @@ static int rpmh_regulator_vrm_set_value(struct udevice *rdev,
+ static int rpmh_regulator_vrm_get_value(struct udevice *rdev)
+ {
+ 	struct rpmh_vreg *vreg = dev_get_priv(rdev);
+-	int ret, uV;
++	int ret, uV = 0;
+ 
+ 	if (vreg->uv < 0) {
+ 		ret = rpmh_regulator_vrm_get_voltage(rdev, &uV);
+-		if (!ret && uV != 0)
+-			vreg->uv = uV;
++		if (ret)
++			return ret;
++		if (!uV)
++			return -ENODATA;
++		vreg->uv = uV;
+ 	}
+ 
+ 	return vreg->uv;
+@@ -358,6 +376,8 @@ static int rpmh_regulator_is_enabled(struct udevice *rdev)
+ 			.addr = vreg->addr + RPMH_REGULATOR_REG_ENABLE,
+ 		};
+ 		ret = rpmh_regulator_read_data(vreg, &cmd);
++		if (ret)
++			return ret;
+ 		/*
+ 		 * Don't override if disabled since we will also vote the right voltage
+ 		 * while enabling
+@@ -382,6 +402,34 @@ static int rpmh_regulator_set_enable_state(struct udevice *rdev,
+ 	debug("%s: set_enable %d (current %d)\n", rdev->name, enable,
+ 	      vreg->enabled);
+ 
++	if (enable && vreg->supply) {
++		struct dm_regulator_uclass_plat *supply_plat;
++		int supply_uv, enabled;
++
++		if (vreg->enabling_supply)
++			return -ELOOP;
++		vreg->enabling_supply = true;
++		supply_plat = dev_get_uclass_plat(vreg->supply);
++		supply_uv = regulator_get_value(vreg->supply);
++		ret = supply_uv < 0 ? supply_uv : 0;
++		/* Preserve an established parent setpoint, never invent headroom. */
++		if (!ret && ((supply_plat->min_uV > 0 &&
++			      supply_uv < supply_plat->min_uV) ||
++			     (supply_plat->max_uV > 0 &&
++			      supply_uv > supply_plat->max_uV) || supply_uv < vreg->uv))
++			ret = -EINVAL;
++		if (!ret) {
++			enabled = regulator_get_enable(vreg->supply);
++			ret = enabled < 0 ? enabled : 0;
++			if (!ret && !enabled)
++				ret = regulator_set_enable(vreg->supply, true);
++		}
++		vreg->enabling_supply = false;
++		if (ret)
++			return ret;
++	}
++	/* Keep shared parent votes enabled when a consumer is disabled. */
++
+ 	if (vreg->mode != -EINVAL) {
+ 		ret = rpmh_regulator_vrm_set_mode_bypass(vreg, vreg->mode, vreg->bypassed);
+ 		if (ret < 0)
+@@ -874,6 +922,8 @@ static int rpmh_regulator_probe(struct udevice *dev)
+ 	const struct rpmh_vreg_init_data *init_data;
+ 	struct rpmh_vreg *priv;
+ 	struct dm_regulator_uclass_plat *plat_data;
++	char supply_name[64];
++	int ret;
+ 
+ 	init_data = (const struct rpmh_vreg_init_data *)dev_get_driver_data(dev);
+ 	priv = dev_get_priv(dev);
+@@ -895,6 +945,13 @@ static int rpmh_regulator_probe(struct udevice *dev)
+ 	plat_data->mode = priv->hw_data->pmic_mode_map;
+ 	plat_data->mode_count = priv->hw_data->n_modes;
+ 
++	snprintf(supply_name, sizeof(supply_name), "%s-supply", init_data->supply_name);
++	if (dev_read_bool(dev->parent, supply_name)) {
++		ret = device_get_supply_regulator(dev->parent, supply_name, &priv->supply);
++		if (ret)
++			return ret;
++	}
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/soc/qcom/rpmh-rsc.c b/drivers/soc/qcom/rpmh-rsc.c
+index 0b821cc6..f8aa2885 100644
+--- a/drivers/soc/qcom/rpmh-rsc.c
++++ b/drivers/soc/qcom/rpmh-rsc.c
+@@ -535,7 +535,7 @@ static int rpmh_rsc_probe(struct udevice *dev)
+ 	drv->ver.minor = rsc_id & (MINOR_VER_MASK << MINOR_VER_SHIFT);
+ 	drv->ver.minor >>= MINOR_VER_SHIFT;
+ 
+-	if (drv->ver.major == 3)
++	if (drv->ver.major >= 3)
+ 		drv->regs = rpmh_rsc_reg_offset_ver_3_0;
+ 	else
+ 		drv->regs = rpmh_rsc_reg_offset_ver_2_7;
+diff --git a/dts/upstream/src/arm64/qcom/sm8750-oneplus-dodge.dts b/dts/upstream/src/arm64/qcom/sm8750-oneplus-dodge.dts
+index 86952fc1..7928c5ab 100644
+--- a/dts/upstream/src/arm64/qcom/sm8750-oneplus-dodge.dts
++++ b/dts/upstream/src/arm64/qcom/sm8750-oneplus-dodge.dts
+@@ -3,6 +3,8 @@
+ #include <dt-bindings/clock/qcom,sm8750-gcc.h>
+ #include <dt-bindings/clock/qcom,sm8750-tcsr.h>
+ #include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
++#include <dt-bindings/soc/qcom,rpmh-rsc.h>
+ / {
+ 	model = "OnePlus 13";
+ 	compatible = "oneplus,dodge", "qcom,sm8750";
+@@ -10,7 +12,17 @@
+ 	#size-cells = <2>;
+ 	/* ABL supplies the complete memory and reservation contract at entry. */
+ 	memory { device_type = "memory"; };
+-	reserved-memory { #address-cells = <2>; #size-cells = <2>; ranges; };
++	reserved-memory {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		aop_cmd_db_mem: aop-cmd-db@81c60000 {
++			compatible = "qcom,cmd-db";
++			reg = <0 0x81c60000 0 0x20000>;
++			no-map;
++		};
++	};
+ 	chosen {
+ 		#address-cells = <2>;
+ 		#size-cells = <2>;
+@@ -27,6 +39,14 @@
+ 			status = "okay";
+ 		};
+ 	};
++	vph_pwr: vph-pwr-regulator {
++		compatible = "regulator-fixed";
++		regulator-name = "vph_pwr";
++		regulator-min-microvolt = <3700000>;
++		regulator-max-microvolt = <3700000>;
++		regulator-always-on;
++		regulator-boot-on;
++	};
+ 	psci { compatible = "arm,psci-1.0"; method = "smc"; };
+ 	timer { compatible = "arm,armv8-timer"; };
+ 	soc {
+@@ -105,6 +125,114 @@
+ 				};
+ 			};
+ 		};
++		apps_rsc: rsc@16500000 {
++			compatible = "qcom,rpmh-rsc";
++			reg = <0 0x16500000 0 0x10000>,
++			      <0 0x16510000 0 0x10000>,
++			      <0 0x16520000 0 0x10000>;
++			reg-names = "drv-0", "drv-1", "drv-2";
++			qcom,tcs-offset = <0xd00>;
++			qcom,drv-id = <2>;
++			qcom,tcs-config = <ACTIVE_TCS 3>, <SLEEP_TCS 2>,
++					  <WAKE_TCS 2>, <CONTROL_TCS 0>;
++			label = "apps_rsc";
++
++			regulators-0 {
++				compatible = "qcom,pm8550-rpmh-regulators";
++				qcom,pmic-id = "b";
++				vdd-bob1-supply = <&vph_pwr>;
++				vdd-l5-l16-supply = <&vreg_bob1>;
++				vdd-l15-supply = <&vreg_s3g_1p8>;
++
++				vreg_bob1: bob1 {
++					regulator-name = "vreg_bob1";
++					regulator-min-microvolt = <3008000>;
++					regulator-max-microvolt = <3960000>;
++					regulator-initial-mode = <RPMH_REGULATOR_MODE_AUTO>;
++				};
++
++				vreg_l5b_3p1: ldo5 {
++					regulator-name = "vreg_l5b_3p1";
++					regulator-min-microvolt = <3100000>;
++					regulator-max-microvolt = <3148000>;
++					regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++					regulator-allow-set-load;
++					regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
++								   RPMH_REGULATOR_MODE_HPM>;
++				};
++
++				vreg_l15b_1p8: ldo15 {
++					regulator-name = "vreg_l15b_1p8";
++					regulator-min-microvolt = <1800000>;
++					regulator-max-microvolt = <1800000>;
++					regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++					regulator-allow-set-load;
++					regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
++								   RPMH_REGULATOR_MODE_HPM>;
++				};
++			};
++			regulators-1 {
++				compatible = "qcom,pm8550ve-rpmh-regulators";
++				qcom,pmic-id = "d";
++				vdd-s1-supply = <&vph_pwr>;
++				vdd-l2-supply = <&vreg_s1d_0p97>;
++
++				vreg_s1d_0p97: smps1 {
++					regulator-name = "vreg_s1d_0p97";
++					regulator-min-microvolt = <880000>;
++					regulator-max-microvolt = <1100000>;
++					regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++				};
++
++				vreg_l2d_0p88: ldo2 {
++					regulator-name = "vreg_l2d_0p88";
++					regulator-min-microvolt = <880000>;
++					regulator-max-microvolt = <912000>;
++					regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++					regulator-allow-set-load;
++					regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
++								   RPMH_REGULATOR_MODE_HPM>;
++				};
++			};
++			regulators-3 {
++				compatible = "qcom,pm8550ve-rpmh-regulators";
++				qcom,pmic-id = "g";
++				vdd-s3-supply = <&vph_pwr>;
++				vdd-l3-supply = <&vreg_s7i_1p2>;
++
++				vreg_s3g_1p8: smps3 {
++					regulator-name = "vreg_s3g_1p8";
++					regulator-min-microvolt = <1856000>;
++					regulator-max-microvolt = <2000000>;
++					regulator-initial-mode = <RPMH_REGULATOR_MODE_LPM>;
++					regulator-allow-set-load;
++					regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
++								   RPMH_REGULATOR_MODE_HPM>;
++				};
++
++				vreg_l3g_1p2: ldo3 {
++					regulator-name = "vreg_l3g_1p2";
++					regulator-min-microvolt = <1200000>;
++					regulator-max-microvolt = <1256000>;
++					regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++					regulator-allow-set-load;
++					regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
++								   RPMH_REGULATOR_MODE_HPM>;
++				};
++			};
++			regulators-4 {
++				compatible = "qcom,pm8550ve-rpmh-regulators";
++				qcom,pmic-id = "i";
++				vdd-s7-supply = <&vph_pwr>;
++
++				vreg_s7i_1p2: smps7 {
++					regulator-name = "vreg_s7i_1p2";
++					regulator-min-microvolt = <1224000>;
++					regulator-max-microvolt = <1340000>;
++					regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++				};
++			};
++		};
+ 		spmi: spmi@c400000 {
+ 			compatible = "qcom,spmi-pmic-arb";
+ 			reg = <0 0xc400000 0 0x3000>, <0 0xc500000 0 0x400000>,
+@@ -124,6 +252,8 @@
+ 				repeater: phy@fd00 {
+ 					compatible = "oneplus,dodge-eusb2-repeater";
+ 					reg = <0xfd00>;
++					vdd18-supply = <&vreg_l15b_1p8>;
++					vdd3-supply = <&vreg_l5b_3p1>;
+ 					#phy-cells = <0>;
+ 				};
+ 			};
+@@ -134,6 +264,8 @@
+ 			clocks = <&tcsrcc TCSR_USB2_CLKREF_EN>;
+ 			clock-names = "ref";
+ 			resets = <&gcc GCC_QUSB2PHY_PRIM_BCR>;
++			vdd-supply = <&vreg_l2d_0p88>;
++			vdda12-supply = <&vreg_l3g_1p2>;
+ 			phys = <&repeater>;
+ 			#phy-cells = <0>;
+ 		};

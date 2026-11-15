@@ -1,0 +1,123 @@
+From 7822a3ea432a7346ab445a9cc817401438ef3902 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 10 Nov 2026 10:25:55 +0800
+Subject: [PATCH] soc: mediatek: restore the complete MT6897 C-PHY LSB word
+
+The stock MT6897 no-swap initialization writes zero to the entire MMSYS
+DSI_SEL_CONFIG_LSB register. Limiting that initialization to bits19:0 can
+retain other fields after display-domain power loss, unlike the initial
+boot configuration.
+
+Match the stock full-word zero while preserving the existing masked MSB
+update and MSB-before-LSB order. Validation-only and unsupported-provider
+paths remain unchanged. Extend the production-function regression with
+both banks, the observed 0x00a00000 prior value, arbitrary prior contents,
+no-op validation and the existing MSB reserved-bit checks.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_mipi_tx.c#L783
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/soc/mediatek/mtk-mmsys.c              |  8 +++---
+ .../selftests/mtk_clk/dsi_mmsys_cases.c       | 25 +++++++++++++++----
+ 2 files changed, 24 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/soc/mediatek/mtk-mmsys.c b/drivers/soc/mediatek/mtk-mmsys.c
+index 3f6cef2a23..447de33344 100644
+--- a/drivers/soc/mediatek/mtk-mmsys.c
++++ b/drivers/soc/mediatek/mtk-mmsys.c
+@@ -247,15 +247,15 @@ int mtk_mmsys_dsi_cphy_config(struct device *dev, bool configure)
+ 	 * MiCode/MTK_kernel_device_modules, 3c4ccd07d5624879555ec710c11bb8818e5cb5c6,
+ 	 * https://github.com/MiCode/MTK_kernel_device_modules/blob/
+ 	 * 3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/
+-	 * mediatek_v2/mtk_mipi_tx.c (mtk_mipi_tx.c:759).
+-	 * Keep reserved fields intact; MSB precedes LSB as in the vendor sequence.
++	 * mediatek_v2/mtk_mipi_tx.c (mtk_mipi_tx.c:783).
++	 * Preserve reserved MSB fields; restore the complete LSB word as in stock.
++	 * MSB precedes LSB as in the vendor sequence.
+ 	 */
+ 	spin_lock_irqsave(&mmsys->lock, flags);
+ 	mtk_mmsys_update_bits(mmsys, MT6897_DSI_SEL_CONFIG_MSB,
+ 			     MT6897_DSI_SEL_CONFIG_MSB_MASK,
+ 			     MT6897_DSI_CPHY_NO_SWAP, NULL);
+-	mtk_mmsys_update_bits(mmsys, MT6897_DSI_SEL_CONFIG_LSB,
+-			     MT6897_DSI_SEL_CONFIG_LSB_MASK, 0, NULL);
++	writel_relaxed(0, mmsys->regs + MT6897_DSI_SEL_CONFIG_LSB);
+ 	spin_unlock_irqrestore(&mmsys->lock, flags);
+ 	return 0;
+ }
+diff --git a/tools/testing/selftests/mtk_clk/dsi_mmsys_cases.c b/tools/testing/selftests/mtk_clk/dsi_mmsys_cases.c
+index c44e02cd79..fa569c9576 100644
+--- a/tools/testing/selftests/mtk_clk/dsi_mmsys_cases.c
++++ b/tools/testing/selftests/mtk_clk/dsi_mmsys_cases.c
+@@ -24,6 +24,7 @@ struct mtk_mmsys_dsi_cphy_state {
+ 	uint32_t routing_lsb, routing_msb, cg2, intmerge;
+ };
+ static int writes, offsets[4];
++static uint8_t *write_regs;
+ static bool of_device_is_compatible(const char *node, const char *compatible)
+ {
+ 	return !strcmp(node, compatible);
+@@ -47,6 +48,12 @@ static void mtk_mmsys_update_bits(struct mtk_mmsys *m, unsigned int offset,
+ 	offsets[writes++] = offset;
+ 	*word = (*word & ~mask) | (value & mask);
+ }
++
++static void writel_relaxed(uint32_t value, void *p)
++{
++	offsets[writes++] = (uint8_t *)p - write_regs;
++	*(uint32_t *)p = value;
++}
+ /* PRODUCTION */
+ int main(void)
+ {
+@@ -55,6 +62,9 @@ int main(void)
+ 	const struct mtk_mmsys_driver_data unsupported = { 0 };
+ 	struct mtk_mmsys m = { .data = &supported };
+ 	struct device d = { .data = &m };
++
++	write_regs = m.regs;
++	(void)writel_relaxed;
+ 	assert(mtk_mmsys_dsi_cphy_config(NULL, false) == -EINVAL);
+ 	assert(mtk_mmsys_dsi_cphy_config(&d, false) == -EINVAL);
+ 	d.of_node = "mediatek,mt6897-ovlsys0";
+@@ -68,21 +78,26 @@ int main(void)
+ 		m.data = &unsupported;
+ 		assert(mtk_mmsys_dsi_cphy_config(&d, true) == -EPROBE_DEFER);
+ 		m.data = &supported;
++		*(uint32_t *)(m.regs + 0x170) = 0x00a00000;
++		*(uint32_t *)(m.regs + 0x174) = 0xfff8888e;
+ 		writes = 0;
+ 		assert(!mtk_mmsys_dsi_cphy_config(&d, false) && !writes);
+-		for (int cycle = 0; cycle < 2; cycle++) {
++		assert(*(uint32_t *)(m.regs + 0x170) == 0x00a00000);
++		assert(*(uint32_t *)(m.regs + 0x174) == 0xfff8888e);
++		for (int cycle = 0; cycle < 3; cycle++) {
+ 			uint32_t *lsb = (uint32_t *)(m.regs + 0x170);
+ 			uint32_t *msb = (uint32_t *)(m.regs + 0x174);
+ 
+-			*lsb = 0xa5ffffff;
++			/* Fresh state, observed post-loss state, arbitrary prior contents. */
++			*lsb = cycle == 0 ? 0 : cycle == 1 ? 0x00a00000 : 0xa5ffffff;
+ 			*msb = 0xfff8888e;
+ 			writes = 0;
+ 			assert(!mtk_mmsys_dsi_cphy_config(&d, true));
+ 			assert(writes == 2 && offsets[0] == 0x174 &&
+ 			       offsets[1] == 0x170);
+-			assert(*lsb == 0xa5f00000);
++			assert(*lsb == 0);
+ 			assert(*msb == (0xfff8888e | 0x62101));
+-			/* Repeat after simulated context loss, preserving new reserved bits. */
++			/* Repeat after register loss without retaining stale LSB fields. */
+ 		}
+ 	}
+ 	struct mtk_mmsys_dsi_cphy_state st;
+@@ -115,5 +130,5 @@ int main(void)
+ 		assert(st.intmerge == 0x00000000);
+ 		assert(writes == state_writes);
+ 	}
+-	puts("MMSYS routing: both banks, validation purity, reserved bits, restore order and state reads passed");
++	puts("MMSYS: both banks, guards, full LSB/MSB masks, order and reads passed");
+ }
+-- 
+2.56.0
+

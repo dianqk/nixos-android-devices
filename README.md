@@ -2,92 +2,72 @@
 
 [中文](README.zh.md)
 
-NixOS device modules, kernels and U-Boot firmware for five Xiaomi and Lenovo
+NixOS device modules, kernels and U-Boot firmware for eight Qualcomm and MediaTek
 phones and tablets. Systems boot through **U-Boot → systemd-boot → Linux** and
-use standard NixOS configuration, updates and generation management. Build on
-AArch64 Linux, or use x86_64 cross compilation with local QEMU for uncached
-native ARM dependencies. See the [build requirements](docs/configuration.md#build-platforms-and-remote-builders).
+use standard NixOS configuration, updates and generation management.
 
-## Supported devices
+## Devices
 
-| Device | Codename | Support tier | Configuration and hardware status |
-| --- | --- | --- | --- |
-| Lenovo Legion Y700 2023 (TB320FC) | `asphalt` | Tier 2: buildable and evaluable | [Device guide](docs/asphalt/README.md) |
-| Xiaomi Mi MIX 2S | `polaris` | Tier 2: buildable and evaluable | [Device guide](docs/polaris/README.md) |
-| Xiaomi Pad 6S Pro 12.4 | `sheng` | Tier 2: buildable and evaluable | [Device guide](docs/sheng/README.md) |
-| Xiaomi 14 Ultra | `aurora` | Tier 2: buildable and evaluable | [Device guide](docs/aurora/README.md) |
-| Xiaomi Mi Pad 4 8-inch LTE | `clover` | Tier 3: evaluable | [Device guide](docs/clover/README.md) |
+| Device | Codename | Guide |
+| --- | --- | --- |
+| Lenovo Legion Y700 2023 (TB320FC) | `asphalt` | [Use and install](docs/asphalt/README.md) |
+| Xiaomi Mi MIX 2S | `polaris` | [Use and install](docs/polaris/README.md) |
+| Xiaomi Pad 6S Pro 12.4 | `sheng` | [Use and install](docs/sheng/README.md) |
+| Xiaomi 14 Ultra | `aurora` | [Use and install](docs/aurora/README.md) |
+| Xiaomi Mi Pad 4 8-inch LTE | `clover` | [Use and install](docs/clover/README.md) |
+| Redmi Note 12 Turbo / POCO F5 | `marble` | [Use and install](docs/marble/README.md) |
+| Alldocube iPlay 80 mini Ultra | `t880` | [Use and install](docs/t880/README.md) |
+| OnePlus 13 | `dodge` | [Use and install](docs/dodge/README.md) |
 
-Tiers describe this repository's examples; consult each device guide for hardware
-features and test coverage. No device currently meets the dedicated runtime
-validation requirement for Tier 1. See the [support criteria](docs/README.md#support-tiers).
+Each guide covers the supported hardware, storage contract, first installation,
+updates, recovery and known limitations. Support status is recorded per device;
+this README does not assign support levels.
 
-## Get started
+## Quick start
 
-1. **Configure**: follow the [configuration guide](docs/configuration.md) to create
-   your flake with `lib.mkSystem` or `nixosModules.<device>`. Device-specific options
-   use `hardware.<device>.*`; shared capabilities use `androidDevices.*`. Users,
-   SSH keys, desktops and applications use ordinary NixOS configuration.
-2. **Build**: export matching system and boot artifacts with `lib.mkArtifacts`.
-   [Artifact selection](docs/configuration.md#select-artifacts) explains the system
-   closure, U-Boot firmware and EFI files.
-3. **Install**: follow the [device installation guide](docs/README.md#installation)
-   to prepare an ext4 root and FAT `/boot`, install the system and EFI files, then
-   install U-Boot. All five devices use the [first installer](docs/initial-install.md)
-   after device-specific partition preparation.
-4. **Update**: connect through [USB SSH](docs/usb-signaller.md) or your configured
-   network, run `nixos-rebuild boot`, and verify the new generation after reboot.
-   Routine updates maintain EFI files on `/boot` without rewriting U-Boot.
+1. **Configure** with `lib.mkSystem` or `nixosModules.<device>`. Device options
+   use `hardware.<device>.*`; shared capabilities use `androidDevices.*`.
+   Users, SSH keys, desktops and applications use ordinary NixOS configuration.
+2. **Build** matching system and boot artifacts with `lib.mkArtifacts`. See the
+   [configuration guide](docs/configuration.md).
+3. **Install** by following the device guide: prepare the ext4 root and FAT
+   `/boot`, install the system and EFI files, then install U-Boot.
+4. **Update** through [USB SSH](docs/usb-signaller.md) or your network with
+   `nixos-rebuild boot`. Routine updates maintain `/boot`; they do not rewrite
+   U-Boot.
 
-**Flashing risk:** This project was generated entirely with LLMs. Flashing its
-images can make a device unbootable or permanently unusable. Anyone who builds
-or flashes them accepts responsibility for that risk. Check the model, partitions
-and image, and establish a working recovery path before writing. Installation
-and troubleshooting use independent [RAM recovery](docs/recovery.md); see
-[U-Boot installation](docs/u-boot-install.md) for storage requirements.
+The [consumer flake](examples/consumer/flake.nix) is a complete starting point.
+The [examples](examples/) are demos, not required policy.
 
-## Kernel status
+## Build platforms
 
-Each device has exactly one kernel: the Linux release provided by the locked
-Nixpkgs input (currently 7.3-rc6) plus the device's patch queue. Recovery uses
-the same kernel as the installed system. See the
-[kernel configuration notes](pkgs/linux-kernel/README.md).
+Build on AArch64 Linux, or use x86_64 cross compilation with local QEMU for
+uncached native ARM dependencies. See
+[build requirements](docs/configuration.md#build-platforms-and-remote-builders).
 
-## Build the repository examples
+## Firmware and risk
 
-On a Linux build computer with Nix flakes enabled, build only the artifacts
-needed for your chosen device. For example:
+Device firmware is distributed as per-device archives in the repository's
+[`firmware` release](https://github.com/dianqk/nixos-android-devices/releases/tag/firmware).
+The Git tree contains packaging and patches, not OEM firmware payloads.
 
-```sh
-nix build .#devices.polaris.system --out-link result-system
-nix build .#devices.polaris.boot-files --out-link result-boot-files
-nix build .#devices.polaris.u-boot --out-link result-u-boot
-```
+**Flashing risk:** This project was generated with LLMs. Flashing its images can
+make a device unbootable or permanently unusable. Check the model, partitions and
+image, and establish a working recovery path before writing. Installation and
+troubleshooting use independent [RAM recovery](docs/recovery.md); see
+[U-Boot installation](docs/u-boot-install.md).
 
-Replace `polaris` with `asphalt`, `sheng`, `clover` or `aurora` for another board.
-`devices.<device>.boot` and `devices.<device>.u-boot` are the same firmware;
-`boot-files` is a directory, not a flashable partition image. Other outputs include
-`bootstrap-info`, `recovery` and `kernel`; select them as the installation guide
-requires. These commands only build artifacts. Set device-specific storage
-identities and access credentials before deployment.
+## Documentation
 
-Desktop configurations in [`examples/`](examples/) explicitly select Niri,
-passwordless `demo` autologin and test tools. Device modules supply hardware
-capabilities. Polaris also has a [minimal console example](docs/polaris/minimal.md)
-with empty-password root SSH over USB. Adapt the examples to your access policy.
-
-## More documentation
-
-- [Documentation index](docs/README.md)
-- [Package reuse and overrides](docs/packages.md)
-- [Module boundaries and shared options](docs/modules.md)
-- [Build and development checks](docs/development.md)
-- [Host deployment tool](pkgs/mobile-device/README.md)
-- [SSC sensors and screen rotation](docs/sensors.md): optional board
-  capabilities; see the runtime validation limits.
-- [Development-host tools and USB configuration](docs/host.md)
+- [Installation and updates](docs/README.md)
+- [Configuration](docs/configuration.md)
+- [Modules and packages](docs/modules.md) · [Packages](docs/packages.md)
+- [Development and checks](docs/development.md)
+- [Recovery](docs/recovery.md) · [USB access](docs/usb-signaller.md)
+- [Dodge same-slot boot choice](docs/boot-choice.md)
 
 ## License
 
 Original project code is available under the [MIT license](LICENSE). Linux
-kernel patches follow the upstream [GPL-2.0 terms](LICENSES/GPL-2.0).
+kernel patches follow the upstream [GPL-2.0 terms](LICENSES/GPL-2.0). Firmware
+binaries retain their upstream licenses and are not covered by these licenses.

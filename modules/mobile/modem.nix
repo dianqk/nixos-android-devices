@@ -58,6 +58,15 @@ let
         fi
         ;;
       stop)
+        ${lib.optionalString (!cfg.stopAtShutdown) ''
+          # Shutdown or reboot: leave MPSS to the reset. Stopping it shortly
+          # after boot reset Aurora (PS_HOLD warm reset), which also lost
+          # reboot-mode requests such as recovery.
+          if [ "$(${config.systemd.package}/bin/systemctl is-system-running || true)" = stopping ]; then
+            echo "System is shutting down; leaving MPSS ($state) to the reset" >&2
+            exit 0
+          fi
+        ''}
         if [ "$state" = running ]; then
           echo stop > "$rproc/state"
         else
@@ -67,17 +76,29 @@ let
     esac
   '';
   # MPSS started before the wall clock was set stalled in initialisation on
-  # SM8650. Wait for clock synchronisation, but start anyway after the timeout
+  # SM8650. Wait for clock synchronisation (or, with androidDevices.clock.rtcOffset,
+  # a clock restored from the RTC offset), but start anyway after the timeout
   # so that an offline phone can still use cellular.
+  rtcOffset = config.androidDevices.clock.rtcOffset;
+  marker = lib.escapeShellArg rtcOffset.markerFile;
+  restoredCheck = lib.concatStringsSep "; " [
+    "if [ -e ${marker} ]; then echo \"clock restored from the RTC offset ($(${pkgs.coreutils}/bin/cat ${marker})), starting MPSS\" >&2"
+    "exit 0"
+    "fi"
+  ];
   waitForTime = pkgs.writeShellScript "modem-mpss-wait-time" ''
     for _ in $(${pkgs.coreutils}/bin/seq ${toString cfg.timeSyncTimeout}); do
       if [ "$(${config.systemd.package}/bin/timedatectl show -p NTPSynchronized --value)" = yes ]; then
+        echo "clock synchronised, starting MPSS" >&2
         exit 0
       fi
+      ${lib.optionalString rtcOffset.enable restoredCheck}
       ${pkgs.coreutils}/bin/sleep 1
     done
     echo "clock not synchronised after ${toString cfg.timeSyncTimeout} s, starting MPSS anyway" >&2
   '';
+  # Units after which the clock wait may pass.
+  timeUnits = [ "time-sync.target" ] ++ lib.optional rtcOffset.enable "rtc-offset-restore.service";
   simProvision = pkgs.writeShellApplication {
     name = "modem-sim-provision";
     runtimeInputs = [
@@ -152,6 +173,10 @@ in
         MPSS. When false, the module leaves ModemManager's settings alone.
       '';
     };
+    ims = {
+      enable = lib.mkEnableOption "IMS data connections requested by the modem over QRTR";
+      package = lib.mkPackageOption pkgs "_81voltd" { };
+    };
     allowNvWrites = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -182,6 +207,17 @@ in
         boot. When false, start `modem-mpss.service` manually.
       '';
     };
+    stopAtShutdown = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Whether system shutdown and reboot stop MPSS before the reset. When
+        false, only an explicit `systemctl stop` of the MPSS start unit stops
+        it; a shutdown leaves it running and the reset takes it down. Stopping
+        MPSS shortly after boot reset Aurora (warm reset). Applies to
+        `startMethod = "remoteproc-unit"`.
+      '';
+    };
     crashRecovery = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -192,7 +228,9 @@ in
       default = 120;
       description = ''
         Seconds `modem-mpss.service` waits for the system clock to be
-        synchronised (`timedatectl` NTPSynchronized) before starting MPSS.
+        synchronised (`timedatectl` NTPSynchronized), or restored by
+        `androidDevices.clock.rtcOffset` when that is enabled, before starting
+        MPSS.
         After the timeout MPSS starts anyway, so that an offline boot can still
         bring up cellular. 0 disables the wait.
       '';
@@ -226,6 +264,10 @@ in
         assertion = cfg.nvDirectory != null -> cfg.nvPartitions == [ ];
         message = "androidDevices.modem: set either nvPartitions or nvDirectory, not both.";
       }
+      {
+        assertion = cfg.ims.enable -> mmWanted;
+        message = "androidDevices.modem.ims requires module-managed ModemManager.";
+      }
     ];
     hardware.firmware = cfg.firmware;
     environment.systemPackages = [
@@ -240,6 +282,11 @@ in
     # release containing it. Only the daemon uses this package; clients such
     # as NetworkManager keep the stock libmm-glib.
     #
+    # On IPA modems, which only allow multiplexed bearers, it also aborted on
+    # every stop with a connected bearer (`max >= ctx.count` in
+    # mm_iface_modem_count_bearers; upstream 0edcb916). Keep this local patch
+    # until nixpkgs ships a release containing it.
+    #
     # Firmware on SDM845 and later (IPA data path) additionally refuses to
     # start a PS call for a WDS client that was never bound to a subscription:
     # registration and PS attach look healthy, but every Start Network returns
@@ -251,6 +298,7 @@ in
         pkgs.modemmanager.overrideAttrs (old: {
           patches = (old.patches or [ ]) ++ [
             ../../pkgs/modemmanager/netlink-transaction-use-after-free.patch
+            ../../pkgs/modemmanager/multiplexed-bearer-cleanup-assert.patch
             ../../pkgs/modemmanager/bind-wds-subscription.patch
           ];
         })
@@ -258,6 +306,23 @@ in
     );
 
     systemd.services = lib.mkMerge [
+      (lib.mkIf mmWanted {
+        # The upstream ModemManager unit Requires=polkit.service (a drop-in
+        # cannot remove that). A configuration switch stops and later starts a
+        # changed polkit; the stop also stopped ModemManager, which was not
+        # started again (cellular down). Restarting polkit instead propagates a
+        # restart to ModemManager.
+        polkit.stopIfChanged = false;
+        # By default ModemManager removes every modem before suspend and
+        # rescans on resume. The rescan does not see the QRTR modem again
+        # ("couldn't check support for device 'qcom-soc'"), so cellular stayed
+        # down after every suspend. Quick mode keeps the modem object (terse
+        # signals while asleep) and resyncs its state on resume.
+        ModemManager.serviceConfig.ExecStart = [
+          ""
+          "${lib.getExe' config.networking.modemmanager.package "ModemManager"} --test-quick-suspend-resume"
+        ];
+      })
       {
         # Serves the modem's /readonly/firmware/image/ tree from the firmware
         # directory next to modem.mdt; /readwrite/ goes to /var/lib/tqftpserv.
@@ -324,6 +389,20 @@ in
         };
       }
 
+      (lib.mkIf cfg.ims.enable {
+        modem-ims = {
+          description = "IMS data connections over QRTR";
+          requires = [ "${startUnit}.service" "ModemManager.service" ];
+          after = [ "${startUnit}.service" "ModemManager.service" ];
+          restartIfChanged = false;
+          serviceConfig = {
+            ExecStart = lib.getExe cfg.ims.package;
+            # Existing IMS bearers outlive this daemon; avoid duplicate owners.
+            Restart = "no";
+          };
+        };
+      })
+
       # Order: QTEE license services -> tqftpserv -> rmtfs -> clock synchronised
       # (or timeout) -> MPSS -> SIM provisioning -> ModemManager.
       {
@@ -332,7 +411,8 @@ in
           wants =
             licenseUnits
             ++ lib.optional cfg.simProvisioning "modem-sim-provision.service"
-            ++ lib.optional mmWanted "ModemManager.service";
+            ++ lib.optional mmWanted "ModemManager.service"
+            ++ lib.optional cfg.ims.enable "modem-ims.service";
         };
       }
 
@@ -341,11 +421,7 @@ in
         modem-mpss = {
           description = "Modem (MPSS) start";
           requires = [ "modem-rmtfs.service" ];
-          after = [
-            "modem-rmtfs.service"
-            "time-sync.target"
-          ]
-          ++ licenseUnits;
+          after = [ "modem-rmtfs.service" ] ++ timeUnits ++ licenseUnits;
           # A switch must not stop a running modem.
           restartIfChanged = false;
           serviceConfig = {
@@ -361,7 +437,7 @@ in
 
       (lib.mkIf (rmtfsStarts && waitForTimeEnabled) {
         modem-rmtfs = {
-          after = [ "time-sync.target" ];
+          after = timeUnits;
           serviceConfig = {
             ExecStartPre = "${waitForTime}";
             TimeoutStartSec = cfg.timeSyncTimeout + 60;

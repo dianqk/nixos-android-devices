@@ -1,0 +1,213 @@
+From e7283c18f841a02551fb9ecb4927a3ff145c8e2f Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 11 Nov 2026 04:24:37 +0800
+Subject: [PATCH 124/144] arm64: dts: qcom: connect the Dodge IMX615 front
+ camera
+
+Describe the QUP I2C9 sensor at the Linux 7-bit address, PM8010M supplies, MCLK4 ownership mux and CSIPHY4 graph. Use voltage ranges that include the next supported PMIC selector for the OEM nominal 1.1 V and 2.9 V requests. Retain the camera IOMMU stream from the exact device Android description.
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0156-arm64-dts-qcom-connect-the-Dodge-IMX615-front-camera.patch
+Import-SHA256: 0a0b30ca86edbc6b75299be58b0904e68492cae00398e0a88d4e229cee72fe03
+Import-Provenance: mail headers
+(cherry picked from commit 95193c7fc7208692b6183ad60ca1ec0e869e9499)
+---
+ .../bindings/media/qcom,sm8750-camss.yaml     |   9 +-
+ .../boot/dts/qcom/sm8750-oneplus-dodge.dts    | 113 ++++++++++++++++++
+ arch/arm64/boot/dts/qcom/sm8750.dtsi          |  11 ++
+ drivers/media/i2c/imx615.c                    |   5 +
+ 4 files changed, 132 insertions(+), 6 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/media/qcom,sm8750-camss.yaml b/Documentation/devicetree/bindings/media/qcom,sm8750-camss.yaml
+index fca288d2b8..71a16a9363 100644
+--- a/Documentation/devicetree/bindings/media/qcom,sm8750-camss.yaml
++++ b/Documentation/devicetree/bindings/media/qcom,sm8750-camss.yaml
+@@ -93,13 +93,10 @@ properties:
+     description: CSIPHY 0-5 PHYs used by the CSID controllers.
+ 
+   phy-names:
++    minItems: 1
++    maxItems: 6
+     items:
+-      - const: csiphy0
+-      - const: csiphy1
+-      - const: csiphy2
+-      - const: csiphy3
+-      - const: csiphy4
+-      - const: csiphy5
++      pattern: '^csiphy[0-5]$'
+ 
+   interconnects:
+     maxItems: 4
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+index 95f37b98fa..81a39fb02a 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
++++ b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+@@ -6,6 +6,7 @@
+ /dts-v1/;
+ 
+ #include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/phy/phy.h>
+ #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
+ #include "sm8750.dtsi"
+ #include "pm8550.dtsi"
+@@ -1077,3 +1078,115 @@ speaker_right: audio-codec@35 {
+ &i2c_master_hub_0 {
+ 	status = "okay";
+ };
++
++/* Front camera supplies are controlled by the AOP through PM8010M VRM votes. */
++&apps_rsc {
++	regulators-camera {
++		compatible = "qcom,pm8010-rpmh-regulators";
++		qcom,pmic-id = "m";
++
++		vreg_l1m_1p1: ldo1 {
++			regulator-name = "vreg_l1m_1p1";
++			regulator-min-microvolt = <1100000>;
++			regulator-max-microvolt = <1104000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		vreg_l3m_2p9: ldo3 {
++			regulator-name = "vreg_l3m_2p9";
++			regulator-min-microvolt = <2900000>;
++			regulator-max-microvolt = <2912000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		vreg_l5m_1p8: ldo5 {
++			regulator-name = "vreg_l5m_1p8";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++};
++
++&camss {
++	phys = <&csiphy4 PHY_TYPE_DPHY>;
++	phy-names = "csiphy4";
++	status = "okay";
++};
++
++&camss_port4 {
++	camss_front_in: endpoint {
++		data-lanes = <1 2 3 4>;
++		remote-endpoint = <&csiphy4_out>;
++	};
++};
++
++&csiphy4 {
++	vdda-0p9-supply = <&vreg_l3i_0p88>;
++	vdda-1p2-supply = <&vreg_l3g_1p2>;
++	status = "okay";
++
++	ports {
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		port@0 {
++			reg = <0>;
++			csiphy4_in: endpoint {
++				bus-type = <4>;
++				data-lanes = <1 2 3 4>;
++				remote-endpoint = <&front_camera_out>;
++			};
++		};
++
++		port@1 {
++			reg = <1>;
++			csiphy4_out: endpoint {
++				remote-endpoint = <&camss_front_in>;
++			};
++		};
++	};
++};
++
++&gpi_dma2 {
++	status = "okay";
++};
++
++&i2c9 {
++	clock-frequency = <1000000>;
++	status = "okay";
++
++	front_camera: camera@10 {
++		compatible = "sony,imx615";
++		reg = <0x10>;
++		clocks = <&cam_front_mux>;
++		assigned-clocks = <&cam_front_mux>;
++		assigned-clock-rates = <19200000>;
++		reset-gpios = <&tlmm 7 GPIO_ACTIVE_LOW>;
++		vdda-supply = <&vreg_l3m_2p9>;
++		vddio-supply = <&vreg_l5m_1p8>;
++		vddd-supply = <&vreg_l1m_1p1>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&cam4_default &front_camera_reset>;
++		rotation = <270>;
++		orientation = <0>;
++
++		port {
++			front_camera_out: endpoint {
++				bus-type = <4>;
++				data-lanes = <1 2 3 4>;
++				link-frequencies = /bits/ 64 <355200000>;
++				remote-endpoint = <&csiphy4_in>;
++			};
++		};
++	};
++};
++
++&tlmm {
++	front_camera_reset: front-camera-reset-state {
++		pins = "gpio7";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++};
+diff --git a/arch/arm64/boot/dts/qcom/sm8750.dtsi b/arch/arm64/boot/dts/qcom/sm8750.dtsi
+index ec624bee6a..20dc148c71 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8750.dtsi
+@@ -3558,6 +3558,17 @@ cci2_i2c1: i2c-bus@1 {
+ 			};
+ 		};
+ 
++		cam_front_mux: clock-controller@ac041e0 {
++			compatible = "qcom,sm8750-camera-aon-mux";
++			reg = <0x0 0x0ac041e0 0x0 0x4>;
++			clocks = <&cambistmclkcc CAM_BIST_MCLK_CC_MCLK4_CLK>,
++				 <&camcc CAM_CC_CAM_TOP_AHB_CLK>,
++				 <&camcc CAM_CC_CAM_TOP_FAST_AHB_CLK>;
++			clock-names = "mclk", "ahb", "fast-ahb";
++			power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>;
++			#clock-cells = <0>;
++		};
++
+ 		camss: isp@ad27000 {
+ 			compatible = "qcom,sm8750-camss";
+ 
+diff --git a/drivers/media/i2c/imx615.c b/drivers/media/i2c/imx615.c
+index 084ee741c4..d3c18138ed 100644
+--- a/drivers/media/i2c/imx615.c
++++ b/drivers/media/i2c/imx615.c
+@@ -300,6 +300,7 @@ static int imx615_probe(struct i2c_client *client)
+ {
+ 	struct device *dev = &client->dev;
+ 	struct v4l2_ctrl *ctrl;
++	struct v4l2_fwnode_device_properties props;
+ 	struct imx615 *s;
+ 	u64 id;
+ 	int ret;
+@@ -366,6 +367,10 @@ static int imx615_probe(struct i2c_client *client)
+ 	v4l2_ctrl_new_std_menu_items(&s->ctrls, &imx615_ctrl_ops,
+ 			V4L2_CID_TEST_PATTERN, ARRAY_SIZE(imx615_patterns) - 1,
+ 			0, 0, imx615_patterns);
++	ret = v4l2_fwnode_device_parse(dev, &props);
++	if (ret)
++		goto free_controls;
++	v4l2_ctrl_new_fwnode_properties(&s->ctrls, NULL, &props);
+ 	ret = s->ctrls.error;
+ 	if (ret)
+ 		goto free_controls;

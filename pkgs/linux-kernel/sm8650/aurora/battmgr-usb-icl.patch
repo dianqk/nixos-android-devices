@@ -1,0 +1,165 @@
+From 19830d77a7708cc5c562fc437cda6b5753633a46 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 21 Oct 2026 10:14:21 +0800
+Subject: [PATCH] power: supply: qcom_battmgr: Aurora USB input current limit
+ from the gadget
+
+On a PC port the Xiaomi Aurora firmware keeps the unconfigured SDP input
+limit (ADSP log "icl: i_sdp-100") until the operating system reports the
+configured current; stock reaches "icl: chg_det-500". There the eUSB2 PHY
+forwards the gadget's vbus_draw to the usb supply's INPUT_CURRENT_LIMIT,
+and qti_battery_charger.c (MiCode Xiaomi_Kernel_OpenSource c7841217725a,
+usb_psy_set_icl) writes USB_INPUT_CURR_LIMIT (wire ID 5) for SDP, CDP and
+PD adapters only, and again after an ADSP restart.
+
+Give Aurora a USB descriptor whose INPUT_CURRENT_LIMIT is writable with the
+same rules, so dwc3's usb-psy-name path can report the gadget current. Like
+the stock PHY, a request of 0 (gadget disconnect with the cable present) is
+ignored; a request before the battery manager service is up is applied when
+it comes up. BATTMGR_USB_PROPERTY_SET responses report a nonzero firmware
+result as -EIO.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/power/supply/qcom_battmgr.c | 100 +++++++++++++++++++++++++++-
+ 1 file changed, 99 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 8565b2833fd5..8ebdc2ce3802 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -335,6 +335,8 @@ struct qcom_battmgr {
+ 	bool xiaomi_chg_ctrl_en;
+ 	unsigned int xiaomi_chg_ctrl_start;
+ 	unsigned int xiaomi_constant_current;
++	/* Last USB input current limit request (uA), re-applied after ADSP restarts. */
++	u32 xiaomi_usb_icl_ua;
+ 
+ 	struct power_supply *ac_psy;
+ 	struct power_supply *bat_psy;
+@@ -1326,6 +1328,90 @@ static const struct power_supply_desc sm8350_usb_psy_desc = {
+ 		     BIT(POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID),
+ };
+ 
++/*
++ * As the OEM driver (usb_psy_set_icl): the USB input current limit follows the
++ * gadget's configured current (dwc3 usb-psy-name), only for SDP, CDP and PD
++ * ports, and is sent again after an ADSP restart. As the stock eUSB2 PHY, a
++ * request of 0 (gadget disconnect with the cable present) is ignored.
++ */
++static int qcom_battmgr_xiaomi_set_usb_icl(struct qcom_battmgr *battmgr, int ua)
++{
++	u32 value = ua < 0 ? UINT_MAX : ua;
++	int ret;
++
++	if (!ua)
++		return 0;
++
++	mutex_lock(&battmgr->lock);
++	if (!battmgr->service_up) {
++		battmgr->xiaomi_usb_icl_ua = value;
++		mutex_unlock(&battmgr->lock);
++		return 0;
++	}
++
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET, USB_ADAP_TYPE, 0);
++	if (ret)
++		goto out_unlock;
++
++	switch (battmgr->usb.usb_type) {
++	case POWER_SUPPLY_USB_TYPE_SDP:
++	case POWER_SUPPLY_USB_TYPE_CDP:
++	case POWER_SUPPLY_USB_TYPE_PD:
++		break;
++	default:
++		ret = -EINVAL;
++		goto out_unlock;
++	}
++
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_SET,
++					    USB_INPUT_CURR_LIMIT, value);
++	if (!ret)
++		battmgr->xiaomi_usb_icl_ua = value;
++
++out_unlock:
++	mutex_unlock(&battmgr->lock);
++
++	return ret;
++}
++
++static int qcom_battmgr_xiaomi_usb_set_property(struct power_supply *psy,
++						enum power_supply_property psp,
++						const union power_supply_propval *pval)
++{
++	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
++
++	if (psp != POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT)
++		return -EINVAL;
++
++	return qcom_battmgr_xiaomi_set_usb_icl(battmgr, pval->intval);
++}
++
++static int qcom_battmgr_xiaomi_usb_is_writeable(struct power_supply *psy,
++						enum power_supply_property psp)
++{
++	return psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT;
++}
++
++static const struct power_supply_desc sm8350_xiaomi_usb_psy_desc = {
++	.name = "qcom-battmgr-usb",
++	.type = POWER_SUPPLY_TYPE_USB,
++	.properties = sm8350_usb_props,
++	.num_properties = ARRAY_SIZE(sm8350_usb_props),
++	.get_property = qcom_battmgr_usb_get_property,
++	.set_property = qcom_battmgr_xiaomi_usb_set_property,
++	.property_is_writeable = qcom_battmgr_xiaomi_usb_is_writeable,
++	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN) |
++		     BIT(POWER_SUPPLY_USB_TYPE_SDP)     |
++		     BIT(POWER_SUPPLY_USB_TYPE_DCP)     |
++		     BIT(POWER_SUPPLY_USB_TYPE_CDP)     |
++		     BIT(POWER_SUPPLY_USB_TYPE_ACA)     |
++		     BIT(POWER_SUPPLY_USB_TYPE_C)       |
++		     BIT(POWER_SUPPLY_USB_TYPE_PD)      |
++		     BIT(POWER_SUPPLY_USB_TYPE_PD_DRP)  |
++		     BIT(POWER_SUPPLY_USB_TYPE_PD_PPS)  |
++		     BIT(POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID),
++};
++
+ static const u8 sm8350_wls_prop_map[] = {
+ 	[POWER_SUPPLY_PROP_ONLINE] = WLS_ONLINE,
+ 	[POWER_SUPPLY_PROP_VOLTAGE_NOW] = WLS_VOLT_NOW,
+@@ -1840,6 +1926,7 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
+ 		}
+ 		break;
+ 	case BATTMGR_BAT_PROPERTY_SET:
++	case BATTMGR_USB_PROPERTY_SET:
+ 		if (payload_len != sizeof(resp->intval) ||
+ 		    le32_to_cpu(resp->intval.result))
+ 			battmgr->error = -EIO;
+@@ -1909,6 +1996,13 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
+ 		return;
+ 	}
+ 
++	if (battmgr->xiaomi_battery_property_ids && battmgr->xiaomi_usb_icl_ua) {
++		ret = qcom_battmgr_xiaomi_set_usb_icl(battmgr, battmgr->xiaomi_usb_icl_ua);
++		if (ret)
++			dev_warn(battmgr->dev, "failed to restore USB input current limit: %d\n",
++				 ret);
++	}
++
+ 	/* Replay initial properties that were unavailable before GLINK came up. */
+ 	if (battmgr->bat_psy)
+ 		power_supply_changed(battmgr->bat_psy);
+@@ -2029,7 +2123,11 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 			return dev_err_probe(dev, PTR_ERR(battmgr->bat_psy),
+ 					     "failed to register battery power supply\n");
+ 
+-		battmgr->usb_psy = devm_power_supply_register(dev, &sm8350_usb_psy_desc, &psy_cfg_supply);
++		battmgr->usb_psy = devm_power_supply_register(dev,
++							      battmgr->xiaomi_battery_property_ids ?
++							      &sm8350_xiaomi_usb_psy_desc :
++							      &sm8350_usb_psy_desc,
++							      &psy_cfg_supply);
+ 		if (IS_ERR(battmgr->usb_psy))
+ 			return dev_err_probe(dev, PTR_ERR(battmgr->usb_psy),
+ 					     "failed to register USB power supply\n");

@@ -1,0 +1,251 @@
+From 2dbb7388b1832194cf7bff3246b88f552e3c1e3e Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 8 Nov 2026 07:46:16 +0800
+Subject: [PATCH 221/221] ccci: publish CCIF power state before enabling
+ receive interrupts
+
+An immediate empty DATA0 interrupt masks the IRQ and schedules its delayed poll. If start is descheduled until that worker runs, publishing PWRON only after enable_irq lets the poll see OFF and exit, leaving the IRQ masked without another poll.
+
+Publish PWRON after all resets but before enabling either IRQ. Pair the polled READ_ONCE state with WRITE_ONCE at start and stop. Exercise the actual startup, ISR and poll code with an IRQ-enable interleaving, and reproduce the lost-poll state with the old publication position.
+---
+ .../misc/mediatek/eccci/hif/ccci_hif_ccif.c   |   5 +-
+ tools/testing/selftests/mtk_ccci/Makefile     |   4 +-
+ .../selftests/mtk_ccci/ccif_start_cases.c     | 137 ++++++++++++++++++
+ .../selftests/mtk_ccci/test_ccif_start.py     |  43 ++++++
+ 4 files changed, 185 insertions(+), 4 deletions(-)
+ create mode 100644 tools/testing/selftests/mtk_ccci/ccif_start_cases.c
+ create mode 100755 tools/testing/selftests/mtk_ccci/test_ccif_start.py
+
+diff --git a/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c b/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c
+index eda157445b..941fb26e4f 100644
+--- a/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c
++++ b/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c
+@@ -1591,6 +1591,8 @@ static int ccif_start(unsigned char hif_id)
+ 	/* clear all ccif irq before enable it.*/
+ 	ccci_reset_ccif_hw(AP_MD1_CCIF, ccif_ctrl->ccif_ap_base,
+ 		ccif_ctrl->ccif_md_base, ccif_ctrl);
++	/* An immediate empty IRQ may run its poll worker before start returns. */
++	WRITE_ONCE(ccif_ctrl->ccif_state, HIFCCIF_STATE_PWRON);
+ 	ccif_enable_irq1(CCIF_HIF_ID);
+ 	if (!ccif_ctrl->irq0_armed) {
+ 		ccif_ctrl->irq0_armed = true;
+@@ -1599,7 +1601,6 @@ static int ccif_start(unsigned char hif_id)
+ 		/* masked by an empty interrupt before the last stop */
+ 		enable_irq(ccif_ctrl->ap_ccif_irq0_id);
+ 	}
+-	ccif_ctrl->ccif_state = HIFCCIF_STATE_PWRON;
+ 	CCCI_NORMAL_LOG(0, TAG, "%s\n", __func__);
+ 	return 0;
+ }
+@@ -1614,7 +1615,7 @@ static int ccif_stop(unsigned char hif_id)
+ 	/* ACK CCIF for MD. while entering flight mode,
+ 	 * we may send something after MD slept
+ 	 */
+-	ccif_ctrl->ccif_state = HIFCCIF_STATE_PWROFF;
++	WRITE_ONCE(ccif_ctrl->ccif_state, HIFCCIF_STATE_PWROFF);
+ 	cancel_delayed_work_sync(&ccif_ctrl->data0_poll_work);
+ 	ccci_reset_ccif_hw(AP_MD1_CCIF,
+ 		ccif_ctrl->ccif_ap_base, ccif_ctrl->ccif_md_base, ccif_ctrl);
+diff --git a/tools/testing/selftests/mtk_ccci/Makefile b/tools/testing/selftests/mtk_ccci/Makefile
+index e519d200e9..ce88e445b5 100644
+--- a/tools/testing/selftests/mtk_ccci/Makefile
++++ b/tools/testing/selftests/mtk_ccci/Makefile
+@@ -1,4 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-TEST_PROGS := test_lk_metadata.py
+-TEST_FILES := lk_metadata_stubs.h lk_metadata_flow_stubs.h lk_metadata_cases.h
++TEST_PROGS := test_ccif_start.py test_lk_metadata.py
++TEST_FILES := ccif_start_cases.c lk_metadata_stubs.h lk_metadata_flow_stubs.h lk_metadata_cases.h
+ include ../lib.mk
+diff --git a/tools/testing/selftests/mtk_ccci/ccif_start_cases.c b/tools/testing/selftests/mtk_ccci/ccif_start_cases.c
+new file mode 100644
+index 0000000000..601358f5fa
+--- /dev/null
++++ b/tools/testing/selftests/mtk_ccci/ccif_start_cases.c
+@@ -0,0 +1,137 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#include <assert.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <string.h>
++#define HIFCCIF_STATE_MIN 0
++#define HIFCCIF_STATE_PWROFF 1
++#define HIFCCIF_STATE_PWRON 2
++#define CCIF_HIF_ID 1
++#define RB_EXP 1
++#define RB_NORMAL 0
++#define AP_MD1_CCIF 0
++#define APCCIF_RCHNUM 4
++#define CCIF_EMPTY_IRQ_POLL_MS 20
++#define IRQ_HANDLED 1
++typedef int irqreturn_t;
++typedef struct { int value; } atomic_t;
++struct work_struct { int unused; };
++struct delayed_work { struct work_struct work; bool pending; };
++struct md_ccif_ctrl {
++    int ccif_state;
++    bool ccif_clk_free_run, irq0_armed;
++    unsigned int ap_ccif_irq0_id, ap_ccif_irq1_id, data0_empty_polls;
++    void *ccif_ap_base, *ccif_md_base;
++    atomic_t data0_irq_masked, ccif_irq1_enabled;
++    struct delayed_work data0_poll_work;
++};
++static struct md_ccif_ctrl ctrl, *ccci_ccif_ctrl = &ctrl;
++static int devapc_flag_lock, devapc_check_flag, system_wq;
++static unsigned int rchnum, reads, processed, schedules, enables[2], disables;
++static unsigned int depth[2], reset_stage, late_inits, clock_on, clock_off, cancels;
++static bool inject;
++#define READ_ONCE(x) (*(volatile __typeof__(x) *)&(x))
++#define WRITE_ONCE(x, v) (READ_ONCE(x) = (v))
++#define container_of(p, type, member) ((type *)((char *)(p) - offsetof(type, member)))
++#define to_delayed_work(w) container_of(w, struct delayed_work, work)
++#define CCCI_NORMAL_LOG(...) ((void)0)
++#define CCCI_NOTICE_LOG(...) ((void)0)
++#define spin_lock_irqsave(lock, flags) ((void)(lock), (flags) = 0)
++#define spin_unlock_irqrestore(lock, flags) ((void)(lock), (void)(flags))
++#define msecs_to_jiffies(x) (x)
++static int atomic_cmpxchg(atomic_t *a, int old, int value) {
++    int prior=a->value; if (prior==old) a->value=value; return prior;
++}
++static unsigned int ccif_read32(void *base, int offset) {
++    assert(offset==APCCIF_RCHNUM); reads++; return rchnum;
++}
++static void md_ccif_process_data0(struct md_ccif_ctrl *c, unsigned int channel) {
++    assert(channel && channel==rchnum); processed++; rchnum=0;
++}
++static void mod_delayed_work(int wq, struct delayed_work *w, unsigned int delay) {
++    assert(delay==20); schedules++; w->pending=true;
++}
++static irqreturn_t md_ccif_isr0(int irq, void *data);
++static void md_ccif_data0_poll(struct work_struct *work);
++static void run_poll(void) {
++    assert(ctrl.data0_poll_work.pending);
++    ctrl.data0_poll_work.pending=false;
++    md_ccif_data0_poll(&ctrl.data0_poll_work.work);
++}
++static void enable_irq(unsigned int irq) {
++    assert(irq<2 && depth[irq]==1);
++    if (irq==1) assert(ctrl.ccif_state==HIFCCIF_STATE_PWRON && reset_stage==6);
++    depth[irq]--; enables[irq]++;
++    if (irq==0 && inject) {
++        inject=false;
++        assert(reset_stage==6); /* All queue/SRAM/hardware reset calls finished. */
++        assert(md_ccif_isr0(0,&ctrl)==IRQ_HANDLED);
++        run_poll(); /* Start is descheduled past the 20-ms delay here. */
++    }
++}
++static void disable_irq_nosync(unsigned int irq) {
++    assert(irq==0 && depth[0]==0); depth[0]++; disables++;
++}
++static void cancel_delayed_work_sync(struct delayed_work *w) {
++    assert(ctrl.ccif_state==HIFCCIF_STATE_PWROFF); w->pending=false; cancels++;
++}
++static void ccif_late_init(unsigned char id) { late_inits++; }
++static void ccif_set_clk_on(unsigned char id) { clock_on++; }
++static void ccif_set_clk_off(unsigned char id) { clock_off++; }
++static void md_ccif_sram_reset(unsigned char id) { assert(++reset_stage==1); }
++static void md_ccif_switch_ringbuf(unsigned char id, int mode) {
++    reset_stage++; assert((reset_stage==2 && mode==RB_EXP) || (reset_stage==4 && mode==RB_NORMAL));
++}
++static void md_ccif_reset_queue(unsigned char id, int mode) {
++    reset_stage++; assert(reset_stage==3 || reset_stage==5);
++}
++static void ccci_reset_ccif_hw(int id, void *ap, void *md, struct md_ccif_ctrl *c) {
++    if (ctrl.ccif_state==HIFCCIF_STATE_PWROFF && cancels) return;
++    assert(++reset_stage==6);
++}
++/* PRODUCTION */
++static void setup(bool restart) {
++    memset(&ctrl,0,sizeof(ctrl)); memset(enables,0,sizeof(enables));
++    rchnum=reads=processed=schedules=disables=reset_stage=late_inits=clock_on=clock_off=cancels=0;
++    ctrl.ccif_state=restart ? HIFCCIF_STATE_PWROFF : HIFCCIF_STATE_MIN;
++    ctrl.ap_ccif_irq0_id=0; ctrl.ap_ccif_irq1_id=1;
++    ctrl.ccif_irq1_enabled.value=1; /* Probe/request_irq already enabled DATA1. */
++    ctrl.irq0_armed=restart; ctrl.data0_irq_masked.value=restart;
++    depth[0]=1; depth[1]=0; inject=true;
++}
++static bool boundary_case(bool restart) {
++    setup(restart); assert(!ccif_start(CCIF_HIF_ID));
++    assert(ctrl.ccif_state==HIFCCIF_STATE_PWRON && ctrl.data0_irq_masked.value==1 && depth[0]==1);
++    if (!ctrl.data0_poll_work.pending) return false; /* Old order strands masked IRQ. */
++    unsigned int prior=schedules;
++    assert(md_ccif_isr0(0,&ctrl)==IRQ_HANDLED);
++    assert(disables==1 && schedules==prior); /* Already masked: no duplicate disable. */
++    assert(!ccif_start(CCIF_HIF_ID)); assert(enables[0]==1 && reset_stage==6); /* ON no-op. */
++    rchnum=4; run_poll();
++    assert(processed==1 && !ctrl.data0_poll_work.pending && depth[0]==0);
++    assert(ctrl.data0_irq_masked.value==0 && enables[0]==2);
++    rchnum=8; md_ccif_data0_poll(&ctrl.data0_poll_work.work);
++    assert(processed==2 && enables[0]==2); /* Duplicate/stale poll cannot double-enable. */
++    assert(!ccif_stop(CCIF_HIF_ID));
++    assert(ctrl.ccif_state==HIFCCIF_STATE_PWROFF && cancels==1 && clock_off==1);
++    prior=reads; md_ccif_data0_poll(&ctrl.data0_poll_work.work); assert(reads==prior);
++    return true;
++}
++int main(int argc, char **argv) {
++    assert(argc==2);
++    bool initial=boundary_case(false), restart=boundary_case(true);
++    if (!strcmp(argv[1],"old-order")) {
++        assert(!initial && !restart);
++        puts("old production order reproduced stranded IRQ on initial arm and masked restart");
++        return 42;
++    }
++    assert(initial && restart);
++    setup(true); inject=false; ctrl.data0_irq_masked.value=0; depth[0]=0;
++    assert(!ccif_start(CCIF_HIF_ID)); assert(!enables[0] && depth[0]==0);
++    setup(true); inject=false; ctrl.ccif_irq1_enabled.value=0; depth[1]=1;
++    assert(!ccif_start(CCIF_HIF_ID));
++    assert(enables[1]==1 && enables[0]==1 && !depth[0] && !depth[1]);
++    assert(ctrl.ccif_irq1_enabled.value==1);
++    puts("CCIF production startup/ISR/poll ordering and IRQ balance cases passed");
++}
+diff --git a/tools/testing/selftests/mtk_ccci/test_ccif_start.py b/tools/testing/selftests/mtk_ccci/test_ccif_start.py
+new file mode 100755
+index 0000000000..fbc8a23a09
+--- /dev/null
++++ b/tools/testing/selftests/mtk_ccci/test_ccif_start.py
+@@ -0,0 +1,43 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Exercise production CCIF startup/ISR/poll paths at the IRQ-enable boundary."""
++from pathlib import Path
++import os
++import subprocess
++import tempfile
++
++assets = Path(__file__).resolve().parent
++repo = Path(os.environ.get('KERNEL_SRC', str(assets.parents[3])))
++source = (repo / 'drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c').read_text()
++
++def function(name):
++    pos = source.index(name + '(')
++    start = source.rfind('\nstatic ', 0, pos) + 1
++    end = source.index('{', pos) + 1
++    depth = 1
++    while depth:
++        depth += (source[end] == '{') - (source[end] == '}')
++        end += 1
++    return source[start:end]
++
++names = ['md_ccif_data0_poll', 'md_ccif_isr0', 'ccif_enable_irq1', 'ccif_start', 'ccif_stop']
++production = '\n'.join(function(name) for name in names)
++# Recreate the old publication position in the same production function. Even
++# WRITE_ONCE cannot repair that ordering: the worker has already seen OFF.
++publication = '\tWRITE_ONCE(ccif_ctrl->ccif_state, HIFCCIF_STATE_PWRON);\n'
++start = function('ccif_start')
++assert start.count(publication) == 1
++old = start.replace(publication, '').replace('\tCCCI_NORMAL_LOG(0, TAG, "%s\\n", __func__);', publication + '\tCCCI_NORMAL_LOG(0, TAG, "%s\\n", __func__);')
++legacy = production.replace(start, old)
++with tempfile.TemporaryDirectory(prefix='mtk-ccif-start-') as tmp:
++    tmp = Path(tmp)
++    for mode, code in [('fixed', production), ('old-order', legacy)]:
++        c = tmp / (mode + '.c')
++        c.write_text((assets / 'ccif_start_cases.c').read_text().replace('/* PRODUCTION */', code))
++        binary = tmp / mode
++        command = [os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
++                   '-Wno-unused-parameter', '-Werror', '-fsanitize=address,undefined',
++                   str(c), '-o', str(binary)]
++        subprocess.run(command, check=True)
++        result = subprocess.run([str(binary), mode], check=False)
++        assert result.returncode == (42 if mode == 'old-order' else 0), (mode, result.returncode)

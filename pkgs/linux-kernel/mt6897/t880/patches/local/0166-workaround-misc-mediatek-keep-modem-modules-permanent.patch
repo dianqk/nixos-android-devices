@@ -1,0 +1,98 @@
+From 434892fea903e1a076e03b6f1081cc3407812d8b Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] workaround: misc: mediatek: keep modem modules permanent
+
+The imported modem stack has no complete teardown. Prevent unload and
+manual unbind rather than exposing an unsupported lifecycle.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T08:45:08+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/misc/mediatek/eccci/fsm/md_sys1_platform.c | 7 ++-----
+ drivers/misc/mediatek/eccci/hif/ccci_dpmaif_com.c  | 6 +-----
+ drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c    | 6 +-----
+ 3 files changed, 4 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/misc/mediatek/eccci/fsm/md_sys1_platform.c b/drivers/misc/mediatek/eccci/fsm/md_sys1_platform.c
+index 78d98a0551..d8e72872b0 100644
+--- a/drivers/misc/mediatek/eccci/fsm/md_sys1_platform.c
++++ b/drivers/misc/mediatek/eccci/fsm/md_sys1_platform.c
+@@ -1486,6 +1486,8 @@ static struct platform_driver ccci_modem_driver = {
+ 
+ 	.driver = {
+ 		   .name = "driver_modem",
++		   /* nothing is torn down: no manual unbind */
++		   .suppress_bind_attrs = true,
+ #if IS_ENABLED(CONFIG_OF)
+ 		   .of_match_table = ccci_modem_of_ids,
+ #endif
+@@ -1522,12 +1524,7 @@ static int __init modem_cd_init(void)
+ 	return 0;
+ }
+ 
+-static void __exit modem_cd_exit(void)
+-{
+-}
+-
+ module_init(modem_cd_init);
+-module_exit(modem_cd_exit);
+ 
+ MODULE_AUTHOR("CCCI");
+ MODULE_DESCRIPTION("CCCI modem driver v0.1");
+diff --git a/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_com.c b/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_com.c
+index f4b823ff52..fb6692e2ca 100644
+--- a/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_com.c
++++ b/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_com.c
+@@ -3216,6 +3216,7 @@ static const struct of_device_id g_dpmaif_of_ids[] = {
+ static struct platform_driver g_dpmaif_driver = {
+ 	.driver = {
+ 		.name = "ccci_dpmaif_driver",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = g_dpmaif_of_ids,
+ 		.pm = &g_dpmaif_pm_ops,
+ 	},
+@@ -3236,12 +3237,7 @@ static int __init ccci_dpmaif_init(void)
+ 	return 0;
+ }
+ 
+-static void __exit ccci_dpmaif_exit(void)
+-{
+-}
+-
+ module_init(ccci_dpmaif_init);
+-module_exit(ccci_dpmaif_exit);
+ 
+ MODULE_AUTHOR("ccci");
+ MODULE_DESCRIPTION("ccci dpmaif driver");
+diff --git a/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c b/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c
+index 52b3d5a026..eda157445b 100644
+--- a/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c
++++ b/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c
+@@ -1946,6 +1946,7 @@ static struct platform_driver ccci_hif_ccif_driver = {
+ 
+ 	.driver = {
+ 		.name = "ccci_hif_ccif",
++		.suppress_bind_attrs = true,
+ 		.of_match_table = ccci_ccif_of_ids,
+ 		.pm = &ccif_pm_ops,
+ 	},
+@@ -1966,12 +1967,7 @@ static int __init ccci_hif_ccif_init(void)
+ 	return 0;
+ }
+ 
+-static void __exit ccci_hif_ccif_exit(void)
+-{
+-}
+-
+ module_init(ccci_hif_ccif_init);
+-module_exit(ccci_hif_ccif_exit);
+ 
+ MODULE_AUTHOR("ccci");
+ MODULE_DESCRIPTION("ccci hif ccif driver");
+-- 
+2.56.0
+

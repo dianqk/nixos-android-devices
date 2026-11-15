@@ -82,9 +82,7 @@ let
     require_measured = r.requireMeasured;
   };
   rolesJSON = builtins.toJSON (lib.mapAttrs (_: roleJSON) daemon.roles);
-  removed =
-    name: message:
-    lib.mkRemovedOptionModule (path ++ [ name ]) message;
+  removed = name: message: lib.mkRemovedOptionModule (path ++ [ name ]) message;
 in
 {
   imports = [
@@ -97,16 +95,33 @@ in
   options.androidDevices.recovery = {
     enable = lib.mkEnableOption "the shared RAM-only mobile recovery environment";
     minimal = lib.mkEnableOption "a console-only RAM recovery without storage tools or screen UI";
+    consoleBlankSeconds = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 0;
+      description = ''
+        Idle seconds before the text console blanks; zero disables blanking.
+        Keep zero when the recovery menu grabs input, since VT key wakeups
+        are unavailable while those devices are grabbed.
+      '';
+    };
+    screen.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Run the recovery display menu; disabling it keeps the full daemon and management interfaces.";
+    };
     daemon = {
       slotModel = lib.mkOption {
         type = lib.types.enum [
           "ab"
+          "mediatek-a"
           "single"
         ];
         description = ''
           Storage model of the Rust recovery daemon. `ab`: B-only Android A/B
-          layout with `linux`/`linux-boot` in the userdata allocation. `single`:
-          one slot with explicit `roles`.
+          layout with `linux`/`linux-boot` in the userdata allocation.
+          `mediatek-a`: Linux on slot A of a MediaTek A/B device (Android kept
+          on B), with `linux-boot` and `linux` split from
+          userdata. `single`: one slot with explicit `roles`.
         '';
       };
       compatible = lib.mkOption {
@@ -127,6 +142,7 @@ in
         type = lib.types.enum [
           "qcom-gpt"
           "boot-hints"
+          "aosp-boot-control"
           "none"
         ];
         default = "none";
@@ -134,10 +150,16 @@ in
       };
       miscBytes = lib.mkOption {
         type = lib.types.enum [
+          524288
           1048576
           4194304
         ];
         description = "Expected complete misc partition capacity for BCB transactions.";
+      };
+      serialPrefix = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Required prefix of the bootloader-provided device-tree `serial-number`.";
       };
       recoveryAvb = lib.mkOption {
         type = lib.types.bool;
@@ -222,11 +244,7 @@ in
   config = lib.mkMerge [
     # The installed system carries the storage contract its recovery checks.
     (lib.mkIf
-      (
-        config.androidDevices.enable
-        && config.androidDevices.role == "system"
-        && daemon.roles != null
-      )
+      (config.androidDevices.enable && config.androidDevices.role == "system" && daemon.roles != null)
       {
         system.systemBuilderCommands = ''
           ln -s ${androidPackages.packaging.writeText "mobile-storage-roles.json" rolesJSON} $out/mobile-storage-roles.json
@@ -245,10 +263,17 @@ in
             || (
               if daemon.slotModel == "single" then
                 daemon.roles != null && daemon.slotMetadata == "none" && !daemon.recoveryAvb
+              else if daemon.slotModel == "mediatek-a" then
+                daemon.roles == null && daemon.slotMetadata == "aosp-boot-control" && daemon.ufsSafeMode == null
               else
-                daemon.roles == null && daemon.slotMetadata != "none" && daemon.ufsSafeMode == null
+                daemon.roles == null
+                && !(builtins.elem daemon.slotMetadata [
+                  "none"
+                  "aosp-boot-control"
+                ])
+                && daemon.ufsSafeMode == null
             );
-          message = "Single-slot recovery needs daemon roles and no A/B metadata; A/B recovery uses fixed partition names and slot metadata.";
+          message = "Single-slot recovery needs daemon roles and no A/B metadata; A/B recovery uses fixed partition names and slot metadata; mediatek-a needs AOSP boot control.";
         }
         {
           assertion = config.androidDevices.enable;
@@ -257,6 +282,7 @@ in
         {
           assertion =
             cfg.minimal
+            || !cfg.screen.enable
             || lib.all config.androidDevices.kernelPackage.config.isYes [
               "VT"
               "FRAMEBUFFER_CONSOLE"
@@ -266,7 +292,7 @@ in
         }
       ];
       androidDevices.role = "recovery";
-      boot.kernelParams = [ "consoleblank=0" ];
+      boot.kernelParams = [ "consoleblank=${toString cfg.consoleBlankSeconds}" ];
       # This configuration never reaches stage 2, but NixOS still requires a
       # root filesystem while evaluating its system closure.
       fileSystems."/" = lib.mkDefault {
@@ -280,31 +306,38 @@ in
         }
         // lib.optionalAttrs (!cfg.minimal) {
           "/etc/mobile-recovery-protocol".text = "1";
-          "/etc/mobile-recovery.json".text = builtins.toJSON {
-            identity = deviceName;
-            inherit (daemon) compatible controller;
-            slot_model = daemon.slotModel;
-            firmware_compatible = daemon.firmwareCompatible;
-            slot_metadata = daemon.slotMetadata;
-            misc_bytes = daemon.miscBytes;
-            recovery_avb = daemon.recoveryAvb;
-            boot_request = daemon.bootRequest;
-            recovery_reboot_argument = daemon.recoveryRebootArgument;
-            roles = if daemon.roles == null then null else builtins.fromJSON rolesJSON;
-            ufs_safe_mode = daemon.ufsSafeMode;
-            deploy_requirements = {
-              mac_files = daemon.deployRequirements.macFiles;
-              checksum_dirs = daemon.deployRequirements.checksumDirectories;
-            };
-            hostname = cfg.targetHostName;
-            root_label = config.androidDevices.persistentImage.rootfs.label;
-            esp_bytes =
-              if config.androidDevices.boot.uefi.espSizeBytes == null then
-                0
-              else
-                config.androidDevices.boot.uefi.espSizeBytes;
-            minimum_root_bytes = cfg.minimumRootBytes;
-          };
+          "/etc/mobile-recovery.json".text = builtins.toJSON (
+            {
+              identity = deviceName;
+              inherit (daemon) compatible controller;
+              slot_model = daemon.slotModel;
+              firmware_compatible = daemon.firmwareCompatible;
+              slot_metadata = daemon.slotMetadata;
+              misc_bytes = daemon.miscBytes;
+              recovery_avb = daemon.recoveryAvb;
+              boot_request = daemon.bootRequest;
+              recovery_reboot_argument = daemon.recoveryRebootArgument;
+              roles = if daemon.roles == null then null else builtins.fromJSON rolesJSON;
+              ufs_safe_mode = daemon.ufsSafeMode;
+              deploy_requirements = {
+                mac_files = daemon.deployRequirements.macFiles;
+                checksum_dirs = daemon.deployRequirements.checksumDirectories;
+              };
+              hostname = cfg.targetHostName;
+              root_label = config.androidDevices.persistentImage.rootfs.label;
+              boot_label = config.androidDevices.boot.uefi.label;
+              esp_bytes =
+                if config.androidDevices.boot.uefi.espSizeBytes == null then
+                  0
+                else
+                  config.androidDevices.boot.uefi.espSizeBytes;
+              minimum_root_bytes = cfg.minimumRootBytes;
+            }
+
+            // lib.optionalAttrs (daemon.serialPrefix != null) {
+              serial_prefix = daemon.serialPrefix;
+            }
+          );
         };
         services.mobile-recovery-daemon = lib.mkIf (!cfg.minimal) {
           description = "Own recovery operations and task state";
@@ -329,7 +362,7 @@ in
             UMask = "0077";
           };
         };
-        services.mobile-recovery-screen = lib.mkIf (!cfg.minimal) {
+        services.mobile-recovery-screen = lib.mkIf (!cfg.minimal && cfg.screen.enable) {
           description = "Independent mobile VT/fbcon recovery menu";
           wantedBy = [ "mobile-recovery.target" ];
           after = [

@@ -1,0 +1,160 @@
+From 1798fddfa0d7fd955f125237e2c407a5fded3cb0 Mon Sep 17 00:00:00 2001
+From: Martin Lund <mrlund@hotmail.com>
+Date: Sat, 24 Oct 2026 11:01:05 +0200
+Subject: [PATCH 012/144] drm/msm/mdss: sm8750: read the display QTB once on
+ every MDSS enable
+
+On the OnePlus 13 (SM8750) a warm reboot often comes up with a black
+panel. The panel driver's first DSI command-mode DMAs (memory fetches by
+VBIF client xin7) complete twice and the third never does: "cmd dma tx
+failed", "Failed to initialize panel: -110", DSI STATUS0 0x20003, lanes in
+stop state, no DSI error and no SMMU fault, the iova still translates.
+A DSI soft reset, a DSI link/PHY power cycle, a panel rail cycle, a VBIF
+halt and the MDSS BCR do not clear it, and commands sent through the DSI
+TPG FIFO (no memory fetch) still go through. It is never seen after a
+true cold start.
+
+The stale state survives the warm reset in the fetch path behind VBIF,
+in the display QTB500 TBU of the apps SMMU (mdp_hf_qtb): a single CPU
+read of its SWID_LOW register (offset 0; the downstream qtb500 driver
+uses the same read as its write_sync) before the first fetch prevents
+the third-fetch hang. Reading it after the hang does not recover it, so
+the read has to come before the first fetch. The likely mechanism is
+that a config-port access resynchronises the QTB clock/idle handshake
+that the bootloader's warm reset left stuck; this is not confirmed by
+documentation. Two controls at the same point do not help, which rules
+out a plain bandwidth or MDSS-side wake:
+ - an extra mdp0-mem interconnect vote (400 MB/s avg, 1.6 GB/s peak),
+ - a read of the MDSS VBIF.
+
+Results on warm boots where the bootloader splash autorefresh had
+stalled at takeover (INTF1 line count 0xc60, the boots that fail),
+2026-10-23:
+
+  arm                        stalled boots   other boots
+                             good/bad        good/bad
+  QTB read (this patch)      8/0             11/0
+  no read (two controls)     2/2             15/0
+  extra mdp0-mem icc vote    0/1             6/0
+  VBIF read                  0/1             1/0
+
+Do the read in msm_mdss_enable(), after the MDSS clocks and interconnect
+votes are up and before any display master fetches, so it also runs on
+every runtime resume (screen wake).
+
+The QTB is not a resource of the MDSS device and mainline DT has no node
+for the SM8750 TBUs, so for now its physical address is per-SoC match
+data (sm8750_data.hf_qtb_base; SM8750 gets its own msm_mdss_data for
+it, since it shared data_57k) mapped with devm_ioremap(). Upstream, this
+should become a DT phandle to a TBU node, or a sync hook in arm-smmu-qcom
+(to be settled with the SMMU maintainers).
+
+The same read covers the stall after an MDSS_GDSC collapse, so the GDSC
+does not have to be kept on.
+
+Assisted-by: Grok Bot
+Signed-off-by: Martin Lund <mrlund@hotmail.com>
+
+(cherry picked from commit a3079a1a9db3d3b60a66261a93931bbee36b96e0)
+Link: https://github.com/mrlund/linux-omarchy-mobile/commit/a3079a1a9db3d3b60a66261a93931bbee36b96e0
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0022-drm-msm-mdss-sm8750-read-the-display-QTB-once-on-eve.patch
+Import-SHA256: e54faddf39c688735b3b61208868f121c49072ccaf70db94c2e29d6428371a80
+Import-Provenance: mail headers
+(cherry picked from commit 9151f26f668e7562573b0447b2a32ab34ecab1a0)
+---
+ drivers/gpu/drm/msm/msm_mdss.c | 39 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/msm/msm_mdss.c b/drivers/gpu/drm/msm/msm_mdss.c
+index 58d30119a8..d14ce5b7ee 100644
+--- a/drivers/gpu/drm/msm/msm_mdss.c
++++ b/drivers/gpu/drm/msm/msm_mdss.c
+@@ -26,6 +26,12 @@
+ 
+ struct msm_mdss_data {
+ 	u32 reg_bus_bw;
++	/*
++	 * Physical address of the display (mdp_hf) QTB500 TBU of the apps
++	 * SMMU, or 0. If set, it is read once on every MDSS enable, before
++	 * any display master issues a memory fetch. See msm_mdss_qtb_sync().
++	 */
++	phys_addr_t hf_qtb_base;
+ };
+ 
+ struct msm_mdss {
+@@ -43,6 +49,7 @@ struct msm_mdss {
+ 	u32 reg_bus_bw;
+ 	struct icc_path *mdp_path[2];
+ 	u32 num_mdp_paths;
++	void __iomem *hf_qtb;
+ 	struct icc_path *reg_bus_path;
+ };
+ 
+@@ -228,6 +235,21 @@ static void msm_mdss_6x_setup_ubwc(struct msm_mdss *msm_mdss)
+ 	 (((minor) & 0xfff) << 16) |	\
+ 	 ((step) & 0xffff))
+ 
++/*
++ * On SM8750 the first DSI command-mode DMA fetches after a warm reset can
++ * wedge in the display QTB500 (the apps SMMU TBU in front of MDSS): the DSI
++ * engine and xin7 stay busy forever, with no SMMU fault and no DSI error,
++ * after two small fetches have completed. A single CPU read of the QTB's
++ * SWID_LOW register (offset 0, what the downstream qtb500 code uses as its
++ * write_sync) before the first fetch avoids it. Do that read here, after the
++ * MDSS clocks and interconnect votes are up.
++ */
++static void msm_mdss_qtb_sync(struct msm_mdss *msm_mdss)
++{
++	if (msm_mdss->hf_qtb)
++		readl(msm_mdss->hf_qtb);
++}
++
+ static int msm_mdss_enable(struct msm_mdss *msm_mdss)
+ {
+ 	int ret, i;
+@@ -258,6 +280,8 @@ static int msm_mdss_enable(struct msm_mdss *msm_mdss)
+ 		return ret;
+ 	}
+ 
++	msm_mdss_qtb_sync(msm_mdss);
++
+ 	/*
+ 	 * Register access requires MDSS_MDP_CLK, which is not enabled by the
+ 	 * mdss on mdp5 hardware. Skip it for now.
+@@ -398,6 +422,14 @@ static struct msm_mdss *msm_mdss_init(struct platform_device *pdev, bool is_mdp5
+ 
+ 	dev_dbg(&pdev->dev, "mapped mdss address space @%p\n", msm_mdss->mmio);
+ 
++	if (mdss_data->hf_qtb_base) {
++		/* Not a resource of this device: the TBU belongs to the apps SMMU */
++		msm_mdss->hf_qtb = devm_ioremap(&pdev->dev, mdss_data->hf_qtb_base,
++						SZ_4K);
++		if (!msm_mdss->hf_qtb)
++			dev_warn(&pdev->dev, "cannot map the display QTB\n");
++	}
++
+ 	ret = msm_mdss_parse_data_bus_icc_path(&pdev->dev, msm_mdss);
+ 	if (ret)
+ 		return ERR_PTR(ret);
+@@ -517,6 +549,11 @@ static const struct msm_mdss_data data_57k = {
+ 	.reg_bus_bw = 57000,
+ };
+ 
++static const struct msm_mdss_data sm8750_data = {
++	.reg_bus_bw = 57000,
++	.hf_qtb_base = 0x017d0000,	/* mdp_hf_qtb, stock DT apps-smmu */
++};
++
+ static const struct msm_mdss_data data_74k = {
+ 	.reg_bus_bw = 74000,
+ };
+@@ -558,7 +595,7 @@ static const struct of_device_id mdss_dt_match[] = {
+ 	{ .compatible = "qcom,sm8450-mdss", .data = &data_74k },
+ 	{ .compatible = "qcom,sm8550-mdss", .data = &data_57k },
+ 	{ .compatible = "qcom,sm8650-mdss", .data = &data_57k },
+-	{ .compatible = "qcom,sm8750-mdss", .data = &data_57k },
++	{ .compatible = "qcom,sm8750-mdss", .data = &sm8750_data },
+ 	/* TODO: x1e8: Add reg_bus_bw with real value */
+ 	{ .compatible = "qcom,x1e80100-mdss", .data = &data_153k6 },
+ 	{}

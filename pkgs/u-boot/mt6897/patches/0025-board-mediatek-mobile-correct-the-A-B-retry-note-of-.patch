@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Thu, 15 Oct 2026 10:24:55 +0800
+Subject: [PATCH 25/29] board: mediatek-mobile: correct the A/B retry note of
+ autoreset
+
+LK decrements the retry counter of a slot that is not marked successful
+on every boot, whatever the reset type; it does not ignore software
+resets. The watchdog route stays: it also resets a hung U-Boot.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ board/mediatek/mediatek-mobile/mediatek-mobile.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/board/mediatek/mediatek-mobile/mediatek-mobile.c b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+index 498592165cb..634d1d4e76f 100644
+--- a/board/mediatek/mediatek-mobile/mediatek-mobile.c
++++ b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+@@ -778,10 +778,11 @@ static bool mtk_usb_addressed(bool verbose)
+ /*
+  * Bring-up safety net: when "autoreset_s" is set (by the environment) and no
+  * USB host has addressed the device within that many seconds, stop
+- * servicing the watchdog. The stock bootloader counts the watchdog reset
+- * (unlike a software reset) as a failed boot, so its A/B retry falls back
+- * to the other slot; the console record is saved for the next boot. Once a
+- * host connects, or "autoreset_s" is cleared, the device stays.
++ * servicing the watchdog. The watchdog also resets a U-Boot that hangs;
++ * the stock bootloader counts every boot of a slot not marked successful,
++ * so after a few attempts its A/B retry falls back to the other slot. The
++ * console record is saved for the next boot. Once a host connects, or
++ * "autoreset_s" is cleared, the device stays.
+  */
+ static struct cyclic_info mtk_autoreset;
+ static ulong mtk_autoreset_start;
+-- 
+2.55.0
+

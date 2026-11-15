@@ -48,9 +48,6 @@ in
           message = "Set hardware.asphalt.systemHostName to the installed host name.";
         }
       ];
-      system.systemBuilderCommands = ''
-        ln -s ${config.system.build.mobileBootImage} $out/asphalt-boot.img
-      '';
     })
   ];
 }

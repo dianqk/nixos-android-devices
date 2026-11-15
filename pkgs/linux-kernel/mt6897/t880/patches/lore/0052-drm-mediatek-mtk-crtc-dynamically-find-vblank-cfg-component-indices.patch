@@ -1,0 +1,163 @@
+From dc24482b354445c849b097aad5342eb2f9a9b40f Mon Sep 17 00:00:00 2001
+From: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Date: Tue, 14 Jul 2026 13:43:48 +0200
+Subject: [PATCH] drm/mediatek: mtk_crtc: Dynamically find vblank/cfg component
+ indices
+
+As of now mtk_crtc assumes that, on all MediaTek SoCs, both the
+vblank and configuration components are the same one, and also
+that this would always be the first one in a display pipeline.
+
+This is not true!
+
+Or at least, it's true for the display pipelines supported by the
+legacy SoCs like MT8173, and also for the ones that are currently
+used in the upstream boards on more recent SoCs like MT8188/95,
+but for the latter ones it just happens to be like this because
+of how the boards are configured.
+
+This is done both in preparation for adding support for complex
+Display Controller pipelines like needed in MT8196 and MT8894, but
+also for supporting display pipelines in MT8188/89/95 (and others
+from the same generation) that are not starting with a component
+that handles both vblank and layer configuration at the same time.
+
+Signed-off-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Link: https://patchwork.kernel.org/project/linux-mediatek/list/?series=1127365
+[dianqk: from the Huge Restructuring v2 series, applied to v7.3-rc6; rc6 drift resolved]
+---
+ drivers/gpu/drm/mediatek/mtk_crtc.c | 56 ++++++++++++++++++++++++++---
+ 1 file changed, 51 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_crtc.c b/drivers/gpu/drm/mediatek/mtk_crtc.c
+index f28116e3f5..3ec2d02e6c 100644
+--- a/drivers/gpu/drm/mediatek/mtk_crtc.c
++++ b/drivers/gpu/drm/mediatek/mtk_crtc.c
+@@ -59,6 +59,8 @@ struct mtk_crtc_hw_layer {
+  * @mmsys_dev:       Pointer to the MMSYS device for configuration registers
+  * @dma_dev:         Pointer to the DMA device (usually linked to an IOMMU)
+  * @mutex:           Pointer to the MediaTek MuteX device for HW triggers mute/unmuting
++ * @vblank_comp_idx: Index of HW component where to enable sending VBlanks
++ * @config_comp_idx: Index of main HW component to use for plane configuration
+  * @ddp_comp_nr:     Number of HW components in ddp_comp structure
+  * @num_conn_routes: Number of alternative connection routes for a pipeline
+  * @conn_routes:     Array of HW components usable as alternative connection route
+@@ -90,6 +92,8 @@ struct mtk_crtc {
+ 	struct device			*mmsys_dev;
+ 	struct device			*dma_dev;
+ 	struct mtk_mutex		*mutex;
++	s8				vblank_comp_idx;
++	s8				config_comp_idx;
+ 	unsigned int			ddp_comp_nr;
+ 	unsigned int			num_conn_routes;
+ 	const struct mtk_drm_route	*conn_routes;
+@@ -523,7 +527,7 @@ static void mtk_crtc_ddp_config(struct drm_crtc *crtc,
+ {
+ 	struct mtk_crtc *mtk_crtc = to_mtk_crtc(crtc);
+ 	struct mtk_crtc_state *state = to_mtk_crtc_state(mtk_crtc->base.state);
+-	struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[0];
++	struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[mtk_crtc->config_comp_idx];
+ 	unsigned int i;
+ 
+ 	/*
+@@ -693,7 +697,7 @@ static void mtk_crtc_ddp_irq(void *data)
+ static int mtk_crtc_enable_vblank(struct drm_crtc *crtc)
+ {
+ 	struct mtk_crtc *mtk_crtc = to_mtk_crtc(crtc);
+-	struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[0];
++	struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[mtk_crtc->vblank_comp_idx];
+ 
+ 	mtk_ddp_comp_enable_vblank(comp);
+ 
+@@ -703,7 +707,7 @@ static int mtk_crtc_enable_vblank(struct drm_crtc *crtc)
+ static void mtk_crtc_disable_vblank(struct drm_crtc *crtc)
+ {
+ 	struct mtk_crtc *mtk_crtc = to_mtk_crtc(crtc);
+-	struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[0];
++	struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[mtk_crtc->vblank_comp_idx];
+ 
+ 	mtk_ddp_comp_disable_vblank(comp);
+ }
+@@ -816,7 +820,7 @@ static void mtk_crtc_atomic_enable(struct drm_crtc *crtc,
+ 				   struct drm_atomic_commit *state)
+ {
+ 	struct mtk_crtc *mtk_crtc = to_mtk_crtc(crtc);
+-	struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[0];
++	struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[mtk_crtc->config_comp_idx];
+ 	struct drm_device *dev = mtk_crtc->base.dev;
+ 	int ret;
+ 
+@@ -844,7 +848,7 @@ static void mtk_crtc_atomic_disable(struct drm_crtc *crtc,
+ 				    struct drm_atomic_commit *state)
+ {
+ 	struct mtk_crtc *mtk_crtc = to_mtk_crtc(crtc);
+-	struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[0];
++	struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[mtk_crtc->config_comp_idx];
+ 	struct drm_device *dev = mtk_crtc->base.dev;
+ 	int i;
+ 
+@@ -1179,6 +1183,10 @@ int mtk_crtc_create(struct drm_device *drm_dev,
+ 		return ret;
+ 	}
+ 
++	/* Component 0 would be valid so initialize vblank and config idx to -EINVAL */
++	mtk_crtc->vblank_comp_idx = -EINVAL;
++	mtk_crtc->config_comp_idx = -EINVAL;
++
+ 	for (i = 0, j = 0; i < mtk_crtc->ddp_comp_nr; i++, j++) {
+ 		unsigned int comp_id = output_path->comp[i].type;
+ 		struct mtk_ddp_comp *comp;
+@@ -1201,12 +1209,50 @@ int mtk_crtc_create(struct drm_device *drm_dev,
+ 
+ 			if (comp->funcs->ctm_set)
+ 				has_ctm = true;
++
++			/*
++			 * Assumes that there can only be one vblank enabler per CRTC,
++			 * and that should there be more than one, the one that should
++			 * handle vblanks has to be the bottom-most HW component.
++			 */
++			if (mtk_crtc->vblank_comp_idx < 0 && comp->funcs->enable_vblank)
++				mtk_crtc->vblank_comp_idx = j;
++
++			/*
++			 * Assumes that there can only be one main configuration
++			 * component per CRTC, and that if more than one has to
++			 * be configured for at each frame, the main one would
++			 * take care of the config chain.
++			 *
++			 * As a note, such component has specific characteristics:
++			 * - It is configurable, and supports per-layer properties;
++			 * - It is a main layer component and not a layer stage;
++			 * - It is always the first one (the bottom-most) in the
++			 *   pipeline that has the characteristics explaned above.
++			 *
++			 * Such hardware is usually an OVL, RDMA or exDMA.
++			 *
++			 * This may change in the future with more complex pipelines.
++			 */
++			if (mtk_crtc->config_comp_idx < 0 && comp->funcs->config &&
++			    comp->funcs->layer_config && comp->funcs->layer_nr)
++				mtk_crtc->config_comp_idx = j;
+ 		}
+ 
+ 		mtk_ddp_comp_register_vblank_cb(comp, mtk_crtc_ddp_irq,
+ 						&mtk_crtc->base);
+ 	}
+ 
++	if (mtk_crtc->config_comp_idx < 0) {
++		dev_err(dev, "No HW component for layer configuration. Bailing out.\n");
++		return -EINVAL;
++	}
++
++	if (mtk_crtc->vblank_comp_idx < 0) {
++		dev_info(dev, "No vblank enabler component found! Expect timeouts.\n");
++		mtk_crtc->vblank_comp_idx = 0;
++	}
++
+ 	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++) {
+ 		struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[i];
+ 
+-- 
+2.56.0
+

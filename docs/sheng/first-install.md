@@ -7,18 +7,22 @@ The recovery initrd contains no Python. Standard NixOS installation/update tools
 Python from the target system inside chroot.
 
 Starting from the original userdata layout, check and explicitly execute **destructive**
-preparation below. Android and Linux each receive approximately half of the original
-userdata allocation; the Linux half contains a separate FAT ESP (1 GiB by default) and
-ext4 root. Android userdata is destroyed and requires a separate factory reset.
-Already partitioned devices are refused by this operation.
+preparation below. Android keeps the userdata size you choose (32/64/128/256/512 GiB,
+offered while Linux keeps at least 64 GiB; see
+[recovery](../recovery.md#ab-devices-preparing-linux-storage)); Linux gets the rest as a
+separate FAT ESP (1 GiB by default) and ext4 root. Android userdata is destroyed and
+requires a separate factory reset. Already partitioned devices are refused by this
+operation.
 
 ```sh
-ssh RECOVERY_HOST 'recovery prepare-install --check'
-ssh RECOVERY_HOST 'recovery prepare-install --confirm-erase-userdata'
+ssh RECOVERY_HOST 'recovery prepare-install --check'   # lists the offered sizes
+ssh RECOVERY_HOST 'recovery prepare-install --android-userdata 64G --check'
+ssh RECOVERY_HOST 'recovery prepare-install --android-userdata 64G --confirm-erase-userdata'
 ```
 
-Then follow [first installation](../initial-install.md) to import the system, install EFI
-and write matching U-Boot last. Update installed systems with `recovery rebuild boot`
+Use the [separate firmware procedure](../u-boot-install.md#build-and-flash-u-boot-independently)
+if compatible U-Boot is missing. Then follow [first installation](../initial-install.md)
+to import the system and install its EFI generation. Update installed systems with `recovery rebuild boot`
 or host-side `mobile-device recovery deploy`. Existing root/ESP ordering and alignment
 gaps remain supported; ordinary updates do not repartition.
 

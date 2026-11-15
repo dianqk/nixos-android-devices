@@ -1,0 +1,249 @@
+From 3aa3a48520431780214b0533ae7b28372ed91acb Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] mfd: mt6375: integrate reporting and bounded charger controls
+
+Adapt the MT6375 MFD to its regmap API and shared charger interface.
+Retain bounded bus writes for charger controls and TCPC shipping bits;
+the firmware configuration whitelist is selected separately.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-16T01:47:11+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T18:23:57+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T20:29:20+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T21:53:56+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+(cherry picked from commit b701a05e07cc1353b295b1c358aa517dae3fccf6)
+Link: https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/power/supply/mt6375-charger.c
+---
+ drivers/mfd/mt6375.c               | 128 ++++++++++++++++++++++++++++-
+ include/linux/mfd/mt6375-charger.h |  17 ++++
+ 2 files changed, 141 insertions(+), 4 deletions(-)
+ create mode 100644 include/linux/mfd/mt6375-charger.h
+
+diff --git a/drivers/mfd/mt6375.c b/drivers/mfd/mt6375.c
+index dbb290e910..aaab9dacf4 100644
+--- a/drivers/mfd/mt6375.c
++++ b/drivers/mfd/mt6375.c
+@@ -21,6 +21,7 @@
+ #include <linux/of_platform.h>
+ #include <linux/regmap.h>
+ #include <linux/atomic.h>
++#include <linux/mfd/mt6375-charger.h>
+ 
+ #define MT6375_SLAVEID_TCPC	0x4E
+ #define MT6375_SLAVEID_PMU	0x34
+@@ -57,6 +58,7 @@ enum {
+ };
+ 
+ struct mt6375_data {
++	struct mt6375_charger charger;
+ 	struct device *dev;
+ 	struct i2c_client *i2c[MT6375_SLAVE_MAX];
+ 	struct regmap *rmap;
+@@ -97,10 +99,67 @@ static int mt6375_regmap_write(void *context, const void *data, size_t count)
+ 		return -EHOSTDOWN;
+ 	}
+ 
++	if (_data[0] == 1 && _data[1] <= 0x28 &&
++	    _data[1] + count - MT6375_REGADDR_SIZE > 0x20) {
++		size_t j;
++		for (j = 2; j < count; j++) {
++			unsigned int reg = _data[1] + j - 2, mask, max;
++			int cur;
++			switch (reg) {
++			case 0x20: mask = BIT(0); max = 1; break;
++			case 0x22: mask = 0x7f; max = 86; break; /* 2.2 A */
++			case 0x23: mask = 0x7f; max = 43; break; /* 8.2 V */
++			case 0x25: mask = 0x7f; max = 50; break; /* 4.40 V */
++			case 0x26: mask = 0x3f; max = 44; break; /* 2.2 A */
++			case 0x28: mask = 0xf2; max = 0x32; break; /* 200 mA */
++			default: return -EPERM;
++			}
++			if (!ddata->charger.enabled || (_data[j] & mask) > max ||
++			    (reg == 0x22 && (_data[j] & mask) < 2) ||
++			    (reg == 0x26 && (_data[j] & mask) < 6) ||
++			    (reg == 0x28 && (_data[j] & 0xf0) < 0x10))
++				return -EPERM;
++			cur = i2c_smbus_read_byte_data(ddata->i2c[MT6375_SLAVE_PMU], reg);
++			if (cur < 0)
++				return cur;
++			if (reg == 0x20) {
++				if (_data[j] & BIT(7)) /* PP_PG_FLAG: W1C */
++					return -EPERM;
++				cur &= ~BIT(7);
++			} else if (reg == 0x28) {
++				if ((_data[j] & BIT(0)) || /* EOC_RST */
++				    ((cur & BIT(1)) && !(_data[j] & BIT(1))))
++					return -EPERM;
++				cur &= ~BIT(0);
++			}
++			if ((_data[j] ^ cur) & ~mask)
++				return -EPERM;
++		}
++	}
+ 	i2c = bank_to_i2c(ddata, _data[0]);
+ 	if (!i2c)
+ 		return -EINVAL;
+ 
++	/*
++	 * TCPC SYSCTRL1 (0x8f) also holds the TCPC shipping bit (bit 5).
++	 * Only bits 7 and 5 may be set (as in the vendor value 0xb8);
++	 * clearing any bit or changing another one is refused at the bus.
++	 */
++	if (_data[0] == 0 && _data[1] <= 0x8f &&
++	    _data[1] + count - MT6375_REGADDR_SIZE > 0x8f) {
++		const u8 *nv = &_data[MT6375_REGADDR_SIZE + 0x8f - _data[1]];
++		int cur = i2c_smbus_read_byte_data(i2c, 0x8f);
++
++		if (cur < 0)
++			return cur;
++		if (((*nv ^ cur) & ~0xa0) || (cur & ~*nv)) {
++			dev_err(ddata->dev,
++				"refused SYSCTRL1 write 0x%02x (now 0x%02x)\n",
++				*nv, cur);
++			return -EPERM;
++		}
++	}
++
+ 	if (_data[0] == MT6375_BANK_TCPC_RT2) {
+ 		ret = i2c_master_send(i2c, _data, count);
+ 		if (ret < 0)
+@@ -178,7 +237,6 @@ static const struct regmap_config mt6375_regmap_config = {
+ 	.val_bits = 8,
+ 	.reg_format_endian = REGMAP_ENDIAN_BIG,
+ 	.max_register = MT6375_REG_RT2_END,
+-	.writeable_reg = mt6375_is_accessible_reg,
+ 	.readable_reg = mt6375_is_accessible_reg,
+ };
+ 
+@@ -313,9 +371,9 @@ static int mt6375_add_irq_chip(struct mt6375_data *ddata)
+ 	ddata->irq_chip.irq_disable = mt6375_irq_disable;
+ 	ddata->irq_chip.irq_enable = mt6375_irq_enable;
+ 
+-	ddata->domain = irq_domain_add_linear(ddata->dev->of_node,
+-					      MT6375_IRQ_REGS * 8,
+-					      &mt6375_domain_ops, ddata);
++	ddata->domain = irq_domain_create_linear(dev_fwnode(ddata->dev),
++						 MT6375_IRQ_REGS * 8,
++						 &mt6375_domain_ops, ddata);
+ 	if (!ddata->domain) {
+ 		dev_err(ddata->dev, "failed to create irq domain\n");
+ 		return -ENOMEM;
+@@ -380,6 +438,55 @@ static int mt6375_check_devid(struct mt6375_data *ddata)
+ 	return 0;
+ }
+ 
++struct mt6375_charger *mt6375_charger_get(struct device *parent)
++{
++	struct mt6375_data *d = dev_get_drvdata(parent);
++
++	return d->charger.enabled ? &d->charger : NULL;
++}
++EXPORT_SYMBOL_GPL(mt6375_charger_get);
++
++static int mt6375_charger_quiesce(struct mt6375_data *d)
++{
++	unsigned int val;
++	int ret;
++
++	ret = regmap_read(d->rmap, 0x120, &val);
++	if (ret)
++		return ret;
++	ret = regmap_write(d->rmap, 0x120, val & ~(BIT(7) | BIT(0)));
++	if (ret)
++		return ret;
++	ret = regmap_read(d->rmap, 0x120, &val);
++	if (ret || (val & BIT(0)))
++		return ret ?: -EIO;
++	ret = regmap_update_bits(d->rmap, 0x122, 0x7f, 2);
++	if (ret)
++		return ret;
++	ret = regmap_read(d->rmap, 0x122, &val);
++	return ret ?: ((val & 0x7f) == 2 ? 0 : -EIO);
++}
++
++int mt6375_charger_contract(struct device *parent, unsigned int ma, unsigned int mv)
++{
++	struct mt6375_data *d = dev_get_drvdata(parent);
++	struct mt6375_charger *c = &d->charger;
++	int ret;
++
++	if (!c->enabled)
++		return 0;
++	guard(mutex)(&c->lock);
++	if (mv != 5000 && mv != 9000)
++		ma = mv = 0;
++	c->epoch++;
++	ret = c->contract_changed ? c->contract_changed(c->ctx, ma, mv) :
++		mt6375_charger_quiesce(d);
++	c->ma = ret ? 0 : ma;
++	c->mv = ret ? 0 : mv;
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mt6375_charger_contract);
++
+ static int mt6375_probe(struct i2c_client *client)
+ {
+ 	int i, ret;
+@@ -391,6 +498,12 @@ static int mt6375_probe(struct i2c_client *client)
+ 		return -ENOMEM;
+ 	ddata->dev = &client->dev;
+ 	mutex_init(&ddata->irq_lock);
++	mutex_init(&ddata->charger.lock);
++	for_each_available_child_of_node_scoped(client->dev.of_node, child) {
++		if (of_device_is_compatible(child, "mediatek,mt6375-power") &&
++		    of_property_read_bool(child, "mediatek,enable-charge-control"))
++			ddata->charger.enabled = true;
++	}
+ 	i2c_set_clientdata(client, ddata);
+ 	atomic_set(&ddata->in_sleep, 0);
+ 
+@@ -424,6 +537,13 @@ static int mt6375_probe(struct i2c_client *client)
+ 		goto err;
+ 	}
+ 
++	if (ddata->charger.enabled) {
++		ret = mt6375_charger_quiesce(ddata);
++		if (ret) {
++			dev_err_probe(ddata->dev, ret, "cannot disable charger safely\n");
++			goto err;
++		}
++	}
+ 	ret = mt6375_add_irq_chip(ddata);
+ 	if (ret < 0) {
+ 		dev_err(ddata->dev, "failed to add irq chip\n");
+diff --git a/include/linux/mfd/mt6375-charger.h b/include/linux/mfd/mt6375-charger.h
+new file mode 100644
+index 0000000000..82b584fa33
+--- /dev/null
++++ b/include/linux/mfd/mt6375-charger.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_MFD_MT6375_CHARGER_H
++#define _LINUX_MFD_MT6375_CHARGER_H
++#include <linux/mutex.h>
++struct device;
++/* Never hold this lock during sensor I/O or while waiting for its lock. */
++struct mt6375_charger {
++	struct mutex lock;
++	bool enabled;
++	unsigned int ma, mv;
++	unsigned long epoch;
++	int (*contract_changed)(void *ctx, unsigned int ma, unsigned int mv);
++	void *ctx;
++};
++struct mt6375_charger *mt6375_charger_get(struct device *parent);
++int mt6375_charger_contract(struct device *parent, unsigned int ma, unsigned int mv);
++#endif
+-- 
+2.56.0
+

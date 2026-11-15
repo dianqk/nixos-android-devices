@@ -1,5 +1,7 @@
 # Mobile charging display
 
+[中文](README.zh.md)
+
 `mobile-charger` runs in a dedicated RAM-only charging initramfs. It uses
 the Linux VT/fbcon console, evdev,
 and explicit power-supply providers supplied by the board configuration.

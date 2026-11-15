@@ -1,0 +1,78 @@
+From 6677f8881194aec9d2a2db954ada8df00980193a Mon Sep 17 00:00:00 2001
+From: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Date: Tue, 14 Jul 2026 13:44:14 +0200
+Subject: [PATCH] drm/mediatek: mtk_drm_drv: Fail init only if all paths are
+ invalid
+
+Up until now, if not all display controller paths were valid, the
+driver would fail probing and refuse to bind components: while
+that was a good idea before, now that mediatek-drm gained much
+more flexibility, it is finally possible to gracefully handle
+this situation and register only the valid paths while leaving
+the invalid ones unregistered, without any crash.
+
+Count how many output paths are found, and then count how many
+have failed probing: if there is at least one valid path, avoid
+erroring out, so that at least some outputs will just work.
+
+Of course, any path failing is not a clean situation and must be
+resolved: in this case, function mtk_crtc_create() still prints
+error messages so, even though some output works, that will not
+go unnoticed, as a quick check in kmsg will show the errors that
+made a certain path not to register.
+
+Signed-off-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Link: https://patchwork.kernel.org/project/linux-mediatek/list/?series=1127365
+[dianqk: from the Huge Restructuring v2 series, applied to v7.3-rc6; rc6 drift resolved]
+---
+ drivers/gpu/drm/mediatek/mtk_drm_drv.c | 20 ++++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_drv.c b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+index ba04d85d3e..5f4b2ba504 100644
+--- a/drivers/gpu/drm/mediatek/mtk_drm_drv.c
++++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+@@ -394,6 +394,8 @@ static int mtk_drm_kms_init(struct drm_device *drm)
+ 	struct mtk_drm_private *priv_n;
+ 	struct device *dma_dev = NULL;
+ 	struct drm_crtc *crtc;
++	int num_failed = 0;
++	int num_paths = 0;
+ 	int ret, i, j;
+ 
+ 	if (drm_firmware_drivers_only())
+@@ -460,15 +462,29 @@ static int mtk_drm_kms_init(struct drm_device *drm)
+ 			if (!priv_n->data->output_paths[i].len)
+ 				continue;
+ 
++			num_paths++;
++
++			dev_vdbg(drm->dev,
++				 "[CTRL%d-CRTC%d] Path Len:%d, Controller Order:%u\n",
++				 j, i, priv_n->data->output_paths[i].len,
++				 priv_n->data->output_paths[i].order);
++
+ 			ret = mtk_crtc_create(drm, i, j,
+ 					      priv_n->data->conn_routes,
+ 					      priv_n->data->num_conn_routes);
++			if (ret == 0)
++				break;
+ 
+-			if (ret)
+-				goto err_component_unbind;
++			num_failed++;
+ 		}
+ 	}
+ 
++	if (num_failed == num_paths) {
++		dev_err(drm->dev, "No valid Display Controller path! Going out.\n");
++		ret = -ENODEV;
++		goto err_component_unbind;
++	}
++
+ 	/* IGT will check if the cursor size is configured */
+ 	drm->mode_config.cursor_width = 512;
+ 	drm->mode_config.cursor_height = 512;
+-- 
+2.56.0
+

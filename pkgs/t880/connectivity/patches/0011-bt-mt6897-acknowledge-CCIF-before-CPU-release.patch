@@ -1,0 +1,72 @@
+From 581b111f07d4368776397388737bc84312d921b7 Mon Sep 17 00:00:00 2001
+From: pswbuild <pswbuild@oppo.com>
+Date: Fri, 20 Mar 2026 03:11:53 +0000
+Subject: [PATCH] Synchronize code for OnePlus OPD2407_16.0.2.400(CN01)
+
+Based on MTK release TAG:
+alps/kernel/build/bazel_mgk_rules:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/bt/linux_v2_mt6653:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/bt/mt66xx:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/bt/mt76xx/sdio:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/common:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/connfem:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/conninfra:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/conninfra_mt6653:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/fmradio:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/gps:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/wlan/adaptor:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/wlan/adaptor_mt6653:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/wlan/core/gen2:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/wlan/core/gen3:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4-mt7663:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4-mt7668:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4-mt79xx:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/connectivity/wlan/core/gen4m_mt6653:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/gpu:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/hbt_driver:t-alps-release-v0.mp1.rc-V14.10
+alps/vendor/mediatek/kernel_modules/hbt_driver_cus:t-alps-release-v0.mp1.rc-V14.10
+alps/vendor/mediatek/kernel_modules/met_drv_v2:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/met_drv_v3:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/sched_cus:t-alps-release-u0.mp1.rc-V10.29
+alps/vendor/mediatek/kernel_modules/udc:t-alps-release-u0.mp1.rc-V10.29
+kernel/build:t-alps-release-u0.mp1.rc-V10.29
+neptune/bt_driver/linux_v2:t-alps-release-u0.mp1.rc-V10.29
+neptune/wlan_driver/gen4m:t-alps-release-u0.mp1.rc-V10.29
+quark/kernel_device_modules-6.1:t-alps-release-u0.mp1.rc-V10.29
+quark/mtkcam-kernel_device_modules:t-alps-release-u0.mp1.rc-V10.29
+
+Local partial backport: acknowledge AP-to-BGF CCIF channels during MT6897
+power-on, after clearing firmware-own interrupts and before releasing the
+BGF CPU. This restores the vendor startup acknowledgment sequence.
+
+Local adaptation: report acknowledgment submission at INFO level; retain
+the existing register helper and its mapping-failure diagnostics.
+
+Link: https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_mt6897/commit/581b111f07d4368776397388737bc84312d921b7
+Link: https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_mt6897/blob/76792af3e1fefabd34be6dd684bfc9facc4d5b17/vendor/mediatek/kernel_modules/connectivity/bt/mt66xx/include/btif/platform_6897.h#L1355
+Signed-off-by: Dian QK <dianqk@dianqk.net>
+---
+--- a/connectivity/bt/mt66xx/include/btif/platform_6897.h
++++ b/connectivity/bt/mt66xx/include/btif/platform_6897.h
+@@ -143,6 +143,8 @@
+ 
+ #define BGF_MCCR_SET					(BGF_REG_BASE_ADDR + 0x0104)
+ #define BGF_CON_CR_AHB_STOP				BIT(2)
++
++#define BGF2AP_CONN_INFRA_ON_CCIF4_BGF2AP_PCCIF_ACK_ADDR (0x1803E014)
+ 
+ #define BGF_SW_IRQ_RESET_ADDR				(0x1803F014)
+ #define BGF_SW_IRQ_STATUS				(0x1803F010)
+@@ -1364,6 +1366,12 @@
+ 	BTMTK_DBG("clear fw own IRQ");
+ 	REG_WRITEL(BGF_IRQ_STAT, BGF_IRQ_FW_OWN_SET_B);
+ 	REG_WRITEL(BGF_IRQ_STAT2, BGF_IRQ_FW_OWN_SET_B);
++
++	/* Acknowledge AP-to-BGF CCIF before releasing the CPU. */
++	BTMTK_INFO("BGF startup: submit CCIF4 ACK addr=0x%08x value=0xff",
++		   BGF2AP_CONN_INFRA_ON_CCIF4_BGF2AP_PCCIF_ACK_ADDR);
++	bt_write_cr(BGF2AP_CONN_INFRA_ON_CCIF4_BGF2AP_PCCIF_ACK_ADDR,
++		    0xFF, FALSE);
+ 
+ 	/* release n10 cpu core */
+ 	SET_BIT(CONN_INFRA_RGU_BGFSYS_CPU_SW_RST, BGF_CPU_SW_RST_B);

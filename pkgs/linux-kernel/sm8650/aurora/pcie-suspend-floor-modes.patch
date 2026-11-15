@@ -1,0 +1,221 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 24 Oct 2026 22:30:00 +0800
+Subject: [PATCH] PCI: qcom: select the s2idle suspend floor at runtime
+
+The suspend OPP keeps two sleep-set votes while the controller is
+suspended: its CX level (required-opps, LOW_SVS) and a PCIe-MEM
+bandwidth. Make pcie_qcom.suspend_opp_floor a mode:
+
+  off   no vote, as upstream (default; N also selects it),
+  full  the DT suspend OPP (Y also selects it),
+  cx    the CX level only, from a second synthetic OPP at 2 Hz with no
+        bandwidth,
+  bw    only a PCIe-MEM vote of pcie_qcom.suspend_floor_kbps (default
+        1000) through a separate path handle, released on resume.
+
+Since the link is torn down in s2idle (pci-host-common-endpoint-d3cold
+and pcie-gdsc-off), Aurora suspends without any floor: CX/DDR collapse
+99.8 % over 2 h 18 min at about 28 mA. The floor stays as a runtime
+fallback; full or bw (any nonzero bandwidth) prevents the CX/DDR
+collapse, while cx alone holds nothing in the sleep set.
+Suspend-to-RAM still drops every vote.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/drivers/pci/controller/dwc/pcie-qcom.c b/drivers/pci/controller/dwc/pcie-qcom.c
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -309,6 +309,8 @@
+ 	struct gpio_desc *reset;
+ 	int global_irq;
+ 	bool use_pm_opp;
++	struct icc_path *icc_floor;	/* PCIe-MEM vote of the "bw" suspend floor */
++	bool floor_bw;
+ };
+ 
+ #define to_qcom_pcie(x)		dev_get_drvdata((x)->dev)
+@@ -2296,6 +2298,14 @@
+ 		}
+ 
+ 		pcie->use_pm_opp = true;
++
++		/* The OPP core owns the paths; the "bw" floor needs its own vote. */
++		pcie->icc_floor = devm_of_icc_get(dev, "pcie-mem");
++		if (IS_ERR(pcie->icc_floor)) {
++			dev_warn(dev, "No PCIe-MEM path for the suspend floor: %ld\n",
++				 PTR_ERR(pcie->icc_floor));
++			pcie->icc_floor = NULL;
++		}
+ 	} else {
+ 		/* Skip ICC init if OPP is supported as it is handled by OPP */
+ 		ret = qcom_pcie_icc_init(pcie);
+@@ -2384,34 +2394,77 @@
+ 	return ret;
+ }
+ 
+-/* Debug knob: drop the suspend OPP floor to reproduce the s2idle hang. */
+-static bool suspend_opp_floor = true;
+-module_param(suspend_opp_floor, bool, 0644);
+-MODULE_PARM_DESC(suspend_opp_floor,
+-		 "Keep the DT suspend OPP during s2idle (default: Y)");
+-
+ /*
+- * Use the DT suspend OPP to retain the PCIe DDR/LLCC sleep-set votes
+- * during s2idle. Suspend-to-RAM tears the link down and keeps dropping
+- * the OPP.
++ * s2idle floor while the controller is suspended:
++ *   off:  no vote, as upstream (default),
++ *   full: the DT suspend OPP (its CX level and PCIe-MEM bandwidth),
++ *   cx:   the CX level of the suspend OPP without bandwidth (DT OPP at
++ *         QCOM_PCIE_FLOOR_CX_HZ),
++ *   bw:   only a PCIe-MEM vote of suspend_floor_kbps (no CX level).
++ * Y/N select full/off. Suspend-to-RAM always drops the votes.
+  */
+-static int qcom_pcie_set_suspend_opp(struct qcom_pcie *pcie)
++enum qcom_pcie_suspend_floor {
++	QCOM_PCIE_FLOOR_OFF,
++	QCOM_PCIE_FLOOR_FULL,
++	QCOM_PCIE_FLOOR_BW,
++	QCOM_PCIE_FLOOR_CX,
++};
++
++#define QCOM_PCIE_FLOOR_CX_HZ	2
++
++static const char * const qcom_pcie_floor_names[] = {
++	[QCOM_PCIE_FLOOR_OFF] = "off",
++	[QCOM_PCIE_FLOOR_FULL] = "full",
++	[QCOM_PCIE_FLOOR_BW] = "bw",
++	[QCOM_PCIE_FLOOR_CX] = "cx",
++};
++
++static int suspend_floor = QCOM_PCIE_FLOOR_OFF;
++
++static int qcom_pcie_floor_param_set(const char *val, const struct kernel_param *kp)
+ {
+-	struct device *dev = pcie->pci->dev;
+-	struct dev_pm_opp *opp;
+-	unsigned long freq;
+-	int ret;
++	int mode = sysfs_match_string(qcom_pcie_floor_names, val);
++	bool on;
+ 
+-	if (pm_suspend_target_state == PM_SUSPEND_MEM || !suspend_opp_floor)
+-		return dev_pm_opp_set_opp(dev, NULL);
++	if (mode < 0) {
++		if (kstrtobool(val, &on))
++			return -EINVAL;
++		mode = on ? QCOM_PCIE_FLOOR_FULL : QCOM_PCIE_FLOOR_OFF;
++	}
++	WRITE_ONCE(*(int *)kp->arg, mode);
++	return 0;
++}
+ 
+-	freq = dev_pm_opp_get_suspend_opp_freq(dev);
+-	if (!freq)
+-		return dev_pm_opp_set_opp(dev, NULL);
++static int qcom_pcie_floor_param_get(char *buf, const struct kernel_param *kp)
++{
++	return scnprintf(buf, PAGE_SIZE, "%s\n",
++			 qcom_pcie_floor_names[READ_ONCE(*(int *)kp->arg)]);
++}
++
++static const struct kernel_param_ops qcom_pcie_floor_param_ops = {
++	.set = qcom_pcie_floor_param_set,
++	.get = qcom_pcie_floor_param_get,
++};
++
++module_param_cb(suspend_opp_floor, &qcom_pcie_floor_param_ops, &suspend_floor, 0644);
++MODULE_PARM_DESC(suspend_opp_floor,
++		 "s2idle floor: off (default, or N), full (or Y), cx or bw");
++
++static unsigned int suspend_floor_kbps = 1000;
++module_param(suspend_floor_kbps, uint, 0644);
++MODULE_PARM_DESC(suspend_floor_kbps,
++		 "PCIe-MEM peak bandwidth of the bw floor in kBps (default: 1000)");
++
++static int qcom_pcie_set_opp_freq(struct device *dev, unsigned long freq)
++{
++	struct dev_pm_opp *opp;
++	int ret;
+ 
+ 	opp = dev_pm_opp_find_freq_exact(dev, freq, true);
+-	if (IS_ERR(opp))
+-		return PTR_ERR(opp);
++	if (IS_ERR(opp)) {
++		dev_err(dev, "No suspend floor OPP at %lu Hz\n", freq);
++		return dev_pm_opp_set_opp(dev, NULL);
++	}
+ 
+ 	ret = dev_pm_opp_set_opp(dev, opp);
+ 	dev_pm_opp_put(opp);
+@@ -2419,6 +2472,38 @@
+ 	return ret;
+ }
+ 
++static int qcom_pcie_set_suspend_opp(struct qcom_pcie *pcie)
++{
++	struct device *dev = pcie->pci->dev;
++	int mode = READ_ONCE(suspend_floor);
++	unsigned long freq;
++	int ret;
++
++	if (pm_suspend_target_state == PM_SUSPEND_MEM)
++		mode = QCOM_PCIE_FLOOR_OFF;
++
++	switch (mode) {
++	case QCOM_PCIE_FLOOR_FULL:
++		freq = dev_pm_opp_get_suspend_opp_freq(dev);
++		if (freq)
++			return qcom_pcie_set_opp_freq(dev, freq);
++		break;
++	case QCOM_PCIE_FLOOR_CX:
++		return qcom_pcie_set_opp_freq(dev, QCOM_PCIE_FLOOR_CX_HZ);
++	case QCOM_PCIE_FLOOR_BW:
++		ret = dev_pm_opp_set_opp(dev, NULL);
++		if (ret || !pcie->icc_floor)
++			return ret;
++		ret = icc_set_bw(pcie->icc_floor, 0,
++				 kBps_to_icc(READ_ONCE(suspend_floor_kbps)));
++		if (!ret)
++			pcie->floor_bw = true;
++		return ret;
++	}
++
++	return dev_pm_opp_set_opp(dev, NULL);
++}
++
+ static int qcom_pcie_suspend_noirq(struct device *dev)
+ {
+ 	struct qcom_pcie *pcie;
+@@ -2493,6 +2578,11 @@
+ 	if (!pcie)
+ 		return 0;
+ 
++	if (pcie->floor_bw) {
++		icc_set_bw(pcie->icc_floor, 0, 0);
++		pcie->floor_bw = false;
++	}
++
+ 	if (pcie->pci->suspended) {
+ 		if (pcie->use_pm_opp) {
+ 			ret = qcom_pcie_set_max_opp(dev);
+diff --git a/arch/arm64/boot/dts/qcom/sm8650.dtsi b/arch/arm64/boot/dts/qcom/sm8650.dtsi
+--- a/arch/arm64/boot/dts/qcom/sm8650.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8650.dtsi
+@@ -3775,6 +3775,16 @@
+ 					opp-peak-kBps = <1000 1>;
+ 					opp-suspend;
+ 				};
++
++				/*
++				 * The suspend OPP's CX level without bandwidth, for the
++				 * pcie_qcom.suspend_opp_floor=cx test mode.
++				 */
++				opp-floor-cx {
++					opp-hz = /bits/ 64 <2>;
++					required-opps = <&rpmhpd_opp_low_svs>;
++					opp-peak-kBps = <0 0>;
++				};
+ 			};
+ 
+ 			pcieport0: pcie@0 {

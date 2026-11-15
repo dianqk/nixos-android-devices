@@ -1,0 +1,72 @@
+From 6408963e4d9b06eef681bbcd451f528f577507cf Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] usb: typec: propagate connector orientation and mux state
+
+usb: typec: propagate connector orientation and mux state.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T02:58:21+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T06:27:40+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/usb/typec/class.c | 18 ++++++++++++++++++
+ drivers/usb/typec/mux.c   |  2 +-
+ 2 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/usb/typec/class.c b/drivers/usb/typec/class.c
+index 54c7810b56..f2ecb5477a 100644
+--- a/drivers/usb/typec/class.c
++++ b/drivers/usb/typec/class.c
+@@ -2257,6 +2257,15 @@ static void typec_partner_deattach(struct typec_connector *con, struct device *d
+ 	mutex_unlock(&port->partner_link_lock);
+ }
+ 
++static int typec_partner_altmode_reprobe(struct device *dev, void *data)
++{
++	if (dev->type == &typec_partner_altmode_dev_type && !dev->driver &&
++	    device_attach(dev) < 0)
++		dev_dbg(dev, "reprobe failed\n");
++
++	return 0;
++}
++
+ /**
+  * typec_set_data_role - Report data role change
+  * @port: The USB Type-C Port where the role was changed
+@@ -2282,6 +2291,15 @@ void typec_set_data_role(struct typec_port *port, enum typec_data_role role)
+ 	if (partner->identity)
+ 		typec_product_type_notify(&partner->dev);
+ 
++	/*
++	 * Alternate mode drivers that act only as the DFP (DisplayPort)
++	 * refuse to bind while the port is the UFP. The partner's modes may
++	 * be discovered before a data role swap, so try them again.
++	 */
++	if (role == TYPEC_HOST)
++		device_for_each_child(&partner->dev, NULL,
++				      typec_partner_altmode_reprobe);
++
+ 	put_device(&partner->dev);
+ }
+ EXPORT_SYMBOL_GPL(typec_set_data_role);
+diff --git a/drivers/usb/typec/mux.c b/drivers/usb/typec/mux.c
+index afa6fc1813..e2acb187e9 100644
+--- a/drivers/usb/typec/mux.c
++++ b/drivers/usb/typec/mux.c
+@@ -17,7 +17,7 @@
+ #include "class.h"
+ #include "mux.h"
+ 
+-#define TYPEC_MUX_MAX_DEVS	3
++#define TYPEC_MUX_MAX_DEVS	5
+ 
+ struct typec_switch {
+ 	struct typec_switch_dev *sw_devs[TYPEC_MUX_MAX_DEVS];
+-- 
+2.56.0
+

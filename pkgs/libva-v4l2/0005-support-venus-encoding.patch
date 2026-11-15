@@ -16,9 +16,14 @@ The V4L2 driver preserves any larger minimum in S_FMT.
 Venus S_FMT also resets the visible crop, so reapply S_SELECTION after the
 final CAPTURE format negotiation. Keep Iris behavior unchanged.
 
+
+Adapted to qcom-va-driver 0980a1decf26: retain Venus discovery, joined headers, OUTPUT frame-rate, coded allocation and crop restoration against the new encoder; Iris remains unchanged.
+
+diff --git a/src/encoder.cpp b/src/encoder.cpp
+index 2ab6bc4..d0619d3 100644
 --- a/src/encoder.cpp
 +++ b/src/encoder.cpp
-@@ -206,7 +206,8 @@
+@@ -206,7 +206,8 @@ std::string find_encoder_device() {
          v4l2_capability cap{};
          bool match = false;
          if (!call(fd, VIDIOC_QUERYCAP, &cap) &&
@@ -28,7 +33,7 @@ final CAPTURE format negotiation. Keep Iris behavior unchanged.
              (cap.device_caps & V4L2_CAP_VIDEO_M2M_MPLANE)) {
              v4l2_fmtdesc fmt{};
              fmt.type = CAPTURE;
-@@ -587,7 +588,10 @@
+@@ -587,7 +588,10 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
      close(probe);
      e.import = coherent;
      e.fd = open(device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
@@ -37,40 +42,34 @@ final CAPTURE format negotiation. Keep Iris behavior unchanged.
 +    v4l2_capability caps{};
 +    checked(e.fd, VIDIOC_QUERYCAP, &caps, "encoder QUERYCAP");
 +    bool venus = !strcmp(reinterpret_cast<char *>(caps.driver), "qcom-venus");
-     // VPP knows the actual RGB conversion. Pass it to firmware so SPS VUI and
-     // container tags agree. Uploaded/decoded surfaces retain upstream defaults.
-     auto set_color = [&](v4l2_pix_format_mplane &f) {
-@@ -653,7 +657,10 @@
+     v4l2_format fmt{};
+     fmt.type = CAPTURE;
+     fmt.fmt.pix_mp.width = width;
+@@ -641,7 +645,8 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
      // Keyframes follow VA picture requests; prevent autonomous periodic IDRs.
      e.control(V4L2_CID_MPEG_VIDEO_GOP_SIZE, std::numeric_limits<int>::max());
      e.control(V4L2_CID_MPEG_VIDEO_HEADER_MODE, V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME);
 -    e.control(V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR, 1);
-+    // Venus HEADER_MODE also sets HFI's sync-frame sequence-header property.
-+    // It does not expose the separate PREPEND_SPSPPS_TO_IDR control.
 +    if (!venus)
 +        e.control(V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR, 1);
      e.control(V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE, s.rate_control != VA_RC_CQP);
      if (s.rate_control != VA_RC_CQP) {
          e.control(V4L2_CID_MPEG_VIDEO_BITRATE_MODE, s.rate_control == VA_RC_CBR
-@@ -666,6 +673,7 @@
+@@ -654,6 +659,7 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
      e.control(s.hevc ? V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP : V4L2_CID_MPEG_VIDEO_H264_MAX_QP, s.max_qp);
      e.configure_deblocking();
      for (unsigned type : {CAPTURE, OUTPUT}) {
-+        if (venus && type == CAPTURE) continue; // Venus frame rate belongs to OUTPUT.
++        if (venus && type == CAPTURE) continue;
          v4l2_streamparm parm{};
          parm.type = type;
          parm.parm.output.timeperframe.numerator = s.fps_den;
-@@ -680,7 +688,15 @@
+@@ -667,7 +673,11 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
+     fmt.fmt.pix_mp.width = width;
      fmt.fmt.pix_mp.height = height;
      fmt.fmt.pix_mp.pixelformat = s.hevc ? V4L2_PIX_FMT_HEVC : V4L2_PIX_FMT_H264;
-     set_color(fmt.fmt.pix_mp);
-+    // Venus firmware rejects the kernel's default 3/4-pixel coded buffers
-+    // (708608 vs 942080 required for 1280x736). Request at least one byte
-+    // per aligned input pixel; S_FMT keeps a larger driver minimum if needed.
 +    if (venus)
 +        fmt.fmt.pix_mp.plane_fmt[0].sizeimage = e.stride * e.storage_height;
      checked(e.fd, VIDIOC_S_FMT, &fmt, "encoder refresh CAPTURE format");
-+    // Venus S_FMT resets the crop to its aligned dimensions.
 +    if (venus)
 +        checked(e.fd, VIDIOC_S_SELECTION, &crop, "encoder restore crop");
      for (unsigned type : {OUTPUT, CAPTURE}) {

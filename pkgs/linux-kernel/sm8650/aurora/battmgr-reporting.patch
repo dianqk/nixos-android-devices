@@ -1,0 +1,103 @@
+From 0618daeb18cd4d594a358569453fba5027b39c01 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 21 Oct 2026 07:19:19 +0800
+Subject: [PATCH] power: supply: qcom_battmgr: Report Aurora charger type and
+ internal resistance
+
+Under the Xiaomi Aurora property quirk, correct two readings against the
+OEM qti_battery_charger.c (MiCode Xiaomi_Kernel_OpenSource c7841217725a):
+
+- USB_TYPE: the OEM driver maps POWER_SUPPLY_PROP_USB_TYPE to the adapter
+  type (wire ID 7, USB_ADAP_TYPE), not wire ID 6, which stayed SDP with a
+  9 V PD charger. The firmware value is the Linux 6.1 enum
+  power_supply_usb_type, which lacks the later PD_SPR_AVS entries, plus
+  Qualcomm extensions from 0x80. Pass 0..8 through, translate 9 to
+  APPLE_BRICK_ID, report HVDCP, HVDCP_3, HVDCP_3P5 and HVDCP_3_CLASSB as
+  DCP (as the OEM classifies the first three) and USB_FLOAT or other
+  values as Unknown.
+- INTERNAL_RESISTANCE: the value equals the OEM resistance_id (the battery
+  ID resistor, 100000), which the OEM never exports as internal
+  resistance; report ENODATA, as for the POWER_NOW placeholder.
+
+CHARGE_COUNTER needs no scaling on the required Android 16 base
+(OS3.0.308.0.WNACNXM): its firmware reports uAh (3935000 at 86 % of a
+4752000 uAh full charge). The Android 14 firmware reported mAh; scaling
+the Android 16 value by 1000 overflowed to negative readings.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/power/supply/qcom_battmgr.c | 40 +++++++++++++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 34120c7144f1..d648bc7d7e9e 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -528,6 +528,14 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
+ 	if (battmgr->xiaomi_battery_property_ids && psp == POWER_SUPPLY_PROP_POWER_NOW)
+ 		return -ENODATA;
+ 
++	/*
++	 * Aurora firmware reports the battery ID resistor (the OEM resistance_id,
++	 * 100 kOhm) here, not the internal resistance.
++	 */
++	if (battmgr->xiaomi_battery_property_ids &&
++	    psp == POWER_SUPPLY_PROP_INTERNAL_RESISTANCE)
++		return -ENODATA;
++
+ 	if (!battmgr->service_up)
+ 		return -EAGAIN;
+ 
+@@ -1005,6 +1013,9 @@ static int qcom_battmgr_usb_sm8350_update(struct qcom_battmgr *battmgr,
+ 		return -EINVAL;
+ 
+ 	prop = sm8350_usb_prop_map[psp];
++	/* Xiaomi firmware reports the detected charger type as the adapter type. */
++	if (battmgr->xiaomi_battery_property_ids && prop == USB_TYPE)
++		prop = USB_ADAP_TYPE;
+ 
+ 	mutex_lock(&battmgr->lock);
+ 	ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET, prop, 0);
+@@ -1384,6 +1395,28 @@ static void qcom_battmgr_sc8280xp_callback(struct qcom_battmgr *battmgr,
+ 	complete(&battmgr->ack);
+ }
+ 
++/*
++ * Xiaomi firmware reports the Linux 6.1 enum power_supply_usb_type (without the
++ * later SPR AVS entries) plus Qualcomm extensions from 0x80. Translate it the
++ * way the OEM qti_battery_charger.c classifies chargers.
++ */
++static unsigned int qcom_battmgr_xiaomi_usb_type(unsigned int type)
++{
++	switch (type) {
++	case 0 ... 8:	/* UNKNOWN, SDP, DCP, CDP, ACA, C, PD, PD_DRP, PD_PPS */
++		return type;
++	case 9:		/* APPLE_BRICK_ID */
++		return POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID;
++	case 0x80:	/* HVDCP */
++	case 0x81:	/* HVDCP_3 */
++	case 0x82:	/* HVDCP_3P5 */
++	case 0x84:	/* HVDCP_3_CLASSB */
++		return POWER_SUPPLY_USB_TYPE_DCP;
++	default:	/* 0x83 USB_FLOAT and unknown values */
++		return POWER_SUPPLY_USB_TYPE_UNKNOWN;
++	}
++}
++
+ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
+ 					 const struct qcom_battmgr_message *resp,
+ 					 size_t len)
+@@ -1543,6 +1576,13 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
+ 		case USB_TYPE:
+ 			battmgr->usb.usb_type = le32_to_cpu(resp->intval.value);
+ 			break;
++		case USB_ADAP_TYPE:
++			if (battmgr->xiaomi_battery_property_ids) {
++				val = le32_to_cpu(resp->intval.value);
++				battmgr->usb.usb_type = qcom_battmgr_xiaomi_usb_type(val);
++				break;
++			}
++			fallthrough;
+ 		default:
+ 			dev_warn(battmgr->dev, "unknown property %#x\n", property);
+ 			break;

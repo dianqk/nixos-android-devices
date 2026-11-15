@@ -78,19 +78,22 @@ mobile-device --serial SERIAL fastboot flash \
 保留 A、super、校准和独立 recovery。Recovery initrd 不包含 Python；标准 NixOS
 安装与更新可在 chroot 中使用目标系统的 Python。
 
-从原厂 userdata 布局开始，以下命令先检查，再明确执行**破坏性**准备：Android 与 Linux
-各约占原 userdata 的 50%，Linux 一侧包含独立 FAT ESP（默认 1 GiB）和 ext4 根。
-Android userdata 数据不保留，之后需要单独恢复出厂初始化。已分区设备不会重新分区。
-不要使用此操作修复已有安装的启动路径。
+从原厂 userdata 布局开始，以下命令先检查，再明确执行**破坏性**准备：Android 保留你选择的
+userdata 大小（32/64/128/256/512 GiB，仅在 Linux 仍有至少 64 GiB 时提供，见
+[recovery](../recovery.zh.md)），其余空间给 Linux，包含独立 FAT ESP（默认 1 GiB）
+和 ext4 根。Android userdata 数据不保留，之后需要单独恢复出厂初始化。已分区设备不会
+重新分区。不要使用此操作修复已有安装的启动路径。
 
 ```sh
-ssh RECOVERY_HOST 'recovery prepare-install --check'
-ssh RECOVERY_HOST 'recovery prepare-install --confirm-erase-userdata'
+ssh RECOVERY_HOST 'recovery prepare-install --check'   # lists the offered sizes
+ssh RECOVERY_HOST 'recovery prepare-install --android-userdata 64G --check'
+ssh RECOVERY_HOST 'recovery prepare-install --android-userdata 64G --confirm-erase-userdata'
 ```
 
-完成后按[首次安装](../initial-install.zh.md)导入匹配系统、安装 EFI，最后写入
-`boot_b` U-Boot。该安装程序不会重启，且已经写入匹配固件；**不要重复启动恢复流程中的
-手动 `boot_b` 刷写**。安装成功后，从 NixOS recovery 返回 OEM fastboot：
+如果尚无兼容的 U-Boot，在 OEM fastboot 按本指南检查并刷写，或从
+[RAM recovery 单独更新固件](../u-boot-install.zh.md#单独构建和刷写-u-boot)。
+随后按[首次安装](../initial-install.zh.md)导入系统并安装 EFI 代际。
+安装成功后，如尚未处理 DTBO，从 NixOS recovery 返回 OEM fastboot：
 
 ```sh
 mobile-device recovery --target RECOVERY_HOST reboot bootloader

@@ -8,9 +8,10 @@
   socId,
   registryVersion,
   registryLayout ? "group",
+  configInput ? false,
 }:
 runCommand name { nativeBuildInputs = [ buildPackages.python3 ]; } ''
   python3 ${./generate.py} ${configDirectory} "$out" \
     --platform ${lib.escapeShellArg hwPlatform} --soc-id ${lib.escapeShellArg socId} \
-    --version ${lib.escapeShellArg registryVersion} --layout ${lib.escapeShellArg registryLayout}
+    --version ${lib.escapeShellArg registryVersion} --layout ${lib.escapeShellArg registryLayout} ${lib.optionalString configInput "--config-input"}
 ''

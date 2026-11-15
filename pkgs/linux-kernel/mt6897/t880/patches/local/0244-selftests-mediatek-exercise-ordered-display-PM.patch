@@ -1,0 +1,470 @@
+From 175ecf946b41ebb37a678a803ae90883b8ab74b7 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 11 Nov 2026 06:46:45 +0800
+Subject: [PATCH] selftests: mediatek: exercise ordered display runtime PM
+
+Exercise production supplier snapshots and teardown ownership with shared consumers, pending PM operations, acquisition and release failures, and retained resources. Verify resume admission after a logically on domain is quarantined.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ tools/testing/selftests/mtk_clk/Makefile      |   4 +-
+ .../mtk_clk/ordered_pm_admission.inc          |  80 +++++
+ .../selftests/mtk_clk/ordered_pm_cases.c      | 292 ++++++++++++++++++
+ .../selftests/mtk_clk/test_ordered_pm.py      |  48 +++
+ 4 files changed, 422 insertions(+), 2 deletions(-)
+ create mode 100644 tools/testing/selftests/mtk_clk/ordered_pm_admission.inc
+ create mode 100644 tools/testing/selftests/mtk_clk/ordered_pm_cases.c
+ create mode 100755 tools/testing/selftests/mtk_clk/test_ordered_pm.py
+
+diff --git a/tools/testing/selftests/mtk_clk/Makefile b/tools/testing/selftests/mtk_clk/Makefile
+index c50b132c3f..451b51387b 100644
+--- a/tools/testing/selftests/mtk_clk/Makefile
++++ b/tools/testing/selftests/mtk_clk/Makefile
+@@ -1,4 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-TEST_PROGS := test_tinysys_mailbox.py test_dram_bootstrap.py test_mt6897.py test_domains.py test_boot_owner.py test_directlink.py test_display_pm.py test_dpintf_pm.py test_cmdq_stop.py test_crtc_stop.py test_dsi_routing.py test_dsc_epoch.py test_mipi_tx_order.py test_ovl_fetch.py test_dsc_version.py
+-TEST_FILES := tinysys_mailbox_cases.c mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c ven_cases.c boot_stubs.h boot_cases.c directlink_cases.c display_pm_cases.c mmsys_pm_cases.c dpintf_pm_cases.c cmdq_stop_cases.c crtc_stop_cases.c dsi_routing_cases.c dsi_mmsys_cases.c dsc_epoch_cases.c mipi_tx_order_cases.c ovl_fetch_cases.c dsc_version_cases.c
++TEST_PROGS := test_tinysys_mailbox.py test_dram_bootstrap.py test_mt6897.py test_domains.py test_boot_owner.py test_directlink.py test_display_pm.py test_dpintf_pm.py test_cmdq_stop.py test_crtc_stop.py test_dsi_routing.py test_dsc_epoch.py test_mipi_tx_order.py test_ovl_fetch.py test_dsc_version.py test_ordered_pm.py
++TEST_FILES := tinysys_mailbox_cases.c mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c ven_cases.c boot_stubs.h boot_cases.c directlink_cases.c display_pm_cases.c mmsys_pm_cases.c dpintf_pm_cases.c cmdq_stop_cases.c crtc_stop_cases.c dsi_routing_cases.c dsi_mmsys_cases.c dsc_epoch_cases.c mipi_tx_order_cases.c ovl_fetch_cases.c dsc_version_cases.c ordered_pm_cases.c ordered_pm_admission.inc
+ include ../lib.mk
+diff --git a/tools/testing/selftests/mtk_clk/ordered_pm_admission.inc b/tools/testing/selftests/mtk_clk/ordered_pm_admission.inc
+new file mode 100644
+index 0000000000..fc7747ef41
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/ordered_pm_admission.inc
+@@ -0,0 +1,80 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Model an off callback returning an error without changing logical ON. */
++typedef long long s64;
++typedef long long ktime_t;
++struct gpd_timing_data { s64 resume_latency_ns; bool constraint_changed; };
++struct generic_pm_domain_data { struct gpd_timing_data *td; int rpm_pstate; };
++struct generic_pm_domain {
++	struct dev_pm_domain domain;
++	struct { int (*start)(struct device *); int (*stop)(struct device *); } dev_ops;
++	struct { bool max_off_time_changed; } *gd;
++	bool on;
++};
++struct scpsys { bool faulted; };
++struct scpsys_root_clocks { bool failed; };
++struct scpsys_domain {
++	struct generic_pm_domain genpd;
++	struct scpsys *scpsys;
++	struct scpsys_root_clocks *roots;
++	int (*root_dev_start)(struct device *);
++};
++#define to_scpsys_domain(g) container_of(g, struct scpsys_domain, genpd)
++#define GENPD_DEV_CALLBACK(g, t, cb, dev) ((g)->dev_ops.cb ? (g)->dev_ops.cb(dev) : (t)0)
++#define pd_to_genpd(d) container_of(d, struct generic_pm_domain, domain)
++#define dev_to_genpd(d) pd_to_genpd((d)->pm_domain)
++#define dev_dbg(...) do { } while (0)
++#define genpd_lock(g) ((void)(g))
++#define genpd_unlock(g) ((void)(g))
++#define genpd_restore_performance_state(d, p) do { (void)(d); (void)(p); } while (0)
++#define genpd_drop_performance_state(d) ((void)(d), 0)
++#define irq_safe_dev_in_sleep_domain(d, g) ((void)(d), (void)(g), false)
++#define pm_runtime_enabled(d) (!(d)->power.disable_depth)
++#define pm_runtime_is_irq_safe(d) ((void)(d), false)
++#define genpd_is_irq_safe(g) ((void)(g), true)
++#define ktime_get() 0LL
++#define ktime_sub(x, y) ((x) - (y))
++#define ktime_to_ns(x) (x)
++static unsigned int power_mmio, start_mmio, resume_mmio;
++static struct generic_pm_domain_data timing;
++static struct generic_pm_domain_data *dev_gpd_data(struct device *d) { (void)d; return &timing; }
++static bool scpsys_root_faulted(struct scpsys *s) { return s->faulted; }
++static int genpd_power_on(struct generic_pm_domain *g, int depth)
++{
++	(void)depth;
++	assert(g->on); /* Logical ON fast path, so provider power_on is skipped. */
++	return 0;
++}
++static int genpd_power_off(struct generic_pm_domain *g, bool one_dev_on, int depth)
++{
++	struct scpsys_domain *pd = to_scpsys_domain(g);
++	(void)one_dev_on; (void)depth;
++	if (!pd->scpsys->faulted && !pd->roots->failed) {
++		power_mmio++;
++		pd->roots->failed = pd->scpsys->faulted = true;
++	}
++	/* Mirrors the existing provider quarantine; genpd remains logically on. */
++	return -EIO;
++}
++static int saved_start(struct device *d) { (void)d; start_mmio++; return 0; }
++static int __genpd_runtime_resume(struct device *d) { (void)d; resume_mmio++; return 0; }
++#include "production-admission.inc"
++
++static void admission_cases(void)
++{
++	struct scpsys s = { };
++	struct scpsys_root_clocks roots = { };
++	struct scpsys_domain pd = { .genpd.on = true, .scpsys = &s,
++				    .roots = &roots, .root_dev_start = saved_start };
++	struct device d;
++
++	init_dev(&d, 11); d.pm_domain = &pd.genpd.domain;
++	pd.genpd.dev_ops.start = scpsys_root_dev_start;
++	assert(genpd_runtime_resume(&d) == 0 && start_mmio == 1 && resume_mmio == 1);
++	assert(genpd_power_off(&pd.genpd, true, 0) == -EIO && pd.genpd.on);
++	assert(power_mmio == 1 && roots.failed && s.faulted);
++	assert(genpd_runtime_resume(&d) == -EIO);
++	assert(start_mmio == 1 && resume_mmio == 1 && power_mmio == 1);
++	/* Pre-guard callback is the counterexample on the same logical ON state. */
++	pd.genpd.dev_ops.start = saved_start;
++	assert(genpd_runtime_resume(&d) == 0 && start_mmio == 2 && resume_mmio == 2);
++}
+diff --git a/tools/testing/selftests/mtk_clk/ordered_pm_cases.c b/tools/testing/selftests/mtk_clk/ordered_pm_cases.c
+new file mode 100644
+index 0000000000..8dbfc5cd68
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/ordered_pm_cases.c
+@@ -0,0 +1,292 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Host fixture: actual snapshot/graph/PM owner and admission helpers. */
++#include <assert.h>
++#include <errno.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define CONFIG_PM 1
++#define GFP_KERNEL 0
++#define DL_FLAG_PM_RUNTIME 4U
++#define READ_ONCE(x) (x)
++#define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
++#define struct_size(p, member, n) (sizeof(*(p)) + sizeof((p)->member[0]) * (n))
++#define ERR_PTR(ret) ((void *)(long)(ret))
++#define PTR_ERR(p) ((int)(long)(p))
++#define IS_ERR(p) ((unsigned long)(p) >= (unsigned long)-4095)
++#define dev_err(...) do { } while (0)
++#define atomic_read(p) (*(p))
++#define spin_lock_irqsave(p, f) do { (void)(p); (f) = 0; } while (0)
++#define spin_unlock_irqrestore(p, f) do { (void)(p); (void)(f); } while (0)
++struct list_head { struct list_head *next, *prev; };
++static void INIT_LIST_HEAD(struct list_head *h) { h->next = h->prev = h; }
++static void list_add_tail(struct list_head *n, struct list_head *h)
++{
++	n->prev = h->prev; n->next = h; h->prev->next = n; h->prev = n;
++}
++#define list_for_each_entry(p, h, m) \
++	for (p = container_of((h)->next, typeof(*p), m); &p->m != (h); \
++	     p = container_of(p->m.next, typeof(*p), m))
++#define list_for_each_entry_reverse(p, h, m) \
++	for (p = container_of((h)->prev, typeof(*p), m); &p->m != (h); \
++	     p = container_of(p->m.prev, typeof(*p), m))
++#define list_for_each_entry_safe(p, n, h, m) \
++	for (p = container_of((h)->next, typeof(*p), m), \
++	     n = container_of(p->m.next, typeof(*p), m); &p->m != (h); \
++	     p = n, n = container_of(n->m.next, typeof(*n), m))
++#define list_for_each_entry_rcu(p, h, m, held) \
++	for (assert(held), p = container_of((h)->next, typeof(*p), m); \
++	     &p->m != (h); p = container_of(p->m.next, typeof(*p), m))
++
++enum rpm_status { RPM_ACTIVE, RPM_RESUMING, RPM_SUSPENDED, RPM_SUSPENDING };
++enum { RPM_REQ_NONE, RPM_REQ_RESUME };
++struct dev_pm_domain { int dummy; };
++struct device {
++	unsigned int id;
++	int refs, resume_error, pin_error, put_error, barriers, suspends;
++	bool barrier_resume;
++	struct device *parent;
++	struct dev_pm_domain *pm_domain;
++	struct { struct list_head suppliers; } links;
++	struct {
++		int usage_count, child_count, disable_depth, request, lock;
++		bool ignore_children, idle_notification, request_pending;
++		enum rpm_status runtime_status;
++	} power;
++};
++struct device_link { unsigned int flags; struct device *supplier; struct list_head c_node; };
++static unsigned int alloc_count, fail_alloc, srcu_depth, order[128], norder;
++static struct device_link *append_link;
++static struct list_head *append_to;
++static bool alloc_fails(void) { return ++alloc_count == fail_alloc; }
++static void *kzalloc(size_t n, int flags) { (void)flags; return alloc_fails() ? NULL : calloc(1, n); }
++static void *kcalloc(size_t n, size_t size, int flags) { return kzalloc(n * size, flags); }
++static void *krealloc_array(void *p, size_t n, size_t size, int flags)
++{
++	(void)flags;
++	if (append_link) {
++		assert(srcu_depth == 1);
++		list_add_tail(&append_link->c_node, append_to);
++		append_link = NULL;
++	}
++	return alloc_fails() ? NULL : realloc(p, n * size);
++}
++#define kfree free
++static int device_links_read_lock(void) { assert(!srcu_depth); return ++srcu_depth; }
++static int device_links_read_lock_held(void) { return srcu_depth == 1; }
++static void device_links_read_unlock(int idx) { assert(idx == 1 && srcu_depth == 1); srcu_depth--; }
++static struct device *get_device(struct device *d) { assert(d); d->refs++; return d; }
++static void put_device(struct device *d) { assert(!srcu_depth && d->refs > 0); d->refs--; }
++static void init_dev(struct device *d, unsigned int id)
++{
++	*d = (struct device){ .id = id, .power.runtime_status = RPM_SUSPENDED };
++	INIT_LIST_HEAD(&d->links.suppliers);
++}
++static void link_to(struct device *d, struct device_link *l, struct device *s, unsigned int flags)
++{
++	l->flags = flags; l->supplier = s; list_add_tail(&l->c_node, &d->links.suppliers);
++}
++static void active(struct device *d, int usage)
++{
++	d->power.runtime_status = RPM_ACTIVE; d->power.usage_count = usage;
++}
++static int pm_runtime_resume_and_get(struct device *d)
++{
++	if (d->resume_error)
++		return d->resume_error;
++	active(d, d->power.usage_count + 1);
++	return 0;
++}
++static int pm_runtime_get_if_active(struct device *d)
++{
++	if (d->pin_error)
++		return d->pin_error;
++	if (d->power.disable_depth)
++		return -EINVAL;
++	if (d->power.runtime_status != RPM_ACTIVE)
++		return 0;
++	d->power.usage_count++;
++	return 1;
++}
++static void pm_runtime_put_noidle(struct device *d)
++{
++	assert(d->power.usage_count > 0); d->power.usage_count--;
++}
++static void pm_runtime_barrier(struct device *d)
++{
++	d->barriers++;
++	d->power.runtime_status = d->barrier_resume ? RPM_ACTIVE : RPM_SUSPENDED;
++	d->power.request_pending = false; d->power.idle_notification = false;
++}
++static int pm_runtime_put_sync_suspend(struct device *d)
++{
++	struct device_link *l;
++
++	assert(norder < sizeof(order) / sizeof(order[0]));
++	order[norder++] = d->id;
++	pm_runtime_put_noidle(d);
++	if (d->power.usage_count)
++		return 0;
++	if (!d->power.ignore_children && d->power.child_count)
++		return -EBUSY;
++	if (d->put_error)
++		return d->put_error;
++	if (d->power.runtime_status == RPM_SUSPENDING ||
++	    (d->power.request_pending && d->power.request == RPM_REQ_RESUME))
++		return -EAGAIN;
++	d->power.runtime_status = RPM_SUSPENDED; d->suspends++;
++	/* Runtime core consumes supplier refs and may queue their idle work. */
++	list_for_each_entry(l, &d->links.suppliers, c_node)
++		if (l->flags & DL_FLAG_PM_RUNTIME)
++			pm_runtime_put_noidle(l->supplier);
++	return 0;
++}
++
++#include "production-pm.inc"
++
++static void snapshot_growth(void)
++{
++	struct device d, s[7], **copy;
++	struct device_link links[7];
++	unsigned int i, count;
++
++	init_dev(&d, 0);
++	for (i = 0; i < 7; i++)
++		init_dev(&s[i], i + 1);
++	for (i = 0; i < 6; i++)
++		link_to(&d, &links[i], &s[i], i ? DL_FLAG_PM_RUNTIME : 0);
++	links[6].flags = DL_FLAG_PM_RUNTIME; links[6].supplier = &s[6];
++	append_link = &links[6]; append_to = &d.links.suppliers;
++	assert(device_links_get_runtime_suppliers(&d, &copy, &count) == 0);
++	assert(count == 6 && copy[5] == &s[6] && !s[0].refs);
++	device_links_put_suppliers(copy, count);
++	alloc_count = 0; fail_alloc = 2;
++	assert(device_links_get_runtime_suppliers(&d, &copy, &count) == -ENOMEM);
++	assert(!copy && !count && !srcu_depth);
++	for (i = 0; i < 7; i++)
++		assert(!s[i].refs);
++	fail_alloc = 0;
++}
++
++static void shared_graph(void)
++{
++	struct device d[10], *panel[4], *dp[2], *parts[4];
++	struct device_link link[4];
++	struct mtk_drm_pm_group *g, *peer;
++	const unsigned int expected[] = { 4, 5, 6, 7, 8, 3, 2, 1, 0 };
++	unsigned int i;
++
++	for (i = 0; i < 10; i++)
++		init_dev(&d[i], i);
++	for (i = 0; i < 4; i++)
++		panel[i] = &d[i];
++	dp[0] = &d[0]; dp[1] = &d[2];
++	g = mtk_drm_pm_group_create(panel, 4); peer = mtk_drm_pm_group_create(dp, 2);
++	assert(!IS_ERR(g) && !IS_ERR(peer));
++	assert(mtk_drm_pm_group_get(g) == 0 && mtk_drm_pm_group_get(peer) == 0);
++	active(&d[4], 1); active(&d[5], 1); active(&d[6], 2);
++	active(&d[7], 1); active(&d[8], 2); /* one external IOMMU owner */
++	d[9].power.disable_depth = 1;
++	d[4].parent = &d[0]; d[5].parent = &d[9];
++	link_to(&d[4], &link[0], &d[6], DL_FLAG_PM_RUNTIME);
++	link_to(&d[5], &link[1], &d[6], DL_FLAG_PM_RUNTIME);
++	link_to(&d[6], &link[2], &d[7], DL_FLAG_PM_RUNTIME);
++	link_to(&d[7], &link[3], &d[8], DL_FLAG_PM_RUNTIME);
++	parts[0] = &d[4]; parts[1] = &d[5]; parts[2] = &d[4]; parts[3] = &d[9];
++	assert(mtk_drm_pm_prepare_put(g, parts, 4) == 0);
++	pm_runtime_put_noidle(&d[4]); pm_runtime_put_noidle(&d[5]);
++	assert(d[4].power.usage_count == 1 && d[5].power.usage_count == 1);
++	norder = 0;
++	assert(mtk_drm_pm_group_put(g) == 0);
++	assert(norder == sizeof(expected) / sizeof(expected[0]));
++	assert(!memcmp(order, expected, sizeof(expected)));
++	assert(!d[8].suspends && d[8].power.usage_count == 1);
++	assert(!d[0].suspends && !d[2].suspends);
++	assert(mtk_drm_pm_prepare_put(peer, NULL, 0) == 0);
++	assert(mtk_drm_pm_group_put(peer) == 0 && d[0].suspends == 1 && d[2].suspends == 1);
++	mtk_drm_pm_group_destroy(g); mtk_drm_pm_group_destroy(peer);
++	for (i = 0; i < 10; i++)
++		assert(!d[i].refs);
++}
++
++static void errors_and_pending(void)
++{
++	struct device a, b, c, d, *controllers[] = { &a, &b }, *parts[] = { &c, &d };
++	struct device_link link;
++	struct mtk_drm_pm_group *g;
++
++	init_dev(&a, 1); init_dev(&b, 2); init_dev(&c, 3); init_dev(&d, 4);
++	g = mtk_drm_pm_group_create(controllers, 2);
++	b.resume_error = -EIO;
++	assert(mtk_drm_pm_group_get(g) == -EIO && g->acquired == 1);
++	c.power.runtime_status = RPM_SUSPENDING;
++	d.power.request = RPM_REQ_RESUME; d.power.request_pending = true; d.barrier_resume = true;
++	assert(mtk_drm_pm_prepare_put(g, parts, 2) == 0);
++	assert(c.barriers == 1 && d.barriers == 1 && d.power.usage_count == 1);
++	norder = 0;
++	assert(mtk_drm_pm_group_put(g) == 0 && norder == 2 && order[0] == 4 && order[1] == 1);
++	assert(!b.suspends && !b.power.usage_count);
++	mtk_drm_pm_group_destroy(g);
++
++	b.resume_error = 0;
++	g = mtk_drm_pm_group_create(controllers, 2);
++	assert(mtk_drm_pm_group_get(g) == 0);
++	active(&c, 1); active(&d, 1);
++	link_to(&c, &link, &d, DL_FLAG_PM_RUNTIME);
++	c.pin_error = -EINVAL;
++	assert(mtk_drm_pm_prepare_put(g, parts, 2) == -EINVAL);
++	assert(!c.refs && !d.refs && d.power.usage_count == 1 && !g->graph);
++	c.pin_error = 0; alloc_count = 0; fail_alloc = 1;
++	assert(mtk_drm_pm_prepare_put(g, parts, 2) == -ENOMEM && g->acquired == 2);
++	fail_alloc = 0;
++	assert(mtk_drm_pm_prepare_put(g, parts, 2) == 0);
++	pm_runtime_put_noidle(&c); c.put_error = -EIO;
++	norder = 0;
++	assert(mtk_drm_pm_group_put(g) == -EIO && norder == 1);
++	assert(!c.power.usage_count && d.power.usage_count == 2 && g->acquired == 2);
++	assert(mtk_drm_pm_group_get(g) == -EIO && mtk_drm_pm_group_put(g) == -EIO);
++	mtk_drm_pm_group_destroy(g);
++	assert(c.refs == 1 && d.refs == 1 && a.refs >= 1 && b.refs >= 1);
++	/* Retained heap/device refs model quarantine, with no test-time puts. */
++}
++
++static void remaining_owner_and_cycle(void)
++{
++	struct device a, b, controller, *controllers[] = { &controller }, *parts[] = { &a };
++	struct device_link edge[2];
++	struct mtk_drm_pm_group *g;
++
++	init_dev(&a, 1); init_dev(&b, 2); init_dev(&controller, 3);
++	active(&a, 1); a.power.child_count = 1;
++	a.power.runtime_status = RPM_SUSPENDING; a.barrier_resume = true;
++	assert(mtk_drm_pm_put(&a) == 0);
++	assert(a.barriers == 1 && !a.power.usage_count && !a.suspends);
++
++	a.power.child_count = 0; a.power.usage_count = 1;
++	a.power.request_pending = true; a.power.request = RPM_REQ_RESUME;
++	assert(mtk_drm_pm_put(&a) == -EAGAIN);
++	assert(a.barriers == 2 && !a.power.usage_count);
++
++	g = mtk_drm_pm_group_create(controllers, 1);
++	assert(!IS_ERR(g) && mtk_drm_pm_group_get(g) == 0);
++	link_to(&a, &edge[0], &b, DL_FLAG_PM_RUNTIME);
++	link_to(&b, &edge[1], &a, DL_FLAG_PM_RUNTIME);
++	assert(mtk_drm_pm_prepare_put(g, parts, 1) == -ELOOP);
++	assert(!a.refs && !b.refs && controller.power.usage_count == 1);
++	assert(mtk_drm_pm_prepare_put(g, NULL, 0) == 0);
++	assert(mtk_drm_pm_group_put(g) == 0);
++	mtk_drm_pm_group_destroy(g);
++}
++
++#include "ordered_pm_admission.inc"
++
++int main(void)
++{
++	snapshot_growth(); shared_graph(); errors_and_pending();
++	remaining_owner_and_cycle(); admission_cases();
++	puts("PASS: actual snapshot growth/unwind, transitive shared graph/release order, partial get, pending PM, active child, cycle rejection, consumed error/quarantine destroy and resume admission");
++	return 0;
++}
+diff --git a/tools/testing/selftests/mtk_clk/test_ordered_pm.py b/tools/testing/selftests/mtk_clk/test_ordered_pm.py
+new file mode 100755
+index 0000000000..c3811162d1
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/test_ordered_pm.py
+@@ -0,0 +1,48 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Exercise ordered display PM reference ownership and quarantine admission."""
++from pathlib import Path
++import os
++import re
++import subprocess
++import tempfile
++
++assets = Path(__file__).resolve().parent
++K = Path(os.environ.get('KERNEL_SRC', str(assets.parents[3])))
++
++def function(text,name):
++ m=re.search(r'^(?:static )?(?:int|void) '+name+r'\([^;]*?\)\n\{',text,re.M)
++ assert m,name
++ pos=m.end()-1;depth=0
++ for end in range(pos,len(text)):
++  c=text[end]
++  if c=='{':depth+=1
++  elif c=='}':
++   depth-=1
++   if not depth:return text[m.start():end+1]
++ raise AssertionError(name)
++core=(K/'drivers/base/core.c').read_text()
++owner=(K/'drivers/gpu/drm/mediatek/mtk_drm_pm.c').read_text()
++provider=(K/'drivers/pmdomain/mediatek/mtk-pm-domains.c').read_text()
++genpd=(K/'drivers/pmdomain/core.c').read_text()
++api='\n\n'.join(function(core,n)for n in ['device_links_put_suppliers','device_links_get_runtime_suppliers'])
++# Integration proof: the actual provider checks quarantine before calling its HWV vote.
++off=function(provider,'scpsys_hwv_root_power_off')
++assert off.index('scpsys_root_faulted')<off.index('scpsys_hwv_root_vote')
++# Actual genpd suspend does not propagate genpd_power_off's return.
++suspend=function(genpd,'genpd_runtime_suspend')
++assert re.search(r'genpd_lock\(genpd\);\s+genpd_power_off\(genpd, true, 0\);',suspend)
++crtc=(K/'drivers/gpu/drm/mediatek/mtk_crtc.c').read_text()
++enable=function(crtc,'mtk_crtc_atomic_enable');disable=function(crtc,'mtk_crtc_atomic_disable')
++assert enable.index('mtk_drm_pm_group_get')<enable.index('mtk_ddp_comp_power_on')
++assert disable.index('mtk_crtc_prepare_pm_put')<disable.index('mtk_crtc_ddp_hw_fini')<disable.index('mtk_ddp_comp_power_off')<disable.index('mtk_drm_pm_group_put')
++
++with tempfile.TemporaryDirectory(prefix='mtk-ordered-pm-') as directory:
++    tmp = Path(directory)
++    (tmp/'production-pm.inc').write_text(api+'\n'+re.sub(r'^#include .*\n','',owner,flags=re.M))
++    (tmp/'production-admission.inc').write_text('\n\n'.join([function(provider,'scpsys_root_dev_start'),*[function(genpd,n)for n in ['genpd_stop_dev','genpd_start_dev','genpd_runtime_resume']]])+'\n')
++    binary = tmp / 'test'
++    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
++                    '-Werror', '-O2', '-I', str(tmp), str(assets / 'ordered_pm_cases.c'),
++                    '-o', str(binary)], check=True)
++    subprocess.run([str(binary)], check=True)
+-- 
+2.56.0
+

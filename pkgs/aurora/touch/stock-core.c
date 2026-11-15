@@ -7,6 +7,7 @@
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <glob.h>
 #include <inttypes.h>
 #include <linux/uinput.h>
 #include <math.h>
@@ -37,10 +38,18 @@ static unsigned char *image, *configuration;
 static size_t config_size;
 static uint64_t frame_time;
 static unsigned long frames_decoded, frames_processed, frames_skipped;
+/* Frames whose core output held at least one contact, total and per period. */
+static unsigned long contact_frames, period_contact_frames, period_processed;
 static unsigned long states[3];
 static void *unavailable_object;
 static bool json_frames = true, input_created, active_slots[12];
 static int input_fd = -1, tracking_id;
+/* Optional display gate: contacts are decoded but not reported while the DRM
+ * connector is not On, and contacts seen then stay hidden until they lift. */
+static const char *dpms_connector, *drm_class = "/sys/class/drm";
+static int dpms_fd = -1;
+static bool display_off, dpms_warned, suppressed_slots[12];
+static uint64_t dpms_checked;
 static volatile sig_atomic_t stop_requested;
 
 static void die(const char *message)
@@ -115,6 +124,24 @@ static void create_input(void)
 	input_created = true;
 }
 
+static void release_contacts(void)
+{
+	bool changed = false;
+	for (unsigned int i = 0; i < 12; ++i) {
+		if (!active_slots[i]) continue;
+		emit(EV_ABS, ABS_MT_SLOT, i);
+		emit(EV_ABS, ABS_MT_TRACKING_ID, -1);
+		active_slots[i] = false;
+		suppressed_slots[i] = true;
+		changed = true;
+	}
+	if (changed) {
+		emit(EV_KEY, BTN_TOUCH, 0);
+		emit(EV_KEY, BTN_TOOL_FINGER, 0);
+		emit(EV_SYN, SYN_REPORT, 0);
+	}
+}
+
 static void report_input(unsigned char *points)
 {
 	if (input_fd < 0) return;
@@ -138,6 +165,16 @@ static void report_input(unsigned char *points)
 		if (state)
 			require(x >= 0 && x <= 143999 && y >= 0 && y <= 319999,
 				"contact outside configured geometry");
+		if (!state && suppressed_slots[id]) {
+			suppressed_slots[id] = false;
+			continue;
+		}
+		/* A new contact after the display is On is reported normally. */
+		if (state == 1 && !display_off) suppressed_slots[id] = false;
+		if (state && (display_off || suppressed_slots[id])) {
+			suppressed_slots[id] = true;
+			continue;
+		}
 		emit(EV_ABS, ABS_MT_SLOT, id);
 		if (!state) {
 			if (active_slots[id]) emit(EV_ABS, ABS_MT_TRACKING_ID, -1);
@@ -162,6 +199,61 @@ static void report_input(unsigned char *points)
 		emit(EV_KEY, BTN_TOOL_FINGER, active);
 		emit(EV_SYN, SYN_REPORT, 0);
 	}
+}
+
+static void dpms_unavailable(const char *message)
+{
+	if (dpms_fd >= 0) close(dpms_fd);
+	dpms_fd = -1;
+	display_off = false;
+	if (!dpms_warned)
+		fprintf(stderr, "stock-core: display DPMS gate inactive (%s); reporting touches\n", message);
+	dpms_warned = true;
+}
+
+/* Poll /sys/class/drm/card*-CONNECTOR/dpms at most every 100 ms. Failures fail open. */
+static void update_display_state(uint64_t now)
+{
+	if (!dpms_connector || (dpms_checked && now - dpms_checked < 100)) return;
+	dpms_checked = now;
+	if (dpms_fd < 0) {
+		char pattern[256];
+		glob_t matches;
+		require((size_t)snprintf(pattern, sizeof(pattern), "%s/card*-%s/dpms", drm_class,
+			dpms_connector) < sizeof(pattern), "display connector name too long");
+		int ret = glob(pattern, 0, NULL, &matches);
+		if (ret || matches.gl_pathc != 1) {
+			if (!ret) globfree(&matches);
+			dpms_unavailable(ret ? "connector not found" : "connector is ambiguous");
+			return;
+		}
+		dpms_fd = open(matches.gl_pathv[0], O_RDONLY | O_CLOEXEC);
+		globfree(&matches);
+		if (dpms_fd < 0) {
+			dpms_unavailable("cannot open dpms attribute");
+			return;
+		}
+	}
+	char state[16];
+	ssize_t n = pread(dpms_fd, state, sizeof(state) - 1, 0);
+	if (n <= 0) {
+		/* The connector may have been removed; resolve it again next time. */
+		dpms_unavailable("cannot read dpms attribute");
+		return;
+	}
+	state[n] = 0;
+	bool off;
+	if (!strcmp(state, "On\n"))
+		off = false;
+	else if (!strcmp(state, "Off\n") || !strcmp(state, "Standby\n") ||
+		 !strcmp(state, "Suspend\n"))
+		off = true;
+	else {
+		dpms_unavailable("unknown dpms state");
+		return;
+	}
+	if (off && !display_off) release_contacts();
+	display_off = off;
 }
 
 static unsigned char *read_file(const char *path, size_t *length, size_t limit)
@@ -395,6 +487,8 @@ static void load_library(const char *path)
 }
 
 static unsigned char *hardware, *parameters, *decoded;
+/* The OEM core's startup frame-skip count, restored after a controller wake. */
+static uint32_t startup_skip;
 static unsigned char normal[1200], source_frame[4096];
 #define FUNCTION(offset, type) ((type)(void *)(image + (offset)))
 typedef void (*noargs_fn)(void);
@@ -419,6 +513,7 @@ static void initialize_core(void)
 	FUNCTION(0x3e36c, onearg_fn)(parameters);
 	require(!FUNCTION(0x95178, alloc_fn)(&decoded, hardware, 1), "frame allocation failed");
 	require(decoded != NULL, "missing decoded frame");
+	startup_skip = get32(parameters + 17);
 }
 
 static void validate_payload(const unsigned char *p)
@@ -500,6 +595,15 @@ static void process_record(const unsigned char *header, const unsigned char *pay
 		++changed;
 	}
 	if (json_frames) puts("]}");
+	++period_processed;
+	for (unsigned int i = 0; i < 12; ++i) {
+		unsigned char *point = points + 172 * i;
+		if (get32(point) && get32(point + 8)) {
+			++contact_frames;
+			++period_contact_frames;
+			break;
+		}
+	}
 	/* Android14 computes the temporal-state update inside 0x3cde4. */
 	require(!parameters[461] && !parameters[1940] && !parameters[1809],
 		"unsupported report mode");
@@ -509,6 +613,24 @@ static void process_record(const unsigned char *header, const unsigned char *pay
 }
 
 static void request_stop(int signal) { (void)signal; stop_requested = 1; }
+
+/* HTRF header byte 18: the kernel powers the controller off with the panel. */
+#define STREAM_PAUSED 1u	/* zero-length record: no frames until a wake */
+#define STREAM_RESUMED 2u	/* first frame after the controller was reset */
+
+/* Validate one raw-stream record and return its event flags. */
+static unsigned int check_record(const unsigned char *record, ssize_t n)
+{
+	require(n >= 24 && !memcmp(record, "HTRF", 4) && !(record[18] & ~3u) &&
+		!memcmp(record + 19, "\0\0\0\0\0", 5), "invalid continuous record");
+	if (record[18] & STREAM_PAUSED) {
+		require(record[18] == STREAM_PAUSED && n == 24 && !get16(record + 16),
+			"invalid pause record");
+	} else {
+		require(n == 1746 && get16(record + 16) == 1722, "invalid continuous record");
+	}
+	return record[18];
+}
 
 static uint64_t monotonic_ms(void)
 {
@@ -538,6 +660,8 @@ static void live(const char *device, unsigned int seconds, const char *capture, 
 	require(!fstat(fd, &st) && S_ISCHR(st.st_mode), "live input must be a character device");
 	json_frames = false;
 	uint64_t start = monotonic_ms(), last_frame = start;
+	bool paused = false, resynchronize = false;
+	uint64_t period_start = start;
 	uint32_t previous_sequence = 0;
 	uint16_t previous_controller = 0;
 	uint64_t previous_timestamp = 0;
@@ -551,23 +675,60 @@ static void live(const char *device, unsigned int seconds, const char *capture, 
 		require(ret >= 0, "raw stream poll failed");
 		require(!(pfd.revents & (POLLERR | POLLHUP | POLLNVAL)), "raw stream stopped or overflowed");
 		if (!(pfd.revents & POLLIN)) {
-			require(monotonic_ms() - last_frame < 2000, "raw stream stalled");
+			uint64_t now = monotonic_ms();
+			require(paused || now - last_frame < 2000, "raw stream stalled");
+			update_display_state(now);
 			continue;
 		}
 		ssize_t n = read(fd, record, sizeof(record));
 		if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
-		require(n == 1746 && !memcmp(record, "HTRF", 4) && get16(record + 16) == 1722 &&
-			!memcmp(record + 18, "\0\0\0\0\0\0", 6), "invalid continuous record");
+		unsigned int flags = check_record(record, n);
+		/* Testable without a finger: frames with decoded contacts per minute,
+		 * and per resume period. */
+		uint64_t now_ms = monotonic_ms();
+		if ((flags & STREAM_PAUSED) || now_ms - period_start >= 60000) {
+			if (period_contact_frames || (flags & STREAM_PAUSED))
+				fprintf(stderr, "Contacts: %lu of %lu processed frames in %" PRIu64 " s\n",
+					period_contact_frames, period_processed, (now_ms - period_start) / 1000);
+			period_contact_frames = period_processed = 0;
+			period_start = now_ms;
+		}
+		if (flags & STREAM_PAUSED) {
+			/* The panel is off: lift contacts and wait without a stall limit. */
+			if (!paused) fprintf(stderr, "Touch controller off with the panel\n");
+			release_contacts();
+			paused = true;
+			continue;
+		}
+		if (flags & STREAM_RESUMED) {
+			/* The controller restarted its frame counter after a reset. */
+			fprintf(stderr, "Touch controller resumed; %u startup frames skipped\n",
+				startup_skip);
+			release_contacts();
+			if (parameters) put32(parameters + 17, startup_skip);
+			paused = false;
+			resynchronize = true;
+		}
+		require(!paused, "frame without resume after a pause");
 		uint32_t sequence = get32(record + 4);
 		uint16_t controller = get16(record + 24 + 28);
 		uint64_t timestamp = get64(record + 8);
-		if (frames_decoded && (sequence - previous_sequence != 1 ||
+		/* A freshly reset controller can skip frame numbers within the OEM
+		 * core's startup frames, which are discarded; the kernel transport
+		 * sequence stays strict. */
+		bool startup = parameters && get32(parameters + 17);
+		if (frames_decoded && !resynchronize && sequence - previous_sequence == 1 &&
+			startup && (uint16_t)(controller - previous_controller) != 1) {
+			fprintf(stderr, "Startup frame gap: controller=%u->%u\n",
+				previous_controller, controller);
+		} else if (frames_decoded && !resynchronize && (sequence - previous_sequence != 1 ||
 			(uint16_t)(controller - previous_controller) != 1)) {
 			fprintf(stderr, "Frame discontinuity: transport=%u->%u controller=%u->%u interval_ns=%" PRIu64 "\n",
 				previous_sequence, sequence, previous_controller, controller,
 				timestamp - previous_timestamp);
 			die("gap in continuous frame sequence");
 		}
+		resynchronize = false;
 		previous_timestamp = timestamp;
 		previous_sequence = sequence;
 		previous_controller = controller;
@@ -577,6 +738,7 @@ static void live(const char *device, unsigned int seconds, const char *capture, 
 			write_all(saved, record, n);
 			++records_saved;
 		}
+		update_display_state(last_frame);
 		process_record(record, record + 24);
 	}
 	close(fd);
@@ -607,7 +769,8 @@ int main(int argc, char **argv)
 	if (argc < 4) {
 		fprintf(stderr, "Usage: %s LIBRARY INI [--events FILE] CAPTURE [CAPTURE ...]\n"
 			"       %s LIBRARY INI --live DEVICE SECONDS CAPTURE [--uinput]\n"
-			"       %s LIBRARY INI --continuous DEVICE [--uinput]\n", argv[0], argv[0], argv[0]);
+			"       %s LIBRARY INI --continuous DEVICE [--uinput] [--display-dpms CONNECTOR]\n",
+			argv[0], argv[0], argv[0]);
 		return 2;
 	}
 	configuration = read_file(argv[2], &config_size, 1024 * 1024);
@@ -616,9 +779,20 @@ int main(int argc, char **argv)
 	initialize_core();
 	atexit(cleanup_input);
 	if (!strcmp(argv[3], "--continuous")) {
-		require(argc == 5 || (argc == 6 && !strcmp(argv[5], "--uinput")),
-			"invalid continuous arguments");
-		live(argv[4], 0, NULL, argc == 6);
+		require(argc >= 5, "invalid continuous arguments");
+		bool input = false;
+		for (int i = 5; i < argc; ++i) {
+			if (!strcmp(argv[i], "--uinput") && !input) {
+				input = true;
+			} else if (!strcmp(argv[i], "--display-dpms") && i + 1 < argc && !dpms_connector) {
+				dpms_connector = argv[++i];
+				require(*dpms_connector && !strpbrk(dpms_connector, "/*?[\\"),
+					"invalid display connector name");
+			} else {
+				die("invalid continuous arguments");
+			}
+		}
+		live(argv[4], 0, NULL, input);
 	} else if (!strcmp(argv[3], "--live")) {
 		require(argc == 7 || (argc == 8 && !strcmp(argv[7], "--uinput")), "invalid live arguments");
 		char *end;
@@ -637,7 +811,8 @@ int main(int argc, char **argv)
 	}
 	require(frames_decoded != 0, "no input frames");
 	fprintf(stderr, "{\"decoded\":%lu,\"startup_skipped\":%lu,\"core_processed\":%lu,"
-		"\"down\":%lu,\"move\":%lu,\"up\":%lu}\n",
-		frames_decoded, frames_skipped, frames_processed, states[1], states[2], states[0]);
+		"\"down\":%lu,\"move\":%lu,\"up\":%lu,\"contact_frames\":%lu}\n",
+		frames_decoded, frames_skipped, frames_processed, states[1], states[2], states[0],
+		contact_frames);
 	return ferror(stdout) ? 1 : 0;
 }

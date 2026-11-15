@@ -1,0 +1,194 @@
+From dbd33b0ac90390af81c7cc027f3ebbe35aa3ea73 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] misc: mediatek: prepare the vendor ECCCI object layout
+
+Prepare the single vendor Makefile for the AT-port frontend.
+Keep the vendor source import and community tty implementation separate.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T08:44:42+08:00
+Link: https://github.com/MT6895-Mainline/linux/tree/qqcandy (the MT6895 port, used as a reference for the sysctl path)
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/misc/mediatek/eccci/Makefile | 167 +++++++--------------------
+ 1 file changed, 40 insertions(+), 127 deletions(-)
+
+diff --git a/drivers/misc/mediatek/eccci/Makefile b/drivers/misc/mediatek/eccci/Makefile
+index 395ba636c5..f683fe1591 100644
+--- a/drivers/misc/mediatek/eccci/Makefile
++++ b/drivers/misc/mediatek/eccci/Makefile
+@@ -1,128 +1,41 @@
+-#
+-# Copyright (C) 2016 MediaTek Inc.
+-#
+-# This program is free software; you can redistribute it and/or modify
+-# it under the terms of the GNU General Public License version 2 as
+-# published by the Free Software Foundation.
+-#
+-# This program is distributed in the hope that it will be useful,
+-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+-# See http://www.gnu.org/licenses/gpl-2.0.html for more details.
+-#
+-
+-ifeq ($(CONFIG_MTK_ECCCI_DRIVER), y)
+-CCCI_OBJ=y
+-else ifeq ($(CONFIG_MTK_ECCCI_DRIVER), m)
+-CCCI_OBJ=m
+-else
+-CCCI_OBJ=n
+-endif
+-
+-ifneq ($(CCCI_OBJ), n)
+-
+-subdir-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/inc/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/ccmni/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/conn_md/include/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/scp/include/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/scp/rv/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/memory-amms
+-subdir-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/include/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/hif/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/mdpm/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/pbm/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/slbc/
+-
+-ifeq ($(CCCI_OBJ), m)
++# SPDX-License-Identifier: GPL-2.0-only
++# The MediaTek evolved CCCI modem driver as modules (vendor CCCI_KMODULE
++# layout): ccci_md_all (core, ports, state machine), ccci_ccif and
++# ccci_dpmaif (host interfaces), ccci_auxadc (the modem's AUXADC queries).
++# Not built: CLDMA, C2K and the SCP handshake module.
++E := $(srctree)/drivers/misc/mediatek/eccci
+ ccflags-y += -DCCCI_KMODULE_ENABLE
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/udc/udc_lib_inc
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/
+-
+-ifneq ($(CONFIG_DEVICE_MODULES_MEDIATEK_MT6577_AUXADC), n)
+-obj-$(CCCI_OBJ) += ccci_auxadc.o
+-endif
+-
+-obj-$(CCCI_OBJ) += ccci_md_all.o
+-ccci_md_all-$(CCCI_OBJ) := ccci_core.o ccci_bm.o ccci_modem.o \
+-		udc/udc.o \
+-		hif/ccci_hif.o
+-
+-# port start
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/port/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/udc
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/udc/udc_lib_inc
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/conn_md/include/
+-
+-ccci_md_all-$(CCCI_OBJ) += port/port_cfg.o \
+-		port/port_char.o \
+-		port/port_ctlmsg.o \
+-		port/port_udc.o \
+-		port/port_ipc.o \
+-		port/port_net.o \
+-		port/port_poller.o \
+-		port/port_proxy.o \
+-		port/port_rpc.o \
+-		port/port_smem.o \
+-		port/port_sysmsg.o \
+-		port/ccci_swtp.o \
+-		port/port_kernel_interface.o
+-# port end
+-# fsm start
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/fsm/
+-ccci_md_all-$(CCCI_OBJ) += fsm/ccci_fsm.o \
+-			fsm/ccci_fsm_ioctl.o \
+-			fsm/ccci_fsm_monitor.o \
+-			fsm/ccci_fsm_poller.o \
+-			fsm/ccci_fsm_ee.o \
+-			fsm/ccci_fsm_sys.o \
+-			fsm/mdee_dumper_v1.o \
+-			fsm/mdee_dumper_v2.o \
+-			fsm/mdee_dumper_v3.o \
+-			fsm/mdee_dumper_v5.o \
+-			fsm/mdee_dumper_v6.o \
+-			fsm/modem_sys1.o \
+-			fsm/md_sys1_platform.o \
+-			fsm/ap_md_reg_dump.o \
+-			fsm/ap_md_mem.o
+-
+-# fsm end
+-
+-# plat start
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/pmic/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/clk/mediatek
+-# security objects
+-MASP_CORE_DRIVER_DIR := $(DEVICE_MODULES_PATH)/drivers/misc/mediatek/drivers/masp
+-
+-subdir-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/fsm
+-obj-$(CCCI_OBJ)	+= fsm/
+-
+-# ccci_ccif.ko, ccci_dpmaif.ko, ccci_cldma.ko
+-subdir-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/hif
+-obj-$(CCCI_OBJ)	+= hif/
+-
+-
+-
+-
+-else
+-
+-obj-$(CCCI_OBJ) += ccci_all.o
+-# common services
+-ccci_all-$(CCCI_OBJ) := ccci_core.o ccci_bm.o ccci_modem.o modem_sys1.o
+-
+-
+-ifneq ($(CONFIG_DEVICE_MODULES_MEDIATEK_MT6577_AUXADC), n)
+-ccci_all-$(CCCI_OBJ) += ccci_auxadc.o
+-endif
+-
+-# sub modules
+-obj-$(CCCI_OBJ) += fsm/
+-obj-$(CCCI_OBJ) += hif/
+-obj-$(CCCI_OBJ) += port/
+-obj-$(CCCI_OBJ) += udc/
+-
+-# platform code
+-obj-$(CCCI_OBJ) += platform/
+-
+-endif
+-
+-endif
++ccflags-y += -I$(E)/compat -I$(E)/inc -I$(E) -I$(E)/hif -I$(E)/port \
++	     -I$(E)/fsm -I$(E)/udc -I$(E)/udc/udc_lib_inc \
++	     -I$(srctree)/drivers/misc/mediatek/ccmni \
++	     -I$(srctree)/drivers/misc/mediatek/include
++ccflags-y += -include $(E)/compat/eccci_compat.h
++
++obj-$(CONFIG_MTK_ECCCI_DRIVER) += ccci_auxadc.o
++
++obj-$(CONFIG_MTK_ECCCI_DRIVER) += ccci_md_all.o
++ccci_md_all-y := ccci_core.o ccci_bm.o ccci_modem.o \
++		 udc/udc.o \
++		 hif/ccci_hif.o \
++		 port/port_cfg.o port/port_char.o port/port_ctlmsg.o \
++		 port/port_udc.o port/port_ipc.o port/port_net.o \
++		 port/port_poller.o port/port_proxy.o port/port_rpc.o \
++		 port/port_smem.o port/port_sysmsg.o port/ccci_swtp.o \
++		 port/port_kernel_interface.o \
++		 fsm/ccci_fsm.o fsm/ccci_fsm_ioctl.o fsm/ccci_fsm_monitor.o \
++		 fsm/ccci_fsm_poller.o fsm/ccci_fsm_ee.o fsm/ccci_fsm_sys.o \
++		 fsm/mdee_dumper_v1.o fsm/mdee_dumper_v2.o fsm/mdee_dumper_v3.o \
++		 fsm/mdee_dumper_v5.o fsm/mdee_dumper_v6.o fsm/modem_sys1.o \
++		 fsm/md_sys1_platform.o fsm/ap_md_reg_dump.o fsm/ap_md_mem.o
++
++obj-$(CONFIG_MTK_ECCCI_DRIVER) += ccci_ccif.o
++ccci_ccif-y := hif/ccci_ringbuf.o hif/ccci_hif_ccif.o
++
++obj-$(CONFIG_MTK_ECCCI_DRIVER) += ccci_dpmaif.o
++ccci_dpmaif-y := hif/net_pool.o hif/md_spd_dvfs_fn.o hif/md_spd_dvfs_method.o \
++		 hif/net_speed.o hif/ccci_dpmaif_com.o hif/ccci_dpmaif_bat.o \
++		 hif/ccci_dpmaif_debug.o hif/ccci_dpmaif_resv_mem.o \
++		 hif/ccci_dpmaif_drv_com.o hif/ccci_dpmaif_drv_v1.o \
++		 hif/ccci_dpmaif_drv_v2.o hif/ccci_dpmaif_drv_v3.o \
++		 hif/ccci_dpmaif_page_pool.o
++ccflags-y += -DRX_PAGE_POOL
+-- 
+2.56.0
+

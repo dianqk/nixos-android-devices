@@ -1,0 +1,83 @@
+From dac8930ddadc9a26d9288ff9b40200c7ad2eed50 Mon Sep 17 00:00:00 2001
+From: Tatsuki Tanaka <tatsuki@tanakatatsuki.dev>
+Date: Fri, 9 Oct 2026 18:40:29 +0800
+Subject: [PATCH 25/46] mfd: qcom-pm8008: make interrupt optional for camera
+ LDO supply
+
+Allow PM8008 camera power management IC to probe without a registered
+interrupt line when only regulator control is needed.
+
+Signed-off-by: Tatsuki Tanaka <tatsuki@tanakatatsuki.dev>
+(cherry picked from commit c693d08cf3fdd975eff143193f016ee7c8465eed)
+---
+ drivers/mfd/qcom-pm8008.c | 55 +++++++++++++++++++++------------------
+ 1 file changed, 30 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/mfd/qcom-pm8008.c b/drivers/mfd/qcom-pm8008.c
+index 60204cc9a2dc..60b7be512f8e 100644
+--- a/drivers/mfd/qcom-pm8008.c
++++ b/drivers/mfd/qcom-pm8008.c
+@@ -231,33 +231,38 @@ static int pm8008_probe(struct i2c_client *client)
+ 	 */
+ 	usleep_range(1000, 2000);
+ 
+-	name = devm_kasprintf(dev, GFP_KERNEL, "%pOF-internal", dev->of_node);
+-	if (!name)
+-		return -ENOMEM;
+-
+-	name = strreplace(name, '/', ':');
+-
+-	fwnode = irq_domain_alloc_named_fwnode(name);
+-	if (!fwnode)
+-		return -ENOMEM;
+-
+-	ret = devm_add_action_or_reset(dev, devm_irq_domain_fwnode_release, fwnode);
+-	if (ret)
+-		return ret;
+-
+-	ret = devm_regmap_add_irq_chip_fwnode(dev, fwnode, regmap, client->irq,
+-				IRQF_SHARED, 0, &pm8008_irq_chip, &irq_data);
+-	if (ret) {
+-		dev_err(dev, "failed to add IRQ chip: %d\n", ret);
+-		return ret;
++	if (client->irq > 0) {
++		name = devm_kasprintf(dev, GFP_KERNEL, "%pOF-internal", dev->of_node);
++		if (!name)
++			return -ENOMEM;
++
++		name = strreplace(name, '/', ':');
++
++		fwnode = irq_domain_alloc_named_fwnode(name);
++		if (!fwnode)
++			return -ENOMEM;
++
++		ret = devm_add_action_or_reset(dev, devm_irq_domain_fwnode_release, fwnode);
++		if (ret)
++			return ret;
++
++		ret = devm_regmap_add_irq_chip_fwnode(dev, fwnode, regmap, client->irq,
++					IRQF_SHARED, 0, &pm8008_irq_chip, &irq_data);
++		if (ret) {
++			dev_err(dev, "failed to add IRQ chip: %d\n", ret);
++			return ret;
++		}
++
++		/* Needed by GPIO driver. */
++		dev_set_drvdata(dev, regmap_irq_get_domain(irq_data));
++
++		return devm_mfd_add_devices(dev, PLATFORM_DEVID_AUTO, pm8008_cells,
++					ARRAY_SIZE(pm8008_cells), NULL, 0,
++					regmap_irq_get_domain(irq_data));
+ 	}
+ 
+-	/* Needed by GPIO driver. */
+-	dev_set_drvdata(dev, regmap_irq_get_domain(irq_data));
+-
+-	return devm_mfd_add_devices(dev, PLATFORM_DEVID_AUTO, pm8008_cells,
+-				ARRAY_SIZE(pm8008_cells), NULL, 0,
+-				regmap_irq_get_domain(irq_data));
++	return devm_mfd_add_devices(dev, PLATFORM_DEVID_AUTO, &pm8008_cells[0],
++				    1, NULL, 0, NULL);
+ }
+ 
+ static const struct of_device_id pm8008_match[] = {

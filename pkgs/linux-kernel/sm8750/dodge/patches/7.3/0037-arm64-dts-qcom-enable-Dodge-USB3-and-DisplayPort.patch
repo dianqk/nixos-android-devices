@@ -1,0 +1,207 @@
+From d2e7e55dc5a13e2490c79b40e3e58a0194c464bc Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 8 Nov 2026 07:49:37 +0800
+Subject: [PATCH 037/144] arm64: dts: qcom: enable Dodge USB3 and DisplayPort
+
+Wire the USB-C connector, combo PHY and WCD9395 USBSS AUX mux using the OEM rails, I2C bus and orientation pin. Keep the codec reset and audio graph separate. Restore the SoC SuperSpeed graph and enable the existing DP controller up to HBR3. Build a second DTB from the same board source for independent USB2 peripheral recovery without ADSP/Type-C dependencies.
+
+Link: https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8750/tree/d50b305f7da9e14715a25120a4ac7b1a4b8b97c3/kernel_platform/qcom/opensource/devicetree
+Link: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/arm64/boot/dts/qcom/sm8750-mtp.dts?h=v7.3
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0055-arm64-dts-qcom-enable-Dodge-USB3-and-DisplayPort.patch
+Import-SHA256: 643f784a41335170658d75285588829f88ae6ab07b79bbe0d985780794a9c734
+Import-Provenance: mail headers
+(cherry picked from commit 31a0a1e35ff8e1fd5e0bda642ec500cb4e7a924b)
+---
+ arch/arm64/boot/dts/qcom/Makefile             |  1 +
+ .../qcom/sm8750-oneplus-dodge-recovery.dts    | 48 ++++++++++
+ .../boot/dts/qcom/sm8750-oneplus-dodge.dts    | 92 +++++++++++++++++--
+ 3 files changed, 132 insertions(+), 9 deletions(-)
+ create mode 100644 arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge-recovery.dts
+
+diff --git a/arch/arm64/boot/dts/qcom/Makefile b/arch/arm64/boot/dts/qcom/Makefile
+index 9559330a25..7c034722af 100644
+--- a/arch/arm64/boot/dts/qcom/Makefile
++++ b/arch/arm64/boot/dts/qcom/Makefile
+@@ -408,6 +408,7 @@ dtb-$(CONFIG_ARCH_QCOM)	+= sm8650-mtp.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8650-qrd.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8750-mtp.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8750-oneplus-dodge.dtb
++dtb-$(CONFIG_ARCH_QCOM)	+= sm8750-oneplus-dodge-recovery.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8750-qrd.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= talos-evk.dtb
+ 
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge-recovery.dts b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge-recovery.dts
+new file mode 100644
+index 0000000000..cffebda861
+--- /dev/null
++++ b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge-recovery.dts
+@@ -0,0 +1,48 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/* USB2 management does not require the installed Type-C firmware path. */
++#include "sm8750-oneplus-dodge.dts"
++
++&remoteproc_adsp {
++	status = "disabled";
++};
++
++&{/pmic-glink} {
++	status = "disabled";
++	/delete-property/ orientation-gpios;
++	/delete-node/ connector@0;
++};
++
++&usb {
++	dr_mode = "peripheral";
++	maximum-speed = "high-speed";
++	phys = <&usb_hsphy>;
++	phy-names = "usb2-phy";
++	qcom,select-utmi-as-pipe-clk;
++	/delete-property/ usb-role-switch;
++	/delete-node/ ports;
++};
++
++&usb_dp_qmpphy {
++	status = "disabled";
++};
++
++&usb_dp_qmpphy_out {
++	/delete-property/ remote-endpoint;
++};
++
++&usb_dp_qmpphy_usb_ss_in {
++	/delete-property/ remote-endpoint;
++};
++
++&mdss_dp0 {
++	status = "disabled";
++};
++
++&i2c3 {
++	status = "disabled";
++};
++
++&wcd_usbss {
++	status = "disabled";
++	/delete-node/ ports;
++};
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+index da0f1b0d9d..c427646c4e 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
++++ b/arch/arm64/boot/dts/qcom/sm8750-oneplus-dodge.dts
+@@ -22,6 +22,42 @@ / {
+ 	pmic-glink {
+ 		compatible = "oneplus,dodge-pmic-glink", "qcom,sm8350-pmic-glink",
+ 			     "qcom,pmic-glink";
++		#address-cells = <1>;
++		#size-cells = <0>;
++		orientation-gpios = <&tlmm 61 GPIO_ACTIVE_HIGH>;
++
++		connector@0 {
++			compatible = "usb-c-connector";
++			reg = <0>;
++			power-role = "dual";
++			data-role = "dual";
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					pmic_glink_hs_in: endpoint {
++						remote-endpoint = <&usb_dwc3_hs>;
++					};
++				};
++
++				port@1 {
++					reg = <1>;
++					pmic_glink_ss_in: endpoint {
++						remote-endpoint = <&usb_dp_qmpphy_out>;
++					};
++				};
++
++				port@2 {
++					reg = <2>;
++					pmic_glink_sbu: endpoint {
++						remote-endpoint = <&wcd_usbss_sbu_mux>;
++					};
++				};
++			};
++		};
+ 	};
+ 
+ 	aliases {
+@@ -543,18 +579,23 @@ mdp_vsync_suspend: mdp-vsync-suspend-state {
+ };
+ 
+ &usb {
+-	dr_mode = "peripheral";
+-	maximum-speed = "high-speed";
+-	phys = <&usb_hsphy>;
+-	phy-names = "usb2-phy";
+-	qcom,select-utmi-as-pipe-clk;
+-	/delete-property/ usb-role-switch;
++	dr_mode = "otg";
++	maximum-speed = "super-speed";
+ 	status = "okay";
+-	/delete-node/ ports;
+ };
+ 
+-&usb_dp_qmpphy_usb_ss_in {
+-	/delete-property/ remote-endpoint;
++&usb_dp_qmpphy {
++	vdda-phy-supply = <&vreg_l2d_0p88>;
++	vdda-pll-supply = <&vreg_l3g_1p2>;
++	status = "okay";
++};
++
++&usb_dp_qmpphy_out {
++	remote-endpoint = <&pmic_glink_ss_in>;
++};
++
++&usb_dwc3_hs {
++	remote-endpoint = <&pmic_glink_hs_in>;
+ };
+ 
+ &usb_hsphy {
+@@ -564,6 +605,39 @@ &usb_hsphy {
+ 	status = "okay";
+ };
+ 
++&i2c3 {
++	status = "okay";
++
++	wcd_usbss: typec-mux@e {
++		compatible = "qcom,wcd9395-usbss", "qcom,wcd9390-usbss";
++		reg = <0xe>;
++		vdd-supply = <&vreg_l15b_1p8>;
++		mode-switch;
++		orientation-switch;
++
++		/* The OEM USBSS node has no reset GPIO or codec dependency. */
++		ports {
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			port@0 {
++				reg = <0>;
++				wcd_usbss_sbu_mux: endpoint {
++					remote-endpoint = <&pmic_glink_sbu>;
++				};
++			};
++		};
++	};
++};
++
++&mdss_dp0 {
++	status = "okay";
++};
++
++&mdss_dp0_out {
++	link-frequencies = /bits/ 64 <1620000000 2700000000 5400000000 8100000000>;
++};
++
+ &gpu {
+ 	status = "okay";
+ };

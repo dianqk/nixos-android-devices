@@ -1,0 +1,80 @@
+From abf7c430478e2d1fb5b428e2ce0fb3f9a5e0c625 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 16 Oct 2026 12:20:49 +0800
+Subject: [PATCH] wlan adaptor: build wmt_chrdev_wifi against an out-of-tree
+ conninfra
+
+Let CONN_SRC point at the connectivity tree instead of the Android
+vendor path, force-include the compat header, and use class_create()
+without the module.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ connectivity/wlan/adaptor/Kbuild          | 18 ++++++++++--------
+ connectivity/wlan/adaptor/wmt_cdev_wifi.c |  2 +-
+ 2 files changed, 11 insertions(+), 9 deletions(-)
+
+diff --git a/connectivity/wlan/adaptor/Kbuild b/connectivity/wlan/adaptor/Kbuild
+index bb633ae..cd99ae7 100644
+--- a/connectivity/wlan/adaptor/Kbuild
++++ b/connectivity/wlan/adaptor/Kbuild
+@@ -22,6 +22,8 @@ endif
+ 
+ # Force build fail on modpost warning
+ KBUILD_MODPOST_FAIL_ON_WARNINGS := y
++CONN_SRC ?= $(TOP)/vendor/mediatek/kernel_modules/connectivity
++ccflags-y += -include $(CONN_SRC)/../compat/t880_compat.h -I$(CONN_SRC)/../compat/include -Wno-error -Wno-missing-prototypes -Wno-missing-declarations
+ 
+ ifeq ($(CONNAC_VER), 3_0)
+     ccflags-y += -DCFG_ANDORID_CONNINFRA_SUPPORT=0
+@@ -29,18 +31,18 @@ ifeq ($(CONNAC_VER), 3_0)
+     ccflags-y += -DCFG_SUPPORT_CONNAC3X=1
+     CONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH := n
+ else ifeq ($(CONNAC_VER), 2_0)
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/include
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2/debug_utility
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2/debug_utility/include
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2/debug_utility/connsyslog
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2/debug_utility/coredump
++    ccflags-y += -I$(CONN_SRC)/conninfra/include
++    ccflags-y += -I$(CONN_SRC)/conninfra/conn_drv/connv2/debug_utility
++    ccflags-y += -I$(CONN_SRC)/conninfra/conn_drv/connv2/debug_utility/include
++    ccflags-y += -I$(CONN_SRC)/conninfra/conn_drv/connv2/debug_utility/connsyslog
++    ccflags-y += -I$(CONN_SRC)/conninfra/conn_drv/connv2/debug_utility/coredump
+     ccflags-y += -DCFG_ANDORID_CONNINFRA_SUPPORT=1
+     ccflags-y += -DCFG_ANDORID_CONNINFRA_COREDUMP_SUPPORT=1
+     ccflags-y += -DCFG_SUPPORT_CONNAC2X=1
+ else
+     ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/include/mt-plat
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/common/common_main/include
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/common/common_main/linux/include
++    ccflags-y += -I$(CONN_SRC)/common/common_main/include
++    ccflags-y += -I$(CONN_SRC)/common/common_main/linux/include
+     ccflags-y += -DCFG_ANDORID_CONNINFRA_SUPPORT=0
+     ccflags-y += -DCFG_ANDORID_CONNINFRA_COREDUMP_SUPPORT=0
+     ccflags-y += -DCFG_SUPPORT_CONNAC1X=1
+@@ -48,7 +50,7 @@ endif
+ 
+ ifeq ($(CONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH), y)
+     ccflags-y += -DCFG_MTK_CONNSYS_DEDICATED_LOG_PATH
+-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/common/debug_utility
++    ccflags-y += -I$(CONN_SRC)/common/debug_utility
+ endif
+ 
+ ifeq ($(CONFIG_MTK_CONN_LTE_IDC_SUPPORT),y)
+diff --git a/connectivity/wlan/adaptor/wmt_cdev_wifi.c b/connectivity/wlan/adaptor/wmt_cdev_wifi.c
+index d455a8b..86c375b 100644
+--- a/connectivity/wlan/adaptor/wmt_cdev_wifi.c
++++ b/connectivity/wlan/adaptor/wmt_cdev_wifi.c
+@@ -820,7 +820,7 @@ static int WIFI_init(void)
+ 		goto error;
+ 
+ #if CREATE_NODE_DYNAMIC	/* mknod replace */
+-	wmtwifi_class = class_create(THIS_MODULE, "wmtWifi");
++	wmtwifi_class = class_create("wmtWifi");
+ 	if (IS_ERR(wmtwifi_class))
+ 		goto error;
+ 	wmtwifi_dev = device_create(wmtwifi_class, NULL, wifi_devno, NULL,
+-- 
+2.55.0
+

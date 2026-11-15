@@ -1,0 +1,56 @@
+From 80314d916634512fa7cab2a83c4f8678f4e47879 Mon Sep 17 00:00:00 2001
+From: Fabricio Akio <fabricioakio@gmail.com>
+Date: Sun, 11 Oct 2026 18:59:05 -0300
+Subject: [PATCH] wifi: ath10k: don't reset TxBF on disassociation
+
+WCN3990 firmware WLAN.HL.1.0.1.c2-00498 crashes whenever the vdev's
+TxBF parameter is set while the vdev has no peer for its AP, whatever
+the value. ath10k_bss_disassoc() sets it to 0 once the AP's peer is
+gone. The firmware therefore crashes on every disconnect, including
+the one cfg80211 makes before a suspend without WoWLAN, and whenever
+mac80211 replays the state of an interface that is not associated, as
+on resume from such a suspend and after a firmware restart. Each
+restart replays it again, so the firmware never comes back:
+
+  qcom-q6v5-mss 4080000.remoteproc: fatal error received:
+    err_qdi.c:459:EX:wlan_process:1:WLAN RT:107b:PC=b00c8334
+
+The reset is not needed: ath10k_bss_assoc() sets TxBF again from the
+next AP's capabilities before bringing the vdev up. Drop it.
+
+Fixes: 139e170da98a ("ath10k: add TxBF support")
+Signed-off-by: Fabricio Akio <fabricioakio@gmail.com>
+Link: https://lore.kernel.org/ath10k/20261011-ath10k-disassoc-txbf-v1-1-51e09115042e@gmail.com/
+Scope: Shared ath10k driver (WCN3990)
+Porting notes: Applied unchanged on v7.3 from the patchwork mbox; not yet merged upstream.
+---
+ drivers/net/wireless/ath/ath10k/mac.c | 9 ---------
+ 1 file changed, 9 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath10k/mac.c b/drivers/net/wireless/ath/ath10k/mac.c
+index 0288d650b7..d853d82573 100644
+--- a/drivers/net/wireless/ath/ath10k/mac.c
++++ b/drivers/net/wireless/ath/ath10k/mac.c
+@@ -3192,7 +3192,6 @@ static void ath10k_bss_disassoc(struct ieee80211_hw *hw,
+ {
+ 	struct ath10k *ar = hw->priv;
+ 	struct ath10k_vif *arvif = (void *)vif->drv_priv;
+-	struct ieee80211_sta_vht_cap vht_cap = {};
+ 	int ret;
+ 
+ 	lockdep_assert_held(&ar->conf_mutex);
+@@ -3206,14 +3205,6 @@ static void ath10k_bss_disassoc(struct ieee80211_hw *hw,
+ 			    arvif->vdev_id, ret);
+ 
+ 	arvif->def_wep_key_idx = -1;
+-
+-	ret = ath10k_mac_vif_recalc_txbf(ar, vif, vht_cap);
+-	if (ret) {
+-		ath10k_warn(ar, "failed to recalc txbf for vdev %i: %d\n",
+-			    arvif->vdev_id, ret);
+-		return;
+-	}
+-
+ 	arvif->is_up = false;
+ 
+ 	ath10k_mac_txpower_recalc(ar);

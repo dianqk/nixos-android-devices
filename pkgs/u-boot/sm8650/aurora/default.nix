@@ -16,10 +16,13 @@
     ./patches/0006-aurora-buttons.patch
   ];
   environment = ./aurora.env;
+  # ABL refuses to boot when the stock dtbo_b overlay cannot be merged into
+  # this DTB; give the overlay's labels sink nodes instead.
+  ablDtboSinkLabels = ./abl-dtbo-labels.txt;
   android = {
     tagsOffset = "0x01e00000";
     osVersion = "14.0.0";
-    osPatchLevel = "2026-02-01";
+    osPatchLevel = "2026-08-01";
     maximumBytes = 104857600;
   };
   config = ''

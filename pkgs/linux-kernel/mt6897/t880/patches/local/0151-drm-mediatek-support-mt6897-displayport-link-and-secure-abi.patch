@@ -1,0 +1,821 @@
+From 9506ef5df60f95e2950214d8fc8a0d57e7dc467a Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] drm/mediatek: support MT6897 DisplayPort link and secure ABI
+
+Describe MT6897 DP resources, retry plug-time training and use the
+MT6897 secure video-mute ABI.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T03:00:38+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T03:01:38+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T03:02:17+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T03:38:35+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T06:29:07+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T06:29:07+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T07:53:29+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T20:33:57+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T22:52:04+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_dp_common.h
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_dp_hal.c
+---
+ drivers/gpu/drm/mediatek/mtk_dp.c | 502 +++++++++++++++++++++++++++++-
+ 1 file changed, 487 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_dp.c b/drivers/gpu/drm/mediatek/mtk_dp.c
+index f656b85b84..c322f27bc7 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dp.c
++++ b/drivers/gpu/drm/mediatek/mtk_dp.c
+@@ -17,6 +17,7 @@
+ #include <drm/drm_probe_helper.h>
+ #include <linux/arm-smccc.h>
+ #include <linux/clk.h>
++#include <linux/debugfs.h>
+ #include <linux/delay.h>
+ #include <linux/errno.h>
+ #include <linux/kernel.h>
+@@ -30,6 +31,8 @@
+ #include <linux/pm_runtime.h>
+ #include <linux/regmap.h>
+ #include <linux/soc/mediatek/mtk_sip_svc.h>
++#include <linux/usb/typec_dp.h>
++#include <linux/usb/typec_mux.h>
+ #include <sound/hdmi-codec.h>
+ #include <video/videomode.h>
+ 
+@@ -38,6 +41,7 @@
+ #define MTK_DP_SIP_CONTROL_AARCH32	MTK_SIP_SMC_CMD(0x523)
+ #define MTK_DP_SIP_ATF_EDP_VIDEO_UNMUTE	(BIT(0) | BIT(5))
+ #define MTK_DP_SIP_ATF_VIDEO_UNMUTE	BIT(5)
++#define MT6897_DP_SIP_ATF_VIDEO_UNMUTE	0x21
+ 
+ #define MTK_DP_THREAD_CABLE_STATE_CHG	BIT(0)
+ #define MTK_DP_THREAD_HPD_EVENT		BIT(1)
+@@ -134,17 +138,53 @@ struct mtk_dp {
+ 	struct device *codec_dev;
+ 	/* protect the plugged_cb as it's used in both bridge ops and audio */
+ 	struct mutex update_plugged_status_lock;
++
++	/* USB Type-C DisplayPort alt mode: plug orientation and pin assignment */
++	struct typec_switch_dev *typec_sw;
++	struct typec_mux_dev *typec_mux;
++	bool aux_pn_swap;
++	u8 typec_lanes;
++
++	/* HPD from the next bridge (e.g. a USB-C connector) instead of a pin */
++	bool oob_hpd;
++	bool oob_hpd_level;
++
++	/* The last link training failed: the sink is not usable */
++	bool link_failed;
++	u8 last_link_status[DP_LINK_STATUS_SIZE];
++
++	/* debugfs: limits for link training experiments (0: none) */
++	struct dentry *debugfs;
++	u8 dbg_max_lanes;
++	u8 dbg_max_rate;
+ };
+ 
+ struct mtk_dp_data {
+ 	int bridge_type;
+ 	unsigned int smc_cmd;
++	bool smc_extended_args;
++	/* NULL: no calibration, the PHY keeps its reset values */
+ 	const struct mtk_dp_efuse_fmt *efuse_fmt;
+ 	bool audio_supported;
+ 	bool audio_pkt_in_hblank_area;
+ 	u16 audio_m_div2_bit;
++	bool mt6897_phya;
+ };
+ 
++/*
++ * MT6897 analog PHY settings of the MediaTek vendor driver
++ * (mhal_DPTx_PHYSetting "porting from CTP" and mhal_DPTx_SetTxRate); the
++ * field names are not known.
++ */
++#define MT6897_DP_PHYA_0008		0x0008
++#define MT6897_DP_PHYA_0008_VAL		(7 << 3)
++#define MT6897_DP_PHYA_0008_MASK	GENMASK(6, 3)
++#define MT6897_DP_PHYA_003C		0x003c
++#define MT6897_DP_PHYA_0054		0x0054
++#define MT6897_DP_PHYA_EN		BIT(23)
++#define MT6897_DP_PHYA_SEL_MASK		GENMASK(28, 24)
++#define MT6897_DP_PHYA_SEL(x)		((x) << 24)
++
+ static const struct mtk_dp_efuse_fmt mt8188_dp_efuse_fmt[MTK_DP_CAL_MAX] = {
+ 	[MTK_DP_CAL_GLB_BIAS_TRIM] = {
+ 		.idx = 0,
+@@ -1080,6 +1120,33 @@ static void mtk_dp_initialize_hpd_detect_settings(struct mtk_dp *mtk_dp)
+ 			   HPD_INT_THD_ECO_DP_TRANS_P0_MASK);
+ }
+ 
++static u8 mtk_dp_max_lanes(struct mtk_dp *mtk_dp)
++{
++	/* A Type-C pin assignment may leave fewer lanes to DisplayPort */
++	if (mtk_dp->typec_lanes)
++		return min(mtk_dp->max_lanes, mtk_dp->typec_lanes);
++
++	return mtk_dp->max_lanes;
++}
++
++static void mtk_dp_set_aux_pn_swap(struct mtk_dp *mtk_dp)
++{
++	/*
++	 * Only Type-C outputs follow the plug orientation. The orientation
++	 * may change while the controller is powered off: init_port applies
++	 * it again.
++	 */
++	if (!mtk_dp->typec_sw || !pm_runtime_active(mtk_dp->dev))
++		return;
++
++	mtk_dp_update_bits(mtk_dp, MTK_DP_AUX_P0_360C,
++			   mtk_dp->aux_pn_swap ? AUX_PN_SWAP_AUX_TX_P0 : 0,
++			   AUX_PN_SWAP_AUX_TX_P0);
++	mtk_dp_update_bits(mtk_dp, MTK_DP_AUX_P0_3680,
++			   mtk_dp->aux_pn_swap ? AUX_PN_SWAP_TX_AUX_TX_P0 : 0,
++			   AUX_PN_SWAP_TX_AUX_TX_P0);
++}
++
+ static void mtk_dp_initialize_aux_settings(struct mtk_dp *mtk_dp)
+ {
+ 	/* modify timeout threshold = 0x1595 */
+@@ -1104,6 +1171,8 @@ static void mtk_dp_initialize_aux_settings(struct mtk_dp *mtk_dp)
+ 	mtk_dp_update_bits(mtk_dp, MTK_DP_AUX_P0_3690,
+ 			   RX_REPLY_COMPLETE_MODE_AUX_TX_P0,
+ 			   RX_REPLY_COMPLETE_MODE_AUX_TX_P0);
++
++	mtk_dp_set_aux_pn_swap(mtk_dp);
+ }
+ 
+ static void mtk_dp_initialize_digital_settings(struct mtk_dp *mtk_dp)
+@@ -1171,6 +1240,9 @@ static void mtk_dp_get_calibration_data(struct mtk_dp *mtk_dp)
+ 	int i;
+ 	size_t len;
+ 
++	if (!mtk_dp->data->efuse_fmt)
++		return;
++
+ 	cell = nvmem_cell_get(dev, "dp_calibration_data");
+ 	if (IS_ERR(cell)) {
+ 		dev_warn(dev, "Failed to get nvmem cell dp_calibration_data\n");
+@@ -1221,6 +1293,9 @@ static void mtk_dp_set_calibration_data(struct mtk_dp *mtk_dp)
+ {
+ 	u32 *cal_data = mtk_dp->cal_data;
+ 
++	if (!mtk_dp->data->efuse_fmt)
++		return;
++
+ 	mtk_dp_update_bits(mtk_dp, DP_PHY_GLB_DPAUX_TX,
+ 			   cal_data[MTK_DP_CAL_CLKTX_IMPSE] << 20,
+ 			   RG_CKM_PT0_CKTX_IMPSEL);
+@@ -1274,6 +1349,26 @@ static int mtk_dp_phy_configure(struct mtk_dp *mtk_dp,
+ 	if (ret)
+ 		return ret;
+ 
++	if (mtk_dp->data->mt6897_phya) {
++		u32 sel;
++
++		/* Per link rate, written with the TPLL off */
++		switch (link_rate) {
++		case DP_LINK_BW_1_62:
++			sel = 3;
++			break;
++		case DP_LINK_BW_8_1:
++			sel = 2;
++			break;
++		default:
++			sel = 5;
++			break;
++		}
++		mtk_dp_update_bits(mtk_dp, MT6897_DP_PHYA_003C,
++				   MT6897_DP_PHYA_EN | MT6897_DP_PHYA_SEL(sel),
++				   MT6897_DP_PHYA_EN | MT6897_DP_PHYA_SEL_MASK);
++	}
++
+ 	mtk_dp_set_calibration_data(mtk_dp);
+ 	mtk_dp_update_bits(mtk_dp, MTK_DP_TOP_PWR_STATE,
+ 			   DP_PWR_STATE_BANDGAP_TPLL_LANE, DP_PWR_STATE_MASK);
+@@ -1324,6 +1419,7 @@ static void mtk_dp_training_set_scramble(struct mtk_dp *mtk_dp, bool enable)
+ static void mtk_dp_video_mute(struct mtk_dp *mtk_dp, bool enable)
+ {
+ 	struct arm_smccc_res res;
++	u32 smc_arg3 = 0, smc_arg4 = 0;
+ 	u32 val = VIDEO_MUTE_SEL_DP_ENC0_P0 |
+ 		  (enable ? VIDEO_MUTE_SW_DP_ENC0_P0 : 0);
+ 
+@@ -1332,9 +1428,15 @@ static void mtk_dp_video_mute(struct mtk_dp *mtk_dp, bool enable)
+ 			   VIDEO_MUTE_SEL_DP_ENC0_P0 |
+ 			   VIDEO_MUTE_SW_DP_ENC0_P0);
+ 
++	/* MT6897 firmware also validates the packed command and token. */
++	if (mtk_dp->data->smc_extended_args) {
++		smc_arg3 = (mtk_dp->data->smc_cmd << 16) | enable;
++		smc_arg4 = 0xfefd;
++	}
++
+ 	arm_smccc_smc(MTK_DP_SIP_CONTROL_AARCH32,
+ 		      mtk_dp->data->smc_cmd, enable,
+-		      0, 0, 0, 0, 0, &res);
++		      smc_arg3, smc_arg4, 0, 0, 0, &res);
+ 
+ 	dev_dbg(mtk_dp->dev, "smc cmd: 0x%x, p1: %s, ret: 0x%lx-0x%lx\n",
+ 		mtk_dp->data->smc_cmd, enable ? "enable" : "disable", res.a0, res.a1);
+@@ -1405,6 +1507,23 @@ static void mtk_dp_power_enable(struct mtk_dp *mtk_dp)
+ 		     RG_DPAUX_RX_VALID_DEGLITCH_EN | RG_XTP_GLB_CKDET_EN |
+ 		     RG_DPAUX_RX_EN);
+ 	mtk_dp_update_bits(mtk_dp, MTK_DP_0034, 0, DA_CKM_CKTX0_EN_FORCE_EN);
++
++	/*
++	 * After the PHYD reset above, which returns these analog settings to
++	 * their defaults (the vendor driver writes them after its analog
++	 * power on too).
++	 */
++	if (mtk_dp->data->mt6897_phya) {
++		mtk_dp_update_bits(mtk_dp, MT6897_DP_PHYA_003C,
++				   MT6897_DP_PHYA_EN | MT6897_DP_PHYA_SEL(4),
++				   MT6897_DP_PHYA_EN | MT6897_DP_PHYA_SEL_MASK);
++		mtk_dp_update_bits(mtk_dp, MT6897_DP_PHYA_0008,
++				   MT6897_DP_PHYA_0008_VAL,
++				   MT6897_DP_PHYA_0008_MASK);
++		mtk_dp_update_bits(mtk_dp, MT6897_DP_PHYA_0054,
++				   MT6897_DP_PHYA_EN | MT6897_DP_PHYA_SEL(4),
++				   MT6897_DP_PHYA_EN | MT6897_DP_PHYA_SEL_MASK);
++	}
+ }
+ 
+ static void mtk_dp_power_disable(struct mtk_dp *mtk_dp)
+@@ -1425,7 +1544,7 @@ static void mtk_dp_initialize_priv_data(struct mtk_dp *mtk_dp)
+ 	bool plugged_in = (mtk_dp->bridge.type == DRM_MODE_CONNECTOR_eDP);
+ 
+ 	mtk_dp->train_info.link_rate = DP_LINK_BW_5_4;
+-	mtk_dp->train_info.lane_count = mtk_dp->max_lanes;
++	mtk_dp->train_info.lane_count = mtk_dp_max_lanes(mtk_dp);
+ 	mtk_dp->train_info.cable_plugged_in = plugged_in;
+ 
+ 	mtk_dp->info.format = DP_PIXELFORMAT_RGB;
+@@ -1648,6 +1767,7 @@ static int mtk_dp_train_cr(struct mtk_dp *mtk_dp, u8 target_lane_count)
+ 
+ 		/* check link status from sink device */
+ 		drm_dp_dpcd_read_link_status(&mtk_dp->aux, link_status);
++		memcpy(mtk_dp->last_link_status, link_status, sizeof(link_status));
+ 		if (drm_dp_clock_recovery_ok(link_status,
+ 					     target_lane_count)) {
+ 			dev_dbg(mtk_dp->dev, "Link train CR pass\n");
+@@ -1716,6 +1836,7 @@ static int mtk_dp_train_eq(struct mtk_dp *mtk_dp, u8 target_lane_count)
+ 
+ 		/* check link status from sink device */
+ 		drm_dp_dpcd_read_link_status(&mtk_dp->aux, link_status);
++		memcpy(mtk_dp->last_link_status, link_status, sizeof(link_status));
+ 		if (drm_dp_channel_eq_ok(link_status, target_lane_count)) {
+ 			dev_dbg(mtk_dp->dev, "Link train EQ pass\n");
+ 
+@@ -1819,9 +1940,13 @@ static int mtk_dp_training(struct mtk_dp *mtk_dp)
+ 
+ 	link_rate = min_t(u8, mtk_dp->max_linkrate,
+ 			  mtk_dp->rx_cap[DP_MAX_LINK_RATE]);
++	if (mtk_dp->dbg_max_rate)
++		link_rate = min_t(u8, link_rate, mtk_dp->dbg_max_rate);
+ 	max_link_rate = link_rate;
+-	lane_count = min_t(u8, mtk_dp->max_lanes,
++	lane_count = min_t(u8, mtk_dp_max_lanes(mtk_dp),
+ 			   drm_dp_max_lane_count(mtk_dp->rx_cap));
++	if (mtk_dp->dbg_max_lanes)
++		lane_count = min_t(u8, lane_count, mtk_dp->dbg_max_lanes);
+ 
+ 	/*
+ 	 * TPS are generated by the hardware pattern generator. From the
+@@ -1837,6 +1962,9 @@ static int mtk_dp_training(struct mtk_dp *mtk_dp)
+ 		if (ret)
+ 			return ret;
+ 
++		dev_dbg(mtk_dp->dev, "training: rate 0x%02x, %u lanes\n",
++			link_rate, lane_count);
++
+ 		ret = mtk_dp_train_cr(mtk_dp, lane_count);
+ 		if (ret == -ENODEV) {
+ 			return ret;
+@@ -1958,6 +2086,50 @@ static int mtk_dp_video_config(struct mtk_dp *mtk_dp)
+ 	return mtk_dp_set_color_format(mtk_dp, mtk_dp->info.format);
+ }
+ 
++static void mtk_dp_set_oob_hpd(struct mtk_dp *mtk_dp)
++{
++	/*
++	 * Without an HPD pin the controller's HPD is set by software from
++	 * the out-of-band state (as the MT6897 vendor driver's
++	 * mhal_DPTx_USBC_HPD); init_port applies it after a power off.
++	 */
++	if (!pm_runtime_active(mtk_dp->dev))
++		return;
++
++	mtk_dp_update_bits(mtk_dp, MTK_DP_TRANS_P0_3414,
++			   HPD_OVR_EN_DP_TRANS_P0 |
++			   (mtk_dp->oob_hpd_level ? HPD_SET_DP_TRANS_P0 : 0),
++			   HPD_OVR_EN_DP_TRANS_P0 | HPD_SET_DP_TRANS_P0);
++}
++
++/*
++ * A change of the out-of-band HPD, from the next bridge (hpd_notify) or
++ * from the DisplayPort alt mode (the Type-C mux state): run the cable
++ * state change as the HPD interrupt would. Before the bridge is attached
++ * only the level is kept.
++ */
++static void mtk_dp_oob_hpd_update(struct mtk_dp *mtk_dp, bool level)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&mtk_dp->irq_thread_lock, flags);
++	if (level == mtk_dp->oob_hpd_level) {
++		spin_unlock_irqrestore(&mtk_dp->irq_thread_lock, flags);
++		return;
++	}
++	mtk_dp->oob_hpd_level = level;
++	if (!mtk_dp->drm_dev) {
++		spin_unlock_irqrestore(&mtk_dp->irq_thread_lock, flags);
++		return;
++	}
++	mtk_dp->irq_thread_handle |= MTK_DP_THREAD_CABLE_STATE_CHG;
++	mtk_dp->train_info.cable_plugged_in = level;
++	spin_unlock_irqrestore(&mtk_dp->irq_thread_lock, flags);
++
++	mtk_dp_set_oob_hpd(mtk_dp);
++	irq_wake_thread(mtk_dp->irq, mtk_dp);
++}
++
+ static void mtk_dp_init_port(struct mtk_dp *mtk_dp)
+ {
+ 	mtk_dp_set_idle_pattern(mtk_dp, true);
+@@ -1967,10 +2139,15 @@ static void mtk_dp_init_port(struct mtk_dp *mtk_dp)
+ 	mtk_dp_initialize_aux_settings(mtk_dp);
+ 	mtk_dp_initialize_digital_settings(mtk_dp);
+ 	mtk_dp_initialize_hpd_detect_settings(mtk_dp);
++	if (mtk_dp->oob_hpd)
++		mtk_dp_set_oob_hpd(mtk_dp);
+ 
+ 	mtk_dp_digital_sw_reset(mtk_dp);
+ }
+ 
++/* Plug-time link training attempts (200 ms, 400 ms pauses between them) */
++#define MTK_DP_TRAIN_ATTEMPTS	3
++
+ static irqreturn_t mtk_dp_hpd_event_thread(int hpd, void *dev)
+ {
+ 	struct mtk_dp *mtk_dp = dev;
+@@ -1987,10 +2164,16 @@ static irqreturn_t mtk_dp_hpd_event_thread(int hpd, void *dev)
+ 	spin_unlock_irqrestore(&mtk_dp->irq_thread_lock, flags);
+ 
+ 	if (status & MTK_DP_THREAD_CABLE_STATE_CHG) {
+-		if (mtk_dp->bridge.dev)
++		/*
++		 * Without an HPD pin, train first: a sink whose link does not
++		 * train is reported disconnected instead of offering modes.
++		 */
++		if (mtk_dp->bridge.dev &&
++		    !(mtk_dp->oob_hpd && mtk_dp->train_info.cable_plugged_in))
+ 			drm_helper_hpd_irq_event(mtk_dp->bridge.dev);
+ 
+ 		if (!mtk_dp->train_info.cable_plugged_in) {
++			mtk_dp->link_failed = false;
+ 			mtk_dp_disable_sdp_aui(mtk_dp);
+ 			memset(&mtk_dp->info.audio_cur_cfg, 0,
+ 			       sizeof(mtk_dp->info.audio_cur_cfg));
+@@ -2005,18 +2188,49 @@ static irqreturn_t mtk_dp_hpd_event_thread(int hpd, void *dev)
+ 			mod_timer(&mtk_dp->debounce_timer,
+ 				  jiffies + msecs_to_jiffies(100) - 1);
+ 		} else {
+-			mtk_dp_aux_panel_poweron(mtk_dp, true);
+-
+-			ret = mtk_dp_parse_capabilities(mtk_dp);
+-			if (ret)
+-				drm_err(mtk_dp->drm_dev, "Can't parse capabilities\n");
++			int attempt;
+ 
+-			/* Training */
+-			ret = mtk_dp_training(mtk_dp);
++			/*
++			 * A sink that has just been plugged in or powered up
++			 * may not lock its receivers yet: at the alt-mode HPD
++			 * a monitor's first training can fail with no clock
++			 * recovery on any lane while a retrain a moment later
++			 * succeeds. Retry with a growing pause.
++			 */
++			for (attempt = 0; attempt < MTK_DP_TRAIN_ATTEMPTS; attempt++) {
++				if (attempt) {
++					msleep(200 * attempt);
++					if (!mtk_dp->train_info.cable_plugged_in)
++						break;
++				}
++				mtk_dp_aux_panel_poweron(mtk_dp, true);
++
++				ret = mtk_dp_parse_capabilities(mtk_dp);
++				if (ret) {
++					drm_err(mtk_dp->drm_dev, "Can't parse capabilities\n");
++					continue;
++				}
++
++				/* Training */
++				ret = mtk_dp_training(mtk_dp);
++				if (!ret)
++					break;
++				dev_info(mtk_dp->dev,
++					 "training attempt %d failed, %d (link status %*ph)\n",
++					 attempt + 1, ret, DP_LINK_STATUS_SIZE,
++					 mtk_dp->last_link_status);
++			}
++			mtk_dp->link_failed = ret;
+ 			if (ret)
+-				drm_err(mtk_dp->drm_dev, "Training failed, %d\n", ret);
++				drm_err(mtk_dp->drm_dev,
++					"Training failed, %d (link status %*ph)\n",
++					ret, DP_LINK_STATUS_SIZE,
++					mtk_dp->last_link_status);
+ 
+ 			mtk_dp->enabled = true;
++
++			if (mtk_dp->oob_hpd && mtk_dp->bridge.dev)
++				drm_helper_hpd_irq_event(mtk_dp->bridge.dev);
+ 		}
+ 	}
+ 
+@@ -2051,8 +2265,10 @@ static irqreturn_t mtk_dp_hpd_event(int hpd, void *dev)
+ 	spin_unlock_irqrestore(&mtk_dp->irq_thread_lock, flags);
+ 
+ 	if (cable_sta_chg) {
+-		if (!!(mtk_dp_read(mtk_dp, MTK_DP_TRANS_P0_3414) &
+-		       HPD_DB_DP_TRANS_P0_MASK))
++		if (mtk_dp->oob_hpd)
++			mtk_dp->train_info.cable_plugged_in = mtk_dp->oob_hpd_level;
++		else if (!!(mtk_dp_read(mtk_dp, MTK_DP_TRANS_P0_3414) &
++			    HPD_DB_DP_TRANS_P0_MASK))
+ 			mtk_dp->train_info.cable_plugged_in = true;
+ 		else
+ 			mtk_dp->train_info.cable_plugged_in = false;
+@@ -2146,6 +2362,15 @@ mtk_dp_bdg_detect(struct drm_bridge *bridge, struct drm_connector *connector)
+ 	enum drm_connector_status ret = connector_status_disconnected;
+ 	bool enabled = mtk_dp->enabled;
+ 
++	/*
++	 * The out-of-band HPD is the state; a sink whose link failed to
++	 * train is not usable and is reported disconnected.
++	 */
++	if (mtk_dp->oob_hpd)
++		return mtk_dp->oob_hpd_level && !mtk_dp->link_failed ?
++			connector_status_connected :
++			connector_status_disconnected;
++
+ 	if (!mtk_dp->train_info.cable_plugged_in)
+ 		return ret;
+ 
+@@ -2333,6 +2558,16 @@ static int mtk_dp_bridge_attach(struct drm_bridge *bridge,
+ 	if (ret)
+ 		goto err_aux_register;
+ 
++	if (mtk_dp->oob_hpd && !mtk_dp->next_bridge) {
++		struct device_node *remote;
++
++		remote = of_graph_get_remote_node(mtk_dp->dev->of_node, 1, 0);
++		mtk_dp->next_bridge = of_drm_find_and_get_bridge(remote);
++		of_node_put(remote);
++		if (!mtk_dp->next_bridge)
++			dev_dbg(mtk_dp->dev, "no bridge at the output yet\n");
++	}
++
+ 	if (mtk_dp->next_bridge) {
+ 		ret = drm_bridge_attach(encoder, mtk_dp->next_bridge,
+ 					&mtk_dp->bridge, flags);
+@@ -2348,12 +2583,28 @@ static int mtk_dp_bridge_attach(struct drm_bridge *bridge,
+ 	if (mtk_dp->bridge.type != DRM_MODE_CONNECTOR_eDP) {
+ 		irq_clear_status_flags(mtk_dp->irq, IRQ_NOAUTOEN);
+ 		enable_irq(mtk_dp->irq);
+-		mtk_dp_hwirq_enable(mtk_dp, true);
++		/* With out-of-band HPD the pin events stay masked */
++		mtk_dp_hwirq_enable(mtk_dp, !mtk_dp->oob_hpd);
++	}
++
++	/* An out-of-band HPD that came before the attach */
++	if (mtk_dp->oob_hpd && mtk_dp->oob_hpd_level) {
++		unsigned long flags;
++
++		spin_lock_irqsave(&mtk_dp->irq_thread_lock, flags);
++		mtk_dp->irq_thread_handle |= MTK_DP_THREAD_CABLE_STATE_CHG;
++		mtk_dp->train_info.cable_plugged_in = true;
++		spin_unlock_irqrestore(&mtk_dp->irq_thread_lock, flags);
++		irq_wake_thread(mtk_dp->irq, mtk_dp);
+ 	}
+ 
+ 	return 0;
+ 
+ err_bridge_attach:
++	if (mtk_dp->oob_hpd) {
++		drm_bridge_put(mtk_dp->next_bridge);
++		mtk_dp->next_bridge = NULL;
++	}
+ 	mtk_dp_poweroff(mtk_dp);
+ err_aux_register:
+ 	drm_dp_aux_unregister(&mtk_dp->aux);
+@@ -2371,6 +2622,26 @@ static void mtk_dp_bridge_detach(struct drm_bridge *bridge)
+ 	mtk_dp->drm_dev = NULL;
+ 	mtk_dp_poweroff(mtk_dp);
+ 	drm_dp_aux_unregister(&mtk_dp->aux);
++	if (mtk_dp->oob_hpd) {
++		drm_bridge_put(mtk_dp->next_bridge);
++		mtk_dp->next_bridge = NULL;
++	}
++}
++
++static void mtk_dp_bridge_hpd_notify(struct drm_bridge *bridge,
++				     struct drm_connector *connector,
++				     enum drm_connector_status status)
++{
++	struct mtk_dp *mtk_dp = mtk_dp_from_bridge(bridge);
++
++	/*
++	 * A Type-C mode switch gets the HPD from the alternate mode itself;
++	 * detection then also reports failed links, which must not count
++	 * as an HPD change.
++	 */
++	if (mtk_dp->oob_hpd && !mtk_dp->typec_mux)
++		mtk_dp_oob_hpd_update(mtk_dp,
++				      status == connector_status_connected);
+ }
+ 
+ static void mtk_dp_bridge_atomic_enable(struct drm_bridge *bridge,
+@@ -2586,6 +2857,7 @@ static const struct drm_bridge_funcs mtk_dp_bridge_funcs = {
+ 	.mode_valid = mtk_dp_bridge_mode_valid,
+ 	.edid_read = mtk_dp_edid_read,
+ 	.detect = mtk_dp_bdg_detect,
++	.hpd_notify = mtk_dp_bridge_hpd_notify,
+ };
+ 
+ static void mtk_dp_debounce_timer(struct timer_list *t)
+@@ -2740,6 +3012,177 @@ static int mtk_dp_edp_link_panel(struct drm_dp_aux *mtk_aux)
+ 	return 0;
+ }
+ 
++/*
++ * debugfs, for link bring-up: "retrain" trains the link again (with the
++ * "max_lanes"/"max_rate" limits, 0 for none) and "link_status" shows the
++ * sink's link status and the main TX registers.
++ */
++static ssize_t mtk_dp_debugfs_retrain(struct file *file,
++				      const char __user *ubuf, size_t count,
++				      loff_t *ppos)
++{
++	struct mtk_dp *mtk_dp = file->private_data;
++	int ret;
++
++	if (!mtk_dp->drm_dev || !mtk_dp->train_info.cable_plugged_in)
++		return -ENODEV;
++
++	/* serialize with the HPD thread */
++	disable_irq(mtk_dp->irq);
++	mtk_dp_aux_panel_poweron(mtk_dp, true);
++	ret = mtk_dp_parse_capabilities(mtk_dp);
++	if (!ret)
++		ret = mtk_dp_training(mtk_dp);
++	mtk_dp->link_failed = ret;
++	dev_info(mtk_dp->dev, "retrain: %d, rate 0x%02x, %u lanes, link status %*ph\n",
++		 ret, mtk_dp->train_info.link_rate, mtk_dp->train_info.lane_count,
++		 DP_LINK_STATUS_SIZE, mtk_dp->last_link_status);
++	enable_irq(mtk_dp->irq);
++
++	drm_helper_hpd_irq_event(mtk_dp->drm_dev);
++
++	return ret ? ret : count;
++}
++
++static const struct file_operations mtk_dp_debugfs_retrain_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = mtk_dp_debugfs_retrain,
++};
++
++static int mtk_dp_debugfs_link_status_show(struct seq_file *m, void *unused)
++{
++	static const u16 regs[] = {
++		0x0008, 0x003c, 0x0054, 0x103c, 0x2000, 0x3000, 0x3408,
++		0x3428, 0x34a4, 0x3414, 0x35f0, 0x360c, 0x3680,
++	};
++	struct mtk_dp *mtk_dp = m->private;
++	u8 status[DP_LINK_STATUS_SIZE];
++	int i;
++
++	seq_printf(m, "plugged %d oob_hpd %d link_failed %d typec_lanes %u aux_pn_swap %d\n",
++		   mtk_dp->train_info.cable_plugged_in, mtk_dp->oob_hpd_level,
++		   mtk_dp->link_failed, mtk_dp->typec_lanes, mtk_dp->aux_pn_swap);
++	seq_printf(m, "trained rate 0x%02x lanes %u; last link status %*ph\n",
++		   mtk_dp->train_info.link_rate, mtk_dp->train_info.lane_count,
++		   DP_LINK_STATUS_SIZE, mtk_dp->last_link_status);
++	if (mtk_dp->train_info.cable_plugged_in &&
++	    drm_dp_dpcd_read_link_status(&mtk_dp->aux, status) == 0)
++		seq_printf(m, "sink link status %*ph\n", DP_LINK_STATUS_SIZE, status);
++	if (!pm_runtime_active(mtk_dp->dev))
++		return 0;
++	for (i = 0; i < ARRAY_SIZE(regs); i++)
++		seq_printf(m, "0x%04x: 0x%08x\n", regs[i], mtk_dp_read(mtk_dp, regs[i]));
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mtk_dp_debugfs_link_status);
++
++static void mtk_dp_debugfs_init(struct mtk_dp *mtk_dp)
++{
++	mtk_dp->debugfs = debugfs_create_dir(dev_name(mtk_dp->dev), NULL);
++	debugfs_create_file("retrain", 0200, mtk_dp->debugfs, mtk_dp,
++			    &mtk_dp_debugfs_retrain_fops);
++	debugfs_create_file("link_status", 0400, mtk_dp->debugfs, mtk_dp,
++			    &mtk_dp_debugfs_link_status_fops);
++	debugfs_create_u8("max_lanes", 0600, mtk_dp->debugfs, &mtk_dp->dbg_max_lanes);
++	debugfs_create_u8("max_rate", 0600, mtk_dp->debugfs, &mtk_dp->dbg_max_rate);
++}
++
++static int mtk_dp_typec_switch_set(struct typec_switch_dev *sw,
++				   enum typec_orientation orientation)
++{
++	struct mtk_dp *mtk_dp = typec_switch_get_drvdata(sw);
++
++	mtk_dp->aux_pn_swap = orientation == TYPEC_ORIENTATION_REVERSE;
++	mtk_dp_set_aux_pn_swap(mtk_dp);
++
++	return 0;
++}
++
++static int mtk_dp_typec_mux_set(struct typec_mux_dev *mux,
++				struct typec_mux_state *state)
++{
++	struct mtk_dp *mtk_dp = typec_mux_get_drvdata(mux);
++	struct typec_displayport_data *dp_data = state->data;
++	bool hpd = false;
++
++	if (!state->alt || state->alt->svid != USB_TYPEC_DP_SID) {
++		mtk_dp->typec_lanes = 0;
++		goto out;
++	}
++
++	switch (state->mode) {
++	case TYPEC_DP_STATE_C:
++	case TYPEC_DP_STATE_E:
++		mtk_dp->typec_lanes = 4;
++		break;
++	case TYPEC_DP_STATE_D:
++	case TYPEC_DP_STATE_F:
++		mtk_dp->typec_lanes = 2;
++		break;
++	default:
++		goto out;
++	}
++
++	/* The DisplayPort status carries the HPD of the sink */
++	hpd = dp_data && (dp_data->status & DP_STATUS_HPD_STATE);
++
++out:
++	if (mtk_dp->oob_hpd)
++		mtk_dp_oob_hpd_update(mtk_dp, hpd);
++
++	return 0;
++}
++
++static void mtk_dp_typec_unregister(void *data)
++{
++	struct mtk_dp *mtk_dp = data;
++
++	typec_mux_unregister(mtk_dp->typec_mux);
++	typec_switch_unregister(mtk_dp->typec_sw);
++}
++
++/*
++ * When the output reaches a USB Type-C connector through the DisplayPort
++ * alt mode, follow the plug orientation (AUX P/N swap) and the pin
++ * assignment (lane count).
++ */
++static int mtk_dp_typec_register(struct mtk_dp *mtk_dp)
++{
++	struct device *dev = mtk_dp->dev;
++	struct typec_switch_desc sw_desc = {
++		.drvdata = mtk_dp,
++		.fwnode = dev_fwnode(dev),
++		.set = mtk_dp_typec_switch_set,
++	};
++	struct typec_mux_desc mux_desc = {
++		.drvdata = mtk_dp,
++		.fwnode = dev_fwnode(dev),
++		.set = mtk_dp_typec_mux_set,
++	};
++
++	if (!IS_ENABLED(CONFIG_TYPEC) ||
++	    !device_property_present(dev, "orientation-switch") ||
++	    !device_property_present(dev, "mode-switch"))
++		return 0;
++
++	mtk_dp->typec_sw = typec_switch_register(dev, &sw_desc);
++	if (IS_ERR(mtk_dp->typec_sw))
++		return dev_err_probe(dev, PTR_ERR(mtk_dp->typec_sw),
++				     "failed to register typec switch\n");
++
++	mtk_dp->typec_mux = typec_mux_register(dev, &mux_desc);
++	if (IS_ERR(mtk_dp->typec_mux)) {
++		typec_switch_unregister(mtk_dp->typec_sw);
++		mtk_dp->typec_sw = NULL;
++		return dev_err_probe(dev, PTR_ERR(mtk_dp->typec_mux),
++				     "failed to register typec mux\n");
++	}
++
++	return devm_add_action_or_reset(dev, mtk_dp_typec_unregister, mtk_dp);
++}
++
+ static int mtk_dp_probe(struct platform_device *pdev)
+ {
+ 	struct mtk_dp *mtk_dp;
+@@ -2807,6 +3250,10 @@ static int mtk_dp_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
++	ret = mtk_dp_typec_register(mtk_dp);
++	if (ret)
++		return ret;
++
+ 	mtk_dp->bridge.of_node = dev->of_node;
+ 	mtk_dp->bridge.type = mtk_dp->data->bridge_type;
+ 
+@@ -2849,6 +3296,16 @@ static int mtk_dp_probe(struct platform_device *pdev)
+ 			}
+ 		}
+ 	} else {
++		struct device_node *remote;
++
++		/*
++		 * An output connected to another bridge (a USB-C connector's
++		 * HPD bridge) gets HPD from there: no HPD pin.
++		 */
++		remote = of_graph_get_remote_node(dev->of_node, 1, 0);
++		mtk_dp->oob_hpd = !!remote;
++		of_node_put(remote);
++
+ 		mtk_dp->bridge.ops = DRM_BRIDGE_OP_DETECT |
+ 				     DRM_BRIDGE_OP_EDID | DRM_BRIDGE_OP_HPD;
+ 		ret = devm_drm_bridge_add(dev, &mtk_dp->bridge);
+@@ -2859,6 +3316,9 @@ static int mtk_dp_probe(struct platform_device *pdev)
+ 	pm_runtime_enable(dev);
+ 	pm_runtime_get_sync(dev);
+ 
++	if (mtk_dp->data->bridge_type != DRM_MODE_CONNECTOR_eDP)
++		mtk_dp_debugfs_init(mtk_dp);
++
+ 	return 0;
+ }
+ 
+@@ -2866,6 +3326,7 @@ static void mtk_dp_remove(struct platform_device *pdev)
+ {
+ 	struct mtk_dp *mtk_dp = platform_get_drvdata(pdev);
+ 
++	debugfs_remove_recursive(mtk_dp->debugfs);
+ 	pm_runtime_put(&pdev->dev);
+ 	pm_runtime_disable(&pdev->dev);
+ 	if (mtk_dp->data->bridge_type != DRM_MODE_CONNECTOR_eDP)
+@@ -2904,6 +3365,13 @@ static int mtk_dp_resume(struct device *dev)
+ 
+ static SIMPLE_DEV_PM_OPS(mtk_dp_pm_ops, mtk_dp_suspend, mtk_dp_resume);
+ 
++static const struct mtk_dp_data mt6897_dp_data = {
++	.bridge_type = DRM_MODE_CONNECTOR_DisplayPort,
++	.smc_cmd = MT6897_DP_SIP_ATF_VIDEO_UNMUTE,
++	.smc_extended_args = true,
++	.mt6897_phya = true,
++};
++
+ static const struct mtk_dp_data mt8188_dp_data = {
+ 	.bridge_type = DRM_MODE_CONNECTOR_DisplayPort,
+ 	.smc_cmd = MTK_DP_SIP_ATF_VIDEO_UNMUTE,
+@@ -2930,6 +3398,10 @@ static const struct mtk_dp_data mt8195_dp_data = {
+ };
+ 
+ static const struct of_device_id mtk_dp_of_match[] = {
++	{
++		.compatible = "mediatek,mt6897-dp-tx",
++		.data = &mt6897_dp_data,
++	},
+ 	{
+ 		.compatible = "mediatek,mt8188-edp-tx",
+ 		.data = &mt8195_edp_data,
+-- 
+2.56.0
+

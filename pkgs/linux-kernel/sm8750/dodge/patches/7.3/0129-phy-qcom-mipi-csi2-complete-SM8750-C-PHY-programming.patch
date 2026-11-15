@@ -1,0 +1,1660 @@
+From 2e99bdaa76b95087403b2a4e8eefc46d1972af6c Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 11 Nov 2026 05:11:47 +0800
+Subject: [PATCH 134/144] phy: qcom-mipi-csi2: complete SM8750 C-PHY
+ programming
+
+Keep the PHY ABI separation, three-trio programming and timing divisor together.
+
+Consolidated from local follow-ups:
+  a93b2a410ca9a17beac312825c90744295bd8f8c media: qcom: preserve PHY ABI and distinguish C-PHY symbols from bus clocks
+  43cce8a3597000d7b0f2012cacabfc9521898985 phy: qcom-mipi-csi2: add SM8750 three-trio C-PHY programming
+  ceff075022e0bd85f97265fca6a8aa071464f387 phy: qcom-mipi-csi2: retain the full picosecond timing divisor
+---
+ .../platform/qcom/camss/camss-csid-680.c      |    1 +
+ .../platform/qcom/camss/camss-csid-980.c      |    2 +
+ .../media/platform/qcom/camss/camss-csiphy.c  |   17 +-
+ drivers/media/platform/qcom/camss/camss.c     |    7 +-
+ drivers/phy/phy-core-mipi-cphy.c              |    5 +-
+ drivers/phy/qualcomm/Makefile                 |    3 +-
+ .../qualcomm/phy-qcom-mipi-csi2-3ph-dphy.c    |    1 +
+ .../phy/qualcomm/phy-qcom-mipi-csi2-core.c    |   13 +-
+ .../phy/qualcomm/phy-qcom-mipi-csi2-sm8750.c  |   97 ++
+ .../phy/qualcomm/phy-qcom-mipi-csi2-sm8750.h  | 1246 +++++++++++++++++
+ drivers/phy/qualcomm/phy-qcom-mipi-csi2.h     |    2 +
+ include/linux/phy/phy-mipi-cphy.h             |   19 +-
+ include/linux/phy/phy.h                       |    2 +-
+ 13 files changed, 1373 insertions(+), 42 deletions(-)
+ create mode 100644 drivers/phy/qualcomm/phy-qcom-mipi-csi2-sm8750.c
+ create mode 100644 drivers/phy/qualcomm/phy-qcom-mipi-csi2-sm8750.h
+
+diff --git a/drivers/media/platform/qcom/camss/camss-csid-680.c b/drivers/media/platform/qcom/camss/camss-csid-680.c
+index 345a67c8fb..f96634c55d 100644
+--- a/drivers/media/platform/qcom/camss/camss-csid-680.c
++++ b/drivers/media/platform/qcom/camss/camss-csid-680.c
+@@ -202,6 +202,7 @@ static void __csid_configure_rx(struct csid_device *csid,
+ 			<< CSI2_RX_CFG0_PHY_NUM_SEL;
+ 	}
+ 
++	val |= phy->cphy << CSI2_RX_CFG0_PHY_TYPE_SEL;
+ 	writel(val, csid->base + CSID_CSI2_RX_CFG0);
+ 
+ 	val = CSI2_RX_CFG1_PACKET_ECC_CORRECTION_EN;
+diff --git a/drivers/media/platform/qcom/camss/camss-csid-980.c b/drivers/media/platform/qcom/camss/camss-csid-980.c
+index 4cc787f515..cd3d7eb6d8 100644
+--- a/drivers/media/platform/qcom/camss/camss-csid-980.c
++++ b/drivers/media/platform/qcom/camss/camss-csid-980.c
+@@ -67,6 +67,7 @@
+ #define		CSI2_RX_CFG0_NUM_ACTIVE_LANES		0
+ #define		CSI2_RX_CFG0_PHY_SEL_BASE_IDX		1
+ #define		CSI2_RX_CFG0_DL0_INPUT_SEL		4
++#define		CSI2_RX_CFG0_PHY_TYPE_SEL		24
+ #define		CSI2_RX_CFG0_PHY_NUM_SEL		20
+ #define		CSI2_RX_CFG0_TPG_MUX_EN			BIT(27)
+ #define		CSI2_RX_CFG0_TPG_MUX_SEL		GENMASK(29, 28)
+@@ -200,6 +201,7 @@ static void __csid_configure_rx(struct csid_device *csid,
+ 			<< CSI2_RX_CFG0_PHY_NUM_SEL;
+ 	}
+ 
++	val |= phy->cphy << CSI2_RX_CFG0_PHY_TYPE_SEL;
+ 	writel(val, csid->base + CSID_CSI2_RX_CFG0);
+ 
+ 	val = CSI2_RX_CFG1_ECC_CORRECTION_EN;
+diff --git a/drivers/media/platform/qcom/camss/camss-csiphy.c b/drivers/media/platform/qcom/camss/camss-csiphy.c
+index a69c2e659c..4e4e947292 100644
+--- a/drivers/media/platform/qcom/camss/camss-csiphy.c
++++ b/drivers/media/platform/qcom/camss/camss-csiphy.c
+@@ -332,12 +332,11 @@ static int csiphy_stream_on(struct csiphy_device *csiphy)
+ 	union phy_configure_opts phy_opts = { 0 };
+ 	struct device *dev = csiphy->camss->dev;
+ 	u8 num_lanes = lncfg->num_data;
+-	const bool cphy = (lncfg->phy_cfg == V4L2_MBUS_CSI2_CPHY);
++	const bool is_cphy = (lncfg->phy_cfg == V4L2_MBUS_CSI2_CPHY);
+ 	s64 link_freq;
+-	int i;
+ 	int ret;
+ 
+-	link_freq = camss_get_link_freq(&csiphy->subdev.entity, bpp, num_lanes, cphy);
++	link_freq = camss_get_link_freq(&csiphy->subdev.entity, bpp, num_lanes, is_cphy);
+ 
+ 	if (link_freq <= 0) {
+ 		dev_err(dev,
+@@ -345,10 +344,10 @@ static int csiphy_stream_on(struct csiphy_device *csiphy)
+ 		return -EINVAL;
+ 	}
+ 
+-	if (cphy) {
++	if (is_cphy) {
+ 		struct phy_configure_opts_mipi_cphy *cphy_cfg = &phy_opts.mipi_cphy;
+ 
+-		ret = phy_mipi_cphy_get_default_config_for_hsclk(link_freq, num_lanes,
++		ret = phy_mipi_cphy_get_default_config_for_hsclk((u64)link_freq * 2, num_lanes,
+ 								 cphy_cfg);
+ 		if (ret < 0) {
+ 			dev_err(dev, "Invalid config for link frequency %lld\n",
+@@ -356,12 +355,6 @@ static int csiphy_stream_on(struct csiphy_device *csiphy)
+ 			return ret;
+ 		}
+ 
+-		/* Set data trio lane positions and polarities (no clock lane) */
+-		for (i = 0; i < num_lanes; i++) {
+-			cphy_cfg->lane_positions[i] = lncfg->data[i].pos;
+-			cphy_cfg->lane_polarities[i] = lncfg->data[i].pol;
+-		}
+-
+ 		ret = phy_set_mode(csiphy->phy, PHY_MODE_MIPI_CPHY);
+ 		if (ret) {
+ 			dev_err(dev, "Failed to set phy mode\n");
+@@ -387,7 +380,7 @@ static int csiphy_stream_on(struct csiphy_device *csiphy)
+ 
+ 	ret = phy_configure(csiphy->phy, &phy_opts);
+ 	if (ret) {
+-		dev_err(dev, "failed to configure MIPI %s\n", cphy ? "C-PHY" : "D-PHY");
++		dev_err(dev, "failed to configure MIPI %s\n", is_cphy ? "C-PHY" : "D-PHY");
+ 		goto error;
+ 	}
+ 
+diff --git a/drivers/media/platform/qcom/camss/camss.c b/drivers/media/platform/qcom/camss/camss.c
+index c3d291d56b..bfe40c0b84 100644
+--- a/drivers/media/platform/qcom/camss/camss.c
++++ b/drivers/media/platform/qcom/camss/camss.c
+@@ -5054,14 +5054,15 @@ s64 camss_get_link_freq(struct media_entity *entity, unsigned int bpp,
+ 			unsigned int lanes, const bool cphy)
+ {
+ 	struct media_pad *sensor_pad;
+-	unsigned int div = lanes * 2 * (cphy ? CAMSS_CPHY_DIVISOR :
+-					       CAMSS_DPHY_DIVISOR);
++	unsigned int mul = bpp * (cphy ? CAMSS_CPHY_DIVISOR :
++					CAMSS_DPHY_DIVISOR);
++	unsigned int div = lanes * 2 * CAMSS_COMMON_PHY_DIVIDENT;
+ 
+ 	sensor_pad = camss_find_sensor_pad(entity);
+ 	if (!sensor_pad)
+ 		return -ENODEV;
+ 
+-	return v4l2_get_link_freq(sensor_pad, CAMSS_COMMON_PHY_DIVIDENT * bpp, div);
++	return v4l2_get_link_freq(sensor_pad, mul, div);
+ }
+ 
+ /*
+diff --git a/drivers/phy/phy-core-mipi-cphy.c b/drivers/phy/phy-core-mipi-cphy.c
+index bbb58d5407..e3090019f7 100644
+--- a/drivers/phy/phy-core-mipi-cphy.c
++++ b/drivers/phy/phy-core-mipi-cphy.c
+@@ -28,7 +28,7 @@ static int phy_mipi_cphy_calc_config(unsigned long pixel_clock,
+ 				     unsigned long long hs_clk_rate,
+ 				     struct phy_configure_opts_mipi_cphy *cfg)
+ {
+-	if (!cfg || !lanes)
++	if (!cfg || !lanes || lanes > PHY_MIPI_CPHY_MAX_DATA_LANES)
+ 		return -EINVAL;
+ 
+ 	if (!hs_clk_rate) {
+@@ -93,7 +93,8 @@ EXPORT_SYMBOL_GPL(phy_mipi_cphy_get_default_config_for_hsclk);
+  */
+ int phy_mipi_cphy_config_validate(struct phy_configure_opts_mipi_cphy *cfg)
+ {
+-	if (!cfg || !cfg->lanes)
++	if (!cfg || !cfg->lanes || cfg->lanes > PHY_MIPI_CPHY_MAX_DATA_LANES ||
++	    !cfg->hs_clk_rate)
+ 		return -EINVAL;
+ 
+ 	if (cfg->t3_prepare < 38000 || cfg->t3_prepare > 95000)
+diff --git a/drivers/phy/qualcomm/Makefile b/drivers/phy/qualcomm/Makefile
+index 0767042518..ace8c0a6bb 100644
+--- a/drivers/phy/qualcomm/Makefile
++++ b/drivers/phy/qualcomm/Makefile
+@@ -9,7 +9,8 @@ obj-$(CONFIG_PHY_QCOM_M31_EUSB)		+= phy-qcom-m31-eusb2.o
+ 
+ phy-qcom-mipi-csi2-objs			+= phy-qcom-mipi-csi2-core.o \
+ 					   phy-qcom-mipi-csi2-3ph-dphy.o \
+-					   phy-qcom-mipi-csi2-3ph-cphy.o
++					   phy-qcom-mipi-csi2-3ph-cphy.o \
++					   phy-qcom-mipi-csi2-sm8750.o
+ obj-$(CONFIG_PHY_QCOM_MIPI_CSI2)	+= phy-qcom-mipi-csi2.o
+ 
+ obj-$(CONFIG_PHY_QCOM_PCIE2)		+= phy-qcom-pcie2.o
+diff --git a/drivers/phy/qualcomm/phy-qcom-mipi-csi2-3ph-dphy.c b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-3ph-dphy.c
+index 25822acee3..90df0bd8e4 100644
+--- a/drivers/phy/qualcomm/phy-qcom-mipi-csi2-3ph-dphy.c
++++ b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-3ph-dphy.c
+@@ -505,6 +505,7 @@ const struct mipi_csi2phy_soc_cfg mipi_csi2_dphy_3nm_kaanapali = {
+ 
+ const struct mipi_csi2phy_soc_cfg mipi_csi2_dphy_sm8750 = {
+ 	.ops = &phy_qcom_mipi_csi2_ops_3ph_1_0,
++	.ops_cphy = &phy_qcom_mipi_csi2_ops_sm8750_cphy,
+ 	.reg_info = {
+ 		.init_seq = lane_regs_sm8750,
+ 		.lane_array_size = ARRAY_SIZE(lane_regs_sm8750),
+diff --git a/drivers/phy/qualcomm/phy-qcom-mipi-csi2-core.c b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-core.c
+index 2ba578aee9..ab2063dfc4 100644
+--- a/drivers/phy/qualcomm/phy-qcom-mipi-csi2-core.c
++++ b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-core.c
+@@ -30,7 +30,9 @@ phy_qcom_mipi_csi2_set_clock_rates(struct mipi_csi2phy_device *csi2phy,
+ 				   s64 link_freq)
+ {
+ 	struct device *dev = csi2phy->dev;
+-	unsigned long opp_rate = link_freq / 4;
++	unsigned long phy_rate = csi2phy->phy_mode == PHY_MODE_MIPI_CPHY ?
++		div_u64(link_freq * 2 * 16, 7 * 32) : link_freq / 4;
++	unsigned long opp_rate = phy_rate;
+ 	struct dev_pm_opp *opp;
+ 	long timer_rate;
+ 	int i, pstate;
+@@ -69,7 +71,7 @@ phy_qcom_mipi_csi2_set_clock_rates(struct mipi_csi2phy_device *csi2phy,
+ 		goto unset_opp_rate;
+ 	}
+ 
+-	timer_rate = clk_round_rate(csi2phy->timer_clk, link_freq / 4);
++	timer_rate = clk_round_rate(csi2phy->timer_clk, phy_rate);
+ 	if (timer_rate <= 0) {
+ 		ret = -ENODEV;
+ 		goto unset_opp_rate;
+@@ -130,13 +132,14 @@ phy_qcom_mipi_csi2_configure_cphy(struct mipi_csi2phy_device *csi2phy,
+ 	if (ret)
+ 		return ret;
+ 
+-	if (cphy_cfg->lanes < 1 || cphy_cfg->lanes > CSI2_MAX_DATA_LANES)
++	if (cphy_cfg->lanes < 1 || cphy_cfg->lanes > 3)
+ 		return -EINVAL;
+ 
+ 	if (cphy_cfg->lanes != stream_cfg->num_data_lanes)
+ 		return -EINVAL;
+ 
+-	stream_cfg->link_freq = cphy_cfg->hs_clk_rate;
++	stream_cfg->link_freq = cphy_cfg->hs_clk_rate / 2;
++	stream_cfg->cphy_settle_ps = cphy_cfg->t3_settle;
+ 
+ 	return 0;
+ }
+@@ -403,7 +406,7 @@ static int phy_qcom_mipi_csi2_parse_routing(struct mipi_csi2phy_device *csi2phy)
+ 	} else {
+ 		/* C-PHY has no clock lane; all entries map data trios. */
+ 		for (i = 0; i < csi2phy->stream_cfg.num_data_lanes; i++) {
+-			if (data_lanes[i] < 1 || data_lanes[i] > CSI2_MAX_DATA_LANES) {
++			if (data_lanes[i] < 1 || data_lanes[i] > 3) {
+ 				dev_err(dev, "Invalid lane %d\n", data_lanes[i]);
+ 				ret = -EINVAL;
+ 				goto out_put;
+diff --git a/drivers/phy/qualcomm/phy-qcom-mipi-csi2-sm8750.c b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-sm8750.c
+new file mode 100644
+index 0000000000..8b8a296ba7
+--- /dev/null
++++ b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-sm8750.c
+@@ -0,0 +1,97 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Qualcomm SM8750 CSIPHY 2.3.0 three-phase operation. */
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/math64.h>
++#include <linux/time64.h>
++
++#include "phy-qcom-mipi-csi2.h"
++#include "phy-qcom-mipi-csi2-sm8750.h"
++
++static void sm8750_cphy_write(struct mipi_csi2phy_device *phy,
++			     const struct mipi_csi2phy_lane_regs *regs,
++			     size_t count, u16 settle)
++{
++	size_t i;
++
++	for (i = 0; i < count; i++) {
++		u32 value = regs[i].reg_data;
++
++		if (regs[i].param_type == 2)
++			value = settle & 0xff;
++		else if (regs[i].param_type == 3)
++			value = settle >> 8;
++		writel(value, phy->base + regs[i].reg_addr);
++		if (regs[i].delay_us)
++			fsleep(regs[i].delay_us);
++	}
++}
++
++static int sm8750_cphy_enable(struct mipi_csi2phy_device *phy,
++			      struct mipi_csi2phy_stream_cfg *cfg)
++{
++	const struct mipi_csi2phy_datarate_regs *tier = NULL;
++	u64 symbol_rate = cfg->link_freq * 2;
++	u64 count;
++	u32 lane_mask = 0;
++	unsigned int i;
++
++	if (!symbol_rate || !phy->timer_clk_rate || !cfg->num_data_lanes ||
++	    cfg->num_data_lanes > 3)
++		return -EINVAL;
++	for (i = 0; i < cfg->num_data_lanes; i++) {
++		unsigned int lane = cfg->lane_cfg.data[i].pos;
++
++		if (lane > 2 || cfg->lane_cfg.data[i].pol ||
++		    (lane_mask & BIT(lane * 2 + 1)))
++			return -EINVAL;
++		lane_mask |= BIT(lane * 2 + 1);
++	}
++	for (i = 0; i < ARRAY_SIZE(sm8750_cphy_rates); i++)
++		if (sm8750_cphy_rates[i].bandwidth >= symbol_rate) {
++			tier = &sm8750_cphy_rates[i];
++			break;
++		}
++	if (!tier)
++		return -ERANGE;
++
++	/* CPAS 2.3 compensates ten timer cycles, as in the OEM PHY driver. */
++	count = div64_u64((u64)cfg->cphy_settle_ps * phy->timer_clk_rate,
++			PSEC_PER_SEC);
++	if (count <= 10 || count > 0xffff + 10)
++		return -ERANGE;
++	count -= 10;
++
++	writel(0, phy->base + 0x1084);
++	writel(0x0e, phy->base + 0x108c);
++	fsleep(1);
++	writel(0x7a, phy->base + 0x101c);
++	writel(1, phy->base + 0x1018);
++	writel(0x0e, phy->base + 0x1000);
++	fsleep(3048);
++	writel(lane_mask, phy->base + 0x1014);
++
++	/* Preserve the OEM order: rate settings, then common per-trio setup. */
++	sm8750_cphy_write(phy, tier->reg_array, tier->reg_array_size, count);
++	sm8750_cphy_write(phy, csiphy_3ph_v2_3_0_reg,
++			  ARRAY_SIZE(csiphy_3ph_v2_3_0_reg), count);
++	for (i = 11; i < 22; i++)
++		writel(0, phy->base + 0x1000 + 4 * i);
++	dev_dbg(phy->dev, "C-PHY %llu sym/s timer %u settle %llu mask %#x\n",
++		symbol_rate, phy->timer_clk_rate, count, lane_mask);
++	return 0;
++}
++
++static void sm8750_cphy_disable(struct mipi_csi2phy_device *phy,
++				struct mipi_csi2phy_stream_cfg *cfg)
++{
++	writel(0, phy->base + 0x1014);
++	writel(0, phy->base + 0x1018);
++}
++
++const struct mipi_csi2phy_hw_ops phy_qcom_mipi_csi2_ops_sm8750_cphy = {
++	.hw_version_read = phy_qcom_mipi_csi2_hw_version_read,
++	.reset = phy_qcom_mipi_csi2_reset,
++	.lanes_enable = sm8750_cphy_enable,
++	.lanes_disable = sm8750_cphy_disable,
++};
+diff --git a/drivers/phy/qualcomm/phy-qcom-mipi-csi2-sm8750.h b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-sm8750.h
+new file mode 100644
+index 0000000000..a25a548a0e
+--- /dev/null
++++ b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-sm8750.h
+@@ -0,0 +1,1246 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Copyright (c) 2023-2024, Qualcomm Innovation Center, Inc. All rights reserved.
++ * CSIPHY 2.3.0 three-phase tables, preserving register order and delays.
++ * Source: OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8750
++ * d50b305f7da9e14715a25120a4ac7b1a4b8b97c3,
++ * vendor/qcom/opensource/camera-kernel/drivers/cam_sensor_module/cam_csiphy/
++ * include/cam_csiphy_2_3_0_hwreg.h
++ */
++
++static const struct mipi_csi2phy_lane_regs csiphy_3ph_v2_3_0_reg[] = {
++	{ 0x0294, 0x0d, 0, 0 },
++	{ 0x02f4, 0x00, 0, 0 },
++	{ 0x02f8, 0x00, 0, 0 },
++	{ 0x02fc, 0x00, 0, 0 },
++	{ 0x02f0, 0xef, 211, 0 },
++	{ 0x0694, 0x0d, 0, 0 },
++	{ 0x06f4, 0x00, 0, 0 },
++	{ 0x06f8, 0x00, 0, 0 },
++	{ 0x06fc, 0x00, 0, 0 },
++	{ 0x06f0, 0xef, 211, 0 },
++	{ 0x0a94, 0x0d, 0, 0 },
++	{ 0x0af4, 0x00, 0, 0 },
++	{ 0x0af8, 0x00, 0, 0 },
++	{ 0x0afc, 0x00, 0, 0 },
++	{ 0x0af0, 0xef, 211, 0 },
++	{ 0x0204, 0x00, 0, 0 },
++	{ 0x02e4, 0x00, 0, 0 },
++	{ 0x02e8, 0x7f, 0, 0 },
++	{ 0x02ec, 0x7f, 0, 0 },
++	{ 0x0218, 0x3e, 0, 0 },
++	{ 0x021c, 0x41, 0, 0 },
++	{ 0x0220, 0x41, 0, 0 },
++	{ 0x0224, 0x7f, 0, 0 },
++	{ 0x0228, 0x00, 0, 0 },
++	{ 0x022c, 0x00, 0, 0 },
++	{ 0x0264, 0x01, 0, 0 },
++	{ 0x0244, 0xb2, 0, 0 },
++	{ 0x0310, 0x35, 0, 0 },
++	{ 0x02bc, 0xd0, 0, 0 },
++	{ 0x0254, 0x00, 0, 0 },
++	{ 0x0240, 0x00, 0, 0 },
++	{ 0x0260, 0xa8, 0, 0 },
++	{ 0x0284, 0x00, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0604, 0x00, 0, 0 },
++	{ 0x06e4, 0x00, 0, 0 },
++	{ 0x06e8, 0x7f, 0, 0 },
++	{ 0x06ec, 0x7f, 0, 0 },
++	{ 0x0618, 0x3e, 0, 0 },
++	{ 0x061c, 0x41, 0, 0 },
++	{ 0x0620, 0x41, 0, 0 },
++	{ 0x0624, 0x7f, 0, 0 },
++	{ 0x0628, 0x00, 0, 0 },
++	{ 0x062c, 0x00, 0, 0 },
++	{ 0x0664, 0x01, 0, 0 },
++	{ 0x0644, 0xb2, 0, 0 },
++	{ 0x0710, 0x35, 0, 0 },
++	{ 0x06bc, 0xd0, 0, 0 },
++	{ 0x0654, 0x00, 0, 0 },
++	{ 0x0640, 0x00, 0, 0 },
++	{ 0x0660, 0xa8, 0, 0 },
++	{ 0x0684, 0x00, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a04, 0x00, 0, 0 },
++	{ 0x0ae4, 0x00, 0, 0 },
++	{ 0x0ae8, 0x7f, 0, 0 },
++	{ 0x0aec, 0x7f, 0, 0 },
++	{ 0x0a18, 0x3e, 0, 0 },
++	{ 0x0a1c, 0x41, 0, 0 },
++	{ 0x0a20, 0x41, 0, 0 },
++	{ 0x0a24, 0x7f, 0, 0 },
++	{ 0x0a28, 0x00, 0, 0 },
++	{ 0x0a2c, 0x00, 0, 0 },
++	{ 0x0a64, 0x01, 0, 0 },
++	{ 0x0a44, 0xb2, 0, 0 },
++	{ 0x0b10, 0x35, 0, 0 },
++	{ 0x0abc, 0xd0, 0, 0 },
++	{ 0x0a54, 0x00, 0, 0 },
++	{ 0x0a40, 0x00, 0, 0 },
++	{ 0x0a60, 0xa8, 0, 0 },
++	{ 0x0a84, 0x00, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_80Msps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x3f, 0, 0 },
++	{ 0x0270, 0x00, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x5f, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x77, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x3f, 0, 0 },
++	{ 0x0670, 0x00, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x5f, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x77, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x3f, 0, 0 },
++	{ 0x0a70, 0x00, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x5f, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x77, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x1f, 0, 2 },
++	{ 0x0208, 0x02, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x6b, 0, 0 },
++	{ 0x060c, 0x1f, 0, 2 },
++	{ 0x0608, 0x02, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x6b, 0, 0 },
++	{ 0x0a0c, 0x1f, 0, 2 },
++	{ 0x0a08, 0x02, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x6b, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_100Msps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x3f, 0, 0 },
++	{ 0x0270, 0x00, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x5f, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x77, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x3f, 0, 0 },
++	{ 0x0670, 0x00, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x5f, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x77, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x3f, 0, 0 },
++	{ 0x0a70, 0x00, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x5f, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x77, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0xb6, 0, 2 },
++	{ 0x0208, 0x01, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x6b, 0, 0 },
++	{ 0x060c, 0xb6, 0, 2 },
++	{ 0x0608, 0x01, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x6b, 0, 0 },
++	{ 0x0a0c, 0xb6, 0, 2 },
++	{ 0x0a08, 0x01, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x6b, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_200Msps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x3f, 0, 0 },
++	{ 0x0270, 0x00, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x5f, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x77, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x3f, 0, 0 },
++	{ 0x0670, 0x00, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x5f, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x77, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x3f, 0, 0 },
++	{ 0x0a70, 0x00, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x5f, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x77, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0xe4, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x33, 0, 0 },
++	{ 0x060c, 0xe4, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x33, 0, 0 },
++	{ 0x0a0c, 0xe4, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x33, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_300Msps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x3f, 0, 0 },
++	{ 0x0270, 0x00, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x5f, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x77, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x3f, 0, 0 },
++	{ 0x0670, 0x00, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x5f, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x77, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x3f, 0, 0 },
++	{ 0x0a70, 0x00, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x5f, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x77, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x9e, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x20, 0, 0 },
++	{ 0x060c, 0x9e, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x20, 0, 0 },
++	{ 0x0a0c, 0x9e, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x20, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_350Msps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x3f, 0, 0 },
++	{ 0x0270, 0x00, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x5f, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x77, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x3f, 0, 0 },
++	{ 0x0670, 0x00, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x5f, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x77, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x3f, 0, 0 },
++	{ 0x0a70, 0x00, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x5f, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x77, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x8a, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x20, 0, 0 },
++	{ 0x060c, 0x8a, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x20, 0, 0 },
++	{ 0x0a0c, 0x8a, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x20, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_400Msps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x3f, 0, 0 },
++	{ 0x0270, 0x00, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x5f, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x77, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x3f, 0, 0 },
++	{ 0x0670, 0x00, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x5f, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x77, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x3f, 0, 0 },
++	{ 0x0a70, 0x00, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x5f, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x77, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x7b, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x20, 0, 0 },
++	{ 0x060c, 0x7b, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x20, 0, 0 },
++	{ 0x0a0c, 0x7b, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x20, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_500Msps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x3f, 0, 0 },
++	{ 0x0270, 0x00, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x5f, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x77, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x3f, 0, 0 },
++	{ 0x0670, 0x00, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x5f, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x77, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x3f, 0, 0 },
++	{ 0x0a70, 0x00, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x5f, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x77, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x66, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x20, 0, 0 },
++	{ 0x060c, 0x66, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x20, 0, 0 },
++	{ 0x0a0c, 0x66, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x20, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_600Msps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x3f, 0, 0 },
++	{ 0x0270, 0x00, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x5f, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x77, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x3f, 0, 0 },
++	{ 0x0670, 0x00, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x5f, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x77, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x3f, 0, 0 },
++	{ 0x0a70, 0x00, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x5f, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x77, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x58, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x20, 0, 0 },
++	{ 0x060c, 0x58, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x20, 0, 0 },
++	{ 0x0a0c, 0x58, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x20, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_700Msps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x3f, 0, 0 },
++	{ 0x0270, 0x00, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x5f, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x77, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x3f, 0, 0 },
++	{ 0x0670, 0x00, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x5f, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x77, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x3f, 0, 0 },
++	{ 0x0a70, 0x00, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x5f, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x77, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x4e, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x20, 0, 0 },
++	{ 0x060c, 0x4e, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x20, 0, 0 },
++	{ 0x0a0c, 0x4e, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x20, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_800Msps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x3f, 0, 0 },
++	{ 0x0270, 0x00, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x5f, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x77, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x3f, 0, 0 },
++	{ 0x0670, 0x00, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x5f, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x77, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x3f, 0, 0 },
++	{ 0x0a70, 0x00, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x5f, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x77, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x46, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x09, 0, 0 },
++	{ 0x060c, 0x46, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x09, 0, 0 },
++	{ 0x0a0c, 0x46, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x09, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_900Msps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x3f, 0, 0 },
++	{ 0x0270, 0x00, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x5f, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x77, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x3f, 0, 0 },
++	{ 0x0670, 0x00, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x5f, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x77, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x3f, 0, 0 },
++	{ 0x0a70, 0x00, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x5f, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x77, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x40, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x09, 0, 0 },
++	{ 0x060c, 0x40, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x09, 0, 0 },
++	{ 0x0a0c, 0x40, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x09, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_1p0Gsps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x3f, 0, 0 },
++	{ 0x0270, 0x00, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x5f, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x77, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x3f, 0, 0 },
++	{ 0x0670, 0x00, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x5f, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x77, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x3f, 0, 0 },
++	{ 0x0a70, 0x00, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x5f, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x77, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x3c, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x09, 0, 0 },
++	{ 0x060c, 0x3c, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x09, 0, 0 },
++	{ 0x0a0c, 0x3c, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x09, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_1p2Gsps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x1d, 0, 0 },
++	{ 0x0270, 0x01, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x3f, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x75, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x1d, 0, 0 },
++	{ 0x0670, 0x01, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x3f, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x75, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x1d, 0, 0 },
++	{ 0x0a70, 0x01, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x3f, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x75, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x35, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x09, 0, 0 },
++	{ 0x060c, 0x35, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x09, 0, 0 },
++	{ 0x0a0c, 0x35, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x09, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_1p5Gsps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x1d, 0, 0 },
++	{ 0x0270, 0x01, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x3f, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x75, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x1d, 0, 0 },
++	{ 0x0670, 0x01, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x3f, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x75, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x1d, 0, 0 },
++	{ 0x0a70, 0x01, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x3f, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x75, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x2e, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x09, 0, 0 },
++	{ 0x060c, 0x2e, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x09, 0, 0 },
++	{ 0x0a0c, 0x2e, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x09, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_1p7Gsps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x1d, 0, 0 },
++	{ 0x0270, 0x00, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x26, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x75, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x1d, 0, 0 },
++	{ 0x0670, 0x00, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x26, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x75, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x1d, 0, 0 },
++	{ 0x0a70, 0x00, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x26, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x75, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x2a, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x09, 0, 0 },
++	{ 0x060c, 0x2a, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x09, 0, 0 },
++	{ 0x0a0c, 0x2a, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x09, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_2p0Gsps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x1d, 0, 0 },
++	{ 0x0270, 0x00, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x26, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x75, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x1d, 0, 0 },
++	{ 0x0670, 0x00, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x26, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x75, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x1d, 0, 0 },
++	{ 0x0a70, 0x00, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x26, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x75, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x27, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x00, 0, 0 },
++	{ 0x060c, 0x27, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x00, 0, 0 },
++	{ 0x0a0c, 0x27, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x00, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_2p1Gsps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x1d, 0, 0 },
++	{ 0x0270, 0x00, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x12, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x75, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x1d, 0, 0 },
++	{ 0x0670, 0x00, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x12, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x75, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x1d, 0, 0 },
++	{ 0x0a70, 0x00, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x12, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x75, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x26, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x00, 0, 0 },
++	{ 0x060c, 0x26, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x00, 0, 0 },
++	{ 0x0a0c, 0x26, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x00, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_2p35Gsps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x1d, 0, 0 },
++	{ 0x0270, 0x00, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x12, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x75, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x1d, 0, 0 },
++	{ 0x0670, 0x00, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x12, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x75, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x1d, 0, 0 },
++	{ 0x0a70, 0x00, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x12, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x75, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x23, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x00, 0, 0 },
++	{ 0x060c, 0x23, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x00, 0, 0 },
++	{ 0x0a0c, 0x23, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x00, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_2p5Gsps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x1d, 0, 0 },
++	{ 0x0270, 0x00, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x12, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x75, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x1d, 0, 0 },
++	{ 0x0670, 0x00, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x12, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x75, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x1d, 0, 0 },
++	{ 0x0a70, 0x00, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x12, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x75, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x22, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x00, 0, 0 },
++	{ 0x060c, 0x22, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x00, 0, 0 },
++	{ 0x0a0c, 0x22, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x00, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_2p6Gsps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x1d, 0, 0 },
++	{ 0x0270, 0x00, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x12, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x75, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x1d, 0, 0 },
++	{ 0x0670, 0x00, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x12, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x75, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x1d, 0, 0 },
++	{ 0x0a70, 0x00, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x12, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x75, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x22, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x00, 0, 0 },
++	{ 0x060c, 0x22, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x00, 0, 0 },
++	{ 0x0a0c, 0x22, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x00, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_2p8Gsps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x1d, 0, 0 },
++	{ 0x0270, 0x00, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x12, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x75, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x1d, 0, 0 },
++	{ 0x0670, 0x00, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x12, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x75, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x1d, 0, 0 },
++	{ 0x0a70, 0x00, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x12, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x75, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x21, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x00, 0, 0 },
++	{ 0x060c, 0x21, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x00, 0, 0 },
++	{ 0x0a0c, 0x21, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x00, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_3p0Gsps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x1d, 0, 0 },
++	{ 0x0270, 0x00, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x12, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x75, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x1d, 0, 0 },
++	{ 0x0670, 0x00, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x12, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x75, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x1d, 0, 0 },
++	{ 0x0a70, 0x00, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x12, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x75, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x20, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x00, 0, 0 },
++	{ 0x060c, 0x20, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x00, 0, 0 },
++	{ 0x0a0c, 0x20, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x00, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_3p3Gsps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x1d, 0, 0 },
++	{ 0x0270, 0x01, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x0f, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x75, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x1d, 0, 0 },
++	{ 0x0670, 0x01, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x0f, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x75, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x1d, 0, 0 },
++	{ 0x0a70, 0x01, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x0f, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x75, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x1e, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x00, 0, 0 },
++	{ 0x060c, 0x1e, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x00, 0, 0 },
++	{ 0x0a0c, 0x1e, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x00, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_3p5Gsps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x1d, 0, 0 },
++	{ 0x0270, 0x01, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x0f, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x75, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x1d, 0, 0 },
++	{ 0x0670, 0x01, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x0f, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x75, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x1d, 0, 0 },
++	{ 0x0a70, 0x01, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x0f, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x75, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x1e, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x00, 0, 0 },
++	{ 0x060c, 0x1e, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x00, 0, 0 },
++	{ 0x0a0c, 0x1e, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x00, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_4p0Gsps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x3d, 0, 0 },
++	{ 0x0270, 0x01, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x0c, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x75, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x3d, 0, 0 },
++	{ 0x0670, 0x01, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x0c, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x75, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x3d, 0, 0 },
++	{ 0x0a70, 0x01, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x0c, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x75, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x1c, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x00, 0, 0 },
++	{ 0x060c, 0x1c, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x00, 0, 0 },
++	{ 0x0a0c, 0x1c, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x00, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_4p5Gsps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x3d, 0, 0 },
++	{ 0x0270, 0x01, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x09, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x75, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x3d, 0, 0 },
++	{ 0x0670, 0x01, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x09, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x75, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x3d, 0, 0 },
++	{ 0x0a70, 0x01, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x09, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x75, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x1b, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x00, 0, 0 },
++	{ 0x060c, 0x1b, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x00, 0, 0 },
++	{ 0x0a0c, 0x1b, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x00, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_5p0Gsps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x3d, 0, 0 },
++	{ 0x0270, 0x01, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x09, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x75, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x3d, 0, 0 },
++	{ 0x0670, 0x01, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x09, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x75, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x3d, 0, 0 },
++	{ 0x0a70, 0x01, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x09, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x75, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x1a, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x00, 0, 0 },
++	{ 0x060c, 0x1a, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x00, 0, 0 },
++	{ 0x0a0c, 0x1a, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x00, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_5p5Gsps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x1d, 0, 0 },
++	{ 0x0270, 0x01, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x08, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x75, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x1d, 0, 0 },
++	{ 0x0670, 0x01, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x08, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x75, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x1d, 0, 0 },
++	{ 0x0a70, 0x01, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x08, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x75, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x19, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x00, 0, 0 },
++	{ 0x060c, 0x19, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x00, 0, 0 },
++	{ 0x0a0c, 0x19, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x00, 0, 0 },
++};
++
++static const struct mipi_csi2phy_lane_regs datarate_230_6p0Gsps[] = {
++	{ 0x0268, 0xf1, 0, 0 },
++	{ 0x026c, 0x1b, 0, 0 },
++	{ 0x0270, 0x02, 0, 0 },
++	{ 0x0274, 0x00, 0, 0 },
++	{ 0x0278, 0x07, 0, 0 },
++	{ 0x0288, 0x00, 0, 0 },
++	{ 0x028c, 0x77, 0, 0 },
++	{ 0x0290, 0x02, 0, 0 },
++	{ 0x0668, 0xf1, 0, 0 },
++	{ 0x066c, 0x1b, 0, 0 },
++	{ 0x0670, 0x02, 0, 0 },
++	{ 0x0674, 0x00, 0, 0 },
++	{ 0x0678, 0x07, 0, 0 },
++	{ 0x0688, 0x00, 0, 0 },
++	{ 0x068c, 0x77, 0, 0 },
++	{ 0x0690, 0x02, 0, 0 },
++	{ 0x0a68, 0xf1, 0, 0 },
++	{ 0x0a6c, 0x1b, 0, 0 },
++	{ 0x0a70, 0x02, 0, 0 },
++	{ 0x0a74, 0x00, 10, 0 },
++	{ 0x0a78, 0x07, 0, 0 },
++	{ 0x0a88, 0x00, 0, 0 },
++	{ 0x0a8c, 0x77, 0, 0 },
++	{ 0x0a90, 0x02, 0, 0 },
++	{ 0x020c, 0x19, 0, 2 },
++	{ 0x0208, 0x00, 0, 3 },
++	{ 0x0210, 0x00, 0, 0 },
++	{ 0x0214, 0x00, 0, 0 },
++	{ 0x060c, 0x19, 0, 2 },
++	{ 0x0608, 0x00, 0, 3 },
++	{ 0x0610, 0x00, 0, 0 },
++	{ 0x0614, 0x00, 0, 0 },
++	{ 0x0a0c, 0x19, 0, 2 },
++	{ 0x0a08, 0x00, 0, 3 },
++	{ 0x0a10, 0x00, 0, 0 },
++	{ 0x0a14, 0x00, 0, 0 },
++};
++
++static const struct mipi_csi2phy_datarate_regs sm8750_cphy_rates[] = {
++	{ 80000000ULL, datarate_230_80Msps, ARRAY_SIZE(datarate_230_80Msps) },
++	{ 100000000ULL, datarate_230_100Msps, ARRAY_SIZE(datarate_230_100Msps) },
++	{ 200000000ULL, datarate_230_200Msps, ARRAY_SIZE(datarate_230_200Msps) },
++	{ 300000000ULL, datarate_230_300Msps, ARRAY_SIZE(datarate_230_300Msps) },
++	{ 350000000ULL, datarate_230_350Msps, ARRAY_SIZE(datarate_230_350Msps) },
++	{ 400000000ULL, datarate_230_400Msps, ARRAY_SIZE(datarate_230_400Msps) },
++	{ 500000000ULL, datarate_230_500Msps, ARRAY_SIZE(datarate_230_500Msps) },
++	{ 600000000ULL, datarate_230_600Msps, ARRAY_SIZE(datarate_230_600Msps) },
++	{ 700000000ULL, datarate_230_700Msps, ARRAY_SIZE(datarate_230_700Msps) },
++	{ 800000000ULL, datarate_230_800Msps, ARRAY_SIZE(datarate_230_800Msps) },
++	{ 900000000ULL, datarate_230_900Msps, ARRAY_SIZE(datarate_230_900Msps) },
++	{ 1000000000ULL, datarate_230_1p0Gsps, ARRAY_SIZE(datarate_230_1p0Gsps) },
++	{ 1200000000ULL, datarate_230_1p2Gsps, ARRAY_SIZE(datarate_230_1p2Gsps) },
++	{ 1500000000ULL, datarate_230_1p5Gsps, ARRAY_SIZE(datarate_230_1p5Gsps) },
++	{ 1700000000ULL, datarate_230_1p7Gsps, ARRAY_SIZE(datarate_230_1p7Gsps) },
++	{ 2000000000ULL, datarate_230_2p0Gsps, ARRAY_SIZE(datarate_230_2p0Gsps) },
++	{ 2100000000ULL, datarate_230_2p1Gsps, ARRAY_SIZE(datarate_230_2p1Gsps) },
++	{ 2350000000ULL, datarate_230_2p35Gsps, ARRAY_SIZE(datarate_230_2p35Gsps) },
++	{ 2500000000ULL, datarate_230_2p5Gsps, ARRAY_SIZE(datarate_230_2p5Gsps) },
++	{ 2600000000ULL, datarate_230_2p6Gsps, ARRAY_SIZE(datarate_230_2p6Gsps) },
++	{ 2800000000ULL, datarate_230_2p8Gsps, ARRAY_SIZE(datarate_230_2p8Gsps) },
++	{ 3000000000ULL, datarate_230_3p0Gsps, ARRAY_SIZE(datarate_230_3p0Gsps) },
++	{ 3300000000ULL, datarate_230_3p3Gsps, ARRAY_SIZE(datarate_230_3p3Gsps) },
++	{ 3500000000ULL, datarate_230_3p5Gsps, ARRAY_SIZE(datarate_230_3p5Gsps) },
++	{ 4000000000ULL, datarate_230_4p0Gsps, ARRAY_SIZE(datarate_230_4p0Gsps) },
++	{ 4500000000ULL, datarate_230_4p5Gsps, ARRAY_SIZE(datarate_230_4p5Gsps) },
++	{ 5000000000ULL, datarate_230_5p0Gsps, ARRAY_SIZE(datarate_230_5p0Gsps) },
++	{ 5500000000ULL, datarate_230_5p5Gsps, ARRAY_SIZE(datarate_230_5p5Gsps) },
++	{ 6000000000ULL, datarate_230_6p0Gsps, ARRAY_SIZE(datarate_230_6p0Gsps) },
++};
+diff --git a/drivers/phy/qualcomm/phy-qcom-mipi-csi2.h b/drivers/phy/qualcomm/phy-qcom-mipi-csi2.h
+index 960fa7e692..f7d04f5e0a 100644
+--- a/drivers/phy/qualcomm/phy-qcom-mipi-csi2.h
++++ b/drivers/phy/qualcomm/phy-qcom-mipi-csi2.h
+@@ -25,6 +25,7 @@ struct mipi_csi2phy_lanes_cfg {
+ 
+ struct mipi_csi2phy_stream_cfg {
+ 	s64 link_freq;
++	u32 cphy_settle_ps;
+ 	u8 num_data_lanes;
+ 	struct mipi_csi2phy_lanes_cfg lane_cfg;
+ };
+@@ -104,6 +105,7 @@ struct mipi_csi2phy_device {
+ 	u32 hw_version;
+ };
+ 
++extern const struct mipi_csi2phy_hw_ops phy_qcom_mipi_csi2_ops_sm8750_cphy;
+ extern const struct mipi_csi2phy_soc_cfg mipi_csi2_dphy_sm8750;
+ extern const struct mipi_csi2phy_soc_cfg mipi_csi2_dphy_3nm_kaanapali;
+ extern const struct mipi_csi2phy_soc_cfg mipi_csi2_dphy_4nm_x1e;
+diff --git a/include/linux/phy/phy-mipi-cphy.h b/include/linux/phy/phy-mipi-cphy.h
+index 7627602eb5..cb17147692 100644
+--- a/include/linux/phy/phy-mipi-cphy.h
++++ b/include/linux/phy/phy-mipi-cphy.h
+@@ -36,24 +36,7 @@ struct phy_configure_opts_mipi_cphy {
+ 	 * Consumers fill this from the sensor link frequency and hand
+ 	 * it to phy_configure().
+ 	 */
+-	unsigned long		hs_clk_rate;
+-
+-	/**
+-	 * @lane_positions:
+-	 *
+-	 * Physical-to-logical trio (data lane) position mapping. Entry @i
+-	 * gives the physical lane position carrying logical trio @i. C-PHY
+-	 * has no clock lane, so all entries map data trios only.
+-	 */
+-	unsigned char		lane_positions[PHY_MIPI_CPHY_MAX_DATA_LANES];
+-
+-	/**
+-	 * @lane_polarities:
+-	 *
+-	 * Polarity (0 = normal, 1 = swapped) of each logical trio. Entry
+-	 * @i corresponds to logical trio @i.
+-	 */
+-	bool			lane_polarities[PHY_MIPI_CPHY_MAX_DATA_LANES];
++	u64			hs_clk_rate;
+ 
+ 	/**
+ 	 * @t3_prepare:
+diff --git a/include/linux/phy/phy.h b/include/linux/phy/phy.h
+index 6384f5a402..71c78ce6ae 100644
+--- a/include/linux/phy/phy.h
++++ b/include/linux/phy/phy.h
+@@ -42,11 +42,11 @@ enum phy_mode {
+ 	PHY_MODE_PCIE,
+ 	PHY_MODE_ETHERNET,
+ 	PHY_MODE_MIPI_DPHY,
+-	PHY_MODE_MIPI_CPHY,
+ 	PHY_MODE_SATA,
+ 	PHY_MODE_LVDS,
+ 	PHY_MODE_DP,
+ 	PHY_MODE_HDMI,
++	PHY_MODE_MIPI_CPHY,
+ };
+ 
+ enum phy_media {

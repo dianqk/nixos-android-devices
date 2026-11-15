@@ -1,0 +1,244 @@
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 06 Nov 2026 19:07:38 +0800
+Subject: [PATCH] board: mediatek-mobile: forward runtime LK modem descriptors
+
+Forward the exact descriptor bytes from LK to an existing OS modem node.
+Validate the bounded little-endian descriptor and full 64 KiB no-map backing
+without touching tag pages. Missing or invalid LK data removes stale OS
+descriptors; preserve platform properties and recovery DTs without a modem.
+Copy before mutation so source/destination FDT aliasing remains safe.
+Coalesce exact LK reservations while preserving no-map, validate existing
+OS reservation nodes and verify final no-map coverage before publishing.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+diff --git a/board/mediatek/mediatek-mobile/mediatek-mobile.c b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+--- a/board/mediatek/mediatek-mobile/mediatek-mobile.c
++++ b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+@@ -110,8 +110,16 @@
+ 
+ static void mtk_add_reserved(u64 start, u64 size, bool nomap)
+ {
++	int i;
++
+ 	if (!size)
+ 		return;
++	for (i = 0; i < mtk_reserved_count; i++) {
++		if (mtk_reserved[i].start == start && mtk_reserved[i].size == size) {
++			mtk_reserved[i].nomap |= nomap;
++			return;
++		}
++	}
+ 	if (mtk_reserved_count == MTK_MAX_RESERVED) {
+ 		log_warning("Too many reserved regions; ignoring 0x%llx\n", start);
+ 		return;
+@@ -1430,6 +1438,165 @@
+ 	return 0;
+ }
+ 
++/* LK descriptors are little-endian opaque properties; never map their payload. */
++static bool mtk_modem_descriptor_valid(const void *data, int len, bool v2)
++{
++	const u8 *p = data;
++	u64 base;
++	u32 size, count, header;
++	int version = 1, i;
++	bool bank = false, reserved = false;
++
++	if (len < (v2 ? 32 : 16))
++		return false;
++	base = get_unaligned_le64(p);
++	size = get_unaligned_le32(p + 8);
++	/* Preserve LK's explicit no-image sentinel without touching tag pages. */
++	if (!base)
++		return !v2 || !get_unaligned_le32(p + 12);
++	if (v2) {
++		version = (s32)get_unaligned_le32(p + 16);
++		if (version < 1 || (s32)get_unaligned_le32(p + 20) < 0)
++			return false;
++		count = get_unaligned_le32(p + 20);
++	} else {
++		count = get_unaligned_le32(p + 12);
++	}
++	header = version >= 2 ? 76 : 28;
++	if (!size || size > SZ_64K || !count || count > size / header ||
++	    !IS_ALIGNED(base, SZ_4K) || base > U64_MAX - SZ_64K)
++		return false;
++	/* Linux maps the full 64 KiB, rather than only the advertised tag size. */
++	for (i = 0; i < mtk_bank_count; i++)
++		if (mtk_banks[i].start <= U64_MAX - mtk_banks[i].size &&
++		    base >= mtk_banks[i].start &&
++		    base - mtk_banks[i].start <= mtk_banks[i].size &&
++		    SZ_64K <= mtk_banks[i].size - (base - mtk_banks[i].start))
++			bank = true;
++	for (i = 0; i < mtk_reserved_count; i++)
++		if (mtk_reserved[i].nomap &&
++		    mtk_reserved[i].start <= U64_MAX - mtk_reserved[i].size &&
++		    base >= mtk_reserved[i].start &&
++		    base - mtk_reserved[i].start <= mtk_reserved[i].size &&
++		    SZ_64K <= mtk_reserved[i].size - (base - mtk_reserved[i].start))
++			reserved = true;
++	return bank && reserved;
++}
++
++static bool mtk_reserved_available(const void *fdt, int node)
++{
++	int len;
++	const char *status = fdt_getprop(fdt, node, "status", &len);
++
++	return !status || (len == 5 && !memcmp(status, "okay", 5)) ||
++		(len == 3 && !memcmp(status, "ok", 3));
++}
++
++static bool mtk_modem_fdt_reserved(const void *fdt, u64 base)
++{
++	int parent = fdt_path_offset(fdt, "/reserved-memory");
++	int node;
++
++	if (!base)
++		return true; /* No-image sentinel has no mapped backing. */
++	if (parent < 0 || fdt_address_cells(fdt, parent) != 2 ||
++	    fdt_size_cells(fdt, parent) != 2)
++		return false;
++	fdt_for_each_subnode(node, fdt, parent) {
++		const u8 *reg;
++		int len, i;
++
++		if (!mtk_reserved_available(fdt, node) ||
++		    fdt_getprop(fdt, node, "reusable", NULL) ||
++		    !fdt_getprop(fdt, node, "no-map", NULL))
++			continue;
++		reg = fdt_getprop(fdt, node, "reg", &len);
++		if (!reg || len < 16 || len % 16)
++			continue;
++		for (i = 0; i < len; i += 16) {
++			u64 start = get_unaligned_be64(reg + i);
++			u64 size = get_unaligned_be64(reg + i + 8);
++
++			if (start <= U64_MAX - size && base >= start &&
++			    base - start <= size && SZ_64K <= size - (base - start))
++				return true;
++		}
++	}
++	return false;
++}
++
++static int mtk_unique_mddriver(const void *fdt)
++{
++	int node = fdt_node_offset_by_compatible(fdt, -1, "mediatek,mddriver");
++
++	if (node < 0)
++		return node;
++	if (fdt_node_offset_by_compatible(fdt, node, "mediatek,mddriver") !=
++	    -FDT_ERR_NOTFOUND)
++		return -FDT_ERR_BADVALUE;
++	return node;
++}
++
++static int mtk_forward_modem_info(void *blob)
++{
++	const void *source = (const void *)(uintptr_t)mtk_lk_fdt;
++	const char *key = "ccci,modem_info_v2";
++	const void *prop;
++	void *copy = NULL;
++	int dst, src, len = 0, ret;
++	const char *reason = "absent or invalid";
++	bool v2 = true;
++
++	dst = mtk_unique_mddriver(blob);
++	if (dst == -FDT_ERR_NOTFOUND)
++		return 0; /* Recovery DTs need not instantiate a modem. */
++	if (dst < 0)
++		return dst;
++	src = source ? mtk_unique_mddriver(source) : -FDT_ERR_NOTFOUND;
++	if (src >= 0) {
++		prop = fdt_getprop(source, src, key, &len);
++		if (!prop && len == -FDT_ERR_NOTFOUND) {
++			key = "ccci,modem_info";
++			v2 = false;
++			prop = fdt_getprop(source, src, key, &len);
++		}
++		if (prop && mtk_modem_descriptor_valid(prop, len, v2) &&
++		    mtk_modem_fdt_reserved(source, get_unaligned_le64(prop)) &&
++		    mtk_modem_fdt_reserved(blob, get_unaligned_le64(prop))) {
++			/* blob may alias source; save bytes before deleting properties. */
++			copy = malloc(len);
++			if (copy)
++				memcpy(copy, prop, len);
++			else
++				reason = "copy allocation failed";
++		}
++	}
++	/* Never allow a stale captured descriptor to win on missing/invalid LK data. */
++	ret = fdt_delprop(blob, dst, "ccci,modem_info_v2");
++	if (ret && ret != -FDT_ERR_NOTFOUND)
++		goto out;
++	dst = mtk_unique_mddriver(blob);
++	if (dst < 0) {
++		ret = dst;
++		goto out;
++	}
++	ret = fdt_delprop(blob, dst, "ccci,modem_info");
++	if (ret && ret != -FDT_ERR_NOTFOUND)
++		goto out;
++	ret = 0;
++	if (copy) {
++		dst = mtk_unique_mddriver(blob);
++		ret = dst < 0 ? dst : fdt_setprop(blob, dst, key, copy, len);
++		if (!ret)
++			printf("LK modem metadata: forwarded %s (%d bytes)\n", key, len);
++	} else {
++		printf("LK modem metadata %s; modem descriptor disabled\n", reason);
++	}
++out:
++	free(copy);
++	return ret;
++}
++
+ /* Forward LK's fixed reservations to the operating system's FDT. */
+ int ft_board_setup(void *blob, struct bd_info *bd)
+ {
+@@ -1458,11 +1625,29 @@
+ 
+ 		snprintf(name, sizeof(name), "lk-reserved@%llx", r->start);
+ 		node = fdt_add_subnode(blob, parent, name);
+-		if (node == -FDT_ERR_EXISTS)
+-			continue;
+-		if (node < 0)
+-			return node;
+-		ret = fdt_setprop(blob, node, "reg", reg, sizeof(reg));
++		if (node == -FDT_ERR_EXISTS) {
++			const u8 *old;
++			u64 start, size;
++			int len;
++
++			node = fdt_subnode_offset(blob, parent, name);
++			if (node < 0)
++				return node;
++			old = fdt_getprop(blob, node, "reg", &len);
++			if (!old || len != (int)sizeof(reg))
++				return -EINVAL;
++			start = get_unaligned_be64(old);
++			size = get_unaligned_be64(old + 8);
++			if (start != r->start || size < r->size || start > U64_MAX - size ||
++			    (r->nomap && (!mtk_reserved_available(blob, node) ||
++					  fdt_getprop(blob, node, "reusable", NULL))))
++				return -EINVAL;
++			ret = 0;
++		} else {
++			if (node < 0)
++				return node;
++			ret = fdt_setprop(blob, node, "reg", reg, sizeof(reg));
++		}
+ 		/*
+ 		 * LK keeps its framebuffer mapped; the OS must not, so that a
+ 		 * simple-framebuffer driver can map the scanout buffer.
+@@ -1474,5 +1659,5 @@
+ 			return ret;
+ 	}
+ 
+-	return 0;
+-}
++	return mtk_forward_modem_info(blob);
++}

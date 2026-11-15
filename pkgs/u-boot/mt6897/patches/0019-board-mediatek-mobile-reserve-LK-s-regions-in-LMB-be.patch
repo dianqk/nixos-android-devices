@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Thu, 15 Oct 2026 02:38:32 +0800
+Subject: [PATCH 19/24] board: mediatek-mobile: reserve LK's regions in LMB
+ before EFI init
+
+A saved console record showed a synchronous abort in efi_allocate_pool()
+at 0x33ffff000: efi_memory_init() runs right after initr_lmb() and picked
+the top page of DRAM, which lies in LK's no-map dramc-rk1 region that
+U-Boot leaves unmapped, because the LK reservations were only added in
+misc_init_r(). Register banks and reservations in lmb_arch_add_memory()
+(LMB_ARCH_MEM_MAP) instead.
+
+Also drop the T880's legacy mediatek,ssusb child, which U-Boot's mtu3
+glue rejects ("legacy mediatek,ssusb child is unsupported").
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm/dts/mt6897-alldocube-t880.dts        |  3 +++
+ arch/arm/mach-mediatek/Kconfig                |  1 +
+ .../mediatek-mobile/mediatek-mobile.c         | 25 +++++++++++++++----
+ 3 files changed, 24 insertions(+), 5 deletions(-)
+
+diff --git a/arch/arm/dts/mt6897-alldocube-t880.dts b/arch/arm/dts/mt6897-alldocube-t880.dts
+index 48b2505e39a..73b18f32fda 100644
+--- a/arch/arm/dts/mt6897-alldocube-t880.dts
++++ b/arch/arm/dts/mt6897-alldocube-t880.dts
+@@ -82,6 +82,9 @@
+ 
+ /delete-node/ &usbphy;
+ 
++/* U-Boot's mtu3 glue rejects the legacy ssusb child; device mode needs none. */
++/delete-node/ &ssusb;
++
+ &ufshci {
+ 	compatible = "mediatek,mt6897-ufshci";
+ 	reg = <0x112b0000 0x3000>;
+diff --git a/arch/arm/mach-mediatek/Kconfig b/arch/arm/mach-mediatek/Kconfig
+index e38c98e0c28..e6fd1394763 100644
+--- a/arch/arm/mach-mediatek/Kconfig
++++ b/arch/arm/mach-mediatek/Kconfig
+@@ -193,6 +193,7 @@ config TARGET_MEDIATEK_MOBILE
+ 	select OF_BOARD_FIXUP
+ 	select OF_BOARD_SETUP
+ 	select ARMV8_CNTFRQ_BROKEN
++	select LMB_ARCH_MEM_MAP
+ 	select POSITION_INDEPENDENT
+ 	select SAVE_PREV_BL_FDT_ADDR
+ 	select SAVE_PREV_BL_INITRAMFS_START_ADDR
+diff --git a/board/mediatek/mediatek-mobile/mediatek-mobile.c b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+index 8a604603338..377852df258 100644
+--- a/board/mediatek/mediatek-mobile/mediatek-mobile.c
++++ b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+@@ -705,20 +705,35 @@ static void mtk_find_payload(void)
+ 	unmap_sysmem(base);
+ }
+ 
+-int misc_init_r(void)
++/*
++ * LMB memory: LK's banks minus its reservations, registered before the EFI
++ * memory map is built from LMB (efi_memory_init runs right after
++ * initr_lmb); otherwise EFI pools land in no-map regions U-Boot does not
++ * map. ft_board_setup() reads LK's FDT again and the payload search reads
++ * the initrd, so those stay reserved as well.
++ */
++void lmb_arch_add_memory(void)
+ {
+-	phys_addr_t fastboot;
+ 	int i;
+ 
+-	mtk_trace("U-Boot: misc_init_r\n");
+-	mtk_pstore_console();
++	for (i = 0; i < mtk_bank_count; i++)
++		lmb_add(mtk_banks[i].start, mtk_banks[i].size);
+ 	for (i = 0; i < mtk_reserved_count; i++)
+ 		mtk_reserve(mtk_reserved[i].start, mtk_reserved[i].size,
+ 			    mtk_reserved[i].nomap ? LMB_NOMAP : LMB_NOOVERWRITE);
+-	/* ft_board_setup() reads LK's FDT again; keep it and the initrd intact. */
+ 	mtk_reserve(mtk_lk_fdt, mtk_lk_fdt_size, LMB_NOOVERWRITE);
+ 	mtk_reserve(mtk_initrd_start, mtk_initrd_end - mtk_initrd_start,
+ 		    LMB_NOOVERWRITE);
++	mtk_trace("U-Boot: LMB has %d banks and %d LK reservations\n",
++		  mtk_bank_count, mtk_reserved_count);
++}
++
++int misc_init_r(void)
++{
++	phys_addr_t fastboot;
++
++	mtk_trace("U-Boot: misc_init_r\n");
++	mtk_pstore_console();
+ 
+ 	mtk_set_serial();
+ 	mtk_find_payload();
+-- 
+2.55.0
+

@@ -1,0 +1,54 @@
+From dcb11138d50a304a35200e4097ca707fa59cb5d3 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Mon, 9 Nov 2026 00:33:32 +0800
+Subject: [PATCH 077/144] drm/msm/dp: keep HPD initialization after connector
+ detection
+
+Connector detection may set plugged before the initial HPD event. The
+multiple-plug reference guard must not skip AUX/PHY setup, panel capability
+discovery or EDID acquisition in that case: get_modes expects HPD to have
+populated the EDID already.
+
+Take a connection runtime-PM reference only when the connection was not
+already detected, while retaining the existing HPD initialization path for
+both first and repeated events. Connector detection separately owns its
+temporary scoped reference and the single connection-state reference.
+
+This adapts the multiple-plug guard to the existing detect/HPD ordering;
+connection teardown and the remaining HPD event series are unchanged.
+
+Link: https://lore.kernel.org/all/20261024-hpd-irq-events-v8-6-6ee949e7a384@oss.qualcomm.com/
+Link: https://lore.kernel.org/all/20261024051952.2006-1-26rote@gmail.com/
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0099-drm-msm-dp-keep-HPD-initialization-after-connector-d.patch
+Import-SHA256: b2438e260c7eab204cd498cf4e028e8ea82c5220837062a567ed6f5f20aa7fc8
+Import-Provenance: mail headers
+(cherry picked from commit a6a9d51dd6186984d6d5fd8d65c96d7d61195a1e)
+---
+ drivers/gpu/drm/msm/dp/dp_display.c | 13 ++++++-------
+ 1 file changed, 6 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index 4af6f57f26..1c1160e36c 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -411,13 +411,12 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
+ 
+ 	guard(mutex)(&dp->plugged_lock);
+ 
+-	if (dp->plugged)
+-		return 0;
+-
+-	ret = pm_runtime_resume_and_get(&pdev->dev);
+-	if (ret) {
+-		DRM_ERROR("failed to pm_runtime_resume\n");
+-		return ret;
++	if (!dp->plugged) {
++		ret = pm_runtime_resume_and_get(&pdev->dev);
++		if (ret) {
++			DRM_ERROR("failed to pm_runtime_resume\n");
++			return ret;
++		}
+ 	}
+ 
+ 	msm_dp_aux_enable_xfers(dp->aux, true);

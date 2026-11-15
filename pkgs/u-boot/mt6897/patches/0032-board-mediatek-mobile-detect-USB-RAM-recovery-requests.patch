@@ -1,0 +1,175 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Thu, 15 Oct 2026 13:58:30 +0800
+Subject: [PATCH] board: mediatek-mobile: detect USB RAM recovery requests
+
+Detect LK RECOVERY_BOOT or the read-only AOSP misc boot-recovery command.
+Export the LK boot mode and fastboot buffer limit, and support requesting
+LK recovery mode through fastboot. The environment routes recovery requests
+to USB fastboot for a host-supplied RAM FIT.
+
+Local adjustment: remove the unpublished on-disk recovery FIT loader.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/board/mediatek/mediatek-mobile/mediatek-mobile.c
++++ b/board/mediatek/mediatek-mobile/mediatek-mobile.c
+@@ -15,6 +15,10 @@
+  */
+ 
+ #include <asm/armv8/mmu.h>
++#include <asm/cache.h>
++#include <blk.h>
++#include <malloc.h>
++#include <part.h>
+ #include <asm/global_data.h>
+ #include <asm/sections.h>
+ #include <asm/system.h>
+@@ -881,6 +885,109 @@
+ }
+ 
+ /*
++ * MediaTek LK passes its boot mode in /chosen "atag,boot": a little-endian
++ * tag {size, tag, boot mode, boot type}. RECOVERY_BOOT (2) is what LK
++ * enters for the reboot-mode "recovery" request, the AOSP misc command
++ * "boot-recovery" or its recovery key; LK still loads the boot partition's
++ * kernel (U-Boot) in that mode.
++ */
++#define MTK_BOOT_MODE_RECOVERY	2
++
++static int mtk_lk_boot_mode(void)
++{
++	const void *fdt = (const void *)(uintptr_t)mtk_lk_fdt;
++	const u8 *tag;
++	int node, len;
++
++	if (!fdt)
++		return -ENOENT;
++	node = fdt_path_offset(fdt, "/chosen");
++	if (node < 0)
++		return -ENOENT;
++	tag = fdt_getprop(fdt, node, "atag,boot", &len);
++	if (!tag || len < 12)
++		return -ENOENT;
++	return get_unaligned_le32(tag + 8);
++}
++
++#if IS_ENABLED(CONFIG_PARTITIONS) && IS_ENABLED(CONFIG_BLK)
++/*
++ * The one SCSI (UFS) partition with this name; a name found on several
++ * logical units is refused rather than guessed.
++ */
++static struct blk_desc *mtk_find_part(const char *name,
++				      struct disk_partition *info)
++{
++	struct blk_desc *found = NULL, *desc;
++	struct disk_partition part;
++	struct udevice *dev;
++
++	uclass_foreach_dev_probe(UCLASS_BLK, dev) {
++		desc = dev_get_uclass_plat(dev);
++		if (desc->uclass_id != UCLASS_SCSI ||
++		    part_get_info_by_name(desc, name, &part) < 0)
++			continue;
++		if (found) {
++			printf("Partition %s exists on more than one SCSI device\n",
++			       name);
++			return NULL;
++		}
++		found = desc;
++		*info = part;
++	}
++	if (!found)
++		printf("No SCSI partition named %s\n", name);
++	return found;
++}
++
++/* Whether the AOSP bootloader message in misc asks for recovery (read only). */
++static bool mtk_misc_requests_recovery(const char *misc)
++{
++	static const char command[] = "boot-recovery";
++	struct disk_partition info;
++	struct blk_desc *desc;
++	bool request = false;
++	u8 *block;
++
++	desc = mtk_find_part(misc, &info);
++	if (!desc || info.blksz < 32)
++		return false;
++	block = memalign(ARCH_DMA_MINALIGN, info.blksz);
++	if (!block)
++		return false;
++	/* command[32] at offset 0, NUL-terminated as Android writes it. */
++	if (blk_dread(desc, info.start, 1, block) == 1)
++		request = !memcmp(block, command, sizeof(command));
++	free(block);
++	return request;
++}
++
++/* Embedded FIT data is only 4-byte aligned; libfdt needs 8. */
++static int do_recoveryrequest(struct cmd_tbl *cmdtp, int flag, int argc,
++                             char *const argv[])
++{
++	int mode;
++
++	if (argc != 2)
++		return CMD_RET_USAGE;
++	mode = mtk_lk_boot_mode();
++	if (mode == MTK_BOOT_MODE_RECOVERY) {
++		printf("RAM recovery requested: LK boot mode %d\n", mode);
++		return CMD_RET_SUCCESS;
++	}
++	if (mtk_misc_requests_recovery(argv[1])) {
++		printf("RAM recovery requested: %s command boot-recovery\n", argv[1]);
++		return CMD_RET_SUCCESS;
++	}
++	return CMD_RET_FAILURE;
++}
++
++U_BOOT_CMD(recoveryrequest, 2, 0, do_recoveryrequest,
++	   "test whether USB RAM recovery was requested",
++	   "<misc> - test LK's boot mode or the misc command (read only)");
++#endif
++
++/*
+  * Stock bootloader modes are requested through the DT syscon-reboot-mode
+  * node (RGU non-reset register), which LK reads like Android's "reboot
+  * bootloader" does. Nothing is written to storage.
+@@ -907,11 +1015,21 @@
+ 	return 0;
+ }
+ 
++/*
++ * "fastboot reboot recovery" asks LK for recovery mode like Android does;
++ * LK loads this boot image again and passes the mode on (see
++ * mtk_lk_boot_mode()).
++ */
+ int fastboot_set_reboot_flag(enum fastboot_reboot_reason reason)
+ {
+-	if (reason != FASTBOOT_REBOOT_REASON_BOOTLOADER)
++	switch (reason) {
++	case FASTBOOT_REBOOT_REASON_BOOTLOADER:
++		return mtk_set_reboot_mode("bootloader");
++	case FASTBOOT_REBOOT_REASON_RECOVERY:
++		return mtk_set_reboot_mode("recovery");
++	default:
+ 		return -EOPNOTSUPP;
+-	return mtk_set_reboot_mode("bootloader");
++	}
+ }
+ 
+ static int do_rebootmode(struct cmd_tbl *cmdtp, int flag, int argc,
+@@ -987,8 +1105,12 @@
+ 	env_set_hex("kernel_comp_size", SZ_128M);
+ 	env_set("loadaddr", env_get("kernel_addr_r"));
+ 	if (CONFIG_IS_ENABLED(USB_FUNCTION_FASTBOOT) &&
+-	    !mtk_alloc_low(CONFIG_FASTBOOT_BUF_SIZE, SZ_2M, &fastboot))
++	    !mtk_alloc_low(CONFIG_FASTBOOT_BUF_SIZE, SZ_2M, &fastboot)) {
+ 		env_set_hex("fastboot_addr_r", fastboot);
++		env_set_hex("fastboot_size_r", CONFIG_FASTBOOT_BUF_SIZE);
++	}
++	if (mtk_lk_boot_mode() >= 0)
++		env_set_ulong("lk_bootmode", mtk_lk_boot_mode());
+ 
+ 	mtk_idle_init();
+ 	mtk_autoreset_start = get_timer(0);

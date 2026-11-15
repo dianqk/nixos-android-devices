@@ -1,0 +1,264 @@
+From b7be97e8490d0fa008bbfa06b8edf040ec0d2af8 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 7 Nov 2026 07:30:21 +0800
+Subject: [PATCH] soc: mediatek: mtk-mmsys: restore MT6897 merge IRQ routing on
+ resume
+
+The vendor display driver clears OVLSYS0/1 and DISPSYS0/1 INTMERGE +0x008 on every top-clock power-on (mtk_ddp_disable_merge_irq(), mtk_drm_ddp.c:26676). The T880 26M trial measured the register as 0 while the display worked, but 1 at pre-26m, post-route, first-command and timeout after a physical display-domain power loss. DSI INTSTA latched the pending read IRQ (0x2) and the handler never ran even though the 26M gate was proven enabled and the routing restored.
+
+Mark the four MT6897 MMSYS data entries with the merge IRQ offset and clear it from the platform runtime-resume callback, which runs after the domain powers on and before consumer MMIO, covering both DIS and OVL banks. Other MMSYS data has a zero offset and performs no write. The existing read-only diagnostic keeps reading the same register.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_drm_ddp.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_drm_drv.c
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/soc/mediatek/mt6897-mmsys.h           |  4 +-
+ drivers/soc/mediatek/mtk-mmsys.c              | 34 +++++++++++++++-
+ drivers/soc/mediatek/mtk-mmsys.h              |  3 ++
+ .../selftests/mtk_clk/mmsys_pm_cases.c        | 40 ++++++++++++++++++-
+ .../selftests/mtk_clk/test_display_pm.py      | 29 +++++++++-----
+ 5 files changed, 96 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/soc/mediatek/mt6897-mmsys.h b/drivers/soc/mediatek/mt6897-mmsys.h
+index f1c86d6b80..f5f2e50547 100644
+--- a/drivers/soc/mediatek/mt6897-mmsys.h
++++ b/drivers/soc/mediatek/mt6897-mmsys.h
+@@ -26,9 +26,9 @@
+ 					 GENMASK(10, 8) | GENMASK(14, 12) | \
+ 					 GENMASK(18, 16))
+ #define MT6897_DSI_CPHY_NO_SWAP			0x62101
+-/* Configuration gate bank 2 status and DIS merge-interrupt registers. */
++/* Configuration gate bank 2 status and merge-interrupt register. */
+ #define MT6897_DISPSYS_CG2			0x1a0
+-#define MT6897_DISPSYS_INTMERGE			0x008
++#define MT6897_MMSYS_INTMERGE			0x008
+ 
+ /* OVLSYS */
+ #define MT6897_OVL_CON				0xf08
+diff --git a/drivers/soc/mediatek/mtk-mmsys.c b/drivers/soc/mediatek/mtk-mmsys.c
+index 347cff29e5..3f6cef2a23 100644
+--- a/drivers/soc/mediatek/mtk-mmsys.c
++++ b/drivers/soc/mediatek/mtk-mmsys.c
+@@ -66,6 +66,7 @@ static const struct mtk_mmsys_driver_data mt6797_mmsys_driver_data = {
+ static const struct mtk_mmsys_driver_data mt6897_dispsys0_driver_data = {
+ 	.dsi_cphy_config = true,
+ 	.runtime_pm = true,
++	.merge_irq_offset = MT6897_MMSYS_INTMERGE,
+ 	.routes = mmsys_mt6897_dispsys0_routing_table,
+ 	.num_routes = ARRAY_SIZE(mmsys_mt6897_dispsys0_routing_table),
+ 	.bypass_mux_shadow = MT6897_DISPSYS_BYPASS_MUX_SHADOW,
+@@ -74,6 +75,7 @@ static const struct mtk_mmsys_driver_data mt6897_dispsys0_driver_data = {
+ static const struct mtk_mmsys_driver_data mt6897_dispsys1_driver_data = {
+ 	.dsi_cphy_config = true,
+ 	.runtime_pm = true,
++	.merge_irq_offset = MT6897_MMSYS_INTMERGE,
+ 	.routes = mmsys_mt6897_dispsys1_routing_table,
+ 	.num_routes = ARRAY_SIZE(mmsys_mt6897_dispsys1_routing_table),
+ 	.bypass_mux_shadow = MT6897_DISPSYS_BYPASS_MUX_SHADOW,
+@@ -81,6 +83,7 @@ static const struct mtk_mmsys_driver_data mt6897_dispsys1_driver_data = {
+ 
+ static const struct mtk_mmsys_driver_data mt6897_ovlsys_driver_data = {
+ 	.runtime_pm = true,
++	.merge_irq_offset = MT6897_MMSYS_INTMERGE,
+ 	.routes = mmsys_mt6897_ovlsys_routing_table,
+ 	.num_routes = ARRAY_SIZE(mmsys_mt6897_ovlsys_routing_table),
+ 	.bypass_mux_shadow = MT6897_OVLSYS_BYPASS_MUX_SHADOW,
+@@ -289,7 +292,7 @@ int mtk_mmsys_dsi_cphy_get_state(struct device *dev,
+ 	state->routing_lsb = readl_relaxed(mmsys->regs + MT6897_DSI_SEL_CONFIG_LSB);
+ 	state->routing_msb = readl_relaxed(mmsys->regs + MT6897_DSI_SEL_CONFIG_MSB);
+ 	state->cg2 = readl_relaxed(mmsys->regs + MT6897_DISPSYS_CG2);
+-	state->intmerge = readl_relaxed(mmsys->regs + MT6897_DISPSYS_INTMERGE);
++	state->intmerge = readl_relaxed(mmsys->regs + MT6897_MMSYS_INTMERGE);
+ 	spin_unlock_irqrestore(&mmsys->lock, flags);
+ 	return 0;
+ }
+@@ -556,6 +559,34 @@ static const struct reset_control_ops mtk_mmsys_reset_ops = {
+ 	.reset = mtk_mmsys_reset,
+ };
+ 
++/*
++ * The vendor display driver clears the merge IRQ routing on every top-clock
++ * power-on (mtk_ddp_disable_merge_irq(), mtk_drm_ddp.c:26676): OVLSYS0/1 and
++ * DISPSYS0/1 INTMERGE +0x008 are written to 0.
++ * MiCode/MTK_kernel_device_modules, 3c4ccd07d5624879555ec710c11bb8818e5cb5c6,
++ * https://github.com/MiCode/MTK_kernel_device_modules/blob/
++ * 3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/
++ * mediatek_v2/mtk_drm_ddp.c (line 26676) and mtk_drm_drv.c (line 5774).
++ *
++ * T880 26M trial evidence: the register read 0 while the display was working,
++ * but 1 at pre-26m, post-route, first-command and timeout after a physical
++ * domain power loss, while DSI INTSTA latched the pending read IRQ and the
++ * handler never ran. Restore the vendor clear from runtime resume, after the
++ * domain powers on and before consumer MMIO, for both DIS and OVL banks.
++ */
++static int mtk_mmsys_runtime_resume(struct device *dev)
++{
++	struct mtk_mmsys *mmsys = dev_get_drvdata(dev);
++
++	if (mmsys->data->merge_irq_offset)
++		writel_relaxed(0, mmsys->regs + mmsys->data->merge_irq_offset);
++	return 0;
++}
++
++static const struct dev_pm_ops mtk_mmsys_pm_ops = {
++	RUNTIME_PM_OPS(NULL, mtk_mmsys_runtime_resume, NULL)
++};
++
+ static int mtk_mmsys_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -681,6 +712,7 @@ static struct platform_driver mtk_mmsys_drv = {
+ 	.driver = {
+ 		.name = "mtk-mmsys",
+ 		.of_match_table = of_match_mtk_mmsys,
++		.pm = pm_ptr(&mtk_mmsys_pm_ops),
+ 	},
+ 	.probe = mtk_mmsys_probe,
+ 	.remove = mtk_mmsys_remove,
+diff --git a/drivers/soc/mediatek/mtk-mmsys.h b/drivers/soc/mediatek/mtk-mmsys.h
+index a41e9013a4..edc33f3959 100644
+--- a/drivers/soc/mediatek/mtk-mmsys.h
++++ b/drivers/soc/mediatek/mtk-mmsys.h
+@@ -116,6 +116,8 @@ struct mtk_mmsys_routes {
+  * @is_vppsys: Whether the mmsys is VPPSYS (Video Processing Pipe)
+  *             or VDOSYS (Video). Only VDOSYS needs to be added to drm driver.
+  * @runtime_pm: Participate in runtime PM for domain-managed MT6897 MMSYS.
++ * @merge_irq_offset: offset of the merge IRQ register cleared on runtime
++ *                    resume, or 0 when the bank has no such register.
+  * @dsi_cphy_config: DISPSYS supports the MT6897 C-PHY lane routing registers.
+  * @vsync_len: VSYNC length of the MIXER.
+  *             VSYNC is usually triggered by the connector, so its length is a
+@@ -143,6 +145,7 @@ struct mtk_mmsys_driver_data {
+ 	const u32 num_resets;
+ 	const bool is_vppsys;
+ 	const bool runtime_pm;
++	const u16 merge_irq_offset;
+ 	const bool dsi_cphy_config;
+ 	const u8 vsync_len;
+ 	/*
+diff --git a/tools/testing/selftests/mtk_clk/mmsys_pm_cases.c b/tools/testing/selftests/mtk_clk/mmsys_pm_cases.c
+index e64a3491f0..af84e1e426 100644
+--- a/tools/testing/selftests/mtk_clk/mmsys_pm_cases.c
++++ b/tools/testing/selftests/mtk_clk/mmsys_pm_cases.c
+@@ -16,7 +16,7 @@
+ #define spin_lock_init(...) ((void)0)
+ struct device { void *of_node, *data; };
+ struct platform_device { struct device dev; int kind; };
+-struct mtk_mmsys_driver_data { int num_resets; bool runtime_pm, is_vppsys; const char *clk_driver; };
++struct mtk_mmsys_driver_data { int num_resets, merge_irq_offset; bool runtime_pm, is_vppsys; const char *clk_driver; };
+ struct mtk_mmsys {
+ 	void *regs;
+ 	const struct mtk_mmsys_driver_data *data;
+@@ -64,6 +64,19 @@ static void *platform_get_drvdata(struct platform_device *pdev)
+ {
+ 	return pdev->dev.data;
+ }
++static void *dev_get_drvdata(struct device *dev)
++{
++	return dev->data;
++}
++static int write_count;
++static unsigned int write_value;
++static void *write_addr;
++static void writel_relaxed(unsigned int value, void *addr)
++{
++	write_count++;
++	write_value = value;
++	write_addr = addr;
++}
+ static int devm_pm_runtime_enable(struct device *dev)
+ {
+ 	assert(dev->data);
+@@ -124,6 +137,9 @@ static void reset(void)
+ 	assert(!allocation && !pm_enabled && !children);
+ 	count = 0;
+ 	failure = 0;
++	write_count = 0;
++	write_value = 0;
++	write_addr = NULL;
+ 	data = (struct mtk_mmsys_driver_data){ .runtime_pm = true };
+ }
+ int main(void)
+@@ -163,6 +179,26 @@ int main(void)
+ 	mtk_mmsys_remove(&pdev);
+ 	release_managed();
+ 	assert(count == 4 && events[2] == -30 && events[3] == -10);
+-	puts("MMSYS production probe/remove failure cleanup and managed PM/child ordering passed");
++	reset();
++	data.merge_irq_offset = 0x008;
++	assert(mtk_mmsys_probe(&pdev) == 0);
++	((struct mtk_mmsys *)allocation)->regs = (void *)0x1000;
++	write_count = 0;
++	assert(mtk_mmsys_runtime_resume(&pdev.dev) == 0);
++	assert(write_count == 1 && write_value == 0 &&
++	       write_addr == (void *)0x1000 + 0x008);
++	assert(pm_enabled && children && count == 3 && allocation);
++	mtk_mmsys_remove(&pdev);
++	release_managed();
++	reset();
++	data.merge_irq_offset = 0;
++	assert(mtk_mmsys_probe(&pdev) == 0);
++	((struct mtk_mmsys *)allocation)->regs = (void *)0x1000;
++	write_count = 0;
++	assert(mtk_mmsys_runtime_resume(&pdev.dev) == 0);
++	assert(write_count == 0 && pm_enabled && children && count == 3);
++	mtk_mmsys_remove(&pdev);
++	release_managed();
++	puts("MMSYS production probe/remove failure cleanup, managed PM/child ordering and merge IRQ resume passed");
+ 	return 0;
+ }
+diff --git a/tools/testing/selftests/mtk_clk/test_display_pm.py b/tools/testing/selftests/mtk_clk/test_display_pm.py
+index 9fb7dc51a2..432f0b9436 100755
+--- a/tools/testing/selftests/mtk_clk/test_display_pm.py
++++ b/tools/testing/selftests/mtk_clk/test_display_pm.py
+@@ -25,18 +25,27 @@ def function(source, name):
+ mutex = (repo / 'drivers/soc/mediatek/mtk-mutex.c').read_text()
+ mmsys = (repo / 'drivers/soc/mediatek/mtk-mmsys.c').read_text()
+ crtc = (repo / 'drivers/gpu/drm/mediatek/mtk_crtc.c').read_text()
+-for source, names in [(mutex, ['mt6897_dispsys0_mutex_driver_data',
+-                              'mt6897_dispsys1_mutex_driver_data',
+-                              'mt6897_ovlsys_mutex_driver_data']),
+-                      (mmsys, ['mt6897_dispsys0_driver_data',
+-                               'mt6897_dispsys1_driver_data',
+-                               'mt6897_ovlsys_driver_data'])]:
++for source, names, check_merge in [
++        (mutex, ['mt6897_dispsys0_mutex_driver_data',
++                 'mt6897_dispsys1_mutex_driver_data',
++                 'mt6897_ovlsys_mutex_driver_data'], False),
++        (mmsys, ['mt6897_dispsys0_driver_data',
++                 'mt6897_dispsys1_driver_data',
++                 'mt6897_ovlsys_driver_data'], True)]:
+     assert source.count('.runtime_pm = true') == len(names)
+     for name in names:
+-        assert '.runtime_pm = true' in source.split(name + ' = {', 1)[1].split('};', 1)[0]
++        block = source.split(name + ' = {', 1)[1].split('};', 1)[0]
++        assert '.runtime_pm = true' in block
++        if check_merge:
++            assert '.merge_irq_offset = MT6897_MMSYS_INTMERGE' in block
+ probe = function(mmsys, 'mtk_mmsys_probe')
+ assert probe.index('platform_set_drvdata') < probe.index('devm_pm_runtime_enable') < probe.index('devm_of_platform_populate') < probe.index('"mediatek-drm"')
+ assert 'platform_device_unregister(clks)' not in probe
++resume = function(mmsys, 'mtk_mmsys_runtime_resume')
++assert resume.index('merge_irq_offset') < resume.index('writel_relaxed')
++assert 'writel_relaxed(0, mmsys->regs + mmsys->data->merge_irq_offset)' in resume
++assert 'RUNTIME_PM_OPS(NULL, mtk_mmsys_runtime_resume, NULL)' in mmsys
++assert '.pm = pm_ptr(&mtk_mmsys_pm_ops)' in mmsys
+ mutex_probe = function(mutex, 'mtk_mutex_probe')
+ assert mutex_probe.index('mtx->dev = dev') < mutex_probe.index('devm_pm_runtime_enable')
+ init = function(crtc, 'mtk_crtc_ddp_hw_init')
+@@ -45,8 +54,10 @@ assert 'for (i = 0; i < mtk_crtc->num_controllers; i++)\n\t\tmtk_mutex_unprepare
+ production = '\n'.join([function(mutex, 'mtk_mutex_prepare'),
+                          function(mutex, 'mtk_mutex_unprepare'),
+                          function(crtc, 'mtk_crtc_mutex_prepare')])
+-mmsys_production = '\n'.join([function(mmsys, 'mtk_mmsys_probe'),
+-                                 function(mmsys, 'mtk_mmsys_remove')])
++mmsys_production = '\n'.join([
++    function(mmsys, 'mtk_mmsys_runtime_resume'),
++    function(mmsys, 'mtk_mmsys_probe'),
++    function(mmsys, 'mtk_mmsys_remove')])
+ for asset, functions in [('display_pm_cases.c', production),
+                          ('mmsys_pm_cases.c', mmsys_production)]:
+     with tempfile.TemporaryDirectory(prefix='mtk-display-pm-') as tmp:
+-- 
+2.56.0
+

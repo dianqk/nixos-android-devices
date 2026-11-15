@@ -1,0 +1,600 @@
+From 91ef64e5d40bdc0094962750ff10b487f1804885 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] misc: mediatek: adapt MT6897 CCIF and DPMAIF transport
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adapt CCIF and DPMAIF to MT6897 resources and kernel APIs. Preserve
+interrupt startup gating, empty-DATA0 handling and shared-memory layout.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T08:13:54+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T08:44:42+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T08:45:00+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T08:45:08+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T09:35:55+08:00
+Link: https://github.com/MiCode/MTK_kernel_device_modules (commit 3c4ccd07d5624879555ec710c11bb8818e5cb5c6, drivers/misc/mediatek/eccci, drivers/misc/mediatek/ccmni)
+Source commit: 3c4ccd07d562 "Kernel: Xiaomi kernel_device_modules changes for
+Redmi K70E Android U" by 何发云 <hefayun@xiaomi.com>, 2024-01-12.
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Link: https://github.com/MT6895-Mainline/linux/tree/qqcandy (the MT6895 port, used as a reference for the sysctl path)
+Link: https://github.com/MT6895-Mainline/linux/tree/qqcandy (CCIF access rules on MT6895)
+Link: https://github.com/MT6895-Mainline/linux/commit/b6b10965446e21e80e875a97aeb14e53212b4a9d (qqcandy branch, Furruka)
+---
+ drivers/misc/mediatek/eccci/hif/Makefile      | 73 --------------
+ .../misc/mediatek/eccci/hif/ccci_dpmaif_com.c | 15 +--
+ .../mediatek/eccci/hif/ccci_dpmaif_debug.c    |  2 +-
+ .../mediatek/eccci/hif/ccci_dpmaif_debug.h    |  2 -
+ .../mediatek/eccci/hif/ccci_dpmaif_drv_v1.c   |  6 +-
+ .../mediatek/eccci/hif/ccci_dpmaif_drv_v2.c   |  6 +-
+ .../mediatek/eccci/hif/ccci_dpmaif_drv_v3.c   | 10 +-
+ .../eccci/hif/ccci_dpmaif_page_pool.c         | 13 +--
+ .../misc/mediatek/eccci/hif/ccci_hif_ccif.c   | 94 +++++++++++++++++--
+ .../misc/mediatek/eccci/hif/ccci_hif_ccif.h   |  5 +
+ .../misc/mediatek/eccci/hif/ccci_ringbuf.c    |  4 +-
+ .../misc/mediatek/eccci/hif/md_spd_dvfs_fn.c  |  6 ++
+ drivers/misc/mediatek/eccci/hif/net_speed.c   |  2 +-
+ 13 files changed, 118 insertions(+), 120 deletions(-)
+ delete mode 100644 drivers/misc/mediatek/eccci/hif/Makefile
+
+diff --git a/drivers/misc/mediatek/eccci/hif/Makefile b/drivers/misc/mediatek/eccci/hif/Makefile
+deleted file mode 100644
+index 2cd60c654b..0000000000
+--- a/drivers/misc/mediatek/eccci/hif/Makefile
++++ /dev/null
+@@ -1,73 +0,0 @@
+-#
+-# Copyright (C) 2016 MediaTek Inc.
+-#
+-# This program is free software; you can redistribute it and/or modify
+-# it under the terms of the GNU General Public License version 2 as
+-# published by the Free Software Foundation.
+-#
+-# This program is distributed in the hope that it will be useful,
+-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+-# See http://www.gnu.org/licenses/gpl-2.0.html for more details.
+-#
+-
+-ifeq ($(CONFIG_MTK_ECCCI_DRIVER), m)
+-ccflags-y += -DCCCI_KMODULE_ENABLE
+-
+-#ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/inc
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/platform
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/base/power/mt6873
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/base/power/include
+-#ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/include/
+-
+-# ccci_ccif.ko
+-
+-ccci_ccif-y := ccci_ringbuf.o ccci_hif_ccif.o
+-obj-$(CONFIG_MTK_ECCCI_DRIVER) += ccci_ccif.o
+-
+-# ccci_dpmaif.ko
+-
+-ccci_dpmaif-y := net_pool.o md_spd_dvfs_fn.o md_spd_dvfs_method.o net_speed.o \
+-	ccci_dpmaif_com.o ccci_dpmaif_bat.o ccci_dpmaif_debug.o ccci_dpmaif_resv_mem.o \
+-	ccci_dpmaif_drv_com.o ccci_dpmaif_drv_v1.o ccci_dpmaif_drv_v2.o ccci_dpmaif_drv_v3.o
+-
+-ifeq ($(CONFIG_PAGE_POOL), y)
+-ccflags-y += -DRX_PAGE_POOL
+-ccci_dpmaif-y += ccci_dpmaif_page_pool.o
+-endif
+-obj-$(CONFIG_MTK_ECCCI_DRIVER) += ccci_dpmaif.o
+-
+-# ccci_cldma.ko
+-ccci_cldma-y := ccci_cldma_plat.o ccci_hif_cldma.o
+-obj-$(CONFIG_MTK_ECCCI_DRIVER) += ccci_cldma.o
+-
+-endif
+-
+-
+-ifeq ($(CONFIG_MTK_ECCCI_DRIVER), y)
+-
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/inc
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/eccci/platform
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/scp/mt6873
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/base/power/mt6873
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/base/power/include
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/conn_md/include/
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/scp/mt6873
+-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/include/
+-
+-
+-# hif objects
+-obj-$(CONFIG_MTK_ECCCI_DRIVER) := ccci_hif_all.o
+-ccci_hif_all-y := ccci_hif.o \
+-		ccci_cldma_plat.o \
+-		ccci_hif_cldma.o \
+-		net_pool.o md_spd_dvfs_fn.o md_spd_dvfs_method.o net_speed.o \
+-		ccci_dpmaif_com.o ccci_dpmaif_bat.o ccci_dpmaif_debug.o ccci_dpmaif_resv_mem.o \
+-		ccci_dpmaif_drv_com.o ccci_dpmaif_drv_v1.o ccci_dpmaif_drv_v2.o ccci_dpmaif_drv_v3.o
+-
+-ccci_hif_all-y += ccci_ringbuf.o ccci_hif_ccif.o
+-
+-endif
+-
+diff --git a/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_com.c b/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_com.c
+index 9f8f23989f..f4b823ff52 100644
+--- a/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_com.c
++++ b/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_com.c
+@@ -293,9 +293,7 @@ static inline int dpmaif_skb_gro_receive(struct sk_buff *p, struct sk_buff *skb)
+ 
+ 		pinfo->nr_frags = nr_frags + 1 + skbinfo->nr_frags;
+ 
+-		__skb_frag_set_page(frag, page);
+-		skb_frag_off_set(frag, first_offset);
+-		skb_frag_size_set(frag, first_size);
++		skb_frag_fill_page_desc(frag, page, first_offset, first_size);
+ 
+ 		memcpy(frag + 1, skbinfo->frags, sizeof(*frag) * skbinfo->nr_frags);
+ 		/* We dont need to clear skbinfo->nr_frags here */
+@@ -1498,8 +1496,8 @@ static int dpmaif_txq_sw_init(struct dpmaif_tx_queue *txq)
+ 
+ 	init_waitqueue_head(&txq->txq_done_wait);
+ 	atomic_set(&txq->txq_done, 0);
+-	hrtimer_init(&txq->txq_done_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+-	txq->txq_done_timer.function = txq_done_timer_action;
++	hrtimer_setup(&txq->txq_done_timer, txq_done_timer_action,
++		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 	txq->txq_done_thread = NULL;
+ 
+ 	spin_lock_init(&txq->txq_lock);
+@@ -3078,11 +3076,8 @@ static int dpmaif_init_com(struct device *dev)
+ 		if (!dev->dma_parms)
+ 			CCCI_ERROR_LOG(0, TAG, "[%s] warning: devm_kzalloc() fail.\n", __func__);
+ 	}
+-	if (dev->dma_parms) {
+-		if (dma_set_max_seg_size(dev, UINT_MAX))
+-			CCCI_ERROR_LOG(0, TAG,
+-				"[%s] warning: dma_set_max_seg_size() fail.\n", __func__);
+-	}
++	if (dev->dma_parms)
++		dma_set_max_seg_size(dev, UINT_MAX);
+ 
+ 	/* hook up to device */
+ 	dev->platform_data = dpmaif_ctl; /* maybe no need */
+diff --git a/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_debug.c b/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_debug.c
+index c90772e050..4605244365 100644
+--- a/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_debug.c
++++ b/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_debug.c
+@@ -386,7 +386,7 @@ static const struct proc_ops g_dpmaif_debug_fops = {
+ 	.proc_release = dpmaif_debug_close,
+ };
+ 
+-void ccci_dpmaif_isr_record_init(void)
++static void ccci_dpmaif_isr_record_init(void)
+ {
+ #ifdef ENABLE_DPMAIF_ISR_LOG
+ 	unsigned int i;
+diff --git a/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_debug.h b/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_debug.h
+index 1f4e1926de..0ba53e5234 100644
+--- a/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_debug.h
++++ b/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_debug.h
+@@ -176,8 +176,6 @@ int ccci_dpmaif_record_isr_cnt(unsigned long long ts, struct dpmaif_rx_queue *rx
+ 		unsigned int L2TISAR0, unsigned int L2RISAR0);
+ 
+ #if IS_ENABLED(CONFIG_MTK_AEE_IPANIC)
+-extern int mrdump_mini_add_extra_file(unsigned long vaddr, unsigned long paddr,
+-	unsigned long size, const char *name);
+ #endif
+ #endif
+ 
+diff --git a/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_drv_v1.c b/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_drv_v1.c
+index fec07e519c..79b1d549d5 100644
+--- a/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_drv_v1.c
++++ b/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_drv_v1.c
+@@ -137,7 +137,7 @@ void ccci_drv1_dl_set_ao_frag_check_thres(void)
+ 	DPMA_WRITE_AO_DL(DPMAIF_AO_DL_RDY_CHK_FRG_THRES, value);
+ }
+ 
+-void ccci_drv3_ul_arb_en(unsigned char q_num, bool enable)
++static void __maybe_unused ccci_drv3_ul_arb_en(unsigned char q_num, bool enable)
+ {
+ 	unsigned int ul_arb_en;
+ 
+@@ -215,12 +215,12 @@ static unsigned int drv1_ul_get_rwidx(unsigned char q_num)
+ 	return DPMA_READ_AO_UL(DPMAIF_ULQ_STA0_n(q_num));
+ }
+ 
+-unsigned int drv1_ul_get_rdidx(unsigned char q_num)
++static unsigned int drv1_ul_get_rdidx(unsigned char q_num)
+ {
+ 	return DPMA_READ_PD_UL(DPMAIF_ULQ_STA0_n(q_num)) & 0x0000FFFF;
+ }
+ 
+-void ccci_drv1_mask_ul_que_interrupt(unsigned char q_num)
++static void ccci_drv1_mask_ul_que_interrupt(unsigned char q_num)
+ {
+ 	unsigned int ui_que_done_mask;
+ 
+diff --git a/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_drv_v2.c b/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_drv_v2.c
+index ad12b55c48..0673242ef4 100644
+--- a/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_drv_v2.c
++++ b/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_drv_v2.c
+@@ -323,7 +323,7 @@ void ccci_drv2_dl_set_ao_chksum_en(bool enable)
+ 	DPMA_WRITE_AO_DL(DPMAIF_AO_DL_RDY_CHK_THRES, value);
+ }
+ 
+-void drv2_dl_set_apit_idx(unsigned int idx)
++static void drv2_dl_set_apit_idx(unsigned int idx)
+ {
+ 	unsigned int value;
+ 
+@@ -764,12 +764,12 @@ static unsigned int drv2_ul_get_rwidx(unsigned char q_num)
+ 	return DPMA_READ_AO_UL(DPMAIF_ULQ_STA0_n(q_num));
+ }
+ 
+-unsigned int drv2_ul_get_rdidx(unsigned char q_num)
++static unsigned int drv2_ul_get_rdidx(unsigned char q_num)
+ {
+ 	return (DPMA_READ_AO_UL(DPMAIF_ULQ_STA0_n(q_num)) >> 16) & 0x0000FFFF;
+ }
+ 
+-void ccci_drv2_mask_ul_que_interrupt(unsigned char q_num)
++static void ccci_drv2_mask_ul_que_interrupt(unsigned char q_num)
+ {
+ 	unsigned int ui_que_done_mask;
+ 
+diff --git a/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_drv_v3.c b/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_drv_v3.c
+index 27c165b884..513729a8f6 100644
+--- a/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_drv_v3.c
++++ b/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_drv_v3.c
+@@ -492,12 +492,12 @@ static void drv3_unmask_dl_interrupt(void)
+ 	DPMA_WRITE_AO_UL(NRL2_DPMAIF_AO_UL_APDL_L2TIMCR0, DPMAIF_DL_INT_QDONE_MSK);
+ }
+ 
+-void drv3_unmask_dl_lro0_interrupt(void)
++static void drv3_unmask_dl_lro0_interrupt(void)
+ {
+ 	DPMA_WRITE_AO_UL(NRL2_DPMAIF_AO_UL_APDL_L2TIMCR0, DPMAIF_DL_INT_LRO0_QDONE_MSK);
+ }
+ 
+-void drv3_unmask_dl_lro1_interrupt(void)
++static void drv3_unmask_dl_lro1_interrupt(void)
+ {
+ 	DPMA_WRITE_AO_UL(NRL2_DPMAIF_AO_UL_APDL_L2TIMCR0, DPMAIF_DL_INT_LRO1_QDONE_MSK);
+ }
+@@ -1089,7 +1089,7 @@ static void drv3_dl_lro_pit_en(bool enable)
+ 	DPMA_WRITE_PD_DL_LRO(NRL2_DPMAIF_DL_LROPIT_INIT_CON3, value);
+ }
+ 
+-void drv3_dl_set_ao_lro_pit_chknum(unsigned int pit_idx)
++static void drv3_dl_set_ao_lro_pit_chknum(unsigned int pit_idx)
+ {
+ 	unsigned int value;
+ 
+@@ -1552,7 +1552,7 @@ static void drv3_hw_reset_v1(void)
+ 
+ static int drv3_setting_hw_reset_func(void)
+ {
+-	int ret;
++	__maybe_unused int ret;
+ 	int hw_reset_ver = 0;
+ 	struct device_node *node;
+ 
+@@ -1634,7 +1634,7 @@ static int drv3_dl_add_lro0_pit_remain_cnt(unsigned short pit_remain_cnt)
+ static int drv3_dl_add_lro1_pit_remain_cnt(unsigned short pit_remain_cnt)
+ {
+ 	unsigned int dl_update;
+-	int count = 0, ret = 0;
++	__maybe_unused int count = 0, ret = 0;
+ 
+ 	dl_update = (pit_remain_cnt & 0x0003FFFF);
+ 	dl_update |= (DPMAIF_DL_ADD_UPDATE | DPMAIF_ADD_LRO_PIT_CHAN_OFS);
+diff --git a/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_page_pool.c b/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_page_pool.c
+index a3e9d18cd9..58fcceba57 100644
+--- a/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_page_pool.c
++++ b/drivers/misc/mediatek/eccci/hif/ccci_dpmaif_page_pool.c
+@@ -70,21 +70,12 @@ static struct ctl_table devalloc_threshold_table[] = {
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+ 	},
+-	{}
+-};
+-static struct ctl_table devalloc_threshold_root[] = {
+-	{
+-		.procname	= "net",
+-		.mode		= 0555,
+-		.child		= devalloc_threshold_table,
+-	},
+-	{}
+ };
+ 
+ static struct ctl_table_header *sysctl_header;
+ static int register_devalloc_threshold_sysctl(void)
+ {
+-	sysctl_header = register_sysctl_table(devalloc_threshold_root);
++	sysctl_header = register_sysctl("net/ccci_dpmaif", devalloc_threshold_table);
+ 	if (sysctl_header == NULL) {
+ 		pr_info("CCCI:dpmaif:register devalloc_threshold failed\n");
+ 		return -1;
+@@ -192,7 +183,7 @@ void ccci_dpmaif_create_page_pool(unsigned int index)
+ }
+ 
+ 
+-void ccci_dpmaif_destroy_page_pool(struct page_pool *g_page_pool)
++static void __maybe_unused ccci_dpmaif_destroy_page_pool(struct page_pool *g_page_pool)
+ {
+ 	page_pool_destroy(g_page_pool);
+ }
+diff --git a/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c b/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c
+index 79b5d42b3c..52b3d5a026 100644
+--- a/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c
++++ b/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c
+@@ -786,13 +786,10 @@ static void md_ccif_launch_work(struct md_ccif_ctrl *ccif_ctrl)
+ }
+ 
+ /* CCIF interrupt 1 handler: mainly for communication notification */
+-static irqreturn_t md_ccif_isr0(int irq, void *data)
++static void md_ccif_process_data0(struct md_ccif_ctrl *ccif_ctrl,
++				  unsigned int ch_id)
+ {
+-	struct md_ccif_ctrl *ccif_ctrl = (struct md_ccif_ctrl *)data;
+-	unsigned int ch_id, i;
+-
+-	/*must ack first, otherwise IRQ will rush in */
+-	ch_id = ccif_read32(ccif_ctrl->ccif_ap_base, APCCIF_RCHNUM);
++	unsigned int i;
+ 
+ 	for (i = 0; i < CCIF_CH_NUM; i++)
+ 		if (ch_id & 0x1 << i) {
+@@ -815,6 +812,67 @@ static irqreturn_t md_ccif_isr0(int irq, void *data)
+ 		md_ccif_launch_work(ccif_ctrl);
+ 	} else // before 6293, maybe can be phased-out
+ 		md_ccif_handle_exception(ccif_ctrl);
++}
++
++#define CCIF_EMPTY_IRQ_POLL_MS 20
++
++/*
++ * The level DATA0 interrupt can be pending with no channel in RCHNUM (or
++ * with the CCIF gated, when every read returns 0): acknowledging 0 cannot
++ * clear it and the handler would re-enter until the watchdog resets the
++ * board. Mask it then and poll RCHNUM until a channel shows up, or leave it
++ * masked until the next start when the CCIF is off.
++ */
++static void md_ccif_data0_poll(struct work_struct *work)
++{
++	struct md_ccif_ctrl *ccif_ctrl = container_of(to_delayed_work(work),
++		struct md_ccif_ctrl, data0_poll_work);
++	unsigned int ch_id;
++
++	if (READ_ONCE(ccif_ctrl->ccif_state) != HIFCCIF_STATE_PWRON)
++		return;
++
++	ch_id = ccif_read32(ccif_ctrl->ccif_ap_base, APCCIF_RCHNUM);
++	if (!ch_id) {
++		ccif_ctrl->data0_empty_polls++;
++		if (ccif_ctrl->data0_empty_polls == 1 ||
++		    !(ccif_ctrl->data0_empty_polls % 50))
++			CCCI_NOTICE_LOG(0, TAG,
++				"DATA0 masked after an empty interrupt, poll %u\n",
++				ccif_ctrl->data0_empty_polls);
++		mod_delayed_work(system_wq, &ccif_ctrl->data0_poll_work,
++			msecs_to_jiffies(CCIF_EMPTY_IRQ_POLL_MS));
++		return;
++	}
++
++	md_ccif_process_data0(ccif_ctrl, ch_id);
++	CCCI_NOTICE_LOG(0, TAG, "DATA0 polling found ch 0x%x after %u polls\n",
++		ch_id, ccif_ctrl->data0_empty_polls);
++	if (READ_ONCE(ccif_ctrl->ccif_state) == HIFCCIF_STATE_PWRON &&
++	    atomic_cmpxchg(&ccif_ctrl->data0_irq_masked, 1, 0) == 1)
++		enable_irq(ccif_ctrl->ap_ccif_irq0_id);
++}
++
++static irqreturn_t md_ccif_isr0(int irq, void *data)
++{
++	struct md_ccif_ctrl *ccif_ctrl = (struct md_ccif_ctrl *)data;
++	unsigned int ch_id;
++
++	/*must ack first, otherwise IRQ will rush in */
++	ch_id = ccif_read32(ccif_ctrl->ccif_ap_base, APCCIF_RCHNUM);
++	if (!ch_id) {
++		if (atomic_cmpxchg(&ccif_ctrl->data0_irq_masked, 0, 1) == 0) {
++			ccif_ctrl->data0_empty_polls = 0;
++			disable_irq_nosync(irq);
++			mod_delayed_work(system_wq, &ccif_ctrl->data0_poll_work,
++				msecs_to_jiffies(CCIF_EMPTY_IRQ_POLL_MS));
++			CCCI_NOTICE_LOG(0, TAG,
++				"DATA0 interrupt without a channel: masked\n");
++		}
++		return IRQ_HANDLED;
++	}
++
++	md_ccif_process_data0(ccif_ctrl, ch_id);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -1078,6 +1136,8 @@ static int md_ccif_start_queue(unsigned char hif_id,
+ #define PCCIF_ACK (0x14)
+ #define PCCIF_CHDATA (0x100)
+ #define PCCIF_SRAM_SIZE (512)
++void ccci_reset_ccif_hw(int ccif_id, void __iomem *baseA,
++	void __iomem *baseB, struct md_ccif_ctrl *ccif_ctrl);
+ void ccci_reset_ccif_hw(int ccif_id, void __iomem *baseA,
+ 	void __iomem *baseB, struct md_ccif_ctrl *ccif_ctrl)
+ {
+@@ -1532,6 +1592,13 @@ static int ccif_start(unsigned char hif_id)
+ 	ccci_reset_ccif_hw(AP_MD1_CCIF, ccif_ctrl->ccif_ap_base,
+ 		ccif_ctrl->ccif_md_base, ccif_ctrl);
+ 	ccif_enable_irq1(CCIF_HIF_ID);
++	if (!ccif_ctrl->irq0_armed) {
++		ccif_ctrl->irq0_armed = true;
++		enable_irq(ccif_ctrl->ap_ccif_irq0_id);
++	} else if (atomic_cmpxchg(&ccif_ctrl->data0_irq_masked, 1, 0) == 1) {
++		/* masked by an empty interrupt before the last stop */
++		enable_irq(ccif_ctrl->ap_ccif_irq0_id);
++	}
+ 	ccif_ctrl->ccif_state = HIFCCIF_STATE_PWRON;
+ 	CCCI_NORMAL_LOG(0, TAG, "%s\n", __func__);
+ 	return 0;
+@@ -1548,6 +1615,7 @@ static int ccif_stop(unsigned char hif_id)
+ 	 * we may send something after MD slept
+ 	 */
+ 	ccif_ctrl->ccif_state = HIFCCIF_STATE_PWROFF;
++	cancel_delayed_work_sync(&ccif_ctrl->data0_poll_work);
+ 	ccci_reset_ccif_hw(AP_MD1_CCIF,
+ 		ccif_ctrl->ccif_ap_base, ccif_ctrl->ccif_md_base, ccif_ctrl);
+ 
+@@ -1679,8 +1747,14 @@ static int ccif_hif_hw_init(struct device *dev, struct md_ccif_ctrl *ccif_ctrl)
+ 	dev->coherent_dma_mask = ccif_dmamask;
+ 	dev->platform_data = ccif_ctrl;
+ 
++	/*
++	 * Left disabled until the first start: its handler reads CCIF
++	 * registers, whose clocks are only switched on at start, and the
++	 * modem LK started may ring before.
++	 */
+ 	ret = request_irq(ccif_ctrl->ap_ccif_irq0_id, md_ccif_isr0,
+-			IRQF_TRIGGER_NONE, "CCIF_AP_DATA0", ccif_ctrl);
++			IRQF_TRIGGER_NONE | IRQF_NO_AUTOEN, "CCIF_AP_DATA0",
++			ccif_ctrl);
+ 	if (ret) {
+ 		CCCI_ERROR_LOG(0, TAG,
+ 			"request CCIF_AP_DATA IRQ0(%d) error %d\n",
+@@ -1751,7 +1825,7 @@ static int ccif_hif_hw_init(struct device *dev, struct md_ccif_ctrl *ccif_ctrl)
+ 
+ }
+ 
+-int ccci_ccif_hif_init(struct platform_device *pdev, unsigned char hif_id)
++static int ccci_ccif_hif_init(struct platform_device *pdev, unsigned char hif_id)
+ {
+ 	int i, ret;
+ 	struct md_ccif_ctrl *ccif_ctrl;
+@@ -1765,6 +1839,8 @@ int ccci_ccif_hif_init(struct platform_device *pdev, unsigned char hif_id)
+ 		return -1;
+ 	}
+ 	INIT_WORK(&ccif_ctrl->ccif_sram_work, md_ccif_sram_rx_work);
++	INIT_DELAYED_WORK(&ccif_ctrl->data0_poll_work, md_ccif_data0_poll);
++	atomic_set(&ccif_ctrl->data0_irq_masked, 0);
+ 	INIT_WORK(&ccif_ctrl->ccif_status_notify_work, ccif_queue_status_notify_work);
+ 
+ 	timer_setup(&ccif_ctrl->traffic_monitor,
+@@ -1803,7 +1879,7 @@ int ccci_ccif_hif_init(struct platform_device *pdev, unsigned char hif_id)
+ 	return 0;
+ }
+ 
+-int ccci_hif_ccif_probe(struct platform_device *pdev)
++static int ccci_hif_ccif_probe(struct platform_device *pdev)
+ {
+ 	int ret;
+ 
+diff --git a/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.h b/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.h
+index fb6655f7b4..25f9e6c88c 100644
+--- a/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.h
++++ b/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.h
+@@ -117,6 +117,11 @@ struct md_ccif_ctrl {
+ 	unsigned char hif_id;
+ 	struct ccci_hif_traffic traffic_info;
+ 	struct timer_list traffic_monitor;
++	bool irq0_armed; /* CCIF_AP_DATA0 enabled at the first start */
++	/* CCIF_AP_DATA0 masked after an entry without a channel, polled */
++	struct delayed_work data0_poll_work;
++	atomic_t data0_irq_masked;
++	unsigned int data0_empty_polls;
+ 
+ 	struct ccci_hif_ops *ops;
+ 	struct platform_device *plat_dev;
+diff --git a/drivers/misc/mediatek/eccci/hif/ccci_ringbuf.c b/drivers/misc/mediatek/eccci/hif/ccci_ringbuf.c
+index 0be4a0824b..2ac3872ec1 100644
+--- a/drivers/misc/mediatek/eccci/hif/ccci_ringbuf.c
++++ b/drivers/misc/mediatek/eccci/hif/ccci_ringbuf.c
+@@ -202,7 +202,7 @@ int ccci_ringbuf_write(struct ccci_ringbuf *ringbuf,
+ 	unsigned char *data, int data_len)
+ {
+ 	int aligned_data_len;
+-	unsigned int read, write, length;
++	__maybe_unused unsigned int read, write, length;
+ 	unsigned char *tx_buffer = NULL;
+ 	unsigned char *h_ptr = NULL;
+ 
+@@ -340,7 +340,7 @@ int ccci_ringbuf_readable(struct ccci_ringbuf *ringbuf)
+ int ccci_ringbuf_read(struct ccci_ringbuf *ringbuf,
+ 	unsigned char *buf, int read_size)
+ {
+-	unsigned int read, write, length;
++	__maybe_unused unsigned int read, write, length;
+ 
+ 	if (ringbuf == NULL || read_size == 0 || buf == NULL)
+ 		return -CCCI_RINGBUF_PARAM_ERR;
+diff --git a/drivers/misc/mediatek/eccci/hif/md_spd_dvfs_fn.c b/drivers/misc/mediatek/eccci/hif/md_spd_dvfs_fn.c
+index 9894fc4afc..30acbe9cc2 100644
+--- a/drivers/misc/mediatek/eccci/hif/md_spd_dvfs_fn.c
++++ b/drivers/misc/mediatek/eccci/hif/md_spd_dvfs_fn.c
+@@ -46,6 +46,7 @@ static void cpu_cluster_freq_tbl_init(void)
+ 		if (policy) {
+ 			s_cluster_num++;
+ 			cpu = cpumask_last(policy->related_cpus);
++			cpufreq_cpu_put(policy);
+ 		}
+ 	}
+ 
+@@ -74,17 +75,20 @@ static void cpu_cluster_freq_tbl_init(void)
+ 			continue;
+ 		if (i >= s_cluster_num) {
+ 			pr_info("ccci: spd: %s fail: i >= s_cluster_num\n", __func__);
++			cpufreq_cpu_put(policy);
+ 			kfree(s_tchbst_rq);
+ 			return;
+ 		}
+ 		freq_qos_add_request(&policy->constraints, &(s_tchbst_rq[i]), FREQ_QOS_MIN, 0);
+ 		cpu = cpumask_last(policy->related_cpus);
++		cpufreq_cpu_put(policy);
+ 		i++;
+ 	}
+ 
+ 	s_cluster_freq_rdy = 1;
+ }
+ 
++void mtk_ccci_qos_cpu_cluster_freq_update(int freq[], unsigned int num);
+ void mtk_ccci_qos_cpu_cluster_freq_update(int freq[], unsigned int num)
+ {
+ 	unsigned int min_num = s_cluster_num > num ? num : s_cluster_num;
+@@ -116,6 +120,7 @@ void mtk_ccci_qos_cpu_cluster_freq_update(int freq[], unsigned int num)
+ static struct device_node *np_node;
+ static struct icc_path *net_icc_path;
+ 
++void mtk_ccci_qos_dram_update(int lvl);
+ void mtk_ccci_qos_dram_update(int lvl)
+ {
+ 	static int curr_lvl = -1;
+@@ -161,6 +166,7 @@ static void qos_dram_init(struct device *dev)
+ 	}
+ }
+ 
++void mtk_ccci_md_spd_qos_init(void *dev);
+ void mtk_ccci_md_spd_qos_init(void *dev)
+ {
+ 	cpu_cluster_freq_tbl_init();
+diff --git a/drivers/misc/mediatek/eccci/hif/net_speed.c b/drivers/misc/mediatek/eccci/hif/net_speed.c
+index 2524210706..6d8a454ae9 100644
+--- a/drivers/misc/mediatek/eccci/hif/net_speed.c
++++ b/drivers/misc/mediatek/eccci/hif/net_speed.c
+@@ -340,7 +340,7 @@ static int speed_calculate_in_thread(void *arg)
+ {
+ 	s64 start_tick, start_tick_500ms, end_tick;
+ 	int i = 0;
+-	int exit_cnt, ret;
++	__maybe_unused int exit_cnt, ret;
+ 
+ again:
+ 	exit_cnt = 5;
+-- 
+2.56.0
+

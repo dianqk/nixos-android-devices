@@ -1,0 +1,314 @@
+From c2266bb4115322d528b69dcc330ac77263a606dc Mon Sep 17 00:00:00 2001
+From: Tatsuki Tanaka <tatsuki@tanakatatsuki.dev>
+Date: Fri, 9 Oct 2026 18:40:28 +0800
+Subject: [PATCH] ASoC: qcom: audioreach: support topology-driven legacy TDM
+ modules
+
+Keep the legacy TDM endpoints for the SM8475 ADSP and configure them from the same framing and lane tokens as Audio IF.
+
+Source changes (original messages and trailers follow).
+
+Source-commit: f56af7557d15cfb10cef112c0b3c41da986c52b6
+Source-author: Tatsuki Tanaka <tatsuki@tanakatatsuki.dev>
+Source-date: 2026-10-09T18:40:28+08:00
+Link: https://github.com/iLtanaka/linux-marble/commit/3a2d02f13d1e22a50a12902aa273ad3aaf76457c
+Imported-from: pkgs/linux-kernel/sm7475/marble/patches/linux-marble/0052-ASoC-qcom-audioreach-add-TDM-DAI-ops-and-modules.patch
+
+ASoC: qcom: audioreach: add TDM DAI ops and modules
+
+Add TDM sink and source graph modules, tertiary TDM bit clock support,
+and AudioReach DAI operations for multi-channel TDM routing on SM8450.
+
+Signed-off-by: Tatsuki Tanaka <tatsuki@tanakatatsuki.dev>
+
+(cherry picked from commit 3a2d02f13d1e22a50a12902aa273ad3aaf76457c)
+
+Conflict resolution for Linux 7.3: 7.3 already has TDM DAI operations
+(4d0840175893: q6tdm_ops with set_tdm_slot) and stores the slot layout
+in audioreach_module_config.{slot_mask,nslots_per_frame,slot_width}
+(67605cbf8dfe); the q6apm-lpass-dais.c hunk is dropped and the TDM
+media format reads those fields instead of the tdm_* ones. The TDM
+sink/source modules, PARAM_ID_TDM_INTF_CFG/LANE_CFG, their topology
+loader case and the tertiary TDM clocks are kept as in the original.
+
+Source-commit: 9128f6e75db4c74893fe2b92d5a04121aece69ad
+Source-author: dianqk <dianqk@dianqk.net>
+Source-date: 2026-10-25T09:48:44+08:00
+Imported-from: pkgs/linux-kernel/sm7475/marble/patches/local/0053-ASoC-qcom-audioreach-take-legacy-TDM-framing-from-th.patch
+
+ASoC: qcom: audioreach: take legacy TDM framing from the topology
+
+The TDM sink/source modules (0x0700100E/0x0700100F) took their frame
+sync source, framing and data output enable from the DAI format set by
+the machine driver. In Linux 7.3 the sc8280xp TDM path only sets the
+clock provider (SND_SOC_DAIFMT_BP_FP), and the topology-driven Audio IF
+modules (67605cbf8dfe) describe the serial interface through topology
+tokens instead.
+
+Load the Audio IF tokens for the TDM modules as well (sync source, data
+output enable, sync mode, sync inversion, data delay, slot layout and
+active lanes) in addition to the I2S interface tokens, and build
+PARAM_ID_TDM_INTF_CFG from them. Slot count, width and mask still come
+from the DAI TDM slots first, then the topology, then the stream.
+
+The SM8475 ADSP of the Xiaomi Poco F5 (ADSP.HT.5.7-01183) registers the
+TDM, I2S and codec DMA endpoint modules but not MODULE_ID_AUDIO_IF_*
+(no 0x0700117C/0x0700117D in its image), so these boards need the
+legacy modules with a board topology.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sound/soc/qcom/qdsp6/audioreach.c   | 119 ++++++++++++++++++++++++++++
+ sound/soc/qcom/qdsp6/audioreach.h   |  36 +++++++++
+ sound/soc/qcom/qdsp6/q6prm-clocks.c |   2 +
+ sound/soc/qcom/qdsp6/q6prm.h        |   2 +
+ sound/soc/qcom/qdsp6/topology.c     |  12 +++
+ 5 files changed, 171 insertions(+)
+
+diff --git a/sound/soc/qcom/qdsp6/audioreach.c b/sound/soc/qcom/qdsp6/audioreach.c
+index 659381316d..85645ec2e6 100644
+--- a/sound/soc/qcom/qdsp6/audioreach.c
++++ b/sound/soc/qcom/qdsp6/audioreach.c
+@@ -190,6 +190,20 @@ struct apm_audio_if_module_intf_cfg {
+ 
+ #define APM_AUDIO_IF_INTF_CFG_PSIZE ALIGN(sizeof(struct apm_audio_if_module_intf_cfg), 8)
+ 
++struct apm_tdm_module_intf_cfg {
++	struct apm_module_param_data param_data;
++	struct param_id_tdm_intf_cfg cfg;
++} __packed;
++
++#define APM_TDM_INTF_CFG_PSIZE ALIGN(sizeof(struct apm_tdm_module_intf_cfg), 8)
++
++struct apm_tdm_module_lane_cfg {
++	struct apm_module_param_data param_data;
++	struct param_id_tdm_lane_cfg cfg;
++} __packed;
++
++#define APM_TDM_LANE_CFG_PSIZE ALIGN(sizeof(struct apm_tdm_module_lane_cfg), 8)
++
+ struct apm_module_hw_ep_mf_cfg {
+ 	struct apm_module_param_data param_data;
+ 	struct param_id_hw_ep_mf mf;
+@@ -1454,6 +1468,107 @@ static int audioreach_audio_if_set_media_format(struct q6apm_graph *graph,
+ 	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+ }
+ 
++static int audioreach_tdm_set_media_format(struct q6apm_graph *graph,
++					   const struct audioreach_module *module,
++					   const struct audioreach_module_config *cfg)
++{
++	struct apm_module_frame_size_factor_cfg *fs_cfg;
++	struct apm_module_param_data *param_data;
++	struct apm_tdm_module_intf_cfg *intf_cfg;
++	struct apm_tdm_module_lane_cfg *lane_cfg;
++	struct apm_module_hw_ep_mf_cfg *hw_cfg;
++	/*
++	 * Lane mask: the Audio IF active-lane token, else the I2S "sd line"
++	 * token (the original topology encoding). Without either the DSP
++	 * keeps its default lane.
++	 */
++	u16 lane_mask = module->active_lane_mask ? module->active_lane_mask :
++			module->sd_line_idx;
++	int ic_sz = APM_TDM_INTF_CFG_PSIZE;
++	int lc_sz = lane_mask ? APM_TDM_LANE_CFG_PSIZE : 0;
++	int ep_sz = APM_HW_EP_CFG_PSIZE;
++	/* stock AGM never sends PARAM_ID_HW_EP_FRAME_SIZE_FACTOR for TDM */
++	int fs_sz = 0;
++	int size = ic_sz + lc_sz + ep_sz + fs_sz;
++	/* Slot layout: machine driver (DAI TDM slots), topology, stream */
++	u16 nslots = cfg->nslots_per_frame ? cfg->nslots_per_frame :
++		     module->nslots_per_frame ? module->nslots_per_frame :
++		     cfg->num_channels;
++	u16 slot_width = cfg->slot_width ? cfg->slot_width :
++			 module->slot_width ? module->slot_width :
++			 cfg->bit_width;
++	u32 slot_mask = cfg->slot_mask ? cfg->slot_mask :
++			module->slot_mask ? module->slot_mask :
++			GENMASK(cfg->num_channels - 1, 0);
++	void *p;
++
++	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(size, APM_CMD_SET_CFG, 0);
++	if (IS_ERR(pkt))
++		return PTR_ERR(pkt);
++
++	p = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
++	intf_cfg = p;
++
++	param_data = &intf_cfg->param_data;
++	param_data->module_instance_id = module->instance_id;
++	param_data->error_code = 0;
++	param_data->param_id = PARAM_ID_TDM_INTF_CFG;
++	param_data->param_size = ic_sz - APM_MODULE_PARAM_DATA_SIZE;
++
++	/*
++	 * Frame sync source, data output enable and framing come from the
++	 * topology, using the Audio IF tokens (as for MODULE_ID_AUDIO_IF_*),
++	 * so the board topology describes the serial interface.
++	 */
++	intf_cfg->cfg.lpaif_type = module->hw_interface_type;
++	intf_cfg->cfg.intf_idx = module->hw_interface_idx;
++	intf_cfg->cfg.sync_src = module->sync_src;
++	intf_cfg->cfg.ctrl_data_out_enable = module->ctrl_data_out_enable;
++	intf_cfg->cfg.slot_mask = slot_mask;
++	intf_cfg->cfg.nslots_per_frame = nslots;
++	intf_cfg->cfg.slot_width = slot_width;
++	intf_cfg->cfg.sync_mode = module->sync_mode;
++	intf_cfg->cfg.ctrl_invert_sync_pulse = module->ctrl_invert_sync_pulse;
++	intf_cfg->cfg.ctrl_sync_data_delay = module->ctrl_sync_data_delay;
++
++	p += ic_sz;
++	if (lc_sz) {
++		lane_cfg = p;
++		param_data = &lane_cfg->param_data;
++		param_data->module_instance_id = module->instance_id;
++		param_data->error_code = 0;
++		param_data->param_id = PARAM_ID_TDM_LANE_CFG;
++		param_data->param_size = lc_sz - APM_MODULE_PARAM_DATA_SIZE;
++		lane_cfg->cfg.lane_mask = lane_mask;
++		p += lc_sz;
++	}
++
++	hw_cfg = p;
++	param_data = &hw_cfg->param_data;
++	param_data->module_instance_id = module->instance_id;
++	param_data->error_code = 0;
++	param_data->param_id = PARAM_ID_HW_EP_MF_CFG;
++	param_data->param_size = ep_sz - APM_MODULE_PARAM_DATA_SIZE;
++
++	hw_cfg->mf.sample_rate = cfg->sample_rate;
++	hw_cfg->mf.bit_width = cfg->bit_width;
++	hw_cfg->mf.num_channels = cfg->num_channels;
++	hw_cfg->mf.data_format = module->data_format;
++
++	if (fs_sz) {
++		p += ep_sz;
++		fs_cfg = p;
++		param_data = &fs_cfg->param_data;
++		param_data->module_instance_id = module->instance_id;
++		param_data->error_code = 0;
++		param_data->param_id = PARAM_ID_HW_EP_FRAME_SIZE_FACTOR;
++		param_data->param_size = fs_sz - APM_MODULE_PARAM_DATA_SIZE;
++		fs_cfg->frame_size_factor = 1;
++	}
++
++	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
++}
++
+ static int audioreach_logging_set_media_format(struct q6apm_graph *graph,
+ 					       const struct audioreach_module *module)
+ {
+@@ -1806,6 +1921,10 @@ int audioreach_set_media_format(struct q6apm_graph *graph,
+ 	case MODULE_ID_I2S_SINK:
+ 		rc = audioreach_i2s_set_media_format(graph, module, cfg);
+ 		break;
++	case MODULE_ID_TDM_SOURCE:
++	case MODULE_ID_TDM_SINK:
++		rc = audioreach_tdm_set_media_format(graph, module, cfg);
++		break;
+ 	case MODULE_ID_WR_SHARED_MEM_EP:
+ 	case MODULE_ID_SH_MEM_PULL_MODE:
+ 		rc = audioreach_shmem_set_media_format(graph, module, cfg);
+diff --git a/sound/soc/qcom/qdsp6/audioreach.h b/sound/soc/qcom/qdsp6/audioreach.h
+index 46413f7821..63af206506 100644
+--- a/sound/soc/qcom/qdsp6/audioreach.h
++++ b/sound/soc/qcom/qdsp6/audioreach.h
+@@ -22,6 +22,8 @@ struct q6apm_graph;
+ #define MODULE_ID_PLACEHOLDER_DECODER	0x07001009
+ #define MODULE_ID_I2S_SINK		0x0700100A
+ #define MODULE_ID_I2S_SOURCE		0x0700100B
++#define MODULE_ID_TDM_SINK		0x0700100E
++#define MODULE_ID_TDM_SOURCE		0x0700100F
+ #define MODULE_ID_SAL			0x07001010
+ #define MODULE_ID_MFC			0x07001015
+ #define MODULE_ID_DATA_LOGGING		0x0700101A
+@@ -545,6 +547,40 @@ struct param_id_i2s_intf_cfg {
+ 	uint16_t ws_src;
+ } __packed;
+ 
++#define PARAM_ID_TDM_INTF_CFG			0x0800101B
++struct param_id_tdm_intf_cfg {
++	uint32_t lpaif_type;
++	uint32_t intf_idx;
++	uint16_t sync_src;
++	uint16_t ctrl_data_out_enable;
++	uint32_t slot_mask;
++	uint16_t nslots_per_frame;
++	uint16_t slot_width;
++	uint16_t sync_mode;
++	uint16_t ctrl_invert_sync_pulse;
++	uint16_t ctrl_sync_data_delay;
++	uint16_t reserved;
++} __packed;
++
++#define TDM_SYNC_SRC_EXTERNAL		0x0
++#define TDM_SYNC_SRC_INTERNAL		0x1
++#define TDM_CTRL_DATA_OE_DISABLE	0x0
++#define TDM_CTRL_DATA_OE_ENABLE		0x1
++#define TDM_SHORT_SYNC_BIT_MODE		0
++#define TDM_LONG_SYNC_MODE		1
++#define TDM_SHORT_SYNC_SLOT_MODE	2
++#define TDM_SYNC_NORMAL			0
++#define TDM_SYNC_INVERT			1
++#define TDM_DATA_DELAY_0_BCLK_CYCLE	0
++#define TDM_DATA_DELAY_1_BCLK_CYCLE	1
++#define TDM_DATA_DELAY_2_BCLK_CYCLE	2
++
++#define PARAM_ID_TDM_LANE_CFG			0x0800106A
++struct param_id_tdm_lane_cfg {
++	uint16_t lane_mask;
++	uint16_t reserved;
++} __packed;
++
+ #define I2S_INTF_TYPE_PRIMARY		0
+ #define I2S_INTF_TYPE_SECONDARY		1
+ #define I2S_INTF_TYPE_TERTIARY		2
+diff --git a/sound/soc/qcom/qdsp6/q6prm-clocks.c b/sound/soc/qcom/qdsp6/q6prm-clocks.c
+index b4f9abbe02..7a8024970f 100644
+--- a/sound/soc/qcom/qdsp6/q6prm-clocks.c
++++ b/sound/soc/qcom/qdsp6/q6prm-clocks.c
+@@ -25,6 +25,8 @@ static const struct q6dsp_clk_init q6prm_clks[] = {
+ 	Q6PRM_CLK(LPASS_CLK_ID_SEC_MI2S_EBIT),
+ 	Q6PRM_CLK(LPASS_CLK_ID_TER_MI2S_IBIT),
+ 	Q6PRM_CLK(LPASS_CLK_ID_TER_MI2S_EBIT),
++	Q6PRM_CLK(LPASS_CLK_ID_TER_TDM_IBIT),
++	Q6PRM_CLK(LPASS_CLK_ID_TER_TDM_EBIT),
+ 	Q6PRM_CLK(LPASS_CLK_ID_QUAD_MI2S_IBIT),
+ 	Q6PRM_CLK(LPASS_CLK_ID_QUAD_MI2S_EBIT),
+ 	Q6PRM_CLK(LPASS_CLK_ID_SPEAKER_I2S_IBIT),
+diff --git a/sound/soc/qcom/qdsp6/q6prm.h b/sound/soc/qcom/qdsp6/q6prm.h
+index cf619ef656..d5593b7a38 100644
+--- a/sound/soc/qcom/qdsp6/q6prm.h
++++ b/sound/soc/qcom/qdsp6/q6prm.h
+@@ -18,6 +18,8 @@
+ #define Q6PRM_LPASS_CLK_ID_TER_MI2S_IBIT                          0x104
+ /* Clock ID for Tertiary I2S EBIT */
+ #define Q6PRM_LPASS_CLK_ID_TER_MI2S_EBIT                          0x105
++#define Q6PRM_LPASS_CLK_ID_TER_TDM_IBIT                           0x204
++#define Q6PRM_LPASS_CLK_ID_TER_TDM_EBIT                           0x205
+ /* Clock ID for Quartnery I2S IBIT */
+ #define Q6PRM_LPASS_CLK_ID_QUAD_MI2S_IBIT                         0x106
+ /* Clock ID for Quartnery I2S EBIT */
+diff --git a/sound/soc/qcom/qdsp6/topology.c b/sound/soc/qcom/qdsp6/topology.c
+index 4bfc772d9e..291d674dcc 100644
+--- a/sound/soc/qcom/qdsp6/topology.c
++++ b/sound/soc/qcom/qdsp6/topology.c
+@@ -903,6 +903,18 @@ static int audioreach_widget_load_buffer(struct snd_soc_component *component,
+ 	case MODULE_ID_I2S_SOURCE:
+ 		audioreach_widget_i2s_module_load(mod, mod_array);
+ 		break;
++	case MODULE_ID_TDM_SINK:
++	case MODULE_ID_TDM_SOURCE:
++		/*
++		 * Interface type/index, data format and sd line as for I2S;
++		 * sync source, data output enable, framing, slots and lanes
++		 * use the Audio IF tokens.
++		 */
++		audioreach_widget_i2s_module_load(mod, mod_array);
++		ret = audioreach_widget_audio_if_module_load(mod, mod_array);
++		if (ret)
++			return ret;
++		break;
+ 	case MODULE_ID_AUDIO_IF_SINK:
+ 	case MODULE_ID_AUDIO_IF_SOURCE:
+ 		ret = audioreach_widget_audio_if_module_load(mod, mod_array);

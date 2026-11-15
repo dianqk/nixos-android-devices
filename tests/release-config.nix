@@ -15,6 +15,8 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
           builtins.elem (lib.getName package) [
             "aurora-firmware"
             "aurora-firmware-zstd"
+            "marble-firmware"
+            "marble-firmware-zstd"
           ];
         modules = [ { androidDevices.usbSerial = "release-check"; } ] ++ modules;
       };
@@ -30,13 +32,14 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
     c = sheng.config;
   in
   {
-    storage = lib.genAttrs [ "asphalt" "sheng" "clover" "aurora" ] (
+    storage = lib.genAttrs [ "asphalt" "sheng" "clover" "aurora" "marble" ] (
       device:
       let
         s = make device [
           {
             androidDevices.recovery.enable = true;
             androidDevices.persistentImage.rootfs.label = "MYROOT";
+            androidDevices.boot.uefi.label = "MYBOOT";
             androidDevices.boot.uefi.espSizeBytes = 536870912;
             androidDevices.recovery.minimumRootBytes = 8589934592;
           }
@@ -49,6 +52,7 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
         contract = builtins.fromJSON cfg.boot.initrd.systemd.contents."/etc/mobile-recovery.json".text;
       in
       assert contract.root_label == "MYROOT";
+      assert contract.boot_label == "MYBOOT";
       assert contract.esp_bytes == 536870912;
       assert contract.minimum_root_bytes == 8589934592;
       assert !(cfg.boot.initrd.systemd.contents ? "/etc/mobile-recovery-target");
@@ -76,5 +80,28 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
       in
       assert custom.services.fprintd.package.drvPath != c.services.fprintd.package.drvPath;
       custom.services.fprintd.package.drvPath;
+    audioOrientation =
+      let
+        enabled =
+          (sheng.extendModules {
+            modules = [ { androidDevices.audio.orientation.enable = true; } ];
+          }).config;
+        routes =
+          (builtins.fromJSON enabled.environment.etc."android-audio-orientation.json".text).orientations;
+        slot =
+          orientation: amp:
+          (lib.findFirst (e: e.control == "${amp} ASPRX1 Slot Position") null routes.${orientation}).value;
+        unit = enabled.systemd.user.services.android-audio-orientation;
+      in
+      assert !(c.environment.etc ? "android-audio-orientation.json");
+      assert !(c.systemd.user.services ? android-audio-orientation);
+      assert lib.all (a: a.assertion) enabled.assertions;
+      assert lib.all (e: e.card == "XiaomiPad6SPro") (lib.concatLists (lib.attrValues routes));
+      assert slot "normal" "TLH" == 0 && slot "normal" "BRL" == 1;
+      assert slot "180" "TLH" == 1 && slot "180" "BRL" == 0;
+      assert lib.length routes."90" == 6 && lib.length routes."270" == 6;
+      assert unit.wantedBy == [ "wireplumber.service" ];
+      assert unit.partOf == [ "wireplumber.service" ];
+      unit.serviceConfig.ExecStart;
   }
 )

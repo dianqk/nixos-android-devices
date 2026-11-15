@@ -1,0 +1,1395 @@
+From be86f2169f6a5447786a38eb8297173a68a1295b Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] misc: mediatek: implement MT6897 SCP sensor transport
+
+Implement bounded MT6897 SCP mailbox transport and the sensor-hub
+handshake, expose accelerometer/light/gyro/magnetometer through IIO and
+provide the modem lifecycle callback interface.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T17:36:00+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T17:52:19+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T18:08:09+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T18:20:28+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T19:21:42+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-20T20:33:57+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-02T23:59:17+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-05T15:20:03+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/misc/mediatek/eccci/fsm/ccci_fsm_scp_c.c
+---
+ drivers/misc/mediatek/scp/Makefile            |    2 +
+ .../misc/mediatek/scp/mt6897-scp-bringup.c    | 1312 +++++++++++++++++
+ include/linux/mt6897-scp-ccci.h               |   15 +
+ 3 files changed, 1329 insertions(+)
+ create mode 100644 drivers/misc/mediatek/scp/Makefile
+ create mode 100644 drivers/misc/mediatek/scp/mt6897-scp-bringup.c
+ create mode 100644 include/linux/mt6897-scp-ccci.h
+
+diff --git a/drivers/misc/mediatek/scp/Makefile b/drivers/misc/mediatek/scp/Makefile
+new file mode 100644
+index 0000000000..231fa9531d
+--- /dev/null
++++ b/drivers/misc/mediatek/scp/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_MTK_MT6897_SCP_BRINGUP) += mt6897-scp-bringup.o
+diff --git a/drivers/misc/mediatek/scp/mt6897-scp-bringup.c b/drivers/misc/mediatek/scp/mt6897-scp-bringup.c
+new file mode 100644
+index 0000000000..98231f71e8
+--- /dev/null
++++ b/drivers/misc/mediatek/scp/mt6897-scp-bringup.c
+@@ -0,0 +1,1312 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MT6897 SCP (tinysys RV55) bring-up helper.
++ *
++ * LK loads the stock SCP loader and firmware (region info at the start of
++ * the SCP SRAM) and leaves the core in reset; the vendor kernel releases it
++ * with the TF-A SiP call MTK_SIP_TINYSYS_SCP_CONTROL /
++ * MTK_TINYSYS_SCP_KERNEL_OP_RESET_RELEASE (vendor scp_helper.h
++ * scp_do_rstn_clr(), all other arguments 0).  This helper reports the state
++ * at probe and issues that one call on request (write 1 to the "release"
++ * attribute), logging the call, its result and the core's program counter
++ * afterwards.  Nothing runs at boot.
++ *
++ * Mailboxes (vendor mtk-mbox, direct mode, 64-bit slots as the vendor SCP
++ * driver configures them): each mailbox has a 0x100-byte message area, a
++ * set register (AP -> SCP, its bits also read back as "busy") and a clear
++ * register that reads the pending SCP -> AP bits.  The pins come from the
++ * stock send-table/recv-table properties and are laid out as vendor
++ * mbox_setup_pin_table() does.  Sending follows the vendor
++ * mtk_mbox_send(), bracketed by the vendor scp_awake_lock()/unlock()
++ * handshake on the infracfg_ao IRQ set/clear registers.
++ *
++ * Sensor hub (vendor sensor 2.0 "sensorhub" protocol): after the SCP ready
++ * message the host announces itself (notify READY), waits for the SCP's
++ * READY notify, describes its shared-memory rings in the stock layout of the
++ * reserved scp_share region (control SHARE_MEMORY), and reads the sensor
++ * list.  The accelerometer is then enabled at a low rate and its latest
++ * sample is exposed as an IIO accelerometer (raw x/y/z, scale from the
++ * gain the SCP reports, Android axes) for iio-sensor-proxy; the ambient
++ * light sensor likewise as an IIO illuminance (lux = value / gain), the
++ * gyroscope as IIO angular velocity (rad/s = value / gain) and the
++ * magnetometer as IIO magnetic field (uT = value / gain, reported in Gauss).
++ * Messages carry the vendor CRC8.
++ */
++
++#include <linux/arm-smccc.h>
++#include <linux/completion.h>
++#include <linux/delay.h>
++#include <linux/iio/iio.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/mt6897-scp-ccci.h>
++#include <linux/mod_devicetable.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/workqueue.h>
++
++/* Vendor mtk_sip_svc.h: MTK_SIP_SMC_CMD(0x528), 64-bit convention on arm64. */
++#define MTK_SIP_TINYSYS_SCP_CONTROL \
++	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL, ARM_SMCCC_SMC_64, \
++			   ARM_SMCCC_OWNER_SIP, 0x528)
++/* Vendor enum MTK_TINYSYS_SCP_KERNEL_OP. */
++#define MTK_TINYSYS_SCP_KERNEL_OP_RESET_RELEASE	3
++
++/* Vendor scp_reg.h, relative to scp_cfgreg_core0. */
++#define R_CORE0_STATUS		0x70
++#define R_CORE0_MON_PC		0x80
++/* Vendor scp_reg.h, relative to scp_cfgreg. */
++#define SCP_TO_SPM_REG		0x94
++/* Vendor scp_reg.h, relative to infracfg_ao (scpreg.scpsys). */
++#define INFRA_IRQ_SET		0xb14
++#define INFRA_IRQ_CLEAR		0xb18
++#define AP_AWAKE_LOCK		0
++#define AP_AWAKE_UNLOCK		1
++
++/* Vendor scp_helper.h: struct scp_region_info_st at SRAM + 0x4. */
++#define SCP_REGION_INFO_OFFSET	0x4
++
++#define SCP_MBOX_MAX		5
++#define SCP_PIN_MAX		32
++#define SCP_MSG_WORDS		32
++
++/* Vendor scp.h IPI ids used here. */
++#define IPI_IN_SCP_READY_1	22
++#define IPI_OUT_APCCCI_0 3
++#define IPI_IN_APCCCI_0 7
++#define IPI_OUT_SENSOR_CTRL	29
++#define IPI_IN_SENSOR_CTRL	30
++#define IPI_OUT_SENSOR_NOTIFY	31
++#define IPI_IN_SENSOR_NOTIFY	32
++
++/* Vendor sensorhub sensor_comm.h. */
++#define SENS_COMM_CTRL_DISABLE_CMD	0
++#define SENS_COMM_CTRL_ENABLE_CMD	1
++#define SENS_COMM_CTRL_SHARE_MEMORY_CMD	11
++#define SENS_COMM_NOTIFY_DATA_CMD	0
++#define SENS_COMM_NOTIFY_FULL_CMD	1
++#define SENS_COMM_NOTIFY_READY_CMD	4
++#define SENS_COMM_NOTIFY_LIST_CMD	5
++#define SENSOR_TYPE_INVALID		0
++#define SENSOR_TYPE_ACCELEROMETER	1
++#define SENSOR_TYPE_MAGNETIC_FIELD	2
++#define SENSOR_TYPE_GYROSCOPE		4
++#define SENSOR_TYPE_LIGHT		5
++#define DATA_ACTION			0
++
++struct sensor_comm_ctrl {
++	u8 sequence;
++	u8 sensor_type;
++	u8 command;
++	u8 length;
++	u8 crc8;
++	u8 data[] __aligned(4);
++} __packed __aligned(4);
++
++struct sensor_comm_ack {
++	u8 sequence;
++	u8 sensor_type;
++	u8 command;
++	s8 ret_val;
++	u8 crc8;
++} __packed __aligned(4);
++
++struct sensor_comm_notify {
++	u8 sequence;
++	u8 sensor_type;
++	u8 command;
++	u8 length;
++	u8 crc8;
++	s32 value[5] __aligned(4);
++} __packed __aligned(4);
++
++struct sensor_comm_batch {
++	s64 delay;
++	s64 latency;
++} __packed __aligned(4);
++
++struct sensor_comm_share_mem {
++	u8 available_num;
++	struct {
++		u8 payload_type;
++		u32 payload_base;
++	} __aligned(4) base_info[4];
++} __packed __aligned(4);
++
++/* Vendor share_memory.h. */
++struct share_mem_base {
++	u32 rp;
++	u32 wp;
++	u32 buffer_size;
++	u32 item_size;
++	u8 data[] __aligned(4);
++} __packed __aligned(4);
++
++struct share_mem_data {
++	u8 sensor_type;
++	u8 action;
++	u8 accurancy;
++	u8 padding[1];
++	s64 timestamp;
++	s32 value[6] __aligned(4);
++} __packed __aligned(4);
++
++struct share_mem_super_data {
++	u8 sensor_type;
++	u8 action;
++	u8 accurancy;
++	u8 padding[1];
++	s64 timestamp;
++	s32 value[16] __aligned(4);
++} __packed __aligned(4);
++
++struct share_mem_debug {
++	u8 sensor_type;
++	u8 padding[3];
++	u32 written;
++	u8 buffer[4032] __aligned(4);
++} __packed __aligned(4);
++
++struct share_mem_info {
++	u8 sensor_type;
++	u8 padding[3];
++	u32 gain;
++	u8 name[16];
++	u8 vendor[16];
++} __packed __aligned(4);
++
++struct share_mem_cmd {
++	u8 command;
++	u8 tx_len;
++	u8 rx_len;
++	u8 padding[1];
++	s32 data[15] __aligned(4);
++} __packed __aligned(4);
++
++/*
++ * The stock scp_share layout (scp-mem-tbl accumulated in id order, as the
++ * vendor scp_reserve_memory_ioremap() does) for the sensor payload types,
++ * in vendor share_memory.c usage order: data, super data, list, debug,
++ * custom write, custom read.
++ */
++struct mt6897_scp_shm_area {
++	u8 payload_type;
++	u32 offset;
++	u32 size;
++	u32 item_size;
++};
++
++static const struct mt6897_scp_shm_area mt6897_scp_shm_areas[] = {
++	{ 0, 0x592700, 0x100000, sizeof(struct share_mem_data) },
++	{ 1, 0x84f700, 0x10000, sizeof(struct share_mem_super_data) },
++	{ 2, 0x85f700, 0x1000, sizeof(struct share_mem_info) },
++	{ 3, 0x860700, 0x2000, sizeof(struct share_mem_debug) },
++	{ 4, 0x862700, 0x100, sizeof(struct share_mem_cmd) },
++	{ 5, 0x862800, 0x100, sizeof(struct share_mem_cmd) },
++};
++
++struct mt6897_scp_pin {
++	u32 id;
++	u32 mbox;
++	u32 size;	/* message size in 32-bit slots */
++	u32 offset;	/* slot offset in the message area */
++	u32 index;	/* bit in the set/clear registers */
++};
++
++struct mt6897_scp_mbox {
++	struct mt6897_scp *scp;
++	unsigned int id;
++	void __iomem *base;
++	void __iomem *set;
++	void __iomem *clr;
++};
++
++struct mt6897_scp {
++	struct device *dev;
++	void __iomem *sram;
++	void __iomem *core0;
++	void __iomem *cfg;
++	void __iomem *infra;
++	void __iomem *shm;
++	phys_addr_t shm_phys;
++	struct mutex lock;
++	bool released;
++	unsigned int mbox_count;
++	struct mt6897_scp_mbox mbox[SCP_MBOX_MAX];
++	unsigned int nsend, nrecv;
++	struct mt6897_scp_pin send[SCP_PIN_MAX];
++	struct mt6897_scp_pin recv[SCP_PIN_MAX];
++	spinlock_t send_lock;
++
++	/* sensor hub */
++	struct work_struct hub_work;
++	struct mutex comm_lock;
++	struct mutex transport_lock;
++	spinlock_t client_lock;
++	bool ccci_ready;
++	const struct mt6897_scp_ccci_client *ccci;
++	u8 sequence;
++	struct completion ack_done;
++	struct sensor_comm_ack ack;
++	struct completion notify_done;
++	struct sensor_comm_notify notify;
++	u8 notify_wait_cmd;
++	bool hub_ready;
++	unsigned int samples_logged;
++
++	/* accelerometer */
++	struct iio_dev *indio;
++	u32 accel_gain;
++	s32 accel[3];
++	spinlock_t accel_lock;
++	bool accel_valid;
++	struct iio_mount_matrix orientation;
++
++	/* ambient light */
++	struct iio_dev *als;
++	u32 light_gain;
++	s32 light;
++	bool light_valid;
++
++	/* gyroscope and magnetometer (same Android axes as the accelerometer) */
++	struct mt6897_scp_vec {
++		struct iio_dev *indio;
++		u8 type;
++		u32 gain;
++		s32 value[3];
++		bool valid;
++	} gyro, magn;
++};
++
++#define SCP_ACCEL_PERIOD_MS	100
++#define SCP_LIGHT_PERIOD_MS	200
++/* The slowest rates the stock sensor list offers (12.5 Hz and 5 Hz). */
++#define SCP_GYRO_PERIOD_MS	80
++#define SCP_MAGN_PERIOD_MS	200
++
++/* Vendor tiny_crc8.c (TINY_CRC8 variant): X^8 + X^5 + X^4 + 1, reflected. */
++static const u8 tiny_crc8_table[] = {
++	0x00, 0x5e, 0xbc, 0xe2, 0x61, 0x3f, 0xdd, 0x83,
++	0xc2, 0x9c, 0x7e, 0x20, 0xa3, 0xfd, 0x1f, 0x41,
++	0x00, 0x9d, 0x23, 0xbe, 0x46, 0xdb, 0x65, 0xf8,
++	0x8c, 0x11, 0xaf, 0x32, 0xca, 0x57, 0xe9, 0x74
++};
++
++static u8 tiny_crc8(const u8 *ptr, unsigned int len)
++{
++	u8 crc = 0;
++
++	while (len--) {
++		crc = *ptr++ ^ crc;
++		crc = tiny_crc8_table[crc & 0x0f] ^
++		      tiny_crc8_table[16 + ((crc >> 4) & 0x0f)];
++	}
++	return crc;
++}
++
++/* Vendor mbox_setup_pin_table() for 64-bit-slot mailboxes. */
++/* One SCP instance; registration pins this module until client removal. */
++static DEFINE_MUTEX(mt6897_scp_registry_lock);
++static struct mt6897_scp *mt6897_scp_instance;
++
++int mt6897_scp_ccci_register(const struct mt6897_scp_ccci_client *client,
++			     bool *ready)
++{
++	struct mt6897_scp *scp;
++	unsigned long flags;
++	int ret = 0;
++	if (!client || !client->ready || !client->receive || !ready)
++		return -EINVAL;
++	mutex_lock(&mt6897_scp_registry_lock);
++	scp = mt6897_scp_instance;
++	if (!scp) {
++		ret = -EPROBE_DEFER;
++		goto out;
++	}
++	spin_lock_irqsave(&scp->client_lock, flags);
++	if (scp->ccci)
++		ret = -EBUSY;
++	else if (!try_module_get(THIS_MODULE))
++		ret = -ENODEV;
++	else {
++		scp->ccci = client;
++		*ready = scp->ccci_ready;
++	}
++	spin_unlock_irqrestore(&scp->client_lock, flags);
++out:
++	mutex_unlock(&mt6897_scp_registry_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mt6897_scp_ccci_register);
++
++void mt6897_scp_ccci_unregister(const struct mt6897_scp_ccci_client *client)
++{
++	struct mt6897_scp *scp;
++	unsigned long flags;
++	mutex_lock(&mt6897_scp_registry_lock);
++	scp = mt6897_scp_instance;
++	if (scp) {
++		spin_lock_irqsave(&scp->client_lock, flags);
++		if (scp->ccci == client) {
++			scp->ccci = NULL;
++			module_put(THIS_MODULE);
++		}
++		spin_unlock_irqrestore(&scp->client_lock, flags);
++	}
++	mutex_unlock(&mt6897_scp_registry_lock);
++}
++EXPORT_SYMBOL_GPL(mt6897_scp_ccci_unregister);
++
++static void mt6897_scp_layout(struct mt6897_scp *scp, unsigned int mbox)
++{
++	u32 last_ofs = 0, last_idx = 0, last_slot = 0, last_sz = 0;
++	struct mt6897_scp_pin *tab[2] = { scp->send, scp->recv };
++	unsigned int n[2] = { scp->nsend, scp->nrecv };
++	unsigned int t, i;
++
++	for (t = 0; t < 2; t++)
++		for (i = 0; i < n[t]; i++) {
++			struct mt6897_scp_pin *pin = &tab[t][i];
++
++			if (pin->mbox != mbox)
++				continue;
++			pin->offset = last_ofs + last_slot;
++			pin->index = last_idx + last_sz;
++			last_idx = pin->index;
++			last_sz = DIV_ROUND_UP(pin->size, 2);
++			last_ofs = last_sz * 2;
++			last_slot = last_idx * 2;
++		}
++}
++
++static int mt6897_scp_tables(struct mt6897_scp *scp)
++{
++	struct device_node *np = scp->dev->of_node;
++	int ns, nr, i;
++	u32 v[3];
++
++	ns = of_property_count_u32_elems(np, "send-table");
++	nr = of_property_count_u32_elems(np, "recv-table");
++	if (ns <= 0 || nr <= 0 || ns % 3 || nr % 7 ||
++	    ns / 3 > SCP_PIN_MAX || nr / 7 > SCP_PIN_MAX)
++		return -EINVAL;
++	scp->nsend = ns / 3;
++	scp->nrecv = nr / 7;
++	for (i = 0; i < scp->nsend; i++) {
++		if (of_property_read_u32_index(np, "send-table", 3 * i, &v[0]) ||
++		    of_property_read_u32_index(np, "send-table", 3 * i + 1, &v[1]) ||
++		    of_property_read_u32_index(np, "send-table", 3 * i + 2, &v[2]))
++			return -EINVAL;
++		scp->send[i] = (struct mt6897_scp_pin){ .id = v[0], .mbox = v[1], .size = v[2] };
++	}
++	for (i = 0; i < scp->nrecv; i++) {
++		if (of_property_read_u32_index(np, "recv-table", 7 * i, &v[0]) ||
++		    of_property_read_u32_index(np, "recv-table", 7 * i + 1, &v[1]) ||
++		    of_property_read_u32_index(np, "recv-table", 7 * i + 2, &v[2]))
++			return -EINVAL;
++		scp->recv[i] = (struct mt6897_scp_pin){ .id = v[0], .mbox = v[1], .size = v[2] };
++	}
++	for (i = 0; i < scp->mbox_count; i++)
++		mt6897_scp_layout(scp, i);
++	return 0;
++}
++
++static struct mt6897_scp_pin *mt6897_scp_send_pin(struct mt6897_scp *scp,
++						   u32 id)
++{
++	unsigned int i;
++
++	for (i = 0; i < scp->nsend; i++)
++		if (scp->send[i].id == id)
++			return &scp->send[i];
++	return NULL;
++}
++
++/* Vendor scp_awake_lock()/scp_awake_unlock(). */
++static int mt6897_scp_awake(struct mt6897_scp *scp, unsigned int bit)
++{
++	unsigned int count;
++	u32 tmp;
++	int ret = -ETIMEDOUT;
++
++	writel(0xa0 | BIT(bit), scp->infra + INFRA_IRQ_SET);
++	for (count = 0; count < 100000; count++) {
++		tmp = readl(scp->infra + INFRA_IRQ_SET);
++		if ((tmp & 0xa0) != 0xa0) {
++			ret = -EIO;
++			break;
++		}
++		if (!(tmp & 0x0f & BIT(bit))) {
++			ret = 0;
++			break;
++		}
++		udelay(10);
++	}
++	writel(0xa0 | BIT(bit), scp->infra + INFRA_IRQ_CLEAR);
++	if (ret)
++		dev_warn(scp->dev, "awake %s failed (%#x)\n",
++			 bit == AP_AWAKE_LOCK ? "lock" : "unlock", tmp);
++	return ret;
++}
++
++/* Vendor mtk_mbox_send(): busy check, message copy, then the pin's bit. */
++static int mt6897_scp_send(struct mt6897_scp *scp, u32 id, const void *msg,
++			   unsigned int len)
++{
++	struct mt6897_scp_pin *pin = mt6897_scp_send_pin(scp, id);
++	unsigned int words = DIV_ROUND_UP(len, 4), i, retry;
++	struct mt6897_scp_mbox *mb;
++	u32 buf[SCP_MSG_WORDS] = { };
++	unsigned long flags;
++	int ret;
++
++	if (!pin || words > pin->size || words > SCP_MSG_WORDS)
++		return -EINVAL;
++	mb = &scp->mbox[pin->mbox];
++	memcpy(buf, msg, len);
++
++	mutex_lock(&scp->transport_lock);
++	ret = mt6897_scp_awake(scp, AP_AWAKE_LOCK);
++	if (ret)
++		goto out_unlock;
++	for (retry = 0; ; retry++) {
++		spin_lock_irqsave(&scp->send_lock, flags);
++		if (!(readl(mb->set) & BIT(pin->index)))
++			break;
++		spin_unlock_irqrestore(&scp->send_lock, flags);
++		if (retry >= 1000) {
++			mt6897_scp_awake(scp, AP_AWAKE_UNLOCK);
++			ret = -EBUSY;
++			goto out_unlock;
++		}
++		usleep_range(100, 200);
++	}
++	for (i = 0; i < words; i++)
++		writel(buf[i], mb->base + 4 * (pin->offset + i));
++	mb();
++	writel(BIT(pin->index), mb->set);
++	spin_unlock_irqrestore(&scp->send_lock, flags);
++	mt6897_scp_awake(scp, AP_AWAKE_UNLOCK);
++	ret = 0;
++out_unlock:
++	mutex_unlock(&scp->transport_lock);
++	return ret;
++}
++
++int mt6897_scp_ccci_send(const u32 words[4])
++{
++	int ret;
++	mutex_lock(&mt6897_scp_registry_lock);
++	ret = mt6897_scp_instance ?
++		      mt6897_scp_send(mt6897_scp_instance, IPI_OUT_APCCCI_0,
++				      words, 16) :
++		      -ENODEV;
++	mutex_unlock(&mt6897_scp_registry_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mt6897_scp_ccci_send);
++
++static int mt6897_scp_notify(struct mt6897_scp *scp, u8 cmd)
++{
++	struct sensor_comm_notify n = {
++		.sensor_type = SENSOR_TYPE_INVALID,
++		.command = cmd,
++	};
++
++	n.sequence = scp->sequence++;
++	n.crc8 = tiny_crc8((u8 *)&n, offsetof(typeof(n), crc8));
++	return mt6897_scp_send(scp, IPI_OUT_SENSOR_NOTIFY, &n, sizeof(n));
++}
++
++/* Notify, then wait for the SCP's notify with the same command. */
++static int mt6897_scp_notify_wait(struct mt6897_scp *scp, u8 cmd,
++				  struct sensor_comm_notify *reply,
++				  unsigned int timeout_ms)
++{
++	int ret;
++
++	reinit_completion(&scp->notify_done);
++	WRITE_ONCE(scp->notify_wait_cmd, cmd);
++	ret = mt6897_scp_notify(scp, cmd);
++	if (ret)
++		return ret;
++	if (!wait_for_completion_timeout(&scp->notify_done,
++					 msecs_to_jiffies(timeout_ms)))
++		return -ETIMEDOUT;
++	if (reply)
++		*reply = scp->notify;
++	return 0;
++}
++
++/* Vendor sensor_comm_ctrl_seq_send(): control message and its ack. */
++static int mt6897_scp_ctrl(struct mt6897_scp *scp, u8 sensor_type, u8 cmd,
++			   const void *data, u8 length)
++{
++	u32 buf[SCP_MSG_WORDS] = { };
++	struct sensor_comm_ctrl *ctrl = (void *)buf;
++	unsigned int size = round_up(sizeof(*ctrl) + length, 4);
++	struct sensor_comm_ack ack;
++	int ret;
++
++	if (size > sizeof(buf))
++		return -EINVAL;
++	mutex_lock(&scp->comm_lock);
++	ctrl->sequence = scp->sequence++;
++	ctrl->sensor_type = sensor_type;
++	ctrl->command = cmd;
++	ctrl->length = length;
++	if (length)
++		memcpy(ctrl->data, data, length);
++	ctrl->crc8 = tiny_crc8((u8 *)ctrl, offsetof(typeof(*ctrl), crc8));
++	reinit_completion(&scp->ack_done);
++	ret = mt6897_scp_send(scp, IPI_OUT_SENSOR_CTRL, ctrl, size);
++	if (!ret && !wait_for_completion_timeout(&scp->ack_done,
++						 msecs_to_jiffies(100)))
++		ret = -ETIMEDOUT;
++	ack = scp->ack;
++	mutex_unlock(&scp->comm_lock);
++	if (ret)
++		return ret;
++	if (ack.crc8 != tiny_crc8((u8 *)&ack, offsetof(typeof(ack), crc8)) ||
++	    ack.sequence != ctrl->sequence || ack.command != cmd ||
++	    ack.sensor_type != sensor_type)
++		return -EPROTO;
++	return ack.ret_val < 0 ? -EREMOTEIO : 0;
++}
++
++static struct share_mem_base __iomem *mt6897_scp_ring(struct mt6897_scp *scp,
++						      unsigned int area)
++{
++	return scp->shm + mt6897_scp_shm_areas[area].offset;
++}
++
++/* Vendor share_mem_read_dram(): copy whole items from rp up to wp. */
++static unsigned int mt6897_scp_ring_read(struct mt6897_scp *scp,
++					 unsigned int area, u32 wp, void *buf,
++					 unsigned int count)
++{
++	struct share_mem_base __iomem *base = mt6897_scp_ring(scp, area);
++	u32 rp = readl(&base->rp), size = readl(&base->buffer_size);
++	u32 first, second;
++	u8 __iomem *src = (u8 __iomem *)base + sizeof(*base);
++
++	if (wp == rp || wp >= size || rp >= size)
++		return 0;
++	if (wp > rp) {
++		first = wp - rp;
++		second = 0;
++	} else {
++		first = size - rp;
++		second = wp;
++	}
++	first = min(first, count);
++	second = min(count - first, second);
++	memcpy_fromio(buf, src + rp, first);
++	memcpy_fromio(buf + first, src, second);
++	rp = (rp + first + second) % size;
++	wmb();
++	writel(rp, &base->rp);
++	return first + second;
++}
++
++static int mt6897_scp_share_memory(struct mt6897_scp *scp)
++{
++	struct sensor_comm_share_mem shm;
++	unsigned int i, n = 0;
++	int ret;
++
++	memset(&shm, 0, sizeof(shm));
++	for (i = 0; i < ARRAY_SIZE(mt6897_scp_shm_areas); i++) {
++		const struct mt6897_scp_shm_area *a = &mt6897_scp_shm_areas[i];
++		struct share_mem_base __iomem *base = mt6897_scp_ring(scp, i);
++		u32 usable = ((a->size - sizeof(*base)) / a->item_size) * a->item_size;
++
++		writel(0, &base->wp);
++		writel(0, &base->rp);
++		writel(a->item_size, &base->item_size);
++		writel(usable, &base->buffer_size);
++		shm.base_info[n].payload_type = a->payload_type;
++		shm.base_info[n].payload_base = scp->shm_phys + a->offset;
++		shm.available_num = ++n;
++		if (n == ARRAY_SIZE(shm.base_info) ||
++		    i == ARRAY_SIZE(mt6897_scp_shm_areas) - 1) {
++			ret = mt6897_scp_ctrl(scp, SENSOR_TYPE_INVALID,
++					      SENS_COMM_CTRL_SHARE_MEMORY_CMD,
++					      &shm, sizeof(shm));
++			dev_info(scp->dev, "share memory config (%u areas): %d\n",
++				 n, ret);
++			if (ret)
++				return ret;
++			n = 0;
++			memset(&shm, 0, sizeof(shm));
++		}
++	}
++	return 0;
++}
++
++static void mt6897_scp_sensor_list(struct mt6897_scp *scp)
++{
++	struct sensor_comm_notify reply;
++	struct share_mem_info info;
++	struct share_mem_base __iomem *base = mt6897_scp_ring(scp, 2);
++	int ret;
++
++	writel(0, &base->rp);
++	ret = mt6897_scp_notify_wait(scp, SENS_COMM_NOTIFY_LIST_CMD, &reply, 100);
++	if (ret) {
++		dev_warn(scp->dev, "sensor list request: %d\n", ret);
++		return;
++	}
++	while (mt6897_scp_ring_read(scp, 2, reply.value[0], &info,
++				    sizeof(info)) == sizeof(info)) {
++		info.name[sizeof(info.name) - 1] = 0;
++		info.vendor[sizeof(info.vendor) - 1] = 0;
++		dev_info(scp->dev, "sensor type %u gain %u name %s vendor %s\n",
++			 info.sensor_type, info.gain, info.name, info.vendor);
++		if (info.sensor_type == SENSOR_TYPE_ACCELEROMETER)
++			scp->accel_gain = info.gain;
++		if (info.sensor_type == SENSOR_TYPE_LIGHT)
++			scp->light_gain = info.gain;
++		if (info.sensor_type == SENSOR_TYPE_GYROSCOPE)
++			scp->gyro.gain = info.gain;
++		if (info.sensor_type == SENSOR_TYPE_MAGNETIC_FIELD)
++			scp->magn.gain = info.gain;
++	}
++}
++
++static void mt6897_scp_enable(struct mt6897_scp *scp, u8 type,
++			      const char *what, unsigned int ms)
++{
++	struct sensor_comm_batch batch = {
++		.delay = (s64)ms * NSEC_PER_MSEC,
++	};
++	int ret;
++
++	ret = mt6897_scp_ctrl(scp, type, SENS_COMM_CTRL_ENABLE_CMD, &batch,
++			      sizeof(batch));
++	dev_info(scp->dev, "%s enable (%u ms): %d\n", what, ms, ret);
++}
++
++static void mt6897_scp_hub_work(struct work_struct *work)
++{
++	struct mt6897_scp *scp = container_of(work, struct mt6897_scp, hub_work);
++	int ret;
++
++	ret = mt6897_scp_notify_wait(scp, SENS_COMM_NOTIFY_READY_CMD, NULL, 5000);
++	dev_info(scp->dev, "sensor hub ready handshake: %d\n", ret);
++	if (ret)
++		return;
++	ret = mt6897_scp_share_memory(scp);
++	if (ret)
++		return;
++	mt6897_scp_sensor_list(scp);
++	WRITE_ONCE(scp->hub_ready, true);
++	if (scp->accel_gain) {
++		struct sensor_comm_batch batch = {
++			.delay = (s64)SCP_ACCEL_PERIOD_MS * NSEC_PER_MSEC,
++		};
++
++		ret = mt6897_scp_ctrl(scp, SENSOR_TYPE_ACCELEROMETER,
++				      SENS_COMM_CTRL_ENABLE_CMD, &batch,
++				      sizeof(batch));
++		dev_info(scp->dev, "accelerometer enable (%u ms): %d\n",
++			 SCP_ACCEL_PERIOD_MS, ret);
++	}
++	if (scp->light_gain) {
++		struct sensor_comm_batch batch = {
++			.delay = (s64)SCP_LIGHT_PERIOD_MS * NSEC_PER_MSEC,
++		};
++
++		ret = mt6897_scp_ctrl(scp, SENSOR_TYPE_LIGHT,
++				      SENS_COMM_CTRL_ENABLE_CMD, &batch,
++				      sizeof(batch));
++		dev_info(scp->dev, "light sensor enable (%u ms): %d\n",
++			 SCP_LIGHT_PERIOD_MS, ret);
++	}
++	if (scp->gyro.gain)
++		mt6897_scp_enable(scp, SENSOR_TYPE_GYROSCOPE, "gyroscope",
++				  SCP_GYRO_PERIOD_MS);
++	if (scp->magn.gain)
++		mt6897_scp_enable(scp, SENSOR_TYPE_MAGNETIC_FIELD,
++				  "magnetometer", SCP_MAGN_PERIOD_MS);
++}
++
++static void mt6897_scp_data(struct mt6897_scp *scp, u32 wp)
++{
++	struct share_mem_data d;
++
++	while (mt6897_scp_ring_read(scp, 0, wp, &d, sizeof(d)) == sizeof(d)) {
++		unsigned long flags;
++
++		if (d.action != DATA_ACTION)
++			continue;
++		if (d.sensor_type == SENSOR_TYPE_LIGHT) {
++			spin_lock_irqsave(&scp->accel_lock, flags);
++			scp->light = d.value[0];
++			scp->light_valid = true;
++			spin_unlock_irqrestore(&scp->accel_lock, flags);
++			continue;
++		}
++		if (d.sensor_type == SENSOR_TYPE_GYROSCOPE ||
++		    d.sensor_type == SENSOR_TYPE_MAGNETIC_FIELD) {
++			struct mt6897_scp_vec *v =
++				d.sensor_type == SENSOR_TYPE_GYROSCOPE ?
++				&scp->gyro : &scp->magn;
++
++			spin_lock_irqsave(&scp->accel_lock, flags);
++			memcpy(v->value, d.value, sizeof(v->value));
++			v->valid = true;
++			spin_unlock_irqrestore(&scp->accel_lock, flags);
++			continue;
++		}
++		if (d.sensor_type != SENSOR_TYPE_ACCELEROMETER)
++			continue;
++		spin_lock_irqsave(&scp->accel_lock, flags);
++		memcpy(scp->accel, d.value, sizeof(scp->accel));
++		scp->accel_valid = true;
++		spin_unlock_irqrestore(&scp->accel_lock, flags);
++		if (scp->samples_logged < 5) {
++			scp->samples_logged++;
++			dev_info(scp->dev, "accel ts %lld: %d %d %d (accuracy %u)\n",
++				 d.timestamp, d.value[0], d.value[1], d.value[2],
++				 d.accurancy);
++		}
++	}
++}
++
++static void mt6897_scp_message(struct mt6897_scp *scp, u32 id, const u32 *msg,
++			       unsigned int words)
++{
++	const struct sensor_comm_notify *n = (const void *)msg;
++	unsigned long flags;
++
++	switch (id) {
++	case IPI_IN_APCCCI_0:
++		if (words != 2) {
++			dev_err(scp->dev, "invalid APCCCI length %u\n", words);
++			return;
++		}
++		spin_lock_irqsave(&scp->client_lock, flags);
++		if (scp->ccci)
++			scp->ccci->receive(scp->ccci->data, msg);
++		spin_unlock_irqrestore(&scp->client_lock, flags);
++		return;
++	case IPI_IN_SCP_READY_1:
++		if (words != 1) {
++			dev_err(scp->dev, "invalid READY length %u\n", words);
++			return;
++		}
++		spin_lock_irqsave(&scp->client_lock, flags);
++		scp->ccci_ready = true;
++		if (scp->ccci)
++			scp->ccci->ready(scp->ccci->data);
++		spin_unlock_irqrestore(&scp->client_lock, flags);
++		dev_info(scp->dev, "SCP ready (image size %#x)\n", msg[0]);
++		schedule_work(&scp->hub_work);
++		return;
++	case IPI_IN_SENSOR_CTRL:
++		memcpy(&scp->ack, msg, sizeof(scp->ack));
++		complete(&scp->ack_done);
++		return;
++	case IPI_IN_SENSOR_NOTIFY:
++		if (n->crc8 != tiny_crc8((const u8 *)n, offsetof(typeof(*n), crc8))) {
++			dev_warn(scp->dev, "notify with a bad CRC\n");
++			return;
++		}
++		if (n->command == SENS_COMM_NOTIFY_DATA_CMD ||
++		    n->command == SENS_COMM_NOTIFY_FULL_CMD) {
++			if (READ_ONCE(scp->hub_ready))
++				mt6897_scp_data(scp, n->value[0]);
++			return;
++		}
++		if (n->command == READ_ONCE(scp->notify_wait_cmd)) {
++			scp->notify = *n;
++			complete(&scp->notify_done);
++			return;
++		}
++		dev_info(scp->dev, "notify cmd %u type %u value %d\n",
++			 n->command, n->sensor_type, n->value[0]);
++		return;
++	}
++	dev_info(scp->dev, "ipi %u (%u words): %*ph\n", id, words,
++		 (int)min(4 * words, 64U), msg);
++}
++
++static irqreturn_t mt6897_scp_mbox_irq(int irq, void *data)
++{
++	struct mt6897_scp_mbox *mb = data;
++	struct mt6897_scp *scp = mb->scp;
++	u32 status, handled = 0, msg[SCP_MSG_WORDS];
++	unsigned int i, j;
++
++	status = readl(mb->clr);
++	for (i = 0; i < scp->nrecv; i++) {
++		struct mt6897_scp_pin *pin = &scp->recv[i];
++
++		if (pin->mbox != mb->id || !(status & BIT(pin->index)))
++			continue;
++		for (j = 0; j < pin->size && j < SCP_MSG_WORDS; j++)
++			msg[j] = readl(mb->base + 4 * (pin->offset + j));
++		handled |= BIT(pin->index);
++		writel(BIT(pin->index), mb->clr);
++		mt6897_scp_message(scp, pin->id, msg, j);
++	}
++	if (status & ~handled) {
++		writel(status & ~handled, mb->clr);
++		dev_warn(scp->dev, "mbox%u unknown pending bits %#x\n", mb->id,
++			 status & ~handled);
++	}
++	writel(0x1, scp->cfg + SCP_TO_SPM_REG);
++	return IRQ_HANDLED;
++}
++
++static int mt6897_scp_mailboxes(struct platform_device *pdev,
++				struct mt6897_scp *scp)
++{
++	char name[16];
++	unsigned int i;
++	int irq, ret;
++
++	if (of_property_read_u32(pdev->dev.of_node, "mbox-count", &scp->mbox_count) ||
++	    scp->mbox_count > SCP_MBOX_MAX)
++		return -EINVAL;
++	for (i = 0; i < scp->mbox_count; i++) {
++		struct mt6897_scp_mbox *mb = &scp->mbox[i];
++
++		mb->scp = scp;
++		mb->id = i;
++		snprintf(name, sizeof(name), "mbox%u-base", i);
++		mb->base = devm_platform_ioremap_resource_byname(pdev, name);
++		snprintf(name, sizeof(name), "mbox%u-set", i);
++		mb->set = devm_platform_ioremap_resource_byname(pdev, name);
++		snprintf(name, sizeof(name), "mbox%u-clr", i);
++		mb->clr = devm_platform_ioremap_resource_byname(pdev, name);
++		if (IS_ERR(mb->base) || IS_ERR(mb->set) || IS_ERR(mb->clr))
++			return -ENOMEM;
++	}
++	ret = mt6897_scp_tables(scp);
++	if (ret)
++		return ret;
++	for (i = 0; i < scp->mbox_count; i++) {
++		snprintf(name, sizeof(name), "mbox%u", i);
++		irq = platform_get_irq_byname(pdev, name);
++		if (irq < 0)
++			return irq;
++		ret = devm_request_threaded_irq(&pdev->dev, irq, NULL,
++						mt6897_scp_mbox_irq, IRQF_ONESHOT,
++						dev_name(&pdev->dev), &scp->mbox[i]);
++		if (ret)
++			return ret;
++	}
++	dev_info(scp->dev, "%u mailboxes, %u send and %u receive pins\n",
++		 scp->mbox_count, scp->nsend, scp->nrecv);
++	return 0;
++}
++
++static void mt6897_scp_report(struct mt6897_scp *scp, const char *when)
++{
++	dev_info(scp->dev, "%s: core0 status %#x pc %#x\n", when,
++		 readl(scp->core0 + R_CORE0_STATUS),
++		 readl(scp->core0 + R_CORE0_MON_PC));
++}
++
++static ssize_t release_store(struct device *dev, struct device_attribute *attr,
++			     const char *buf, size_t count)
++{
++	struct mt6897_scp *scp = dev_get_drvdata(dev);
++	struct arm_smccc_res res;
++	bool val;
++	int i;
++
++	if (kstrtobool(buf, &val) || !val)
++		return -EINVAL;
++
++	mutex_lock(&scp->lock);
++	if (scp->released) {
++		mutex_unlock(&scp->lock);
++		return -EALREADY;
++	}
++	mt6897_scp_report(scp, "before release");
++	arm_smccc_smc(MTK_SIP_TINYSYS_SCP_CONTROL,
++		      MTK_TINYSYS_SCP_KERNEL_OP_RESET_RELEASE,
++		      0, 0, 0, 0, 0, 0, &res);
++	dev_info(dev, "SiP %#lx(%#x, 0, 0, 0, 0, 0, 0) = %#lx %#lx %#lx %#lx\n",
++		 (unsigned long)MTK_SIP_TINYSYS_SCP_CONTROL,
++		 MTK_TINYSYS_SCP_KERNEL_OP_RESET_RELEASE,
++		 res.a0, res.a1, res.a2, res.a3);
++	scp->released = true;
++	for (i = 0; i < 3; i++) {
++		msleep(100);
++		mt6897_scp_report(scp, "after release");
++	}
++	mutex_unlock(&scp->lock);
++	return count;
++}
++static DEVICE_ATTR_WO(release);
++
++static ssize_t state_show(struct device *dev, struct device_attribute *attr,
++			  char *buf)
++{
++	struct mt6897_scp *scp = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "released=%d hub=%d status=%#x pc=%#x\n",
++			  scp->released, READ_ONCE(scp->hub_ready),
++			  readl(scp->core0 + R_CORE0_STATUS),
++			  readl(scp->core0 + R_CORE0_MON_PC));
++}
++static DEVICE_ATTR_RO(state);
++
++/* Write a sampling period in ms to enable the accelerometer, 0 to disable. */
++static ssize_t accel_store(struct device *dev, struct device_attribute *attr,
++			   const char *buf, size_t count)
++{
++	struct mt6897_scp *scp = dev_get_drvdata(dev);
++	struct sensor_comm_batch batch;
++	unsigned int ms;
++	int ret;
++
++	if (kstrtouint(buf, 0, &ms))
++		return -EINVAL;
++	if (!READ_ONCE(scp->hub_ready))
++		return -EAGAIN;
++	if (ms) {
++		scp->samples_logged = 0;
++		batch.delay = (s64)ms * NSEC_PER_MSEC;
++		batch.latency = 0;
++		ret = mt6897_scp_ctrl(scp, SENSOR_TYPE_ACCELEROMETER,
++				      SENS_COMM_CTRL_ENABLE_CMD, &batch,
++				      sizeof(batch));
++	} else {
++		ret = mt6897_scp_ctrl(scp, SENSOR_TYPE_ACCELEROMETER,
++				      SENS_COMM_CTRL_DISABLE_CMD, NULL, 0);
++	}
++	dev_info(dev, "accelerometer %s (%u ms): %d\n", ms ? "enable" : "disable",
++		 ms, ret);
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_WO(accel);
++
++static struct attribute *mt6897_scp_attrs[] = {
++	&dev_attr_release.attr,
++	&dev_attr_state.attr,
++	&dev_attr_accel.attr,
++	NULL
++};
++ATTRIBUTE_GROUPS(mt6897_scp);
++
++static int mt6897_scp_read_raw(struct iio_dev *indio,
++			       struct iio_chan_spec const *chan, int *val,
++			       int *val2, long mask)
++{
++	struct mt6897_scp *scp = iio_priv(indio);
++	unsigned long flags;
++	int ret = IIO_VAL_INT;
++
++	switch (mask) {
++	case IIO_CHAN_INFO_RAW:
++		spin_lock_irqsave(&scp->accel_lock, flags);
++		if (scp->accel_valid)
++			*val = scp->accel[chan->address];
++		else
++			ret = -EAGAIN;
++		spin_unlock_irqrestore(&scp->accel_lock, flags);
++		return ret;
++	case IIO_CHAN_INFO_SCALE:
++		if (!scp->accel_gain)
++			return -EAGAIN;
++		*val = 1;
++		*val2 = scp->accel_gain;
++		return IIO_VAL_FRACTIONAL;
++	}
++	return -EINVAL;
++}
++
++static const struct iio_info mt6897_scp_iio_info = {
++	.read_raw = mt6897_scp_read_raw,
++};
++
++struct mt6897_scp_als {
++	struct mt6897_scp *scp;
++};
++
++static int mt6897_scp_als_read_raw(struct iio_dev *indio,
++				   struct iio_chan_spec const *chan, int *val,
++				   int *val2, long mask)
++{
++	struct mt6897_scp *scp = ((struct mt6897_scp_als *)iio_priv(indio))->scp;
++	unsigned long flags;
++	int ret = IIO_VAL_FRACTIONAL;
++
++	if (mask != IIO_CHAN_INFO_PROCESSED)
++		return -EINVAL;
++	spin_lock_irqsave(&scp->accel_lock, flags);
++	if (scp->light_valid && scp->light_gain) {
++		*val = scp->light;
++		*val2 = scp->light_gain;
++	} else {
++		ret = -EAGAIN;
++	}
++	spin_unlock_irqrestore(&scp->accel_lock, flags);
++	return ret;
++}
++
++static const struct iio_info mt6897_scp_als_info = {
++	.read_raw = mt6897_scp_als_read_raw,
++};
++
++static const struct iio_chan_spec mt6897_scp_als_channels[] = {
++	{
++		.type = IIO_LIGHT,
++		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
++	},
++};
++
++static const struct iio_mount_matrix *
++mt6897_scp_get_mount_matrix(const struct iio_dev *indio,
++			    const struct iio_chan_spec *chan)
++{
++	struct mt6897_scp *scp = iio_priv(indio);
++
++	return &scp->orientation;
++}
++
++static const struct iio_chan_spec_ext_info mt6897_scp_accel_ext_info[] = {
++	IIO_MOUNT_MATRIX(IIO_SHARED_BY_DIR, mt6897_scp_get_mount_matrix),
++	{ }
++};
++
++#define SCP_ACCEL_CHANNEL(axis, idx) {					\
++	.type = IIO_ACCEL,						\
++	.modified = 1,							\
++	.channel2 = IIO_MOD_##axis,					\
++	.address = idx,							\
++	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),			\
++	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE),		\
++	.ext_info = mt6897_scp_accel_ext_info,				\
++}
++
++static const struct iio_chan_spec mt6897_scp_accel_channels[] = {
++	SCP_ACCEL_CHANNEL(X, 0),
++	SCP_ACCEL_CHANNEL(Y, 1),
++	SCP_ACCEL_CHANNEL(Z, 2),
++};
++
++struct mt6897_scp_vec_priv {
++	struct mt6897_scp *scp;
++	struct mt6897_scp_vec *vec;
++};
++
++static int mt6897_scp_vec_read_raw(struct iio_dev *indio,
++				   struct iio_chan_spec const *chan, int *val,
++				   int *val2, long mask)
++{
++	struct mt6897_scp_vec_priv *priv = iio_priv(indio);
++	struct mt6897_scp_vec *v = priv->vec;
++	unsigned long flags;
++	int ret = IIO_VAL_INT;
++
++	switch (mask) {
++	case IIO_CHAN_INFO_RAW:
++		spin_lock_irqsave(&priv->scp->accel_lock, flags);
++		if (v->valid)
++			*val = v->value[chan->address];
++		else
++			ret = -EAGAIN;
++		spin_unlock_irqrestore(&priv->scp->accel_lock, flags);
++		return ret;
++	case IIO_CHAN_INFO_SCALE:
++		if (!v->gain)
++			return -EAGAIN;
++		*val = 1;
++		/* rad/s for the gyroscope; uT -> Gauss for the magnetometer */
++		*val2 = chan->type == IIO_MAGN ? v->gain * 100 : v->gain;
++		return IIO_VAL_FRACTIONAL;
++	}
++	return -EINVAL;
++}
++
++static const struct iio_info mt6897_scp_vec_info = {
++	.read_raw = mt6897_scp_vec_read_raw,
++};
++
++static const struct iio_mount_matrix *
++mt6897_scp_vec_get_mount_matrix(const struct iio_dev *indio,
++				const struct iio_chan_spec *chan)
++{
++	struct mt6897_scp_vec_priv *priv = iio_priv(indio);
++
++	return &priv->scp->orientation;
++}
++
++static const struct iio_chan_spec_ext_info mt6897_scp_vec_ext_info[] = {
++	IIO_MOUNT_MATRIX(IIO_SHARED_BY_DIR, mt6897_scp_vec_get_mount_matrix),
++	{ }
++};
++
++#define SCP_VEC_CHANNEL(t, axis, idx) {					\
++	.type = t,							\
++	.modified = 1,							\
++	.channel2 = IIO_MOD_##axis,					\
++	.address = idx,							\
++	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),			\
++	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE),		\
++	.ext_info = mt6897_scp_vec_ext_info,				\
++}
++
++static const struct iio_chan_spec mt6897_scp_gyro_channels[] = {
++	SCP_VEC_CHANNEL(IIO_ANGL_VEL, X, 0),
++	SCP_VEC_CHANNEL(IIO_ANGL_VEL, Y, 1),
++	SCP_VEC_CHANNEL(IIO_ANGL_VEL, Z, 2),
++};
++
++static const struct iio_chan_spec mt6897_scp_magn_channels[] = {
++	SCP_VEC_CHANNEL(IIO_MAGN, X, 0),
++	SCP_VEC_CHANNEL(IIO_MAGN, Y, 1),
++	SCP_VEC_CHANNEL(IIO_MAGN, Z, 2),
++};
++
++static int mt6897_scp_vec_register(struct device *dev, struct mt6897_scp *scp,
++				   struct mt6897_scp_vec *v, const char *name,
++				   const struct iio_chan_spec *channels)
++{
++	struct mt6897_scp_vec_priv *priv;
++
++	v->indio = devm_iio_device_alloc(dev, sizeof(*priv));
++	if (!v->indio)
++		return -ENOMEM;
++	priv = iio_priv(v->indio);
++	priv->scp = scp;
++	priv->vec = v;
++	v->indio->name = name;
++	v->indio->info = &mt6897_scp_vec_info;
++	v->indio->modes = INDIO_DIRECT_MODE;
++	v->indio->channels = channels;
++	v->indio->num_channels = 3;
++	return devm_iio_device_register(dev, v->indio);
++}
++
++static int mt6897_scp_probe(struct platform_device *pdev)
++{
++	struct mt6897_scp *scp;
++	struct iio_dev *indio;
++	struct resource *res;
++	u32 info[8];
++	int i, ret;
++
++	indio = devm_iio_device_alloc(&pdev->dev, sizeof(*scp));
++	if (!indio)
++		return -ENOMEM;
++	scp = iio_priv(indio);
++	scp->indio = indio;
++	scp->dev = &pdev->dev;
++	spin_lock_init(&scp->accel_lock);
++	mutex_init(&scp->lock);
++	mutex_init(&scp->comm_lock);
++	mutex_init(&scp->transport_lock);
++	spin_lock_init(&scp->client_lock);
++	spin_lock_init(&scp->send_lock);
++	init_completion(&scp->ack_done);
++	init_completion(&scp->notify_done);
++
++	/* The SCP reports Android device axes; the board maps them to Linux */
++	ret = iio_read_mount_matrix(&pdev->dev, &scp->orientation);
++	if (ret)
++		return ret;
++	INIT_WORK(&scp->hub_work, mt6897_scp_hub_work);
++
++	scp->sram = devm_platform_ioremap_resource_byname(pdev, "sram");
++	if (IS_ERR(scp->sram))
++		return PTR_ERR(scp->sram);
++	scp->core0 = devm_platform_ioremap_resource_byname(pdev, "cfg-core0");
++	if (IS_ERR(scp->core0))
++		return PTR_ERR(scp->core0);
++	scp->cfg = devm_platform_ioremap_resource_byname(pdev, "cfg");
++	if (IS_ERR(scp->cfg))
++		return PTR_ERR(scp->cfg);
++	/* Shared with the infracfg_ao clock controller: map, do not claim. */
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "infra-irq");
++	if (!res)
++		return -EINVAL;
++	scp->infra = devm_ioremap(&pdev->dev, res->start - INFRA_IRQ_SET,
++				  INFRA_IRQ_CLEAR + 4);
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "share");
++	if (!scp->infra || !res)
++		return -ENOMEM;
++	scp->shm_phys = res->start;
++	scp->shm = devm_ioremap_wc(&pdev->dev, res->start, resource_size(res));
++	if (!scp->shm)
++		return -ENOMEM;
++	platform_set_drvdata(pdev, scp);
++
++	ret = mt6897_scp_mailboxes(pdev, scp);
++	if (ret)
++		return dev_err_probe(&pdev->dev, ret, "mailboxes\n");
++
++	for (i = 0; i < ARRAY_SIZE(info); i++)
++		info[i] = readl(scp->sram + SCP_REGION_INFO_OFFSET + 4 * i);
++	dev_info(&pdev->dev,
++		 "region info: loader %#x+%#x firmware %#x+%#x dram %#x+%#x backup %#x size %u\n",
++		 info[0], info[1], info[2], info[3], info[4], info[5], info[6],
++		 info[7]);
++	mt6897_scp_report(scp, "probe");
++
++	/* The accelerometer reads -EAGAIN until the SCP runs and reports. */
++	indio->name = "scp-accel";
++	indio->info = &mt6897_scp_iio_info;
++	indio->modes = INDIO_DIRECT_MODE;
++	indio->channels = mt6897_scp_accel_channels;
++	indio->num_channels = ARRAY_SIZE(mt6897_scp_accel_channels);
++	ret = devm_iio_device_register(&pdev->dev, indio);
++	if (ret)
++		return ret;
++
++	scp->als = devm_iio_device_alloc(&pdev->dev, sizeof(struct mt6897_scp_als));
++	if (!scp->als)
++		return -ENOMEM;
++	((struct mt6897_scp_als *)iio_priv(scp->als))->scp = scp;
++	scp->als->name = "scp-als";
++	scp->als->info = &mt6897_scp_als_info;
++	scp->als->modes = INDIO_DIRECT_MODE;
++	scp->als->channels = mt6897_scp_als_channels;
++	scp->als->num_channels = ARRAY_SIZE(mt6897_scp_als_channels);
++	ret = devm_iio_device_register(&pdev->dev, scp->als);
++	if (ret)
++		return ret;
++
++	ret = mt6897_scp_vec_register(&pdev->dev, scp, &scp->gyro, "scp-gyro",
++				      mt6897_scp_gyro_channels);
++	if (ret)
++		return ret;
++	ret = mt6897_scp_vec_register(&pdev->dev, scp, &scp->magn, "scp-magn",
++				      mt6897_scp_magn_channels);
++	if (ret)
++		return ret;
++	mutex_lock(&mt6897_scp_registry_lock);
++	if (mt6897_scp_instance)
++		ret = -EBUSY;
++	else
++		mt6897_scp_instance = scp;
++	mutex_unlock(&mt6897_scp_registry_lock);
++	return ret;
++}
++
++static const struct of_device_id mt6897_scp_of_match[] = {
++	{ .compatible = "mediatek,mt6897-scp-bringup" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mt6897_scp_of_match);
++
++static struct platform_driver mt6897_scp_driver = {
++	.probe = mt6897_scp_probe,
++	.driver = {
++		.name = "mt6897-scp-bringup",
++		.of_match_table = mt6897_scp_of_match,
++		.dev_groups = mt6897_scp_groups,
++		.suppress_bind_attrs = true,
++	},
++};
++module_platform_driver(mt6897_scp_driver);
++
++MODULE_DESCRIPTION("MT6897 SCP bring-up helper (reset release, mailboxes, sensor hub)");
++MODULE_LICENSE("GPL");
+diff --git a/include/linux/mt6897-scp-ccci.h b/include/linux/mt6897-scp-ccci.h
+new file mode 100644
+index 0000000000..9063b3d352
+--- /dev/null
++++ b/include/linux/mt6897-scp-ccci.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_MT6897_SCP_CCCI_H
++#define _LINUX_MT6897_SCP_CCCI_H
++#include <linux/types.h>
++/* Callbacks run under the transport spinlock: copy/queue only; never send. */
++struct mt6897_scp_ccci_client {
++	void (*ready)(void *data);
++	void (*receive)(void *data, const u32 words[2]);
++	void *data;
++};
++int mt6897_scp_ccci_register(const struct mt6897_scp_ccci_client *client,
++			     bool *ready);
++void mt6897_scp_ccci_unregister(const struct mt6897_scp_ccci_client *client);
++int mt6897_scp_ccci_send(const u32 words[4]);
++#endif
+-- 
+2.56.0
+

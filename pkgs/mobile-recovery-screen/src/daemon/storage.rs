@@ -9,7 +9,7 @@ use std::{
     fs::{self, File, OpenOptions},
     os::{
         fd::AsRawFd,
-        unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt},
+        unix::fs::{FileExt, FileTypeExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
     process::Command,
@@ -53,6 +53,9 @@ fn slot_hints(cmdline: &str, boot: &str) -> Result<(bool, Option<String>)> {
     }
     Ok((seen, uuid))
 }
+#[path = "boot_control.rs"]
+mod boot_control_metadata;
+pub use boot_control_metadata::*;
 /// One storage role of a single-slot device. Only `label` is required: the
 /// partition must be the unique GPT entry with that name on the controller.
 /// Measured fields, when present, must all match.
@@ -98,6 +101,9 @@ pub struct Config {
     pub controller: String,
     pub hostname: String,
     pub root_label: String,
+    /// FAT label created (and, for explicit roles, checked) on the boot partition.
+    #[serde(default = "default_boot_label")]
+    pub boot_label: String,
     pub esp_bytes: u64,
     pub minimum_root_bytes: u64,
     pub slot_metadata: String,
@@ -114,6 +120,12 @@ pub struct Config {
     /// Controller sysfs directory whose clock gating/scaling must be disabled.
     pub ufs_safe_mode: Option<String>,
     pub deploy_requirements: Requirements,
+    /// Required prefix of the bootloader-provided `/serial-number`.
+    #[serde(default)]
+    pub serial_prefix: Option<String>,
+}
+fn default_boot_label() -> String {
+    "BOOT".into()
 }
 /// Filesystem roots for storage resolution; fixtures replace the live paths.
 pub struct Host {
@@ -276,6 +288,19 @@ impl Config {
     pub fn single(&self) -> bool {
         self.slot_model == "single"
     }
+    /// Linux on slot A of a MediaTek A/B device, Android preserved on B, with
+    /// `linux-boot` and `linux` split from userdata.
+    pub fn mediatek_a(&self) -> bool {
+        self.slot_model == "mediatek-a"
+    }
+    /// ESP size of the userdata split (1 GiB unless configured).
+    pub fn esp_size(&self) -> u64 {
+        if self.esp_bytes == 0 {
+            1 << 30
+        } else {
+            self.esp_bytes
+        }
+    }
     pub fn load() -> Result<Self> {
         let c: Self = serde_json::from_slice(&fs::read("/etc/mobile-recovery.json")?)?;
         c.check()?;
@@ -293,20 +318,30 @@ impl Config {
                 c.slot_metadata == "none" && c.roles.is_some() && !c.recovery_avb,
                 "single-slot recovery needs storage roles and no A/B metadata"
             );
+        } else if c.mediatek_a() {
+            ensure!(
+                c.roles.is_none()
+                    && c.ufs_safe_mode.is_none()
+                    && c.slot_metadata == "aosp-boot-control",
+                "MediaTek slot-A recovery needs AOSP boot control"
+            );
         } else {
             ensure!(c.slot_model == "ab", "unsupported slot model");
             ensure!(
-                c.roles.is_none() && c.ufs_safe_mode.is_none(),
+                c.roles.is_none()
+                    && c.ufs_safe_mode.is_none()
+                    && c.slot_metadata != "aosp-boot-control",
                 "A/B recovery uses fixed partition names"
             );
         }
         ensure!(
-            ["qcom-gpt", "boot-hints", "none"].contains(&c.slot_metadata.as_str())
+            ["qcom-gpt", "boot-hints", "aosp-boot-control", "none"]
+                .contains(&c.slot_metadata.as_str())
                 && (c.single() || c.slot_metadata != "none"),
             "unsupported slot metadata"
         );
         ensure!(
-            [1048576, 4194304].contains(&c.misc_bytes),
+            [524288, 1048576, 4194304].contains(&c.misc_bytes),
             "unsupported misc capacity"
         );
         ensure!(
@@ -323,6 +358,15 @@ impl Config {
                 .any(|s| s == self.compatible.as_bytes()),
             "device-tree identity mismatch"
         );
+        if let Some(prefix) = &self.serial_prefix {
+            ensure!(
+                fs::read("/proc/device-tree/serial-number")
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .is_some_and(|v| v.trim_end_matches('\0').starts_with(prefix.as_str())),
+                "bootloader serial number does not identify this board"
+            );
+        }
         ensure!(
             fs::read_to_string("/proc/1/comm")?.trim() == "systemd"
                 && Path::new("/etc/initrd-release").is_file()
@@ -332,6 +376,11 @@ impl Config {
         Ok(())
     }
     pub fn slot(&self, j: &Job) -> Result<()> {
+        self.slot_mode(j, false)
+    }
+    /// `slot` for `repair-backup-gpt`: the GPTs it reads may have a stale
+    /// backup within the repair scope; slot B is checked on the primary.
+    fn slot_mode(&self, j: &Job, repair: bool) -> Result<()> {
         self.identity()?;
         if self.single() {
             if let Some(c) = &self.ufs_safe_mode {
@@ -339,18 +388,30 @@ impl Config {
             }
             return Ok(());
         }
+        if self.mediatek_a() {
+            let misc = self.partition_mode(j, "misc", repair)?;
+            ensure!(
+                misc.entry.bytes() == self.misc_bytes as u64,
+                "misc capacity mismatch"
+            );
+            let mut b = [0; 32];
+            File::open(&misc.node)?
+                .read_exact_at(&mut b, BOOT_CONTROL_OFFSET)
+                .context("read boot control")?;
+            return check_slot_a(&boot_control(&b)?);
+        }
         let (seen, uuid) = slot_hints(
             &fs::read_to_string("/proc/cmdline")?,
             &fs::read_to_string("/proc/bootconfig").unwrap_or_default(),
         )?;
         if self.slot_metadata == "qcom-gpt" {
-            self.partition(j, "boot_b")?.gpt.selected_b()?;
+            self.partition_mode(j, "boot_b", repair)?.gpt.selected_b()?;
         } else {
             ensure!(seen || uuid.is_some(), "cannot verify active slot B");
         }
         if let Some(uuid) = uuid {
             ensure!(
-                self.partition(j, "vbmeta_b")?
+                self.partition_mode(j, "vbmeta_b", repair)?
                     .entry
                     .uuid
                     .eq_ignore_ascii_case(&uuid),
@@ -360,7 +421,24 @@ impl Config {
         Ok(())
     }
     pub fn ram_gate(&self, j: &Job) -> Result<()> {
-        self.slot(j)?;
+        self.ram_gate_mode(j, false)
+    }
+    pub fn ram_gate_for_backup_repair(&self, j: &Job) -> Result<()> {
+        self.ram_gate_mode(j, true)
+    }
+    fn ram_gate_mode(&self, j: &Job, repair: bool) -> Result<()> {
+        self.slot_mode(j, repair)?;
+        self.ram_only()
+    }
+    /// Gate for reboot/poweroff requests that write nothing: identity and no
+    /// mounted UFS filesystems (the forced restart skips unmounting), but no
+    /// partition-table or slot reads, so a damaged GPT never traps the user
+    /// in recovery.
+    pub fn reboot_gate(&self) -> Result<()> {
+        self.identity()?;
+        self.ram_only()
+    }
+    fn ram_only(&self) -> Result<()> {
         for line in fs::read_to_string("/proc/self/mountinfo")?.lines() {
             let fields: Vec<_> = line.split_whitespace().collect();
             ensure!(fields.len() > 6, "malformed mountinfo");
@@ -475,7 +553,16 @@ impl Config {
         let gpt = if repair {
             Gpt::read_for_backup_repair(&f, bytes)?
         } else {
-            Gpt::read(&f, bytes)?
+            Gpt::read(&f, bytes).map_err(|e| {
+                if Gpt::read_for_backup_repair(&f, bytes).is_ok() {
+                    e.context(format!(
+                        "{} has a stale backup GPT within the repair scope; see `recovery repair-backup-gpt --check`",
+                        disk.display()
+                    ))
+                } else {
+                    e
+                }
+            })?
         };
         let entry = gpt.partition(name)?.clone();
         ensure!(
@@ -525,10 +612,14 @@ impl Config {
             };
             return resolve_role(&Host::live(), &self.controller, which, role);
         }
-        let name = match which {
-            "firmware" => "boot_b",
-            "recovery" => "recovery_b",
-            "misc" => "misc",
+        let name = match (which, self.mediatek_a()) {
+            ("firmware", false) => "boot_b",
+            ("recovery", false) => "recovery_b",
+            ("firmware", true) => "boot_a",
+            ("recovery", true) => {
+                anyhow::bail!("this slot model uses USB RAM recovery; no recovery partition")
+            }
+            ("misc", _) => "misc",
             _ => anyhow::bail!("unknown storage role {which}"),
         };
         self.partition(j, name)
@@ -580,8 +671,13 @@ impl Config {
         let root = self.partition(j, "linux")?;
         let esp = self.partition(j, "linux-boot")?;
         ensure!(root.disk == esp.disk, "root and ESP are on different disks");
-        root.gpt
-            .check_linux_layout(self.esp_bytes, self.minimum_root_bytes)?;
+        if self.mediatek_a() {
+            root.gpt
+                .check_userdata_layout(self.esp_size(), self.minimum_root_bytes)?;
+        } else {
+            root.gpt
+                .check_linux_layout(self.esp_bytes, self.minimum_root_bytes)?;
+        }
         if filesystems {
             ensure!(
                 probe(j, &root.node, "TYPE")? == "ext4"
@@ -1000,6 +1096,7 @@ mod tests {
             controller: "ufs".into(),
             hostname: "aurora".into(),
             root_label: "ROOT".into(),
+            boot_label: "BOOT".into(),
             esp_bytes: 1 << 30,
             minimum_root_bytes: 16 << 30,
             slot_metadata: "qcom-gpt".into(),
@@ -1072,6 +1169,7 @@ mod retry_tests {
             controller: "ufs".into(),
             hostname: "aurora".into(),
             root_label: "ROOT".into(),
+            boot_label: "BOOT".into(),
             esp_bytes: 1 << 30,
             minimum_root_bytes: 16 << 30,
             slot_metadata: "qcom-gpt".into(),
@@ -1248,7 +1346,7 @@ mod single_tests {
         assert_eq!(misc.entry.bytes(), 4 << 20);
         // Missing names, another controller and an absent label fail closed.
         assert!(resolve_role(&f.host, "1d84000.ufshc", "x", &role("recovery")).is_err());
-        assert!(resolve_role(&f.host, "c0c4000.sdhci", "root", &role("userdata")).is_err());
+        assert!(resolve_role(&f.host, "c0c4000.mmc", "root", &role("userdata")).is_err());
         assert!(resolve_role(&f.host, "1d84000.ufshc", "x", &role("a/b")).is_err());
     }
     #[test]
@@ -1323,7 +1421,7 @@ mod single_tests {
         let u3 = Box::leak(uuid(13).into_boxed_str());
         let mut disks = vec![Disk {
             name: "mmcblk0p",
-            controller: "c0c4000.sdhci",
+            controller: "c0c4000.mmc",
             sector: 512,
             blocks: 1 << 20,
             removable: false,
@@ -1339,13 +1437,13 @@ mod single_tests {
             max_bytes: Some(64 << 20),
             ..role("system")
         };
-        let d = resolve_role(&f.host, "c0c4000.sdhci", "esp", &esp).unwrap();
+        let d = resolve_role(&f.host, "c0c4000.mmc", "esp", &esp).unwrap();
         assert_eq!((d.entry.sector, d.entry.bytes()), (512, 65536 * 512));
         let small = Role {
             min_bytes: Some(1 << 30),
             ..esp.clone()
         };
-        assert!(resolve_role(&f.host, "c0c4000.sdhci", "esp", &small).is_err());
+        assert!(resolve_role(&f.host, "c0c4000.mmc", "esp", &small).is_err());
         drop(f);
         // A second "system" on a removable card makes the name ambiguous.
         disks.push(Disk {
@@ -1357,13 +1455,13 @@ mod single_tests {
             parts: vec![("system", 2048, 4095, u3)],
         });
         let f = fixture("clover-card", &disks);
-        assert!(resolve_role(&f.host, "c0c4000.sdhci", "esp", &esp).is_err());
+        assert!(resolve_role(&f.host, "c0c4000.mmc", "esp", &esp).is_err());
         drop(f);
         // A role found only on a removable disk is refused.
         disks.remove(0);
-        disks[0].controller = "c0c4000.sdhci";
+        disks[0].controller = "c0c4000.mmc";
         let f = fixture("clover-removable", &disks);
-        assert!(resolve_role(&f.host, "c0c4000.sdhci", "esp", &role("system")).is_err());
+        assert!(resolve_role(&f.host, "c0c4000.mmc", "esp", &role("system")).is_err());
     }
     #[test]
     fn deployment_requirements_and_installed_roles() {
@@ -1401,7 +1499,7 @@ mod single_tests {
         let roles = Roles {
             root: role("userdata"),
             esp: Role {
-                fs_label: Some("NIXOS_BOOT".into()),
+                fs_label: Some("BOOT".into()),
                 ..role("system")
             },
             ..Default::default()
@@ -1506,5 +1604,113 @@ mod single_tests {
         }
         .check()
         .is_err());
+        let mediatek = Config {
+            identity: "t880".into(),
+            compatible: "alldocube,t880".into(),
+            firmware_compatible: "alldocube,t880".into(),
+            controller: "112b0000.ufshci".into(),
+            slot_model: "mediatek-a".into(),
+            slot_metadata: "aosp-boot-control".into(),
+            misc_bytes: 524288,
+
+            serial_prefix: Some("T880".into()),
+            ..ab.clone()
+        };
+        mediatek.check().unwrap();
+        for bad in [
+            Config {
+                slot_metadata: "qcom-gpt".into(),
+                ..mediatek.clone()
+            },
+            Config {
+                roles: Some(Roles::default()),
+                ..mediatek.clone()
+            },
+            Config {
+                slot_model: "ab".into(),
+                ..mediatek.clone()
+            },
+        ] {
+            assert!(bad.check().is_err());
+        }
+        assert!(Config {
+            misc_bytes: 524288,
+            ..ab.clone()
+        }
+        .check()
+        .is_ok());
+    }
+    /// The T880 misc block read on 2026-10-15: slot A selected (priority 7,
+    /// six tries, not yet successful), Android on B successful.
+    fn t880_boot_control() -> Vec<u8> {
+        let mut b = vec![0u8; 32];
+        b[..4].copy_from_slice(b"_b\0\0");
+        b[4..8].copy_from_slice(b"BCAB");
+        b[8] = 1;
+        b[9] = 2;
+        b[12] = 0x67;
+        b[14] = 0x96;
+        b[28..32].copy_from_slice(&[0xbe, 0xfc, 0x47, 0xb5]);
+        b
+    }
+    #[test]
+    fn aosp_boot_control_selects_slot_a_and_keeps_b() {
+        let b = t880_boot_control();
+        let slots = boot_control(&b).unwrap();
+        assert_eq!(
+            slots,
+            [
+                SlotInfo {
+                    priority: 7,
+                    tries: 6,
+                    successful: false
+                },
+                SlotInfo {
+                    priority: 6,
+                    tries: 1,
+                    successful: true
+                }
+            ]
+        );
+        check_slot_a(&slots).unwrap();
+        let mut swapped = slots;
+        swapped.swap(0, 1);
+        assert!(check_slot_a(&swapped).is_err());
+        let mut dead_b = slots;
+        dead_b[1].priority = 0;
+        assert!(check_slot_a(&dead_b).is_err());
+        let mut corrupt = b.clone();
+        corrupt[12] ^= 1;
+        assert!(boot_control(&corrupt).is_err());
+        let mut wrong = b;
+        wrong[9] = 3;
+        assert!(boot_control(&wrong).is_err());
+    }
+    #[test]
+    fn marking_slot_a_changes_only_its_bit_and_the_crc() {
+        let b: [u8; 32] = t880_boot_control().try_into().unwrap();
+        let n = mark_slot_a_successful(&b).unwrap().unwrap();
+        for i in 0..32 {
+            if i != 12 && !(28..32).contains(&i) {
+                assert_eq!(n[i], b[i], "byte {i}");
+            }
+        }
+        assert_eq!(n[12], 0xe7);
+        let slots = boot_control(&n).unwrap();
+        assert_eq!(
+            slots[0],
+            SlotInfo {
+                priority: 7,
+                tries: 6,
+                successful: true
+            }
+        );
+        assert_eq!(slots[1], boot_control(&b).unwrap()[1]);
+        assert_eq!(mark_slot_a_successful(&n).unwrap(), None);
+        let mut dead = b;
+        dead[12] = 0x60;
+        let crc = super::super::gpt::crc(&dead[..28]);
+        dead[28..32].copy_from_slice(&crc.to_le_bytes());
+        assert!(mark_slot_a_successful(&dead).is_err());
     }
 }

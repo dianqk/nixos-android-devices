@@ -1,0 +1,369 @@
+From 2817dda8ccdd5313c280f5b3f8d3a884ade87584 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 21 Oct 2026 11:34:50 +0800
+Subject: [PATCH] input: aurora-tcm: Power the touch controller off with the
+ panel
+
+With the display off, the S3910P kept scanning and sent about 119 frames/s
+over SPI, which woke CPU0 for the threaded IRQ and the userspace touch
+processor. The stock kernel sleeps the controller on its panel notifier.
+
+Follow the panel with a DRM panel follower, as i2c-hid does: before the
+panel powers off, stop the interrupt and any recovery, queue a zero-length
+PAUSED record for the raw-stream reader and remove the controller's
+dedicated supplies (avdd, iovdd, reset asserted). After the panel powers
+on, a work item repeats the probe sequence (power, reset and identity,
+format check, reports on) off the panel's prepare path; the first frame
+afterwards carries a RESUMED flag. Both flags use the formerly reserved
+HTRF header byte 18. A failed wake falls back to the existing recovery
+work, which now powers the controller on first. System suspend leaves a
+sleeping controller's interrupt alone. debugfs "sleeps" counts panel-off
+cycles.
+
+Touch can then no longer wake the display; the follow_panel module
+parameter (default on) keeps the controller running for setups that
+want touch-to-wake. The DT links the touchscreen to the N1 panel.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../boot/dts/qcom/sm8650-xiaomi-aurora.dts    |   4 +-
+ drivers/input/touchscreen/Kconfig             |   1 +
+ drivers/input/touchscreen/aurora-tcm.c        | 189 ++++++++++++++++--
+ 3 files changed, 179 insertions(+), 15 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts b/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
+index 36ef4d7fd33d..5026480840ce 100644
+--- a/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
++++ b/arch/arm64/boot/dts/qcom/sm8650-xiaomi-aurora.dts
+@@ -269,7 +269,7 @@ n1_te: panel-te-state {
+ &mdss_dsi0 {
+ 	vdda-supply = <&vreg_l3i>;
+ 	status = "okay";
+-	panel@0 {
++	n1_panel: panel@0 {
+ 		compatible = "xiaomi,n1-42-02-0a";
+ 		reg = <0>;
+ 		vddio-supply = <&vreg_l2g>;
+@@ -363,6 +363,8 @@ touchscreen@0 {
+ 		iovdd-supply = <&vreg_l12b_touch>;
+ 		reset-gpios = <&tlmm 161 GPIO_ACTIVE_LOW>;
+ 		irq-gpios = <&tlmm 162 GPIO_ACTIVE_LOW>;
++		/* The controller is powered off while the panel is. */
++		panel = <&n1_panel>;
+ 		pinctrl-names = "default";
+ 		pinctrl-0 = <&touch_reset_default &touch_irq_default>;
+ 	};
+diff --git a/drivers/input/touchscreen/Kconfig b/drivers/input/touchscreen/Kconfig
+index ba16913b3472..c1f915ac43ae 100644
+--- a/drivers/input/touchscreen/Kconfig
++++ b/drivers/input/touchscreen/Kconfig
+@@ -1417,6 +1417,7 @@ config TOUCHSCREEN_HIMAX_HX83112B
+ config TOUCHSCREEN_AURORA_TCM
+ 	tristate "Xiaomi 14 Ultra Synaptics raw touch transport"
+ 	depends on SPI && GPIOLIB
++	depends on DRM || !DRM
+ 	help
+ 	  Raw-frame transport for Aurora's S3910P controller. Coordinates are
+ 	  calculated by the Aurora userspace touch host processor via uinput.
+diff --git a/drivers/input/touchscreen/aurora-tcm.c b/drivers/input/touchscreen/aurora-tcm.c
+index 2c8a8bb9776e..db366797a7cf 100644
+--- a/drivers/input/touchscreen/aurora-tcm.c
++++ b/drivers/input/touchscreen/aurora-tcm.c
+@@ -16,6 +16,7 @@
+ #include <linux/unaligned.h>
+ #include <linux/kfifo.h>
+ #include <linux/kref.h>
++#include <drm/drm_panel.h>
+ #include <linux/miscdevice.h>
+ #include <linux/poll.h>
+ #include <linux/pm.h>
+@@ -25,6 +26,15 @@
+ #include <linux/uaccess.h>
+ #include <linux/workqueue.h>
+ 
++/* HTRF header byte 18 (formerly reserved, zero): stream events. */
++static bool follow_panel = true;
++module_param(follow_panel, bool, 0444);
++MODULE_PARM_DESC(follow_panel,
++		 "Power the controller off while the panel is off (touch cannot wake the display)");
++
++#define AURORA_STREAM_PAUSED	BIT(0)	/* zero-length record: controller off */
++#define AURORA_STREAM_RESUMED	BIT(1)	/* first frame after a controller wake */
++
+ struct aurora_stream_record {
+ 	u16 length;
+ 	u8 bytes[24 + 4096];
+@@ -58,6 +68,12 @@ struct aurora_tcm_probe {
+ 	struct delayed_work recover_work;
+ 	unsigned long recovering;
+ 	unsigned int recover_attempts, recoveries;
++	/* Panel follower: the controller is powered off while the panel is. */
++	struct drm_panel_follower panel_follower;
++	struct work_struct wake_work;
++	struct mutex pm_lock;
++	bool powered, asleep, resume_pending;
++	unsigned int sleeps;
+ };
+ 
+ struct aurora_stream_reader {
+@@ -229,6 +245,10 @@ static void aurora_stream_enqueue(struct aurora_tcm_probe *t)
+ 	put_unaligned_le32(t->raw_sequence, p + 4);
+ 	put_unaligned_le64(t->raw_timestamp, p + 8);
+ 	put_unaligned_le16(t->raw_len, p + 16);
++	if (t->resume_pending) {
++		p[18] = AURORA_STREAM_RESUMED;
++		t->resume_pending = false;
++	}
+ 	memcpy(p + 24, t->raw, t->raw_len);
+ 	t->producer.length = 24 + t->raw_len;
+ 	if (kfifo_in(&t->stream_fifo, &t->producer, 1) != 1)
+@@ -270,6 +290,9 @@ static void aurora_tcm_power_off(void *data)
+ {
+ 	struct aurora_tcm_probe *t = data;
+ 
++	if (!t->powered)
++		return;
++	t->powered = false;
+ 	gpiod_set_value_cansleep(t->reset, 1);
+ 	regulator_disable(t->iovdd);
+ 	usleep_range(3000, 3100);
+@@ -362,6 +385,7 @@ static int aurora_tcm_command(struct aurora_tcm_probe *t, u8 cmd,
+ }
+ 
+ static void aurora_tcm_recover(struct work_struct *work);
++static int aurora_tcm_power_on(struct aurora_tcm_probe *t);
+ static int aurora_tcm_identify(struct aurora_tcm_probe *t);
+ static int aurora_tcm_configure(struct aurora_tcm_probe *t);
+ static const u8 aurora_touch_report = 0xc0;
+@@ -369,7 +393,8 @@ static const u8 aurora_touch_report = 0xc0;
+ /* Disable the IRQ once per recovery; recovery re-enables it. */
+ static void aurora_tcm_schedule_recovery(struct aurora_tcm_probe *t, int error, bool sync)
+ {
+-	if (READ_ONCE(t->stopping) || test_and_set_bit(0, &t->recovering))
++	if (READ_ONCE(t->stopping) || READ_ONCE(t->asleep) ||
++	    test_and_set_bit(0, &t->recovering))
+ 		return;
+ 	if (sync)
+ 		disable_irq(t->irq_number);
+@@ -445,11 +470,14 @@ static void aurora_tcm_recover(struct work_struct *work)
+ 	u16 len;
+ 	int ret;
+ 
+-	if (READ_ONCE(t->stopping))
++	if (READ_ONCE(t->stopping) || READ_ONCE(t->asleep))
+ 		return;
+ 	/* The IRQ thread may still be returning from the failed packet. */
+ 	synchronize_irq(t->irq_number);
+-	ret = aurora_tcm_identify(t);
++	/* A failed panel wake may have left the supplies off. */
++	ret = t->powered ? 0 : aurora_tcm_power_on(t);
++	if (!ret)
++		ret = aurora_tcm_identify(t);
+ 	if (!ret)
+ 		ret = aurora_tcm_configure(t);
+ 	if (!ret)
+@@ -653,6 +681,126 @@ static int aurora_tcm_identify(struct aurora_tcm_probe *t)
+ 	return 0;
+ }
+ 
++static int aurora_tcm_power_on(struct aurora_tcm_probe *t)
++{
++	int ret;
++
++	ret = regulator_enable(t->avdd);
++	if (ret)
++		return ret;
++	usleep_range(3000, 3100);
++	ret = regulator_enable(t->iovdd);
++	if (ret) {
++		regulator_disable(t->avdd);
++		return ret;
++	}
++	t->powered = true;
++	msleep(50);
++	return 0;
++}
++
++/* Queue the zero-length pause record; the reader keeps its session. */
++static void aurora_stream_pause(struct aurora_tcm_probe *t)
++{
++	u8 *p = t->producer.bytes;
++
++	mutex_lock(&t->raw_lock);
++	if (t->stream_open && !t->stream_error && !t->stream_dead) {
++		memset(p, 0, 24);
++		memcpy(p, "HTRF", 4);
++		put_unaligned_le32(t->raw_sequence, p + 4);
++		put_unaligned_le64(t->raw_timestamp = ktime_get_ns(), p + 8);
++		p[18] = AURORA_STREAM_PAUSED;
++		t->producer.length = 24;
++		if (kfifo_in(&t->stream_fifo, &t->producer, 1) != 1)
++			t->stream_error = -EOVERFLOW;
++	}
++	t->raw_len = 0;
++	t->resume_pending = true;
++	mutex_unlock(&t->raw_lock);
++	wake_up_interruptible(&t->stream_wait);
++}
++
++/*
++ * Panel wake: power the controller on and repeat the probe sequence, off the
++ * panel's prepare path (about 0.3 s). On failure the recovery work retries
++ * and enables the interrupt when the controller answers.
++ */
++static void aurora_tcm_wake(struct work_struct *work)
++{
++	struct aurora_tcm_probe *t = container_of(work, struct aurora_tcm_probe, wake_work);
++	u16 len;
++	int ret;
++
++	mutex_lock(&t->pm_lock);
++	if (!t->asleep || READ_ONCE(t->stopping))
++		goto out;
++	ret = aurora_tcm_power_on(t);
++	if (!ret)
++		ret = aurora_tcm_identify(t);
++	if (!ret)
++		ret = aurora_tcm_configure(t);
++	if (!ret)
++		ret = aurora_tcm_command(t, 0x05, &aurora_touch_report, 1, &len);
++	WRITE_ONCE(t->asleep, false);
++	if (ret) {
++		dev_err(&t->spi->dev, "Touch controller wake failed (%d); recovering\n", ret);
++		set_bit(0, &t->recovering);
++		t->recover_attempts = 0;
++		queue_delayed_work(system_freezable_wq, &t->recover_work, 0);
++	} else {
++		enable_irq(t->irq_number);
++	}
++out:
++	mutex_unlock(&t->pm_lock);
++}
++
++static int aurora_tcm_panel_prepared(struct drm_panel_follower *follower)
++{
++	struct aurora_tcm_probe *t = container_of(follower, struct aurora_tcm_probe,
++						 panel_follower);
++
++	if (READ_ONCE(t->asleep))
++		queue_work(system_freezable_wq, &t->wake_work);
++	return 0;
++}
++
++static int aurora_tcm_panel_unpreparing(struct drm_panel_follower *follower)
++{
++	struct aurora_tcm_probe *t = container_of(follower, struct aurora_tcm_probe,
++						 panel_follower);
++
++	cancel_work_sync(&t->wake_work);
++	mutex_lock(&t->pm_lock);
++	if (t->asleep || READ_ONCE(t->stopping))
++		goto out;
++	/* New recoveries stop here; then drain the IRQ thread and recovery work. */
++	WRITE_ONCE(t->asleep, true);
++	disable_irq(t->irq_number);
++	cancel_delayed_work_sync(&t->recover_work);
++	/* An unfinished recovery held its own interrupt disable. */
++	if (test_and_clear_bit(0, &t->recovering))
++		enable_irq(t->irq_number);
++	aurora_stream_pause(t);
++	aurora_tcm_power_off(t);
++	t->sleeps++;
++out:
++	mutex_unlock(&t->pm_lock);
++	return 0;
++}
++
++static const struct drm_panel_follower_funcs aurora_tcm_panel_funcs = {
++	.panel_prepared = aurora_tcm_panel_prepared,
++	.panel_unpreparing = aurora_tcm_panel_unpreparing,
++};
++
++static void aurora_tcm_cancel_wake(void *data)
++{
++	struct aurora_tcm_probe *t = data;
++
++	cancel_work_sync(&t->wake_work);
++}
++
+ static int aurora_tcm_probe(struct spi_device *spi)
+ {
+ 	struct device *dev = &spi->dev;
+@@ -665,6 +813,8 @@ static int aurora_tcm_probe(struct spi_device *spi)
+ 	t->spi = spi;
+ 	spi_set_drvdata(spi, t);
+ 	mutex_init(&t->raw_lock);
++	mutex_init(&t->pm_lock);
++	INIT_WORK(&t->wake_work, aurora_tcm_wake);
+ 	kref_init(&t->refs);
+ 	init_waitqueue_head(&t->stream_wait);
+ 	INIT_DELAYED_WORK(&t->recover_work, aurora_tcm_recover);
+@@ -691,19 +841,12 @@ static int aurora_tcm_probe(struct spi_device *spi)
+ 	ret = spi_setup(spi);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "SPI setup\n");
+-	ret = regulator_enable(t->avdd);
++	ret = aurora_tcm_power_on(t);
+ 	if (ret)
+ 		return ret;
+-	usleep_range(3000, 3100);
+-	ret = regulator_enable(t->iovdd);
+-	if (ret) {
+-		regulator_disable(t->avdd);
+-		return ret;
+-	}
+ 	ret = devm_add_action_or_reset(dev, aurora_tcm_power_off, t);
+ 	if (ret)
+ 		return ret;
+-	msleep(50);
+ 	ret = aurora_tcm_identify(t);
+ 	if (ret == -ENODEV) {
+ 		dev_info(dev, "Not a TCM v1 identify report; no further commands\n");
+@@ -711,7 +854,19 @@ static int aurora_tcm_probe(struct spi_device *spi)
+ 	}
+ 	if (ret)
+ 		return ret;
+-	return aurora_tcm_setup_stream(t);
++	ret = aurora_tcm_setup_stream(t);
++	if (ret || !follow_panel || !drm_is_panel_follower(dev))
++		return ret;
++	/* Removed before the wake work is cancelled and the IRQ is quiesced. */
++	ret = devm_add_action_or_reset(dev, aurora_tcm_cancel_wake, t);
++	if (ret)
++		return ret;
++	t->panel_follower.funcs = &aurora_tcm_panel_funcs;
++	ret = devm_drm_panel_add_follower(dev, &t->panel_follower);
++	if (ret)
++		return dev_err_probe(dev, ret, "panel follower\n");
++	debugfs_create_u32("sleeps", 0400, t->debug, &t->sleeps);
++	return 0;
+ }
+ 
+ static int aurora_tcm_suspend(struct device *dev)
+@@ -720,9 +875,13 @@ static int aurora_tcm_suspend(struct device *dev)
+ 
+ 	/* Quiesce the threaded reader before the parent SPI controller suspends.
+ 	 * Otherwise a report can return -ESHUTDOWN and permanently stop the stream.
++	 * A controller asleep with the panel already has its interrupt disabled.
+ 	 */
+-	if (t->irq_number > 0)
++	cancel_work_sync(&t->wake_work);
++	mutex_lock(&t->pm_lock);
++	if (t->irq_number > 0 && !t->asleep)
+ 		disable_irq(t->irq_number);
++	mutex_unlock(&t->pm_lock);
+ 	mutex_lock(&t->raw_lock);
+ 	t->stream_error = -EPIPE;
+ 	mutex_unlock(&t->raw_lock);
+@@ -734,8 +893,10 @@ static int aurora_tcm_resume(struct device *dev)
+ {
+ 	struct aurora_tcm_probe *t = dev_get_drvdata(dev);
+ 
+-	if (t->irq_number > 0)
++	mutex_lock(&t->pm_lock);
++	if (t->irq_number > 0 && !t->asleep)
+ 		enable_irq(t->irq_number);
++	mutex_unlock(&t->pm_lock);
+ 	return 0;
+ }
+ 

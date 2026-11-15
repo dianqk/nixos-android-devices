@@ -1,0 +1,87 @@
+From c6ca314e18a04a8380e3ea6912cce8c9368f8a55 Mon Sep 17 00:00:00 2001
+From: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Date: Tue, 20 Oct 2026 14:47:01 +0200
+Subject: [PATCH 033/144] crypto: qce - Don't modify the TFM context for
+ per-request fallback
+
+qce_aead_crypt() records a per-request decision to use the software
+fallback (on zero-length message) in ctx->need_fallback, which lives in the
+TFM context shared by all concurrent requests on the transform, and then
+clears it again. This has two problems:
+
+1. Concurrent requests race on the flag: one request can observe and
+clear the flag set for another, so that a request that needs the fallback
+is sent to the engine while an unrelated one is diverted to the fallback.
+
+2. ctx->need_fallback is also set by setkey() for AES-192 keys, which
+the engine cannot handle for any request. Clearing it after the first
+fallback request makes every following request on that TFM go to the
+hardware with an unsupported key size.
+
+Use a local variable seeded from the per-TFM flag for the per-request
+decision and stop clearing the flag.
+
+Fixes: b51dcf05c1e9 ("crypto: qce - Schedule fallback aead algorithm")
+Cc: stable@vger.kernel.org
+Signed-off-by: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Message-ID: <20261020-qce-fixes-aead-v12-1-77a2e09abd0c@oss.qualcomm.com>
+Link: https://lore.kernel.org/r/20261020-qce-fixes-aead-v12-1-77a2e09abd0c@oss.qualcomm.com
+(cherry picked from commit 6eeff9163bd5e5b5de6fbe7ff8cc978abff23497)
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0051-crypto-qce-Don-t-modify-the-TFM-context-for-per-requ.patch
+Import-SHA256: 1d57a8b973cf148cd809414ae7a42e7ca7c411d3acf910a547a83a836ea204a9
+Import-Provenance: mail headers
+(cherry picked from commit e7df87478efe6b2991de04509aeba69ae646d9d1)
+---
+ drivers/crypto/qce/aead.c | 14 +++++---------
+ 1 file changed, 5 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/crypto/qce/aead.c b/drivers/crypto/qce/aead.c
+index a9642c67f4..09be3f745f 100644
+--- a/drivers/crypto/qce/aead.c
++++ b/drivers/crypto/qce/aead.c
+@@ -499,6 +499,7 @@ static int qce_aead_crypt(struct aead_request *req, int encrypt)
+ 	struct qce_aead_ctx *ctx = crypto_aead_ctx(tfm);
+ 	struct qce_alg_template *tmpl = to_aead_tmpl(tfm);
+ 	unsigned int blocksize = crypto_aead_blocksize(tfm);
++	bool fallback = ctx->need_fallback;
+ 
+ 	rctx->flags  = tmpl->alg_flags;
+ 	rctx->flags |= encrypt ? QCE_ENCRYPT : QCE_DECRYPT;
+@@ -511,14 +512,11 @@ static int qce_aead_crypt(struct aead_request *req, int encrypt)
+ 	/* CE does not handle 0 length messages */
+ 	if (!rctx->cryptlen) {
+ 		if (!(IS_CCM(rctx->flags) && IS_DECRYPT(rctx->flags)))
+-			ctx->need_fallback = true;
++			fallback = true;
+ 	}
+ 
+ 	/* If fallback is needed, schedule and exit */
+-	if (ctx->need_fallback) {
+-		/* Reset need_fallback in case the same ctx is used for another transaction */
+-		ctx->need_fallback = false;
+-
++	if (fallback) {
+ 		aead_request_set_tfm(&rctx->fallback_req, ctx->fallback);
+ 		aead_request_set_callback(&rctx->fallback_req, req->base.flags,
+ 					  req->base.complete, req->base.data);
+@@ -577,8 +575,7 @@ static int qce_aead_ccm_setkey(struct crypto_aead *tfm, const u8 *key,
+ 	memcpy(ctx->enc_key, key, keylen);
+ 	memcpy(ctx->auth_key, key, keylen);
+ 
+-	if (keylen == AES_KEYSIZE_192)
+-		ctx->need_fallback = true;
++	ctx->need_fallback = (keylen == AES_KEYSIZE_192);
+ 
+ 	return IS_CCM_RFC4309(flags) ?
+ 		crypto_aead_setkey(ctx->fallback, key, keylen + QCE_CCM4309_SALT_SIZE) :
+@@ -606,8 +603,7 @@ static int qce_aead_setkey(struct crypto_aead *tfm, const u8 *key, unsigned int
+ 		    authenc_keys.enckeylen != AES_KEYSIZE_192 &&
+ 		    authenc_keys.enckeylen != AES_KEYSIZE_256)
+ 			return -EINVAL;
+-		if (authenc_keys.enckeylen == AES_KEYSIZE_192)
+-			ctx->need_fallback = true;
++		ctx->need_fallback = (authenc_keys.enckeylen == AES_KEYSIZE_192);
+ 	}
+ 
+ 	ctx->enc_keylen = authenc_keys.enckeylen;

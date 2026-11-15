@@ -1,0 +1,285 @@
+From: dianqk <dianqk@dianqk.net>
+Subject: [PATCH] t880: allocate decode presentation buffers through Panthor DRM
+
+T880 copies decoded NV12 into stable GPU presentation storage. Allocate that
+storage through the Panthor render node and export a PRIME fd, rather than
+requiring DMA-heap device access from sandboxed VA-API consumers. Preserve
+CPU-access synchronization, reservation-fence waits and previously exported
+storage identities. Keep system DMA heaps for new upload/write allocations
+and the noncoherent VPU input path.
+
+diff --git a/meson.build b/meson.build
+index b916f7b..f93c287 100644
+--- a/meson.build
++++ b/meson.build
+@@ -65,6 +65,7 @@ sources = files(
+   'src/av1.cpp',
+   'src/decoder.cpp',
+   'src/t880-decoder.cpp',
++  'src/t880-presentation.cpp',
+   'src/encoder.cpp',
+   'src/h264.cpp',
+   'src/hevc.cpp',
+@@ -143,3 +144,7 @@ test('T880 AV1 replay anchors', t880_anchor_test)
+ t880_encoder_test = executable('t880-encoder-test', 'tests/t880/encoder.cpp',
+   dependencies: [va, threads], cpp_args: ['-UNDEBUG'], build_by_default: false)
+ test('T880 encoder ownership and controls', t880_encoder_test)
++
++t880_presentation_test = executable('t880-presentation-test', 'tests/t880/presentation.cpp',
++  dependencies: [va, drm, threads], cpp_args: ['-UNDEBUG'])
++test('T880 presentation allocation and ownership', t880_presentation_test)
+diff --git a/src/backend.cpp b/src/backend.cpp
+index a04be09..8618360 100644
+--- a/src/backend.cpp
++++ b/src/backend.cpp
+@@ -272,16 +272,19 @@ static VAImage create_image(Driver &d, unsigned fourcc, unsigned w, unsigned h)
+ }
+ 
+ static std::shared_ptr<Memory> allocate_undecoded_surface(VADriverContextP ctx, const Surface &s,
+-                                                          bool pixel_write = false) {
++                                                          bool pixel_write = false, unsigned export_flags = 0) {
+     check(!s.reconstruction_only || pixel_write, "reconstruction pixels are not available",
+           VA_STATUS_ERROR_UNIMPLEMENTED);
+-    // mpv probes GPU import before creating a decoder context. Use an actual
+-    // linear MSM GEM allocation for these otherwise unbacked VA surfaces.
+-    // The PRIME fd owns the storage after the temporary GEM handle is closed.
+-    // If exported before decode, keep this allocation for the surface's
++    // Clients may probe GPU import before creating a decoder context. Choose
++    // independent linear storage for the requested presentation/upload purpose.
++    // The independent DMA-BUF fd owns the storage; presentation BOs close
++    // their temporary GEM handle before publishing it. If exported before
++    // decode, keep this allocation for the surface's
+     // lifetime. A consumer may keep its fd without calling export again.
+     check(ctx->drm_state, "surface allocation requires a DRM display");
+     int fd = static_cast<drm_state *>(ctx->drm_state)->fd;
++    if (static_cast<Driver *>(ctx->pDriverData)->t880 && !pixel_write)
++        return allocate_t880_export_surface(fd, s.width, s.height, s.fourcc, export_flags);
+     return allocate_surface(fd, s.width, s.height, s.fourcc);
+ }
+ 
+@@ -1224,9 +1227,10 @@ API(
+               s->memory->origin == MemoryOrigin::MsmCoherent ||
+               s->memory->origin == MemoryOrigin::MsmWriteCombined ||
+               s->memory->origin == MemoryOrigin::DmaHeap ||
++              s->memory->origin == MemoryOrigin::PanthorPresentation ||
+               s->memory->origin == MemoryOrigin::Imported,
+           "writable export requires independent storage", VA_STATUS_ERROR_UNIMPLEMENTED);
+-    if (!s->memory) s->memory = allocate_undecoded_surface(ctx, *s); auto m = s->memory;
++    if (!s->memory) s->memory = allocate_undecoded_surface(ctx, *s, false, flags); auto m = s->memory;
+     auto &desc = *static_cast<VADRMPRIMESurfaceDescriptor *>(out); desc = {};
+     desc.fourcc = m->fourcc; desc.width = s->width; desc.height = s->height; desc.num_objects = 1;
+     desc.objects[0].fd = fcntl(m->fd, F_DUPFD_CLOEXEC, 0);
+diff --git a/src/internal.hpp b/src/internal.hpp
+index a1aaf2c..ac50de9 100644
+--- a/src/internal.hpp
++++ b/src/internal.hpp
+@@ -66,7 +66,7 @@ template <class... A> void trace(const char *f, A... a) {
+         std::fprintf(stderr, "\n");
+     }
+ }
+-enum class MemoryOrigin { Unknown, MsmWriteCombined, MsmCoherent, DmaHeap, Imported, Iris, V4l2Mmap };
++enum class MemoryOrigin { Unknown, MsmWriteCombined, MsmCoherent, PanthorPresentation, DmaHeap, Imported, Iris, V4l2Mmap };
+ struct Memory {
+     MemoryOrigin origin = MemoryOrigin::Unknown;
+     int fd = -1;
+@@ -300,6 +300,11 @@ class Encoder {
+     void finish();
+ };
+ void copy_surface(Memory &destination, Memory &source, unsigned width, unsigned height);
++// Independent CPU-written/GPU-read T880 decode output; never a VPU upload.
++std::shared_ptr<Memory> allocate_t880_presentation_surface(int render_fd, unsigned width,
++                                                         unsigned height, unsigned fourcc);
++std::shared_ptr<Memory> allocate_t880_export_surface(int render_fd, unsigned width,
++                                                     unsigned height, unsigned fourcc, unsigned flags);
+ std::shared_ptr<Memory> allocate_surface(int render_fd, unsigned width, unsigned height,
+                                          unsigned fourcc);
+ void copy_to_v4l2_mmap(Memory &destination, Memory &source, unsigned width, unsigned height);
+diff --git a/src/t880-decoder.cpp b/src/t880-decoder.cpp
+index ebc0380..05fa3bf 100644
+--- a/src/t880-decoder.cpp
++++ b/src/t880-decoder.cpp
+@@ -364,7 +364,7 @@ void T880Decoder::submit(const std::vector<uint8_t> &bytes,
+           accepted.size() <= HISTORY_LIMIT - history_bytes_), "T880 contiguous history limit",
+           VA_STATUS_ERROR_ALLOCATION_FAILED);
+     History picture{next_client_, accepted};
+-    auto memory = s->memory ? s->memory : allocate_surface(render_fd_, s->width, s->height,
++    auto memory = s->memory ? s->memory : allocate_t880_presentation_surface(render_fd_, s->width, s->height,
+                                                           VA_FOURCC_NV12);
+     history_.reserve(history_.size() + 1);
+     try {
+diff --git a/src/t880-presentation.cpp b/src/t880-presentation.cpp
+new file mode 100644
+index 0000000..84c0e72
+--- /dev/null
++++ b/src/t880-presentation.cpp
+@@ -0,0 +1,73 @@
++// SPDX-License-Identifier: MIT
++#include "internal.hpp"
++#include <drm/panthor_drm.h>
++#include <xf86drm.h>
++#include <fcntl.h>
++#include <cstring>
++#include <sys/ioctl.h>
++#include <unistd.h>
++#include <utility>
++
++namespace irisva {
++namespace {
++// A PRIME fd owns its storage independently of this temporary DRM handle.
++// Never retry a numeric handle after an attempted close: it may be recycled.
++struct BoHandle {
++    int fd;
++    uint32_t handle;
++    int release() {
++        drm_gem_close request{};
++        request.handle = std::exchange(handle, 0);
++        return ioctl(fd, DRM_IOCTL_GEM_CLOSE, &request);
++    }
++    ~BoHandle() { if (handle) release(); }
++};
++constexpr size_t PRESENTATION_LIMIT = 16u * 1024 * 1024;
++}
++std::shared_ptr<Memory> allocate_t880_presentation_surface(int render_fd, unsigned width,
++                                                         unsigned height, unsigned fourcc) {
++    check(render_fd >= 0 && fourcc == VA_FOURCC_NV12 && width && height &&
++          !(width & 1) && !(height & 1) && width <= 4096 && height <= 2176,
++          "T880 presentation geometry", VA_STATUS_ERROR_INVALID_PARAMETER);
++    auto version = drmGetVersion(render_fd);
++    bool panthor = version && version->name && !std::strcmp(version->name, "panthor");
++    if (version) drmFreeVersion(version);
++    check(panthor, "T880 presentation requires a Panthor render node",
++          VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE);
++    auto m = std::make_shared<Memory>();
++    m->width = width; m->height = height; m->fourcc = fourcc;
++    m->stride = (width + 127) & ~127u;
++    m->storage_height = (height + 31) & ~31u;
++    long page = sysconf(_SC_PAGESIZE);
++    check(page > 0 && size_t(page) <= PRESENTATION_LIMIT, "T880 presentation page size");
++    size_t bytes = size_t(m->stride) * m->storage_height * 3 / 2;
++    m->size = (bytes + size_t(page) - 1) / size_t(page) * size_t(page);
++    check(m->size <= PRESENTATION_LIMIT, "T880 presentation allocation limit",
++          VA_STATUS_ERROR_ALLOCATION_FAILED);
++    // flags=0 uses Panthor's coherent/default WC CPU mapping policy. VM=0
++    // permits PRIME export. These buffers are GPU presentation storage, not
++    // attachments of the noncoherent VPU: keep DMA heaps for upload/encoding.
++    // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/uapi/drm/panthor_drm.h?h=v7.3
++    drm_panthor_bo_create create{};
++    create.size = m->size;
++    check(ioctl(render_fd, DRM_IOCTL_PANTHOR_BO_CREATE, &create) == 0,
++          "create Panthor presentation BO", VA_STATUS_ERROR_ALLOCATION_FAILED);
++    BoHandle handle{render_fd, create.handle};
++    check(create.handle && create.size >= m->size && create.size <= PRESENTATION_LIMIT,
++          "invalid Panthor presentation BO", VA_STATUS_ERROR_ALLOCATION_FAILED);
++    check(drmPrimeHandleToFD(render_fd, create.handle, DRM_CLOEXEC | DRM_RDWR, &m->fd) == 0,
++          "export Panthor presentation BO", VA_STATUS_ERROR_ALLOCATION_FAILED);
++    check(handle.release() == 0, "close Panthor presentation handle",
++          VA_STATUS_ERROR_ALLOCATION_FAILED);
++    m->origin = MemoryOrigin::PanthorPresentation;
++    // Memory::map and all CPU reads/writes retain DMA_BUF_IOCTL_SYNC and
++    // reservation-fence waits. Panthor provides real PRIME CPU-access callbacks.
++    return m;
++}
++std::shared_ptr<Memory> allocate_t880_export_surface(int render_fd, unsigned width,
++                                                     unsigned height, unsigned fourcc, unsigned flags) {
++    if ((flags & VA_EXPORT_SURFACE_READ_ONLY) && !(flags & VA_EXPORT_SURFACE_WRITE_ONLY))
++        return allocate_t880_presentation_surface(render_fd, width, height, fourcc);
++    return allocate_surface(render_fd, width, height, fourcc);
++}
++} // namespace irisva
+diff --git a/tests/t880/presentation.cpp b/tests/t880/presentation.cpp
+new file mode 100644
+index 0000000..fa8ad64
+--- /dev/null
++++ b/tests/t880/presentation.cpp
+@@ -0,0 +1,75 @@
++// SPDX-License-Identifier: MIT
++#include "../../src/internal.hpp"
++#include <drm/panthor_drm.h>
++#include <xf86drm.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <cassert>
++#include <cerrno>
++#include <iostream>
++using namespace irisva;
++namespace {
++struct Fake { bool create_fail=false,export_fail=false,close_fail=false,bad_size=false,wrong_driver=false;
++ unsigned creates=0,exports=0,closes=0,heap=0,live=0;int last_fd=-1;uint64_t size=0; } f;
++drmVersion version{};
++drmVersionPtr fake_version(int fd){assert(fd==100);version.name=const_cast<char*>(f.wrong_driver?"msm":"panthor");return &version;}
++void fake_free_version(drmVersionPtr v){assert(v==&version);}
++int fake_ioctl(int fd,unsigned long request,void*arg) {
++ assert(fd==100);
++ if(request==DRM_IOCTL_PANTHOR_BO_CREATE){auto&r=*static_cast<drm_panthor_bo_create*>(arg);
++  ++f.creates;assert(r.flags==0&&r.exclusive_vm_id==0&&r.size<=16u*1024*1024);
++  if(f.create_fail){errno=ENOMEM;return -1;}f.size=r.size;r.handle=7;f.live=1;if(f.bad_size)r.size=0;return 0;}
++ assert(request==DRM_IOCTL_GEM_CLOSE);auto&r=*static_cast<drm_gem_close*>(arg);assert(r.handle==7&&f.live==1);f.live=0;++f.closes;
++ if(f.close_fail){errno=EIO;return -1;}return 0;
++}
++int fake_export(int fd,uint32_t handle,uint32_t flags,int*out) {
++ assert(fd==100&&handle==7&&flags==(DRM_CLOEXEC|DRM_RDWR));++f.exports;
++ if(f.export_fail){errno=ENOMEM;return -1;}
++ f.last_fd=memfd_create("presentation-test",MFD_CLOEXEC);assert(f.last_fd>=0);assert(!ftruncate(f.last_fd,f.size));*out=f.last_fd;return 0;
++}
++}
++#define drmGetVersion fake_version
++#define drmFreeVersion fake_free_version
++#define ioctl fake_ioctl
++#define drmPrimeHandleToFD fake_export
++#include "../../src/t880-presentation.cpp"
++#undef drmGetVersion
++#undef drmFreeVersion
++#undef ioctl
++#undef drmPrimeHandleToFD
++namespace irisva {
++Memory::~Memory(){if(mapping)munmap(mapping,size);if(fd>=0)close(fd);}
++std::shared_ptr<Memory> allocate_surface(int,unsigned w,unsigned h,unsigned fourcc) {
++ ++f.heap;auto m=std::make_shared<Memory>();m->width=w;m->height=h;m->fourcc=fourcc;m->origin=MemoryOrigin::DmaHeap;return m;
++}
++}
++template<class F>void rejects(F action){bool failed=false;try{action();}catch(const Error&){failed=true;}assert(failed);}
++int main(){
++ for(unsigned flags:{unsigned(VA_EXPORT_SURFACE_READ_ONLY),unsigned(VA_EXPORT_SURFACE_READ_ONLY|VA_EXPORT_SURFACE_SEPARATE_LAYERS)}){
++  f={};auto m=allocate_t880_export_surface(100,1920,1080,VA_FOURCC_NV12,flags);
++  assert(f.creates==1&&f.exports==1&&f.closes==1&&!f.live&&!f.heap);
++  assert(m->origin==MemoryOrigin::PanthorPresentation&&m->stride==1920&&m->storage_height==1088);
++  int held=fcntl(m->fd,F_DUPFD_CLOEXEC,0);assert(held>=0);struct stat a{},b{};assert(!fstat(m->fd,&a)&&!fstat(held,&b));assert(a.st_ino==b.st_ino);
++  int original=m->fd;m.reset();assert(fcntl(original,F_GETFD)==-1&&errno==EBADF);assert(!fstat(held,&b)&&b.st_ino==a.st_ino);close(held);
++ }
++ for(unsigned flags:{0u,unsigned(VA_EXPORT_SURFACE_WRITE_ONLY),unsigned(VA_EXPORT_SURFACE_READ_WRITE)}){
++  f={};auto m=allocate_t880_export_surface(100,1920,1080,VA_FOURCC_NV12,flags);assert(f.heap==1&&!f.creates&&m->origin==MemoryOrigin::DmaHeap);
++ }
++ for(int mode=0;mode<4;mode++){
++  // A failed close verifies single-attempt handling and fd cleanup,
++  // not a guarantee that an arbitrary kernel failure released its handle.
++  f={};f.create_fail=mode==0;f.export_fail=mode==1;f.close_fail=mode==2;f.bad_size=mode==3;
++  rejects([]{allocate_t880_presentation_surface(100,1920,1080,VA_FOURCC_NV12);});assert(!f.live);
++  assert(f.closes==(mode==0?0u:1u));
++  if(f.last_fd>=0)assert(fcntl(f.last_fd,F_GETFD)==-1&&errno==EBADF);
++ }
++ f={};f.wrong_driver=true;rejects([]{allocate_t880_presentation_surface(100,1920,1080,VA_FOURCC_NV12);});assert(!f.creates);
++ f={};for(auto size:{std::pair<unsigned,unsigned>{0,1080},{1921,1080},{4098,2176},{4096,2178}})
++  rejects([&]{allocate_t880_presentation_surface(100,size.first,size.second,VA_FOURCC_NV12);});
++ rejects([]{allocate_t880_presentation_surface(100,1920,1080,VA_FOURCC_P010);});assert(!f.creates);
++ auto max=allocate_t880_presentation_surface(100,4096,2176,VA_FOURCC_NV12);assert(max->size<=16u*1024*1024&&f.closes==1);
++ std::cout<<"T880 read-only/early presentation, upload policy, PRIME lifetime, failures and bounds passed\n";
++}
+diff --git a/tests/t880/replay.cpp b/tests/t880/replay.cpp
+index 2653b75..9b9aca5 100644
+--- a/tests/t880/replay.cpp
++++ b/tests/t880/replay.cpp
+@@ -163,6 +163,11 @@ std::shared_ptr<Memory> allocate_surface(int, unsigned w, unsigned h, unsigned f
+     m->fourcc = fourcc; m->size = size_t(w) * h * 3 / 2; m->mapping = calloc(1, m->size);
+     return m;
+ }
++std::shared_ptr<Memory> allocate_t880_presentation_surface(int fd, unsigned w, unsigned h, unsigned fourcc) {
++    auto m = allocate_surface(fd, w, h, fourcc);
++    m->origin = MemoryOrigin::PanthorPresentation;
++    return m;
++}
+ }
+ std::shared_ptr<Surface> surface() {
+     auto s = std::make_shared<Surface>(); s->width = 160; s->height = 128; return s;

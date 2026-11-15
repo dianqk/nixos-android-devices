@@ -1,0 +1,76 @@
+From 559752c2724822e53802ce96c5ebe2d3ebde9260 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] mailbox: mediatek: support MT6897 GPUEB channels and replies
+
+Use the MT6897 mailbox channel layout and accept a subsequent send
+while the previous reply is being delivered.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-15T15:12:49+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T04:12:24+08:00
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/mailbox/mtk-gpueb-mailbox.c | 34 +++++++++++++++++++++++++++--
+ 1 file changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/mailbox/mtk-gpueb-mailbox.c b/drivers/mailbox/mtk-gpueb-mailbox.c
+index f6d2beccd9..37c3b27d56 100644
+--- a/drivers/mailbox/mtk-gpueb-mailbox.c
++++ b/drivers/mailbox/mtk-gpueb-mailbox.c
+@@ -130,8 +130,15 @@ static int mtk_gpueb_mbox_send_data(struct mbox_chan *chan, void *data)
+ 	u32 *values = data;
+ 	int i;
+ 
+-	if (atomic_read(&ch->rx_status))
+-		return -EBUSY;
++	/*
++	 * Don't look at the RX state here. The reply to the previous message
++	 * is handed to the client before the IRQ thread clears rx_status, so a
++	 * client sending its next message straight from its RX callback (or
++	 * right after being woken by it) would see a busy channel. The
++	 * mailbox core does not retry a refused message: it stays queued until
++	 * the next mbox_send_message() and the remote never sees it in time.
++	 * TX completion is tracked by last_tx_done() instead.
++	 */
+ 
+ 	/*
+ 	 * We don't want any fancy nonsense, just write the 32-bit values in
+@@ -299,7 +306,30 @@ static const struct mtk_gpueb_mbox_variant mtk_gpueb_mbox_mt8196 = {
+ 	},
+ };
+ 
++/*
++ * MT6897: the same mailbox with 11 channels (no "ppb"). The vendor IPI table
++ * sizes the TX slots like MT8196's, but "brisket" sends 12 bytes, so the RX
++ * area starts 8 bytes earlier, right after the 216 TX bytes.
++ */
++static const struct mtk_gpueb_mbox_variant mtk_gpueb_mbox_mt6897 = {
++	.num_channels = 11,
++	.channels = {
++		{ "fast-dvfs-event", 0, 0x0000, 16, 0x00d8, 16 },
++		{ "gpufreq",         1, 0x0010, 32, 0x00e8, 32 },
++		{ "sleep",           2, 0x0030, 12, 0x0108,  4 },
++		{ "timer",           3, 0x003c, 24, 0x010c,  4 },
++		{ "fhctl",           4, 0x0054, 36, 0x0110,  4 },
++		{ "ccf",             5, 0x0078, 16, 0x0114, 16 },
++		{ "gpumpu",          6, 0x0088, 24, 0x0124,  4 },
++		{ "fast-dvfs",       7, 0x00a0, 24, 0x0128, 24 },
++		{ "ipir-c-met",      8, 0x00b8,  4, 0x0140, 16 },
++		{ "ipis-c-met",      9, 0x00bc, 16, 0x0150,  4 },
++		{ "brisket",        10, 0x00cc, 12, 0x0154, 12 },
++	},
++};
++
+ static const struct of_device_id mtk_gpueb_mbox_of_ids[] = {
++	{ .compatible = "mediatek,mt6897-gpueb-mbox", .data = &mtk_gpueb_mbox_mt6897 },
+ 	{ .compatible = "mediatek,mt8196-gpueb-mbox", .data = &mtk_gpueb_mbox_mt8196 },
+ 	{ /* Sentinel */ }
+ };
+-- 
+2.56.0
+

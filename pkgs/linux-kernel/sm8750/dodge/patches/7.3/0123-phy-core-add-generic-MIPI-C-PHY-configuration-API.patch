@@ -1,0 +1,434 @@
+From aaf23982d97473c43577fc2afbf295010e7f9128 Mon Sep 17 00:00:00 2001
+From: Anusha Arun Nandi <anusha.nandi@oss.qualcomm.com>
+Date: Fri, 16 Oct 2026 21:17:31 -0700
+Subject: [PATCH 128/144] phy: core: add generic MIPI C-PHY configuration API
+
+Add PHY_MODE_MIPI_CPHY, struct phy_configure_opts_mipi_cphy and three
+helpers: phy_mipi_cphy_get_default_config(),
+phy_mipi_cphy_get_default_config_for_hsclk() and
+phy_mipi_cphy_config_validate(). These mirror the existing MIPI D-PHY
+generic configuration API (phy-core-mipi-dphy.c) so PHY providers can
+be configured for C-PHY via phy_configure().
+
+C-PHY encodes 16 bits per 7 symbols across a 3-wire trio; the default
+config helper derives the required per-trio symbol rate from the pixel
+clock, bits-per-pixel and lane (trio) count the same way the D-PHY
+helper derives its HS clock rate. The timing fields are filled in from
+the MIPI Alliance Specification for C-PHY (v1.0), Table 18 "Global
+Operation Timing Parameters"; unlike D-PHY, these are not data-rate
+dependent, so phy_mipi_cphy_get_default_config() fills the spec's
+minimum values directly rather than computing them from the symbol
+rate, and phy_mipi_cphy_config_validate() checks each field against
+its spec-defined bound.
+
+No existing phy consumer or provider selects GENERIC_PHY_MIPI_CPHY
+yet, so this commit has no functional effect on its own.
+
+Co-developed-by: Jigarkumar Zala <jigarkumar.zala@oss.qualcomm.com>
+Signed-off-by: Jigarkumar Zala <jigarkumar.zala@oss.qualcomm.com>
+Signed-off-by: Anusha Arun Nandi <anusha.nandi@oss.qualcomm.com>
+Link: https://lore.kernel.org/r/20261017041733.3946816-2-anusha.nandi@oss.qualcomm.com
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0164-phy-core-add-generic-MIPI-C-PHY-configuration-API.patch
+Import-SHA256: 5dc4644a87cad0aa2ebedf26e7bce5b2a7dd0f4b3f0969807403fb912740172d
+Import-Provenance: mail headers
+(cherry picked from commit d95ce2086c50112ce97c10638c7128522b919b94)
+---
+ drivers/phy/Kconfig               |   9 ++
+ drivers/phy/Makefile              |   1 +
+ drivers/phy/phy-core-mipi-cphy.c  | 131 ++++++++++++++++++++++
+ include/linux/phy/phy-mipi-cphy.h | 177 ++++++++++++++++++++++++++++++
+ include/linux/phy/phy.h           |   5 +
+ 5 files changed, 323 insertions(+)
+ create mode 100644 drivers/phy/phy-core-mipi-cphy.c
+ create mode 100644 include/linux/phy/phy-mipi-cphy.h
+
+diff --git a/drivers/phy/Kconfig b/drivers/phy/Kconfig
+index 19f3b7d12b..a6b0749a40 100644
+--- a/drivers/phy/Kconfig
++++ b/drivers/phy/Kconfig
+@@ -46,6 +46,15 @@ config GENERIC_PHY_MIPI_DPHY
+ 	  Provides a number of helpers a core functions for MIPI D-PHY
+ 	  drivers to us.
+ 
++config GENERIC_PHY_MIPI_CPHY
++	bool
++	select GENERIC_PHY
++	help
++	  Generic MIPI C-PHY configuration helpers.
++
++	  Provides a number of helper core functions for MIPI C-PHY
++	  drivers to use.
++
+ config PHY_AIROHA_PCIE
+ 	tristate "Airoha PCIe-PHY Driver"
+ 	depends on ARCH_AIROHA || COMPILE_TEST
+diff --git a/drivers/phy/Makefile b/drivers/phy/Makefile
+index d7aa516bcc..a94dc1b352 100644
+--- a/drivers/phy/Makefile
++++ b/drivers/phy/Makefile
+@@ -7,6 +7,7 @@ obj-$(CONFIG_PHY_COMMON_PROPS)		+= phy-common-props.o
+ obj-$(CONFIG_PHY_COMMON_PROPS_TEST)	+= phy-common-props-test.o
+ obj-$(CONFIG_GENERIC_PHY)		+= phy-core.o
+ obj-$(CONFIG_GENERIC_PHY_MIPI_DPHY)	+= phy-core-mipi-dphy.o
++obj-$(CONFIG_GENERIC_PHY_MIPI_CPHY)	+= phy-core-mipi-cphy.o
+ obj-$(CONFIG_PHY_AIROHA_PCIE)		+= phy-airoha-pcie.o
+ obj-$(CONFIG_PHY_CAN_TRANSCEIVER)	+= phy-can-transceiver.o
+ obj-$(CONFIG_PHY_ECONET_PCIE)		+= phy-econet-pcie.o
+diff --git a/drivers/phy/phy-core-mipi-cphy.c b/drivers/phy/phy-core-mipi-cphy.c
+new file mode 100644
+index 0000000000..bbb58d5407
+--- /dev/null
++++ b/drivers/phy/phy-core-mipi-cphy.c
+@@ -0,0 +1,131 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ *
++ * Generic MIPI C-PHY configuration helpers.
++ */
++#include <linux/phy/phy-mipi-cphy.h>
++#include <linux/errno.h>
++#include <linux/export.h>
++#include <linux/kernel.h>
++#include <linux/math64.h>
++
++/*
++ * C-PHY carries 16 bits per 7 symbols per trio (lane).
++ */
++#define PHY_MIPI_CPHY_SYMBOLS_PER_GROUP		7
++#define PHY_MIPI_CPHY_BITS_PER_GROUP		16
++
++/*
++ * Fill in the C-PHY global operation timing parameters based on the MIPI
++ * Alliance Specification for C-PHY (v1.0), Table 18 "Global Operation Timing
++ * Parameters". These parameters are not data rate dependent (see sections
++ * 6.14.3 and 6.14.4 of that specification), so unlike the D-PHY equivalent
++ * this helper does not need the symbol rate to compute them.
++ */
++static int phy_mipi_cphy_calc_config(unsigned long pixel_clock,
++				     unsigned int bpp, unsigned int lanes,
++				     unsigned long long hs_clk_rate,
++				     struct phy_configure_opts_mipi_cphy *cfg)
++{
++	if (!cfg || !lanes)
++		return -EINVAL;
++
++	if (!hs_clk_rate) {
++		if (!bpp)
++			return -EINVAL;
++
++		/*
++		 * Total payload bits/s = pixel_clock * bpp, spread over the
++		 * active trios. C-PHY carries 16 bits per 7 symbols per trio,
++		 * so the per-trio symbol rate is the bit rate scaled by 7/16.
++		 */
++		hs_clk_rate = (unsigned long long)pixel_clock * bpp;
++		hs_clk_rate = DIV_ROUND_UP_ULL(hs_clk_rate *
++						PHY_MIPI_CPHY_SYMBOLS_PER_GROUP,
++						(unsigned long long)lanes *
++						PHY_MIPI_CPHY_BITS_PER_GROUP);
++	}
++
++	cfg->lanes = lanes;
++	cfg->hs_clk_rate = hs_clk_rate;
++
++	cfg->t3_prepare = 38000;
++	cfg->t3_term_en = 0;
++	cfg->t3_settle = 95000;
++	cfg->t3_hs_exit = 100000;
++	cfg->lpx = 50000;
++	cfg->init = 100;
++	cfg->ta_get = 5 * cfg->lpx;
++	cfg->ta_go = 4 * cfg->lpx;
++	cfg->ta_sure = cfg->lpx;
++	cfg->wakeup = 1000;
++
++	return 0;
++}
++
++int phy_mipi_cphy_get_default_config(unsigned long pixel_clock,
++				     unsigned int bpp, unsigned int lanes,
++				     struct phy_configure_opts_mipi_cphy *cfg)
++{
++	if (!bpp)
++		return -EINVAL;
++
++	return phy_mipi_cphy_calc_config(pixel_clock, bpp, lanes, 0, cfg);
++}
++EXPORT_SYMBOL_GPL(phy_mipi_cphy_get_default_config);
++
++int phy_mipi_cphy_get_default_config_for_hsclk(unsigned long long hs_clk_rate,
++					       unsigned int lanes,
++					       struct phy_configure_opts_mipi_cphy *cfg)
++{
++	if (!hs_clk_rate)
++		return -EINVAL;
++
++	return phy_mipi_cphy_calc_config(0, 0, lanes, hs_clk_rate, cfg);
++}
++EXPORT_SYMBOL_GPL(phy_mipi_cphy_get_default_config_for_hsclk);
++
++/*
++ * Validate C-PHY configuration according to the MIPI Alliance
++ * Specification for C-PHY (v1.0), Table 18 "Global Operation Timing
++ * Parameters".
++ */
++int phy_mipi_cphy_config_validate(struct phy_configure_opts_mipi_cphy *cfg)
++{
++	if (!cfg || !cfg->lanes)
++		return -EINVAL;
++
++	if (cfg->t3_prepare < 38000 || cfg->t3_prepare > 95000)
++		return -EINVAL;
++
++	if (cfg->t3_term_en > 38000)
++		return -EINVAL;
++
++	if (cfg->t3_settle < 95000 || cfg->t3_settle > 300000)
++		return -EINVAL;
++
++	if (cfg->t3_hs_exit < 100000)
++		return -EINVAL;
++
++	if (cfg->lpx < 50000)
++		return -EINVAL;
++
++	if (cfg->init < 100)
++		return -EINVAL;
++
++	if (cfg->ta_get != 5 * cfg->lpx)
++		return -EINVAL;
++
++	if (cfg->ta_go != 4 * cfg->lpx)
++		return -EINVAL;
++
++	if (cfg->ta_sure < cfg->lpx || cfg->ta_sure > (2 * cfg->lpx))
++		return -EINVAL;
++
++	if (cfg->wakeup < 1000)
++		return -EINVAL;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(phy_mipi_cphy_config_validate);
+diff --git a/include/linux/phy/phy-mipi-cphy.h b/include/linux/phy/phy-mipi-cphy.h
+new file mode 100644
+index 0000000000..7627602eb5
+--- /dev/null
++++ b/include/linux/phy/phy-mipi-cphy.h
+@@ -0,0 +1,177 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++#ifndef __PHY_MIPI_CPHY_H_
++#define __PHY_MIPI_CPHY_H_
++
++#include <linux/types.h>
++
++#define PHY_MIPI_CPHY_MAX_DATA_LANES	4
++
++/**
++ * struct phy_configure_opts_mipi_cphy - MIPI C-PHY configuration set
++ *
++ * This structure is used to represent the configuration state of a
++ * MIPI C-PHY phy. The timing fields are named after their symbol in
++ * the MIPI Alliance Specification for C-PHY (v1.0), Table 18 "Global
++ * Operation Timing Parameters", and are all time values in picoseconds
++ * (microseconds for @init and @wakeup) that are not data rate dependent
++ * (see Table 18 and sections 6.14.3/6.14.4 of that specification).
++ */
++struct phy_configure_opts_mipi_cphy {
++	/**
++	 * @lanes:
++	 *
++	 * Number of active C-PHY trios (data lanes).
++	 */
++	unsigned int		lanes;
++
++	/**
++	 * @hs_clk_rate:
++	 *
++	 * High speed symbol rate in symbols/s derived from link rate.
++	 *
++	 * C-PHY encodes 16 bits per 7 symbols across a 3-wire trio.
++	 * Consumers fill this from the sensor link frequency and hand
++	 * it to phy_configure().
++	 */
++	unsigned long		hs_clk_rate;
++
++	/**
++	 * @lane_positions:
++	 *
++	 * Physical-to-logical trio (data lane) position mapping. Entry @i
++	 * gives the physical lane position carrying logical trio @i. C-PHY
++	 * has no clock lane, so all entries map data trios only.
++	 */
++	unsigned char		lane_positions[PHY_MIPI_CPHY_MAX_DATA_LANES];
++
++	/**
++	 * @lane_polarities:
++	 *
++	 * Polarity (0 = normal, 1 = swapped) of each logical trio. Entry
++	 * @i corresponds to logical trio @i.
++	 */
++	bool			lane_polarities[PHY_MIPI_CPHY_MAX_DATA_LANES];
++
++	/**
++	 * @t3_prepare:
++	 *
++	 * Time, in picoseconds, that the transmitter drives the
++	 * 3-wire LP-000 line state immediately before the HS_+x line
++	 * state starting HS transmission.
++	 *
++	 * Minimum value: 38000 ps
++	 * Maximum value: 95000 ps
++	 */
++	unsigned int		t3_prepare;
++
++	/**
++	 * @t3_term_en:
++	 *
++	 * Time, in picoseconds, for the slave to enable the HS line
++	 * termination, starting from the time point when the A, B
++	 * and C wires cross VIL_MAX.
++	 *
++	 * Maximum value: 38000 ps
++	 */
++	unsigned int		t3_term_en;
++
++	/**
++	 * @t3_settle:
++	 *
++	 * Time interval, in picoseconds, during which the HS receiver
++	 * should ignore any HS transitions on the lane, starting from
++	 * the beginning of @t3_prepare.
++	 *
++	 * Minimum value: 95000 ps
++	 * Maximum value: 300000 ps
++	 */
++	unsigned int		t3_settle;
++
++	/**
++	 * @t3_hs_exit:
++	 *
++	 * Time, in picoseconds, that the transmitter drives LP-111
++	 * following an HS burst.
++	 *
++	 * Minimum value: 100000 ps
++	 */
++	unsigned int		t3_hs_exit;
++
++	/**
++	 * @lpx:
++	 *
++	 * Transmitted length, in picoseconds, of any low-power state
++	 * period.
++	 *
++	 * Minimum value: 50000 ps
++	 */
++	unsigned int		lpx;
++
++	/**
++	 * @init:
++	 *
++	 * Time, in microseconds, for the initialization period to
++	 * complete.
++	 *
++	 * Minimum value: 100 us
++	 */
++	unsigned int		init;
++
++	/**
++	 * @ta_get:
++	 *
++	 * Time, in picoseconds, that the new transmitter drives the
++	 * Bridge state (LP-000) after accepting control during a
++	 * link turnaround.
++	 *
++	 * Value: 5 * @lpx
++	 */
++	unsigned int		ta_get;
++
++	/**
++	 * @ta_go:
++	 *
++	 * Time, in picoseconds, that the transmitter drives the
++	 * Bridge state (LP-000) before releasing control during a
++	 * link turnaround.
++	 *
++	 * Value: 4 * @lpx
++	 */
++	unsigned int		ta_go;
++
++	/**
++	 * @ta_sure:
++	 *
++	 * Time, in picoseconds, that the new transmitter waits after
++	 * the LP-100 state before transmitting the Bridge state
++	 * (LP-000) during a link turnaround.
++	 *
++	 * Minimum value: @lpx
++	 * Maximum value: 2 * @lpx
++	 */
++	unsigned int		ta_sure;
++
++	/**
++	 * @wakeup:
++	 *
++	 * Time, in microseconds, that a transmitter drives a Mark-1
++	 * state prior to a Stop state in order to initiate an exit
++	 * from ULPS.
++	 *
++	 * Minimum value: 1000 us
++	 */
++	unsigned int		wakeup;
++};
++
++int phy_mipi_cphy_get_default_config(unsigned long pixel_clock,
++				     unsigned int bpp, unsigned int lanes,
++				     struct phy_configure_opts_mipi_cphy *cfg);
++int phy_mipi_cphy_get_default_config_for_hsclk(unsigned long long hs_clk_rate,
++					       unsigned int lanes,
++					       struct phy_configure_opts_mipi_cphy *cfg);
++int phy_mipi_cphy_config_validate(struct phy_configure_opts_mipi_cphy *cfg);
++
++#endif /* __PHY_MIPI_CPHY_H_ */
+diff --git a/include/linux/phy/phy.h b/include/linux/phy/phy.h
+index 14b924a884..6384f5a402 100644
+--- a/include/linux/phy/phy.h
++++ b/include/linux/phy/phy.h
+@@ -19,6 +19,7 @@
+ #include <linux/phy/phy-dp.h>
+ #include <linux/phy/phy-hdmi.h>
+ #include <linux/phy/phy-lvds.h>
++#include <linux/phy/phy-mipi-cphy.h>
+ #include <linux/phy/phy-mipi-dphy.h>
+ 
+ struct phy;
+@@ -41,6 +42,7 @@ enum phy_mode {
+ 	PHY_MODE_PCIE,
+ 	PHY_MODE_ETHERNET,
+ 	PHY_MODE_MIPI_DPHY,
++	PHY_MODE_MIPI_CPHY,
+ 	PHY_MODE_SATA,
+ 	PHY_MODE_LVDS,
+ 	PHY_MODE_DP,
+@@ -67,6 +69,8 @@ union phy_notify {
+  *
+  * @mipi_dphy:	Configuration set applicable for phys supporting
+  *		the MIPI_DPHY phy mode.
++ * @mipi_cphy:	Configuration set applicable for phys supporting
++ *		the MIPI_CPHY phy mode.
+  * @dp:		Configuration set applicable for phys supporting
+  *		the DisplayPort protocol.
+  * @lvds:	Configuration set applicable for phys supporting
+@@ -76,6 +80,7 @@ union phy_notify {
+  */
+ union phy_configure_opts {
+ 	struct phy_configure_opts_mipi_dphy	mipi_dphy;
++	struct phy_configure_opts_mipi_cphy	mipi_cphy;
+ 	struct phy_configure_opts_dp		dp;
+ 	struct phy_configure_opts_lvds		lvds;
+ 	struct phy_configure_opts_hdmi		hdmi;

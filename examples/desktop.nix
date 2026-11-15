@@ -20,12 +20,23 @@ in
       default = "1";
       description = "Scale of the internal display.";
     };
+    output = lib.mkOption {
+      type = lib.types.str;
+      default = "DSI-1";
+      description = "Niri name of the internal display output.";
+    };
+    niriPowerKey = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Let niri handle the power key (its default action suspends); when false, logind's HandlePowerKey applies.";
+    };
   };
 
   config = {
     hardware.bluetooth.enable = true;
     users.users.demo = {
       isNormalUser = true;
+      uid = 1001;
       hashedPassword = "";
       extraGroups = [
         "video"
@@ -47,9 +58,10 @@ in
     ];
     environment.etc."niri/config.kdl".text = ''
       input {
-        touch { map-to-output "DSI-1"; }
+        touch { map-to-output "${cfg.output}"; }
+        ${lib.optionalString (!cfg.niriPowerKey) "disable-power-key-handling"}
       }
-      output "DSI-1" {
+      output "${cfg.output}" {
         scale ${cfg.scale}
       }
       layout {

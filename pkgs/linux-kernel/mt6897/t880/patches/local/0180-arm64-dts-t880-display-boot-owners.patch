@@ -1,0 +1,99 @@
+From cbe550a9dd38fa7b28389878bbbc343d95b243fc Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 16:21:30 +0800
+Subject: [PATCH] arm64: dts: mediatek: describe T880 inherited display owners
+
+Describe the seven represented OVLs, the unowned OVL7 and POSTMASK read
+windows, and both IOMMU providers for the independent boot owner.
+
+Give every OVL its two physical SMI larb suppliers so power ownership is
+valid before translated display attachment as well as afterward. OVL3 at
+14405000 uses larb1 and larb0 according to the vendor DT.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ .../mt6897-alldocube-t880-display-boot.dtsi   | 58 +++++++++++++++++++
+ .../dts/mediatek/mt6897-alldocube-t880.dts    |  1 +
+ 2 files changed, 59 insertions(+)
+ create mode 100644 arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-display-boot.dtsi
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-display-boot.dtsi b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-display-boot.dtsi
+new file mode 100644
+index 0000000000..1171f4b4a7
+--- /dev/null
++++ b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-display-boot.dtsi
+@@ -0,0 +1,58 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++/* Address-mode-independent inherited display ownership. Port suppliers follow
++ * the MT6897 vendor mediatek,larb entries, including OVL3's larb1/larb0 pair.
++ */
++&{/soc} {
++	display_boot: display-boot-state@14605000 {
++		compatible = "mediatek,mt6897-display-boot-state";
++		reg = <0 0x14605000 0 0x1000>,
++		      <0 0x14015000 0 0x1000>,
++		      <0 0x14215000 0 0x1000>;
++		reg-names = "unowned-ovl", "postmask0", "postmask1";
++		power-domains = <&hwv_pd MT6897_POWER_DOMAIN_HWV_MM_INFRA>;
++		clocks = <&ovlsys1_config CLK_OVLSYS1_OVL3_2L>,
++			 <&dispsys0_config CLK_DISPSYS0_DISP_POSTMASK0>,
++			 <&dispsys1_config CLK_DISPSYS1_DISP_POSTMASK0>;
++		clock-names = "ovl7", "postmask0", "postmask1";
++		mediatek,iommus = <&disp_iommu>, <&mdp_iommu>;
++		mediatek,gce = <&gce>;
++		mediatek,engines = <&ovlsys0_ovl0>, <&ovlsys0_ovl1>,
++			<&ovlsys0_ovl2>, <&ovlsys0_ovl3>, <&ovlsys1_ovl0>,
++			<&ovlsys1_ovl1>, <&ovlsys1_ovl2>;
++	};
++};
++
++&ovlsys0_ovl0 {
++	mediatek,boot-handover = <&display_boot>;
++	mediatek,smi = <&smi_larb0>, <&smi_larb1>;
++};
++
++&ovlsys0_ovl1 {
++	mediatek,boot-handover = <&display_boot>;
++	mediatek,smi = <&smi_larb0>, <&smi_larb1>;
++};
++
++&ovlsys0_ovl2 {
++	mediatek,boot-handover = <&display_boot>;
++	mediatek,smi = <&smi_larb0>, <&smi_larb1>;
++};
++
++&ovlsys0_ovl3 {
++	mediatek,boot-handover = <&display_boot>;
++	mediatek,smi = <&smi_larb1>, <&smi_larb0>;
++};
++
++&ovlsys1_ovl0 {
++	mediatek,boot-handover = <&display_boot>;
++	mediatek,smi = <&smi_larb20>, <&smi_larb21>;
++};
++
++&ovlsys1_ovl1 {
++	mediatek,boot-handover = <&display_boot>;
++	mediatek,smi = <&smi_larb20>, <&smi_larb21>;
++};
++
++&ovlsys1_ovl2 {
++	mediatek,boot-handover = <&display_boot>;
++	mediatek,smi = <&smi_larb20>, <&smi_larb21>;
++};
+diff --git a/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880.dts b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880.dts
+index ea5572d3c3..a9ff6a3e06 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880.dts
+@@ -972,6 +972,7 @@ ramoops@300000000 {
+ };
+ 
+ #include "mt6897-alldocube-t880-mtkdrm.dtsi"
++#include "mt6897-alldocube-t880-display-boot.dtsi"
+ #include "mt6897-alldocube-t880-cmdq.dtsi"
+ 
+ /* The first region-0 client initializes the shared DMA allocator. Describe
+-- 
+2.56.0
+

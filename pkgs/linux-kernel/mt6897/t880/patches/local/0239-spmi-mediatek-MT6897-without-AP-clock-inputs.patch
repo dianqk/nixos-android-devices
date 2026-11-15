@@ -1,0 +1,196 @@
+From 2e1e397945a6fd03095a23742b1ce944e1573911 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 11 Nov 2026 04:39:44 +0800
+Subject: [PATCH] spmi: mediatek: describe MT6897 without AP clock inputs
+
+Add explicit MT6897 match data for its SPMI 2.0 two-bus controller.
+It uses the currently supported channel and register layout, but does not
+acquire AP clocks, matching the MediaTek caps=2 variant. Keep three clock
+inputs for every existing variant.
+
+Use a standalone compatible because the no-clock contract differs from
+MT8196. Drop the fixed references from the MT6897 bus children and keep
+clock requirements for the other binding variants. Register accesses,
+interrupt routing and acknowledgement handling are unchanged.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/spmi/spmi-mtk-pmif-core.c#L663-L673
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/spmi/spmi-mtk-pmif-core.c#L1710-L1745
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ .../bindings/spmi/mediatek,mt8196-spmi.yaml   | 27 +++++++++++++++----
+ arch/arm64/boot/dts/mediatek/mt6897.dtsi      |  8 +-----
+ drivers/spmi/spmi-mtk-pmif.c                  | 19 ++++++++++++-
+ 3 files changed, 41 insertions(+), 13 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/spmi/mediatek,mt8196-spmi.yaml b/Documentation/devicetree/bindings/spmi/mediatek,mt8196-spmi.yaml
+index aff9bd1a73..83d110d153 100644
+--- a/Documentation/devicetree/bindings/spmi/mediatek,mt8196-spmi.yaml
++++ b/Documentation/devicetree/bindings/spmi/mediatek,mt8196-spmi.yaml
+@@ -4,14 +4,14 @@
+ $id: http://devicetree.org/schemas/spmi/mediatek,mt8196-spmi.yaml#
+ $schema: http://devicetree.org/meta-schemas/core.yaml#
+ 
+-title: MediaTek MT8196 SPMI 2.0 Controller
++title: MediaTek SPMI 2.0 Controller
+ 
+ maintainers:
+   - Hsin-Hsiung Wang <hsin-hsiung.wang@mediatek.com>
+   - AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+ 
+ description:
+-  The MediaTek MT8196 SoC features a SPMI version 2.0 compliant controller,
++  The MediaTek MT6897 and MT8196 SoCs feature a SPMI version 2.0 compliant controller,
+   with internal wrapping arbitration logic to allow for multiple on-chip
+   devices to control up to two SPMI buses.
+   The main arbiter also acts as an interrupt controller, arbitering also
+@@ -22,10 +22,10 @@ properties:
+   compatible:
+     oneOf:
+       - enum:
++          - mediatek,mt6897-spmi
+           - mediatek,mt8196-spmi
+       - items:
+           - enum:
+-              - mediatek,mt6897-spmi
+               - mediatek,mt6991-spmi
+           - const: mediatek,mt8196-spmi
+ 
+@@ -84,13 +84,30 @@ patternProperties:
+     required:
+       - reg
+       - reg-names
+-      - clocks
+-      - clock-names
+       - interrupts
+       - interrupt-names
+       - interrupt-controller
+       - "#interrupt-cells"
+ 
++allOf:
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: mediatek,mt6897-spmi
++    then:
++      patternProperties:
++        "^spmi@[a-f0-9]+$":
++          properties:
++            clocks: false
++            clock-names: false
++    else:
++      patternProperties:
++        "^spmi@[a-f0-9]+$":
++          required:
++            - clocks
++            - clock-names
++
+ required:
+   - compatible
+   - ranges
+diff --git a/arch/arm64/boot/dts/mediatek/mt6897.dtsi b/arch/arm64/boot/dts/mediatek/mt6897.dtsi
+index a64bd1e8ba..073cbe8e60 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6897.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6897.dtsi
+@@ -1406,7 +1406,7 @@ disp_pwm0: pwm@1100e000 {
+ 		 * through the RCS line on EINT 248.
+ 		 */
+ 		spmi: spmi@1cc00000 {
+-			compatible = "mediatek,mt6897-spmi", "mediatek,mt8196-spmi";
++			compatible = "mediatek,mt6897-spmi";
+ 			ranges = <0x0 0x0 0x1cc00000 0x7000>;
+ 			#address-cells = <1>;
+ 			#size-cells = <1>;
+@@ -1418,9 +1418,6 @@ spmi_m: spmi@4000 {
+ 				interrupt-names = "rcs";
+ 				interrupt-controller;
+ 				#interrupt-cells = <3>;
+-				clocks = <&clk26m>, <&clk26m>, <&clk26m>;
+-				clock-names = "pmif_sys_ck", "pmif_tmr_ck",
+-					      "spmimst_clk_mux";
+ 				#address-cells = <2>;
+ 				#size-cells = <0>;
+ 
+@@ -1484,9 +1481,6 @@ mt6685_rtc: rtc@580 {
+ 			spmi_p: spmi@6000 {
+ 				reg = <0x6000 0x900>, <0x0 0x100>;
+ 				reg-names = "pmif", "spmimst";
+-				clocks = <&clk26m>, <&clk26m>, <&clk26m>;
+-				clock-names = "pmif_sys_ck", "pmif_tmr_ck",
+-					      "spmimst_clk_mux";
+ 				#address-cells = <2>;
+ 				#size-cells = <0>;
+ 				status = "disabled";
+diff --git a/drivers/spmi/spmi-mtk-pmif.c b/drivers/spmi/spmi-mtk-pmif.c
+index 85abf1f62e..b4975e4d81 100644
+--- a/drivers/spmi/spmi-mtk-pmif.c
++++ b/drivers/spmi/spmi-mtk-pmif.c
+@@ -52,6 +52,7 @@ struct pmif_data {
+ 	u32	soc_chan;
+ 	u8	spmi_ver;
+ 	u32	num_spmi_buses;
++	u8	num_clks;
+ };
+ 
+ struct pmif_bus {
+@@ -636,18 +637,21 @@ static const struct irq_domain_ops mtk_spmi_rcs_irq_domain_ops = {
+ };
+ 
+ static const struct pmif_data mt6873_pmif_arb = {
++	.num_clks = ARRAY_SIZE(pmif_clock_names),
+ 	.regs = mt6873_regs,
+ 	.spmimst_regs = mt6873_spmi_regs,
+ 	.soc_chan = 2,
+ };
+ 
+ static const struct pmif_data mt8195_pmif_arb = {
++	.num_clks = ARRAY_SIZE(pmif_clock_names),
+ 	.regs = mt8195_regs,
+ 	.spmimst_regs = mt8195_spmi_regs,
+ 	.soc_chan = 2,
+ };
+ 
+ static const struct pmif_data mt8196_pmif_arb = {
++	.num_clks = ARRAY_SIZE(pmif_clock_names),
+ 	.regs = mt8195_regs,
+ 	.spmimst_regs = mt8195_spmi_regs,
+ 	.soc_chan = 2,
+@@ -655,6 +659,16 @@ static const struct pmif_data mt8196_pmif_arb = {
+ 	.num_spmi_buses = 2,
+ };
+ 
++/* MT6897 uses the same SPMI 2.0 layout without AP-controlled clocks. */
++static const struct pmif_data mt6897_pmif_arb = {
++	.regs = mt8195_regs,
++	.spmimst_regs = mt8195_spmi_regs,
++	.soc_chan = 2,
++	.spmi_ver = 2,
++	.num_spmi_buses = 2,
++	.num_clks = 0,
++};
++
+ static int mtk_spmi_irq_init(struct device_node *node,
+ 			     const struct pmif_data *pdata,
+ 			     struct pmif_bus *pbus)
+@@ -733,7 +747,7 @@ static int mtk_spmi_bus_probe(struct platform_device *pdev,
+ 	if (IS_ERR(pbus->spmimst_base))
+ 		return PTR_ERR(pbus->spmimst_base);
+ 
+-	pbus->nclks = ARRAY_SIZE(pmif_clock_names);
++	pbus->nclks = pdata->num_clks;
+ 	for (i = 0; i < pbus->nclks; i++) {
+ 		pbus->clks[i].id = pmif_clock_names[i];
+ 		pbus->clks[i].clk = of_clk_get_by_name(node, pbus->clks[i].id);
+@@ -851,6 +865,9 @@ static void mtk_spmi_remove(struct platform_device *pdev)
+ 
+ static const struct of_device_id mtk_spmi_match_table[] = {
+ 	{
++		.compatible = "mediatek,mt6897-spmi",
++		.data = &mt6897_pmif_arb,
++	}, {
+ 		.compatible = "mediatek,mt6873-spmi",
+ 		.data = &mt6873_pmif_arb,
+ 	}, {
+-- 
+2.56.0
+

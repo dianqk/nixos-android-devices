@@ -1,0 +1,244 @@
+From 2a18311a1b8edff64d5e33f371e306c8a3e35b5a Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 7 Nov 2026 01:59:48 +0800
+Subject: [PATCH] drm/mediatek: scope DirectLink config clocks to active
+ components
+
+The bind-lifetime config clock hold keeps multimedia clock providers and their domains active even when every DirectLink component is stopped. Acquire a configuration reference before each component port and release it after that port. Roll back the local configuration reference when the port fails to enable.
+
+Ordinary CCF references balance shared and shadow components independently. CRTC routing/configuration and teardown already run within this component clock lifetime. Keep boot ownership and domain-root protocols unchanged.
+
+Add extracted-production-function sanitizer tests for ordered enable/disable, configuration and port failures, shared roots and shadow gate aliases.
+---
+ .../gpu/drm/mediatek/mtk_disp_directlink.c    |  26 ++---
+ tools/testing/selftests/mtk_clk/Makefile      |   4 +-
+ .../selftests/mtk_clk/directlink_cases.c      | 101 ++++++++++++++++++
+ .../selftests/mtk_clk/test_directlink.py      |  40 +++++++
+ 4 files changed, 157 insertions(+), 14 deletions(-)
+ create mode 100644 tools/testing/selftests/mtk_clk/directlink_cases.c
+ create mode 100755 tools/testing/selftests/mtk_clk/test_directlink.py
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_directlink.c b/drivers/gpu/drm/mediatek/mtk_disp_directlink.c
+index 83bf57ab04..26caad8b97 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_directlink.c
++++ b/drivers/gpu/drm/mediatek/mtk_disp_directlink.c
+@@ -158,16 +158,28 @@ void mtk_direct_link_disconnect(struct mtk_ddp_comp *comp, struct device *mmsys_
+ 
+ int mtk_direct_link_clk_enable(struct mtk_ddp_comp *comp)
+ {
++	struct mtk_direct_link *dl_async = dev_get_drvdata(comp->dev);
+ 	struct mtk_disp_dl_port *dl_port = mtk_direct_link_get_port(comp);
++	int ret;
++
++	ret = clk_prepare_enable(dl_async->clk);
++	if (ret)
++		return ret;
+ 
+-	return clk_prepare_enable(dl_port->clks[comp->inst_id]);
++	ret = clk_prepare_enable(dl_port->clks[comp->inst_id]);
++	if (ret)
++		clk_disable_unprepare(dl_async->clk);
++
++	return ret;
+ }
+ 
+ void mtk_direct_link_clk_disable(struct mtk_ddp_comp *comp)
+ {
++	struct mtk_direct_link *dl_async = dev_get_drvdata(comp->dev);
+ 	struct mtk_disp_dl_port *dl_port = mtk_direct_link_get_port(comp);
+ 
+ 	clk_disable_unprepare(dl_port->clks[comp->inst_id]);
++	clk_disable_unprepare(dl_async->clk);
+ }
+ 
+ void mtk_direct_link_config(struct mtk_ddp_comp *comp,
+@@ -216,21 +228,11 @@ void mtk_direct_link_config(struct mtk_ddp_comp *comp,
+ 
+ static int mtk_direct_link_bind(struct device *dev, struct device *master, void *data)
+ {
+-	struct mtk_direct_link *dl_async = dev_get_drvdata(dev);
+-
+-	return clk_prepare_enable(dl_async->clk);
+-}
+-
+-static void mtk_direct_link_unbind(struct device *dev, struct device *master, void *data)
+-{
+-	struct mtk_direct_link *dl_async = dev_get_drvdata(dev);
+-
+-	clk_disable_unprepare(dl_async->clk);
++	return 0;
+ }
+ 
+ static const struct component_ops mtk_direct_link_component_ops = {
+ 	.bind	= mtk_direct_link_bind,
+-	.unbind = mtk_direct_link_unbind,
+ };
+ 
+ static int mtk_direct_link_port_probe(struct device *dev, struct mtk_disp_dl_port *dl_port, u32 of_port_id)
+diff --git a/tools/testing/selftests/mtk_clk/Makefile b/tools/testing/selftests/mtk_clk/Makefile
+index a8f810fe37..3ce43476bd 100644
+--- a/tools/testing/selftests/mtk_clk/Makefile
++++ b/tools/testing/selftests/mtk_clk/Makefile
+@@ -1,4 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-TEST_PROGS := test_mt6897.py test_domains.py test_boot_owner.py
+-TEST_FILES := mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c ven_cases.c boot_stubs.h boot_cases.c
++TEST_PROGS := test_mt6897.py test_domains.py test_boot_owner.py test_directlink.py
++TEST_FILES := mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c ven_cases.c boot_stubs.h boot_cases.c directlink_cases.c
+ include ../lib.mk
+diff --git a/tools/testing/selftests/mtk_clk/directlink_cases.c b/tools/testing/selftests/mtk_clk/directlink_cases.c
+new file mode 100644
+index 0000000000..7e7894dfc5
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/directlink_cases.c
+@@ -0,0 +1,101 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <assert.h>
++#include <errno.h>
++#include <stdio.h>
++
++enum { MTK_DISP_DIRECT_LINK_IN, MTK_DISP_DIRECT_LINK_OUT };
++enum { MTK_DISP_DL_IN, MTK_DISP_DL_OUT };
++struct clk { int id, refs, error; };
++struct device { void *data; };
++struct mtk_ddp_comp { struct device *dev; int type, inst_id; };
++struct mtk_disp_dl_port { struct clk **clks; };
++struct mtk_direct_link { struct clk *clk; struct mtk_disp_dl_port dl_port[2]; };
++static int events[32], event_count;
++static void *dev_get_drvdata(struct device *dev)
++{
++	return dev->data;
++}
++static int clk_prepare_enable(struct clk *clk)
++{
++	events[event_count++] = clk->id;
++	if (clk->error)
++		return clk->error;
++	clk->refs++;
++	return 0;
++}
++static void clk_disable_unprepare(struct clk *clk)
++{
++	events[event_count++] = -clk->id;
++	assert(clk->refs > 0);
++	clk->refs--;
++}
++/* PRODUCTION */
++
++static void check_events(const int *expected, int count)
++{
++	assert(event_count == count);
++	for (int i = 0; i < count; i++)
++		assert(events[i] == expected[i]);
++	event_count = 0;
++}
++
++int main(void)
++{
++	struct clk config = { .id = 1 }, input = { .id = 2 }, output = { .id = 3 };
++	struct clk *inputs[] = { &input, &input };
++	struct clk *outputs[] = { &output };
++	struct mtk_direct_link link = {
++		.clk = &config,
++		.dl_port = { { .clks = inputs }, { .clks = outputs } },
++	};
++	struct device dev = { .data = &link };
++	struct mtk_ddp_comp in = { &dev, MTK_DISP_DIRECT_LINK_IN, 0 };
++	struct mtk_ddp_comp shadow = { &dev, MTK_DISP_DIRECT_LINK_IN, 1 };
++	struct mtk_ddp_comp out = { &dev, MTK_DISP_DIRECT_LINK_OUT, 0 };
++
++	assert(mtk_direct_link_bind(&dev, NULL, NULL) == 0);
++	assert(config.refs == 0);
++	check_events(NULL, 0);
++
++	config.error = -EIO;
++	assert(mtk_direct_link_clk_enable(&in) == -EIO);
++	assert(config.refs == 0 && input.refs == 0);
++	check_events((int[]){ 1 }, 1);
++	config.error = 0;
++
++	input.error = -ETIMEDOUT;
++	assert(mtk_direct_link_clk_enable(&in) == -ETIMEDOUT);
++	assert(config.refs == 0 && input.refs == 0);
++	check_events((int[]){ 1, 2, -1 }, 3);
++	input.error = 0;
++
++	assert(mtk_direct_link_clk_enable(&in) == 0);
++	assert(mtk_direct_link_clk_enable(&out) == 0);
++	assert(config.refs == 2 && input.refs == 1 && output.refs == 1);
++	check_events((int[]){ 1, 2, 1, 3 }, 4);
++	mtk_direct_link_clk_disable(&in);
++	assert(config.refs == 1 && input.refs == 0 && output.refs == 1);
++	check_events((int[]){ -2, -1 }, 2);
++	input.error = -EIO;
++	assert(mtk_direct_link_clk_enable(&in) == -EIO);
++	assert(config.refs == 1 && output.refs == 1);
++	check_events((int[]){ 1, 2, -1 }, 3);
++	input.error = 0;
++	mtk_direct_link_clk_disable(&out);
++	assert(config.refs == 0 && output.refs == 0);
++	check_events((int[]){ -3, -1 }, 2);
++
++	/* Shadow components share physical gates but own independent CCF refs. */
++	assert(mtk_direct_link_clk_enable(&in) == 0);
++	assert(mtk_direct_link_clk_enable(&shadow) == 0);
++	assert(config.refs == 2 && input.refs == 2);
++	check_events((int[]){ 1, 2, 1, 2 }, 4);
++	mtk_direct_link_clk_disable(&shadow);
++	assert(config.refs == 1 && input.refs == 1);
++	mtk_direct_link_clk_disable(&in);
++	assert(config.refs == 0 && input.refs == 0);
++	check_events((int[]){ -2, -1, -2, -1 }, 4);
++
++	puts("DirectLink bind, ordered lifetime, errors and shared/shadow reference balance passed");
++	return 0;
++}
+diff --git a/tools/testing/selftests/mtk_clk/test_directlink.py b/tools/testing/selftests/mtk_clk/test_directlink.py
+new file mode 100755
+index 0000000000..f8baff61b7
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/test_directlink.py
+@@ -0,0 +1,40 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Test the production DirectLink per-component clock lifetime with host mocks."""
++from pathlib import Path
++import os
++import re
++import subprocess
++import tempfile
++
++assets = Path(__file__).resolve().parent
++repo = Path(os.environ.get('KERNEL_SRC', str(assets.parents[3])))
++source = (repo / 'drivers/gpu/drm/mediatek/mtk_disp_directlink.c').read_text()
++
++
++def function(name):
++    match = re.search(r'^(?:static )?(?:int|void|struct mtk_disp_dl_port \*)\s*' + name + r'\(', source, re.M)
++    start = match.start()
++    end = source.index('{', start) + 1
++    depth = 1
++    while depth:
++        depth += (source[end] == '{') - (source[end] == '}')
++        end += 1
++    return source[start:end]
++
++
++production = '\n'.join(function(name) for name in [
++    'mtk_direct_link_get_port', 'mtk_direct_link_clk_enable',
++    'mtk_direct_link_clk_disable', 'mtk_direct_link_bind'])
++assert 'clk_' not in function('mtk_direct_link_bind')
++assert '.unbind' not in source[source.index('static const struct component_ops'):source.index('static int mtk_direct_link_port_probe')]
++cases = (assets / 'directlink_cases.c').read_text()
++with tempfile.TemporaryDirectory(prefix='mtk-directlink-') as tmp:
++    tmp = Path(tmp)
++    c = tmp / 'test.c'
++    c.write_text(cases.replace('/* PRODUCTION */', production))
++    binary = tmp / 'test'
++    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
++                    '-Wno-unused-parameter', '-Werror', '-g', '-fsanitize=address,undefined',
++                    str(c), '-o', str(binary)], check=True)
++    subprocess.run([str(binary)], check=True)
+-- 
+2.56.0
+

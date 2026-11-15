@@ -21,6 +21,17 @@ from boot_image import BOARDS, inspect_image
 
 RECOVERY_COMMAND = "recovery"
 
+# Boards whose fastboot product, slot layout and boot partition have not been
+# read from the device. Images are inspected, but no fastboot command runs.
+UNVERIFIED_BOARDS = {
+    # Slot A for NixOS and the 64 MiB boot_a are measured; the stock LK's
+    # fastboot product is not, and flashing awaits explicit approval.
+    "t880": "the T880 fastboot product is unverified and flashing it is not yet approved",
+    # U-Boot stage only: boot_b (slot B, A preserved) is the target, but the
+    # stock fastboot product and the image are not yet checked on hardware.
+    "marble": "the marble fastboot product is unverified and flashing it is not yet approved",
+}
+
 
 class ToolError(Exception):
     pass
@@ -106,6 +117,15 @@ class Ssh:
                 raise ToolError("SSH upload failed")
         if self.text("sha256sum", destination).split()[0] != digest(source):
             raise ToolError(f"SSH transfer checksum mismatch: {destination}")
+
+    def pull(self, source, destination):
+        destination = Path(destination)
+        with destination.open("xb") as stream:
+            process = subprocess.Popen(self.command(shlex.join(["cat", source])), stdout=stream)
+            if process.wait():
+                raise ToolError("SSH download failed; local file is incomplete")
+        if digest(destination) != self.text("sha256sum", source).split()[0]:
+            raise ToolError(f"SSH download checksum mismatch: {source}")
 
     def temporary(self):
         directory = self.text("mktemp", "-d", "/tmp/mobile-device.XXXXXXXX")
@@ -299,10 +319,14 @@ def fastboot(args):
         raise ToolError("Fastboot boot and flash require an image")
     image = local_file(args.image)
     board, recovery = inspect_image(image.read_bytes())
+    if board in UNVERIFIED_BOARDS:
+        raise ToolError(f"Refusing {board}: {UNVERIFIED_BOARDS[board]}")
     serial = choose_serial("fastboot", args.serial, "fastboot")
     product = fastboot_var(serial, "product").lower()
     products = {"clover": {"clover"}, "polaris": {"polaris"},
-                "aurora": {"aurora"}, "sheng": {"sheng"}, "asphalt": {"asphalt", "tb320fc"}}
+                "aurora": {"aurora"}, "sheng": {"sheng"}, "asphalt": {"asphalt", "tb320fc"},
+                # PLACEHOLDER: no T880 or marble fastboot product has been observed.
+                "t880": set(), "marble": set()}
     identity = fastboot_identity(args, board, serial, product)
     if (board, product) == ("asphalt", "taro"):
         model = fastboot_modelname(serial)
@@ -317,7 +341,7 @@ def fastboot(args):
             identity = True
     if product not in products[board] and not identity:
         raise ToolError(f"Image is for {board}, connected fastboot product is {product}")
-    ab = board in ("asphalt", "sheng", "aurora")
+    ab = board in ("asphalt", "sheng", "aurora", "marble")
     if ab and fastboot_var(serial, "current-slot").removeprefix("_") != "b":
         raise ToolError("Select slot B explicitly before using this image; slot A must be preserved")
     operation = ["fastboot", "-s", serial, args.operation]
@@ -452,12 +476,15 @@ def recovery_install_initial(args, transport):
     device = transport.text("cat", "/etc/mobile-ram-recovery")
     if not (system / "mobile-efi").is_file() or (system / "mobile-device").read_text().strip() != device:
         raise ToolError("Initial system does not match the recovery device or lacks EFI support")
-    if not (system / "mobile-boot.img").is_file():
-        raise ToolError("Initial system lacks its matching U-Boot image")
+    recovery_daemon(transport)
+    # The legacy operation can flash firmware from older system closures.
+    operation = "install-initial-system"
+    capabilities = json.loads(transport.text(RECOVERY_COMMAND, "capabilities"))
+    if operation not in (capabilities.get("capabilities") or []):
+        raise ToolError("Recovery does not support system-only installation; boot a current recovery image")
     paths, manifest = closure_manifest(system)
     registration, size = bootstrap_info(args.bootstrap_info, paths)
     resume = getattr(args, "resume", False)
-    recovery_daemon(transport)
     with tempfile.TemporaryDirectory(prefix="mobile-device-") as directory:
         source = Path(directory) / "manifest"
         source.write_bytes(manifest)
@@ -468,7 +495,7 @@ def recovery_install_initial(args, transport):
         try:
             transport.push(source, remote_manifest)
             transport.push(registration, remote_registration)
-            arguments = [RECOVERY_COMMAND, "install-initial", remote_manifest,
+            arguments = [RECOVERY_COMMAND, operation, remote_manifest,
                          remote_registration, str(system), str(size)]
             transport.shell(*arguments, "--resume-check" if resume else "--check", capture=False)
             if not args.execute:
@@ -509,6 +536,69 @@ def recovery_command(args, transport):
             print(f"Check only: {RECOVERY_COMMAND} reboot-{args.destination} --confirm")
 
 
+GPT_BACKUP = "/run/mobile-recovery/gpt-original"
+GPT_RESTORE = "/run/mobile-recovery/gpt-restore"
+GPT_FILE = re.compile(r"(header|table)-[0-9]+")
+
+
+def gpt_files(names):
+    names = sorted(names)
+    if len(names) != 4 or not all(GPT_FILE.fullmatch(n) for n in names) or \
+            sum(n.startswith("header-") for n in names) != 2:
+        raise ToolError(f"Unexpected GPT backup files: {names}")
+    return names
+
+
+def recovery_prepare_install(args, transport):
+    """Plan the userdata split for the chosen Android size, optionally copy the original GPT to the host, then erase.
+
+    The recovery keeps the original GPT in RAM itself (the check or the write
+    saves it); --gpt-backup DIR adds a permanent host copy first."""
+    transport.recovery()
+    recovery_daemon(transport)
+    # The Android userdata size is chosen explicitly; a check without it
+    # lists the offered sizes, and the check with it saves the original GPT
+    # in recovery RAM.
+    size = ["--android-userdata", args.android_userdata] if args.android_userdata else []
+    transport.shell(RECOVERY_COMMAND, "prepare-install", *size, "--check", capture=False)
+    if (args.gpt_backup is not None or args.execute) and not args.android_userdata:
+        raise ToolError("Choose the Android userdata size with --android-userdata SIZE (the check lists the choices)")
+    if args.gpt_backup is not None:
+        backup = Path(args.gpt_backup).expanduser()
+        backup.mkdir(parents=True, exist_ok=False)
+        for name in gpt_files(transport.text("ls", GPT_BACKUP).split()):
+            transport.pull(f"{GPT_BACKUP}/{name}", backup / name)
+        print(f"Original GPT saved on the host: {backup}")
+    elif args.execute:
+        print("No host copy (--gpt-backup DIR): the original GPT stays only in recovery RAM; "
+              "restore-gpt can undo the split until the recovery restarts.")
+    else:
+        print("Check only; add --execute to partition (--gpt-backup DIR keeps a permanent host copy of the original GPT).")
+        return
+    if args.execute:
+        transport.shell(RECOVERY_COMMAND, "prepare-install", *size, "--confirm-erase-userdata", capture=False)
+
+
+def recovery_restore_gpt(args, transport):
+    """Write the original GPT back (undo the userdata split): a host copy, or without --gpt-backup the copy in recovery RAM."""
+    transport.recovery()
+    recovery_daemon(transport)
+    names = None
+    if args.gpt_backup is not None:
+        backup = Path(args.gpt_backup).expanduser().resolve(strict=True)
+        names = gpt_files(p.name for p in backup.iterdir())
+    # The daemon prefers a pushed copy; remove a stale one so that without
+    # --gpt-backup it uses the original saved in RAM by prepare-install.
+    transport.shell("rm", "-rf", GPT_RESTORE)
+    if names is not None:
+        transport.shell("mkdir", "-p", GPT_RESTORE)
+        for name in names:
+            transport.push(backup / name, f"{GPT_RESTORE}/{name}")
+    transport.shell(RECOVERY_COMMAND, "restore-gpt", "--check", capture=False)
+    if args.execute:
+        transport.shell(RECOVERY_COMMAND, "restore-gpt", "--confirm", capture=False)
+
+
 def recovery_install_image(args, transport):
     transport.recovery()
     image = local_file(args.image)
@@ -518,6 +608,7 @@ def recovery_install_image(args, transport):
         recovery_daemon(transport)
         operations = {"/dev/disk/by-partlabel/boot_b": "update-firmware",
                       "/dev/disk/by-partlabel/recovery_b": "update-recovery",
+                      "/dev/disk/by-partlabel/boot_a": "update-firmware",
                       "/dev/disk/by-partlabel/boot": "update-firmware",
                       "/dev/disk/by-partlabel/recovery": "update-recovery"}
         operation = operations.get(args.partition)
@@ -606,16 +697,28 @@ def parser_for_cli():
     deploy = actions.add_parser("deploy", help="query or deploy a NixOS system from recovery")
     deploy.add_argument("system")
     deploy.add_argument("--execute", action="store_true")
+    split = actions.add_parser("prepare-install", help="plan the userdata split; save the original GPT on the host; then partition")
+    split.add_argument("--gpt-backup", help="new host directory for a permanent copy of the original GPT "
+                       "(recommended; the recovery keeps one in RAM regardless)")
+    split.add_argument("--android-userdata", metavar="SIZE",
+                       help="Android userdata to keep, such as 64G (a check without it lists the choices)")
+    split.add_argument("--execute", action="store_true")
+    restore = actions.add_parser("restore-gpt", help="write the original GPT back (host copy or recovery RAM copy)")
+    restore.add_argument("--gpt-backup", help="host directory saved by prepare-install "
+                         "(default: the copy in recovery RAM, until the recovery restarts)")
+    restore.add_argument("--execute", action="store_true")
     format_linux = actions.add_parser("format-root", help="explicitly format the device's Linux root partition")
     format_linux.add_argument("--execute", action="store_true")
-    initial = actions.add_parser("install-initial", help="stream a closure to an empty root and install its boot image")
+    mark = actions.add_parser("mark-slot-successful", help="MediaTek slot A: set its successful bit in misc (repair)")
+    mark.add_argument("--execute", action="store_true")
+    initial = actions.add_parser("install-initial", help="stream a closure to an empty root and install its EFI generation")
     initial.add_argument("system")
     initial.add_argument("--bootstrap-info", required=True, help="matching flake bootstrap-info output")
     initial.add_argument("--execute", action="store_true")
-    initial.add_argument("--resume", action="store_true", help="resume EFI finalization of the same fully transferred, registered system; reverify all contents")
+    initial.add_argument("--resume", action="store_true", help="resume a failed first installation of the same system after its closure transfer, without retransmitting; reverifies all contents")
     image = actions.add_parser("install-image", help="write a checked firmware or recovery image from recovery")
     image.add_argument("image")
-    image.add_argument("--partition", help="target /dev/disk/by-partlabel path (boot[_b] or recovery[_b])")
+    image.add_argument("--partition", help="target /dev/disk/by-partlabel path (boot, boot_a/_b, recovery[_b])")
     image.add_argument("--execute", action="store_true")
 
     system = commands.add_parser("system", help="interact with a running NixOS mobile system")
@@ -694,20 +797,23 @@ def main(argv=None):
                 elif args.action == "push":
                     transport.push(local_file(args.source), args.destination)
                 else:
-                    destination = Path(args.destination)
-                    with destination.open("xb") as stream:
-                        process = subprocess.Popen(transport.command(shlex.join(["cat", args.source])), stdout=stream)
-                        if process.wait():
-                            raise ToolError("SSH download failed; local file is incomplete")
-                    if digest(destination) != transport.text("sha256sum", args.source).split()[0]:
-                        raise ToolError("SSH download checksum mismatch")
+                    transport.pull(args.source, args.destination)
             elif args.action == "prepare-boot":
                 transport.recovery()
                 transport.shell(RECOVERY_COMMAND, "prepare-boot", "--confirm" if args.execute else "--check", capture=False)
             elif args.action == "deploy":
                 recovery_deploy(args, transport)
+            elif args.action == "prepare-install":
+                recovery_prepare_install(args, transport)
+            elif args.action == "restore-gpt":
+                recovery_restore_gpt(args, transport)
             elif args.action == "format-root":
                 recovery_format_root(args, transport)
+            elif args.action == "mark-slot-successful":
+                transport.recovery()
+                transport.shell(RECOVERY_COMMAND, "mark-slot-successful", "--check", capture=False)
+                if args.execute:
+                    transport.shell(RECOVERY_COMMAND, "mark-slot-successful", "--confirm", capture=False)
             elif args.action == "install-initial":
                 recovery_install_initial(args, transport)
             elif args.action == "install-image":

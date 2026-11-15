@@ -1,0 +1,395 @@
+From 429dfd289c919e6d678b2b1927f09a8740397e0b Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] drm/mediatek: support MT6897 dual-core DSC
+
+Drive both cores of the MT6897 dual-input/output DSC wrapper.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T14:13:46+08:00
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/gpu/drm/mediatek/mtk_disp_dsc.c | 211 +++++++++++++++++++-----
+ 1 file changed, 168 insertions(+), 43 deletions(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_dsc.c b/drivers/gpu/drm/mediatek/mtk_disp_dsc.c
+index c9e35c09a4..765624a9c1 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_dsc.c
++++ b/drivers/gpu/drm/mediatek/mtk_disp_dsc.c
+@@ -9,6 +9,7 @@
+ #include <linux/component.h>
+ #include <linux/module.h>
+ #include <linux/of_device.h>
++#include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/soc/mediatek/mtk-cmdq.h>
+@@ -130,9 +131,45 @@
+ #  define DSC_READ_WORKING		BIT(2)
+ #  define DSC_SHADOW_DSC_VERSION_MINOR	GENMASK(8, 5)
+ 
++/**
++ * struct mtk_dsc_data - per-SoC DSC data
++ * @shadow_reg: offset of the shadow control register
++ * @obuf_sw_narrow: output buffer setting (with the software override bit)
++ *		    for encoded widths below 1440, or 0 for the default size
++ * @dsi_buffer: the DSI has a TX buffer (no DSC init delay), and the core
++ *		takes the stock driver's geometry and control values: picture
++ *		group width in 3-pixel groups, the height extended to whole
++ *		slices, the pad to a multiple of 3 bytes, CFG without the
++ *		checksum and 1.2 bug-fix bits, CON without the empty-flag and
++ *		FIFO-stall overrides, and no pre-pad size
++ */
++struct mtk_dsc_data {
++	u16 shadow_reg;
++	u32 obuf_sw_narrow;
++	bool dsi_buffer;
++};
++
++static const struct mtk_dsc_data mt8195_dsc_data = {
++	.shadow_reg = DISP_REG_DSC_SHADOW,
++};
++
++/* MT6897: shadow control at 0x228 and a smaller output buffer below 1440 */
++static const struct mtk_dsc_data mt6897_dsc_data = {
++	.shadow_reg = 0x228,
++	.obuf_sw_narrow = 0x800000c8,
++	.dsi_buffer = true,
++};
++
+ struct mtk_dsc {
+ 	struct clk		*clk;
+ 	void __iomem		*reg;
++	const struct mtk_dsc_data *data;
++	/*
++	 * Dual pipe: core 0 of a dual-core wrapper (DUAL_INOUT) owns core 1,
++	 * its twin node, and programs it with the same per-pipe setup.
++	 */
++	struct device_node	*twin_np;
++	struct mtk_dsc		*twin;
+ 	bool			dsc_config_done;
+ };
+ 
+@@ -150,7 +187,7 @@ void mtk_dsc_clk_disable(struct mtk_ddp_comp *comp)
+ 	clk_disable_unprepare(disp_dsc->clk);
+ }
+ 
+-static void mtk_dsc_pps_setup(struct mtk_dsc *disp_dsc, struct drm_dsc_config *dsc_cfg)
++static void mtk_dsc_pps_setup(void __iomem *reg, struct drm_dsc_config *dsc_cfg)
+ {
+ 	struct drm_dsc_rc_range_parameters *rcrp = dsc_cfg->rc_range_params;
+ 	u16 *rbt = dsc_cfg->rc_buf_thresh;
+@@ -162,38 +199,38 @@ static void mtk_dsc_pps_setup(struct mtk_dsc *disp_dsc, struct drm_dsc_config *d
+ 	data |= FIELD_PREP(DSC_P0_BPC, dsc_cfg->bits_per_component);
+ 	data |= FIELD_PREP(DSC_P0_BPP, dsc_cfg->bits_per_pixel);
+ 	data |= DSC_P0_RCT_ON | DSC_P0_BLOCK_PRED_EN;
+-	writel(data, disp_dsc->reg + DISP_REG_DSC_PPS(0));
++	writel(data, reg + DISP_REG_DSC_PPS(0));
+ 
+ 	/* PPS 1 */
+ 	data = FIELD_PREP(DSC_P1_INITIAL_XMIT_DELAY, dsc_cfg->initial_xmit_delay);
+ 	data |= FIELD_PREP(DSC_P1_INITIAL_DEC_DELAY, dsc_cfg->initial_dec_delay);
+-	writel(data, disp_dsc->reg + DISP_REG_DSC_PPS(1));
++	writel(data, reg + DISP_REG_DSC_PPS(1));
+ 
+ 	/* PPS 2 */
+ 	data = FIELD_PREP(DSC_P2_INITIAL_SCALE_VALUE, dsc_cfg->initial_scale_value);
+ 	data |= FIELD_PREP(DSC_P2_SCALE_INCR_INTERVAL, dsc_cfg->scale_increment_interval);
+-	writel(data, disp_dsc->reg + DISP_REG_DSC_PPS(2));
++	writel(data, reg + DISP_REG_DSC_PPS(2));
+ 
+ 	/* PPS 3 */
+ 	data = FIELD_PREP(DSC_P3_SCALE_DECR_INTERVAL, dsc_cfg->scale_decrement_interval);
+ 	data |= FIELD_PREP(DSC_P3_FIRST_LINE_BPG_OFFSET, dsc_cfg->first_line_bpg_offset);
+-	writel(data, disp_dsc->reg + DISP_REG_DSC_PPS(3));
++	writel(data, reg + DISP_REG_DSC_PPS(3));
+ 
+ 	/* PPS 4 */
+ 	data = FIELD_PREP(DSC_P4_NFL_BPG_OFFSET, dsc_cfg->nfl_bpg_offset);
+ 	data |= FIELD_PREP(DSC_P4_SLICE_BPG_OFFSET, dsc_cfg->slice_bpg_offset);
+-	writel(data, disp_dsc->reg + DISP_REG_DSC_PPS(4));
++	writel(data, reg + DISP_REG_DSC_PPS(4));
+ 
+ 	/* PPS 5 */
+ 	data = FIELD_PREP(DSC_P5_INITIAL_OFFSET, dsc_cfg->initial_offset);
+ 	data |= FIELD_PREP(DSC_P5_FINAL_OFFSET, dsc_cfg->final_offset);
+-	writel(data, disp_dsc->reg + DISP_REG_DSC_PPS(5));
++	writel(data, reg + DISP_REG_DSC_PPS(5));
+ 
+ 	/* PPS 6 */
+ 	data = FIELD_PREP(DSC_P6_FLATNESS_MIN_QP, dsc_cfg->flatness_min_qp);
+ 	data |= FIELD_PREP(DSC_P6_FLATNESS_MAX_QP, dsc_cfg->flatness_max_qp);
+ 	data |= FIELD_PREP(DSC_P6_RC_MODEL_SIZE, dsc_cfg->rc_model_size);
+-	writel(data, disp_dsc->reg + DISP_REG_DSC_PPS(6));
++	writel(data, reg + DISP_REG_DSC_PPS(6));
+ 
+ 	/* PPS 7 */
+ 	data = FIELD_PREP(DSC_P7_RC_EDGE_FACTOR, dsc_cfg->rc_edge_factor);
+@@ -201,7 +238,7 @@ static void mtk_dsc_pps_setup(struct mtk_dsc *disp_dsc, struct drm_dsc_config *d
+ 	data |= FIELD_PREP(DSC_P7_RC_QUANT_INCR_LIMIT1, dsc_cfg->rc_quant_incr_limit1);
+ 	data |= FIELD_PREP(DSC_P7_RC_TGT_OFFSET_HI, dsc_cfg->rc_tgt_offset_high);
+ 	data |= FIELD_PREP(DSC_P7_RC_TGT_OFFSET_LO, dsc_cfg->rc_tgt_offset_low);
+-	writel(data, disp_dsc->reg + DISP_REG_DSC_PPS(7));
++	writel(data, reg + DISP_REG_DSC_PPS(7));
+ 
+ 	/* PPS 8..11 - Each register holds 4 RC buffer thresholds (PPS 11 has two) */
+ 	for (i = 0; i < 4; i++) {
+@@ -218,7 +255,7 @@ static void mtk_dsc_pps_setup(struct mtk_dsc *disp_dsc, struct drm_dsc_config *d
+ 
+ 			data |= (rbt[buf_index] & DSC_P8_RC_BUF_THR_X) << data_shift;
+ 		}
+-		writel(data, disp_dsc->reg + DISP_REG_DSC_PPS(8 + i));
++		writel(data, reg + DISP_REG_DSC_PPS(8 + i));
+ 	}
+ 
+ 	/* PPS 12..18 - Each register holds two sets of RC range parameters */
+@@ -243,27 +280,35 @@ static void mtk_dsc_pps_setup(struct mtk_dsc *disp_dsc, struct drm_dsc_config *d
+ 			if (buf_index == 13)
+ 				break;
+ 		}
+-		writel(data, disp_dsc->reg + DISP_REG_DSC_PPS(12 + i));
++		writel(data, reg + DISP_REG_DSC_PPS(12 + i));
+ 	}
+ 
+ 	/* PPS 19 - Last RC range register, holds only one set of parameters */
+ 	writel(FIELD_PREP(DSC_P12_RC_RANGE_MIN_QP, rcrp[14].range_min_qp) |
+ 	       FIELD_PREP(DSC_P12_RC_RANGE_MAX_QP, rcrp[14].range_max_qp) |
+ 	       FIELD_PREP(DSC_P12_RC_RANGE_BPG_OFFSET, rcrp[14].range_bpg_offset),
+-	       disp_dsc->reg + DISP_REG_DSC_PPS(19));
++	       reg + DISP_REG_DSC_PPS(19));
+ }
+ 
+-void mtk_dsc_setup(struct device *dev, struct drm_dsc_config *dsc_cfg)
++static void mtk_dsc_setup_core(struct mtk_dsc *disp_dsc, void __iomem *reg,
++			       struct drm_dsc_config *dsc_cfg, bool dual_inout)
+ {
+-	struct mtk_dsc *disp_dsc = dev_get_drvdata(dev);
+ 	u32 dsc_slice_w, dsc_slice_h, dsc_mode, dsc_cfg_rval, dsc_shadow;
+ 	u32 dsc_dbg_con, dsc_con, dsc_enc_width, dsc_pic_w, dsc_pic_h;
+ 	u32 pic_group_width, pic_height_ext_num, slice_group_width;
+ 	u32 chunk_size, dsc_pad_num, dsc_pre_pad_sz;
++	bool v1 = disp_dsc->data->dsi_buffer;
+ 	bool dsc_en_bit;
+ 
+-	pic_height_ext_num = dsc_cfg->pic_height + dsc_cfg->slice_height - 1;
+-	pic_group_width = (dsc_cfg->slice_width * 4) / 3;
++	if (v1) {
++		pic_height_ext_num = DIV_ROUND_UP(dsc_cfg->pic_height,
++						  dsc_cfg->slice_height) *
++				     dsc_cfg->slice_height;
++		pic_group_width = DIV_ROUND_UP(dsc_cfg->pic_width, 3);
++	} else {
++		pic_height_ext_num = dsc_cfg->pic_height + dsc_cfg->slice_height - 1;
++		pic_group_width = (dsc_cfg->slice_width * 4) / 3;
++	}
+ 	slice_group_width = (dsc_cfg->slice_width + 2) / 3;
+ 
+ 	if (dsc_cfg->slice_chunk_size)
+@@ -286,19 +331,26 @@ void mtk_dsc_setup(struct device *dev, struct drm_dsc_config *dsc_cfg)
+ 				  (pic_height_ext_num / dsc_cfg->slice_height) - 1);
+ 	dsc_slice_h |= FIELD_PREP(DSC_SLICE_HEIGHT_M1, dsc_cfg->slice_height - 1);
+ 
+-	dsc_pad_num = (3 - ((chunk_size * 2) % 3)) % 3;
++	if (v1)
++		dsc_pad_num = DIV_ROUND_UP(chunk_size * dsc_cfg->slice_count, 3) * 3 -
++			      chunk_size * dsc_cfg->slice_count;
++	else
++		dsc_pad_num = (3 - ((chunk_size * 2) % 3)) % 3;
+ 	dsc_pad_num = FIELD_PREP(DSC_PAD_NUMBER, dsc_pad_num);
+ 
+ 	dsc_pre_pad_sz = FIELD_PREP(DSC_PIC_PREPAD_HEIGHT, dsc_cfg->pic_height);
+ 	dsc_pre_pad_sz |= FIELD_PREP(DSC_PIC_PREPAD_WIDTH, dsc_cfg->pic_width);
+ 
+-	dsc_mode = FIELD_PREP(DSC_INIT_DELAY_HEIGHT, 4);
++	/* With a DSI TX buffer the DSC starts without an initial delay */
++	dsc_mode = FIELD_PREP(DSC_INIT_DELAY_HEIGHT, v1 ? 0 : 4);
+ 	dsc_mode |= FIELD_PREP(DSC_RGB_SWAP, 0);
+ 	dsc_mode |= FIELD_PREP(DSC_TWO_SLICE_MODE, (dsc_cfg->slice_count == 2));
+ 
+ 	/* Must enable checksum calc in DBG if enabling core checksum in CFG */
+-	dsc_cfg_rval = DSC_CFG_ICH_EN | DSC_CFG_CRC_EN | DSC_CFG_DSC12_BUGFIX |
+-		       DSC_CFG_CORE_CHECKSUM;
++	dsc_cfg_rval = DSC_CFG_ICH_EN;
++	if (!v1)
++		dsc_cfg_rval |= DSC_CFG_CRC_EN | DSC_CFG_DSC12_BUGFIX |
++				DSC_CFG_CORE_CHECKSUM;
+ 	dsc_dbg_con = DSC_CKSM_CAL_EN;
+ 
+ 	if (dsc_cfg->bits_per_component == 8)
+@@ -313,43 +365,98 @@ void mtk_dsc_setup(struct device *dev, struct drm_dsc_config *dsc_cfg)
+ 	dsc_shadow |= DSC_FORCE_COMMIT | DSC_BYPASS_SHADOW;
+ 
+ 	/* If DSC is currently enabled, disable it before setup and re-enable after */
+-	dsc_con = readl(disp_dsc->reg + DISP_REG_DSC_CON);
++	dsc_con = readl(reg + DISP_REG_DSC_CON);
+ 	if (dsc_con & DSC_EN) {
+ 		dsc_en_bit = true;
+-		writel(dsc_con & ~DSC_EN, disp_dsc->reg + DISP_REG_DSC_CON);
++		writel(dsc_con & ~DSC_EN, reg + DISP_REG_DSC_CON);
+ 	} else {
+ 		dsc_en_bit = false;
+ 	}
+ 
+-	writel(0, disp_dsc->reg + DISP_REG_DSC_SPR);
+-	writel(dsc_enc_width, disp_dsc->reg + DISP_REG_DSC_ENC_WIDTH);
+-	writel(dsc_pic_w, disp_dsc->reg + DISP_REG_DSC_PIC_W);
+-	writel(dsc_pic_h, disp_dsc->reg + DISP_REG_DSC_PIC_H);
+-	writel(dsc_slice_w, disp_dsc->reg + DISP_REG_DSC_SLICE_W);
+-	writel(dsc_slice_h, disp_dsc->reg + DISP_REG_DSC_SLICE_H);
++	/* Reset the core: a bootloader may have left it running */
++	if (v1) {
++		writel(DSC_SW_RESET, reg + DISP_REG_DSC_CON);
++		writel(0, reg + DISP_REG_DSC_CON);
++	}
++
++	writel(0, reg + DISP_REG_DSC_SPR);
++	writel(dsc_enc_width, reg + DISP_REG_DSC_ENC_WIDTH);
++	writel(dsc_pic_w, reg + DISP_REG_DSC_PIC_W);
++	writel(dsc_pic_h, reg + DISP_REG_DSC_PIC_H);
++	writel(dsc_slice_w, reg + DISP_REG_DSC_SLICE_W);
++	writel(dsc_slice_h, reg + DISP_REG_DSC_SLICE_H);
+ 	writel(((chunk_size * 4) / 3) << 16 | chunk_size,
+-	       disp_dsc->reg + DISP_REG_DSC_CHUNK_SIZE);
+-	writel(dsc_pre_pad_sz, disp_dsc->reg + DISP_REG_DSC_PIC_PRE_PAD_SIZE);
+-	writel(dsc_pad_num, disp_dsc->reg + DISP_REG_DSC_PAD);
++	       reg + DISP_REG_DSC_CHUNK_SIZE);
++	if (!v1)
++		writel(dsc_pre_pad_sz, reg + DISP_REG_DSC_PIC_PRE_PAD_SIZE);
++	writel(dsc_pad_num, reg + DISP_REG_DSC_PAD);
+ 	writel(FIELD_PREP(DISP_DSC_BUF_SIZE_MASK, chunk_size * dsc_cfg->slice_height),
+-	       disp_dsc->reg + DISP_REG_DSC_BUF_SIZE);
+-	writel(dsc_mode, disp_dsc->reg + DISP_REG_DSC_MODE);
+-	writel(dsc_cfg_rval, disp_dsc->reg + DISP_REG_DSC_CFG);
+-	writel(dsc_dbg_con, disp_dsc->reg + DISP_REG_DSC_DBG_CON);
+-	writel(FIELD_PREP_CONST(DSC_OBUF_SIZE, 1040), disp_dsc->reg + DISP_REG_DSC_OUTBUF);
+-	writel(dsc_shadow, disp_dsc->reg + DISP_REG_DSC_SHADOW);
++	       reg + DISP_REG_DSC_BUF_SIZE);
++	if (v1)
++		/* Only the low half is the mode; keep the rest */
++		writel((readl(reg + DISP_REG_DSC_MODE) & ~GENMASK(15, 0)) | dsc_mode,
++		       reg + DISP_REG_DSC_MODE);
++	else
++		writel(dsc_mode, reg + DISP_REG_DSC_MODE);
++	writel(dsc_cfg_rval, reg + DISP_REG_DSC_CFG);
++	writel(dsc_dbg_con, reg + DISP_REG_DSC_DBG_CON);
++	if (disp_dsc->data->obuf_sw_narrow && dsc_cfg->pic_width < 1440)
++		writel(disp_dsc->data->obuf_sw_narrow, reg + DISP_REG_DSC_OUTBUF);
++	else
++		writel(FIELD_PREP_CONST(DSC_OBUF_SIZE, 1040), reg + DISP_REG_DSC_OUTBUF);
++	writel(dsc_shadow, reg + disp_dsc->data->shadow_reg);
+ 
+ 	/* Set PPS registers configuration */
+-	mtk_dsc_pps_setup(disp_dsc, dsc_cfg);
++	mtk_dsc_pps_setup(reg, dsc_cfg);
+ 
+-	dsc_con = FIELD_PREP_CONST(DSC_EMPTY_FLAG_SEL, DSC_EMPTY_FLAG_ALWAYS_LOW);
+-	dsc_con |= DSC_V1_1_EXT | DSC_UFOE_SEL | DSC_PT_MEM_EN;
+-	dsc_con |= DSC_ZERO_FIFO_STALL_DISABLE;
++	if (v1) {
++		dsc_con = DSC_UFOE_SEL | DSC_PT_MEM_EN;
++	} else {
++		dsc_con = FIELD_PREP_CONST(DSC_EMPTY_FLAG_SEL, DSC_EMPTY_FLAG_ALWAYS_LOW);
++		dsc_con |= DSC_V1_1_EXT | DSC_UFOE_SEL | DSC_PT_MEM_EN;
++		dsc_con |= DSC_ZERO_FIFO_STALL_DISABLE;
++	}
++	if (dual_inout)
++		dsc_con |= DSC_DUAL_INOUT;
+ 
+ 	if (dsc_en_bit)
+ 		dsc_con |= DSC_EN;
+ 
+-	writel(dsc_con, disp_dsc->reg + DISP_REG_DSC_CON);
++	writel(dsc_con, reg + DISP_REG_DSC_CON);
++
++}
++
++static struct mtk_dsc *mtk_dsc_twin(struct mtk_dsc *disp_dsc)
++{
++	struct platform_device *pdev;
++
++	if (!disp_dsc->twin_np || disp_dsc->twin)
++		return disp_dsc->twin;
++
++	pdev = of_find_device_by_node(disp_dsc->twin_np);
++	if (!pdev)
++		return NULL;
++
++	disp_dsc->twin = platform_get_drvdata(pdev);
++	put_device(&pdev->dev);
++	return disp_dsc->twin;
++}
++
++/*
++ * A dual-inout wrapper takes both pipes: core 0 (this node) gets DUAL_INOUT,
++ * core 1 (the twin) the same per-pipe setup without it (vendor CON values
++ * 0x10085 and 0x10081).
++ */
++void mtk_dsc_setup(struct device *dev, struct drm_dsc_config *dsc_cfg)
++{
++	struct mtk_dsc *disp_dsc = dev_get_drvdata(dev);
++	struct mtk_dsc *twin = mtk_dsc_twin(disp_dsc);
++
++	mtk_dsc_setup_core(disp_dsc, disp_dsc->reg, dsc_cfg, !!disp_dsc->twin_np);
++	if (twin) {
++		mtk_dsc_setup_core(twin, twin->reg, dsc_cfg, false);
++		twin->dsc_config_done = true;
++	}
+ 
+ 	disp_dsc->dsc_config_done = true;
+ }
+@@ -371,6 +478,15 @@ void mtk_dsc_start(struct device *dev)
+ 	/* Enable the DSC IP with the new settings */
+ 	val |= DSC_EN;
+ 	writel(val, disp_dsc->reg + DISP_REG_DSC_CON);
++
++	if (mtk_dsc_twin(disp_dsc)) {
++		struct mtk_dsc *twin = disp_dsc->twin;
++
++		val = readl(twin->reg + DISP_REG_DSC_CON);
++		if (!twin->dsc_config_done)
++			val = (val & ~DSC_EN) | DSC_BYPASS | DSC_UFOE_SEL;
++		writel(val | DSC_EN, twin->reg + DISP_REG_DSC_CON);
++	}
+ }
+ 
+ void mtk_dsc_stop(struct device *dev)
+@@ -378,6 +494,8 @@ void mtk_dsc_stop(struct device *dev)
+ 	struct mtk_dsc *disp_dsc = dev_get_drvdata(dev);
+ 
+ 	writel(0, disp_dsc->reg + DISP_REG_DSC_CON);
++	if (mtk_dsc_twin(disp_dsc))
++		writel(0, disp_dsc->twin->reg + DISP_REG_DSC_CON);
+ }
+ 
+ static int mtk_dsc_bind(struct device *dev, struct device *master, void *data)
+@@ -415,6 +533,9 @@ static int mtk_dsc_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, PTR_ERR(priv->reg),
+ 				     "failed to do ioremap\n");
+ 
++	priv->data = of_device_get_match_data(dev);
++	priv->twin_np = of_parse_phandle(dev->of_node, "mediatek,dual-pipe-twin", 0);
++
+ 	platform_set_drvdata(pdev, priv);
+ 
+ 	ret = devm_pm_runtime_enable(dev);
+@@ -430,11 +551,15 @@ static int mtk_dsc_probe(struct platform_device *pdev)
+ 
+ static void mtk_dsc_remove(struct platform_device *pdev)
+ {
++	struct mtk_dsc *disp_dsc = platform_get_drvdata(pdev);
++
++	of_node_put(disp_dsc->twin_np);
+ 	component_del(&pdev->dev, &mtk_dsc_component_ops);
+ }
+ 
+ static const struct of_device_id mtk_dsc_driver_dt_match[] = {
+-	{ .compatible = "mediatek,mt8195-disp-dsc" },
++	{ .compatible = "mediatek,mt6897-disp-dsc", .data = &mt6897_dsc_data },
++	{ .compatible = "mediatek,mt8195-disp-dsc", .data = &mt8195_dsc_data },
+ 	{ /* sentinel */ }
+ };
+ MODULE_DEVICE_TABLE(of, mtk_dsc_driver_dt_match);
+-- 
+2.56.0
+

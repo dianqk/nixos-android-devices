@@ -1,0 +1,54 @@
+From dd8dcdf9e993632e30177b7e4de145fd2b98ec6c Mon Sep 17 00:00:00 2001
+From: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Date: Mon, 19 Oct 2026 16:46:05 +0200
+Subject: [PATCH 029/144] crypto: qce - Reject messages shorter than a block
+ for AES-XTS
+
+XTS is not defined for a payload shorter than one cipher block. The
+driver treated a zero-length request as a successful no-op, so the
+crypto self-tests "unexpectedly succeeded" when -EINVAL was expected.
+Requests of 1 to 15 bytes are not rejected either and, when they are not
+diverted to the fallback (e.g. with aes_sw_max_len set to 0), reach the
+engine which stalls waiting for a full block of input.
+
+Return -EINVAL for XTS requests shorter than AES_BLOCK_SIZE while
+keeping the no-op behavior for empty requests of the other ciphers,
+which the crypto engine simply cannot process due to its DMA not
+supporting zero-length transfers.
+
+Cc: stable@vger.kernel.org
+Fixes: f08789462255 ("crypto: qce - Return error for zero length messages")
+Tested-by: Kuldeep Singh <kuldeep.singh@oss.qualcomm.com>
+Tested-by: Pankaj Patil <pankaj.patil@oss.qualcomm.com>
+Signed-off-by: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Message-ID: <20261019-qce-fixes-skcipher-v12-1-046e6be9bd83@oss.qualcomm.com>
+Link: https://lore.kernel.org/r/20261019-qce-fixes-skcipher-v12-1-046e6be9bd83@oss.qualcomm.com
+(cherry picked from commit 7f8117e633dda5c42844fc9f5ae4762253929615)
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0047-crypto-qce-Reject-messages-shorter-than-a-block-for-.patch
+Import-SHA256: cefb27d6700e671f9db00db32b6cd6c5a8737ba0a875e8e5fb853dcd503a83f9
+Import-Provenance: mail headers
+(cherry picked from commit 4d4e0d130051df1bf5a8b32dce5992aeeac33d58)
+---
+ drivers/crypto/qce/skcipher.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/drivers/crypto/qce/skcipher.c b/drivers/crypto/qce/skcipher.c
+index 4931b064f1..da9393aed9 100644
+--- a/drivers/crypto/qce/skcipher.c
++++ b/drivers/crypto/qce/skcipher.c
+@@ -221,6 +221,14 @@ static int qce_skcipher_crypt(struct skcipher_request *req, int encrypt)
+ 	rctx->flags |= encrypt ? QCE_ENCRYPT : QCE_DECRYPT;
+ 	keylen = IS_XTS(rctx->flags) ? ctx->enc_keylen >> 1 : ctx->enc_keylen;
+ 
++	/*
++	 * XTS requires at least one full block of data. Reject anything
++	 * shorter here as the engine would stall waiting for more input if
++	 * such a request reached it.
++	 */
++	if (IS_XTS(rctx->flags) && req->cryptlen < AES_BLOCK_SIZE)
++		return -EINVAL;
++
+ 	/* CE does not handle 0 length messages */
+ 	if (!req->cryptlen)
+ 		return 0;

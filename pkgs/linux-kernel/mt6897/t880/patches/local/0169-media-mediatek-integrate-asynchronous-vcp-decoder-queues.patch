@@ -1,0 +1,2079 @@
+From e08b70b774abc03bd5fd35d012743e7fc4bf644c Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] media: mediatek: integrate asynchronous VCP decoder queues
+
+Publish source changes and queue asynchronous VCP decoder events while
+tracking compressed OUTPUT geometry and capture buffer ownership.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T15:50:44+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T17:25:12+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T17:27:31+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T17:35:56+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T17:49:07+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T17:57:50+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T18:09:33+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T18:38:09+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T19:33:11+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-04T23:12:20+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-05T05:55:07+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-05T08:48:08+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-05T09:37:14+08:00
+Link: https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec
+Link: https://github.com/MT6895-Mainline/linux/tree/f1c0c8245d163fece46699612b8322d11e26348d
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec/mtk_vcodec_dec.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec/vdec/vdec_vcp_if.c
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ .../mediatek/vcodec/vcp/mtk_vcp_vdec_drv.c    | 1195 +++++++++++------
+ 1 file changed, 785 insertions(+), 410 deletions(-)
+
+diff --git a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_drv.c b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_drv.c
+index 58cfb422b9..30a423f209 100644
+--- a/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_drv.c
++++ b/drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_drv.c
+@@ -1,8 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+-/* Stateful V4L2 decoding through the MT6895 VCP firmware. */
++/* Stateful V4L2 decoding through the MT6897 VCP firmware. */
+ #include <linux/atomic.h>
+ #include <linux/dma-buf.h>
+ #include <linux/dma-mapping.h>
++#include <linux/fcntl.h>
+ #include <linux/iommu.h>
+ #include <linux/ktime.h>
+ #include <linux/module.h>
+@@ -11,6 +12,7 @@
+ #include <linux/pm.h>
+ #include <linux/slab.h>
+ #include <linux/sizes.h>
++#include <linux/spinlock.h>
+ #include <linux/vmalloc.h>
+ #include <linux/workqueue.h>
+ #include <media/v4l2-ctrls.h>
+@@ -22,6 +24,7 @@
+ #include <media/videobuf2-vmalloc.h>
+ #include <media/videobuf2-dma-sg.h>
+ #include "mtk_vcp_vdec_hw.h"
++#include "mtk_vcp_vdec_pixels.h"
+ #include "mtk_vcp_vdec_bitstream.h"
+ 
+ #define DEC_SURFACES 36
+@@ -45,10 +48,7 @@ static bool direct_dbg;
+ module_param_named(direct_dbg, direct_dbg, bool, 0644);
+ MODULE_PARM_DESC(direct_dbg, "trace the direct (tiled) capture handover");
+ 
+-/* VP8 uses synchronous bitstream/frame pairing; VP9 chroma follows luma
+- * in the shared surface allocation. Both use the verified MM21 layout.
+- * HEIF remains unadvertised until a working firmware output is verified.
+- */
++/* MT6897 formats supported by the firmware capability table. */
+ struct vdec_codec {
+ 	u32 fourcc;
+ 	u32 vcp_fourcc;
+@@ -58,24 +58,13 @@ struct vdec_codec {
+ 
+ static const struct vdec_codec vdec_codecs[] = {
+ 	{ V4L2_PIX_FMT_H264, v4l2_fourcc('H', '2', '6', '4'), VCP_VDEC_H264,
+-	  { 16, 4096, 16, 16, 2176, 16 } },
++	  { 64, 4096, 16, 64, 2176, 16 } },
+ 	{ V4L2_PIX_FMT_HEVC, v4l2_fourcc('H', '2', '6', '5'), VCP_VDEC_H265,
+ 	  { 16, 4096, 16, 16, 2176, 16 } },
+ 	{ V4L2_PIX_FMT_VP9, v4l2_fourcc('V', 'P', '9', '0'), VCP_VDEC_VP9,
+-	  { 16, 4096, 16, 16, 2176, 16 } },
+-	{ V4L2_PIX_FMT_VP8, v4l2_fourcc('V', 'P', '8', '0'), VCP_VDEC_VP8,
+-	  { 16, 2048, 16, 16, 1088, 32 } },
+-	{ V4L2_PIX_FMT_MPEG2, v4l2_fourcc('M', 'P', 'G', '2'), VCP_VDEC_MPEG12,
+-	  { 16, 2048, 16, 16, 1088, 32 } },
+-	{ V4L2_PIX_FMT_MPEG4, v4l2_fourcc('M', 'P', 'G', '4'), VCP_VDEC_MPEG4,
+-	  { 16, 2048, 16, 16, 1088, 32 } },
+-	{ V4L2_PIX_FMT_H263, v4l2_fourcc('H', '2', '6', '3'), VCP_VDEC_H263,
+-	  { 16, 1408, 16, 16, 1152, 32 } },
+-	/* Upstream V4L2 spells AV1 'AV01' while the firmware table spells it
+-	 * 'AV10'; the vcp_fourcc column carries the firmware spelling.
+-	 */
++	  { 16, 4096, 64, 16, 2176, 64 } },
+ 	{ V4L2_PIX_FMT_AV1, v4l2_fourcc('A', 'V', '1', '0'), VCP_VDEC_AV1,
+-	  { 16, 4096, 16, 16, 2176, 32 } },
++	  { 16, 4096, 64, 16, 2176, 64 } },
+ };
+ 
+ static const struct vdec_codec *vdec_codec_by_fourcc(u32 fourcc)
+@@ -95,9 +84,7 @@ static const struct v4l2_frmsize_stepwise vdec_capture_size = {
+ 	16, 4096, 16, 16, 2176, 16,
+ };
+ 
+-/* Round a requested dimension down to a step the firmware accepts, inside the
+- * range the codec publishes.
+- */
++/* Align a CAPTURE allocation dimension within its published range. */
+ static u32 vdec_dimension(u32 v, u32 min, u32 max, u32 step)
+ {
+ 	v = clamp_t(u32, v, min, max);
+@@ -106,7 +93,7 @@ static u32 vdec_dimension(u32 v, u32 min, u32 max, u32 step)
+ 
+ struct vdec_ctx;
+ struct vdec_dev {
+-	struct device *dev, *bs_dev, *ube_dev;
++	struct device *dev, *ube_dev, *lat_dev;
+ 	struct mtk_vcp *vcp;
+ 	struct mtk_vcp_vdec_hw *hw;
+ 	struct video_device video;
+@@ -117,14 +104,35 @@ struct vdec_dev {
+ 	struct list_head ctx_list;
+ 	struct mtk_vcp_vdec_engine *engine;
+ };
++struct vdec_buffer {
++	struct v4l2_m2m_buffer m2m;
++	u64 generation;
++};
++struct vdec_direct_plane {
++	struct dma_buf *dbuf;
++	struct dma_buf_attachment *attachment;
++	struct sg_table *mapping;
++	bool shared_mapping;
++	void *mem_priv; /* opaque MMAP identity, never dereferenced after DONE */
++};
++struct vdec_direct_backing {
++	struct vdec_direct_plane plane[2];
++	u64 generation;
++	u32 index;
++	enum vb2_memory memory;
++	u32 offset[2];
++	size_t bytes;
++	bool accounted;
++};
+ struct vdec_surface {
+ 	/* plane[0] owns the entire allocation; plane[1] is a chroma view.
+-	 * In direct mode there is no allocation at all: the slot is only a
+-	 * handle on the CAPTURE buffer the firmware writes that frame into,
+-	 * so sgt stays NULL and vb names the client's buffer.
++	 * Direct mode instead pins the client's DMA-BUF backing independently
++	 * of vb2 metadata. vb is non-NULL only while the driver holds that
++	 * ACTIVE buffer; firmware ownership can outlive a DISPLAY/DQBUF.
+ 	 */
+ 	struct mtk_vcp_mem plane[2];
+ 	struct sg_table *sgt;
++	struct vdec_direct_backing backing;
+ 	struct vb2_v4l2_buffer *vb; /* direct mode: buffer held in this slot */
+ 	u64 cookie;
+ 	bool queued; /* direct mode: recorded, awaiting the START that names it */
+@@ -134,6 +142,7 @@ struct vdec_pending {
+ 	u32 surface;
+ 	u64 timestamp;
+ 	u64 fw_done_ns;
++	bool no_generated;
+ };
+ /* perf_frames arms ktime staging splits for the next N delivered frames
+  * (0 = off). Re-arm by writing the count again through sysfs; each write
+@@ -168,6 +177,9 @@ struct vdec_ctx {
+ 	struct v4l2_fh fh;
+ 	struct v4l2_ctrl_handler controls;
+ 	struct vdec_dev *dev;
++	struct mutex direct_lock; /* QBUF identity checks versus worker ownership */
++	u64 next_buffer_generation;
++	size_t direct_bytes;
+ 	struct mtk_vcp_vdec *decoder;
+ 	struct v4l2_pix_format_mplane src_fmt, dst_fmt;
+ 	u32 codec_id;
+@@ -178,15 +190,23 @@ struct vdec_ctx {
+ 	struct vdec_pending pending[DEC_SURFACES];
+ 	u32 pool_count, pending_read, pending_count, sequence, source_sequence;
+ 	u64 next_cookie, source_cookie;
++	u32 source_changed;
++	unsigned long source_deadline;
+ 	u32 header_changed; /* saved across an interrupted header release wait */
+ 	u32 operation_rate; /* client's declared decode rate, 0 = no hint */
++	bool direct_ready; /* eligible queued backing plus a free firmware slot */
+ 	bool direct_capture; /* CAPTURE holds the firmware's tiled frame buffer */
+ 	bool direct_logged; /* frame-buffer mapping reported once per session */
+-	struct work_struct work;
++	struct work_struct work, schedule_work;
++	spinlock_t schedule_lock;
++	bool schedule_enabled;
+ 	wait_queue_head_t wait;
+ 	atomic_t notification;
++	int collected_notification;
+ 	bool booted, initialized, header, stopping, failed, orphan, released;
+ 	bool source_done, draining, drained;
++	bool sequence_announced; /* current OUTPUT stream, survives CAPTURE restart */
++	struct v4l2_rect announced_crop;
+ 	bool eos_sent; /* end-of-stream published for the current drain */
+ 	bool submitted;   /* head OUTPUT buffer handed to firmware, release pending */
+ 	bool last_pending; /* previous capture sequence still needs its LAST marker */
+@@ -214,6 +234,8 @@ struct vdec_ctx {
+ 	u32 prev_dst_size[2], prev_dst_planes; /* CAPTURE geometry before the change */
+ };
+ 
++static void update_direct_ready(struct vdec_ctx *c);
++
+ static struct vdec_ctx *file_ctx(struct file *file)
+ {
+ 	return container_of(file_to_v4l2_fh(file), struct vdec_ctx, fh);
+@@ -252,6 +274,13 @@ static struct v4l2_pix_format_mplane *queue_format(struct vdec_ctx *c, enum v4l2
+ 	return is_output(type) ? &c->src_fmt : &c->dst_fmt;
+ }
+ 
++static int codec_power_ao(void *priv, bool on)
++{
++	struct vdec_ctx *c = priv;
++
++	return mtk_vcp_vdec_hw_power_ao(c->dev->hw, on);
++}
++
+ static int codec_power(void *priv, unsigned int core, bool on)
+ {
+ 	struct vdec_ctx *c = priv;
+@@ -276,15 +305,41 @@ static void codec_free(void *priv, u32 type, struct mtk_vcp_mem *mem)
+ 
+ 	mtk_vcp_vdec_hw_free(c->dev->hw, type, mem);
+ }
++/* RX callbacks hold the decoder's rx_lock. Only kick the mem2mem scheduler
++ * here: collection must stay in its serialized decode job, never in RX.
++ * The lifetime gate is closed and this work joined before m2m_ctx is freed.
++ */
++static void schedule_kick(struct work_struct *work)
++{
++	struct vdec_ctx *c = container_of(work, struct vdec_ctx, schedule_work);
++
++	v4l2_m2m_try_schedule(c->fh.m2m_ctx);
++}
++
++static void stop_scheduling(struct vdec_ctx *c)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&c->schedule_lock, flags);
++	c->schedule_enabled = false;
++	spin_unlock_irqrestore(&c->schedule_lock, flags);
++	cancel_work_sync(&c->schedule_work);
++}
++
+ static void codec_notify(void *priv)
+ {
+ 	struct vdec_ctx *c = priv;
++	unsigned long flags;
+ 
+ 	atomic_inc(&c->notification);
+ 	wake_up(&c->wait);
++	spin_lock_irqsave(&c->schedule_lock, flags);
++	if (c->schedule_enabled)
++		queue_work(c->dev->queue, &c->schedule_work);
++	spin_unlock_irqrestore(&c->schedule_lock, flags);
+ }
+ static const struct mtk_vcp_vdec_ops codec_ops = {
+-	.power = codec_power, .wait_irq = codec_wait,
++	.power = codec_power, .power_ao = codec_power_ao, .wait_irq = codec_wait,
+ 	.alloc = codec_alloc, .free = codec_free, .notify = codec_notify,
+ };
+ 
+@@ -325,7 +380,7 @@ static int vdec_check_caps(struct vdec_ctx *c)
+ 			dev_info(c->dev->dev,
+ 				 "VDEC cap fmt[%d]: fourcc=%p4cc type=%u planes=%u\n", i,
+ 				 &fourcc, le32_to_cpu(fmts[i].type),
+-				 le32_to_cpu(fmts[i].num_planes));
++				 le32_to_cpu(fmts[i].planes));
+ 		if (fourcc == k->vcp_fourcc)
+ 			found = true;
+ 	}
+@@ -348,12 +403,12 @@ static int vdec_check_caps(struct vdec_ctx *c)
+ 			 "VDEC cap size[%d]: fourcc=%p4cc profile=%u level=%u %ux%u..%ux%u step %ux%u\n",
+ 			 i, &sizes[i].fourcc, le32_to_cpu(sizes[i].profile),
+ 			 le32_to_cpu(sizes[i].level),
+-			 le32_to_cpu(sizes[i].stepwise.min_width),
+-			 le32_to_cpu(sizes[i].stepwise.min_height),
+-			 le32_to_cpu(sizes[i].stepwise.max_width),
+-			 le32_to_cpu(sizes[i].stepwise.max_height),
+-			 le32_to_cpu(sizes[i].stepwise.step_width),
+-			 le32_to_cpu(sizes[i].stepwise.step_height));
++			 le32_to_cpu(sizes[i].min_width),
++			 le32_to_cpu(sizes[i].min_height),
++			 le32_to_cpu(sizes[i].max_width),
++			 le32_to_cpu(sizes[i].max_height),
++			 le32_to_cpu(sizes[i].step_width),
++			 le32_to_cpu(sizes[i].step_height));
+ out:
+ 	kfree(fmts);
+ 	kfree(sizes);
+@@ -440,14 +495,13 @@ static int session_boot(struct vdec_ctx *c)
+ 		ret = -ENOMEM;
+ 		goto rollback;
+ 	}
+-	c->bs.cpu = dma_alloc_coherent(c->dev->bs_dev, c->bs.size, &c->bs.dma, GFP_KERNEL);
++	ret = mtk_vcp_alloc_workmem(c->dev->vcp, c->bs.size, &c->bs);
+ 	VCPDBG("boot: bitstream mapping size=%zu cpu=%px dma=%pad\n",
+ 	       c->bs.size, c->bs.cpu, &c->bs.dma);
+-	if (c->bs.cpu) {
++	if (!ret) {
+ 		vdec_state(c, "booted");
+ 		return 0;
+ 	}
+-	ret = -ENOMEM;
+ rollback:
+ 	/* A session without a usable bitstream mapping, or with a format the
+ 	 * firmware does not decode, must not be left half initialized: a later
+@@ -486,16 +540,106 @@ static int session_start(struct vdec_ctx *c)
+ 	return session_boot(c);
+ }
+ 
++static void direct_backing_release(struct vdec_direct_backing *b)
++{
++	unsigned int p;
++
++	for (p = 0; p < 2; p++) {
++		struct vdec_direct_plane *v = &b->plane[p];
++
++		if (v->shared_mapping) {
++			if (v->dbuf)
++				dma_buf_put(v->dbuf);
++			continue;
++		}
++		if (v->mapping) {
++			dma_addr_t dma = sg_dma_address(v->mapping->sgl);
++
++			VCPDBG("unpin: vb=%u generation=%llu plane=%u dma=%pad size=%zu\n",
++			       b->index, b->generation, p, &dma, v->dbuf->size);
++		}
++		if (v->mapping)
++			dma_buf_unmap_attachment(v->attachment, v->mapping, DMA_BIDIRECTIONAL);
++		if (v->attachment)
++			dma_buf_detach(v->dbuf, v->attachment);
++		if (v->dbuf)
++			dma_buf_put(v->dbuf);
++	}
++	memset(b, 0, sizeof(*b));
++}
++
++/* direct_lock protects accounting; physical unmap may follow outside it. */
++static void direct_backing_forget(struct vdec_ctx *c, struct vdec_direct_backing *b)
++{
++	if (b->accounted) {
++		WARN_ON(b->bytes > c->direct_bytes);
++		c->direct_bytes -= b->bytes;
++		b->accounted = false;
++	}
++}
++
++static u64 direct_generation(struct vb2_buffer *vb)
++{
++	struct vdec_buffer *b = container_of(to_vb2_v4l2_buffer(vb),
++					    struct vdec_buffer, m2m.vb);
++
++	return b->generation;
++}
++
++static bool direct_backing_matches(const struct vdec_direct_backing *b,
++				   struct vb2_buffer *vb)
++{
++	unsigned int p;
++
++	if (!b->generation || b->memory != vb->memory)
++		return false;
++	for (p = 0; p < 2; p++) {
++		if (b->offset[p] != vb->planes[p].data_offset)
++			return false;
++		if (vb->memory == VB2_MEMORY_DMABUF) {
++			if (b->plane[p].dbuf != vb->planes[p].dbuf)
++				return false;
++		} else if (b->generation != direct_generation(vb) ||
++			   b->plane[p].mem_priv != vb->planes[p].mem_priv) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static bool direct_same_dmabuf(struct dma_buf *a, struct dma_buf *b)
++{
++	return a && b && (a == b || (a->ops == b->ops && a->priv == b->priv));
++}
++
++static bool direct_backing_aliases(const struct vdec_direct_backing *b,
++				  struct vb2_buffer *vb)
++{
++	unsigned int p, q;
++
++	if (!b->generation)
++		return false;
++	if (vb->memory == VB2_MEMORY_MMAP)
++		return b->memory == VB2_MEMORY_MMAP &&
++		       b->generation == direct_generation(vb);
++	for (p = 0; p < 2; p++)
++		for (q = 0; q < 2; q++)
++			if (direct_same_dmabuf(b->plane[p].dbuf, vb->planes[q].dbuf))
++				return true;
++	return false;
++}
++
+ /* Direct capture keeps CAPTURE buffers that are no longer on the m2m ready
+  * list, because they are the firmware's frame buffers. Any path that ends the
+  * session has to take them back or vb2 refuses to release the queue.
+  */
+-static unsigned int release_direct_slots(struct vdec_ctx *c)
++static unsigned int return_direct_buffers(struct vdec_ctx *c, bool quiesced)
+ {
+ 	unsigned int i, dropped = 0;
+ 
+ 	if (!c->direct_capture)
+ 		return 0;
++	mutex_lock(&c->direct_lock);
+ 	for (i = 0; i < c->pool_count; i++) {
+ 		struct vdec_surface *s = &c->surfaces[i];
+ 
+@@ -505,16 +649,15 @@ static unsigned int release_direct_slots(struct vdec_ctx *c)
+ 		s->vb = NULL;
+ 		s->queued = false;
+ 		s->pending = false;
+-		/* The slot is free again for the next stream to fill. A firmware
+-		 * session that outlives the capture restart still holds the old
+-		 * cookie; its release is dropped when it arrives.
+-		 */
+-		s->cookie = 0;
+-		s->free = true;
++		if (quiesced) {
++			s->cookie = 0;
++			s->free = true;
++		}
+ 		dropped++;
+ 	}
+ 	c->pending_count = 0;
+ 	c->pending_read = 0;
++	mutex_unlock(&c->direct_lock);
+ 	return dropped;
+ }
+ 
+@@ -525,7 +668,6 @@ static int session_teardown(struct vdec_ctx *c)
+ {
+ 	int ret = 0, stopped, i;
+ 
+-	release_direct_slots(c);
+ 	if (!c->decoder)
+ 		return 0;
+ 	VCPDBG("teardown: init=%d boot=%d orphan=%d\n", c->initialized,
+@@ -557,16 +699,33 @@ static int session_teardown(struct vdec_ctx *c)
+ 		       ret, stopped, mtk_vcp_is_offline(c->dev->vcp));
+ 		goto retain;
+ 	}
+-	stopped = mtk_vcp_vdec_destroy(c->decoder, !!ret);
++	/* Firmware has deinitialized or the VCP reset is confirmed above.
++	 * Keep the owning context if the allocator cannot confirm safe release.
++	 */
++	if (c->bs.cpu) {
++		mtk_vcp_free_workmem(c->dev->vcp, &c->bs);
++		if (c->bs.cpu)
++			goto retain;
++	}
++	stopped = mtk_vcp_vdec_destroy(c->decoder, !!ret || mtk_vcp_is_offline(c->dev->vcp));
+ 	if (stopped) {
+ 		VCPDBG("teardown: destroy failed: %d\n", stopped);
+ 		goto retain;
+ 	}
++	return_direct_buffers(c, true);
++	for (i = 0; i < DEC_SURFACES; i++) {
++		struct vdec_direct_backing backing;
++
++		mutex_lock(&c->direct_lock);
++		backing = c->surfaces[i].backing;
++		direct_backing_forget(c, &backing);
++		memset(&c->surfaces[i].backing, 0, sizeof(backing));
++		mutex_unlock(&c->direct_lock);
++		direct_backing_release(&backing);
++	}
+ 	c->decoder = NULL;
+ 	c->booted = false;
+ 	c->initialized = false;
+-	if (c->bs.cpu)
+-		dma_free_coherent(c->dev->bs_dev, c->bs.size, c->bs.cpu, c->bs.dma);
+ 	memset(&c->bs, 0, sizeof(c->bs));
+ 	kvfree(c->bs_snapshot);
+ 	c->bs_snapshot = NULL;
+@@ -586,10 +745,13 @@ static int session_teardown(struct vdec_ctx *c)
+ 	}
+ 	c->probe_cookie = 0;
+ 	c->probe_done = false;
++	mutex_lock(&c->direct_lock);
+ 	memset(c->surfaces, 0, sizeof(c->surfaces));
+ 	c->pool_count = 0;
++	WRITE_ONCE(c->direct_ready, false);
+ 	c->pending_count = 0;
+ 	c->pending_read = 0;
++	mutex_unlock(&c->direct_lock);
+ 	if (c->orphan) {
+ 		c->orphan = false;
+ 		module_put(THIS_MODULE);
+@@ -597,7 +759,11 @@ static int session_teardown(struct vdec_ctx *c)
+ 	VCPDBG("teardown: complete\n");
+ 	return 0;
+ retain:
++	/* vb2 may now destroy its queue. Keep only independent DMA pins and
++	 * opaque identities in the quarantined session, never raw vb pointers.
++	 */
+ 	WRITE_ONCE(c->failed, true);
++	return_direct_buffers(c, false);
+ 	if (!c->orphan) {
+ 		c->orphan = true;
+ 		__module_get(THIS_MODULE);
+@@ -640,76 +806,16 @@ static int recover_released_session(struct vdec_dev *d)
+ 
+ static dma_addr_t plane_dma(const struct sg_table *sgt, size_t need);
+ 
+-/* Hand the firmware a capture buffer for the header pass.  Codecs whose frame
+- * buffers it drives itself (HEVC reports input_driven = NON_INPUT_DRIVEN)
+- * expect a frame with every START, including the one that only parses the
+- * sequence header.  The client's buffers are still at the minimal geometry
+- * here, which is enough: nothing is written into it before the resolution
+- * change has been handled.
+- */
+-static int probe_surface(struct vdec_ctx *c)
+-{
+-	struct vb2_v4l2_buffer *vb = v4l2_m2m_next_dst_buf(c->fh.m2m_ctx);
+-	struct sg_table *y, *uv;
+-	dma_addr_t dma_y, dma_uv;
+-	u32 width, height;
+-
+-	if (vb && vb->vb2_buf.num_planes >= 2) {
+-		y = vb2_dma_sg_plane_desc(&vb->vb2_buf, 0);
+-		uv = vb2_dma_sg_plane_desc(&vb->vb2_buf, 1);
+-		if (!y || !uv)
+-			return -EINVAL;
+-		dma_y = plane_dma(y, vb2_plane_size(&vb->vb2_buf, 0));
+-		dma_uv = plane_dma(uv, vb2_plane_size(&vb->vb2_buf, 1));
+-		if (dma_y && dma_uv) {
+-			VCPDBG("probe: client buffer %u dma=%pad/%pad\n",
+-			       vb->vb2_buf.index, &dma_y, &dma_uv);
+-			goto queue;
+-		}
+-	}
+-
+-	/* The client only queues capture buffers once it knows the stream
+-	 * geometry, so the header pass allocates a surface of its own.  It has
+-	 * to have the geometry the firmware is about to report, otherwise the
+-	 * START is rejected: the CAPTURE format already carries the client's
+-	 * picture size padded to the driver's 16x32 step.
+-	 */
+-	width = c->dst_fmt.width;
+-	height = c->dst_fmt.height;
+-	if (!width || !height)
+-		return -EINVAL;
+-	if (!c->probe.sgt || c->probe.plane[0].size != (size_t)width * height * 3 / 2) {
+-		if (c->probe.sgt) {
+-			dma_free_noncontiguous(c->dev->dev, c->probe.plane[0].size,
+-					       c->probe.sgt, DMA_BIDIRECTIONAL);
+-			memset(&c->probe, 0, sizeof(c->probe));
+-		}
+-		c->probe.plane[0].size = (size_t)width * height * 3 / 2;
+-		c->probe.sgt = dma_alloc_noncontiguous(c->dev->dev, c->probe.plane[0].size,
+-						       DMA_BIDIRECTIONAL, GFP_KERNEL, 0);
+-		if (!c->probe.sgt)
+-			return -ENOMEM;
+-		c->probe.plane[0].dma = sg_dma_address(c->probe.sgt->sgl);
+-	}
+-	dma_y = c->probe.plane[0].dma;
+-	dma_uv = dma_y + (dma_addr_t)width * height;
+-	VCPDBG("probe: internal %ux%u surface dma=%pad/%pad\n", width, height, &dma_y,
+-	       &dma_uv);
+-
+-queue:
+-	c->probe_cookie = ++c->next_cookie;
+-	return mtk_vcp_vdec_frame(c->decoder, c->probe_cookie, 0, dma_y, dma_uv);
+-}
+-
+-static int collect_events(struct vdec_ctx *c)
++static int collect_events_locked(struct vdec_ctx *c)
+ {
+ 	struct vcp_vdec_event event;
++	/* Notifications arriving during collection remain eligible for a job. */
++	int notification = atomic_read(&c->notification);
+ 	int ret;
+ 	unsigned int i;
+ 
+-	/* The firmware publishes finished pictures in its display ring instead
+-	 * of an IPI when it drives the frame buffers, so poll it before
+-	 * draining the event list.
++	/* Collect worker-owned input releases and synchronous frame rings.
++	 * Async frame events were queued before the PUT_FRAME_BUFFER reply.
+ 	 */
+ 	if (c->decoder) {
+ 		ret = mtk_vcp_vdec_collect(c->decoder);
+@@ -756,21 +862,23 @@ static int collect_events(struct vdec_ctx *c)
+ 						c->surfaces[k].free,
+ 						c->surfaces[k].pending);
+ 			}
+-			/* A capture restart can leave the firmware still holding
+-			 * a cookie the driver has already reclaimed. Releasing a
+-			 * frame nobody owns any more is not a protocol error.
+-			 */
+-			if (c->direct_capture &&
+-			    event.type == VCP_VDEC_FREE_FRAME) {
+-				VCPDBG("event: stale FREE_FRAME cookie %#llx\n",
+-				       event.cookie);
+-				continue;
+-			}
+ 			VCPDBG("event: unknown cookie, pool=%u\n", c->pool_count);
+ 			return -EPROTO;
+ 		}
+ 		if (event.type == VCP_VDEC_FREE_FRAME) {
+-			c->surfaces[i].free = true;
++			struct vdec_surface *surface = &c->surfaces[i];
++
++			if (surface->free)
++				return -EPROTO;
++			surface->free = true;
++			if (c->direct_capture && surface->vb && !surface->pending) {
++				/* Flush/non-display release: still ACTIVE in vb2, never
++				 * published to userspace, so return it to the ready list.
++				 */
++				v4l2_m2m_buf_queue(c->fh.m2m_ctx, surface->vb);
++				surface->vb = NULL;
++				surface->queued = false;
++			}
+ 			continue;
+ 		}
+ 		if (c->pending_count == DEC_SURFACES || c->surfaces[i].pending) {
+@@ -785,18 +893,33 @@ static int collect_events(struct vdec_ctx *c)
+ 		 */
+ 		u64 timestamp = event.timestamp;
+ 
++		c->surfaces[i].queued = false;
+ 		c->surfaces[i].pending = true;
+ 		c->pending[(c->pending_read + c->pending_count++) % DEC_SURFACES] =
+ 			(struct vdec_pending){ .surface = i, .timestamp = timestamp,
+-						.fw_done_ns = ktime_get_ns() };
++						.fw_done_ns = ktime_get_ns(),
++						.no_generated = event.no_generated };
+ 		VCPDBG("event: display surface=%u pending=%u ts=%llu\n", i,
+ 		       c->pending_count, timestamp);
+ 	}
+ 	if (ret != -EAGAIN)
+ 		VCPDBG("events: stopped with %d\n", ret);
++	if (ret == -EAGAIN)
++		WRITE_ONCE(c->collected_notification, notification);
+ 	return ret == -EAGAIN ? 0 : ret;
+ }
+ 
++static int collect_events(struct vdec_ctx *c)
++{
++	int ret;
++
++	mutex_lock(&c->direct_lock);
++	ret = collect_events_locked(c);
++	update_direct_ready(c);
++	mutex_unlock(&c->direct_lock);
++	return ret;
++}
++
+ /* MM21: 16x32 luma tiles and 16x16 interleaved chroma tiles in raster order.
+  * MT2T luma: the same 16x32 grid at 10 bits per sample. Each 16x4 slab
+  * stores 16 LSB bytes then 64 MSB bytes; LSB byte k packs samples
+@@ -810,18 +933,6 @@ static int collect_events(struct vdec_ctx *c)
+  * odd bytes to V. Cell (i, j) is MSB index j * 8 + i and LSB pair
+  * k = i * 4 + j of its own plane (MSBs remain row-major).
+  */
+-static void detile(void *destination, const void *source, u32 stride, u32 height, u32 tile_h)
+-{
+-	u32 x, y;
+-
+-	for (y = 0; y < height; y++)
+-		for (x = 0; x < stride; x += 16) {
+-			u32 offset = (y / tile_h * (stride / 16) + x / 16) * tile_h * 16;
+-
+-			memcpy(destination + y * stride + x, source + offset + y % tile_h * 16, 16);
+-		}
+-}
+-
+ static void detile_10_chroma(__le16 *dst_uv, const u8 *source, u32 stride,
+ 			       u32 buffer_height)
+ {
+@@ -915,12 +1026,16 @@ static bool capture_fits(const struct vdec_ctx *c, struct vb2_v4l2_buffer *vb)
+ 	 * there is no linear form to convert into.
+ 	 */
+ 	if (c->direct_capture)
+-		return vb2_plane_size(&vb->vb2_buf, 0) >= luma &&
+-		       vb2_plane_size(&vb->vb2_buf, 1) >= chroma;
++		return vb->vb2_buf.planes[0].data_offset <= vb2_plane_size(&vb->vb2_buf, 0) &&
++		       luma <= vb2_plane_size(&vb->vb2_buf, 0) - vb->vb2_buf.planes[0].data_offset &&
++		       vb->vb2_buf.planes[1].data_offset <= vb2_plane_size(&vb->vb2_buf, 1) &&
++		       chroma <= vb2_plane_size(&vb->vb2_buf, 1) - vb->vb2_buf.planes[1].data_offset;
+ 	/* P010 output is larger than the MT2T tiles it is converted from. */
+ 	if (c->pic.fourcc == V4L2_PIX_FMT_MT2T)
+ 		return vb2_plane_size(&vb->vb2_buf, 0) >=
+ 			(size_t)c->pic.stride * c->pic.buffer_height * 3;
++	luma = c->pic.stride * c->pic.buffer_height;
++	chroma = luma / 2;
+ 	if (c->dst_fmt.num_planes == 1)
+ 		return vb2_plane_size(&vb->vb2_buf, 0) >= (size_t)luma + chroma;
+ 	return vb2_plane_size(&vb->vb2_buf, 0) >= luma &&
+@@ -975,10 +1090,36 @@ static void surface_cpu_access(struct vdec_ctx *c, struct vdec_surface *s)
+ 	invalidate_kernel_vmap_range(s->plane[0].cpu, s->plane[0].size);
+ }
+ 
++static void clear_capture_payload(struct vb2_v4l2_buffer *vb)
++{
++	unsigned int p;
++
++	for (p = 0; p < vb->vb2_buf.num_planes; p++) {
++		vb->vb2_buf.planes[p].data_offset = 0;
++		vb2_set_plane_payload(&vb->vb2_buf, p, 0);
++	}
++}
++
++static void direct_capture_payload(struct vdec_ctx *c, struct vdec_surface *s,
++				   struct vb2_v4l2_buffer *vb, bool empty)
++{
++	unsigned int p;
++
++	if (empty) {
++		clear_capture_payload(vb);
++		return;
++	}
++	for (p = 0; p < 2; p++) {
++		vb->vb2_buf.planes[p].data_offset = s->backing.offset[p];
++		vb2_set_plane_payload(&vb->vb2_buf, p,
++				      s->backing.offset[p] + c->pic.size[p]);
++	}
++}
++
+ /* Direct capture: the picture already sits in the buffer the firmware wrote,
+  * so there is no tile walk to do - only the CAPTURE buffer to hand back.
+  */
+-static int deliver_frames_direct(struct vdec_ctx *c)
++static int deliver_frames_direct_locked(struct vdec_ctx *c)
+ {
+ 	unsigned int delivered = 0;
+ 
+@@ -1008,14 +1149,12 @@ static int deliver_frames_direct(struct vdec_ctx *c)
+ 		 * an imported dma-buf only has to be handed on. A CPU mapping
+ 		 * still needs the cache invalidated before userspace reads it.
+ 		 */
+-		if (vb->vb2_buf.memory == VB2_MEMORY_MMAP)
++		if (!p->no_generated && vb->vb2_buf.memory == VB2_MEMORY_MMAP)
+ 			capture_sync(&vb->vb2_buf, true);
+ 		vb->vb2_buf.timestamp = p->timestamp;
+ 		vb->field = V4L2_FIELD_NONE;
+ 		vb->sequence = c->sequence++;
+-		vb2_set_plane_payload(&vb->vb2_buf, 0, c->pic.size[0]);
+-		if (c->dst_fmt.num_planes > 1)
+-			vb2_set_plane_payload(&vb->vb2_buf, 1, c->pic.size[1]);
++		direct_capture_payload(c, s, vb, p->no_generated);
+ 		s->vb = NULL;
+ 		s->pending = false;
+ 		c->pending_read = (c->pending_read + 1) % DEC_SURFACES;
+@@ -1031,6 +1170,17 @@ static int deliver_frames_direct(struct vdec_ctx *c)
+ 	return 0;
+ }
+ 
++static int deliver_frames_direct(struct vdec_ctx *c)
++{
++	int ret;
++
++	mutex_lock(&c->direct_lock);
++	ret = deliver_frames_direct_locked(c);
++	update_direct_ready(c);
++	mutex_unlock(&c->direct_lock);
++	return ret;
++}
++
+ static int deliver_frames(struct vdec_ctx *c)
+ {
+ 	struct vb2_v4l2_buffer *vb;
+@@ -1049,6 +1199,13 @@ static int deliver_frames(struct vdec_ctx *c)
+ 			v4l2_m2m_buf_done(vb, VB2_BUF_STATE_ERROR);
+ 			continue;
+ 		}
++		if (p->no_generated) {
++			unsigned int plane;
++
++			for (plane = 0; plane < c->dst_fmt.num_planes; plane++)
++				vb2_set_plane_payload(&vb->vb2_buf, plane, 0);
++			goto publish;
++		}
+ 		ret = capture_sync(&vb->vb2_buf, true);
+ 		if (ret) {
+ 			v4l2_m2m_buf_done(vb, VB2_BUF_STATE_ERROR);
+@@ -1104,10 +1261,10 @@ static int deliver_frames(struct vdec_ctx *c)
+ 			if (perf_sample()) {
+ 				u64 t0 = ktime_get_ns(), t1, t2;
+ 
+-				detile(base, s->plane[0].cpu,
++				mtk_vcp_mm21_detile(base, s->plane[0].cpu,
+ 				       c->pic.stride, c->pic.buffer_height, 32);
+ 				t1 = ktime_get_ns();
+-				detile(base + c->pic.size[0], s->plane[1].cpu,
++				mtk_vcp_mm21_detile(base + (size_t)c->pic.stride * c->pic.buffer_height, s->plane[1].cpu,
+ 				       c->pic.stride, c->pic.buffer_height / 2,
+ 				       16);
+ 				t2 = ktime_get_ns();
+@@ -1115,14 +1272,14 @@ static int deliver_frames(struct vdec_ctx *c)
+ 					c->sequence, (t0 - p->fw_done_ns) / 1000,
+ 					(t1 - t0) / 1000, (t2 - t1) / 1000);
+ 			} else {
+-				detile(base, s->plane[0].cpu,
++				mtk_vcp_mm21_detile(base, s->plane[0].cpu,
+ 				       c->pic.stride, c->pic.buffer_height, 32);
+-				detile(base + c->pic.size[0], s->plane[1].cpu,
++				mtk_vcp_mm21_detile(base + (size_t)c->pic.stride * c->pic.buffer_height, s->plane[1].cpu,
+ 				       c->pic.stride, c->pic.buffer_height / 2,
+ 				       16);
+ 			}
+ 			vb2_set_plane_payload(&vb->vb2_buf, 0,
+-					      c->pic.size[0] + c->pic.size[1]);
++					      (size_t)c->pic.stride * c->pic.buffer_height * 3 / 2);
+ 		} else {
+ 			void *y = vb2_plane_vaddr(&vb->vb2_buf, 0);
+ 			void *uv = vb2_plane_vaddr(&vb->vb2_buf, 1);
+@@ -1136,10 +1293,10 @@ static int deliver_frames(struct vdec_ctx *c)
+ 			if (perf_sample()) {
+ 				u64 t0 = ktime_get_ns(), t1, t2;
+ 
+-				detile(y, s->plane[0].cpu,
++				mtk_vcp_mm21_detile(y, s->plane[0].cpu,
+ 				       c->pic.stride, c->pic.buffer_height, 32);
+ 				t1 = ktime_get_ns();
+-				detile(uv, s->plane[1].cpu,
++				mtk_vcp_mm21_detile(uv, s->plane[1].cpu,
+ 				       c->pic.stride, c->pic.buffer_height / 2,
+ 				       16);
+ 				t2 = ktime_get_ns();
+@@ -1147,14 +1304,16 @@ static int deliver_frames(struct vdec_ctx *c)
+ 					c->sequence, (t0 - p->fw_done_ns) / 1000,
+ 					(t1 - t0) / 1000, (t2 - t1) / 1000);
+ 			} else {
+-				detile(y, s->plane[0].cpu,
++				mtk_vcp_mm21_detile(y, s->plane[0].cpu,
+ 				       c->pic.stride, c->pic.buffer_height, 32);
+-				detile(uv, s->plane[1].cpu,
++				mtk_vcp_mm21_detile(uv, s->plane[1].cpu,
+ 				       c->pic.stride, c->pic.buffer_height / 2,
+ 				       16);
+ 			}
+-			vb2_set_plane_payload(&vb->vb2_buf, 0, c->pic.size[0]);
+-			vb2_set_plane_payload(&vb->vb2_buf, 1, c->pic.size[1]);
++			vb2_set_plane_payload(&vb->vb2_buf, 0,
++					      (size_t)c->pic.stride * c->pic.buffer_height);
++			vb2_set_plane_payload(&vb->vb2_buf, 1,
++					      (size_t)c->pic.stride * c->pic.buffer_height / 2);
+ 		}
+ delivered:
+ 		/* CPU access above is read-only; firmware may still retain this
+@@ -1166,6 +1325,7 @@ static int deliver_frames(struct vdec_ctx *c)
+ 			v4l2_m2m_buf_done(vb, VB2_BUF_STATE_ERROR);
+ 			return ret;
+ 		}
++publish:
+ 		vb->vb2_buf.timestamp = p->timestamp;
+ 		vb->field = V4L2_FIELD_NONE;
+ 		vb->sequence = c->sequence++;
+@@ -1210,12 +1370,109 @@ static dma_addr_t plane_dma(const struct sg_table *sgt, size_t need)
+ 	return total >= need ? base : 0;
+ }
+ 
+-/* Direct capture: hand the firmware one queued CAPTURE buffer as the target of
+- * the next access unit. The NON_INPUT_DRIVEN protocol names a single frame
+- * buffer per START, so one pending slot at a time is what the exchange wants;
+- * keeping the slot busy is what the linear path's private pool used to do.
++static int direct_backing_pin(struct vdec_ctx *c, struct vdec_direct_backing *b,
++			      struct vb2_buffer *vb)
++{
++	unsigned int p;
++	int ret = -EINVAL;
++
++	if (vb->num_planes != 2 ||
++	    (vb->memory != VB2_MEMORY_MMAP && vb->memory != VB2_MEMORY_DMABUF))
++		return -EINVAL;
++	b->generation = direct_generation(vb);
++	b->index = vb->index;
++	b->memory = vb->memory;
++	for (p = 0; p < 2; p++) {
++		struct vdec_direct_plane *v = &b->plane[p];
++		dma_addr_t dma;
++
++		v->mem_priv = vb->planes[p].mem_priv;
++		b->offset[p] = vb->planes[p].data_offset;
++		if (vb->memory == VB2_MEMORY_DMABUF) {
++			v->dbuf = vb->planes[p].dbuf;
++			get_dma_buf(v->dbuf);
++		} else {
++			v->dbuf = vb->vb2_queue->mem_ops->get_dmabuf(vb, v->mem_priv, O_RDWR);
++			if (IS_ERR(v->dbuf)) {
++				ret = PTR_ERR(v->dbuf);
++				v->dbuf = NULL;
++				goto fail;
++			}
++		}
++		if (p && v->dbuf == b->plane[0].dbuf) {
++			v->attachment = b->plane[0].attachment;
++			v->mapping = b->plane[0].mapping;
++			v->shared_mapping = true;
++			goto validate_mapping;
++		}
++		if (!v->dbuf->size || v->dbuf->size > SZ_16M ||
++		    c->direct_bytes > SZ_256M || b->bytes > SZ_256M - c->direct_bytes ||
++		    v->dbuf->size > SZ_256M - c->direct_bytes - b->bytes)
++			goto fail;
++		b->bytes += v->dbuf->size;
++		v->attachment = dma_buf_attach(v->dbuf, c->dev->dev);
++		if (IS_ERR(v->attachment)) {
++			ret = PTR_ERR(v->attachment);
++			v->attachment = NULL;
++			goto fail;
++		}
++		v->mapping = dma_buf_map_attachment(v->attachment, DMA_BIDIRECTIONAL);
++		if (IS_ERR(v->mapping)) {
++			ret = PTR_ERR(v->mapping);
++			v->mapping = NULL;
++			goto fail;
++		}
++validate_mapping:
++		if (b->offset[p] > v->dbuf->size ||
++		    c->pic.size[p] > v->dbuf->size - b->offset[p])
++			goto fail;
++		dma = plane_dma(v->mapping, (size_t)b->offset[p] + c->pic.size[p]);
++		if (!dma || dma >= BIT_ULL(32) || b->offset[p] > BIT_ULL(32) - dma ||
++		    c->pic.size[p] > BIT_ULL(32) - dma - b->offset[p])
++			goto fail;
++	}
++	c->direct_bytes += b->bytes;
++	b->accounted = true;
++	return 0;
++fail:
++	direct_backing_release(b);
++	return ret;
++}
++
++/* Do not let an early-requeued reference at the head starve other buffers.
++ * QBUF appends under rdy_spinlock; STREAMOFF waits for this worker first.
+  */
+-static int queue_surfaces_direct(struct vdec_ctx *c)
++static struct vb2_v4l2_buffer *direct_ready_buffer(struct vdec_ctx *c)
++{
++	struct v4l2_m2m_queue_ctx *q = &c->fh.m2m_ctx->cap_q_ctx;
++	struct v4l2_m2m_buffer *candidate;
++	struct vb2_v4l2_buffer *result = NULL;
++	unsigned long flags;
++	unsigned int i;
++
++	spin_lock_irqsave(&q->rdy_spinlock, flags);
++	v4l2_m2m_for_each_dst_buf(c->fh.m2m_ctx, candidate) {
++		bool busy = false;
++
++		for (i = 0; i < c->pool_count; i++) {
++			struct vdec_surface *s = &c->surfaces[i];
++
++			if ((!s->free || s->pending) &&
++			    direct_backing_aliases(&s->backing, &candidate->vb.vb2_buf)) {
++				busy = true;
++				break;
++			}
++		}
++		if (!busy) {
++			result = &candidate->vb;
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&q->rdy_spinlock, flags);
++	return result;
++}
++
++static unsigned int direct_offer_limit(const struct vdec_ctx *c)
+ {
+ 	/* A few slots are deliberately left unused. The client hands its CAPTURE
+ 	 * buffers over as frame buffers, so if all of them are absorbed there is
+@@ -1232,10 +1489,35 @@ static int queue_surfaces_direct(struct vdec_ctx *c)
+ 	 * always keep two slots back, one for the LAST marker at drain.
+ 	 */
+ 	unsigned int room = c->pool_count > 2 ? c->pool_count - 2 : c->pool_count;
+-	unsigned int i, absorbed = 0;
+ 
+ 	if (limit < c->pic.dpb + 2 && room > limit)
+ 		limit = room;
++	return limit;
++}
++
++/* Called under direct_lock; job_ready cannot take a sleeping lock. */
++static void update_direct_ready(struct vdec_ctx *c)
++{
++	unsigned int i;
++	bool free_slot = false;
++
++	if (!c->direct_capture || !c->fh.m2m_ctx)
++		return;
++	for (i = 0; i < direct_offer_limit(c); i++)
++		if (!c->surfaces[i].vb && c->surfaces[i].free &&
++		    !c->surfaces[i].pending) {
++			free_slot = true;
++			break;
++		}
++	WRITE_ONCE(c->direct_ready, free_slot && direct_ready_buffer(c));
++}
++
++/* Offer eligible client-backed tiles. Firmware FREE and client QBUF are
++ * independent leases; neither alone permits reusing the backing.
++ */
++static int queue_surfaces_direct_locked(struct vdec_ctx *c)
++{
++	unsigned int limit = direct_offer_limit(c), i, absorbed = 0;
+ 
+ 	for (i = 0; i < limit; i++) {
+ 		struct vdec_surface *s = &c->surfaces[i];
+@@ -1246,23 +1528,30 @@ static int queue_surfaces_direct(struct vdec_ctx *c)
+ 
+ 		if (s->vb || s->pending || !s->free)
+ 			continue;
+-		vb = v4l2_m2m_next_dst_buf(c->fh.m2m_ctx);
++		vb = direct_ready_buffer(c);
+ 		if (!vb)
+ 			return 0;
+ 		if (!capture_fits(c, vb)) {
+ 			/* Left over from the previous geometry: hand it back so
+ 			 * the client can replace it.
+ 			 */
+-			v4l2_m2m_dst_buf_remove(c->fh.m2m_ctx);
++			v4l2_m2m_dst_buf_remove_by_buf(c->fh.m2m_ctx, vb);
+ 			v4l2_m2m_buf_done(vb, VB2_BUF_STATE_ERROR);
+ 			continue;
+ 		}
+-		y = vb2_dma_sg_plane_desc(&vb->vb2_buf, 0);
+-		uv = vb2_dma_sg_plane_desc(&vb->vb2_buf, 1);
+-		if (!y || !uv)
+-			return -EINVAL;
+-		dma_y = plane_dma(y, c->pic.size[0]);
+-		dma_uv = plane_dma(uv, c->pic.size[1]);
++		if (!direct_backing_matches(&s->backing, &vb->vb2_buf)) {
++			direct_backing_forget(c, &s->backing);
++			direct_backing_release(&s->backing);
++			ret = direct_backing_pin(c, &s->backing, &vb->vb2_buf);
++			if (ret)
++				return ret;
++		}
++		y = s->backing.plane[0].mapping;
++		uv = s->backing.plane[1].mapping;
++		dma_y = plane_dma(y, (size_t)s->backing.offset[0] + c->pic.size[0]);
++		dma_uv = plane_dma(uv, (size_t)s->backing.offset[1] + c->pic.size[1]);
++		if (dma_y) dma_y += s->backing.offset[0];
++		if (dma_uv) dma_uv += s->backing.offset[1];
+ 		if (!dma_y || !dma_uv) {
+ 			dev_err(c->dev->dev,
+ 				"direct capture: plane not contiguous (y nents=%u uv nents=%u)\n",
+@@ -1277,16 +1566,25 @@ static int queue_surfaces_direct(struct vdec_ctx *c)
+ 				 c->pic.size[0], uv->nents, &dma_uv,
+ 				 sg_dma_len(uv->sgl), c->pic.size[1]);
+ 		}
+-		v4l2_m2m_dst_buf_remove(c->fh.m2m_ctx);
++		v4l2_m2m_dst_buf_remove_by_buf(c->fh.m2m_ctx, vb);
+ 		s->vb = vb;
+ 		s->free = false;
+ 		s->cookie = ++c->next_cookie;
++		/* Identity and DMA are reserved before dropping the lock. A
++		 * concurrent QBUF sees this backing as firmware-owned; the RPC
++		 * callback never needs direct_lock. No firmware wait holds it.
++		 */
++		VCPDBG("offer: slot=%u vb=%u cookie=%#llx y=%pad/%u uv=%pad/%u\n",
++		       i, vb->vb2_buf.index, s->cookie, &dma_y, c->pic.size[0],
++		       &dma_uv, c->pic.size[1]);
++		mutex_unlock(&c->direct_lock);
+ 		ret = mtk_vcp_vdec_frame(c->decoder, s->cookie, i, dma_y, dma_uv);
++		mutex_lock(&c->direct_lock);
+ 		if (ret) {
+ 			VCPDBG("surfaces^: slot %u failed: %d\n", i, ret);
+-			s->vb = NULL;
+-			s->free = true;
+-			s->cookie = 0;
++			/* A failed RPC may still have transferred ownership. Keep
++			 * the buffer and its mappings until verified session stop.
++			 */
+ 			return ret;
+ 		}
+ 		s->queued = true;
+@@ -1303,6 +1601,17 @@ static int queue_surfaces_direct(struct vdec_ctx *c)
+ 	return 0;
+ }
+ 
++static int queue_surfaces_direct(struct vdec_ctx *c)
++{
++	int ret;
++
++	mutex_lock(&c->direct_lock);
++	ret = queue_surfaces_direct_locked(c);
++	update_direct_ready(c);
++	mutex_unlock(&c->direct_lock);
++	return ret;
++}
++
+ static int queue_surfaces(struct vdec_ctx *c)
+ {
+ 	unsigned int i;
+@@ -1328,6 +1637,17 @@ static int queue_surfaces(struct vdec_ctx *c)
+ 	return 0;
+ }
+ 
++/* An input-driven AU may stall until a released frame is offered again.
++ * Continue feeding free surfaces while retaining the same bitstream owner;
++ * never issue another START or extend its release deadline here.
++ */
++static int replenish_held_source(struct vdec_ctx *c)
++{
++	if (c->source_done || READ_ONCE(c->stopping) || READ_ONCE(c->draining))
++		return 0;
++	return queue_surfaces(c);
++}
++
+ static bool surfaces_idle(struct vdec_ctx *c)
+ {
+ 	unsigned int i;
+@@ -1358,7 +1678,7 @@ static int finish_old_sequence(struct vdec_ctx *c)
+ 		VCPDBG("last: no capture buffer available, deferring the LAST marker\n");
+ 		return 0;
+ 	}
+-	vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
++	clear_capture_payload(dst);
+ 	if (c->dst_fmt.num_planes > 1)
+ 		vb2_set_plane_payload(&dst->vb2_buf, 1, 0);
+ 	dst->sequence = c->sequence++;
+@@ -1367,6 +1687,21 @@ static int finish_old_sequence(struct vdec_ctx *c)
+ 	return 0;
+ }
+ 
++static int update_capture_minimum(struct vdec_ctx *c)
++{
++	struct v4l2_ctrl *ctrl = v4l2_ctrl_find(&c->controls,
++					     V4L2_CID_MIN_BUFFERS_FOR_CAPTURE);
++	u32 minimum;
++
++	if (c->direct_capture && c->pic.dpb > DEC_SURFACES - 3)
++		return -EINVAL;
++	minimum = c->direct_capture ? c->pic.dpb + 3 : 2;
++
++	if (!ctrl || minimum > DEC_SURFACES)
++		return -EINVAL;
++	return v4l2_ctrl_s_ctrl(ctrl, minimum);
++}
++
+ static int parse_headers(struct vdec_ctx *c, struct vb2_v4l2_buffer *src);
+ 
+ static int read_source(struct vdec_ctx *c, struct vb2_buffer *vb, void *snapshot);
+@@ -1394,18 +1729,19 @@ static int snapshot_au(struct vdec_ctx *c, struct vb2_v4l2_buffer *src)
+  * the next picture. H.264 parameter sets are tens of bytes; an HEVC
+  * configuration packet (VPS/SPS/PPS and their extensions) reaches a few KB.
+  */
+-static void cache_config_au(struct vdec_ctx *c)
++static int cache_config_au(struct vdec_ctx *c)
+ {
+ 	u32 room = sizeof(c->sps_pps) - c->sps_pps_len;
+ 
+ 	if (!c->bs_bytes || c->bs_bytes > room) {
+ 		VCPDBG("config: %u bytes do not fit the replay buffer\n",
+ 		       c->bs_bytes);
+-		return;
++		return -E2BIG;
+ 	}
+ 	memcpy(c->sps_pps + c->sps_pps_len, c->bs_snapshot, c->bs_bytes);
+ 	c->sps_pps_len += c->bs_bytes;
+ 	VCPDBG("config: cached %u bytes, total %u\n", c->bs_bytes, c->sps_pps_len);
++	return 0;
+ }
+ 
+ /* True when the access unit in the snapshot carries at least one coded slice.
+@@ -1642,8 +1978,8 @@ static int allocate_surfaces(struct vdec_ctx *c)
+ 		if (!s->sgt)
+ 			return -ENOMEM;
+ 		s->plane[0].dma = sg_dma_address(s->sgt->sgl);
+-		if (s->plane[0].dma >= BIT_ULL(34) ||
+-		    bytes > BIT_ULL(34) - s->plane[0].dma)
++		if (s->plane[0].dma >= BIT_ULL(32) ||
++		    bytes > BIT_ULL(32) - s->plane[0].dma)
+ 			return -ERANGE;
+ 		s->plane[0].cpu = dma_vmap_noncontiguous(c->dev->dev, bytes, s->sgt);
+ 		if (!s->plane[0].cpu)
+@@ -1699,14 +2035,14 @@ static void picture_format(struct vdec_ctx *c, struct v4l2_pix_format_mplane *f,
+ 		f->pixelformat = V4L2_PIX_FMT_NV12;
+ 		f->num_planes = 1;
+ 		f->plane_fmt[0].bytesperline = c->pic.stride;
+-		f->plane_fmt[0].sizeimage = c->pic.size[0] + c->pic.size[1];
++		f->plane_fmt[0].sizeimage = (size_t)c->pic.stride * c->pic.buffer_height * 3 / 2;
+ 	} else {
+ 		f->pixelformat = V4L2_PIX_FMT_NV12M;
+ 		f->num_planes = 2;
+ 		f->plane_fmt[0].bytesperline = c->pic.stride;
+ 		f->plane_fmt[1].bytesperline = c->pic.stride;
+-		f->plane_fmt[0].sizeimage = c->pic.size[0];
+-		f->plane_fmt[1].sizeimage = c->pic.size[1];
++		f->plane_fmt[0].sizeimage = (size_t)c->pic.stride * c->pic.buffer_height;
++		f->plane_fmt[1].sizeimage = (size_t)c->pic.stride * c->pic.buffer_height / 2;
+ 	}
+ }
+ 
+@@ -1755,6 +2091,31 @@ static int read_source(struct vdec_ctx *c, struct vb2_buffer *vb, void *snapshot
+ 	return ret;
+ }
+ 
++static int start_owned_source(struct vdec_ctx *c, struct vb2_v4l2_buffer *src,
++			      u32 *changed)
++{
++	int ret;
++	u64 fb_cookie = 0;
++
++	ret = mtk_vcp_vdec_start(c->decoder, c->source_cookie, c->bs.dma,
++				 c->bs_bytes, c->bs.size, src->vb2_buf.timestamp,
++				 changed, &fb_cookie, c->source_deadline);
++	/* The frame buffer this access unit named now belongs to the firmware;
++	 * it comes back as a FREE_FRAME event. Match it by cookie: the IPC
++	 * layer's slot numbering is its own, not this frontend's.
++	 */
++	if (!ret && c->direct_capture && fb_cookie) {
++		unsigned int k;
++
++		for (k = 0; k < c->pool_count; k++)
++			if (c->surfaces[k].cookie == fb_cookie) {
++				c->surfaces[k].queued = false;
++				break;
++			}
++	}
++	return ret;
++}
++
+ static int submit_source(struct vdec_ctx *c, struct vb2_v4l2_buffer *src, u32 *changed)
+ {
+ 	struct vb2_plane *p = &src->vb2_buf.planes[0];
+@@ -1763,7 +2124,6 @@ static int submit_source(struct vdec_ctx *c, struct vb2_v4l2_buffer *src, u32 *c
+ 		c->source_sequence < READ_ONCE(perf_frames);
+ 	u64 begin = sample ? ktime_get_ns() : 0, rpc;
+ 	int ret;
+-	u64 fb_cookie = 0;
+ 
+ 	/* Annex B needs a start code and NAL header; VP9 may carry a one-byte
+ 	 * show_existing_frame. Both queue-time and DMA snapshot guards apply.
+@@ -1793,28 +2153,14 @@ static int submit_source(struct vdec_ctx *c, struct vb2_v4l2_buffer *src, u32 *c
+ 		memcpy(c->bs.cpu, c->bs_snapshot, bytes);
+ 	}
+ 	c->source_cookie = ++c->next_cookie;
++	c->source_deadline = jiffies + msecs_to_jiffies(5000);
+ 	c->source_done = false;
+ 	VCPDBG("submit: bytes=%u offset=%u cookie=%#llx\n", bytes,
+ 	       p->data_offset, c->source_cookie);
+ 	dma_wmb();
+ 
+ 	rpc = sample ? ktime_get_ns() : 0;
+-	ret = mtk_vcp_vdec_start(c->decoder, c->source_cookie, c->bs.dma,
+-				 c->bs_bytes, c->bs.size, src->vb2_buf.timestamp,
+-				 changed, &fb_cookie);
+-	/* The frame buffer this access unit named now belongs to the firmware;
+-	 * it comes back as a FREE_FRAME event. Match it by cookie: the IPC
+-	 * layer's slot numbering is its own, not this frontend's.
+-	 */
+-	if (!ret && c->direct_capture && fb_cookie) {
+-		unsigned int k;
+-
+-		for (k = 0; k < c->pool_count; k++)
+-			if (c->surfaces[k].cookie == fb_cookie) {
+-				c->surfaces[k].queued = false;
+-				break;
+-			}
+-	}
++	ret = start_owned_source(c, src, changed);
+ 	if (sample)
+ 		pr_info("VCPERF submit=%u snapshot_us=%llu rpc_us=%llu\n",
+ 			c->source_sequence, (rpc - begin) / 1000,
+@@ -1848,80 +2194,10 @@ static int wait_header_source(struct vdec_ctx *c)
+ 	}
+ }
+ 
+-/* Default decode rate for a picture the client declared no rate for.
+- *
+- * The request is a pixel rate, so it needs a frame rate, and this frontend
+- * does not parse the stream's VUI. Without a hint the rate comes from here:
+- * the vendor decoder's own default for this SoC - its max-op-rate-table in the
+- * MT6895 device tree - with the 120 fps tier widened to cover this panel's
+- * 2560x1600 and 3200x2000 modes, which the vendor table leaves at 60 because
+- * it buckets them with 4K. Everything up to 1920x1088 provisions for 180 fps,
+- * which is the 416 MHz step (measured fastest for 1080p; 594 MHz is *slower*
+- * there because the per-frame costs dominate above it). Up to 3200x2000
+- * provisions for 120, which saturates the 660 MHz step. 4K provisions for 60,
+- * the 594 MHz step H.264 already lands on.
+- *
+- * A client that knows better - a high-refresh panel, playback above 1x, a
+- * benchmark - overrides this through the operation-rate control, exactly as
+- * the vendor decoder does: the table is consulted only while that control is
+- * unset. Nothing here is a measurement of the stream; it is provisioning, and
+- * the raising direction is the only one with evidence behind it.
+- */
+-static const struct {
+-	u32 max_pixels;
+-	u32 fps;
+-} vdec_default_op_rate[] = {
+-	{ 2088960, 180 },	/* 1920x1088 */
+-	{ 6400000, 120 },	/* 3200x2000 and 2560x1600 */
+-	{ 8847360, 60 },	/* 3840x2304 / 4096x2160 */
+-	{ 35389440, 5 },
+-};
+-
+-/* Never provision below the floor the port was measured with: 60 for H.264 and
+- * 75 for HEVC/MT2T, the 1.25 complexity allowance the 4K steps were chosen
+- * with.
+- */
+-static u32 vdec_codec_floor_fps(const struct vdec_ctx *c)
+-{
+-	return (c->codec_id == VCP_VDEC_H265 ||
+-		c->pic.fourcc == V4L2_PIX_FMT_MT2T) ? 75 : 60;
+-}
+-
+-/* The rate the OPP request falls back to when the client declared none. */
+-static u32 vdec_floor_fps(const struct vdec_ctx *c)
+-{
+-	u32 floor = vdec_codec_floor_fps(c);
+-	u64 area = (u64)c->pic.width * c->pic.height;
+-	unsigned int i;
+-
+-	for (i = 0; i < ARRAY_SIZE(vdec_default_op_rate); i++)
+-		if (area <= vdec_default_op_rate[i].max_pixels)
+-			return max(floor, vdec_default_op_rate[i].fps);
+-	return floor;
+-}
+-
++/* Operation rate is a client hint; MT6897 retains the inherited clocks. */
+ static u32 vdec_perf_fps(const struct vdec_ctx *c)
+ {
+-	unsigned long top = mtk_vcp_vdec_hw_top_hz(c->dev->hw);
+-	u32 floor = vdec_codec_floor_fps(c);
+-	u32 fps = c->operation_rate ? max(c->operation_rate, floor) :
+-				      vdec_floor_fps(c);
+-	u64 area = (u64)c->pic.width * c->pic.height;
+-
+-	/* set_perf() matches W*H*fps against the OPP table, so a hint above the
+-	 * top step is rejected with -ERANGE and takes the whole session down.
+-	 * Saturate it at the top step instead: as much as the rail has is what
+-	 * the client was asking for, and refusing to play is strictly worse. A
+-	 * geometry that cannot fit even at the floor is left alone, so it still
+-	 * fails in set_perf exactly as it did before this control existed.
+-	 */
+-	if (top && area) {
+-		u64 fits = top / area;
+-
+-		if (fps > fits && fits >= floor)
+-			fps = (u32)fits;
+-	}
+-	return fps;
++	return c->operation_rate ?: 30;
+ }
+ 
+ static int vdec_s_ctrl(struct v4l2_ctrl *ctrl)
+@@ -1938,12 +2214,7 @@ static int vdec_s_ctrl(struct v4l2_ctrl *ctrl)
+ 		return 0;
+ 	}
+ 
+-	/* Before the first header parse the geometry is not known yet and
+-	 * parse_headers() sizes the request from the stored value. Once the
+-	 * stream runs, the request has to be revised in place - and a rate the
+-	 * rail cannot serve has to fail here rather than be accepted and then
+-	 * silently decoded below it.
+-	 */
++	/* Store the client hint until stream geometry is available. */
+ 	if (!c->header)
+ 		return 0;
+ 	width = c->pic.width;
+@@ -1954,7 +2225,7 @@ static int vdec_s_ctrl(struct v4l2_ctrl *ctrl)
+ 				       vdec_perf_fps(c));
+ 	if (ret)
+ 		dev_warn(c->dev->dev,
+-			 "operation rate %u: no step for %ux%u: %d\n",
++			 "operation rate %u: rejected %ux%u: %d\n",
+ 			 c->operation_rate, width, height, ret);
+ 	return ret;
+ }
+@@ -1963,6 +2234,26 @@ static const struct v4l2_ctrl_ops vdec_ctrl_ops = {
+ 	.s_ctrl = vdec_s_ctrl,
+ };
+ 
++static bool vdec_sequence_changed(bool announced,
++		const struct v4l2_pix_format_mplane *prev,
++		const struct v4l2_pix_format_mplane *next,
++		const struct v4l2_rect *old_crop, const struct v4l2_rect *crop)
++{
++	unsigned int i;
++
++	if (!announced || prev->pixelformat != next->pixelformat ||
++	    prev->width != next->width || prev->height != next->height ||
++	    prev->num_planes != next->num_planes ||
++	    old_crop->left != crop->left || old_crop->top != crop->top ||
++	    old_crop->width != crop->width || old_crop->height != crop->height)
++		return true;
++	for (i = 0; i < next->num_planes; i++)
++		if (prev->plane_fmt[i].sizeimage != next->plane_fmt[i].sizeimage ||
++		    prev->plane_fmt[i].bytesperline != next->plane_fmt[i].bytesperline)
++			return true;
++	return false;
++}
++
+ /* Hands the pending OUTPUT buffer to firmware for sequence parsing and
+  * publishes the geometry it describes. Returns 0 once the picture is known,
+  * -EAGAIN when the buffer did not carry a complete sequence, or a negative
+@@ -1980,6 +2271,9 @@ static int parse_headers(struct vdec_ctx *c, struct vb2_v4l2_buffer *src)
+ 	bool publish;
+ 
+ 	if (!c->submitted) {
++		ret = mtk_vcp_vdec_prepare_header(c->decoder);
++		if (ret)
++			return ret;
+ 		ret = submit_source(c, src, &c->header_changed);
+ 		if (ret) {
+ 			dev_info(c->dev->dev, "header submit failed: %d\n", ret);
+@@ -2003,66 +2297,42 @@ static int parse_headers(struct vdec_ctx *c, struct vb2_v4l2_buffer *src)
+ 	VCPDBG("parse: picture %ux%u dpb=%u stride=%u bh=%u ret=%d\n",
+ 	       c->pic.width, c->pic.height, c->pic.dpb, c->pic.stride,
+ 	       c->pic.buffer_height, ret);
+-	/* The picture geometry is known from here on. H.264 carries its frame rate
+-	 * in the VUI, which this frontend does not parse, so the request falls
+-	 * back to the resolution default table (never below the codec floor)
+-	 * unless the client declared a rate through the operation-rate control;
+-	 * whether that workload has an operating point at all is decided by the
+-	 * DVFSRC table. The step is asked for before any capture buffer is
+-	 * published, so a stream the rail cannot serve fails the session instead
+-	 * of decoding at a step nobody was granted.
+-	 */
+ 	if (!ret) {
+-		/* HEVC and MT2T/Main10 need the next multimedia step at 4K60.
+-		 * The plain pixel-rate request lands at 594 MHz because
+-		 * 3840*2160*60 is below that OPP; measured HEVC throughput there
+-		 * is only about 49 fps. vdec_codec_floor_fps() keeps that 1.25
+-		 * complexity allowance as its floor, and the resolution default
+-		 * table (or the client's declared rate) lifts the request above
+-		 * it.
+-		 */
+ 		perf_fps = vdec_perf_fps(c);
+ 		ret = mtk_vcp_vdec_hw_set_perf(c->dev->hw, c->pic.width,
+ 					       c->pic.height, perf_fps);
+-		if (!ret && perf_fps > vdec_codec_floor_fps(c)) {
+-			u32 want = c->operation_rate ? c->operation_rate :
+-						      vdec_floor_fps(c);
+-
+-			dev_info(c->dev->dev,
+-				 "%s %u -> %u fps for the %ux%u OPP request%s\n",
+-				 c->operation_rate ? "operation rate" : "default rate",
+-				 want, perf_fps, c->pic.width, c->pic.height,
+-				 perf_fps < want ? " (clamped to the top step)" : "");
+-		}
+ 	}
+-	if (!ret)
+-		ret = allocate_surfaces(c);
++	if (!ret && c->pic.dpb > DEC_SURFACES - 3)
++		ret = -EOVERFLOW;
+ 	if (ret) {
+-		VCPDBG("parse: picture/perf/surfaces failed: %d\n", ret);
++		VCPDBG("parse: picture/perf failed: %d\n", ret);
+ 		return ret;
+ 	}
+-	VCPDBG("parse: surfaces allocated, pool=%u\n", c->pool_count);
+ 	{
+-		/* The client only has to renegotiate CAPTURE when the geometry
+-		 * actually moved. Republishing for a sequence the client has
+-		 * already handled makes a client that restarts CAPTURE on every
+-		 * SOURCE_CHANGE renegotiate forever - which the tiled path's
+-		 * session restart would otherwise provoke on each restart.
+-		 */
+ 		struct v4l2_pix_format_mplane prev = c->dst_fmt;
++		struct v4l2_rect crop = {
++			c->pic.crop_left, c->pic.crop_top,
++			c->pic.crop_width, c->pic.crop_height,
++		};
+ 
+ 		capture_format(c);
+-		publish = prev.pixelformat != c->dst_fmt.pixelformat ||
+-			  prev.width != c->dst_fmt.width ||
+-			  prev.height != c->dst_fmt.height ||
+-			  prev.num_planes != c->dst_fmt.num_planes ||
+-			  prev.plane_fmt[0].sizeimage !=
+-				  c->dst_fmt.plane_fmt[0].sizeimage;
++		/* The first sequence is announced even if default CAPTURE already
++		 * matches. CAPTURE-only session rebuilds retain this announcement,
++		 * so an unchanged sequence cannot cause a renegotiation loop.
++		 */
++		publish = vdec_sequence_changed(c->sequence_announced, &prev,
++				&c->dst_fmt, &c->announced_crop, &crop);
++		c->announced_crop = crop;
+ 	}
++	ret = update_capture_minimum(c);
++	if (ret)
++		return ret;
+ 	c->header = true;
+ 	c->fh.m2m_ctx->ignore_cap_streaming = false;
+-	if (publish)
++	if (publish) {
+ 		v4l2_event_queue_fh(&c->fh, &event);
++		c->sequence_announced = true;
++	}
+ 	dev_info(c->dev->dev, "header parsed: %ux%u dpb=%u surfaces=%u\n",
+ 		 c->pic.width, c->pic.height, c->pic.dpb, c->pool_count);
+ 	return 0;
+@@ -2086,18 +2356,6 @@ static void decode_work(struct work_struct *work)
+ 		goto error;
+ 	}
+ 	VCPDBG("work: session ready\n");
+-	/* Direct capture: a CAPTURE STREAMOFF took the firmware session with it
+-	 * because the frame buffers were the client's. Rebuild the frame table
+-	 * from the geometry already parsed rather than re-parsing (which would
+-	 * publish another SOURCE_CHANGE for a change the client has handled).
+-	 */
+-	if (c->direct_capture && c->header && !c->pool_count) {
+-		ret = allocate_surfaces(c);
+-		if (ret) {
+-			VCPDBG("work: frame table rebuild failed: %d\n", ret);
+-			goto error;
+-		}
+-	}
+ 	/* A resolution change ends the previous capture sequence before any frame
+ 	 * of the new one is decoded; the marker may have been deferred until a
+ 	 * capture buffer became available.
+@@ -2131,20 +2389,15 @@ static void decode_work(struct work_struct *work)
+ 			}
+ 			if (!au_has_slice(c)) {
+ 				VCPDBG("work: holding the sequence header for the first picture\n");
+-				cache_config_au(c);
++				ret = cache_config_au(c);
++				if (ret)
++					goto error;
+ 				src = v4l2_m2m_src_buf_remove(m);
+ 				v4l2_m2m_buf_done(src, VB2_BUF_STATE_DONE);
+ 				goto finish;
+ 			}
+ 		}
+ 		VCPDBG("work: header pass over output buffer %u\n", src->vb2_buf.index);
+-		if (c->codec_id == VCP_VDEC_H265 && !c->probe_done) {
+-			ret = probe_surface(c);
+-			if (!ret)
+-				c->probe_done = true;
+-			else
+-				VCPDBG("work: no probe frame for the header pass: %d\n", ret);
+-		}
+ 		ret = parse_headers(c, src);
+ 		if (ret == -ECANCELED)
+ 			goto finish;
+@@ -2163,12 +2416,23 @@ static void decode_work(struct work_struct *work)
+ 		}
+ 		if (!au_has_slice(c)) {
+ 			VCPDBG("work: configuration-only access unit, consuming it\n");
+-			cache_config_au(c);
++			ret = cache_config_au(c);
++			if (ret)
++				goto error;
+ 			src = v4l2_m2m_src_buf_remove(m);
+ 			v4l2_m2m_buf_done(src, VB2_BUF_STATE_DONE);
+ 		}
+ 		goto finish;
+ 	}
++	/* Both delivery modes allocate only after header negotiation and the
++	 * old-sequence gates above. A legal late NV12 -> MM21 selection must
++	 * not inherit a private frame table created by the header pass.
++	 */
++	if (!c->pool_count) {
++		ret = allocate_surfaces(c);
++		if (ret)
++			goto error;
++	}
+ 	ret = collect_events(c);
+ 	if (!ret)
+ 		ret = deliver_frames(c);
+@@ -2188,7 +2452,9 @@ static void decode_work(struct work_struct *work)
+ 		}
+ 		if (!au_has_slice(c)) {
+ 			VCPDBG("work: configuration-only access unit, consuming it\n");
+-			cache_config_au(c);
++			ret = cache_config_au(c);
++			if (ret)
++				goto error;
+ 			src = v4l2_m2m_src_buf_remove(m);
+ 			v4l2_m2m_buf_done(src, VB2_BUF_STATE_DONE);
+ 			goto finish;
+@@ -2198,6 +2464,8 @@ static void decode_work(struct work_struct *work)
+ 			VCPDBG("work: queueing surfaces failed: %d\n", ret);
+ 			goto error;
+ 		}
++		if (c->submitted)
++			changed = c->source_changed;
+ 		if (!c->submitted) {
+ 			/* An earlier job may have handed this buffer to firmware
+ 			 * before STREAMOFF interrupted the wait for its release;
+@@ -2209,6 +2477,7 @@ static void decode_work(struct work_struct *work)
+ 				goto error;
+ 			}
+ 			c->submitted = true;
++			c->source_changed = changed;
+ 			VCPDBG("work: submitted, changed=%#x\n", changed);
+ 			if (changed & (BIT(2) | BIT(3))) {
+ 				VCPDBG("work: firmware reports a stream error\n");
+@@ -2236,13 +2505,16 @@ static void decode_work(struct work_struct *work)
+ 				}
+ 			}
+ 		}
+-		deadline = jiffies + msecs_to_jiffies(5000);
++		deadline = c->source_deadline;
+ 		while (!c->source_done) {
+ 			int seq = atomic_read(&c->notification);
++			u64 offered = c->next_cookie;
+ 
+ 			ret = collect_events(c);
+ 			if (!ret)
+ 				ret = deliver_frames(c);
++			if (!ret)
++				ret = replenish_held_source(c);
+ 			if (ret) {
+ 				VCPDBG("work: wait loop delivery failed: %d\n", ret);
+ 				goto error;
+@@ -2293,6 +2565,41 @@ static void decode_work(struct work_struct *work)
+ 				c->drained = true;
+ 				break;
+ 			}
++			if (changed & BIT(4)) {
++				if (time_after_eq(jiffies, deadline)) {
++					ret = -ETIMEDOUT;
++					goto error;
++				}
++				if (offered == c->next_cookie) {
++					wait_event_timeout(c->wait,
++						atomic_read(&c->notification) != seq ||
++						READ_ONCE(c->stopping) || READ_ONCE(c->draining),
++						msecs_to_jiffies(20));
++					if (READ_ONCE(c->stopping) || READ_ONCE(c->draining))
++						continue;
++					ret = collect_events(c);
++					if (!ret)
++						ret = deliver_frames(c);
++					if (!ret)
++						ret = replenish_held_source(c);
++					if (ret)
++						goto error;
++					if (c->source_done)
++						break;
++				}
++				VCPDBG("work: continue held input cookie=%#llx bytes=%u\n",
++				       c->source_cookie, c->bs_bytes);
++				ret = start_owned_source(c, src, &changed);
++				c->source_changed = changed;
++				if (ret)
++					goto error;
++				if (changed & (BIT(0) | BIT(2) | BIT(3))) {
++					ret = -EPIPE;
++					goto error;
++				}
++				continue;
++			}
++
+ 			if (time_after_eq(jiffies, deadline)) {
+ 				VCPDBG("work: timed out waiting for the bitstream release, submitted=%d notification=%d\n",
+ 				       c->submitted, atomic_read(&c->notification));
+@@ -2327,7 +2634,7 @@ static void decode_work(struct work_struct *work)
+ 
+ 		VCPDBG("work: drain complete, dst=%s\n", dst ? "available" : "none");
+ 		if (dst) {
+-			vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
++			clear_capture_payload(dst);
+ 			if (c->dst_fmt.num_planes > 1)
+ 				vb2_set_plane_payload(&dst->vb2_buf, 1, 0);
+ 			dst->sequence = c->sequence++;
+@@ -2380,23 +2687,11 @@ static bool direct_slot_queued(const struct vdec_ctx *c)
+ 	unsigned int i;
+ 
+ 	for (i = 0; i < c->pool_count; i++)
+-		if (c->surfaces[i].queued)
++		if (READ_ONCE(c->surfaces[i].queued))
+ 			return true;
+ 	return false;
+ }
+ 
+-static bool direct_slot_free(const struct vdec_ctx *c)
+-{
+-	unsigned int i;
+-
+-	for (i = 0; i < c->pool_count; i++) {
+-		const struct vdec_surface *s = &c->surfaces[i];
+-
+-		if (!s->vb && s->free && !s->pending)
+-			return true;
+-	}
+-	return false;
+-}
+ 
+ static int job_ready(void *priv)
+ {
+@@ -2436,6 +2731,10 @@ static int job_ready(void *priv)
+ 		ready = 1;
+ 	else if (READ_ONCE(c->drained))
+ 		ready = !READ_ONCE(c->pending_count) && dst;
++	/* RX may publish DISPLAY after the last input job has finished. */
++	else if (atomic_read(&c->notification) !=
++		 READ_ONCE(c->collected_notification))
++		ready = 1;
+ 	/* A frame that is only waiting to be handed back does not need another
+ 	 * CAPTURE buffer; an access unit does. An empty frame table means a
+ 	 * CAPTURE restart dropped the session and the worker has to refill it.
+@@ -2443,7 +2742,7 @@ static int job_ready(void *priv)
+ 	else if (c->direct_capture)
+ 		ready = READ_ONCE(c->pending_count) ||
+ 			(src && (!c->pool_count || direct_slot_queued(c) ||
+-				 (dst && direct_slot_free(c))));
++				 READ_ONCE(c->direct_ready)));
+ 	else if (READ_ONCE(c->pending_count) && dst)
+ 		ready = 1;
+ 	else
+@@ -2454,7 +2753,7 @@ static int job_ready(void *priv)
+ 			READ_ONCE(c->last_pending), READ_ONCE(c->wait_capture),
+ 			READ_ONCE(c->draining), READ_ONCE(c->drained),
+ 			c->pool_count, direct_slot_queued(c),
+-			direct_slot_free(c));
++			READ_ONCE(c->direct_ready));
+ 
+ 	VCPDBG("job_ready: src=%u dst=%u fits=%d hdr=%d lastp=%d waitcap=%d pend=%u drn=%d drnd=%d stop=%d fail=%d sub=%d -> %d\n",
+ 	       src, dst, fits, READ_ONCE(c->header), READ_ONCE(c->last_pending),
+@@ -2500,6 +2799,56 @@ static int queue_setup(struct vb2_queue *q, unsigned int *buffers,
+ 	       *planes > 1 ? sizes[1] : 0);
+ 	return 0;
+ }
++static int buffer_init(struct vb2_buffer *vb)
++{
++	struct vdec_ctx *c = vb2_get_drv_priv(vb->vb2_queue);
++	struct vdec_buffer *b = container_of(to_vb2_v4l2_buffer(vb),
++					    struct vdec_buffer, m2m.vb);
++
++	if (c->next_buffer_generation == U64_MAX)
++		return -EOVERFLOW;
++	b->generation = ++c->next_buffer_generation;
++	return 0;
++}
++
++static int prepare_direct_backing(struct vdec_ctx *c, struct vb2_buffer *vb,
++				  struct v4l2_pix_format_mplane *f)
++{
++	unsigned int i;
++	bool shared;
++	u32 y_size, uv_size;
++
++	if (READ_ONCE(c->failed))
++		return -EIO;
++	if (vb->num_planes != 2)
++		return -EINVAL;
++	shared = vb->memory == VB2_MEMORY_DMABUF && vb->planes[0].dbuf &&
++		vb->planes[0].dbuf == vb->planes[1].dbuf;
++	y_size = c->header ? c->pic.size[0] : f->plane_fmt[0].sizeimage;
++	uv_size = c->header ? c->pic.size[1] : f->plane_fmt[1].sizeimage;
++	if (c->codec_id == VCP_VDEC_VP9 && !shared)
++		return -EOPNOTSUPP;
++	vb->planes[0].data_offset = 0;
++	vb->planes[1].data_offset = shared ? y_size : 0;
++	if (shared && ((u64)y_size + uv_size > vb2_plane_size(vb, 0) ||
++	    (u64)y_size + uv_size > vb2_plane_size(vb, 1)))
++		return -EINVAL;
++	mutex_lock(&c->direct_lock);
++	for (i = 0; i < c->pool_count; i++) {
++		struct vdec_surface *surface = &c->surfaces[i];
++
++		if (!surface->free && surface->backing.index == vb->index &&
++		    surface->backing.generation &&
++		    !direct_backing_matches(&surface->backing, vb)) {
++			mutex_unlock(&c->direct_lock);
++			return -EBUSY;
++		}
++	}
++	mutex_unlock(&c->direct_lock);
++
++	return 0;
++}
++
+ static int buffer_prepare(struct vb2_buffer *vb)
+ {
+ 	struct vdec_ctx *c = vb2_get_drv_priv(vb->vb2_queue);
+@@ -2541,6 +2890,11 @@ static int buffer_prepare(struct vb2_buffer *vb)
+ 		if (ret)
+ 			return ret;
+ 	}
++	if (!is_output(vb->type) && c->direct_capture) {
++		ret = prepare_direct_backing(c, vb, f);
++		if (ret)
++			return ret;
++	}
+ 	VCPDBG("prepare: %s buf %u ok, %ux%u planes=%u\n",
+ 	       is_output(vb->type) ? "output" : "capture", vb->index,
+ 	       f->width, f->height, f->num_planes);
+@@ -2551,11 +2905,20 @@ static void buffer_queue(struct vb2_buffer *vb)
+ 	struct vdec_ctx *c = vb2_get_drv_priv(vb->vb2_queue);
+ 
+ 	v4l2_m2m_buf_queue(c->fh.m2m_ctx, to_vb2_v4l2_buffer(vb));
++	if (!is_output(vb->type) && c->direct_capture) {
++		mutex_lock(&c->direct_lock);
++		update_direct_ready(c);
++		mutex_unlock(&c->direct_lock);
++	}
+ 	VCPDBG("queue: %s buf %u queued ts=%llu (srcq=%u dstq=%u)\n",
+ 	       is_output(vb->type) ? "output" : "capture", vb->index,
+ 	       vb->timestamp,
+ 	       v4l2_m2m_num_src_bufs_ready(c->fh.m2m_ctx),
+ 	       v4l2_m2m_num_dst_bufs_ready(c->fh.m2m_ctx));
++	if (!is_output(vb->type)) {
++		atomic_inc(&c->notification);
++		wake_up(&c->wait);
++	}
+ }
+ 
+ /* LAST sets the mem2mem has_stopped flag, which suppresses all further
+@@ -2611,6 +2974,9 @@ static int start_streaming(struct vb2_queue *q, unsigned int count)
+ 		goto return_buffers;
+ 	}
+ 	WRITE_ONCE(c->stopping, false);
++	spin_lock_irq(&c->schedule_lock);
++	c->schedule_enabled = true;
++	spin_unlock_irq(&c->schedule_lock);
+ 	if (is_output(q->type)) {
+ 		/* Reserve before returning success, even before a worker boots VCP.
+ 		 * Encoders use the same reservation, in either startup order.
+@@ -2623,6 +2989,7 @@ static int start_streaming(struct vb2_queue *q, unsigned int count)
+ 		c->drained = false;
+ 		c->eos_sent = false;
+ 		c->submitted = false;
++		c->sequence_announced = false;
+ 		c->wait_capture = false;
+ 		v4l2_m2m_clear_state(c->fh.m2m_ctx);
+ 		vdec_state(c, "start_streaming/output");
+@@ -2664,28 +3031,14 @@ static void stop_streaming(struct vb2_queue *q)
+ 	vdec_state(c, "stop_streaming/in");
+ 	WRITE_ONCE(c->stopping, true);
+ 	wake_up(&c->wait);
++	stop_scheduling(c);
+ 	flush_work(&c->work);
+-	/* Direct capture holds CAPTURE buffers that are no longer on the m2m
+-	 * ready list, because they are the firmware's frame buffers. STREAMOFF
+-	 * has to take them back or vb2 refuses to release the queue - and since
+-	 * the firmware's frame table is those same buffers, a session that had
+-	 * already absorbed them cannot outlive the queue. Drop it; the worker
+-	 * refills the table from the picture already parsed, so no new
+-	 * SOURCE_CHANGE is published.
+-	 */
+-	{
+-		unsigned int held = release_direct_slots(c);
+-
+-		if (held) {
+-			dropped += held;
+-			session_teardown(c);
+-			/* The firmware's frame table died with the queue; the
+-			 * worker re-parses so it is refilled before the next
+-			 * access unit. The geometry is unchanged, so no new
+-			 * SOURCE_CHANGE is published for it.
+-			 */
+-			c->header = false;
+-		}
++	if (c->direct_capture && c->decoder) {
++		/* Pin records survive DONE and are independent of vb2 lifetime.
++		 * Only verified firmware deinit/reset permits releasing them.
++		 */
++		session_teardown(c);
++		c->header = false;
+ 	}
+ 	if (!is_output(q->type)) {
+ 		/* Capture re-setup (e.g. after SOURCE_CHANGE) keeps the
+@@ -2717,13 +3070,14 @@ static void stop_streaming(struct vb2_queue *q)
+ 		dropped++;
+ 	}
+ 	c->header = false;
++	c->sequence_announced = false;
+ 	c->fh.m2m_ctx->ignore_cap_streaming = true;
+ 	VCPDBG("stop_streaming: output, dropped=%u lastp=%d waitcap=%d\n",
+ 	       dropped, c->last_pending, c->wait_capture);
+ 	vdec_state(c, "stop_streaming/out");
+ }
+ static const struct vb2_ops queue_ops = {
+-	.queue_setup = queue_setup, .buf_prepare = buffer_prepare, .buf_queue = buffer_queue,
++	.queue_setup = queue_setup, .buf_init = buffer_init, .buf_prepare = buffer_prepare, .buf_queue = buffer_queue,
+ 	.start_streaming = start_streaming, .stop_streaming = stop_streaming,
+ };
+ static int queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *dst)
+@@ -2741,7 +3095,7 @@ static int queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *dst)
+ 		 */
+ 		q->io_modes = VB2_MMAP | VB2_DMABUF;
+ 		q->drv_priv = c;
+-		q->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
++		q->buf_struct_size = sizeof(struct vdec_buffer);
+ 		q->ops = &queue_ops;
+ 		q->mem_ops = i ? &vb2_dma_sg_memops : &vb2_vmalloc_memops;
+ 		/* CAPTURE has CPU writes as well as external device reads. */
+@@ -2773,8 +3127,8 @@ static int queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *dst)
+ static int querycap(struct file *file, void *priv, struct v4l2_capability *cap)
+ {
+ 	strscpy(cap->driver, "mtk-vcp-dec", sizeof(cap->driver));
+-	strscpy(cap->card, "MT6895 VCP decoder", sizeof(cap->card));
+-	strscpy(cap->bus_info, "platform:mt6895-vcp-dec", sizeof(cap->bus_info));
++	strscpy(cap->card, "MT6897 VCP decoder", sizeof(cap->card));
++	strscpy(cap->bus_info, "platform:mt6897-vcp-dec", sizeof(cap->bus_info));
+ 	return 0;
+ }
+ static int enum_format(struct file *file, void *priv, struct v4l2_fmtdesc *f)
+@@ -2847,10 +3201,11 @@ static int try_format(struct file *file, void *priv, struct v4l2_format *f)
+ 			k = &vdec_codecs[0];
+ 			p->pixelformat = k->fourcc;
+ 		}
+-		p->width = vdec_dimension(p->width, k->size.min_width,
+-					  k->size.max_width, k->size.step_width);
+-		p->height = vdec_dimension(p->height, k->size.min_height,
+-					   k->size.max_height, k->size.step_height);
++		/* Compressed OUTPUT dimensions are visible/container hints, not
++		 * aligned CAPTURE allocation geometry.
++		 */
++		p->width = clamp_t(u32, p->width, k->size.min_width, k->size.max_width);
++		p->height = clamp_t(u32, p->height, k->size.min_height, k->size.max_height);
+ 		p->num_planes = 1;
+ 		p->plane_fmt[0].sizeimage = clamp_t(u32, size ?: SZ_4M, SZ_64K, SZ_16M);
+ 	} else {
+@@ -2906,30 +3261,44 @@ static int set_format(struct file *file, void *priv, struct v4l2_format *f)
+ {
+ 	struct vdec_ctx *c = file_ctx(file);
+ 	u32 requested = f->fmt.pix_mp.pixelformat;
++	bool old_direct = c->direct_capture;
++	struct v4l2_pix_format_mplane previous;
+ 	int ret;
+ 
+ 	if (!valid_type(f->type))
+ 		return -EINVAL;
++	previous = *queue_format(c, f->type);
+ 	if (vb2_is_busy(v4l2_m2m_get_vq(c->fh.m2m_ctx, f->type)))
+ 		return -EBUSY;
+ 	/* The tiled layouts are the firmware's own frame buffer, so choosing
+ 	 * one switches the whole delivery path, not just the reported format.
+ 	 */
+-	if (!is_output(f->type))
+-		c->direct_capture = requested == V4L2_PIX_FMT_MM21 ||
+-				    requested == V4L2_PIX_FMT_MT2T;
++	if (!is_output(f->type)) {
++		bool direct = requested == V4L2_PIX_FMT_MM21 || requested == V4L2_PIX_FMT_MT2T;
++
++		if (direct != old_direct && c->pool_count)
++			return -EBUSY;
++		c->direct_capture = direct;
++	}
+ 	ret = try_format(file, priv, f);
+ 	if (!ret) {
+ 		*queue_format(c, f->type) = f->fmt.pix_mp;
+ 		if (is_output(f->type)) {
+ 			u32 fourcc = f->fmt.pix_mp.pixelformat;
+ 
++			c->sequence_announced = false;
+ 			c->codec_id = vdec_codec_by_fourcc(fourcc)->codec_id;
+ 			c->dst_fmt.colorspace = c->src_fmt.colorspace;
+ 			c->dst_fmt.xfer_func = c->src_fmt.xfer_func;
+ 			c->dst_fmt.ycbcr_enc = c->src_fmt.ycbcr_enc;
+ 			c->dst_fmt.quantization = c->src_fmt.quantization;
+ 		}
++		if (!is_output(f->type) && c->header)
++			ret = update_capture_minimum(c);
++	}
++	if (ret) {
++		c->direct_capture = old_direct;
++		*queue_format(c, f->type) = previous;
+ 	}
+ 	return ret;
+ }
+@@ -3056,7 +3425,10 @@ static int vdec_open(struct file *file)
+ 	c->dev = d;
+ 	INIT_LIST_HEAD(&c->list);
+ 	c->next_cookie = 0x1000;
++	mutex_init(&c->direct_lock);
+ 	INIT_WORK(&c->work, decode_work);
++	INIT_WORK(&c->schedule_work, schedule_kick);
++	spin_lock_init(&c->schedule_lock);
+ 	init_waitqueue_head(&c->wait);
+ 	atomic_set(&c->notification, 0);
+ 	v4l2_fh_init(&c->fh, &d->video);
+@@ -3123,6 +3495,7 @@ static int vdec_release(struct file *file)
+ 	vdec_state(c, "release/in");
+ 	WRITE_ONCE(c->stopping, true);
+ 	wake_up(&c->wait);
++	stop_scheduling(c);
+ 	v4l2_m2m_ctx_release(c->fh.m2m_ctx);
+ 	flush_work(&c->work);
+ 	session_stop(c);
+@@ -3180,12 +3553,13 @@ static int vdec_probe(struct platform_device *pdev)
+ 	d->dev = &pdev->dev;
+ 	mutex_init(&d->lock);
+ 	INIT_LIST_HEAD(&d->ctx_list);
+-	d->bs_dev = get_dma_device(d->dev, "mediatek,vcp-vdec-dma");
+-	if (IS_ERR(d->bs_dev))
+-		return PTR_ERR(d->bs_dev);
+-	d->ube_dev = get_dma_device(d->dev, "mediatek,vdec-ube-dma");
+-	if (IS_ERR(d->ube_dev))
+-		return PTR_ERR(d->ube_dev);
++	d->ube_dev = d->dev;
++	d->lat_dev = get_dma_device(d->dev, "mediatek,lat-dma");
++	if (IS_ERR(d->lat_dev))
++		return PTR_ERR(d->lat_dev);
++	if (!iommu_get_domain_for_dev(d->dev) ||
++	    iommu_get_domain_for_dev(d->lat_dev) != iommu_get_domain_for_dev(d->dev))
++		return -EXDEV;
+ 	d->vcp = mtk_vcp_get(d->dev);
+ 	if (IS_ERR(d->vcp))
+ 		return PTR_ERR(d->vcp);
+@@ -3247,7 +3621,7 @@ static void vdec_remove(struct platform_device *pdev)
+ 	destroy_workqueue(d->queue);
+ }
+ static const struct of_device_id vdec_match[] = {
+-	{ .compatible = "mediatek,mt6895-vcodec-dec" }, {}
++	{ .compatible = "mediatek,mt6897-vcodec-dec" }, {}
+ };
+ MODULE_DEVICE_TABLE(of, vdec_match);
+ static int vdec_suspend(struct device *dev)
+@@ -3266,17 +3640,18 @@ static struct platform_driver vdec_driver = {
+ static int dma_probe(struct platform_device *pdev)
+ {
+ 	struct iommu_domain *domain = iommu_get_domain_for_dev(&pdev->dev);
+-	bool ube = of_device_is_compatible(pdev->dev.of_node, "mediatek,mt6895-vdec-ube-dma");
+-
+-	if (!domain || !domain->geometry.force_aperture ||
+-	    domain->geometry.aperture_start != (ube ? 0x20000000ULL : 0x110000000ULL) ||
+-	    domain->geometry.aperture_end != (ube ? 0x32bfffffULL : 0x12fffffffULL))
+-		return -EINVAL;
+-	return dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(34));
++	if (!domain || !mt6897_vdec_normal_aperture_valid(
++			domain->geometry.aperture_start, domain->geometry.aperture_end,
++			domain->geometry.force_aperture))
++		return dev_err_probe(&pdev->dev, -EINVAL,
++				     "normal decoder domain must fit below 4 GiB\n");
++	/* The shared normal domain reserves an 8 MiB gap below 4 GiB. */
++	dev_info(&pdev->dev, "normal decoder DMA aperture %#llx..%#llx\n",
++		 domain->geometry.aperture_start, domain->geometry.aperture_end);
++	return dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+ }
+ static const struct of_device_id dma_match[] = {
+-	{ .compatible = "mediatek,mt6895-vcp-vdec-dma" },
+-	{ .compatible = "mediatek,mt6895-vdec-ube-dma" }, {}
++	{ .compatible = "mediatek,mt6897-vdec-lat-dma" }, {}
+ };
+ MODULE_DEVICE_TABLE(of, dma_match);
+ static struct platform_driver dma_driver = {
+@@ -3307,4 +3682,4 @@ module_init(vdec_init);
+ module_exit(vdec_exit);
+ MODULE_LICENSE("GPL");
+ MODULE_IMPORT_NS("DMA_BUF");
+-MODULE_DESCRIPTION("MediaTek MT6895 VCP stateful V4L2 decoder");
++MODULE_DESCRIPTION("MediaTek MT6897 VCP stateful V4L2 decoder");
+-- 
+2.56.0
+

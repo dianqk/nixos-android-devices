@@ -1,0 +1,292 @@
+From 97093fd29776f7f80da534dbb89ee97f44541036 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 7 Nov 2026 13:21:59 +0800
+Subject: [PATCH] pmdomain: mediatek: diagnose HWV root vote failures
+
+The MT6897 display-off path can fail in scpsys_hwv_root_vote() with -110
+after OVL1's identical vote and BOOT accounting transfer succeeded. No DSI
+or CMDQ error precedes it, the OVL0 BOOT accounting transfer line is absent,
+and the device resets after the root quarantine, consistent with the 30 s
+watchdog. The failing poll step and HWV register state are not observable.
+
+Record the running vote step (done wait, set/clr write, AP set/clear wait,
+done-state wait) and, on failure only, dump the domain, step, return code and
+the six HWV registers (done, set, clr, en, set_sta, clr_sta) with
+enabled_count/num_clks, roots_failed, faulted and children_pending. Log the
+pre-vote and post-vote state once per HWV root power-off, keeping the existing
+quarantine message.
+
+The diagnostics only read registers on failure; vote behavior, timeouts,
+writes and quarantine policy are unchanged. Portable pmdomain tests cover
+the exact step and register values for every simulated poll failure, bounded
+logging and unchanged write counts.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/pmdomain/mediatek/mtk-pm-domains.c    | 58 +++++++++++-
+ .../testing/selftests/mtk_clk/domain_cases.c  | 94 +++++++++++++++++++
+ .../testing/selftests/mtk_clk/domain_stubs.h  | 18 +++-
+ 3 files changed, 164 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/pmdomain/mediatek/mtk-pm-domains.c b/drivers/pmdomain/mediatek/mtk-pm-domains.c
+index e6d2fd737e..82b61e6f3f 100644
+--- a/drivers/pmdomain/mediatek/mtk-pm-domains.c
++++ b/drivers/pmdomain/mediatek/mtk-pm-domains.c
+@@ -749,6 +749,30 @@ static int scpsys_hwv_root_done(struct scpsys_domain *pd, bool on)
+ 	return (val[0] & mask) && !(val[1] & mask) && (!on || (val[2] & mask));
+ }
+ 
++static void scpsys_hwv_root_vote_dump(struct scpsys_domain *pd, bool on,
++				      const char *step, int err)
++{
++	const struct scpsys_hwv_domain_data *hwv = pd->hwv_data;
++	struct scpsys_root_clocks *roots = pd->roots;
++	u32 regs[6] = { hwv->done, hwv->set, hwv->clr, hwv->en,
++			hwv->set_sta, hwv->clr_sta };
++	u32 val[6] = { 0 };
++	int ret;
++
++	ret = regmap_multi_reg_read(pd->scpsys->base, regs, val,
++				    ARRAY_SIZE(regs));
++	dev_err(pd->scpsys->dev,
++		"%s: HWV root vote %s: step=%s ret=%d regs_ret=%d "
++		"done=%08x set=%08x clr=%08x en=%08x set_sta=%08x "
++		"clr_sta=%08x enabled=%u/%d roots_failed=%d faulted=%d "
++		"children_pending=%d\n",
++		pd->genpd.name, on ? "on" : "off", step, err, ret, val[0],
++		val[1], val[2], val[3], val[4], val[5], roots->enabled_count,
++		roots->num_clks, roots->failed,
++		scpsys_root_faulted(pd->scpsys),
++		scpsys_root_children_pending(pd));
++}
++
+ static int scpsys_hwv_root_vote(struct scpsys_domain *pd, bool on)
+ {
+ 	const struct scpsys_hwv_domain_data *hwv = pd->hwv_data;
+@@ -758,22 +782,36 @@ static int scpsys_hwv_root_vote(struct scpsys_domain *pd, bool on)
+ 
+ 	ret = regmap_read_poll_timeout_atomic(map, hwv->done, val, val & mask,
+ 					      MTK_HWV_POLL_DELAY_US, MTK_HWV_POLL_TIMEOUT);
+-	if (ret)
++	if (ret) {
++		scpsys_hwv_root_vote_dump(pd, on, "done-wait", ret);
+ 		return ret;
++	}
+ 	ret = regmap_write(map, ofs, mask);
+-	if (ret)
++	if (ret) {
++		scpsys_hwv_root_vote_dump(pd, on,
++					  on ? "set-write" : "clr-write", ret);
+ 		return ret;
++	}
+ 	ret = regmap_read_poll_timeout_atomic(map, ofs, val,
+ 					      on ? (val & mask) : !(val & mask),
+ 					      MTK_HWV_PREPARE_DELAY_US, MTK_HWV_PREPARE_TIMEOUT);
+-	if (ret)
++	if (ret) {
++		scpsys_hwv_root_vote_dump(pd, on,
++					  on ? "ap-set-wait" : "ap-clear-wait",
++					  ret);
+ 		return ret;
++	}
+ 	if (!on)
+ 		udelay(100);
+ 	ret = read_poll_timeout_atomic(scpsys_hwv_root_done, done, done,
+ 				       MTK_HWV_POLL_DELAY_US, MTK_HWV_POLL_TIMEOUT,
+ 				       false, pd, on);
+-	return ret ? ret : (done < 0 ? done : 0);
++	if (ret || done < 0) {
++		scpsys_hwv_root_vote_dump(pd, on, "done-state-wait",
++					  ret ? ret : done);
++		return ret ? ret : done;
++	}
++	return 0;
+ }
+ 
+ static int scpsys_root_enable(struct scpsys_domain *pd)
+@@ -981,7 +1019,19 @@ static int scpsys_hwv_root_power_off(struct generic_pm_domain *genpd)
+ 	if (scpsys_root_children_pending(pd))
+ 		return -EBUSY;
+ 
++	dev_info(pd->scpsys->dev,
++		 "%s: HWV root off enter: children_pending=%d roots_failed=%d "
++		 "faulted=%d enabled=%u/%d\n",
++		 genpd->name, scpsys_root_children_pending(pd), roots->failed,
++		 scpsys_root_faulted(pd->scpsys), roots->enabled_count,
++		 roots->num_clks);
+ 	ret = scpsys_hwv_root_vote(pd, false);
++	dev_info(pd->scpsys->dev,
++		 "%s: HWV root off vote=%d: roots_failed=%d faulted=%d "
++		 "enabled=%u/%d\n",
++		 genpd->name, ret, roots->failed,
++		 scpsys_root_faulted(pd->scpsys), roots->enabled_count,
++		 roots->num_clks);
+ 	if (ret) {
+ 		roots->failed = true;
+ 		scpsys_root_set_fault(pd->scpsys);
+diff --git a/tools/testing/selftests/mtk_clk/domain_cases.c b/tools/testing/selftests/mtk_clk/domain_cases.c
+index 4422bbe23e..a8fe81ae97 100644
+--- a/tools/testing/selftests/mtk_clk/domain_cases.c
++++ b/tools/testing/selftests/mtk_clk/domain_cases.c
+@@ -72,6 +72,7 @@ static void reset(void)
+ 	bus_map = (struct regmap){.bus = true, .sta = 1};
+ 	controller.fault = &controller.local_fault;
+ 	num_delays = 0;
++	num_logs = 0;
+ 	acquire_calls = prepare_calls = enable_calls = 0;
+ 	fail_acquire = fail_prepare = fail_enable = 0;
+ 	invalid_provider = invalid_clock_id = invalid_voter = 0;
+@@ -92,6 +93,13 @@ static void reset(void)
+ 	soc.type = SCPSYS_MTCMOS_TYPE_HW_VOTER;
+ 	soc.root_fault_parent = false;
+ }
++static const char *find_log(const char *needle)
++{
++	for (int i = 0; i < num_logs && i < 64; i++)
++		if (strstr(test_logs[i], needle))
++			return test_logs[i];
++	return NULL;
++}
+ static struct scpsys_domain domain(unsigned n)
+ {
+ 	return (struct scpsys_domain){.genpd = {.name = "ovl"},
+@@ -363,8 +371,94 @@ static void test_spm_preflight_and_observation(void)
+ 	}
+ }
+ 
++static void test_off_vote_diagnostics(void)
++{
++	struct scpsys_domain a;
++	const char *line;
++	int writes;
++
++	/* Each failure logs the entry, one step/result pair and quarantine. */
++	for (int mode = 0; mode < 3; mode++) {
++		reset();
++		assert(!scpsys_prepare_root_clocks(&controller, &parent));
++		a = domain(0);
++		assert(!scpsys_hwv_root_power_on(&a.genpd));
++		num_logs = 0;
++		map.writes = 0;
++		if (mode == 0)
++			map.done = 0;
++		else if (mode == 1)
++			map.stuck = 1;
++		else
++			map.drop_done = 1;
++		assert(scpsys_hwv_root_power_off(&a.genpd) == -ETIMEDOUT);
++		assert(num_logs == 4);
++		assert(find_log("HWV root off enter: children_pending=0 "
++				"roots_failed=0 faulted=0 enabled=1/1"));
++		assert(find_log("HWV root off vote=-110: roots_failed=0 "
++				"faulted=0 enabled=1/1"));
++		writes = map.writes;
++		if (mode == 0) {
++			line = find_log("step=done-wait ret=-110");
++			assert(line && strstr(line,
++				"done=00000000 set=00000001 clr=00000000 "
++				"en=00000003 set_sta=00000000 clr_sta=00000000 "
++				"enabled=1/1 roots_failed=0 faulted=0 "
++				"children_pending=0"));
++			assert(writes == 0);
++		} else if (mode == 1) {
++			line = find_log("step=ap-clear-wait ret=-110");
++			assert(line && strstr(line,
++				"done=00000003 set=00000001 clr=00000001 "
++				"en=00000003 set_sta=00000000 clr_sta=00000000 "
++				"enabled=1/1 roots_failed=0 faulted=0 "
++				"children_pending=0"));
++			assert(writes == 1);
++		} else {
++			line = find_log("step=done-state-wait ret=-110");
++			assert(line && strstr(line,
++				"done=00000000 set=00000000 clr=00000000 "
++				"en=00000002 set_sta=00000000 clr_sta=00000000 "
++				"enabled=1/1 roots_failed=0 faulted=0 "
++				"children_pending=0"));
++			assert(writes == 1);
++		}
++	}
++
++	reset();
++	assert(!scpsys_prepare_root_clocks(&controller, &parent));
++	a = domain(0);
++	assert(!scpsys_hwv_root_power_on(&a.genpd));
++	num_logs = 0;
++	map.writes = 0;
++	map.calls = 0;
++	map.fail = 2;
++	assert(scpsys_hwv_root_power_off(&a.genpd) == -EIO);
++	assert(num_logs == 4 && map.writes == 1);
++	line = find_log("step=clr-write ret=-5");
++	assert(line && strstr(line,
++		"done=00000003 set=00000001 clr=00000000 en=00000003 "
++		"set_sta=00000000 clr_sta=00000000 enabled=1/1 "
++		"roots_failed=0 faulted=0 children_pending=0"));
++
++	/* The on path uses the same bounded step naming. */
++	reset();
++	assert(!scpsys_prepare_root_clocks(&controller, &parent));
++	a = domain(0);
++	map.done = 0;
++	num_logs = 0;
++	assert(scpsys_hwv_root_power_on(&a.genpd) == -ETIMEDOUT);
++	assert(num_logs == 2);
++	line = find_log("step=done-wait ret=-110");
++	assert(line && strstr(line, "HWV root vote on:") &&
++	       strstr(line, "done=00000000 set=00000000 clr=00000000 "
++		"en=00000003 set_sta=00000000 clr_sta=00000000 "
++		"enabled=1/1 roots_failed=0 faulted=0 children_pending=0"));
++}
++
+ static void test_existing_domains(void)
+ {
++	test_off_vote_diagnostics();
+ 	test_spm_preflight_and_observation();
+ 	test_preflight_failures();
+ 	test_invalid_roots();
+diff --git a/tools/testing/selftests/mtk_clk/domain_stubs.h b/tools/testing/selftests/mtk_clk/domain_stubs.h
+index d634507cad..8ec1f57c55 100644
+--- a/tools/testing/selftests/mtk_clk/domain_stubs.h
++++ b/tools/testing/selftests/mtk_clk/domain_stubs.h
+@@ -2,12 +2,26 @@
+ #include <assert.h>
+ #include <errno.h>
+ #include <pthread.h>
++#include <stdarg.h>
+ #include <stdatomic.h>
+ #include <stdbool.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++static char test_logs[64][512];
++static int num_logs;
++static void test_log(const char *fmt, ...)
++{
++	va_list ap;
++
++	if (num_logs < 64) {
++		va_start(ap, fmt);
++		vsnprintf(test_logs[num_logs], sizeof(test_logs[0]), fmt, ap);
++		va_end(ap);
++	}
++	num_logs++;
++}
+ typedef uint32_t u32;
+ typedef uint16_t u16;
+ typedef uint8_t u8;
+@@ -17,8 +31,8 @@ typedef uint8_t u8;
+ #define ERR_PTR(e) ((void *)(intptr_t)(e))
+ #define PTR_ERR(p) ((int)(intptr_t)(p))
+ #define IS_ERR(p) ((uintptr_t)(p) >= (uintptr_t)-4095)
+-#define dev_err(...) ((void)0)
+-#define dev_info(...) ((void)0)
++#define dev_err(dev, ...) test_log(__VA_ARGS__)
++#define dev_info(dev, ...) test_log(__VA_ARGS__)
+ #define MTK_SCPD_DOMAIN_SUPPLY 1
+ #define MTK_SCPD_INFRA_PWR_CTL 2
+ #define MTK_SCPD_KEEP_DEFAULT_OFF 4
+-- 
+2.56.0
+

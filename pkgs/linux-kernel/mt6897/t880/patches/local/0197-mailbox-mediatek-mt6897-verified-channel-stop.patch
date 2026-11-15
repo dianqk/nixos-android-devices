@@ -1,0 +1,790 @@
+From 2f37e8b54821715a5eb57c3cb5518705abd794ed Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 7 Nov 2026 02:53:21 +0800
+Subject: [PATCH] mailbox: mediatek: verify MT6897 channel stop before task
+ retirement
+
+The legacy WFE flush warns on suspend failure, ignores reset failure and retires tasks before confirming the thread is disabled. Empty software task lists also do not prove hardware stop.
+
+Select a checked flush for MT6897. Acquire runtime PM outside the channel lock, check suspend/reset and disabled readback before abort callbacks, and verify hardware plus task-list consistency after a non-WFE completion wait. On uncertainty publish the channel fault before returning to mailbox TX bookkeeping and retain at most one acquired fault PM lease. Reject further submissions and preserve faulted task storage; IRQ status is acknowledged without task retirement. Recheck shutdown fault state after its temporary PM acquisition.
+
+Keep other SoC flush behavior unchanged. Add extracted-production-function sanitizer tests with deterministic errors and host-thread PM/flush interleavings. This verifies stop and channel power accounting; framebuffer retirement and manual unbind safety after a hardware fault remain separate limitations.
+---
+ drivers/mailbox/mtk-cmdq-mailbox.c            | 147 +++++-
+ tools/testing/selftests/mtk_clk/Makefile      |   4 +-
+ .../selftests/mtk_clk/cmdq_stop_cases.c       | 479 ++++++++++++++++++
+ .../selftests/mtk_clk/test_cmdq_stop.py       |  48 ++
+ 4 files changed, 675 insertions(+), 3 deletions(-)
+ create mode 100644 tools/testing/selftests/mtk_clk/cmdq_stop_cases.c
+ create mode 100755 tools/testing/selftests/mtk_clk/test_cmdq_stop.py
+
+diff --git a/drivers/mailbox/mtk-cmdq-mailbox.c b/drivers/mailbox/mtk-cmdq-mailbox.c
+index cbf8aa64e2..7cd11c1d40 100644
+--- a/drivers/mailbox/mtk-cmdq-mailbox.c
++++ b/drivers/mailbox/mtk-cmdq-mailbox.c
+@@ -80,6 +80,10 @@ struct cmdq_thread {
+ 	void __iomem		*base;
+ 	struct list_head	task_busy_list;
+ 	u32			priority;
++	/* Protected by chan->lock; retained fault ownership lasts until reboot. */
++	bool			stop_faulted;
++	bool			stop_pm_retained;
++	bool			stopping;
+ };
+ 
+ struct cmdq_task {
+@@ -116,6 +120,7 @@ struct gce_plat {
+ 	bool gce_vm;
+ 	bool has_timer;
+ 	bool default_tokens;
++	bool checked_flush;
+ 	u32 gce_num;
+ 	u32 reserved_threads;
+ };
+@@ -168,7 +173,7 @@ bool cmdq_mbox_channel_idle(struct mbox_chan *chan)
+ 	bool idle;
+ 
+ 	spin_lock_irqsave(&chan->lock, flags);
+-	idle = list_empty(&thread->task_busy_list) &&
++	idle = !thread->stop_faulted && list_empty(&thread->task_busy_list) &&
+ 		!(readl(thread->base + CMDQ_THR_ENABLE_TASK) & CMDQ_THR_ENABLED);
+ 	spin_unlock_irqrestore(&chan->lock, flags);
+ 	return idle;
+@@ -412,6 +417,10 @@ static void cmdq_thread_irq_handler(struct cmdq *cmdq,
+ 	irq_flag = readl(thread->base + CMDQ_THR_IRQ_STATUS);
+ 	writel(~irq_flag, thread->base + CMDQ_THR_IRQ_STATUS);
+ 
++	if (cmdq->pdata->checked_flush && thread->stop_faulted)
++		return;
++
++
+ 	/*
+ 	 * When ISR call this function, another CPU core could run
+ 	 * "release task" right before we acquire the spin lock, and thus
+@@ -646,6 +655,13 @@ static int cmdq_mbox_send_data(struct mbox_chan *chan, void *data)
+ 	u32 gce_addr;
+ 	dma_addr_t curr_pa, end_pa;
+ 
++	if (cmdq->pdata->checked_flush) {
++		if (thread->stop_faulted)
++			return -EIO;
++		if (thread->stopping)
++			return -EBUSY;
++	}
++
+ 	/* Client should not flush new tasks if suspended. */
+ 	WARN_ON(cmdq->suspended);
+ 
+@@ -713,9 +729,16 @@ static void cmdq_mbox_shutdown(struct mbox_chan *chan)
+ 	struct cmdq_task *task, *tmp;
+ 	unsigned long flags;
+ 
++	if (cmdq->pdata->checked_flush && READ_ONCE(thread->stop_faulted)) {
++		dev_err(cmdq->mbox.dev, "faulted channel shutdown retains tasks/power\n");
++		return;
++	}
++
+ 	WARN_ON(pm_runtime_get_sync(cmdq->mbox.dev) < 0);
+ 
+ 	spin_lock_irqsave(&thread->chan->lock, flags);
++	if (cmdq->pdata->checked_flush && thread->stop_faulted)
++		goto done;
+ 	if (list_empty(&thread->task_busy_list))
+ 		goto done;
+ 
+@@ -747,6 +770,124 @@ static void cmdq_mbox_shutdown(struct mbox_chan *chan)
+ 	pm_runtime_put_autosuspend(cmdq->mbox.dev);
+ }
+ 
++/* Caller holds the channel lock and one successfully acquired PM reference. */
++static int cmdq_thread_stop_fault(struct cmdq *cmdq, struct cmdq_thread *thread,
++				int error)
++{
++	thread->stop_faulted = true;
++	thread->stopping = false;
++	thread->stop_pm_retained = true;
++	dev_err(cmdq->mbox.dev,
++		"thread %#x stop unverified: %d; tasks and power retained, reboot required\n",
++		(u32)(thread->base - cmdq->base), error);
++	return error;
++}
++
++static int cmdq_mbox_flush_checked(struct mbox_chan *chan, unsigned long timeout)
++{
++	struct cmdq_thread *thread = chan->con_priv;
++	struct cmdq *cmdq = dev_get_drvdata(chan->mbox->dev);
++	struct cmdq_task *task, *tmp;
++	unsigned long flags;
++	bool put_pm = false;
++	u32 enable;
++	int ret;
++
++	spin_lock_irqsave(&chan->lock, flags);
++	if (thread->stop_faulted || thread->stopping) {
++		ret = thread->stop_faulted ? -EIO : -EBUSY;
++		/* A negative mailbox flush can advance framework TX bookkeeping. */
++		thread->stop_faulted = true;
++		spin_unlock_irqrestore(&chan->lock, flags);
++		return ret;
++	}
++	spin_unlock_irqrestore(&chan->lock, flags);
++
++	/* Runtime PM may sleep and must never run under the channel spinlock. */
++	ret = pm_runtime_resume_and_get(cmdq->mbox.dev);
++	if (ret < 0) {
++		spin_lock_irqsave(&chan->lock, flags);
++		thread->stop_faulted = true;
++		spin_unlock_irqrestore(&chan->lock, flags);
++		dev_err(cmdq->mbox.dev, "flush runtime PM failed: %d; channel faulted\n", ret);
++		return ret;
++	}
++
++	spin_lock_irqsave(&chan->lock, flags);
++	/* Another flush can have failed while this caller acquired runtime PM. */
++	if (thread->stop_faulted) {
++		put_pm = thread->stop_pm_retained;
++		thread->stop_pm_retained = true;
++		ret = -EIO;
++		goto unlock;
++	}
++	if (thread->stopping) {
++		thread->stop_faulted = true;
++		thread->stop_pm_retained = true;
++		ret = -EBUSY;
++		goto unlock;
++	}
++	thread->stopping = true;
++	enable = readl(thread->base + CMDQ_THR_ENABLE_TASK);
++	if (!(enable & CMDQ_THR_ENABLED) && list_empty(&thread->task_busy_list))
++		goto stopped;
++
++	ret = cmdq_thread_suspend(cmdq, thread);
++	if (ret)
++		goto fault;
++	if (list_empty(&thread->task_busy_list) || cmdq_thread_is_in_wfe(thread)) {
++		ret = cmdq_thread_reset(cmdq, thread);
++		if (ret)
++			goto fault;
++		writel(CMDQ_THR_DISABLED, thread->base + CMDQ_THR_ENABLE_TASK);
++		ret = readl_poll_timeout_atomic(thread->base + CMDQ_THR_ENABLE_TASK,
++					       enable, !(enable & CMDQ_THR_ENABLED), 1, timeout);
++		if (ret)
++			goto fault;
++		/* Do not notify clients or free task storage before verified stop. */
++		list_for_each_entry_safe(task, tmp, &thread->task_busy_list, list_entry) {
++			cmdq_task_exec_done(task, -ECONNABORTED);
++			kfree(task);
++		}
++		goto stopped;
++	}
++
++	cmdq_thread_resume(thread);
++	spin_unlock_irqrestore(&chan->lock, flags);
++	ret = readl_poll_timeout_atomic(thread->base + CMDQ_THR_ENABLE_TASK,
++				       enable, !(enable & CMDQ_THR_ENABLED), 1, timeout);
++	spin_lock_irqsave(&chan->lock, flags);
++	if (thread->stop_faulted) {
++		put_pm = thread->stop_pm_retained;
++		thread->stop_pm_retained = true;
++		thread->stopping = false;
++		ret = -EIO;
++		goto unlock;
++	}
++	if (ret)
++		goto fault;
++	/* IRQ retirement and final hardware state must agree under the lock. */
++	if ((readl(thread->base + CMDQ_THR_ENABLE_TASK) & CMDQ_THR_ENABLED) ||
++	    !list_empty(&thread->task_busy_list)) {
++		ret = -EIO;
++		goto fault;
++	}
++stopped:
++	thread->stopping = false;
++	put_pm = true;
++	ret = 0;
++	goto unlock;
++fault:
++	ret = cmdq_thread_stop_fault(cmdq, thread, ret);
++unlock:
++	spin_unlock_irqrestore(&chan->lock, flags);
++	if (put_pm) {
++		pm_runtime_mark_last_busy(cmdq->mbox.dev);
++		pm_runtime_put_autosuspend(cmdq->mbox.dev);
++	}
++	return ret;
++}
++
+ static int cmdq_mbox_flush(struct mbox_chan *chan, unsigned long timeout)
+ {
+ 	struct cmdq_thread *thread = (struct cmdq_thread *)chan->con_priv;
+@@ -757,6 +898,9 @@ static int cmdq_mbox_flush(struct mbox_chan *chan, unsigned long timeout)
+ 	u32 enable;
+ 	int ret;
+ 
++	if (cmdq->pdata->checked_flush)
++		return cmdq_mbox_flush_checked(chan, timeout);
++
+ 	ret = pm_runtime_get_sync(cmdq->mbox.dev);
+ 	if (ret < 0)
+ 		return ret;
+@@ -1085,6 +1229,7 @@ static const struct gce_plat gce_plat_mt6897 = {
+ 	.mminfra_offset = SZ_1G,
+ 	.has_timer = true,
+ 	.default_tokens = true,
++	.checked_flush = true,
+ 	.reserved_threads = GENMASK(15, 8) | BIT(29),
+ 	.control_by_sw = false,
+ 	.gce_num = 1
+diff --git a/tools/testing/selftests/mtk_clk/Makefile b/tools/testing/selftests/mtk_clk/Makefile
+index 5c3f31fa7e..b47b95b004 100644
+--- a/tools/testing/selftests/mtk_clk/Makefile
++++ b/tools/testing/selftests/mtk_clk/Makefile
+@@ -1,4 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-TEST_PROGS := test_mt6897.py test_domains.py test_boot_owner.py test_directlink.py test_display_pm.py test_dpintf_pm.py
+-TEST_FILES := mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c ven_cases.c boot_stubs.h boot_cases.c directlink_cases.c display_pm_cases.c mmsys_pm_cases.c dpintf_pm_cases.c
++TEST_PROGS := test_mt6897.py test_domains.py test_boot_owner.py test_directlink.py test_display_pm.py test_dpintf_pm.py test_cmdq_stop.py
++TEST_FILES := mt6897_stubs.h mt6897_cases.c domain_stubs.h domain_cases.c ven_cases.c boot_stubs.h boot_cases.c directlink_cases.c display_pm_cases.c mmsys_pm_cases.c dpintf_pm_cases.c cmdq_stop_cases.c
+ include ../lib.mk
+diff --git a/tools/testing/selftests/mtk_clk/cmdq_stop_cases.c b/tools/testing/selftests/mtk_clk/cmdq_stop_cases.c
+new file mode 100644
+index 0000000000..24a66ebf3c
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/cmdq_stop_cases.c
+@@ -0,0 +1,479 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <errno.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <sched.h>
++#include <time.h>
++typedef uint32_t u32;
++typedef uintptr_t dma_addr_t;
++#define CMDQ_THR_WARM_RESET 0x00
++#define CMDQ_THR_ENABLE_TASK 0x04
++#define CMDQ_THR_SUSPEND_TASK 0x08
++#define CMDQ_THR_CURR_STATUS 0x0c
++#define CMDQ_THR_IRQ_STATUS 0x10
++#define CMDQ_THR_IRQ_ENABLE 0x14
++#define CMDQ_THR_CURR_ADDR 0x20
++#define CMDQ_THR_END_ADDR 0x24
++#define CMDQ_THR_WAIT_TOKEN 0x30
++#define CMDQ_THR_PRIORITY 0x40
++#define CMDQ_THR_ENABLED 1
++#define CMDQ_THR_DISABLED 0
++#define CMDQ_THR_SUSPEND 1
++#define CMDQ_THR_RESUME 0
++#define CMDQ_THR_STATUS_SUSPENDED 2
++#define CMDQ_THR_DO_WARM_RESET 1
++#define CMDQ_THR_IRQ_DONE 1
++#define CMDQ_THR_IRQ_ERROR 0x12
++#define CMDQ_THR_IRQ_EN 0x13
++#define CMDQ_THR_IS_WAITING (1U << 31)
++#define CMDQ_INST_SIZE 8
++#define GFP_ATOMIC 0
++#define READ_ONCE(x) (x)
++#define dev_err(...) ((void)0)
++#define WARN_ON(x) ((void)(x))
++#define smp_mb() ((void)0)
++struct list_head {
++	struct list_head *next, *prev;
++};
++#define INIT_LIST_HEAD(h) ((h)->next = (h)->prev = (h))
++static bool list_empty(struct list_head *h)
++{
++	return h->next == h;
++}
++static void list_del(struct list_head *p)
++{
++	p->prev->next = p->next;
++	p->next->prev = p->prev;
++}
++static void list_move_tail(struct list_head *p, struct list_head *h)
++{
++	list_del(p);
++	p->prev = h->prev;
++	p->next = h;
++	h->prev->next = p;
++	h->prev = p;
++}
++#define entry(p, type, member) ((type *)((char *)(p) - offsetof(type, member)))
++#define list_for_each_entry_safe(pos, tmp, head, member)                       \
++	for (pos = list_empty(head) ?                                          \
++			   NULL :                                              \
++			   entry((head)->next, __typeof__(*pos), member);      \
++	     pos &&                                                            \
++	     (tmp = pos->member.next == (head) ?                               \
++			    NULL :                                             \
++			    entry(pos->member.next, __typeof__(*pos), member), \
++	     true);                                                            \
++	     pos = tmp)
++struct device {
++	void *data;
++	atomic_int refs;
++};
++struct mbox_controller {
++	struct device *dev;
++};
++struct mbox_chan {
++	void *con_priv;
++	struct mbox_controller *mbox;
++	int lock;
++};
++struct cmdq_thread {
++	struct mbox_chan *chan;
++	void *base;
++	struct list_head task_busy_list;
++	u32 priority;
++	bool stop_faulted, stop_pm_retained, stopping;
++};
++struct cmdq_pkt {
++	dma_addr_t pa_base;
++	size_t cmd_buf_size;
++};
++struct gce_plat {
++	bool checked_flush;
++	int shift;
++	dma_addr_t mminfra_offset;
++};
++struct cmdq {
++	struct mbox_controller mbox;
++	void *base;
++	const struct gce_plat *pdata;
++	bool suspended;
++};
++struct cmdq_task {
++	struct cmdq *cmdq;
++	struct list_head list_entry;
++	dma_addr_t pa_base;
++	struct cmdq_thread *thread;
++	struct cmdq_pkt *pkt;
++};
++static u32 regs[128];
++static struct device device;
++static struct gce_plat pdata = { .checked_flush = true };
++static struct cmdq cmdq;
++static struct cmdq_thread thread;
++static struct mbox_chan chan;
++static atomic_int pm_calls, pm_puts, callbacks, frees, allocations, reads,
++	writes, ack_writes;
++static _Thread_local bool locked;
++static bool suspend_fail, reset_fail, disable_fail;
++static pthread_mutex_t channel_lock = PTHREAD_MUTEX_INITIALIZER;
++static _Thread_local int role;
++static int threaded_case;
++static atomic_bool pm_waiting, poll_waiting, release_pm, release_poll;
++static int pm_mode, poll_mode, hooks;
++#define spin_lock_irqsave(p, flags)                             \
++	do {                                                    \
++		(flags) = 0;                                    \
++		assert(!locked);                                \
++		assert(pthread_mutex_lock(&channel_lock) == 0); \
++		locked = true;                                  \
++	} while (0)
++#define spin_unlock_irqrestore(p, flags)                          \
++	do {                                                      \
++		(void)(flags);                                    \
++		assert(locked);                                   \
++		locked = false;                                   \
++		assert(pthread_mutex_unlock(&channel_lock) == 0); \
++	} while (0)
++static void *dev_get_drvdata(struct device *dev)
++{
++	return dev->data;
++}
++static u32 readl(void *addr)
++{
++	reads++;
++	return *(u32 *)addr;
++}
++static void writel(u32 val, void *addr)
++{
++	writes++;
++	uintptr_t offset = (char *)addr - (char *)thread.base;
++	if (offset == CMDQ_THR_SUSPEND_TASK && val == CMDQ_THR_SUSPEND &&
++	    !suspend_fail)
++		*(u32 *)(thread.base + CMDQ_THR_CURR_STATUS) =
++			CMDQ_THR_STATUS_SUSPENDED;
++	if (offset == CMDQ_THR_WARM_RESET && !reset_fail)
++		val = 0;
++	if (offset == CMDQ_THR_ENABLE_TASK && disable_fail && val == 0)
++		val = 1;
++	if (offset == CMDQ_THR_IRQ_STATUS)
++		ack_writes++;
++	*(u32 *)addr = val;
++}
++static int cmdq_mbox_flush_checked(struct mbox_chan *c, unsigned long timeout);
++static void poll_hook(void *addr);
++#define readl_poll_timeout_atomic(addr, val, condition, delay, timeout) \
++	({                                                              \
++		int _ret = -ETIMEDOUT;                                  \
++		(void)(delay);                                          \
++		(void)(timeout);                                        \
++		for (int _i = 0; _i < 3; _i++) {                        \
++			poll_hook(addr);                                \
++			(val) = readl(addr);                            \
++			if (condition) {                                \
++				_ret = 0;                               \
++				break;                                  \
++			}                                               \
++		}                                                       \
++		_ret;                                                   \
++	})
++static void wait_flag(atomic_bool *flag)
++{
++	struct timespec start, now;
++	assert(clock_gettime(CLOCK_MONOTONIC, &start) == 0);
++	while (!atomic_load(flag)) {
++		sched_yield();
++		assert(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
++		assert(now.tv_sec - start.tv_sec < 5);
++	}
++}
++static int pm_runtime_resume_and_get(struct device *dev)
++{
++	assert(!locked);
++	pm_calls++;
++	if (pm_mode == 1)
++		return -EIO;
++	dev->refs++;
++	if (threaded_case == 2 && role == 1) {
++		atomic_store(&pm_waiting, true);
++		wait_flag(&release_pm);
++	}
++	if (pm_mode >= 2) {
++		hooks++;
++		thread.stop_faulted = pm_mode != 4;
++		thread.stop_pm_retained = pm_mode == 2;
++		thread.stopping = pm_mode == 4;
++		if (pm_mode == 2 || pm_mode == 4)
++			dev->refs++; /* Separate concurrent caller's acquired lease. */
++	}
++	return 0;
++}
++static int pm_runtime_get_sync(struct device *dev)
++{
++	return pm_runtime_resume_and_get(dev);
++}
++static void pm_runtime_mark_last_busy(struct device *dev)
++{
++	assert(!locked);
++}
++static void pm_runtime_put_autosuspend(struct device *dev)
++{
++	assert(!locked && dev->refs > 0);
++	pm_puts++;
++	dev->refs--;
++}
++static void cmdq_task_exec_done(struct cmdq_task *task, int status)
++{
++	assert(locked);
++	if (status == -ECONNABORTED)
++		assert(!(*(u32 *)(thread.base + CMDQ_THR_ENABLE_TASK) &
++			 CMDQ_THR_ENABLED));
++	callbacks++;
++	list_del(&task->list_entry);
++}
++static void kfree(void *task)
++{
++	frees++;
++	free(task);
++}
++static void *host_alloc(size_t size)
++{
++	allocations++;
++	return calloc(1, size);
++}
++#define kzalloc_obj(obj, flags) host_alloc(sizeof(obj))
++static u32 cmdq_convert_gce_addr(dma_addr_t addr, const struct gce_plat *p)
++{
++	return addr;
++}
++static dma_addr_t cmdq_revert_gce_addr(u32 addr, const struct gce_plat *p)
++{
++	return addr;
++}
++static void cmdq_task_insert_into_thread(struct cmdq_task *task)
++{
++}
++static void cmdq_task_handle_error(struct cmdq_task *task)
++{
++}
++/* PRODUCTION */
++
++static void poll_hook(void *addr)
++{
++	if (addr == thread.base + CMDQ_THR_ENABLE_TASK && !locked &&
++	    ((threaded_case == 1 && role == 1) ||
++	     (threaded_case == 2 && role == 2))) {
++		atomic_store(&poll_waiting, true);
++		wait_flag(&release_poll);
++	}
++	if (addr != thread.base + CMDQ_THR_ENABLE_TASK || locked || !poll_mode)
++		return;
++	int mode = poll_mode;
++	poll_mode = 0;
++	hooks++;
++	if (mode == 1) {
++		struct cmdq_task *task, *tmp;
++		locked = true; /* Model IRQ retirement during unlocked wait. */
++		list_for_each_entry_safe(task, tmp, &thread.task_busy_list,
++					 list_entry) {
++			cmdq_task_exec_done(task, 0);
++			kfree(task);
++		}
++		locked = false;
++		*(u32 *)addr = 0;
++	} else if (mode == 2) {
++		assert(cmdq_mbox_flush_checked(&chan, 10) == -EBUSY);
++	} else if (mode == 3) {
++		thread.stop_faulted = thread.stop_pm_retained = true;
++		device.refs++; /* Racing caller owns the retained fault lease. */
++	} else if (mode == 4) {
++		*(u32 *)addr =
++			0; /* Hardware/list mismatch must not report success. */
++	}
++}
++static void reset(void)
++{
++	struct cmdq_task *task, *tmp;
++	if (thread.task_busy_list.next) {
++		list_for_each_entry_safe(task, tmp, &thread.task_busy_list,
++					 list_entry) {
++			list_del(&task->list_entry);
++			free(task); /* Test-fixture disposal only. */
++		}
++	}
++	for (size_t i = 0; i < 128; i++)
++		regs[i] = 0;
++	device = (struct device){ .data = &cmdq };
++	cmdq = (struct cmdq){ .mbox.dev = &device,
++			      .base = regs,
++			      .pdata = &pdata };
++	thread = (struct cmdq_thread){ .chan = &chan, .base = regs + 64 };
++	chan = (struct mbox_chan){ .con_priv = &thread, .mbox = &cmdq.mbox };
++	INIT_LIST_HEAD(&thread.task_busy_list);
++	pm_calls = pm_puts = callbacks = frees = allocations = reads = writes =
++		ack_writes = hooks = 0;
++	pm_mode = poll_mode = threaded_case = 0;
++	atomic_store(&pm_waiting, false);
++	atomic_store(&poll_waiting, false);
++	atomic_store(&release_pm, false);
++	atomic_store(&release_poll, false);
++	suspend_fail = reset_fail = disable_fail = locked = false;
++	pdata.checked_flush = true;
++}
++static void add_task(bool wfe)
++{
++	static struct cmdq_pkt pkt = { .pa_base = 0x1000, .cmd_buf_size = 16 };
++	struct cmdq_task *task = calloc(1, sizeof(*task));
++	*task = (struct cmdq_task){ .cmdq = &cmdq,
++				    .thread = &thread,
++				    .pkt = &pkt,
++				    .pa_base = pkt.pa_base };
++	INIT_LIST_HEAD(&task->list_entry);
++	list_move_tail(&task->list_entry, &thread.task_busy_list);
++	*(u32 *)(thread.base + CMDQ_THR_ENABLE_TASK) = 1;
++	*(u32 *)(thread.base + CMDQ_THR_WAIT_TOKEN) =
++		wfe ? CMDQ_THR_IS_WAITING : 0;
++}
++static void fault_retained(int refs)
++{
++	assert(thread.stop_faulted && device.refs == refs);
++	assert(callbacks == 0 && frees == 0);
++	int before = pm_calls;
++	assert(cmdq_mbox_flush_checked(&chan, 10) == -EIO &&
++	       pm_calls == before);
++	int r = reads, w = writes, a = allocations;
++	locked = true;
++	assert(cmdq_mbox_send_data(&chan, NULL) == -EIO);
++	assert(reads == r && writes == w && allocations == a);
++	*(u32 *)(thread.base + CMDQ_THR_IRQ_STATUS) = CMDQ_THR_IRQ_DONE;
++	cmdq_thread_irq_handler(&cmdq, &thread);
++	locked = false;
++	assert(ack_writes == 1 && callbacks == 0 && frees == 0);
++}
++struct flush_worker {
++	int role, result;
++};
++static void *flush_worker(void *opaque)
++{
++	struct flush_worker *worker = opaque;
++	role = worker->role;
++	worker->result = cmdq_mbox_flush_checked(&chan, 10);
++	return NULL;
++}
++static void threaded_races(void)
++{
++	pthread_t first, second;
++	struct flush_worker a = { .role = 1 }, b = { .role = 2 };
++
++	reset();
++	add_task(false);
++	threaded_case = 1;
++	assert(pthread_create(&first, NULL, flush_worker, &a) == 0);
++	wait_flag(&poll_waiting);
++	assert(cmdq_mbox_flush_checked(&chan, 10) == -EBUSY && pm_calls == 1);
++	atomic_store(&release_poll, true);
++	assert(pthread_join(first, NULL) == 0 && a.result == -EIO);
++	fault_retained(1);
++
++	reset();
++	add_task(false);
++	threaded_case = 2;
++	assert(pthread_create(&first, NULL, flush_worker, &a) == 0);
++	wait_flag(&pm_waiting);
++	assert(pthread_create(&second, NULL, flush_worker, &b) == 0);
++	wait_flag(&poll_waiting);
++	atomic_store(&release_pm, true);
++	assert(pthread_join(first, NULL) == 0 && a.result == -EBUSY);
++	assert(device.refs == 2 && thread.stop_pm_retained);
++	atomic_store(&release_poll, true);
++	assert(pthread_join(second, NULL) == 0 && b.result == -EIO);
++	assert(device.refs == 1 && pm_puts == 1);
++	fault_retained(1);
++}
++int main(void)
++{
++	reset();
++	assert(cmdq_mbox_flush_checked(&chan, 10) == 0 && device.refs == 0);
++	assert(writes == 0 && pm_calls == 1 && pm_puts == 1);
++	reset();
++	*(u32 *)(thread.base + CMDQ_THR_ENABLE_TASK) = 1;
++	assert(cmdq_mbox_flush_checked(&chan, 10) == 0 && device.refs == 0);
++	assert(!(*(u32 *)(thread.base + CMDQ_THR_ENABLE_TASK) & 1));
++	reset();
++	add_task(true);
++	assert(cmdq_mbox_flush_checked(&chan, 10) == 0);
++	assert(callbacks == 1 && frees == 1 && device.refs == 0);
++	for (int fail = 0; fail < 4; fail++) {
++		reset();
++		add_task(true);
++		pm_mode = fail == 0 ? 1 : 0;
++		suspend_fail = fail == 1;
++		reset_fail = fail == 2;
++		disable_fail = fail == 3;
++		assert(cmdq_mbox_flush_checked(&chan, 10) < 0);
++		if (fail == 0)
++			assert(reads == 0 && writes == 0);
++		fault_retained(fail == 0 ? 0 : 1);
++	}
++	reset();
++	add_task(false);
++	assert(cmdq_mbox_flush_checked(&chan, 10) == -ETIMEDOUT);
++	fault_retained(1);
++	reset();
++	add_task(false);
++	poll_mode = 1;
++	assert(cmdq_mbox_flush_checked(&chan, 10) == 0 && hooks == 1);
++	assert(callbacks == 1 && frees == 1 && device.refs == 0);
++	reset();
++	add_task(false);
++	poll_mode = 4;
++	assert(cmdq_mbox_flush_checked(&chan, 10) == -EIO && hooks == 1);
++	fault_retained(1);
++	for (int race = 2; race <= 4; race++) {
++		reset();
++		pm_mode = race;
++		assert(cmdq_mbox_flush_checked(&chan, 10) < 0 && hooks == 1);
++		assert(device.refs == (race == 4 ? 2 : 1));
++		if (race == 4)
++			pm_runtime_put_autosuspend(
++				&device); /* Other in-flight caller. */
++		fault_retained(1);
++	}
++	for (int race = 2; race <= 3; race++) {
++		reset();
++		add_task(false);
++		poll_mode = race;
++		assert(cmdq_mbox_flush_checked(&chan, 10) < 0 && hooks == 1);
++		fault_retained(1);
++	}
++	reset();
++	thread.stopping = true;
++	assert(cmdq_mbox_flush_checked(&chan, 10) == -EBUSY && pm_calls == 0);
++	assert(thread.stop_faulted);
++	reset();
++	pdata.checked_flush = false;
++	thread.stop_faulted = true;
++	struct cmdq_pkt pkt = { .pa_base = 0x1000, .cmd_buf_size = 16 };
++	locked = true;
++	assert(cmdq_mbox_send_data(&chan, &pkt) == 0 && allocations == 1);
++	locked = false;
++	reset();
++	reset();
++	add_task(true);
++	pm_mode = 2;
++	cmdq_mbox_shutdown(&chan);
++	assert(device.refs == 1 && callbacks == 0 && frees == 0 && writes == 0);
++	int before = pm_calls;
++	cmdq_mbox_shutdown(&chan);
++	assert(pm_calls == before && device.refs == 1);
++	threaded_races();
++	reset();
++	assert(pthread_mutex_destroy(&channel_lock) == 0);
++	puts("MT6897 checked stop, readback/timeout failures, fault retention and PM-race models passed");
++	return 0;
++}
+diff --git a/tools/testing/selftests/mtk_clk/test_cmdq_stop.py b/tools/testing/selftests/mtk_clk/test_cmdq_stop.py
+new file mode 100755
+index 0000000000..bac2ce54cc
+--- /dev/null
++++ b/tools/testing/selftests/mtk_clk/test_cmdq_stop.py
+@@ -0,0 +1,48 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Test production MT6897 checked mailbox stop with deterministic MMIO/PM mocks."""
++from pathlib import Path
++import os
++import re
++import subprocess
++import tempfile
++
++assets = Path(__file__).resolve().parent
++repo = Path(os.environ.get('KERNEL_SRC', str(assets.parents[3])))
++source = (repo / 'drivers/mailbox/mtk-cmdq-mailbox.c').read_text()
++
++
++def function(name):
++    match = re.search(r'^static (?:int|void|bool) ' + name + r'\(', source, re.M)
++    start = match.start()
++    end = source.index('{', start) + 1
++    depth = 1
++    while depth:
++        depth += (source[end] == '{') - (source[end] == '}')
++        end += 1
++    return source[start:end]
++
++
++assert source.count('.checked_flush = true') == 1
++assert '.checked_flush = true' in source.split('gce_plat_mt6897 = {', 1)[1].split('};', 1)[0]
++irq = function('cmdq_thread_irq_handler')
++assert irq.index('writel(~irq_flag') < irq.index('thread->stop_faulted') < irq.index('cmdq_task_exec_done')
++send = function('cmdq_mbox_send_data')
++assert send.index('thread->stop_faulted') < send.index('kzalloc_obj') < send.index('writel(')
++production = '\n'.join(function(name) for name in [
++    'cmdq_thread_suspend', 'cmdq_thread_reset', 'cmdq_thread_disable',
++    'cmdq_thread_is_in_wfe', 'cmdq_thread_stop_fault', 'cmdq_mbox_flush_checked',
++    'cmdq_thread_irq_handler', 'cmdq_mbox_send_data', 'cmdq_mbox_shutdown'])
++# Resume is an inline function in the driver.
++a = source.index('static void cmdq_thread_resume(')
++b = source.index('\n}\n', a) + 3
++production = source[a:b] + '\n' + production
++with tempfile.TemporaryDirectory(prefix='mtk-cmdq-stop-') as tmp:
++    tmp = Path(tmp)
++    c = tmp / 'test.c'
++    c.write_text((assets / 'cmdq_stop_cases.c').read_text().replace('/* PRODUCTION */', production))
++    binary = tmp / 'test'
++    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
++                    '-Wno-unused-parameter', '-Werror', '-g', '-pthread', '-fsanitize=address,undefined',
++                    str(c), '-o', str(binary)], check=True)
++    subprocess.run([str(binary)], check=True)
+-- 
+2.56.0
+

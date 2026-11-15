@@ -1,0 +1,1235 @@
+diff --git a/meson.build b/meson.build
+index 04c6b6ec..914c85bf 100644
+--- a/meson.build
++++ b/meson.build
+@@ -64,6 +64,7 @@ sources = files(
+   'src/backend.cpp',
+   'src/av1.cpp',
+   'src/decoder.cpp',
++  'src/t880-decoder.cpp',
+   'src/encoder.cpp',
+   'src/h264.cpp',
+   'src/hevc.cpp',
+@@ -128,3 +129,13 @@ if formatter.found()
+   run_target('format', command: [formatter, '-i', '--style=file', sources, headers])
+   run_target('format-check', command: [formatter, '--dry-run', '--Werror', '--style=file', sources, headers])
+ endif
++
++install_symlink('panthor_drv_video.so', pointing_to: 'qcom_drv_video.so', install_dir: driver_install_dir)
++
++t880_replay_test = executable('t880-replay-test', 'tests/t880/replay.cpp',
++  dependencies: [va, threads], cpp_args: ['-UNDEBUG'], build_by_default: false)
++test('T880 replay ownership', t880_replay_test)
++
++t880_anchor_test = executable('t880-anchor-test', 'tests/t880/anchors.cpp',
++  dependencies: [va, threads], cpp_args: ['-UNDEBUG'], build_by_default: false)
++test('T880 AV1 replay anchors', t880_anchor_test)
+diff --git a/src/av1.cpp b/src/av1.cpp
+index bb0a2e66..b006d371 100644
+--- a/src/av1.cpp
++++ b/src/av1.cpp
+@@ -88,6 +88,19 @@ void obu(std::vector<uint8_t> &out, unsigned type, const std::vector<uint8_t> &p
+     } while (length);
+     out.insert(out.end(), payload.begin(), payload.end());
+ }
++// Keep replay framing separate from ordinary serialization. The cached raw
++// sequence payload must be framed after the temporal delimiter on later keys.
++std::vector<uint8_t> replay_anchor(const std::vector<uint8_t> &out, size_t td_end,
++                                  const std::vector<uint8_t> &sequence, unsigned type,
++                                  bool show, bool new_sequence) {
++    if (type != key_frame || !(show || new_sequence)) return {};
++    if (new_sequence) return out;
++    check(td_end <= out.size() && !sequence.empty(), "AV1 replay sequence missing", invalid);
++    std::vector<uint8_t> anchor(out.begin(), out.begin() + td_end);
++    obu(anchor, 1, sequence);
++    anchor.insert(anchor.end(), out.begin() + td_end, out.end());
++    return anchor;
++}
+ std::vector<uint8_t> sequence_header(const VADecPictureParameterBufferAV1 &p, unsigned width,
+                                      unsigned height) {
+     const auto &s = p.seq_info_fields.fields;
+@@ -556,7 +569,7 @@ void remember(Av1State &state, const Av1Picture &picture, unsigned refresh) {
+ } // namespace
+ 
+ std::vector<uint8_t> av1_bitstream(const Av1Picture &picture, Av1State &state, unsigned width,
+-                                   unsigned height) {
++                                   unsigned height, std::vector<uint8_t> *anchor) {
+     check(picture.has_params && !picture.slices.empty() && picture.pending_slices.empty(),
+           "AV1 picture missing parameters or tiles", invalid);
+     const auto &p = picture.params;
+@@ -602,6 +615,7 @@ std::vector<uint8_t> av1_bitstream(const Av1Picture &picture, Av1State &state, u
+                  (f.frame_type == key_frame && (f.show_frame || new_sequence));
+     std::vector<uint8_t> out;
+     obu(out, 2, {}); // One complete temporal unit per V4L2 OUTPUT buffer.
++    const size_t td_end = out.size();
+     if (new_sequence)
+         obu(out, 1, sequence);
+ 
+@@ -629,6 +643,8 @@ std::vector<uint8_t> av1_bitstream(const Av1Picture &picture, Av1State &state, u
+     trace("AV1 frame surface=%u type=%u original-show=%u refresh=%02x tiles=%ux%u bytes=%zu",
+           p.current_frame, f.frame_type, f.show_frame, refresh, p.tile_cols, p.tile_rows,
+           out.size());
++    if (anchor) *anchor = replay_anchor(out, td_end, sequence, f.frame_type,
++                                         f.show_frame, new_sequence);
+     return out;
+ }
+ } // namespace irisva
+diff --git a/src/backend.cpp b/src/backend.cpp
+index 56fc3e6b..4bb6bb43 100644
+--- a/src/backend.cpp
++++ b/src/backend.cpp
+@@ -87,6 +87,9 @@ template <class F> VAStatus guard(VADriverContextP ctx, F f) noexcept {
+         return guard(ctx, [&](Driver &d) -> VAStatus { __VA_ARGS__ });                             \
+     }
+ static bool supported(const Driver &d, VAProfile p) {
++    if (d.t880) return (d.h264 && (p == VAProfileH264ConstrainedBaseline ||
++        p == VAProfileH264Main || p == VAProfileH264High)) || (d.hevc && p == VAProfileHEVCMain) ||
++        (d.vp9 && p == VAProfileVP9Profile0) || (d.av1 && p == VAProfileAV1Profile0);
+     return p == VAProfileH264ConstrainedBaseline || p == VAProfileH264Main ||
+            p == VAProfileH264High || is_hevc(p) || is_vp9(p) || (is_av1(p) && d.av1);
+ }
+@@ -216,6 +219,8 @@ static VAImageFormat image_format(unsigned fourcc) {
+     return f;
+ }
+ static VAImage create_image(Driver &d, unsigned fourcc, unsigned w, unsigned h) {
++    check(!d.t880 || fourcc == VA_FOURCC_NV12 || fourcc == VA_FOURCC_I420,
++          "T880 image format unsupported", VA_STATUS_ERROR_INVALID_IMAGE_FORMAT);
+     check(w && h && w <= 8192 && h <= 8192, "invalid image dimensions",
+           VA_STATUS_ERROR_INVALID_PARAMETER);
+     check(fourcc == VA_FOURCC_NV12 || fourcc == VA_FOURCC_I420 || fourcc == VA_FOURCC_P010 ||
+@@ -268,15 +273,22 @@ static std::shared_ptr<Memory> allocate_undecoded_surface(VADriverContextP ctx,
+ 
+ API(query_profiles, (VADriverContextP ctx, VAProfile *out, int *count), (void)d;
+     check(out && count, "null profiles", VA_STATUS_ERROR_INVALID_PARAMETER);
++    if (d.t880) {
++        *count = 0;
++        for (auto p : {VAProfileH264ConstrainedBaseline, VAProfileH264Main,
++                       VAProfileH264High, VAProfileHEVCMain, VAProfileVP9Profile0, VAProfileAV1Profile0})
++            if (supported(d, p)) out[(*count)++] = p;
++        return VA_STATUS_SUCCESS;
++    }
+     out[0] = VAProfileH264ConstrainedBaseline; out[1] = VAProfileH264Main;
+     out[2] = VAProfileH264High; out[3] = VAProfileHEVCMain; out[4] = VAProfileHEVCMain10;
+     out[5] = VAProfileVP9Profile0; out[6] = VAProfileVP9Profile2; *count = 7;
+     if (d.av1) out[(*count)++] = VAProfileAV1Profile0;
+-    if (vpp_supported(VAProfileNone, VAEntrypointVideoProc)) out[(*count)++] = VAProfileNone;
++    if ((!d.t880 && vpp_supported(VAProfileNone, VAEntrypointVideoProc))) out[(*count)++] = VAProfileNone;
+     return VA_STATUS_SUCCESS;)
+ API(query_entrypoints, (VADriverContextP ctx, VAProfile profile, VAEntrypoint *out, int *count),
+     (void)d;
+-    check(supported(d, profile) || vpp_supported(profile, VAEntrypointVideoProc),
++    check(supported(d, profile) || (!d.t880 && vpp_supported(profile, VAEntrypointVideoProc)),
+           "unsupported profile", VA_STATUS_ERROR_UNSUPPORTED_PROFILE);
+     check(out && count, "null entrypoints", VA_STATUS_ERROR_INVALID_PARAMETER);
+     out[0] = profile == VAProfileNone ? VAEntrypointVideoProc : VAEntrypointVLD; *count = 1;
+@@ -286,9 +298,9 @@ API(
+     get_attributes,
+     (VADriverContextP ctx, VAProfile profile, VAEntrypoint entry, VAConfigAttrib *attrs, int count),
+     (void)d;
+-    check(supported(d, profile) || vpp_supported(profile, VAEntrypointVideoProc),
++    check(supported(d, profile) || (!d.t880 && vpp_supported(profile, VAEntrypointVideoProc)),
+           "unsupported profile", VA_STATUS_ERROR_UNSUPPORTED_PROFILE);
+-    check((supported(d, profile) && entry == VAEntrypointVLD) || vpp_supported(profile, entry) ||
++    check((supported(d, profile) && entry == VAEntrypointVLD) || (!d.t880 && vpp_supported(profile, entry)) ||
+               encode_supported(d, profile, entry),
+           "unsupported entrypoint", VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT);
+     for (int i = 0; i < count; ++i) {
+@@ -307,7 +319,7 @@ API(
+         }
+         switch (attrs[i].type) {
+         case VAConfigAttribRTFormat:
+-            attrs[i].value = profile_format(profile);
++            attrs[i].value = d.t880 ? VA_RT_FORMAT_YUV420 : profile_format(profile);
+             break;
+         case VAConfigAttribDecAV1Features:
+             attrs[i].value = is_av1(profile) ? 0 : VA_ATTRIB_NOT_SUPPORTED;
+@@ -316,8 +328,10 @@ API(
+             attrs[i].value = VA_DEC_SLICE_MODE_NORMAL;
+             break;
+         case VAConfigAttribMaxPictureWidth:
++            attrs[i].value = d.t880 ? 4096 : 8192;
++            break;
+         case VAConfigAttribMaxPictureHeight:
+-            attrs[i].value = 8192;
++            attrs[i].value = d.t880 ? 2176 : 8192;
+             break;
+         default:
+             attrs[i].value = VA_ATTRIB_NOT_SUPPORTED;
+@@ -327,9 +341,9 @@ API(
+     create_config,
+     (VADriverContextP ctx, VAProfile p, VAEntrypoint e, VAConfigAttrib *attrs, int count,
+      VAConfigID *id),
+-    check(supported(d, p) || vpp_supported(p, VAEntrypointVideoProc), "unsupported profile",
++    check(supported(d, p) || (!d.t880 && vpp_supported(p, VAEntrypointVideoProc)), "unsupported profile",
+           VA_STATUS_ERROR_UNSUPPORTED_PROFILE);
+-    check((supported(d, p) && e == VAEntrypointVLD) || vpp_supported(p, e) ||
++    check((supported(d, p) && e == VAEntrypointVLD) || (!d.t880 && vpp_supported(p, e)) ||
+               encode_supported(d, p, e),
+           "unsupported entrypoint", VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT);
+     Config config{p, e, VA_RC_CQP}; check(id, "null config ID", VA_STATUS_ERROR_INVALID_PARAMETER);
+@@ -350,7 +364,7 @@ API(
+                 config.rate_control = attrs[i].value;
+             }
+         } else if (attrs[i].type == VAConfigAttribRTFormat)
+-            check(attrs[i].value && !(attrs[i].value & ~render_formats(p, e)),
++            check(attrs[i].value && !(attrs[i].value & ~(d.t880 ? VA_RT_FORMAT_YUV420 : render_formats(p, e))),
+                   "unsupported render format", VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+         else if (e == VAEntrypointVLD && attrs[i].type == VAConfigAttribDecSliceMode)
+             check(attrs[i].value == VA_DEC_SLICE_MODE_NORMAL, "unsupported slice mode",
+@@ -369,7 +383,7 @@ API(query_config,
+     (VADriverContextP ctx, VAConfigID id, VAProfile *p, VAEntrypoint *e, VAConfigAttrib *a, int *n),
+     auto config = lookup(d.configs, id, VA_STATUS_ERROR_INVALID_CONFIG);
+     *p = config.profile; *e = config.entrypoint;
+-    a[0] = {VAConfigAttribRTFormat, render_formats(*p, *e)}; *n = 1;
++    a[0] = {VAConfigAttribRTFormat, d.t880 ? VA_RT_FORMAT_YUV420 : render_formats(*p, *e)}; *n = 1;
+     if (*e == VAEntrypointEncSlice) a[(*n)++] = {VAConfigAttribRateControl, config.rate_control};
+     return VA_STATUS_SUCCESS;)
+ API(
+@@ -384,6 +398,7 @@ API(
+     unsigned values[] = {profile_fourcc(profile), 128, 128, 8192, 8192,
+                          VA_SURFACE_ATTRIB_MEM_TYPE_VA | VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME |
+                              VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2};
++    if (d.t880) { values[0] = VA_FOURCC_NV12; values[3] = 4096; values[4] = 2176; }
+     if (config.entrypoint == VAEntrypointVideoProc) {
+         values[1] = 2;
+         values[2] = 2;
+@@ -518,6 +533,9 @@ API(
+     create_surfaces,
+     (VADriverContextP ctx, unsigned format, unsigned w, unsigned h, VASurfaceID *ids,
+      unsigned count, VASurfaceAttrib *attrs, unsigned nattrs),
++    check(!d.t880 || (format == VA_RT_FORMAT_YUV420 && w && h && !(w & 1) && !(h & 1) &&
++          w <= 4096 && h <= 2176 && uint64_t(w) * h <= uint64_t(4096) * 2176),
++          "T880 requires bounded even NV12 surfaces", VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+     check(format == VA_RT_FORMAT_YUV420 || format == VA_RT_FORMAT_YUV420_10 ||
+               format == VA_RT_FORMAT_RGB32,
+           "unsupported surface RT format", VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+@@ -578,6 +596,8 @@ API(
+         imported = import_prime(desc, w, h, fourcc);
+     } else check(!external, "external descriptor without PRIME memory type",
+                  VA_STATUS_ERROR_INVALID_PARAMETER);
++    check(!d.t880 || fourcc == VA_FOURCC_NV12, "T880 NV12 only",
++          VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+     for (unsigned i = 0; i < count; ++i) {
+         auto s = std::make_shared<Surface>();
+         s->memory = imported;
+@@ -606,6 +626,9 @@ API(
+     check(((processing && w >= 0 && h >= 0) || (w >= 128 && h >= 128)) && w <= 8192 && h <= 8192 &&
+               result,
+           "invalid context dimensions", VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
++    check(!d.t880 || (!(w & 1) && !(h & 1) && w <= 4096 && h <= 2176 &&
++          uint64_t(w) * h <= uint64_t(4096) * 2176), "T880 context geometry",
++          VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
+     auto c = std::make_shared<Context>(); c->profile = config.profile;
+     c->entrypoint = config.entrypoint; c->encode_settings.rate_control = config.rate_control;
+     c->encode_settings.hevc = is_hevc(c->profile); if (c->entrypoint == VAEntrypointEncSlice)
+@@ -910,21 +933,47 @@ API(
+             check(fourcc == target->fourcc,
+                   "AV1 bit depth does not match target", VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+             auto next_state = c->av1;
+-            auto bytes = av1_bitstream(c->av1_picture, next_state, c->width, c->height);
+-            c->decoder->submit(bytes, target);
++            std::vector<uint8_t> anchor;
++            auto bytes = av1_bitstream(c->av1_picture, next_state, c->width, c->height,
++                                      d.t880 ? &anchor : nullptr);
++            c->decoder->submit(bytes, target, anchor);
+             c->av1 = std::move(next_state);
+         } else if (is_vp9(c->profile)) {
+             auto bytes = vp9_bitstream(c->profile, c->vp9_picture);
+-            c->decoder->submit(bytes, target);
++            std::vector<uint8_t> anchor;
++            if (d.t880 && !c->vp9_picture.params.pic_fields.bits.frame_type) anchor = bytes;
++            c->decoder->submit(bytes, target, anchor);
+         } else if (is_hevc(c->profile)) {
+             auto next_state = c->hevc;
+             auto bytes = hevc_bitstream(c->internal_profile, c->hevc_picture, next_state);
+-            c->decoder->submit(bytes, target);
++            std::vector<uint8_t> anchor;
++            if (d.t880) {
++                unsigned type = (c->hevc_picture.slices.front().bytes[0] >> 1) & 63;
++                if (type == 19 || type == 20) {
++                    check(!next_state.vps.empty() && !next_state.sps.empty() && !next_state.pps.empty(),
++                          "T880 IDR parameter snapshot missing");
++                    anchor = next_state.vps;
++                    anchor.insert(anchor.end(), next_state.sps.begin(), next_state.sps.end());
++                    for (const auto &[id, pps] : next_state.pps)
++                        anchor.insert(anchor.end(), pps.begin(), pps.end());
++                    anchor.insert(anchor.end(), bytes.begin(), bytes.end());
++                }
++            }
++            c->decoder->submit(bytes, target, anchor);
+             c->hevc = std::move(next_state);
+         } else {
+             auto next_state = c->h264;
+             auto bytes = h264_bitstream(c->profile, c->picture, next_state);
+-            c->decoder->submit(bytes, target);
++            std::vector<uint8_t> anchor;
++            if (d.t880 && (c->picture.slices.front().bytes[0] & 31) == 5) {
++                check(!next_state.sps.empty() && !next_state.pps.empty(),
++                      "T880 IDR parameter snapshot missing");
++                anchor = next_state.sps;
++                for (const auto &[id, pps] : next_state.pps)
++                    anchor.insert(anchor.end(), pps.begin(), pps.end());
++                anchor.insert(anchor.end(), bytes.begin(), bytes.end());
++            }
++            c->decoder->submit(bytes, target, anchor);
+             c->h264 = std::move(next_state);
+         }
+         // Chromium's cached NativePixmap output does not call vaSyncSurface
+@@ -955,6 +1004,8 @@ API(query_error, (VADriverContextP ctx, VASurfaceID id, VAStatus status, void **
+     surface(d, id);
+     (void)status; *info = nullptr; return VA_STATUS_SUCCESS;)
+ API(query_images, (VADriverContextP ctx, VAImageFormat *out, int *count), (void)d;
++    if (d.t880) { out[0] = image_format(VA_FOURCC_NV12);
++        out[1] = image_format(VA_FOURCC_I420); *count = 2; return VA_STATUS_SUCCESS; }
+     out[0] = image_format(VA_FOURCC_NV12); out[1] = image_format(VA_FOURCC_I420);
+     out[2] = image_format(VA_FOURCC_P010); out[3] = image_format(VA_FOURCC_BGRA);
+     out[4] = image_format(VA_FOURCC_RGBA); *count = 5; return VA_STATUS_SUCCESS;)
+@@ -1202,8 +1253,8 @@ extern "C" VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
+     using namespace irisva;
+     try {
+         auto d = std::make_unique<Driver>();
+-        d->device = find_device(d->av1);
+-        d->encoder_device = find_encoder_device();
++        d->device = find_device(d->av1, d->t880, d->h264, d->hevc, d->vp9);
++        if (!d->t880) d->encoder_device = find_encoder_device();
+         ctx->version_major = VA_MAJOR_VERSION;
+         ctx->version_minor = VA_MINOR_VERSION;
+         ctx->max_profiles = 9;
+@@ -1215,7 +1266,7 @@ extern "C" VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
+         ctx->max_display_attributes = 1;
+         ctx->str_vendor = "Iris V4L2 stateful VA-API backend";
+         auto &v = *ctx->vtable;
+-        if (ctx->vtable_vpp && vpp_supported(VAProfileNone, VAEntrypointVideoProc)) {
++        if (ctx->vtable_vpp && (!d->t880 && vpp_supported(VAProfileNone, VAEntrypointVideoProc))) {
+             auto &vpp = *ctx->vtable_vpp;
+             vpp.version = VA_DRIVER_VTABLE_VPP_VERSION;
+             vpp.vaQueryVideoProcFilters = query_vpp_filters;
+diff --git a/src/decoder.cpp b/src/decoder.cpp
+index 2354787c..67e6a1fc 100644
+--- a/src/decoder.cpp
++++ b/src/decoder.cpp
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MIT
+ #include "internal.hpp"
++#include "t880-decoder.hpp"
+ #include <linux/videodev2.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+@@ -60,7 +61,7 @@ uint8_t *Memory::map() {
+     }
+     return static_cast<uint8_t *>(mapping);
+ }
+-std::string find_device(bool &av1) {
++std::string find_device(bool &av1, bool &t880, bool &h264, bool &hevc, bool &vp9) {
+     std::vector<std::string> paths;
+     if (const char *p = std::getenv("IRIS_VAAPI_DEVICE"))
+         paths.push_back(p);
+@@ -76,18 +77,22 @@ std::string find_device(bool &av1) {
+         if (fd < 0)
+             continue;
+         v4l2_capability cap{};
+-        bool match = false, has_av1 = false;
++        bool match = false, has_av1 = false, is_t880 = false, has_hevc = false, has_vp9 = false;
+         if (!call(fd, VIDIOC_QUERYCAP, &cap) &&
+             (!strcmp(reinterpret_cast<char *>(cap.driver), "iris_driver") ||
+-             !strcmp(reinterpret_cast<char *>(cap.driver), "qcom-venus"))) {
++             !strcmp(reinterpret_cast<char *>(cap.driver), "qcom-venus") ||
++             !strcmp(reinterpret_cast<char *>(cap.driver), "mtk-vcp-dec"))) {
+             unsigned caps =
+                 cap.capabilities & V4L2_CAP_DEVICE_CAPS ? cap.device_caps : cap.capabilities;
+-            if (caps & V4L2_CAP_VIDEO_M2M_MPLANE) {
++            is_t880 = !strcmp(reinterpret_cast<char *>(cap.driver), "mtk-vcp-dec");
++            if ((caps & V4L2_CAP_VIDEO_M2M_MPLANE) && (caps & V4L2_CAP_STREAMING)) {
+                 v4l2_fmtdesc fmt{};
+                 fmt.type = OUTPUT;
+                 while (!call(fd, VIDIOC_ENUM_FMT, &fmt)) {
+                     if (fmt.pixelformat == V4L2_PIX_FMT_H264)
+                         match = true;
++                    if (fmt.pixelformat == V4L2_PIX_FMT_HEVC) has_hevc = true;
++                    if (fmt.pixelformat == V4L2_PIX_FMT_VP9) has_vp9 = true;
+                     if (fmt.pixelformat == V4L2_PIX_FMT_AV1)
+                         has_av1 = true;
+                     ++fmt.index;
+@@ -96,7 +101,8 @@ std::string find_device(bool &av1) {
+         }
+         close(fd);
+         if (match) {
+-            av1 = has_av1;
++            t880 = is_t880; h264 = match; hevc = has_hevc;
++            av1 = has_av1 && !t880; vp9 = has_vp9;
+             return path;
+         }
+     }
+@@ -108,6 +114,18 @@ Decoder::Decoder(const std::string &device, unsigned width, unsigned height, uns
+       preferred_pool_size_(std::min(64u, std::max(32u, surfaces + 4))),
+       fourcc_(rt_format == VA_RT_FORMAT_YUV420_10 ? VA_FOURCC_P010 : VA_FOURCC_NV12),
+       copier_(render_fd) {
++    // Recognition is repeated on the opened node by discovery; this probe
++    // selects the private implementation before any Qualcomm controls run.
++    int probe = open(device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
++    check(probe >= 0, "probe decoder");
++    v4l2_capability cap{};
++    int result = call(probe, VIDIOC_QUERYCAP, &cap);
++    close(probe);
++    check(result == 0, "query decoder driver");
++    if (!strcmp(reinterpret_cast<char *>(cap.driver), "mtk-vcp-dec")) {
++        t880_ = std::make_unique<T880Decoder>(device, width, height, profile, rt_format, render_fd);
++        return;
++    }
+     fd_ = open(device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+     check(fd_ >= 0, "open Iris decoder");
+     try {
+@@ -149,6 +167,7 @@ Decoder::Decoder(const std::string &device, unsigned width, unsigned height, uns
+     }
+ }
+ Decoder::~Decoder() {
++    if (t880_) return;
+     if (dump_)
+         fclose(dump_);
+     fail(VA_STATUS_ERROR_DECODING_ERROR);
+@@ -390,7 +409,9 @@ void Decoder::pump(int timeout_ms) {
+     check(!source_change_, "in-context dynamic resolution change not yet implemented",
+           VA_STATUS_ERROR_UNIMPLEMENTED);
+ }
+-void Decoder::submit(const std::vector<uint8_t> &bytes, const std::shared_ptr<Surface> &surface) {
++void Decoder::submit(const std::vector<uint8_t> &bytes, const std::shared_ptr<Surface> &surface,
++                     const std::vector<uint8_t> &anchor) {
++    if (t880_) { t880_->submit(bytes, surface, anchor); return; }
+     std::lock_guard<std::mutex> lock(mutex_);
+     // VLC allocates its renderer pool before creating the FFmpeg context,
+     // which can pass zero render targets to VA. Preserve the allocation hint
+@@ -446,11 +467,13 @@ void Decoder::submit(const std::vector<uint8_t> &bytes, const std::shared_ptr<Su
+     }
+ }
+ void Decoder::refresh() {
++    if (t880_) { t880_->refresh(); return; }
+     std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+     if (lock.owns_lock() && failure_ == VA_STATUS_SUCCESS)
+         pump(0);
+ }
+ void Decoder::finish() {
++    if (t880_) { t880_->finish(); return; }
+     std::lock_guard<std::mutex> lock(mutex_);
+     if (failure_ != VA_STATUS_SUCCESS)
+         return;
+@@ -461,6 +484,7 @@ void Decoder::finish() {
+     }
+ }
+ void Decoder::sync(const std::shared_ptr<Surface> &surface) {
++    if (t880_) { t880_->sync(surface); return; }
+     std::unique_lock<std::mutex> lock(mutex_);
+     pump(0);
+     auto start = std::chrono::steady_clock::now();
+diff --git a/src/internal.hpp b/src/internal.hpp
+index 1744f554..21def0d0 100644
+--- a/src/internal.hpp
++++ b/src/internal.hpp
+@@ -188,7 +188,7 @@ struct Av1State {
+     std::shared_ptr<const Av1Picture> pending_reference;
+ };
+ std::vector<uint8_t> av1_bitstream(const Av1Picture &picture, Av1State &state, unsigned width,
+-                                  unsigned height);
++                                  unsigned height, std::vector<uint8_t> *anchor = nullptr);
+ std::vector<uint8_t> vp9_bitstream(VAProfile profile, const Vp9Picture &picture);
+ std::vector<uint8_t> h264_bitstream(VAProfile profile, const Picture &picture, H264State &state);
+ std::vector<uint8_t> hevc_bitstream(VAProfile profile, const HevcPicture &picture,
+@@ -204,7 +204,9 @@ inline unsigned capture_pool_size(unsigned preferred, unsigned minimum, size_t b
+           VA_STATUS_ERROR_ALLOCATION_FAILED);
+     return std::min(std::max(preferred, minimum), limit);
+ }
++class T880Decoder;
+ class Decoder {
++    std::unique_ptr<T880Decoder> t880_;
+     int fd_ = -1;
+     int render_fd_; // Borrowed from the VA display, which outlives the decoder.
+     FILE *dump_ = nullptr;
+@@ -228,12 +230,13 @@ class Decoder {
+     Decoder(const std::string &device, unsigned width, unsigned height, unsigned surfaces,
+             VAProfile profile, unsigned rt_format, int render_fd);
+     ~Decoder();
+-    void submit(const std::vector<uint8_t> &bytes, const std::shared_ptr<Surface> &surface);
++    void submit(const std::vector<uint8_t> &bytes, const std::shared_ptr<Surface> &surface,
++                const std::vector<uint8_t> &anchor = {});
+     void sync(const std::shared_ptr<Surface> &surface);
+     void finish();
+     void refresh();
+ };
+-std::string find_device(bool &av1);
++std::string find_device(bool &av1, bool &t880, bool &h264, bool &hevc, bool &vp9);
+ std::string find_encoder_device();
+ struct EncodePicture {
+     VAEncPictureParameterBufferH264 params{};
+@@ -340,6 +343,7 @@ struct Driver {
+     std::recursive_mutex mutex;
+     std::string device;
+     bool av1 = false;
++    bool t880 = false, h264 = false, hevc = false, vp9 = false;
+     std::string encoder_device;
+     uint32_t next_id = 1;
+     std::map<uint32_t, Config> configs;
+diff --git a/src/t880-decoder.cpp b/src/t880-decoder.cpp
+new file mode 100644
+index 00000000..63049327
+--- /dev/null
++++ b/src/t880-decoder.cpp
+@@ -0,0 +1,413 @@
++// SPDX-License-Identifier: MIT
++#include "t880-decoder.hpp"
++#include <linux/dma-buf.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <poll.h>
++#include <cerrno>
++#include <limits>
++
++namespace irisva {
++namespace {
++struct CpuWrite {
++    int fd; bool active = false;
++    explicit CpuWrite(Memory &m) : fd(m.fd) {
++        wait_surface_access(m, POLLOUT);
++        dma_buf_sync sync{DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE};
++        checked_begin(sync); active = true;
++    }
++    void checked_begin(dma_buf_sync &sync) {
++        int r; do { r = ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync); } while (r < 0 && errno == EINTR);
++        check(r == 0, "T880 CPU write cache access");
++    }
++    void finish() {
++        dma_buf_sync sync{DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE};
++        checked_begin(sync); active = false;
++    }
++    ~CpuWrite() {
++        if (active) { dma_buf_sync sync{DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE};
++            while (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) < 0 && errno == EINTR) {} }
++    }
++};
++constexpr unsigned OUT = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++constexpr unsigned CAP = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++constexpr size_t AU_LIMIT = 4u * 1024 * 1024;
++constexpr size_t HISTORY_LIMIT = 64u * 1024 * 1024;
++constexpr size_t COUNT_LIMIT = 4096;
++int call(int fd, unsigned long request, void *arg) {
++    int r;
++    do { r = ioctl(fd, request, arg); } while (r < 0 && errno == EINTR);
++    return r;
++}
++void checked(int fd, unsigned long request, void *arg, const char *what) {
++    check(call(fd, request, arg) == 0, (std::string(what) + ": " + strerror(errno)).c_str());
++}
++struct T880Buffer {
++    v4l2_plane planes[VIDEO_MAX_PLANES]{};
++    v4l2_buffer value{};
++    T880Buffer(unsigned type, unsigned index = 0) {
++        value.type = type; value.index = index; value.memory = V4L2_MEMORY_MMAP;
++        value.length = VIDEO_MAX_PLANES; value.m.planes = planes;
++    }
++};
++uint64_t token(const timeval &t) {
++    check(t.tv_sec >= 0 && t.tv_usec >= 0 && t.tv_usec < 1000000 &&
++          uint64_t(t.tv_sec) <= (UINT64_MAX - uint64_t(t.tv_usec)) / 1000000,
++          "invalid T880 timestamp");
++    return uint64_t(t.tv_sec) * 1000000 + t.tv_usec;
++}
++}
++T880Decoder::Plane::Plane(Plane &&p) noexcept : address(p.address), size(p.size) {
++    p.address = nullptr; p.size = 0;
++}
++T880Decoder::Plane::~Plane() { if (address) munmap(address, size); }
++T880Decoder::T880Decoder(const std::string &device, unsigned width, unsigned height,
++                         VAProfile profile, unsigned rt_format, int render_fd)
++    : render_fd_(render_fd), width_(width), height_(height) {
++    check(rt_format == VA_RT_FORMAT_YUV420 && width >= 128 && height >= 128 && !(width & 1) &&
++          !(height & 1) && width <= 4096 && height <= 2176 &&
++          uint64_t(width) * height <= uint64_t(4096) * 2176,
++          "T880 requires bounded even 8-bit geometry", VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
++    check(profile == VAProfileH264ConstrainedBaseline || profile == VAProfileH264Main ||
++          profile == VAProfileH264High || profile == VAProfileHEVCMain ||
++          profile == VAProfileVP9Profile0 || profile == VAProfileAV1Profile0,
++          "T880 profile not enabled", VA_STATUS_ERROR_UNSUPPORTED_PROFILE);
++    fd_ = open(device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
++    check(fd_ >= 0, "open T880 decoder");
++    try {
++        v4l2_capability caps{};
++        checked(fd_, VIDIOC_QUERYCAP, &caps, "T880 QUERYCAP");
++        unsigned capabilities = caps.capabilities & V4L2_CAP_DEVICE_CAPS
++                                    ? caps.device_caps : caps.capabilities;
++        check(!strcmp(reinterpret_cast<const char *>(caps.driver), "mtk-vcp-dec") &&
++              (capabilities & V4L2_CAP_VIDEO_M2M_MPLANE) &&
++              (capabilities & V4L2_CAP_STREAMING), "T880 decoder identity changed");
++        v4l2_event_subscription sub{}; sub.type = V4L2_EVENT_SOURCE_CHANGE;
++        checked(fd_, VIDIOC_SUBSCRIBE_EVENT, &sub, "subscribe SOURCE_CHANGE");
++        v4l2_format fmt{}; fmt.type = OUT;
++        auto &p = fmt.fmt.pix_mp;
++        p.width = width; p.height = height;
++        p.pixelformat = is_av1(profile) ? v4l2_fourcc('A', 'V', '0', '1')
++                         : is_vp9(profile) ? V4L2_PIX_FMT_VP9
++                         : is_hevc(profile) ? V4L2_PIX_FMT_HEVC : V4L2_PIX_FMT_H264;
++        unsigned codec = p.pixelformat;
++        p.num_planes = 1; p.plane_fmt[0].sizeimage = AU_LIMIT;
++        checked(fd_, VIDIOC_S_FMT, &fmt, "S_FMT OUTPUT");
++        check(p.pixelformat == codec && p.num_planes == 1 &&
++              p.plane_fmt[0].sizeimage >= AU_LIMIT, "T880 OUTPUT capacity mismatch");
++        allocate(OUT, 4, output_);
++        unsigned type = OUT;
++        checked(fd_, VIDIOC_STREAMON, &type, "STREAMON OUTPUT"); output_on_ = true;
++    } catch (...) { fail(VA_STATUS_ERROR_DECODING_ERROR); throw; }
++}
++T880Decoder::~T880Decoder() { fail(VA_STATUS_ERROR_DECODING_ERROR); }
++void T880Decoder::fail(VAStatus status) noexcept {
++    failure_ = status;
++    if (fd_ >= 0) {
++        unsigned type = OUT; if (output_on_) call(fd_, VIDIOC_STREAMOFF, &type);
++        type = CAP; if (capture_on_) call(fd_, VIDIOC_STREAMOFF, &type);
++        close(fd_); fd_ = -1;
++    }
++    output_on_ = capture_on_ = false;
++    for (auto &[id, s] : pending_) { s->status = status; s->pending = false; }
++    pending_.clear(); wire_.clear(); capture_.clear(); output_.clear();
++}
++void T880Decoder::check_deadline() {
++    check(failure_ == VA_STATUS_SUCCESS, "T880 session failed", failure_);
++    check(Clock::now() < deadline_, "T880 operation deadline", VA_STATUS_ERROR_TIMEDOUT);
++}
++void T880Decoder::allocate(unsigned type, unsigned count, std::vector<Slot> &slots) {
++    v4l2_requestbuffers req{}; req.type = type; req.memory = V4L2_MEMORY_MMAP; req.count = count;
++    checked(fd_, VIDIOC_REQBUFS, &req, "REQBUFS");
++    check(req.count >= count && req.count <= 64, "T880 invalid pool size");
++    slots.resize(req.count);
++    for (unsigned i = 0; i < req.count; ++i) {
++        T880Buffer q(type, i); checked(fd_, VIDIOC_QUERYBUF, &q.value, "QUERYBUF");
++        check(q.value.length == (type == CAP ? 2u : 1u), "T880 plane count");
++        for (unsigned j = 0; j < q.value.length; ++j) {
++            Plane p; p.size = q.planes[j].length;
++            check(p.size && p.size <= 16u * 1024 * 1024, "T880 plane allocation budget");
++            void *mapping = mmap(nullptr, p.size, PROT_READ | PROT_WRITE, MAP_SHARED,
++                                 fd_, q.planes[j].m.mem_offset);
++            check(mapping != MAP_FAILED, "T880 mmap"); p.address = mapping;
++            slots[i].planes.push_back(std::move(p));
++        }
++    }
++}
++void T880Decoder::queue_capture(unsigned index) {
++    auto &slot = capture_.at(index); check(!slot.queued, "T880 double CAPTURE QBUF");
++    T880Buffer q(CAP, index); q.value.length = 2;
++    for (unsigned p = 0; p < 2; ++p) q.planes[p].length = slot.planes[p].size;
++    checked(fd_, VIDIOC_QBUF, &q.value, "QBUF CAPTURE"); slot.queued = true;
++}
++void T880Decoder::configure_capture() {
++    check(!capture_on_ && capture_.empty(), "T880 dynamic resolution change unsupported",
++          VA_STATUS_ERROR_UNIMPLEMENTED);
++    v4l2_format fmt{}; fmt.type = CAP;
++    checked(fd_, VIDIOC_G_FMT, &fmt, "G_FMT CAPTURE");
++    fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12M;
++    checked(fd_, VIDIOC_S_FMT, &fmt, "S_FMT CAPTURE");
++    auto &p = fmt.fmt.pix_mp;
++    check(p.pixelformat == V4L2_PIX_FMT_NV12M && p.num_planes == 2 &&
++          p.width >= width_ && p.height >= height_ && p.width <= 4096 && p.height <= 2176,
++          "T880 unsupported CAPTURE geometry");
++    v4l2_selection selection{}; selection.type = CAP; selection.target = V4L2_SEL_TGT_COMPOSE;
++    checked(fd_, VIDIOC_G_SELECTION, &selection, "G_SELECTION visible");
++    check(selection.r.left == 0 && selection.r.top == 0 &&
++          selection.r.width == width_ && selection.r.height == height_,
++          "T880 visible crop mismatch");
++    storage_height_ = p.height;
++    for (unsigned i = 0; i < 2; ++i) {
++        stride_[i] = p.plane_fmt[i].bytesperline;
++        check(stride_[i] >= width_ && stride_[i] <= 16384 &&
++              uint64_t(stride_[i]) * (i ? (p.height + 1) / 2 : p.height) <=
++                  p.plane_fmt[i].sizeimage, "T880 invalid plane layout");
++    }
++    v4l2_control min{}; min.id = V4L2_CID_MIN_BUFFERS_FOR_CAPTURE;
++    checked(fd_, VIDIOC_G_CTRL, &min, "minimum CAPTURE");
++    check(min.value > 0 && min.value <= 60, "T880 capture minimum");
++    allocate(CAP, unsigned(min.value) + 4, capture_);
++    for (const auto &slot : capture_)
++        for (unsigned i = 0; i < 2; ++i)
++            check(slot.planes[i].size >= p.plane_fmt[i].sizeimage,
++                  "T880 mapped plane smaller than negotiated layout");
++    for (unsigned i = 0; i < capture_.size(); ++i) queue_capture(i);
++    unsigned type = CAP; checked(fd_, VIDIOC_STREAMON, &type, "STREAMON CAPTURE");
++    capture_on_ = true;
++}
++void T880Decoder::copy(unsigned index, const v4l2_buffer &, const v4l2_plane *planes,
++                        const std::shared_ptr<Surface> &s) {
++    check(s->width >= width_ && s->height >= height_ && s->fourcc == VA_FOURCC_NV12,
++          "T880 destination mismatch");
++    auto m = s->memory;
++    check(bool(m) && m->origin != MemoryOrigin::Iris && m->fourcc == VA_FOURCC_NV12,
++          "T880 stable destination missing");
++    for (unsigned p = 0; p < 2; ++p) {
++        size_t rows = p ? height_ / 2 : height_;
++        size_t end = size_t(planes[p].data_offset) + (rows - 1) * stride_[p] + width_;
++        check(planes[p].bytesused <= capture_[index].planes[p].size &&
++              planes[p].data_offset <= planes[p].bytesused && end <= planes[p].bytesused,
++              "T880 invalid CAPTURE payload");
++    }
++    check(m->stride >= width_ && m->storage_height >= height_ &&
++          m->data_offset <= m->size, "T880 destination bounds");
++    size_t available = m->size - m->data_offset;
++    check(m->stride && m->storage_height <= available / m->stride,
++          "T880 destination chroma offset");
++    size_t chroma = size_t(m->stride) * m->storage_height;
++    check(width_ <= available - chroma &&
++          size_t(height_ / 2 - 1) <= (available - chroma - width_) / m->stride,
++          "T880 destination chroma bounds");
++    auto *dst = m->map();
++    CpuWrite access(*m);
++    for (unsigned p = 0; p < 2; ++p) {
++        auto *src = static_cast<uint8_t *>(capture_[index].planes[p].address) + planes[p].data_offset;
++        size_t base = m->data_offset + (p ? size_t(m->stride) * m->storage_height : 0);
++        for (unsigned y = 0; y < (p ? height_ / 2 : height_); ++y)
++            memcpy(dst + base + size_t(y) * m->stride, src + size_t(y) * stride_[p], width_);
++    }
++    access.finish();
++    check_deadline();
++}
++void T880Decoder::pump(int timeout) {
++    check_deadline();
++    pollfd p{fd_, POLLIN | POLLOUT | POLLPRI, 0};
++    int r; do { r = poll(&p, 1, timeout); } while (r < 0 && errno == EINTR);
++    check(r >= 0 && !(p.revents & (POLLHUP | POLLNVAL)), "T880 poll failure");
++    for (;;) {
++        v4l2_event event{};
++        if (call(fd_, VIDIOC_DQEVENT, &event) < 0) {
++            check(errno == EAGAIN || errno == ENOENT, "T880 DQEVENT failure"); break;
++        }
++        if (event.type == V4L2_EVENT_SOURCE_CHANGE) configure_capture();
++        else check(event.type == V4L2_EVENT_EOS, "T880 unexpected event");
++    }
++    for (;;) {
++        T880Buffer q(OUT);
++        if (call(fd_, VIDIOC_DQBUF, &q.value) < 0) {
++            check(errno == EAGAIN, "T880 OUTPUT DQBUF failure"); break;
++        }
++        check(q.value.index < output_.size() && q.value.length == 1 &&
++              !(q.value.flags & V4L2_BUF_FLAG_ERROR), "T880 OUTPUT error");
++        auto &slot = output_[q.value.index];
++        auto it = wire_.find(token(q.value.timestamp));
++        check(slot.queued && slot.wire == token(q.value.timestamp) && it != wire_.end() &&
++              !it->second.returned, "T880 unknown/duplicate OUTPUT token");
++        it->second.returned = true; slot.queued = false;
++    }
++    if (!capture_on_ || last_) return;
++    for (;;) {
++        T880Buffer q(CAP);
++        if (call(fd_, VIDIOC_DQBUF, &q.value) < 0) {
++            check(errno == EAGAIN || (errno == EPIPE && last_), "T880 CAPTURE DQBUF failure");
++            break;
++        }
++        check(q.value.index < capture_.size() && q.value.length == 2 &&
++              !(q.value.flags & V4L2_BUF_FLAG_ERROR), "T880 CAPTURE error");
++        auto &slot = capture_[q.value.index];
++        check(slot.queued, "T880 duplicate CAPTURE index"); slot.queued = false;
++        bool payload = q.planes[0].bytesused || q.planes[1].bytesused;
++        if (payload) {
++            uint64_t id = token(q.value.timestamp);
++            auto it = wire_.find(id);
++            check(it != wire_.end() && !it->second.displayed,
++                  "T880 unknown/duplicate DISPLAY token");
++            auto &job = it->second;
++            if (!job.replay) {
++                auto target = pending_.find(job.client);
++                check(target != pending_.end() && target->second->pending &&
++                      target->second->token == job.client, "T880 missing CLIENT surface");
++                copy(q.value.index, q.value, q.planes, target->second);
++                target->second->status = VA_STATUS_SUCCESS;
++                target->second->pending = false; pending_.erase(target);
++            } else {
++                // Replay duplicates never replace stable outputs, but malformed
++                // scratch payloads are still errors, including byte bounds.
++                for (unsigned plane = 0; plane < 2; ++plane) {
++                    size_t rows = plane ? height_ / 2 : height_;
++                    size_t end = size_t(q.planes[plane].data_offset) +
++                                 (rows - 1) * stride_[plane] + width_;
++                    check(end <= q.planes[plane].bytesused &&
++                          q.planes[plane].bytesused <= slot.planes[plane].size,
++                          "T880 replay payload bounds");
++                }
++            }
++            job.displayed = true;
++            trace("T880 display wire=%llu client=%llu replay=%d",
++                  (unsigned long long)id, (unsigned long long)job.client, job.replay);
++        }
++        if (q.value.flags & V4L2_BUF_FLAG_LAST) { last_ = true; break; }
++        check(payload, "T880 empty non-LAST CAPTURE");
++        queue_capture(q.value.index);
++    }
++}
++void T880Decoder::wait_inputs() {
++    for (;;) {
++        bool busy = false; for (auto &slot : output_) busy |= slot.queued;
++        if (!busy) return;
++        pump(10);
++    }
++}
++void T880Decoder::drain() {
++    if (drained_) return;
++    wait_inputs();
++    v4l2_decoder_cmd cmd{}; cmd.cmd = V4L2_DEC_CMD_STOP;
++    checked(fd_, VIDIOC_DECODER_CMD, &cmd, "T880 STOP");
++    while (!last_) pump(10);
++    wait_inputs();
++    for (const auto &[id, job] : wire_)
++        check(job.returned && job.displayed, "T880 missing completion at LAST");
++    check(pending_.empty(), "T880 pending CLIENT at LAST");
++    drained_ = true;
++}
++void T880Decoder::send(const History &picture, bool replay) {
++    unsigned index;
++    for (;;) {
++        pump(0);
++        for (index = 0; index < output_.size(); ++index) if (!output_[index].queued) break;
++        if (index < output_.size()) break;
++        pump(10);
++    }
++    auto &slot = output_[index];
++    check(picture.bytes.size() <= slot.planes[0].size, "T880 negotiated OUTPUT limit");
++    check(next_wire_ < uint64_t(INT64_MAX),
++          "T880 wire token exhausted");
++    uint64_t id = next_wire_++;
++    // Allocate ledger nodes before transferring queue ownership.
++    wire_.emplace(id, Submission{picture.client, replay, false, false});
++    memcpy(slot.planes[0].address, picture.bytes.data(), picture.bytes.size());
++    T880Buffer q(OUT, index); q.value.length = 1;
++    q.planes[0].length = slot.planes[0].size; q.planes[0].bytesused = picture.bytes.size();
++    q.value.timestamp.tv_sec = id / 1000000; q.value.timestamp.tv_usec = id % 1000000;
++    checked(fd_, VIDIOC_QBUF, &q.value, "T880 QBUF OUTPUT");
++    slot.wire = id; slot.queued = true;
++    trace("T880 submit wire=%llu client=%llu replay=%d bytes=%zu",
++          (unsigned long long)id, (unsigned long long)picture.client, replay, picture.bytes.size());
++    while (!capture_on_) pump(10);
++}
++void T880Decoder::rebuild() {
++    check(drained_ && last_ && pending_.empty(), "T880 unsafe replay reset");
++    unsigned type = CAP;
++    checked(fd_, VIDIOC_STREAMOFF, &type, "T880 powered CAPTURE reset");
++    capture_on_ = false;
++    for (auto &s : capture_) s.queued = false;
++    wire_.clear(); last_ = false;
++    for (unsigned i = 0; i < capture_.size(); ++i) queue_capture(i);
++    checked(fd_, VIDIOC_STREAMON, &type, "T880 powered CAPTURE resume");
++    capture_on_ = true; drained_ = false;
++    for (const auto &picture : history_) send(picture, true);
++    // Return all compressed ownership before accepting a new CLIENT AU. The
++    // replay tail remains in the DPB and may display only with later input.
++    wait_inputs();
++}
++void T880Decoder::submit(const std::vector<uint8_t> &bytes,
++                          const std::shared_ptr<Surface> &s,
++                          const std::vector<uint8_t> &anchor) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    check(failure_ == VA_STATUS_SUCCESS, "T880 failed session", failure_);
++    deadline_ = Clock::now() + std::chrono::seconds(30);
++    // Validate engineering bounds and allocate AU/stable backing before reset.
++    // Later ledger allocation failure is fatal and closes the session safely.
++    const auto &accepted = anchor.empty() ? bytes : anchor;
++    check(!accepted.empty() && accepted.size() <= AU_LIMIT, "T880 AU size limit",
++          VA_STATUS_ERROR_INVALID_BUFFER);
++    check(!history_.empty() || !anchor.empty(), "T880 first picture must be an independent key anchor",
++          VA_STATUS_ERROR_INVALID_PARAMETER);
++    check(next_client_ != std::numeric_limits<uint64_t>::max(), "T880 CLIENT token exhausted");
++    check(!anchor.empty() || (history_.size() < COUNT_LIMIT &&
++          accepted.size() <= HISTORY_LIMIT - history_bytes_), "T880 contiguous history limit",
++          VA_STATUS_ERROR_ALLOCATION_FAILED);
++    History picture{next_client_, accepted};
++    auto memory = s->memory ? s->memory : allocate_surface(render_fd_, s->width, s->height,
++                                                          VA_FOURCC_NV12);
++    history_.reserve(history_.size() + 1);
++    try {
++        pump(0);
++        if (!anchor.empty() && !history_.empty()) {
++            // Retire an old anchor only after every accepted CLIENT has a
++            // stable completed output. Reset also releases old DPB references.
++            drain();
++            history_.clear(); history_bytes_ = 0;
++        }
++        if (drained_) rebuild();
++        s->memory = std::move(memory);
++        pending_.emplace(picture.client, s);
++        s->token = picture.client; s->status = VA_STATUS_SUCCESS; s->pending = true;
++        send(picture, false);
++        history_bytes_ += picture.bytes.size(); history_.push_back(std::move(picture));
++        ++next_client_;
++    } catch (const Error &e) { fail(e.status); throw; }
++      catch (...) { fail(VA_STATUS_ERROR_ALLOCATION_FAILED); throw; }
++}
++void T880Decoder::sync(const std::shared_ptr<Surface> &s) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    check(failure_ == VA_STATUS_SUCCESS, "T880 failed session", failure_);
++    deadline_ = Clock::now() + std::chrono::seconds(30);
++    try {
++        pump(0);
++        if (s->pending) {
++            wait_inputs(); pump(0);
++            if (s->pending) drain();
++        }
++        check(!s->pending && s->status == VA_STATUS_SUCCESS, "T880 sync failed");
++    } catch (const Error &e) { fail(e.status); throw; }
++      catch (...) { fail(VA_STATUS_ERROR_ALLOCATION_FAILED); throw; }
++}
++void T880Decoder::finish() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (failure_ != VA_STATUS_SUCCESS) return;
++    deadline_ = Clock::now() + std::chrono::seconds(30);
++    try { if (!history_.empty()) drain(); }
++    catch (const Error &e) { fail(e.status); throw; }
++    catch (...) { fail(VA_STATUS_ERROR_ALLOCATION_FAILED); throw; }
++}
++void T880Decoder::refresh() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    check(failure_ == VA_STATUS_SUCCESS, "T880 failed session", failure_);
++    deadline_ = Clock::now() + std::chrono::seconds(30);
++    try { pump(0); } catch (const Error &e) { fail(e.status); throw; }
++      catch (...) { fail(VA_STATUS_ERROR_ALLOCATION_FAILED); throw; }
++}
++} // namespace irisva
+diff --git a/src/t880-decoder.hpp b/src/t880-decoder.hpp
+new file mode 100644
+index 00000000..5c5d7a05
+--- /dev/null
++++ b/src/t880-decoder.hpp
+@@ -0,0 +1,72 @@
++// SPDX-License-Identifier: MIT
++#pragma once
++#include "internal.hpp"
++#include <linux/videodev2.h>
++
++namespace irisva {
++// One serialized V4L2 owner. Scratch mappings never escape this object; CLIENT
++// surfaces own independent DMA-heap memory. Wire tokens identify submissions,
++// not VA surface IDs or recycled CAPTURE indices.
++class T880Decoder {
++    struct Plane {
++        void *address = nullptr;
++        size_t size = 0;
++        Plane() = default;
++        Plane(const Plane &) = delete;
++        Plane &operator=(const Plane &) = delete;
++        Plane(Plane &&other) noexcept;
++        ~Plane();
++    };
++    struct Slot {
++        std::vector<Plane> planes;
++        bool queued = false;
++        uint64_t wire = 0;
++    };
++    struct History {
++        uint64_t client;
++        std::vector<uint8_t> bytes;
++    };
++    struct Submission {
++        uint64_t client;
++        bool replay;
++        bool displayed = false;
++        bool returned = false;
++    };
++    using Clock = std::chrono::steady_clock;
++    int fd_ = -1, render_fd_;
++    unsigned width_, height_, stride_[2]{}, storage_height_ = 0;
++    std::mutex mutex_;
++    bool output_on_ = false, capture_on_ = false, drained_ = false, last_ = false;
++    VAStatus failure_ = VA_STATUS_SUCCESS;
++    uint64_t next_client_ = 1, next_wire_ = 1;
++    size_t history_bytes_ = 0;
++    std::vector<Slot> output_, capture_;
++    std::vector<History> history_;
++    std::map<uint64_t, Submission> wire_;
++    std::map<uint64_t, std::shared_ptr<Surface>> pending_;
++    Clock::time_point deadline_;
++    void allocate(unsigned type, unsigned count, std::vector<Slot> &slots);
++    void configure_capture();
++    void queue_capture(unsigned index);
++    void pump(int timeout);
++    void wait_inputs();
++    void drain();
++    void rebuild();
++    void send(const History &picture, bool replay);
++    void copy(unsigned index, const v4l2_buffer &buffer, const v4l2_plane *planes,
++              const std::shared_ptr<Surface> &surface);
++    void check_deadline();
++    void fail(VAStatus status) noexcept;
++  public:
++    T880Decoder(const std::string &device, unsigned width, unsigned height,
++                VAProfile profile, unsigned rt_format, int render_fd);
++    ~T880Decoder();
++    // anchor contains complete codec parameters and an independent key AU.
++    // Empty anchor means this AU depends on the current contiguous history.
++    void submit(const std::vector<uint8_t> &bytes, const std::shared_ptr<Surface> &surface,
++                const std::vector<uint8_t> &anchor);
++    void sync(const std::shared_ptr<Surface> &surface);
++    void finish();
++    void refresh();
++};
++} // namespace irisva
+diff --git a/tests/t880/anchors.cpp b/tests/t880/anchors.cpp
+new file mode 100644
+index 00000000..edded36c
+--- /dev/null
++++ b/tests/t880/anchors.cpp
+@@ -0,0 +1,32 @@
++// SPDX-License-Identifier: MIT
++#include "../../src/av1.cpp"
++#include <cassert>
++#include <iostream>
++using namespace irisva;
++std::vector<unsigned> types(const std::vector<uint8_t> &bytes) {
++    std::vector<unsigned> result;
++    for (size_t at = 0; at < bytes.size();) {
++        unsigned header = bytes[at++]; assert((header & 7) == 2);
++        result.push_back(header >> 3); size_t size = 0; unsigned shift = 0, byte;
++        do { assert(at < bytes.size() && shift < 56); byte = bytes[at++];
++             size |= size_t(byte & 127) << shift; shift += 7; } while (byte & 128);
++        assert(size <= bytes.size() - at); at += size;
++    }
++    return result;
++}
++int main() {
++    std::vector<uint8_t> cached(130, 0xab), out;
++    obu(out, 2, {}); size_t td_end = out.size(); obu(out, 6, {1, 2, 3});
++    auto unchanged = out;
++    auto anchor = replay_anchor(out, td_end, cached, 0, true, false);
++    assert(types(anchor) == std::vector<unsigned>({2, 1, 6}));
++    std::vector<uint8_t> expected; obu(expected, 2, {}); obu(expected, 1, cached); obu(expected, 6, {1,2,3});
++    assert(anchor == expected && out == unchanged);
++    assert(replay_anchor(out, td_end, cached, 0, false, false).empty()); // hidden cached KEY
++    assert(replay_anchor(out, td_end, cached, 1, true, false).empty()); // INTER
++    assert(replay_anchor(out, td_end, cached, 2, true, false).empty()); // INTRA_ONLY
++    assert(replay_anchor(out, td_end, cached, 3, true, false).empty()); // SWITCH
++    assert(replay_anchor(expected, td_end, cached, 0, false, true) == expected); // initial KEY
++    assert(replay_anchor(expected, td_end, cached, 0, true, true) == expected);
++    std::cout << "AV1 initial/cached/hidden/switch anchor framing passed\n";
++}
+diff --git a/tests/t880/replay.cpp b/tests/t880/replay.cpp
+new file mode 100644
+index 00000000..71668fdb
+--- /dev/null
++++ b/tests/t880/replay.cpp
+@@ -0,0 +1,225 @@
++// SPDX-License-Identifier: MIT
++// Exercise the production class against a deterministic stateful V4L2 model.
++#include "../../src/t880-decoder.hpp"
++#include <linux/dma-buf.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <poll.h>
++#include <cerrno>
++#include <limits>
++#include <deque>
++#include <cassert>
++#include <iostream>
++using namespace irisva;
++namespace {
++struct Fake {
++    bool event = false, configured = false, last = false;
++    bool duplicate = false, wrong_output = false, bad_alloc = false, bad_payload = false;
++    unsigned resets = 0, stops = 0, accepted = 0;
++    std::deque<std::pair<unsigned, timeval>> output;
++    std::deque<timeval> decoded, display;
++    std::deque<unsigned> capture;
++    std::map<unsigned, uint8_t *> mapped;
++    std::vector<uint64_t> submitted;
++} f;
++int fake_open(const char *, int, ...) { return 900; }
++int fake_close(int) { return 0; }
++void *fake_mmap(void *, size_t n, int, int, int, off_t offset) {
++    auto p = static_cast<uint8_t *>(calloc(1, n));
++    f.mapped[unsigned(offset)] = p; return p;
++}
++int fake_munmap(void *p, size_t) { free(p); return 0; }
++int fake_poll(pollfd *, nfds_t, int) { if (f.bad_alloc) throw std::bad_alloc(); return 0; }
++int fake_ioctl(int fd, unsigned long request, void *arg) {
++    if (fd != 900) { assert(request == DMA_BUF_IOCTL_SYNC); return 0; }
++    if (request == VIDIOC_QUERYCAP) {
++        auto &cap = *static_cast<v4l2_capability *>(arg);
++        strcpy(reinterpret_cast<char *>(cap.driver), "mtk-vcp-dec");
++        cap.capabilities = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING; return 0;
++    }
++    if (request == VIDIOC_SUBSCRIBE_EVENT) return 0;
++    if (request == VIDIOC_S_FMT || request == VIDIOC_G_FMT) {
++        auto &p = static_cast<v4l2_format *>(arg)->fmt.pix_mp;
++        if (static_cast<v4l2_format *>(arg)->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
++            p.pixelformat = V4L2_PIX_FMT_NV12M; p.num_planes = 2;
++            p.width = 160; p.height = 128;
++            for (unsigned i = 0; i < 2; ++i) {
++                p.plane_fmt[i].bytesperline = 160;
++                p.plane_fmt[i].sizeimage = i ? 10240 : 20480;
++            }
++        }
++        return 0;
++    }
++    if (request == VIDIOC_G_SELECTION) {
++        auto &r = static_cast<v4l2_selection *>(arg)->r;
++        r.width = 160; r.height = 128; return 0;
++    }
++    if (request == VIDIOC_G_CTRL) { static_cast<v4l2_control *>(arg)->value = 1; return 0; }
++    if (request == VIDIOC_REQBUFS) return 0;
++    if (request == VIDIOC_QUERYBUF) {
++        auto &q = *static_cast<v4l2_buffer *>(arg);
++        bool cap = q.type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++        q.length = cap ? 2 : 1;
++        for (unsigned p = 0; p < q.length; ++p) {
++            q.m.planes[p].length = cap ? (p ? 10240 : 20480) : 4u * 1024 * 1024;
++            q.m.planes[p].m.mem_offset = (cap ? 100 : 0) + q.index * 2 + p;
++        }
++        return 0;
++    }
++    if (request == VIDIOC_STREAMON) return 0;
++    if (request == VIDIOC_STREAMOFF) {
++        if (*static_cast<unsigned *>(arg) == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
++            f.capture.clear(); f.decoded.clear(); f.last = false; ++f.resets;
++        }
++        return 0;
++    }
++    if (request == VIDIOC_QBUF) {
++        auto &q = *static_cast<v4l2_buffer *>(arg);
++        if (q.type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) f.capture.push_back(q.index);
++        else {
++            if (!f.configured) { f.event = true; f.configured = true; }
++            f.output.emplace_back(q.index, q.timestamp);
++            f.decoded.push_back(q.timestamp);
++            f.submitted.push_back(uint64_t(q.timestamp.tv_sec) * 1000000 + q.timestamp.tv_usec);
++            ++f.accepted;
++        }
++        return 0;
++    }
++    if (request == VIDIOC_DQEVENT) {
++        if (!f.event) { errno = ENOENT; return -1; }
++        f.event = false; static_cast<v4l2_event *>(arg)->type = V4L2_EVENT_SOURCE_CHANGE; return 0;
++    }
++    if (request == VIDIOC_DECODER_CMD) {
++        assert(static_cast<v4l2_decoder_cmd *>(arg)->cmd == V4L2_DEC_CMD_STOP);
++        ++f.stops; f.display = f.decoded; f.decoded.clear(); f.last = true;
++        if (f.duplicate && !f.display.empty()) f.display.push_back(f.display.front());
++        return 0;
++    }
++    if (request == VIDIOC_DQBUF) {
++        auto &q = *static_cast<v4l2_buffer *>(arg);
++        if (q.type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
++            if (f.output.empty()) { errno = EAGAIN; return -1; }
++            auto [index, ts] = f.output.front(); f.output.pop_front();
++            q.index = index; q.timestamp = ts; q.length = 1;
++            if (f.wrong_output) ++q.timestamp.tv_usec;
++            return 0;
++        }
++        if (f.capture.empty() || (!f.last && f.display.empty())) { errno = EAGAIN; return -1; }
++        q.index = f.capture.front(); f.capture.pop_front(); q.length = 2;
++        if (f.display.empty()) { q.flags = V4L2_BUF_FLAG_LAST; f.last = false; }
++        else {
++            q.timestamp = f.display.front(); f.display.pop_front();
++            for (unsigned p = 0; p < 2; ++p) {
++                q.m.planes[p].bytesused = p ? 10240 : 20480;
++                if (f.bad_payload) ++q.m.planes[p].bytesused;
++                memset(f.mapped.at(100 + q.index * 2 + p), q.timestamp.tv_usec & 255,
++                       p ? 10240 : 20480);
++            }
++        }
++        return 0;
++    }
++    assert(false); return -1;
++}
++}
++#define open fake_open
++#define close fake_close
++#define mmap fake_mmap
++#define munmap fake_munmap
++#define ioctl fake_ioctl
++#define poll fake_poll
++#include "../../src/t880-decoder.cpp"
++#undef open
++#undef close
++#undef mmap
++#undef munmap
++#undef ioctl
++#undef poll
++namespace irisva {
++Memory::~Memory() { free(mapping); }
++uint8_t *Memory::map() { return static_cast<uint8_t *>(mapping); }
++void wait_surface_access(const Memory &, short) {}
++std::shared_ptr<Memory> allocate_surface(int, unsigned w, unsigned h, unsigned fourcc) {
++    auto m = std::make_shared<Memory>(); m->fd = 901; m->origin = MemoryOrigin::DmaHeap;
++    m->width = w; m->height = h; m->stride = w; m->storage_height = h;
++    m->fourcc = fourcc; m->size = size_t(w) * h * 3 / 2; m->mapping = calloc(1, m->size);
++    return m;
++}
++}
++std::shared_ptr<Surface> surface() {
++    auto s = std::make_shared<Surface>(); s->width = 160; s->height = 128; return s;
++}
++template<class F> void rejects(F action) { bool rejected = false;
++    try { action(); } catch (const Error &) { rejected = true; } if (!rejected) std::cerr << "missing rejection\n"; assert(rejected); }
++int main() {
++    for (auto profile : {VAProfileH264Main, VAProfileHEVCMain, VAProfileVP9Profile0, VAProfileAV1Profile0}) {
++        f = Fake{};
++        T880Decoder d("fake", 160, 128, profile, VA_RT_FORMAT_YUV420, -1);
++        auto a = surface(), b = surface(), c = surface();
++        rejects([&] { d.submit({1}, a, {}); }); assert(f.accepted == 0);
++        d.submit({1}, a, {7, 8, 1}); d.sync(a);
++        assert(!a->pending && a->memory->map()[0] == 1);
++        d.submit({2}, b, {}); d.sync(b);
++        assert(a->memory->map()[0] == 1 && b->memory->map()[0] == 3);
++        d.submit({3}, c, {}); d.sync(c);
++        assert(a->memory->map()[0] == 1 && b->memory->map()[0] == 3 && c->memory->map()[0] == 6);
++        assert(f.accepted == 6 && f.stops == 3 && f.resets == 2);
++        for (unsigned i = 0; i < f.submitted.size(); ++i) assert(f.submitted[i] == i + 1);
++        unsigned count = f.accepted;
++        rejects([&] { d.submit(std::vector<uint8_t>(4u * 1024 * 1024 + 1), surface(), {}); });
++        assert(f.accepted == count); // Limits fail before reset or QBUF.
++        auto anchor = surface(); d.submit({4}, anchor, {9, 4}); d.sync(anchor);
++        assert(f.accepted == count + 1 && a->memory->map()[0] == 1);
++        d.finish();
++    }
++    f = Fake{};
++    {
++        T880Decoder d("fake", 160, 128, VAProfileHEVCMain, VA_RT_FORMAT_YUV420, -1);
++        auto s = surface(); d.submit({1}, s, {1}); f.duplicate = true;
++        rejects([&] { d.sync(s); });
++        rejects([&] { d.submit({2}, surface(), {}); });
++    }
++    f = Fake{};
++    {
++        T880Decoder d("fake", 160, 128, VAProfileH264Main, VA_RT_FORMAT_YUV420, -1);
++        auto s = surface(); f.wrong_output = true;
++        rejects([&] { d.submit({1}, s, {1}); }); assert(!s->pending && s->status != VA_STATUS_SUCCESS);
++    }
++    f = Fake{};
++    {
++        T880Decoder d("fake", 160, 128, VAProfileH264Main, VA_RT_FORMAT_YUV420, -1);
++        auto s = surface(); d.submit({1}, s, {1}); f.bad_alloc = true;
++        bool failed = false;
++        try { d.sync(s); } catch (const std::bad_alloc &) { failed = true; }
++        assert(failed && !s->pending && s->status == VA_STATUS_ERROR_ALLOCATION_FAILED);
++        f.bad_alloc = false; rejects([&] { d.submit({2}, surface(), {}); });
++    }
++    f = Fake{};
++    {
++        T880Decoder d("fake", 160, 128, VAProfileH264Main, VA_RT_FORMAT_YUV420, -1);
++        auto s = surface(); d.submit({1}, s, {1}); f.bad_payload = true;
++        rejects([&] { d.sync(s); }); assert(!s->pending && s->status != VA_STATUS_SUCCESS);
++    }
++    f = Fake{};
++    {
++        T880Decoder d("fake", 160, 128, VAProfileH264Main, VA_RT_FORMAT_YUV420, -1);
++        std::vector<uint8_t> megabyte(1024 * 1024, 1);
++        d.submit(megabyte, surface(), megabyte);
++        for (unsigned i = 1; i < 64; ++i) d.submit(megabyte, surface(), {});
++        unsigned accepted = f.accepted;
++        rejects([&] { d.submit({1}, surface(), {}); });
++        assert(f.accepted == accepted && f.resets == 0);
++    }
++    f = Fake{};
++    {
++        T880Decoder d("fake", 160, 128, VAProfileH264Main, VA_RT_FORMAT_YUV420, -1);
++        d.submit({1}, surface(), {1});
++        for (unsigned i = 1; i < 4096; ++i) d.submit({1}, surface(), {});
++        unsigned accepted = f.accepted;
++        rejects([&] { d.submit({1}, surface(), {}); });
++        assert(f.accepted == accepted && f.resets == 0);
++    }
++    rejects([] { token(timeval{std::numeric_limits<long>::max(), 999999}); });
++    std::cout << "T880 replay ownership, stable pixels, fresh anchor, limits and sticky faults passed\n";
++}

@@ -1,0 +1,326 @@
+From 6dfbe61cdc24e5f06e255f02e9309d9b5e030b2a Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] pmdomain: mediatek: support MT6897 GPUEB GPU DVFS
+
+Use the MT6897 GPUEB protocol and OPP table for GPU DVFS and cooling.
+Ignore stale replies and honor the vendor timeout.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-15T15:49:29+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-16T00:20:05+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-16T22:58:49+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-16T22:59:05+08:00
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/pmdomain/mediatek/mtk-mfg-pmdomain.c | 156 +++++++++++++++----
+ 1 file changed, 129 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/pmdomain/mediatek/mtk-mfg-pmdomain.c b/drivers/pmdomain/mediatek/mtk-mfg-pmdomain.c
+index 1417ffc22b..99933649ea 100644
+--- a/drivers/pmdomain/mediatek/mtk-mfg-pmdomain.c
++++ b/drivers/pmdomain/mediatek/mtk-mfg-pmdomain.c
+@@ -163,6 +163,9 @@ enum mtk_mfg_ipi_cmd {
+ 	CMD_NUM				= 19,
+ };
+ 
++/* IPI target of CMD_COMMIT: 1 is the GPU, 2 the stack (dual-buck only) */
++#define MFG_IPI_TARGET_GPU		1
++
+ /*
+  * This struct is part of the ABI of the GPUEB firmware. Changing it, or
+  * reordering fields in it, will break things, so don't do it. Thank you.
+@@ -285,6 +288,32 @@ struct mtk_mfg_variant {
+ 	/** @turbo_below: opp indices below this value are considered turbo */
+ 	unsigned int turbo_below;
+ 	int (*init)(struct mtk_mfg *mfg);
++	/** @freq_gpu: shared-memory word with the GPU frequency in kHz */
++	unsigned int freq_gpu;
++	/** @freq_stk: shared-memory word with the stack frequency in kHz */
++	unsigned int freq_stk;
++	/** @opp_table_gpu: offset of the GPU OPP table in the shared memory */
++	unsigned int opp_table_gpu;
++	/** @opp_table_stk: offset of the stack OPP table in the shared memory */
++	unsigned int opp_table_stk;
++	/** @gpr_ipi_magic: offset of the IPI magic word in the GPR block */
++	unsigned int gpr_ipi_magic;
++	/**
++	 * @eb_always_on: the bootloader starts the GPUEB and it keeps running;
++	 * no GHPM power sequence and no sleep requests
++	 */
++	bool eb_always_on;
++	/**
++	 * @ipi_timeout_ms: how long to wait for a gpufreq IPI reply; 0 means
++	 * the default of 500 ms
++	 */
++	unsigned int ipi_timeout_ms;
++	/**
++	 * @gpu_commit: single-buck firmware: request GPU OPPs with CMD_COMMIT
++	 * for the GPU target, as the stock driver does, instead of fixing a
++	 * dual GPU/stack OPP
++	 */
++	bool gpu_commit;
+ };
+ 
+ static inline struct mtk_mfg *mtk_mfg_from_genpd(struct generic_pm_domain *pd)
+@@ -307,7 +336,7 @@ static unsigned long mtk_mfg_recalc_rate_gpu(struct clk_hw *hw,
+ {
+ 	struct mtk_mfg *mfg = container_of(hw, struct mtk_mfg, clk_core_hw);
+ 
+-	return readl(mfg->shared_mem + GF_REG_FREQ_OUT_GPU) * HZ_PER_KHZ;
++	return readl(mfg->shared_mem + mfg->variant->freq_gpu) * HZ_PER_KHZ;
+ }
+ 
+ static unsigned long mtk_mfg_recalc_rate_stack(struct clk_hw *hw,
+@@ -315,7 +344,7 @@ static unsigned long mtk_mfg_recalc_rate_stack(struct clk_hw *hw,
+ {
+ 	struct mtk_mfg *mfg = container_of(hw, struct mtk_mfg, clk_stack_hw);
+ 
+-	return readl(mfg->shared_mem + GF_REG_FREQ_OUT_STK) * HZ_PER_KHZ;
++	return readl(mfg->shared_mem + mfg->variant->freq_stk) * HZ_PER_KHZ;
+ }
+ 
+ static const struct clk_ops mtk_mfg_clk_gpu_ops = {
+@@ -434,22 +463,46 @@ static int mtk_mfg_eb_off(struct mtk_mfg *mfg)
+ static int mtk_mfg_send_ipi(struct mtk_mfg *mfg, struct mtk_mfg_ipi_msg *msg)
+ {
+ 	struct device *dev = &mfg->pdev->dev;
+-	unsigned long wait;
++	struct mtk_mfg_mbox *gf = mfg->gf_mbox;
++	unsigned long wait = msecs_to_jiffies(mfg->variant->ipi_timeout_ms ?: 500);
++	struct mtk_mfg_ipi_msg *reply = gf->rx_data;
++	u32 cmd = le32_to_cpu(msg->cmd);
++	unsigned long start;
+ 	int ret;
+ 
+ 	msg->magic = mfg->ipi_magic;
+ 
+-	ret = mbox_send_message(mfg->gf_mbox->ch, msg);
++	/* A late reply to an earlier, timed-out command must not count */
++	reinit_completion(&gf->rx_done);
++
++	start = jiffies;
++	ret = mbox_send_message(gf->ch, msg);
+ 	if (ret < 0) {
+ 		dev_err(dev, "Cannot send GPUFreq IPI command: %pe\n", ERR_PTR(ret));
+ 		return ret;
+ 	}
+ 
+-	wait = wait_for_completion_timeout(&mfg->gf_mbox->rx_done, msecs_to_jiffies(500));
+-	if (!wait)
+-		return -ETIMEDOUT;
++	/* The firmware echoes the command in its reply; drop other replies */
++	for (;;) {
++		wait = wait_for_completion_timeout(&gf->rx_done, wait);
++		if (!wait)
++			return -ETIMEDOUT;
++		if (le32_to_cpu(reply->cmd) == cmd)
++			break;
++
++		dev_warn(dev, "dropped a late reply to GPUFreq IPI command %u\n",
++			 le32_to_cpu(reply->cmd));
++		reinit_completion(&gf->rx_done);
++		/* The reply to this command may have arrived meanwhile */
++		if (le32_to_cpu(reply->cmd) == cmd)
++			break;
++	}
++
++	if (time_after(jiffies, start + msecs_to_jiffies(500)))
++		dev_warn(dev, "slow GPUFreq IPI reply to command %u: %u ms\n",
++			 cmd, jiffies_to_msecs(jiffies - start));
+ 
+-	msg = mfg->gf_mbox->rx_data;
++	msg = reply;
+ 
+ 	if (msg->u.return_value < 0) {
+ 		dev_err(dev, "IPI return: %d\n", msg->u.return_value);
+@@ -502,9 +555,15 @@ static int mtk_mfg_set_oppidx(struct mtk_mfg *mfg, unsigned int opp_idx)
+ 	if (opp_idx >= mfg->num_gpu_opps)
+ 		return -EINVAL;
+ 
+-	msg.cmd = CMD_FIX_DUAL_TARGET_OPPIDX;
+-	msg.u.dual_commit.gpu_oppidx = opp_idx;
+-	msg.u.dual_commit.stack_oppidx = opp_idx;
++	if (mfg->variant->gpu_commit) {
++		msg.cmd = CMD_COMMIT;
++		msg.target = cpu_to_le32(MFG_IPI_TARGET_GPU);
++		msg.u.oppidx = opp_idx;
++	} else {
++		msg.cmd = CMD_FIX_DUAL_TARGET_OPPIDX;
++		msg.u.dual_commit.gpu_oppidx = opp_idx;
++		msg.u.dual_commit.stack_oppidx = opp_idx;
++	}
+ 
+ 	ret = mtk_mfg_send_ipi(mfg, &msg);
+ 	if (ret) {
+@@ -550,7 +609,7 @@ static int mtk_mfg_read_opp_tables(struct mtk_mfg *mfg)
+ 	}
+ 
+ 	for (i = 0; i < mfg->num_gpu_opps; i++) {
+-		memcpy_fromio(&e, mfg->shared_mem + GF_REG_OPP_TABLE_GPU + i * sizeof(e),
++		memcpy_fromio(&e, mfg->shared_mem + mfg->variant->opp_table_gpu + i * sizeof(e),
+ 			      sizeof(e));
+ 		if (mem_is_zero(&e, sizeof(e))) {
+ 			dev_err(dev, "ran into an empty GPU OPP at index %u\n",
+@@ -565,7 +624,7 @@ static int mtk_mfg_read_opp_tables(struct mtk_mfg *mfg)
+ 	}
+ 
+ 	for (i = 0; i < mfg->num_stack_opps; i++) {
+-		memcpy_fromio(&e, mfg->shared_mem + GF_REG_OPP_TABLE_STK + i * sizeof(e),
++		memcpy_fromio(&e, mfg->shared_mem + mfg->variant->opp_table_stk + i * sizeof(e),
+ 			      sizeof(e));
+ 		if (mem_is_zero(&e, sizeof(e))) {
+ 			dev_err(dev, "ran into an empty Stack OPP at index %u\n",
+@@ -622,6 +681,31 @@ static const struct mtk_mfg_variant mtk_mfg_mt8196_variant = {
+ 	.num_regulators = ARRAY_SIZE(mtk_mfg_mt8196_regulators),
+ 	.turbo_below = 7,
+ 	.init = mtk_mfg_mt8196_init,
++	.freq_gpu = GF_REG_FREQ_OUT_GPU,
++	.freq_stk = GF_REG_FREQ_OUT_STK,
++	.opp_table_gpu = GF_REG_OPP_TABLE_GPU,
++	.opp_table_stk = GF_REG_OPP_TABLE_STK,
++	.gpr_ipi_magic = GPR_IPI_MAGIC,
++};
++
++/*
++ * MT6897: the same gpufreq firmware ABI; the bootloader starts the GPUEB,
++ * which then owns the GPU clocks and supplies. Its GPR block keeps the IPI
++ * magic in word 13 counted from 0x1c (the vendor "gpueb_gpr_base"). The
++ * shared memory starts like the MT8196 one, but its OPP tables sit 0xd8
++ * bytes further in.
++ */
++static const struct mtk_mfg_variant mtk_mfg_mt6897_variant = {
++	/* FREQ_OUT stays 0 on this firmware; FREQ_CUR holds the frequency. */
++	.freq_gpu = GF_REG_FREQ_CUR_GPU,
++	.freq_stk = GF_REG_FREQ_CUR_STK,
++	.opp_table_gpu = 0x3ec,
++	.opp_table_stk = 0xa7c,
++	.gpr_ipi_magic = 0x50,
++	.eb_always_on = true,
++	.gpu_commit = true,
++	/* The vendor gpufreq driver waits up to IPI_TIMEOUT_MS = 10 s */
++	.ipi_timeout_ms = 10000,
+ };
+ 
+ static void mtk_mfg_mbox_rx_callback(struct mbox_client *cl, void *mssg)
+@@ -715,11 +799,13 @@ static int mtk_mfg_power_on(struct generic_pm_domain *pd)
+ 	if (ret)
+ 		goto err_disable_eb_clk;
+ 
+-	ret = mtk_mfg_eb_on(mfg);
+-	if (ret)
+-		goto err_disable_clks;
++	if (!mfg->variant->eb_always_on) {
++		ret = mtk_mfg_eb_on(mfg);
++		if (ret)
++			goto err_disable_clks;
++	}
+ 
+-	mfg->ipi_magic = readl(mfg->gpr + GPR_IPI_MAGIC);
++	mfg->ipi_magic = readl(mfg->gpr + mfg->variant->gpr_ipi_magic);
+ 
+ 	ret = mtk_mfg_power_control(mfg, true);
+ 	if (ret)
+@@ -736,7 +822,8 @@ static int mtk_mfg_power_on(struct generic_pm_domain *pd)
+ 	return 0;
+ 
+ err_eb_off:
+-	mtk_mfg_eb_off(mfg);
++	if (!mfg->variant->eb_always_on)
++		mtk_mfg_eb_off(mfg);
+ err_disable_clks:
+ 	clk_bulk_disable_unprepare(mfg->variant->num_clks, mfg->gpu_clks);
+ err_disable_eb_clk:
+@@ -759,10 +846,12 @@ static int mtk_mfg_power_off(struct generic_pm_domain *pd)
+ 		return ret;
+ 	}
+ 
+-	ret = mtk_mfg_eb_off(mfg);
+-	if (ret) {
+-		dev_err(dev, "eb_off failed: %pe\n", ERR_PTR(ret));
+-		return ret;
++	if (!mfg->variant->eb_always_on) {
++		ret = mtk_mfg_eb_off(mfg);
++		if (ret) {
++			dev_err(dev, "eb_off failed: %pe\n", ERR_PTR(ret));
++			return ret;
++		}
+ 	}
+ 
+ 	clk_bulk_disable_unprepare(mfg->variant->num_clks, mfg->gpu_clks);
+@@ -801,6 +890,10 @@ static int mtk_mfg_init_mbox(struct mtk_mfg *mfg)
+ 
+ 	mfg->gf_mbox = gf;
+ 
++	/* An always-on GPUEB gets no sleep requests. */
++	if (mfg->variant->eb_always_on)
++		return 0;
++
+ 	slp = devm_kzalloc(dev, sizeof(*slp), GFP_KERNEL);
+ 	if (!slp)
+ 		return -ENOMEM;
+@@ -998,6 +1091,9 @@ static int mtk_mfg_probe(struct platform_device *pdev)
+ 		goto err_remove_genpd;
+ 	}
+ 
++	if (data->eb_always_on)
++		dev_info(dev, "IPI magic %08x\n", readl(mfg->gpr + data->gpr_ipi_magic));
++
+ 	ret = mtk_mfg_power_on(&mfg->pd);
+ 	if (ret) {
+ 		dev_err_probe(dev, ret, "Failed to power on MFG\n");
+@@ -1035,8 +1131,10 @@ static int mtk_mfg_probe(struct platform_device *pdev)
+ err_power_off:
+ 	mtk_mfg_power_off(&mfg->pd);
+ err_free_mbox:
+-	mbox_free_channel(mfg->slp_mbox->ch);
+-	mfg->slp_mbox->ch = NULL;
++	if (mfg->slp_mbox) {
++		mbox_free_channel(mfg->slp_mbox->ch);
++		mfg->slp_mbox->ch = NULL;
++	}
+ 	mbox_free_channel(mfg->gf_mbox->ch);
+ 	mfg->gf_mbox->ch = NULL;
+ err_remove_genpd:
+@@ -1046,6 +1144,7 @@ static int mtk_mfg_probe(struct platform_device *pdev)
+ }
+ 
+ static const struct of_device_id mtk_mfg_of_match[] = {
++	{ .compatible = "mediatek,mt6897-gpufreq", .data = &mtk_mfg_mt6897_variant },
+ 	{ .compatible = "mediatek,mt8196-gpufreq", .data = &mtk_mfg_mt8196_variant },
+ 	{}
+ };
+@@ -1055,7 +1154,8 @@ static void mtk_mfg_remove(struct platform_device *pdev)
+ {
+ 	struct mtk_mfg *mfg = dev_get_drvdata(&pdev->dev);
+ 
+-	if (mtk_mfg_is_powered_on(mfg))
++	if (mfg->variant->eb_always_on ? mfg->pd.status == GENPD_STATE_ON :
++					 mtk_mfg_is_powered_on(mfg))
+ 		mtk_mfg_power_off(&mfg->pd);
+ 
+ 	of_genpd_del_provider(pdev->dev.of_node);
+@@ -1064,8 +1164,10 @@ static void mtk_mfg_remove(struct platform_device *pdev)
+ 	mbox_free_channel(mfg->gf_mbox->ch);
+ 	mfg->gf_mbox->ch = NULL;
+ 
+-	mbox_free_channel(mfg->slp_mbox->ch);
+-	mfg->slp_mbox->ch = NULL;
++	if (mfg->slp_mbox) {
++		mbox_free_channel(mfg->slp_mbox->ch);
++		mfg->slp_mbox->ch = NULL;
++	}
+ }
+ 
+ static struct platform_driver mtk_mfg_driver = {
+-- 
+2.56.0
+

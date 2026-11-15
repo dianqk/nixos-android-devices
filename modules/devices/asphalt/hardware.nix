@@ -20,10 +20,10 @@ in
     example = null;
     description = ''
       Upper limit in Hz for UFS clock scaling, applied in the initrd and the
-      installed system. Once fw_devlink sync_state() releases the boot-time
-      interconnect and power votes, transfers at the higher UFS clock and
-      gear raise PHY/data-link errors and controller resets on Linux
-      7.3.0-rc6; 75 MHz measured clean. Set to null to remove the limit.
+      installed system. The kernel scales between 75 MHz (HS-G1) and
+      850 MHz (HS-G4 with the SM8475 turbo configuration); sustained writes
+      at 850 MHz measured clean, but system suspend and resume at that rate
+      are not yet verified. Set to null to remove the limit.
     '';
   };
 
@@ -31,7 +31,6 @@ in
   config.boot.initrd.services.udev.rules = lib.mkIf (ufsMaxFrequency != null) ufsRule;
 
   config.androidDevices = {
-    kernelPackage = lib.mkDefault androidPackages.devices.asphalt.kernel;
 
     boot.android = {
       # Keep the kernel uncompressed like Lenovo's stock boot images, while a

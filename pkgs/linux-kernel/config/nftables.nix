@@ -60,3 +60,9 @@ lib.genAttrs [
   "NF_FLOW_TABLE_INET"
   "NFT_FLOW_OFFLOAD"
 ] (_: lib.kernel.yes)
+// lib.genAttrs [
+  # Reverse-path match for the NixOS firewall's checkReversePath. Modules,
+  # because the legacy iptables tables they depend on may be modules.
+  "IP_NF_MATCH_RPFILTER"
+  "IP6_NF_MATCH_RPFILTER"
+] (_: lib.kernel.module)

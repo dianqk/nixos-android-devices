@@ -1,0 +1,222 @@
+From 6ed6d51b3ffb7e4a4a1fd6940469a8ecb287ebe8 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] soc: mediatek: establish MT6897 MCUPM boot contact
+
+Contact the bootloader-started MCUPM and supply its AP timebase before
+the firmware accepts CPU idle.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-10-17T00:02:59+08:00
+Link: https://github.com/MiCode/MTK_kernel_device_modules/tree/bsp-duchamp-u-oss/drivers/misc/mediatek/mcupm/v2
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/soc/mediatek/mtk-mcupm.c | 195 +++++++++++++++++++++++++++++++
+ 1 file changed, 195 insertions(+)
+ create mode 100644 drivers/soc/mediatek/mtk-mcupm.c
+
+diff --git a/drivers/soc/mediatek/mtk-mcupm.c b/drivers/soc/mediatek/mtk-mcupm.c
+new file mode 100644
+index 0000000000..2aadb7fe6d
+--- /dev/null
++++ b/drivers/soc/mediatek/mtk-mcupm.c
+@@ -0,0 +1,195 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek MCUPM boot contact
++ *
++ * The MCUPM is the CPU power-management coprocessor of the MT6897. Its
++ * firmware only accepts CPU idle requests (PSCI CPU_SUSPEND through the
++ * TF-A) after the AP has made contact with it, as the vendor mcupm driver
++ * does at boot: an "alive" command on mailbox 0 and the AP time base
++ * (arch counter and the matching sched_clock time in ns) in mailbox 4.
++ * Until then every CPU_SUSPEND call is rejected. Around system sleep the
++ * time base is published again with the freeze flag set, and refreshed
++ * on resume.
++ *
++ * Only these mailbox words are written; the MCDI state that the TF-A and
++ * the MCUPM share in the same SRAM is left alone.
++ *
++ * Based on the MediaTek mcupm v2 driver (Copyright (c) MediaTek Inc.).
++ * Like that driver, the frozen time base is published in the normal
++ * suspend phase.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/bits.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/sched/clock.h>
++#include <linux/spinlock.h>
++#include <linux/suspend.h>
++#include <clocksource/arm_arch_timer.h>
++
++/* Shared SRAM: mailboxes of 0xa0 bytes (40 words) each */
++#define MCUPM_MBOX_SIZE			0xa0
++#define MCUPM_MBOX(n)			((n) * MCUPM_MBOX_SIZE)
++
++/* Mailbox 0, platform channel: command in words 0-2, ack in word 20 */
++#define MCUPM_PLT_CMD			(MCUPM_MBOX(0) + 0x00)
++#define MCUPM_PLT_ARG0			(MCUPM_MBOX(0) + 0x04)
++#define MCUPM_PLT_ARG1			(MCUPM_MBOX(0) + 0x08)
++#define MCUPM_PLT_ACK			(MCUPM_MBOX(0) + 0x50)
++#define MCUPM_PLT_CMD_ALIVE		0xdead
++
++/* Mailbox 4, time sync: words 12-15 */
++#define MCUPM_TS_TICK_H			(MCUPM_MBOX(4) + 0x30)
++#define MCUPM_TS_TICK_L			(MCUPM_MBOX(4) + 0x34)
++#define MCUPM_TS_NS_H			(MCUPM_MBOX(4) + 0x38)
++#define MCUPM_TS_NS_L			(MCUPM_MBOX(4) + 0x3c)
++#define MCUPM_TS_FREEZE			BIT(31)
++#define MCUPM_TS_VER			GENMASK(30, 28)
++#define MCUPM_SRAM_SIZE			MCUPM_MBOX(5)
++
++/* Mailbox 0 interrupt registers */
++#define MCUPM_MBOX_SEND			0x00
++#define MCUPM_MBOX_SET			0x04
++#define MCUPM_MBOX_RECV			0x10
++#define MCUPM_MBOX_CLR			0x18
++#define MCUPM_MBOX_PIN			BIT(0)
++
++#define MCUPM_ACK_POLL_US		1000
++#define MCUPM_ACK_TIMEOUT_US		(2 * USEC_PER_SEC)
++
++struct mtk_mcupm {
++	struct device *dev;
++	void __iomem *sram;
++	void __iomem *mbox;
++	/* serialises the four time-sync words */
++	spinlock_t ts_lock;
++	u8 ts_ver;
++};
++
++static void mtk_mcupm_timesync(struct mtk_mcupm *mcupm, bool freeze)
++{
++	unsigned long flags;
++	u64 tick, ns;
++	u32 header;
++
++	spin_lock_irqsave(&mcupm->ts_lock, flags);
++
++	tick = arch_timer_read_counter();
++	ns = sched_clock();
++
++	mcupm->ts_ver = (mcupm->ts_ver + 1) % (FIELD_MAX(MCUPM_TS_VER) + 1);
++	header = FIELD_PREP(MCUPM_TS_VER, mcupm->ts_ver);
++	if (freeze)
++		header |= MCUPM_TS_FREEZE;
++
++	/* The firmware expects this order: tick high, low, then ns low, high */
++	writel(upper_32_bits(tick) | header, mcupm->sram + MCUPM_TS_TICK_H);
++	writel(lower_32_bits(tick), mcupm->sram + MCUPM_TS_TICK_L);
++	writel(lower_32_bits(ns), mcupm->sram + MCUPM_TS_NS_L);
++	writel(upper_32_bits(ns) | header, mcupm->sram + MCUPM_TS_NS_H);
++
++	spin_unlock_irqrestore(&mcupm->ts_lock, flags);
++}
++
++static int mtk_mcupm_alive(struct mtk_mcupm *mcupm)
++{
++	u32 val;
++	int ret;
++
++	if (readl(mcupm->mbox + MCUPM_MBOX_SEND) & MCUPM_MBOX_PIN)
++		return -EBUSY;
++
++	/* A stale ack from an earlier contact must not count */
++	writel(0, mcupm->sram + MCUPM_PLT_ACK);
++	writel(MCUPM_PLT_CMD_ALIVE, mcupm->sram + MCUPM_PLT_CMD);
++	writel(0, mcupm->sram + MCUPM_PLT_ARG0);
++	writel(0, mcupm->sram + MCUPM_PLT_ARG1);
++	writel(MCUPM_MBOX_PIN, mcupm->mbox + MCUPM_MBOX_SET);
++
++	ret = readl_poll_timeout(mcupm->mbox + MCUPM_MBOX_RECV, val,
++				 val & MCUPM_MBOX_PIN, MCUPM_ACK_POLL_US,
++				 MCUPM_ACK_TIMEOUT_US);
++	if (ret)
++		return ret;
++
++	val = readl(mcupm->sram + MCUPM_PLT_ACK);
++	writel(MCUPM_MBOX_PIN, mcupm->mbox + MCUPM_MBOX_CLR);
++
++	return val ? 0 : -EIO;
++}
++
++static int mtk_mcupm_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct resource *res;
++	struct mtk_mcupm *mcupm;
++	int ret;
++
++	mcupm = devm_kzalloc(dev, sizeof(*mcupm), GFP_KERNEL);
++	if (!mcupm)
++		return -ENOMEM;
++
++	mcupm->dev = dev;
++	spin_lock_init(&mcupm->ts_lock);
++
++	mcupm->sram = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
++	if (IS_ERR(mcupm->sram))
++		return PTR_ERR(mcupm->sram);
++	if (resource_size(res) < MCUPM_SRAM_SIZE)
++		return dev_err_probe(dev, -EINVAL, "mailbox SRAM too small\n");
++
++	mcupm->mbox = devm_platform_ioremap_resource(pdev, 1);
++	if (IS_ERR(mcupm->mbox))
++		return PTR_ERR(mcupm->mbox);
++
++	platform_set_drvdata(pdev, mcupm);
++
++	ret = mtk_mcupm_alive(mcupm);
++	if (ret)
++		return dev_err_probe(dev, ret, "MCUPM did not answer\n");
++
++	mtk_mcupm_timesync(mcupm, false);
++
++	return 0;
++}
++
++static int mtk_mcupm_suspend(struct device *dev)
++{
++	mtk_mcupm_timesync(dev_get_drvdata(dev), true);
++
++	return 0;
++}
++
++static int mtk_mcupm_resume(struct device *dev)
++{
++	mtk_mcupm_timesync(dev_get_drvdata(dev), false);
++
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(mtk_mcupm_pm_ops, mtk_mcupm_suspend,
++				mtk_mcupm_resume);
++
++static const struct of_device_id mtk_mcupm_of_match[] = {
++	{ .compatible = "mediatek,mt6897-mcupm" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, mtk_mcupm_of_match);
++
++static struct platform_driver mtk_mcupm_driver = {
++	.probe = mtk_mcupm_probe,
++	.driver = {
++		.name = "mtk-mcupm",
++		.of_match_table = mtk_mcupm_of_match,
++		.pm = pm_sleep_ptr(&mtk_mcupm_pm_ops),
++		.suppress_bind_attrs = true,
++	},
++};
++module_platform_driver(mtk_mcupm_driver);
++
++MODULE_DESCRIPTION("MediaTek MCUPM boot contact");
++MODULE_LICENSE("GPL");
+-- 
+2.56.0
+

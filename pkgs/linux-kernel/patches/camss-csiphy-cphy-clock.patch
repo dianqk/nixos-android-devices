@@ -1,0 +1,35 @@
+From dcd33d51a8613d04873f68465d3139ee01d73aea Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Mon, 2 Nov 2026 00:59:20 +0800
+Subject: [PATCH] media: qcom: camss: csiphy: scale the C-PHY clock rate
+
+For C-PHY the link frequency is half the symbol rate per trio, so a
+quarter of it overestimates the CSIPHY clock the receiver needs and a
+3.4 Gsps link failed with "Pixel clock is too high for CSIPHY". Use the
+trio bit rate (symbol rate * 16 / 7) divided by 32, as the Qualcomm
+camera kernel does for its CSIPHY clock votes.
+
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/media/platform/qcom/camss/camss-csiphy.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/platform/qcom/camss/camss-csiphy.c b/drivers/media/platform/qcom/camss/camss-csiphy.c
+index a136cd2788..e36e014c9a 100644
+--- a/drivers/media/platform/qcom/camss/camss-csiphy.c
++++ b/drivers/media/platform/qcom/camss/camss-csiphy.c
+@@ -154,7 +154,13 @@ static int csiphy_set_clock_rates(struct csiphy_device *csiphy)
+ 		struct camss_clock *clock = &csiphy->clock[i];
+ 
+ 		if (csiphy->rate_set[i]) {
+-			u64 min_rate = link_freq / 4;
++			/*
++			 * D-PHY: a quarter of the DDR clock. C-PHY: the symbol
++			 * rate (twice the link frequency) times 16/7 bits per
++			 * symbol, divided by 32 as the Qualcomm camera kernel does.
++			 */
++			u64 min_rate = cphy ? div_u64(link_freq * 2 * 16, 7 * 32) :
++					      link_freq / 4;
+ 			long round_rate;
+ 
+ 			camss_add_clock_margin(&min_rate);

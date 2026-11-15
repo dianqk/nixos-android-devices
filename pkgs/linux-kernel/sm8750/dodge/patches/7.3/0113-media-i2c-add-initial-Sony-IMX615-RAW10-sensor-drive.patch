@@ -1,0 +1,850 @@
+From 6aaceec695508dc22014761225414226ec23277d Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 11 Nov 2026 04:12:03 +0800
+Subject: [PATCH 118/144] media: i2c: add initial Sony IMX615 RAW10 sensor
+ driver
+
+Implement the OnePlus 13 front sensor with its 19.2 MHz clock, ordered three-supply power sequence and 1640x1232 four-lane D-PHY mode. Expose exposure, analogue gain, vertical blanking and the solid-colour test pattern. Keep runtime power and failed-stream cleanup bounded. Register values are derived from the dodgefront sensor module identified in the table header.
+
+Import-Patch: pkgs/linux-kernel/sm8750/dodge/patches/7.3/0150-media-i2c-add-initial-Sony-IMX615-RAW10-sensor-drive.patch
+Import-SHA256: 6b079fd51460f832cec251f8fc06d57e4030810abd38d8f1d1a35318467627fe
+Import-Provenance: mail headers
+(cherry picked from commit 03e4a2e6f4df5809b06740e59b7c6a3579e41ad9)
+---
+ drivers/media/i2c/Kconfig       |  10 +
+ drivers/media/i2c/Makefile      |   2 +
+ drivers/media/i2c/imx615-regs.h | 328 +++++++++++++++++++++++
+ drivers/media/i2c/imx615.c      | 458 ++++++++++++++++++++++++++++++++
+ 4 files changed, 798 insertions(+)
+ create mode 100644 drivers/media/i2c/imx615-regs.h
+ create mode 100644 drivers/media/i2c/imx615.c
+
+diff --git a/drivers/media/i2c/Kconfig b/drivers/media/i2c/Kconfig
+index 5c52007f9c..18ca92ddf0 100644
+--- a/drivers/media/i2c/Kconfig
++++ b/drivers/media/i2c/Kconfig
+@@ -299,6 +299,16 @@ config VIDEO_IMX471
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called imx471.
+ 
++config VIDEO_IMX615
++	tristate "Sony IMX615 sensor support"
++	depends on I2C && VIDEO_DEV && COMMON_CLK
++	select V4L2_CCI_I2C
++	select V4L2_FWNODE
++	select VIDEO_V4L2_SUBDEV_API
++	help
++	  Sony IMX615 RAW10 image sensor with four-lane MIPI CSI-2 D-PHY.
++	  The initial mode is 1640x1232 with a 19.2 MHz input clock.
++
+ config VIDEO_IMX678
+ 	tristate "Sony IMX678 sensor support"
+ 	depends on GPIOLIB
+diff --git a/drivers/media/i2c/Makefile b/drivers/media/i2c/Makefile
+index d04bd57245..61ec51edef 100644
+--- a/drivers/media/i2c/Makefile
++++ b/drivers/media/i2c/Makefile
+@@ -174,3 +174,5 @@ obj-$(CONFIG_VIDEO_VPX3220) += vpx3220.o
+ obj-$(CONFIG_VIDEO_WM8739) += wm8739.o
+ obj-$(CONFIG_VIDEO_WM8775) += wm8775.o
+ obj-$(CONFIG_VIDEO_INTEL_CVS) += cvs/
++
++obj-$(CONFIG_VIDEO_IMX615) += imx615.o
+diff --git a/drivers/media/i2c/imx615-regs.h b/drivers/media/i2c/imx615-regs.h
+new file mode 100644
+index 0000000000..8461565577
+--- /dev/null
++++ b/drivers/media/i2c/imx615-regs.h
+@@ -0,0 +1,328 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* OnePlus 13 IMX615 (dodgefront), 19.2 MHz external clock.
++ * Sensor module SHA256: d09025829ce1fed5835de24b19544c0d6e8bde657d50aee018dc0ec0a7ff7113
++ * Initial capture mode: vendor mode 4, 1640x1232 RAW10, D-PHY x4.
++ * Register values preserve the sensor module's order and byte widths.
++ */
++#ifndef __IMX615_REGS_H__
++#define __IMX615_REGS_H__
++
++static const struct cci_reg_sequence imx615_init_regs[] = {
++	{ CCI_REG8(0x0136), 0x13 },
++	{ CCI_REG8(0x0137), 0x33 },
++	{ CCI_REG8(0x3c7e), 0x01 },
++	{ CCI_REG8(0x3c7f), 0x01 },
++	{ CCI_REG8(0x0111), 0x02 },
++	{ CCI_REG8(0x380c), 0x00 },
++	{ CCI_REG8(0x3c00), 0x01 },
++	{ CCI_REG8(0x3c01), 0x00 },
++	{ CCI_REG8(0x3c02), 0x00 },
++	{ CCI_REG8(0x3c03), 0x03 },
++	{ CCI_REG8(0x3c04), 0xff },
++	{ CCI_REG8(0x3c05), 0x01 },
++	{ CCI_REG8(0x3c06), 0x00 },
++	{ CCI_REG8(0x3c07), 0x00 },
++	{ CCI_REG8(0x3c08), 0x03 },
++	{ CCI_REG8(0x3c09), 0xff },
++	{ CCI_REG8(0x3c0a), 0x00 },
++	{ CCI_REG8(0x3c0b), 0x00 },
++	{ CCI_REG8(0x3c0c), 0x10 },
++	{ CCI_REG8(0x3c0d), 0x10 },
++	{ CCI_REG8(0x3c0e), 0x10 },
++	{ CCI_REG8(0x3c0f), 0x10 },
++	{ CCI_REG8(0x3c10), 0x10 },
++	{ CCI_REG8(0x3c11), 0x20 },
++	{ CCI_REG8(0x3c15), 0x00 },
++	{ CCI_REG8(0x3c16), 0x00 },
++	{ CCI_REG8(0x3c17), 0x01 },
++	{ CCI_REG8(0x3c18), 0x00 },
++	{ CCI_REG8(0x3c19), 0x01 },
++	{ CCI_REG8(0x3c1a), 0x00 },
++	{ CCI_REG8(0x3c1b), 0x01 },
++	{ CCI_REG8(0x3c1c), 0x00 },
++	{ CCI_REG8(0x3c1d), 0x01 },
++	{ CCI_REG8(0x3c1e), 0x00 },
++	{ CCI_REG8(0x3c1f), 0x00 },
++	{ CCI_REG8(0x3f89), 0x01 },
++	{ CCI_REG8(0x3f8f), 0x01 },
++	{ CCI_REG8(0x53b9), 0x01 },
++	{ CCI_REG8(0x62c4), 0x04 },
++	{ CCI_REG8(0x658f), 0x07 },
++	{ CCI_REG8(0x6590), 0x05 },
++	{ CCI_REG8(0x6591), 0x07 },
++	{ CCI_REG8(0x6592), 0x05 },
++	{ CCI_REG8(0x6593), 0x07 },
++	{ CCI_REG8(0x6594), 0x05 },
++	{ CCI_REG8(0x6595), 0x07 },
++	{ CCI_REG8(0x6596), 0x05 },
++	{ CCI_REG8(0x6597), 0x05 },
++	{ CCI_REG8(0x6598), 0x05 },
++	{ CCI_REG8(0x6599), 0x05 },
++	{ CCI_REG8(0x659a), 0x05 },
++	{ CCI_REG8(0x659b), 0x05 },
++	{ CCI_REG8(0x659c), 0x05 },
++	{ CCI_REG8(0x659d), 0x05 },
++	{ CCI_REG8(0x659e), 0x07 },
++	{ CCI_REG8(0x659f), 0x05 },
++	{ CCI_REG8(0x65a0), 0x07 },
++	{ CCI_REG8(0x65a1), 0x05 },
++	{ CCI_REG8(0x65a2), 0x07 },
++	{ CCI_REG8(0x65a3), 0x05 },
++	{ CCI_REG8(0x65a4), 0x07 },
++	{ CCI_REG8(0x65a5), 0x05 },
++	{ CCI_REG8(0x65a6), 0x05 },
++	{ CCI_REG8(0x65a7), 0x05 },
++	{ CCI_REG8(0x65a8), 0x05 },
++	{ CCI_REG8(0x65a9), 0x05 },
++	{ CCI_REG8(0x65aa), 0x05 },
++	{ CCI_REG8(0x65ab), 0x05 },
++	{ CCI_REG8(0x65ac), 0x05 },
++	{ CCI_REG8(0x65ad), 0x07 },
++	{ CCI_REG8(0x65ae), 0x07 },
++	{ CCI_REG8(0x65af), 0x07 },
++	{ CCI_REG8(0x65b0), 0x05 },
++	{ CCI_REG8(0x65b1), 0x05 },
++	{ CCI_REG8(0x65b2), 0x05 },
++	{ CCI_REG8(0x65b3), 0x05 },
++	{ CCI_REG8(0x65b4), 0x07 },
++	{ CCI_REG8(0x65b5), 0x07 },
++	{ CCI_REG8(0x65b6), 0x07 },
++	{ CCI_REG8(0x65b7), 0x07 },
++	{ CCI_REG8(0x65b8), 0x05 },
++	{ CCI_REG8(0x65b9), 0x05 },
++	{ CCI_REG8(0x65ba), 0x05 },
++	{ CCI_REG8(0x65bb), 0x05 },
++	{ CCI_REG8(0x65bc), 0x05 },
++	{ CCI_REG8(0x65bd), 0x05 },
++	{ CCI_REG8(0x65be), 0x05 },
++	{ CCI_REG8(0x65bf), 0x05 },
++	{ CCI_REG8(0x65c0), 0x05 },
++	{ CCI_REG8(0x65c1), 0x05 },
++	{ CCI_REG8(0x65c2), 0x05 },
++	{ CCI_REG8(0x65c3), 0x05 },
++	{ CCI_REG8(0x65c4), 0x05 },
++	{ CCI_REG8(0x65c5), 0x05 },
++	{ CCI_REG8(0x6e1c), 0x00 },
++	{ CCI_REG8(0x6e1d), 0x00 },
++	{ CCI_REG8(0x6e25), 0x00 },
++	{ CCI_REG8(0x6e38), 0x03 },
++	{ CCI_REG8(0x895c), 0x01 },
++	{ CCI_REG8(0x895d), 0x00 },
++	{ CCI_REG8(0x8966), 0x00 },
++	{ CCI_REG8(0x8967), 0x4e },
++	{ CCI_REG8(0x896a), 0x00 },
++	{ CCI_REG8(0x896b), 0x24 },
++	{ CCI_REG8(0x896f), 0x34 },
++	{ CCI_REG8(0x8976), 0x00 },
++	{ CCI_REG8(0x8977), 0x00 },
++	{ CCI_REG8(0x9004), 0x1f },
++	{ CCI_REG8(0x9200), 0xb7 },
++	{ CCI_REG8(0x9201), 0x34 },
++	{ CCI_REG8(0x9202), 0xb7 },
++	{ CCI_REG8(0x9203), 0x36 },
++	{ CCI_REG8(0x9204), 0xb7 },
++	{ CCI_REG8(0x9205), 0x37 },
++	{ CCI_REG8(0x9206), 0xb7 },
++	{ CCI_REG8(0x9207), 0x38 },
++	{ CCI_REG8(0x9208), 0xb7 },
++	{ CCI_REG8(0x9209), 0x39 },
++	{ CCI_REG8(0x920a), 0xb7 },
++	{ CCI_REG8(0x920b), 0x3a },
++	{ CCI_REG8(0x920c), 0xb7 },
++	{ CCI_REG8(0x920d), 0x3c },
++	{ CCI_REG8(0x920e), 0xb7 },
++	{ CCI_REG8(0x920f), 0x3d },
++	{ CCI_REG8(0x9210), 0xb7 },
++	{ CCI_REG8(0x9211), 0x3e },
++	{ CCI_REG8(0x9212), 0xb7 },
++	{ CCI_REG8(0x9213), 0x3f },
++	{ CCI_REG8(0x9214), 0xf6 },
++	{ CCI_REG8(0x9215), 0x13 },
++	{ CCI_REG8(0x9216), 0xf6 },
++	{ CCI_REG8(0x9217), 0x34 },
++	{ CCI_REG8(0x9218), 0xf4 },
++	{ CCI_REG8(0x9219), 0xa7 },
++	{ CCI_REG8(0x921a), 0xf4 },
++	{ CCI_REG8(0x921b), 0xaa },
++	{ CCI_REG8(0x921c), 0xf4 },
++	{ CCI_REG8(0x921d), 0xad },
++	{ CCI_REG8(0x921e), 0xf4 },
++	{ CCI_REG8(0x921f), 0xb0 },
++	{ CCI_REG8(0x9220), 0xf4 },
++	{ CCI_REG8(0x9221), 0xb3 },
++	{ CCI_REG8(0x9222), 0x85 },
++	{ CCI_REG8(0x9223), 0x77 },
++	{ CCI_REG8(0x9224), 0xc4 },
++	{ CCI_REG8(0x9225), 0x4b },
++	{ CCI_REG8(0x9226), 0xc4 },
++	{ CCI_REG8(0x9227), 0x4c },
++	{ CCI_REG8(0x9228), 0xc4 },
++	{ CCI_REG8(0x9229), 0x4d },
++	{ CCI_REG8(0x922a), 0xf5 },
++	{ CCI_REG8(0x922b), 0x5e },
++	{ CCI_REG8(0x922c), 0xf5 },
++	{ CCI_REG8(0x922d), 0x5f },
++	{ CCI_REG8(0x922e), 0xf5 },
++	{ CCI_REG8(0x922f), 0x64 },
++	{ CCI_REG8(0x9230), 0xf5 },
++	{ CCI_REG8(0x9231), 0x65 },
++	{ CCI_REG8(0x9232), 0xf5 },
++	{ CCI_REG8(0x9233), 0x6a },
++	{ CCI_REG8(0x9234), 0xf5 },
++	{ CCI_REG8(0x9235), 0x6b },
++	{ CCI_REG8(0x9236), 0xf5 },
++	{ CCI_REG8(0x9237), 0x70 },
++	{ CCI_REG8(0x9238), 0xf5 },
++	{ CCI_REG8(0x9239), 0x71 },
++	{ CCI_REG8(0x923a), 0xf5 },
++	{ CCI_REG8(0x923b), 0x76 },
++	{ CCI_REG8(0x923c), 0xf5 },
++	{ CCI_REG8(0x923d), 0x77 },
++	{ CCI_REG8(0x9810), 0x14 },
++	{ CCI_REG8(0x9814), 0x14 },
++	{ CCI_REG8(0xc020), 0x00 },
++	{ CCI_REG8(0xc026), 0x00 },
++	{ CCI_REG8(0xc027), 0x00 },
++	{ CCI_REG8(0xc448), 0x01 },
++	{ CCI_REG8(0xc44f), 0x01 },
++	{ CCI_REG8(0xc450), 0x00 },
++	{ CCI_REG8(0xc451), 0x00 },
++	{ CCI_REG8(0xc452), 0x01 },
++	{ CCI_REG8(0xc455), 0x00 },
++	{ CCI_REG8(0xe186), 0x36 },
++	{ CCI_REG8(0xe206), 0x35 },
++	{ CCI_REG8(0xe226), 0x33 },
++	{ CCI_REG8(0xe266), 0x34 },
++	{ CCI_REG8(0xe2a6), 0x31 },
++	{ CCI_REG8(0xe2c6), 0x37 },
++	{ CCI_REG8(0xe2e6), 0x32 },
++	{ CCI_REG8(0x88d6), 0x60 },
++	{ CCI_REG8(0x9852), 0x00 },
++	{ CCI_REG8(0xa569), 0x06 },
++	{ CCI_REG8(0xa56a), 0x13 },
++	{ CCI_REG8(0xa56b), 0x13 },
++	{ CCI_REG8(0xa56c), 0x01 },
++	{ CCI_REG8(0xa678), 0x00 },
++	{ CCI_REG8(0xa679), 0x20 },
++	{ CCI_REG8(0xa812), 0x00 },
++	{ CCI_REG8(0xa813), 0x3f },
++	{ CCI_REG8(0xa814), 0x3f },
++	{ CCI_REG8(0xa830), 0x68 },
++	{ CCI_REG8(0xa831), 0x56 },
++	{ CCI_REG8(0xa832), 0x2b },
++	{ CCI_REG8(0xa833), 0x55 },
++	{ CCI_REG8(0xa834), 0x55 },
++	{ CCI_REG8(0xa835), 0x16 },
++	{ CCI_REG8(0xa837), 0x51 },
++	{ CCI_REG8(0xa838), 0x34 },
++	{ CCI_REG8(0xa854), 0x4f },
++	{ CCI_REG8(0xa855), 0x48 },
++	{ CCI_REG8(0xa856), 0x45 },
++	{ CCI_REG8(0xa857), 0x02 },
++	{ CCI_REG8(0xa85a), 0x23 },
++	{ CCI_REG8(0xa85b), 0x16 },
++	{ CCI_REG8(0xa85c), 0x12 },
++	{ CCI_REG8(0xa85d), 0x02 },
++	{ CCI_REG8(0xaa55), 0x00 },
++	{ CCI_REG8(0xaa56), 0x01 },
++	{ CCI_REG8(0xaa57), 0x30 },
++	{ CCI_REG8(0xaa58), 0x01 },
++	{ CCI_REG8(0xaa59), 0x30 },
++	{ CCI_REG8(0xac72), 0x01 },
++	{ CCI_REG8(0xac73), 0x26 },
++	{ CCI_REG8(0xac74), 0x01 },
++	{ CCI_REG8(0xac75), 0x26 },
++	{ CCI_REG8(0xac76), 0x00 },
++	{ CCI_REG8(0xac77), 0xc4 },
++	{ CCI_REG8(0xae09), 0xff },
++	{ CCI_REG8(0xae0a), 0xff },
++	{ CCI_REG8(0xae12), 0x58 },
++	{ CCI_REG8(0xae13), 0x58 },
++	{ CCI_REG8(0xae15), 0x10 },
++	{ CCI_REG8(0xae16), 0x10 },
++	{ CCI_REG8(0xaf05), 0x48 },
++	{ CCI_REG8(0xb069), 0x02 },
++	{ CCI_REG8(0xea4b), 0x00 },
++	{ CCI_REG8(0xea4c), 0x00 },
++	{ CCI_REG8(0xea4d), 0x00 },
++	{ CCI_REG8(0xea4e), 0x00 },
++	{ CCI_REG8(0x574b), 0x01 },
++	{ CCI_REG8(0x5765), 0x33 },
++};
++
++static const struct cci_reg_sequence imx615_mode_regs[] = {
++	{ CCI_REG8(0x0112), 0x0a },
++	{ CCI_REG8(0x0113), 0x0a },
++	{ CCI_REG8(0x0114), 0x03 },
++	{ CCI_REG8(0x0342), 0x08 },
++	{ CCI_REG8(0x0343), 0xc8 },
++	{ CCI_REG8(0x0340), 0x10 },
++	{ CCI_REG8(0x0341), 0x74 },
++	{ CCI_REG8(0x0344), 0x00 },
++	{ CCI_REG8(0x0345), 0x00 },
++	{ CCI_REG8(0x0346), 0x00 },
++	{ CCI_REG8(0x0347), 0x00 },
++	{ CCI_REG8(0x0348), 0x19 },
++	{ CCI_REG8(0x0349), 0x9f },
++	{ CCI_REG8(0x034a), 0x13 },
++	{ CCI_REG8(0x034b), 0x3f },
++	{ CCI_REG8(0x0900), 0x01 },
++	{ CCI_REG8(0x0901), 0x44 },
++	{ CCI_REG8(0x0902), 0x08 },
++	{ CCI_REG8(0x3246), 0x89 },
++	{ CCI_REG8(0x3247), 0x89 },
++	{ CCI_REG8(0x0401), 0x00 },
++	{ CCI_REG8(0x0404), 0x00 },
++	{ CCI_REG8(0x0405), 0x10 },
++	{ CCI_REG8(0x0408), 0x00 },
++	{ CCI_REG8(0x0409), 0x00 },
++	{ CCI_REG8(0x040a), 0x00 },
++	{ CCI_REG8(0x040b), 0x00 },
++	{ CCI_REG8(0x040c), 0x06 },
++	{ CCI_REG8(0x040d), 0x68 },
++	{ CCI_REG8(0x040e), 0x04 },
++	{ CCI_REG8(0x040f), 0xd0 },
++	{ CCI_REG8(0x034c), 0x06 },
++	{ CCI_REG8(0x034d), 0x68 },
++	{ CCI_REG8(0x034e), 0x04 },
++	{ CCI_REG8(0x034f), 0xd0 },
++	{ CCI_REG8(0x0301), 0x05 },
++	{ CCI_REG8(0x0303), 0x04 },
++	{ CCI_REG8(0x0305), 0x03 },
++	{ CCI_REG8(0x0306), 0x00 },
++	{ CCI_REG8(0x0307), 0xde },
++	{ CCI_REG8(0x030b), 0x02 },
++	{ CCI_REG8(0x030d), 0x03 },
++	{ CCI_REG8(0x030e), 0x00 },
++	{ CCI_REG8(0x030f), 0xde },
++	{ CCI_REG8(0x0310), 0x01 },
++	{ CCI_REG8(0x3620), 0x00 },
++	{ CCI_REG8(0x3621), 0x00 },
++	{ CCI_REG8(0x3c12), 0x3e },
++	{ CCI_REG8(0x3c13), 0x3a },
++	{ CCI_REG8(0x3c14), 0x22 },
++	{ CCI_REG8(0x3f0c), 0x00 },
++	{ CCI_REG8(0x3f14), 0x00 },
++	{ CCI_REG8(0x3f80), 0x00 },
++	{ CCI_REG8(0x3f81), 0x00 },
++	{ CCI_REG8(0x3f8c), 0x00 },
++	{ CCI_REG8(0x3f8d), 0x00 },
++	{ CCI_REG8(0x3ffc), 0x00 },
++	{ CCI_REG8(0x3ffd), 0x55 },
++	{ CCI_REG8(0x3ffe), 0x00 },
++	{ CCI_REG8(0x3fff), 0x78 },
++	{ CCI_REG8(0x0202), 0x10 },
++	{ CCI_REG8(0x0203), 0x44 },
++	{ CCI_REG8(0x0204), 0x00 },
++	{ CCI_REG8(0x0205), 0x70 },
++	{ CCI_REG8(0x020e), 0x01 },
++	{ CCI_REG8(0x020f), 0x00 },
++	{ CCI_REG8(0x0210), 0x01 },
++	{ CCI_REG8(0x0211), 0x00 },
++	{ CCI_REG8(0x0212), 0x01 },
++	{ CCI_REG8(0x0213), 0x00 },
++	{ CCI_REG8(0x0214), 0x01 },
++	{ CCI_REG8(0x0215), 0x00 },
++};
++
++#endif
+diff --git a/drivers/media/i2c/imx615.c b/drivers/media/i2c/imx615.c
+new file mode 100644
+index 0000000000..084ee741c4
+--- /dev/null
++++ b/drivers/media/i2c/imx615.c
+@@ -0,0 +1,458 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Sony IMX615 RAW10 sensor. Initial mode: 1640x1232, four D-PHY lanes.
++ * Register sequences and power timing: OnePlus 13 dodgefront sensor module.
++ * See imx615-regs.h for the source identity.
++ */
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/pm_runtime.h>
++#include <linux/regulator/consumer.h>
++#include <media/v4l2-cci.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-fwnode.h>
++#include <media/v4l2-subdev.h>
++
++#include "imx615-regs.h"
++
++#define IMX615_WIDTH 1640
++#define IMX615_HEIGHT 1232
++#define IMX615_LINE_LENGTH 2248
++#define IMX615_FRAME_LENGTH 4212
++#define IMX615_MARGIN 48
++#define IMX615_XCLK 19200000
++#define IMX615_LINK_FREQ 355200000LL
++#define IMX615_PIXEL_RATE 284160000
++
++struct imx615 {
++	struct device *dev;
++	struct regmap *regmap;
++	struct clk *xclk;
++	struct gpio_desc *reset;
++	struct regulator *vdda, *vddio, *vddd;
++	struct v4l2_subdev sd;
++	struct media_pad pad;
++	struct v4l2_ctrl_handler ctrls;
++	struct v4l2_ctrl *exposure;
++	struct mutex lock;
++	bool streaming;
++};
++
++static const s64 imx615_link_freq[] = { IMX615_LINK_FREQ };
++static const char * const imx615_patterns[] = { "Disabled", "Solid colour" };
++
++static struct imx615 *to_imx615(struct v4l2_subdev *sd)
++{
++	return container_of(sd, struct imx615, sd);
++}
++
++static int imx615_power_on(struct device *dev)
++{
++	struct imx615 *s = to_imx615(dev_get_drvdata(dev));
++	int ret;
++
++	/* VANA -> VIO, 3 ms -> VDIG -> MCLK, 1 ms -> RESET, 3 ms. */
++	ret = regulator_enable(s->vdda);
++	if (ret)
++		return ret;
++	ret = regulator_enable(s->vddio);
++	if (ret)
++		goto disable_analog;
++	fsleep(3000);
++	ret = regulator_enable(s->vddd);
++	if (ret)
++		goto disable_io;
++	ret = clk_prepare_enable(s->xclk);
++	if (ret)
++		goto disable_digital;
++	fsleep(1000);
++	gpiod_set_value_cansleep(s->reset, 0);
++	fsleep(3000);
++	return 0;
++
++disable_digital:
++	regulator_disable(s->vddd);
++disable_io:
++	regulator_disable(s->vddio);
++disable_analog:
++	regulator_disable(s->vdda);
++	return ret;
++}
++
++static int imx615_power_off(struct device *dev)
++{
++	struct imx615 *s = to_imx615(dev_get_drvdata(dev));
++
++	clk_disable_unprepare(s->xclk);
++	fsleep(1000);
++	gpiod_set_value_cansleep(s->reset, 1);
++	fsleep(3000);
++	regulator_disable(s->vddd);
++	regulator_disable(s->vddio);
++	regulator_disable(s->vdda);
++	return 0;
++}
++
++static int imx615_set_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct imx615 *s = container_of(ctrl->handler, struct imx615, ctrls);
++	int ret = 0, err;
++
++	if (ctrl->id == V4L2_CID_VBLANK)
++		__v4l2_ctrl_modify_range(s->exposure, 1,
++			IMX615_HEIGHT + ctrl->val - IMX615_MARGIN, 1,
++			min(1000, IMX615_HEIGHT + ctrl->val - IMX615_MARGIN));
++
++	ret = pm_runtime_get_if_in_use(s->dev);
++	if (ret <= 0)
++		return ret;
++	ret = 0;
++
++	/* Commit multi-byte exposure/gain/frame length under group hold. */
++	cci_write(s->regmap, CCI_REG8(0x0104), 1, &ret);
++	switch (ctrl->id) {
++	case V4L2_CID_VBLANK:
++		cci_write(s->regmap, CCI_REG16(0x0340),
++			  IMX615_HEIGHT + ctrl->val, &ret);
++		break;
++	case V4L2_CID_EXPOSURE:
++		cci_write(s->regmap, CCI_REG16(0x0202), ctrl->val, &ret);
++		break;
++	case V4L2_CID_ANALOGUE_GAIN:
++		cci_write(s->regmap, CCI_REG16(0x0204), ctrl->val, &ret);
++		break;
++	case V4L2_CID_TEST_PATTERN:
++		cci_write(s->regmap, CCI_REG16(0x0600), ctrl->val, &ret);
++		break;
++	default:
++		ret = -EINVAL;
++	}
++	/* Release hold even if an earlier I2C transaction failed. */
++	err = cci_write(s->regmap, CCI_REG8(0x0104), 0, NULL);
++	if (!ret)
++		ret = err;
++	pm_runtime_put(s->dev);
++	return ret;
++}
++
++static const struct v4l2_ctrl_ops imx615_ctrl_ops = {
++	.s_ctrl = imx615_set_ctrl,
++};
++
++static void imx615_format(struct v4l2_mbus_framefmt *fmt)
++{
++	*fmt = (struct v4l2_mbus_framefmt) {
++		.width = IMX615_WIDTH, .height = IMX615_HEIGHT,
++		.code = MEDIA_BUS_FMT_SRGGB10_1X10,
++		.field = V4L2_FIELD_NONE,
++		.colorspace = V4L2_COLORSPACE_RAW,
++		.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT,
++		.quantization = V4L2_QUANTIZATION_FULL_RANGE,
++		.xfer_func = V4L2_XFER_FUNC_NONE,
++	};
++}
++
++static int imx615_init_state(struct v4l2_subdev *sd,
++			      struct v4l2_subdev_state *state)
++{
++	imx615_format(v4l2_subdev_state_get_format(state, 0));
++	return 0;
++}
++
++static int imx615_enum_code(struct v4l2_subdev *sd,
++			     struct v4l2_subdev_state *state,
++			     struct v4l2_subdev_mbus_code_enum *code)
++{
++	if (code->index)
++		return -EINVAL;
++	code->code = MEDIA_BUS_FMT_SRGGB10_1X10;
++	return 0;
++}
++
++static int imx615_enum_size(struct v4l2_subdev *sd,
++			     struct v4l2_subdev_state *state,
++			     struct v4l2_subdev_frame_size_enum *fse)
++{
++	if (fse->index || fse->code != MEDIA_BUS_FMT_SRGGB10_1X10)
++		return -EINVAL;
++	fse->min_width = fse->max_width = IMX615_WIDTH;
++	fse->min_height = fse->max_height = IMX615_HEIGHT;
++	return 0;
++}
++
++static int imx615_set_format(struct v4l2_subdev *sd,
++			      struct v4l2_subdev_state *state,
++			      struct v4l2_subdev_format *fmt)
++{
++	struct imx615 *s = to_imx615(sd);
++
++	if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE && s->streaming)
++		return -EBUSY;
++	imx615_format(&fmt->format);
++	*v4l2_subdev_state_get_format(state, fmt->pad) = fmt->format;
++	return 0;
++}
++
++static int imx615_get_selection(struct v4l2_subdev *sd,
++				 struct v4l2_subdev_state *state,
++				 struct v4l2_subdev_selection *sel)
++{
++	switch (sel->target) {
++	case V4L2_SEL_TGT_NATIVE_SIZE:
++	case V4L2_SEL_TGT_CROP_BOUNDS:
++	case V4L2_SEL_TGT_CROP_DEFAULT:
++	case V4L2_SEL_TGT_CROP:
++		sel->r = (struct v4l2_rect) { .width = 6560, .height = 4928 };
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static int imx615_stream(struct v4l2_subdev *sd, int enable)
++{
++	struct imx615 *s = to_imx615(sd);
++	int ret = 0;
++
++	mutex_lock(&s->lock);
++	if (s->streaming == !!enable)
++		goto unlock;
++	if (!enable) {
++		ret = cci_write(s->regmap, CCI_REG8(0x0100), 0, NULL);
++		s->streaming = false;
++		pm_runtime_mark_last_busy(s->dev);
++		pm_runtime_put_autosuspend(s->dev);
++		goto unlock;
++	}
++	ret = pm_runtime_resume_and_get(s->dev);
++	if (ret)
++		goto unlock;
++	ret = cci_multi_reg_write(s->regmap, imx615_init_regs,
++				ARRAY_SIZE(imx615_init_regs), NULL);
++	if (ret)
++		goto power_off;
++	ret = cci_multi_reg_write(s->regmap, imx615_mode_regs,
++				ARRAY_SIZE(imx615_mode_regs), NULL);
++	if (ret)
++		goto power_off;
++	ret = __v4l2_ctrl_handler_setup(&s->ctrls);
++	if (ret)
++		goto power_off;
++	ret = cci_write(s->regmap, CCI_REG8(0x0100), 1, NULL);
++	if (ret)
++		goto power_off;
++	fsleep(5);
++	s->streaming = true;
++	goto unlock;
++
++power_off:
++	cci_write(s->regmap, CCI_REG8(0x0100), 0, NULL);
++	pm_runtime_put(s->dev);
++unlock:
++	mutex_unlock(&s->lock);
++	return ret;
++}
++
++static const struct v4l2_subdev_video_ops imx615_video_ops = {
++	.s_stream = imx615_stream,
++};
++static const struct v4l2_subdev_pad_ops imx615_pad_ops = {
++	.enum_mbus_code = imx615_enum_code,
++	.enum_frame_size = imx615_enum_size,
++	.get_fmt = v4l2_subdev_get_fmt,
++	.set_fmt = imx615_set_format,
++	.get_selection = imx615_get_selection,
++};
++static const struct v4l2_subdev_ops imx615_ops = {
++	.video = &imx615_video_ops,
++	.pad = &imx615_pad_ops,
++};
++static const struct v4l2_subdev_internal_ops imx615_internal_ops = {
++	.init_state = imx615_init_state,
++};
++
++static int imx615_hwcfg(struct device *dev)
++{
++	struct v4l2_fwnode_endpoint ep = { .bus_type = V4L2_MBUS_CSI2_DPHY };
++	struct fwnode_handle *node;
++	bool freq_found = false;
++	unsigned int i;
++	int ret;
++
++	node = fwnode_graph_get_next_endpoint(dev_fwnode(dev), NULL);
++	if (!node)
++		return -EINVAL;
++	ret = v4l2_fwnode_endpoint_alloc_parse(node, &ep);
++	fwnode_handle_put(node);
++	if (ret)
++		return ret;
++	for (i = 0; i < ep.nr_of_link_frequencies; i++)
++		freq_found |= ep.link_frequencies[i] == IMX615_LINK_FREQ;
++	if (ep.bus.mipi_csi2.num_data_lanes != 4 || !freq_found)
++		ret = -EINVAL;
++	v4l2_fwnode_endpoint_free(&ep);
++	return ret;
++}
++
++static int imx615_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct v4l2_ctrl *ctrl;
++	struct imx615 *s;
++	u64 id;
++	int ret;
++
++	ret = imx615_hwcfg(dev);
++	if (ret)
++		return dev_err_probe(dev, ret, "invalid four-lane D-PHY endpoint\n");
++	s = devm_kzalloc(dev, sizeof(*s), GFP_KERNEL);
++	if (!s)
++		return -ENOMEM;
++	s->dev = dev;
++	s->regmap = devm_cci_regmap_init_i2c(client, 16);
++	if (IS_ERR(s->regmap))
++		return PTR_ERR(s->regmap);
++	s->xclk = devm_clk_get(dev, NULL);
++	if (IS_ERR(s->xclk))
++		return dev_err_probe(dev, PTR_ERR(s->xclk), "clock unavailable\n");
++	if (clk_get_rate(s->xclk) != IMX615_XCLK)
++		return dev_err_probe(dev, -EINVAL, "clock must be 19.2 MHz\n");
++	s->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(s->reset))
++		return dev_err_probe(dev, PTR_ERR(s->reset), "reset unavailable\n");
++	s->vdda = devm_regulator_get(dev, "vdda");
++	if (IS_ERR(s->vdda))
++		return dev_err_probe(dev, PTR_ERR(s->vdda), "analog supply unavailable\n");
++	s->vddio = devm_regulator_get(dev, "vddio");
++	if (IS_ERR(s->vddio))
++		return dev_err_probe(dev, PTR_ERR(s->vddio), "I/O supply unavailable\n");
++	s->vddd = devm_regulator_get(dev, "vddd");
++	if (IS_ERR(s->vddd))
++		return dev_err_probe(dev, PTR_ERR(s->vddd), "digital supply unavailable\n");
++
++	mutex_init(&s->lock);
++	v4l2_i2c_subdev_init(&s->sd, client, &imx615_ops);
++	s->sd.internal_ops = &imx615_internal_ops;
++	s->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
++	s->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
++	s->pad.flags = MEDIA_PAD_FL_SOURCE;
++	ret = media_entity_pads_init(&s->sd.entity, 1, &s->pad);
++	if (ret)
++		goto destroy_mutex;
++	v4l2_ctrl_handler_init(&s->ctrls, 8);
++	s->ctrls.lock = &s->lock;
++	ctrl = v4l2_ctrl_new_int_menu(&s->ctrls, NULL, V4L2_CID_LINK_FREQ,
++				    0, 0, imx615_link_freq);
++	if (ctrl)
++		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++	v4l2_ctrl_new_std(&s->ctrls, NULL, V4L2_CID_PIXEL_RATE,
++			 IMX615_PIXEL_RATE, IMX615_PIXEL_RATE, 1, IMX615_PIXEL_RATE);
++	ctrl = v4l2_ctrl_new_std(&s->ctrls, NULL, V4L2_CID_HBLANK,
++			       IMX615_LINE_LENGTH - IMX615_WIDTH,
++			       IMX615_LINE_LENGTH - IMX615_WIDTH, 1,
++			       IMX615_LINE_LENGTH - IMX615_WIDTH);
++	if (ctrl)
++		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++	v4l2_ctrl_new_std(&s->ctrls, &imx615_ctrl_ops, V4L2_CID_VBLANK,
++			 IMX615_FRAME_LENGTH - IMX615_HEIGHT, 0xffff - IMX615_HEIGHT,
++			 1, IMX615_FRAME_LENGTH - IMX615_HEIGHT);
++	s->exposure = v4l2_ctrl_new_std(&s->ctrls, &imx615_ctrl_ops,
++			V4L2_CID_EXPOSURE, 1, IMX615_FRAME_LENGTH - IMX615_MARGIN,
++			1, 1000);
++	v4l2_ctrl_new_std(&s->ctrls, &imx615_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
++			 0, 896, 1, 0);
++	v4l2_ctrl_new_std_menu_items(&s->ctrls, &imx615_ctrl_ops,
++			V4L2_CID_TEST_PATTERN, ARRAY_SIZE(imx615_patterns) - 1,
++			0, 0, imx615_patterns);
++	ret = s->ctrls.error;
++	if (ret)
++		goto free_controls;
++	s->sd.ctrl_handler = &s->ctrls;
++	s->sd.state_lock = &s->lock;
++	ret = v4l2_subdev_init_finalize(&s->sd);
++	if (ret)
++		goto free_controls;
++	ret = imx615_power_on(dev);
++	if (ret)
++		goto cleanup_subdev;
++	ret = cci_read(s->regmap, CCI_REG16(0x0016), &id, NULL);
++	if (ret)
++		goto power_off;
++	if (id != 0x0615) {
++		ret = dev_err_probe(dev, -ENODEV, "unexpected chip ID 0x%04llx\n", id);
++		goto power_off;
++	}
++	pm_runtime_set_active(dev);
++	pm_runtime_get_noresume(dev);
++	pm_runtime_enable(dev);
++	pm_runtime_set_autosuspend_delay(dev, 1000);
++	pm_runtime_use_autosuspend(dev);
++	ret = v4l2_async_register_subdev_sensor(&s->sd);
++	if (ret)
++		goto disable_pm;
++	pm_runtime_mark_last_busy(dev);
++	pm_runtime_put_autosuspend(dev);
++	dev_info(dev, "IMX615 detected, four-lane 1640x1232 RAW10\n");
++	return 0;
++
++disable_pm:
++	pm_runtime_disable(dev);
++	pm_runtime_put_noidle(dev);
++	pm_runtime_set_suspended(dev);
++power_off:
++	imx615_power_off(dev);
++cleanup_subdev:
++	v4l2_subdev_cleanup(&s->sd);
++free_controls:
++	v4l2_ctrl_handler_free(&s->ctrls);
++	media_entity_cleanup(&s->sd.entity);
++destroy_mutex:
++	mutex_destroy(&s->lock);
++	return ret;
++}
++
++static void imx615_remove(struct i2c_client *client)
++{
++	struct v4l2_subdev *sd = i2c_get_clientdata(client);
++	struct imx615 *s = to_imx615(sd);
++
++	v4l2_async_unregister_subdev(sd);
++	mutex_lock(&s->lock);
++	if (s->streaming) {
++		cci_write(s->regmap, CCI_REG8(0x0100), 0, NULL);
++		s->streaming = false;
++		pm_runtime_put_noidle(s->dev);
++	}
++	mutex_unlock(&s->lock);
++	pm_runtime_disable(s->dev);
++	if (!pm_runtime_status_suspended(s->dev))
++		imx615_power_off(s->dev);
++	pm_runtime_set_suspended(s->dev);
++	v4l2_subdev_cleanup(sd);
++	media_entity_cleanup(&sd->entity);
++	v4l2_ctrl_handler_free(&s->ctrls);
++	mutex_destroy(&s->lock);
++}
++
++static const struct dev_pm_ops imx615_pm_ops = {
++	SET_RUNTIME_PM_OPS(imx615_power_off, imx615_power_on, NULL)
++};
++static const struct of_device_id imx615_of_match[] = {
++	{ .compatible = "sony,imx615" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, imx615_of_match);
++static struct i2c_driver imx615_driver = {
++	.driver = {
++		.name = "imx615",
++		.of_match_table = imx615_of_match,
++		.pm = pm_ptr(&imx615_pm_ops),
++	},
++	.probe = imx615_probe,
++	.remove = imx615_remove,
++};
++module_i2c_driver(imx615_driver);
++MODULE_DESCRIPTION("Sony IMX615 image sensor driver");
++MODULE_LICENSE("GPL");

@@ -1,0 +1,580 @@
+From 7da2330350964c6f605bd105b03d72c0c5d08789 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 7 Nov 2026 00:23:41 +0800
+Subject: [PATCH 192/192] pmdomain: mediatek: verify OVL physical off before
+ retiring boot votes
+
+Use an optional always-on MT6897 SPM syscon to observe OVL PWR_CON after
+successful HWV-off, before releasing the complete ordinary root enable
+references. Require both ACKs, RST_B and both PWR_ON bits clear, with ISO
+and CLK_DIS set. Invalid, mixed or failed reads preserve boot ownership
+without quarantining an otherwise healthy domain. Log bounded initial
+failures and eventual successful observations.
+
+Resolve the static top boot-owner handle after all root preparation and
+before any domain initialization or hardware request. Pure preflight
+unwind releases enrollment before parent readiness; successful and
+quarantined controllers retain it. Keep the physical offsets and bank
+identity explicit and independent of clock-reference counts. Point T880's
+optional phandle to the SPM syscon, avoiding its dependent child domain.
+
+Reject clocks, resets, hardware locks and domain dependencies before
+creating the status-only map. In particular syscon map creation could
+otherwise deassert a reset. Existing HWV map reset handling is unchanged.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/clk/mediatek/clkchk-mt6897.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/soc/mediatek/mtk-scpsys-mt6897.c
+---
+ .../mt6897-alldocube-t880-mtkdrm.dtsi         |   1 +
+ drivers/pmdomain/mediatek/mt6897-pm-domains.h |  18 ++--
+ drivers/pmdomain/mediatek/mtk-pm-domains.c    | 100 ++++++++++++++++++
+ drivers/pmdomain/mediatek/mtk-pm-domains.h    |   4 +
+ .../testing/selftests/mtk_clk/domain_cases.c  |  89 +++++++++++++++-
+ .../testing/selftests/mtk_clk/domain_stubs.h  |  74 +++++++++++--
+ .../testing/selftests/mtk_clk/test_domains.py |  10 +-
+ 7 files changed, 276 insertions(+), 20 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-mtkdrm.dtsi b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-mtkdrm.dtsi
+index b2e5c25146..5503bb4186 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-mtkdrm.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6897-alldocube-t880-mtkdrm.dtsi
+@@ -79,6 +79,7 @@ hwv: syscon@10320000 {
+ 
+ 		hwv_pd: power-controller {
+ 			compatible = "mediatek,mt6897-hwv-power-controller";
++			mediatek,spm = <&scpsys>;
+ 			#address-cells = <1>;
+ 			#size-cells = <0>;
+ 			#power-domain-cells = <1>;
+diff --git a/drivers/pmdomain/mediatek/mt6897-pm-domains.h b/drivers/pmdomain/mediatek/mt6897-pm-domains.h
+index 7b9f133e27..3d92d50c67 100644
+--- a/drivers/pmdomain/mediatek/mt6897-pm-domains.h
++++ b/drivers/pmdomain/mediatek/mt6897-pm-domains.h
+@@ -537,7 +537,7 @@ static const struct scpsys_soc_data mt6897_scpsys_data = {
+  * the running display off. VDE0/1 stay default-off; voting them would wake
+  * the decoders.
+  */
+-#define MT6897_HWV_DOMAIN(_name, _bit, _caps, _roots)	{	\
++#define MT6897_HWV_DOMAIN(_name, _bit, _caps, _roots, _pwr, _bank)	{	\
+ 		.name = _name,			\
+ 		.set = 0x0198,			\
+ 		.clr = 0x019c,			\
+@@ -548,17 +548,19 @@ static const struct scpsys_soc_data mt6897_scpsys_data = {
+ 		.setclr_bit = _bit,		\
+ 		.num_prepared_clks = _roots,	\
+ 		.prepared_clk_ids = { CLK_TOP_OVL0, CLK_TOP_OVL1 }, \
++		.spm_pwr_con = _pwr, \
++		.boot_bank = _bank, \
+ 		.caps = _caps,			\
+ 	}
+ 
+ static const struct scpsys_hwv_domain_data scpsys_hwv_domain_data_mt6897[] = {
+-	[MT6897_POWER_DOMAIN_HWV_MM_INFRA] = MT6897_HWV_DOMAIN("mm-infra", 0, 0, 0),
+-	[MT6897_POWER_DOMAIN_HWV_VDE0] = MT6897_HWV_DOMAIN("vde0", 1, MTK_SCPD_KEEP_DEFAULT_OFF, 0),
+-	[MT6897_POWER_DOMAIN_HWV_VDE1] = MT6897_HWV_DOMAIN("vde1", 2, MTK_SCPD_KEEP_DEFAULT_OFF, 0),
+-	[MT6897_POWER_DOMAIN_HWV_DIS0] = MT6897_HWV_DOMAIN("dis0", 3, 0, 0),
+-	[MT6897_POWER_DOMAIN_HWV_DIS1] = MT6897_HWV_DOMAIN("dis1", 4, 0, 0),
+-	[MT6897_POWER_DOMAIN_HWV_OVL0] = MT6897_HWV_DOMAIN("ovl0", 5, 0, 1),
+-	[MT6897_POWER_DOMAIN_HWV_OVL1] = MT6897_HWV_DOMAIN("ovl1", 6, 0, 2),
++	[MT6897_POWER_DOMAIN_HWV_MM_INFRA] = MT6897_HWV_DOMAIN("mm-infra", 0, 0, 0, 0, 0),
++	[MT6897_POWER_DOMAIN_HWV_VDE0] = MT6897_HWV_DOMAIN("vde0", 1, MTK_SCPD_KEEP_DEFAULT_OFF, 0, 0, 0),
++	[MT6897_POWER_DOMAIN_HWV_VDE1] = MT6897_HWV_DOMAIN("vde1", 2, MTK_SCPD_KEEP_DEFAULT_OFF, 0, 0, 0),
++	[MT6897_POWER_DOMAIN_HWV_DIS0] = MT6897_HWV_DOMAIN("dis0", 3, 0, 0, 0, 0),
++	[MT6897_POWER_DOMAIN_HWV_DIS1] = MT6897_HWV_DOMAIN("dis1", 4, 0, 0, 0, 0),
++	[MT6897_POWER_DOMAIN_HWV_OVL0] = MT6897_HWV_DOMAIN("ovl0", 5, 0, 1, 0xea4, 0),
++	[MT6897_POWER_DOMAIN_HWV_OVL1] = MT6897_HWV_DOMAIN("ovl1", 6, 0, 2, 0xea8, 1),
+ };
+ 
+ static const struct scpsys_soc_data mt6897_scpsys_hwv_data = {
+diff --git a/drivers/pmdomain/mediatek/mtk-pm-domains.c b/drivers/pmdomain/mediatek/mtk-pm-domains.c
+index b763c00e82..7b28e9d5be 100644
+--- a/drivers/pmdomain/mediatek/mtk-pm-domains.c
++++ b/drivers/pmdomain/mediatek/mtk-pm-domains.c
+@@ -4,6 +4,7 @@
+  */
+ #include <linux/arm-smccc.h>
+ #include <linux/clk.h>
++#include <linux/clk/mediatek-mt6897.h>
+ #include <linux/clk-provider.h>
+ #include <linux/init.h>
+ #include <linux/io.h>
+@@ -70,6 +71,8 @@ struct scpsys_root_clocks {
+ 	bool prepared;
+ 	unsigned int enabled_count;
+ 	bool failed;
++	bool off_reported;
++	bool ineligible_reported;
+ };
+ 
+ struct scpsys_domain {
+@@ -88,6 +91,8 @@ struct scpsys_domain {
+ struct scpsys {
+ 	struct device *dev;
+ 	struct regmap *base;
++	struct regmap *spm;
++	struct mt6897_clk_boot_owner *boot_owner;
+ 	struct device_node *hwv_node;
+ 	const struct scpsys_soc_data *soc_data;
+ 	u8 bus_prot_index[BUS_PROT_BLOCK_COUNT];
+@@ -413,10 +418,102 @@ static int scpsys_prepare_root_clocks(struct scpsys *scpsys, struct device_node
+ 	return 0;
+ }
+ 
++static int scpsys_get_boot_owner(struct scpsys *scpsys)
++{
++	struct device_node *node, *top;
++	struct mt6897_clk_boot_owner *owner;
++	struct regmap *map;
++	u16 offsets[2] = { 0 };
++	unsigned int i;
++	int ret = 0;
++
++	if (!of_property_present(scpsys->dev->of_node, "mediatek,spm"))
++		return 0;
++	for (i = 0; i < scpsys->soc_data->num_hwv_domains; i++) {
++		const struct scpsys_hwv_domain_data *data = &scpsys->soc_data->hwv_domains_data[i];
++
++		if (!data->num_prepared_clks)
++			continue;
++		if (!data->spm_pwr_con || (data->spm_pwr_con & 3) ||
++		    data->boot_bank > 1 || offsets[data->boot_bank])
++			return -EINVAL;
++		offsets[data->boot_bank] = data->spm_pwr_con;
++	}
++	if (!offsets[0] || !offsets[1] || offsets[0] == offsets[1])
++		return -EINVAL;
++	node = of_parse_phandle(scpsys->dev->of_node, "mediatek,spm", 0);
++	if (!node)
++		return -EINVAL;
++	if (!of_device_is_compatible(node, "mediatek,mt6897-scpsys") ||
++	    of_property_present(node, "clocks") || of_property_present(node, "hwlocks") ||
++	    of_property_present(node, "resets") ||
++	    of_property_present(node, "power-domains")) {
++		ret = -EINVAL;
++		goto out;
++	}
++	map = syscon_node_to_regmap(node);
++	if (IS_ERR(map)) {
++		ret = PTR_ERR(map);
++		goto out;
++	}
++	if (regmap_might_sleep(map)) {
++		ret = -EINVAL;
++		goto out;
++	}
++	top = of_find_compatible_node(NULL, NULL, scpsys->soc_data->prepared_clk_compatible);
++	owner = mt6897_clk_boot_get(top, scpsys->dev);
++	of_node_put(top);
++	if (IS_ERR(owner)) {
++		ret = PTR_ERR(owner);
++		goto out;
++	}
++	scpsys->spm = map;
++	scpsys->boot_owner = owner;
++out:
++	of_node_put(node);
++	return ret;
++}
++
++static void scpsys_record_boot_off(struct scpsys_domain *pd)
++{
++	struct scpsys *scpsys = pd->scpsys;
++	struct scpsys_root_clocks *roots = pd->roots;
++	u32 status = 0;
++	int ret;
++
++	if (!scpsys->boot_owner)
++		return;
++	/* Keep the complete ordinary-root reference set through observation and
++	 * transfer. Incomplete ownership must not record even a sticky epoch.
++	 */
++	if (roots->enabled_count != roots->num_clks)
++		ret = -EINVAL;
++	else {
++		ret = regmap_read(scpsys->spm, pd->hwv_data->spm_pwr_con, &status);
++		if (!ret)
++			ret = mt6897_clk_boot_record_off(scpsys->boot_owner,
++						       pd->hwv_data->boot_bank, status);
++	}
++	/* A busy first sample must not hide a later verified off observation. */
++	if ((!ret && !roots->off_reported) || (ret && !roots->ineligible_reported)) {
++		dev_info(scpsys->dev, "%s: physical-off observation %#x, epoch result %d\n",
++			 pd->genpd.name, status, ret);
++		if (ret)
++			roots->ineligible_reported = true;
++		else
++			roots->off_reported = true;
++	}
++}
++
+ static void scpsys_unprepare_root_clocks(struct scpsys *scpsys)
+ {
+ 	int i;
+ 
++	if (scpsys->boot_owner) {
++		mt6897_clk_boot_put(scpsys->boot_owner);
++		scpsys->boot_owner = NULL;
++	}
++
+ 	for (i = scpsys->soc_data->num_hwv_domains - 1; i >= 0; i--) {
+ 		struct scpsys_root_clocks *roots = &scpsys->roots[i];
+ 
+@@ -511,6 +608,7 @@ static int scpsys_hwv_root_power_off(struct generic_pm_domain *genpd)
+ 			genpd->name, ret);
+ 		return ret;
+ 	}
++	scpsys_record_boot_off(pd);
+ 	while (roots->enabled_count)
+ 		clk_disable(roots->clks[--roots->enabled_count].clk);
+ 	return 0;
+@@ -1680,6 +1778,8 @@ static int scpsys_probe(struct platform_device *pdev)
+ 		if (!scpsys->roots)
+ 			return -ENOMEM;
+ 		ret = scpsys_prepare_root_clocks(scpsys, np);
++		if (!ret)
++			ret = scpsys_get_boot_owner(scpsys);
+ 		if (ret) {
+ 			scpsys_unprepare_root_clocks(scpsys);
+ 			return dev_err_probe(dev, ret, "failed to prepare domain roots\n");
+diff --git a/drivers/pmdomain/mediatek/mtk-pm-domains.h b/drivers/pmdomain/mediatek/mtk-pm-domains.h
+index 1b0c97edb7..517fe7f928 100644
+--- a/drivers/pmdomain/mediatek/mtk-pm-domains.h
++++ b/drivers/pmdomain/mediatek/mtk-pm-domains.h
+@@ -196,6 +196,8 @@ struct scpsys_domain_data {
+  * @sta_bit:    The SET/CLR STA bit to check for on/off ACK
+  * @num_prepared_clks: Roots to prepare once before domain initialization
+  * @prepared_clk_ids: Exact provider clock IDs, checked before preparing
++ * @spm_pwr_con: Physical SPM power-status register for boot handoff
++ * @boot_bank: OVL bank associated with the physical off epoch
+  * @caps:       The flag for active wake-up action
+  */
+ struct scpsys_hwv_domain_data {
+@@ -211,6 +213,8 @@ struct scpsys_hwv_domain_data {
+ 	/* Prepare these domain roots once, before any domain initialization. */
+ 	u8 num_prepared_clks;
+ 	u16 prepared_clk_ids[2];
++	u16 spm_pwr_con;
++	u8 boot_bank;
+ 	u16 caps;
+ };
+ 
+diff --git a/tools/testing/selftests/mtk_clk/domain_cases.c b/tools/testing/selftests/mtk_clk/domain_cases.c
+index 5062910fc5..2b10e3911e 100644
+--- a/tools/testing/selftests/mtk_clk/domain_cases.c
++++ b/tools/testing/selftests/mtk_clk/domain_cases.c
+@@ -1,6 +1,8 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+ static struct scpsys_hwv_domain_data data[2] = {
+     {.num_prepared_clks = 1,
++     .spm_pwr_con = 0xea4,
++     .boot_bank = 0,
+      .set = 1,
+      .clr = 2,
+      .done = 3,
+@@ -9,6 +11,8 @@ static struct scpsys_hwv_domain_data data[2] = {
+      .clr_sta = 6,
+      .setclr_bit = 0},
+     {.num_prepared_clks = 2,
++     .spm_pwr_con = 0xea8,
++     .boot_bank = 1,
+      .prepared_clk_ids = {0, 1},
+      .set = 1,
+      .clr = 2,
+@@ -31,6 +35,7 @@ static struct device_node parent = {.child = &ovl0};
+ static struct scpsys_root_clocks roots[2];
+ static struct regmap map;
+ static struct scpsys controller;
++static struct device controller_device = {.of_node = &parent};
+ static void reset(void)
+ {
+ 	for (unsigned i = 0; i < num_allocations; i++)
+@@ -40,13 +45,20 @@ static void reset(void)
+ 	functional = (struct core){0};
+ 	memset(roots, 0, sizeof(roots));
+ 	map = (struct regmap){.done = 3, .en = 3};
+-	controller = (struct scpsys){.base = &map,
++	controller = (struct scpsys){.dev = &controller_device,
++				     .base = &map,
+ 				     .hwv_node = &hwv_node,
+ 				     .soc_data = &soc,
+ 				     .roots = roots};
+ 	acquire_calls = prepare_calls = enable_calls = 0;
+ 	fail_acquire = fail_prepare = fail_enable = 0;
+ 	invalid_provider = invalid_clock_id = invalid_voter = 0;
++	unwind_sequence = put_sequence = unprepare_sequence = 0;
++	parent.spm = false;
++	owner_get_error = owner_put_calls = unsafe_spm = sleeping_spm =
++	    reset_spm = map_creations = 0;
++	boot_handle.calls = 0;
++	spm_map = (struct regmap){0};
+ 	ovl0.disabled = false;
+ 	parent.child = &ovl0;
+ 	ovl0.next = &ovl1;
+@@ -225,8 +237,83 @@ static void test_off_timeouts_and_ancestor_guard(void)
+ 	}
+ }
+ 
++static void test_spm_preflight_and_observation(void)
++{
++	reset();
++	assert(!scpsys_prepare_root_clocks(&controller, &parent));
++	assert(!scpsys_get_boot_owner(&controller));
++	assert(!controller.boot_owner);
++	parent.spm = true;
++	for (int bad = 0; bad < 5; bad++) {
++		struct scpsys_hwv_domain_data saved = data[1];
++		if (bad == 0)
++			data[1].spm_pwr_con = 0;
++		if (bad == 1)
++			data[1].spm_pwr_con = 0xea5;
++		if (bad == 2)
++			data[1].boot_bank = 2;
++		if (bad == 3)
++			data[1].boot_bank = 0;
++		if (bad == 4)
++			data[1].spm_pwr_con = data[0].spm_pwr_con;
++		assert(scpsys_get_boot_owner(&controller) == -EINVAL);
++		assert(!map_creations && !map.writes);
++		data[1] = saved;
++	}
++	reset_spm = 1;
++	assert(scpsys_get_boot_owner(&controller) == -EINVAL);
++	assert(!map_creations);
++	reset_spm = 0;
++	unsafe_spm = 1;
++	assert(scpsys_get_boot_owner(&controller) == -EINVAL);
++	unsafe_spm = 0;
++	sleeping_spm = 1;
++	assert(scpsys_get_boot_owner(&controller) == -EINVAL);
++	sleeping_spm = 0;
++	owner_get_error = -EPROBE_DEFER;
++	assert(scpsys_get_boot_owner(&controller) == -EPROBE_DEFER);
++	assert(!map.writes);
++	owner_get_error = 0;
++	assert(!scpsys_get_boot_owner(&controller));
++	assert(controller.boot_owner == &boot_handle);
++	scpsys_unprepare_root_clocks(&controller);
++	assert(owner_put_calls == 1 && !controller.boot_owner &&
++	       !shared.prepared);
++	assert(put_sequence && unprepare_sequence > put_sequence);
++	reset();
++	parent.spm = true;
++	assert(!scpsys_prepare_root_clocks(&controller, &parent));
++	assert(!scpsys_get_boot_owner(&controller));
++	assert(!scpsys_quarantine_initialization(&controller, -EIO));
++	assert(controller.boot_owner == &boot_handle && !owner_put_calls &&
++	       shared.prepared == 2);
++	for (int mode = 0; mode < 4; mode++) {
++		reset();
++		parent.spm = true;
++		assert(!scpsys_prepare_root_clocks(&controller, &parent));
++		assert(!scpsys_get_boot_owner(&controller));
++		struct scpsys_domain a = domain(0);
++		assert(!scpsys_hwv_root_power_on(&a.genpd));
++		spm_map.physical = mode == 0 ? 18 : mode == 1 ? BIT(30) : 0;
++		spm_map.fail = mode == 3 ? 1 : 0;
++		assert(!scpsys_hwv_root_power_off(&a.genpd));
++		assert(!shared.enabled && !controller.quarantined);
++		assert(boot_handle.calls == (mode == 3 ? 0 : 1));
++		assert(roots[0].off_reported == (mode == 0));
++		assert(roots[0].ineligible_reported == (mode != 0));
++		/* A first ineligible sample does not suppress eventual success.
++		 */
++		spm_map.fail = 0;
++		spm_map.physical = 18;
++		assert(!scpsys_hwv_root_power_on(&a.genpd));
++		assert(!scpsys_hwv_root_power_off(&a.genpd));
++		assert(roots[0].off_reported);
++	}
++}
++
+ int main(void)
+ {
++	test_spm_preflight_and_observation();
+ 	test_preflight_failures();
+ 	test_invalid_roots();
+ 	test_missing_required_domains();
+diff --git a/tools/testing/selftests/mtk_clk/domain_stubs.h b/tools/testing/selftests/mtk_clk/domain_stubs.h
+index 28032fad09..bfaaa483d1 100644
+--- a/tools/testing/selftests/mtk_clk/domain_stubs.h
++++ b/tools/testing/selftests/mtk_clk/domain_stubs.h
+@@ -7,6 +7,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ typedef uint32_t u32;
++typedef uint16_t u16;
+ #define BIT(x) (1U << (x))
+ #define EPROBE_DEFER 517
+ #define GFP_KERNEL 0
+@@ -14,6 +15,7 @@ typedef uint32_t u32;
+ #define PTR_ERR(p) ((int)(intptr_t)(p))
+ #define IS_ERR(p) ((uintptr_t)(p) >= (uintptr_t)-4095)
+ #define dev_err(...) ((void)0)
++#define dev_info(...) ((void)0)
+ #define MTK_SCPD_DOMAIN_SUPPLY 1
+ #define MTK_SCPD_INFRA_PWR_CTL 2
+ #define MTK_SCPD_KEEP_DEFAULT_OFF 4
+@@ -35,7 +37,7 @@ struct clk_bulk_data {
+ 	struct clk *clk;
+ };
+ struct device_node {
+-	bool disabled;
++	bool disabled, spm;
+ 	u32 id;
+ 	int count;
+ 	const char *names[2];
+@@ -44,6 +46,7 @@ struct device_node {
+ };
+ struct scpsys_hwv_domain_data {
+ 	unsigned num_prepared_clks, caps;
++	u32 spm_pwr_con, boot_bank;
+ 	u32 prepared_clk_ids[2];
+ 	u32 set, clr, done, en, set_sta, clr_sta, setclr_bit;
+ };
+@@ -56,18 +59,26 @@ struct generic_pm_domain {
+ 	const char *name;
+ };
+ struct regmap {
+-	u32 vote, done, en, sta;
++	u32 vote, done, en, sta, physical;
+ 	int calls, fail, stuck, writes, drop_done;
+ 	u32 pending_clr;
+ };
+ struct scpsys_root_clocks {
+ 	struct clk_bulk_data *clks;
+ 	int num_clks;
+-	bool seen, prepared, failed;
++	bool seen, prepared, failed, off_reported, ineligible_reported;
+ 	unsigned enabled_count;
+ };
++struct device {
++	struct device_node *of_node;
++};
++struct mt6897_clk_boot_owner {
++	int calls;
++};
+ struct scpsys {
+-	void *dev;
++	struct device *dev;
++	struct regmap *spm;
++	struct mt6897_clk_boot_owner *boot_owner;
+ 	struct device_node *hwv_node;
+ 	struct regmap *base;
+ 	const struct scpsys_soc_data *soc_data;
+@@ -84,6 +95,7 @@ struct scpsys_domain {
+ 	void *supply;
+ };
+ #define to_scpsys_domain(g) container_of(g, struct scpsys_domain, genpd)
++static int unwind_sequence, put_sequence, unprepare_sequence;
+ static int acquire_calls, fail_acquire, prepare_calls, fail_prepare,
+     enable_calls, fail_enable;
+ static void *allocations[128];
+@@ -130,6 +142,8 @@ static void clk_bulk_put(int n, struct clk_bulk_data *c)
+ }
+ static void clk_bulk_unprepare(int n, struct clk_bulk_data *c)
+ {
++	if (n && !unprepare_sequence)
++		unprepare_sequence = ++unwind_sequence;
+ 	for (int i = 0; i < n; i++) {
+ 		assert(c[i].clk->core->prepared > 0);
+ 		c[i].clk->core->prepared--;
+@@ -181,11 +195,12 @@ static int regmap_read(struct regmap *m, u32 r, u32 *v)
+ {
+ 	if (++m->calls == m->fail)
+ 		return -EIO;
+-	*v = r == 1   ? m->vote
+-	     : r == 2 ? m->pending_clr
+-	     : r == 3 ? m->done
+-	     : r == 4 ? m->en
+-		      : m->sta;
++	*v = r >= 0xea4 ? m->physical
++	     : r == 1	? m->vote
++	     : r == 2	? m->pending_clr
++	     : r == 3	? m->done
++	     : r == 4	? m->en
++			: m->sta;
+ 	return 0;
+ }
+ static int regmap_write(struct regmap *m, u32 r, u32 v)
+@@ -298,9 +313,48 @@ static void clk_disable(struct clk *c)
+ 
+ #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+ 
+-static struct device_node hwv_node;
++static struct device_node hwv_node, spm_node;
+ static struct device_node *of_parse_phandle(struct device_node *n,
+ 					    const char *k, int i)
+ {
++	if (!strcmp(k, "mediatek,spm"))
++		return &spm_node;
+ 	return invalid_voter ? NULL : &hwv_node;
+ }
++
++static struct mt6897_clk_boot_owner boot_handle;
++static struct regmap spm_map;
++static int owner_get_error, owner_put_calls, unsafe_spm, sleeping_spm,
++    reset_spm, map_creations;
++static bool of_property_present(struct device_node *n, const char *k)
++{
++	if (!strcmp(k, "mediatek,spm"))
++		return n->spm;
++	return unsafe_spm || (!strcmp(k, "resets") && reset_spm);
++}
++static bool of_device_is_compatible(struct device_node *n, const char *c)
++{
++	return !unsafe_spm;
++}
++static struct regmap *syscon_node_to_regmap(struct device_node *n)
++{
++	map_creations++;
++	return &spm_map;
++}
++static bool regmap_might_sleep(struct regmap *m) { return sleeping_spm; }
++static struct mt6897_clk_boot_owner *mt6897_clk_boot_get(struct device_node *n,
++							 struct device *d)
++{
++	return owner_get_error ? ERR_PTR(owner_get_error) : &boot_handle;
++}
++static void mt6897_clk_boot_put(struct mt6897_clk_boot_owner *o)
++{
++	owner_put_calls++;
++	put_sequence = ++unwind_sequence;
++}
++static int mt6897_clk_boot_record_off(struct mt6897_clk_boot_owner *o,
++				      unsigned bank, u32 status)
++{
++	o->calls++;
++	return status == 18 ? 0 : -EINVAL;
++}
+diff --git a/tools/testing/selftests/mtk_clk/test_domains.py b/tools/testing/selftests/mtk_clk/test_domains.py
+index 3d0800b8ac..bbdf4dc2a9 100755
+--- a/tools/testing/selftests/mtk_clk/test_domains.py
++++ b/tools/testing/selftests/mtk_clk/test_domains.py
+@@ -3,6 +3,7 @@
+ """Exercise production root-preflight and HWV domain functions with host mocks."""
+ from pathlib import Path
+ import os
++import re
+ import subprocess
+ import tempfile
+ 
+@@ -29,8 +30,15 @@ for name in ['scpsys_hwv_power_on', 'scpsys_hwv_power_off_internal',
+ for name in ['scpsys_hwv_root_power_on', 'scpsys_hwv_root_power_off']:
+     assert 'clk_bulk_prepare' not in function(name)
+     assert 'clk_bulk_unprepare' not in function(name)
++mapping = (repo / 'drivers/pmdomain/mediatek/mt6897-pm-domains.h').read_text()
++for bank, offset in [(0, '0xea4'), (1, '0xea8')]:
++    pattern = (r'\[MT6897_POWER_DOMAIN_HWV_OVL' + str(bank) +
++               r'\] = MT6897_HWV_DOMAIN\("ovl' + str(bank) +
++               r'", \d+, 0, ' + str(bank + 1) + ', ' + offset + ', ' + str(bank) + r'\)')
++    assert re.search(pattern, mapping)
+ probe = function('scpsys_probe')
+-assert probe.index('scpsys_prepare_root_clocks') < probe.index('scpsys_add_one_domain')
++assert probe.index('scpsys_prepare_root_clocks') < probe.index('scpsys_get_boot_owner') < probe.index('scpsys_add_one_domain')
++assert function('scpsys_hwv_root_power_off').index('scpsys_hwv_root_vote') < function('scpsys_hwv_root_power_off').index('scpsys_record_boot_off') < function('scpsys_hwv_root_power_off').index('clk_disable')
+ assert probe.index('scpsys_prepare_root_clocks') < probe.index('of_genpd_add_provider_onecell')
+ assert 'return scpsys_quarantine_initialization(scpsys, ret)' in probe
+ add_start = source.index('generic_pm_domain *scpsys_add_one_domain')
+-- 
+2.56.0
+

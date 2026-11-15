@@ -114,23 +114,64 @@ pub(crate) fn render(
     } else if menu.logs {
         canvas.line(6, "RECOVERY LOG (WARNING+)");
         logs(canvas, 8, footer, log);
-    } else if menu.error || menu.busy || menu.confirming {
+    } else if menu.error || menu.busy || menu.confirming || menu.choosing {
         canvas.line(6, cfg.item_label(&cfg.items[menu.selected]));
+        let question;
         canvas.line(
             8,
-            if menu.error {
+            if menu.error && menu.succeeded {
+                "Action finished"
+            } else if menu.error {
                 "Action stopped"
             } else if menu.busy {
                 "Running action..."
+            } else if let Some(size) = menu.chosen() {
+                question = format!("Erase userdata; keep {size} for Android?");
+                &question
+            } else if menu.choosing {
+                "Android userdata to keep (erased):"
             } else {
                 "Leave recovery? RAM data will be lost."
             },
         );
         if menu.error {
             logs(canvas, 10, footer, failure);
+        } else if menu.choosing && !menu.confirming {
+            if menu.choices.is_empty() {
+                canvas.line(10, "Reading storage...");
+            }
+            let names = menu.choices.iter().map(String::as_str).chain(["Cancel"]);
+            for (i, name) in names.enumerate() {
+                let marker = if i == menu.choice { '>' } else { ' ' };
+                canvas.line(11 + i * 2, &format!("{marker} {name}"));
+            }
+            canvas.line(
+                12 + (menu.choices.len() + 1) * 2,
+                "Linux gets the rest of userdata.",
+            );
         } else if menu.confirming {
-            canvas.line(11, if menu.yes { "  Cancel" } else { "> Cancel" });
-            canvas.line(13, if menu.yes { "> Confirm" } else { "  Confirm" });
+            // The plan of the chosen size; the buttons follow it.
+            let mut row = 10;
+            if menu.chosen().is_some() {
+                let room = footer.saturating_sub(row + 5);
+                let width = canvas.w;
+                let plan: Vec<String> = menu
+                    .plan
+                    .iter()
+                    .flat_map(|l| wrap_log(l, width))
+                    .take(room)
+                    .collect();
+                for line in plan {
+                    canvas.line(row, &line);
+                    row += 1;
+                }
+                if menu.plan.is_empty() {
+                    canvas.line(row, "Reading the plan...");
+                    row += 1;
+                }
+            }
+            canvas.line(row + 1, if menu.yes { "  Cancel" } else { "> Cancel" });
+            canvas.line(row + 3, if menu.yes { "> Confirm" } else { "  Confirm" });
         }
     } else {
         for (idx, item) in cfg.items.iter().enumerate() {

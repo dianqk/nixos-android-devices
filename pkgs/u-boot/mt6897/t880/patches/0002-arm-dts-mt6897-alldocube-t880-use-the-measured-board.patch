@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Wed, 14 Oct 2026 20:55:10 +0800
+Subject: [PATCH] arm: dts: mt6897-alldocube-t880: use the measured board
+ values
+
+Values from the device's runtime FDT: the USB 2.0 port is an xsphy at
+0x11e40000 (not the TB373FU t-phy), driven in peripheral mode with VBUS
+forced as the vendor tree does; the UFS host register window is 0x3000;
+volume down and up are keypad matrix positions 0 and 1; the framebuffer
+is portrait 1600x2560 ARGB8888 with a 6400-byte pitch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm/dts/mt6897-alldocube-t880.dts | 59 ++++++++++++++++++--------
+ 1 file changed, 41 insertions(+), 18 deletions(-)
+
+diff --git a/arch/arm/dts/mt6897-alldocube-t880.dts b/arch/arm/dts/mt6897-alldocube-t880.dts
+index 5177b64be86..48b2505e39a 100644
+--- a/arch/arm/dts/mt6897-alldocube-t880.dts
++++ b/arch/arm/dts/mt6897-alldocube-t880.dts
+@@ -2,13 +2,10 @@
+ /*
+  * Alldocube iPlay 80 mini Ultra (T880, MediaTek MT8883 / MT6897 class)
+  *
+- * PLACEHOLDER VALUES: nothing below has been read from a T880 yet. SoC
+- * addresses come from the MT6897 Lenovo TB373FU/TB375FC device trees;
+- * the keypad and framebuffer geometry are assumptions. Replace them with
+- * the T880's own FDT (/sys/firmware/fdt) before flashing.
+- *
+- * Memory, reserved memory, the initrd and the framebuffer base are taken
+- * at runtime from the FDT that LK passes to U-Boot.
++ * Board values come from the device's own runtime FDT (stock LK, Android
++ * 16), read on 2026-10-14. Memory, reserved memory, the initrd window and
++ * the framebuffer base are taken at runtime from the FDT that LK passes to
++ * U-Boot. Still unverified on hardware: everything U-Boot does with them.
+  */
+ 
+ /dts-v1/;
+@@ -26,9 +23,9 @@
+ 		ranges;
+ 
+ 		/*
+-		 * PLACEHOLDER: portrait 1600x2560 a8r8g8b8 is assumed for the
+-		 * 2560x1600 panel. board_fix_fdt() fills reg from LK's videolfb
+-		 * tags and enables the node only if LK's VRAM holds this size.
++		 * LK framebuffer: 0xfd11f000, VRAM 0x2ee0000 (three portrait
++		 * 1600x2560 ARGB8888 buffers, pitch 6400). board_fix_fdt() fills
++		 * reg from LK's videolfb tags and enables the node.
+ 		 */
+ 		framebuffer: framebuffer@0 {
+ 			compatible = "simple-framebuffer";
+@@ -41,30 +38,56 @@
+ 		};
+ 	};
+ 
+-	/* PLACEHOLDER (TB373FU): volume down on the keypad controller. */
++	/* Keypad matrix positions from the vendor mediatek,hw-init-map. */
+ 	kp_keys: kp-keys {
+ 		compatible = "mediatek,kp-raw";
+ 
+ 		voldown-key {
+ 			label = "Volume Down";
+ 			linux,code = <KEY_VOLUMEDOWN>;
++			mediatek,kp-index = <0>;
++		};
++
++		volup-key {
++			label = "Volume Up";
++			linux,code = <KEY_VOLUMEUP>;
++			mediatek,kp-index = <1>;
+ 		};
+ 	};
+ };
+ 
+-&ufshci {
+-	compatible = "mediatek,mt6897-ufshci";
+-	status = "okay";
++&soc {
++	/* The device uses an xsphy, not the t-phy of the TB373FU tree. */
++	xsphy: usb-phy@11e43000 {
++		compatible = "mediatek,xsphy";
++		reg = <0x11e43000 0x200>;
++		#address-cells = <1>;
++		#size-cells = <1>;
++		ranges;
++
++		xsphy_u2: usb2-phy@11e40000 {
++			reg = <0x11e40000 0x400>;
++			clocks = <&clk26m>;
++			clock-names = "ref";
++			#phy-cells = <1>;
++		};
++	};
+ };
+ 
+-&ufsphy {
+-	status = "okay";
++&mtu3 {
++	phys = <&xsphy_u2 PHY_TYPE_USB2>;
++	maximum-speed = "high-speed";
++	mediatek,force-vbus;
+ };
+ 
+-&usbphy {
++/delete-node/ &usbphy;
++
++&ufshci {
++	compatible = "mediatek,mt6897-ufshci";
++	reg = <0x112b0000 0x3000>;
+ 	status = "okay";
+ };
+ 
+-&u2port {
++&ufsphy {
+ 	status = "okay";
+ };

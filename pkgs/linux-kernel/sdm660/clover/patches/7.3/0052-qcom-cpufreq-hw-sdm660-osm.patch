@@ -1,0 +1,674 @@
+From f71b65ae74280f84da7186fa5e7fed409c38f325 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sat, 31 Oct 2026 19:46:22 +0800
+Subject: [PATCH] cpufreq: qcom-hw: Add SDM660 OSM programming
+
+The SDM660 OSM runs the TrustZone owned sequencer like MSM8998 but is
+programmed as clk-cpu-osm-660.c of the vendor kernel does. Add a
+qcom,sdm660-cpufreq-hw variant that follows the vendor driver and the
+vendor device tree configuration:
+
+- Wait for the L2 SAWs listed in qcom,saw, which pass the CPRh voltage
+  requests to the PMIC, then set the GPLL0 based alternate clock (LUT
+  index 0) to 300 MHz and the APCS OSM clock RCG to 200 MHz from it
+  (source 1, divider 1.5) before any OSM register is written.
+- Attach the CPU to the CPRh power domain first, so the CPRh is fully
+  programmed before the OSM, then write the cycle counter, all 40 LUT
+  rows (the last entry fills the rest), the CC and LLM policies and the
+  FSM timers in OSM clock cycles, with the vendor read-modify-write
+  semantics and no PC override index.
+- Derive the MEM-ACC thresholds from the corners where the LUT spare data
+  changes, keeping missing transitions at corner 0 as the vendor driver
+  does instead of requiring two crossovers, and write the L-val of the
+  first corner of the highest MEM-ACC level.
+- Write the APM threshold corner (not the crossover corner) to SEQ_REG1,
+  and the crossover, threshold, previous-corner (0xff below corner 1) and
+  APM parameter sequencer registers through SCM.
+- Request index 0 before enabling the OSM. Any error leaves it disabled.
+- On any programming error, detach the CPU from the CPRh domain again
+  (and free the parameter table), so that the next CPU of the domain
+  retries from a clean state instead of finding a stale attachment.
+- No ACD and no bandwidth votes on frequency changes.
+
+The LUT, MEM-ACC and APM values are logged when the OSM is programmed.
+
+An optional qcom,lut-max-microvolt property keeps LUT entries above that
+voltage out of the cpufreq frequency table, so they are never requested
+while the hardware still has the full table.
+
+Scope: SDM630/660 common
+Porting notes: Local addition based on the vendor crDroid 4.19 drivers/clk/qcom/clk-cpu-osm-660.c and the clock_cpu node of arch/arm64/boot/dts/vendor/qcom/sdm660.dtsi (not upstream).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/cpufreq/qcom-cpufreq-hw.c | 494 ++++++++++++++++++++++++++++--
+ 1 file changed, 469 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/cpufreq/qcom-cpufreq-hw.c b/drivers/cpufreq/qcom-cpufreq-hw.c
+index 578d911ebe..cd1422abad 100644
+--- a/drivers/cpufreq/qcom-cpufreq-hw.c
++++ b/drivers/cpufreq/qcom-cpufreq-hw.c
+@@ -248,6 +248,9 @@ struct qcom_cpufreq_hw_params {
+  * @lut_row_size:          Lookup Table row size
+  * @clk_hw_div:            Divider for "alternate" OSM clock-source
+  * @uses_tz:               OSM already set-up and protected by TrustZone
++ * @no_bw_votes:           Don't set the OPPs (bandwidth votes) on frequency changes
++ * @osm_setup:             SoC specific OSM programming, instead of the generic one
++ * @setup_clocks:          SoC specific clock setup before OSM programming
+  * @setup_regs:            Register offsets for OSM setup
+  */
+ 
+@@ -266,6 +269,10 @@ struct qcom_cpufreq_soc_data {
+ 	u8 lut_row_size;
+ 	u8 clk_hw_div;
+ 	bool uses_tz;
++	bool no_bw_votes;
++	int (*osm_setup)(struct device *cpu_dev, struct cpufreq_policy *policy,
++			 int cpu_count, int index);
++	int (*setup_clocks)(struct platform_device *pdev);
+ 	const struct qcom_cpufreq_soc_setup_data setup_regs;
+ 	const struct qcom_cpufreq_soc_acd_data acd_data;
+ };
+@@ -285,6 +292,9 @@ struct qcom_cpufreq_data {
+ 	struct cpufreq_policy *policy;
+ 	struct clk_hw cpu_clk;
+ 
++	/* CPU attachment to the CPR power domain, while programming the OSM */
++	struct device *cpr_vdev;
++
+ 	bool per_core_dcvs;
+ };
+ 
+@@ -384,7 +394,7 @@ static int qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
+ 		for (i = 1; i < cpumask_weight(policy->related_cpus); i++)
+ 			writel_relaxed(index, data->base + soc_data->reg_perf_state + i * 4);
+ 
+-	if (icc_scaling_enabled)
++	if (icc_scaling_enabled && !soc_data->no_bw_votes)
+ 		qcom_cpufreq_set_bw(policy, freq);
+ 
+ 	return 0;
+@@ -491,9 +501,9 @@ static void qcom_cpufreq_hw_boost_setup(void __iomem *timer0_addr, u32 len)
+ }
+ 
+ /**
+- * qcom_cpufreq_gen_params() - Generate parameters to send to the hardware
++ * __qcom_cpufreq_gen_params() - Generate parameters to send to the hardware
+  * @cpu_dev:     CPU device
+- * @data:        SoC specific register offsets
++ * @genpd_cpr_vdev: Virtual device of the CPU in the CPR power domain
+  * @hw_tbl:      Pointer to return the array of parameters
+  * @apm_vc:      APM Virtual Corner crossover number, returned to the caller
+  * @acc_vc:      MEMACC Virtual Corner crossover number, returned to the caller
+@@ -508,13 +518,12 @@ static void qcom_cpufreq_hw_boost_setup(void __iomem *timer0_addr, u32 len)
+  *
+  * Returns: Zero for success, otherwise negative value on errors.
+  */
+-static int qcom_cpufreq_gen_params(struct device *cpu_dev,
+-				   struct qcom_cpufreq_data *data,
+-				   struct qcom_cpufreq_hw_params **hw_tbl,
+-				   int *apm_vc, int *acc_vc, int cpu_count,
+-				   u8 *num_entries)
++static int __qcom_cpufreq_gen_params(struct device *cpu_dev,
++				     struct device *genpd_cpr_vdev,
++				     struct qcom_cpufreq_hw_params **hw_tbl,
++				     int *apm_vc, int *acc_vc, int cpu_count,
++				     u8 *num_entries)
+ {
+-	struct device *genpd_cpr_vdev;
+ 	struct platform_device *pdev = cpufreq_get_driver_data();
+ 	const struct qcom_cpufreq_soc_data *soc_data = qcom_cpufreq.soc_data;
+ 	struct device *dev = &pdev->dev;
+@@ -523,18 +532,6 @@ static int qcom_cpufreq_gen_params(struct device *cpu_dev,
+ 	unsigned long rate;
+ 	int apm_uV, acc_uV, i, gpd_opp_cnt, ret = 0;
+ 
+-	/*
+-	 * Attaching the CPU to the CPRh power domain makes the CPR3 driver
+-	 * compute the corner voltages and fill them into the OPP table of the
+-	 * (shared) CPU OPP table, which the virtual device is a member of.
+-	 */
+-	genpd_cpr_vdev = dev_pm_domain_attach_by_name(cpu_dev, cprh_genpd_names[0]);
+-	if (IS_ERR(genpd_cpr_vdev))
+-		return dev_err_probe(dev, PTR_ERR(genpd_cpr_vdev),
+-				     "Could not attach to pm_domain\n");
+-	if (!genpd_cpr_vdev)
+-		return dev_err_probe(dev, -EINVAL, "Got a NULL genpd vdev");
+-
+ 	/*
+ 	 * In the CPR3 driver we have assigned data to the genpd newly created
+ 	 * virtual device: this contains MEMACC and APM thresholds, as passing
+@@ -696,6 +693,59 @@ static int qcom_cpufreq_gen_params(struct device *cpu_dev,
+ 	return ret;
+ }
+ 
++static int qcom_cpufreq_gen_params(struct device *cpu_dev,
++				   struct qcom_cpufreq_data *data,
++				   struct qcom_cpufreq_hw_params **hw_tbl,
++				   int *apm_vc, int *acc_vc, int cpu_count,
++				   u8 *num_entries)
++{
++	struct platform_device *pdev = cpufreq_get_driver_data();
++	struct device *dev = &pdev->dev;
++	struct device *vdev;
++	int ret;
++
++	*hw_tbl = NULL;
++
++	/*
++	 * Attaching the CPU to the CPRh power domain makes the CPR3 driver
++	 * compute the corner voltages and fill them into the OPP table of
++	 * the virtual device it creates for the CPU.
++	 */
++	vdev = dev_pm_domain_attach_by_name(cpu_dev, cprh_genpd_names[0]);
++	if (IS_ERR(vdev))
++		return dev_err_probe(dev, PTR_ERR(vdev),
++				     "Could not attach to pm_domain\n");
++	if (!vdev)
++		return dev_err_probe(dev, -EINVAL, "Got a NULL genpd vdev");
++
++	ret = __qcom_cpufreq_gen_params(cpu_dev, vdev, hw_tbl, apm_vc, acc_vc,
++					cpu_count, num_entries);
++	if (ret) {
++		if (*hw_tbl)
++			devm_kfree(dev, *hw_tbl);
++		*hw_tbl = NULL;
++		dev_pm_domain_detach(vdev, false);
++		return ret;
++	}
++
++	data->cpr_vdev = vdev;
++
++	return 0;
++}
++
++/*
++ * Detach the CPU from the CPR power domain after a failed OSM programming, so
++ * that the next CPU of the domain can attach and program it from scratch.
++ */
++static void qcom_cpufreq_hw_osm_release(struct qcom_cpufreq_data *data)
++{
++	if (!data->cpr_vdev)
++		return;
++
++	dev_pm_domain_detach(data->cpr_vdev, false);
++	data->cpr_vdev = NULL;
++}
++
+ static inline u32 qcom_cpufreq_acd_regbit(u8 acd_reg_offset)
+ {
+ 	return BIT(acd_reg_offset / 4);
+@@ -1048,7 +1098,9 @@ static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
+ 				    struct cpufreq_policy *policy)
+ {
+ 	u32 data, src, lval, i, core_count, prev_freq = 0, freq;
+-	u32 volt;
++	u32 volt, max_uV = 0;
++	bool capped, prev_capped = false, any_capped = false;
++	struct platform_device *pdev = cpufreq_get_driver_data();
+ 	struct cpufreq_frequency_table	*table;
+ 	struct dev_pm_opp *opp;
+ 	unsigned long rate;
+@@ -1060,6 +1112,12 @@ static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
+ 	if (!table)
+ 		return -ENOMEM;
+ 
++	/*
++	 * Optionally keep LUT entries above a voltage out of the frequency
++	 * table: the OSM keeps them, but cpufreq never requests them.
++	 */
++	of_property_read_u32(pdev->dev.of_node, "qcom,lut-max-microvolt", &max_uV);
++
+ 	ret = dev_pm_opp_of_add_table(cpu_dev);
+ 	if (!ret) {
+ 		/* Disable all opps and cross-validate against LUT later */
+@@ -1097,8 +1155,16 @@ static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
+ 		else
+ 			freq = cpu_hw_rate / 1000;
+ 
++		capped = max_uV && volt > max_uV;
++
+ 		if (freq != prev_freq && core_count != LUT_TURBO_IND) {
+-			if (!qcom_cpufreq_update_opp(cpu_dev, freq, volt)) {
++			if (capped) {
++				table[i].frequency = CPUFREQ_ENTRY_INVALID;
++				if (!any_capped)
++					dev_info(cpu_dev, "LUT entries from %u kHz (%u uV) are above %u uV and not used\n",
++						 freq, volt, max_uV);
++				any_capped = true;
++			} else if (!qcom_cpufreq_update_opp(cpu_dev, freq, volt)) {
+ 				table[i].frequency = freq;
+ 				dev_dbg(cpu_dev, "index=%d freq=%d, core_count %d\n", i,
+ 				freq, core_count);
+@@ -1122,7 +1188,7 @@ static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
+ 			 * Only treat the last frequency that might be a boost
+ 			 * as the boost frequency
+ 			 */
+-			if (prev->frequency == CPUFREQ_ENTRY_INVALID) {
++			if (prev->frequency == CPUFREQ_ENTRY_INVALID && !prev_capped) {
+ 				if (!qcom_cpufreq_update_opp(cpu_dev, prev_freq, volt)) {
+ 					prev->frequency = prev_freq;
+ 					prev->flags = CPUFREQ_BOOST_FREQ;
+@@ -1134,6 +1200,7 @@ static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
+ 		}
+ 
+ 		prev_freq = freq;
++		prev_capped = capped;
+ 	}
+ 
+ 	table[i].frequency = CPUFREQ_TABLE_END;
+@@ -1330,6 +1397,58 @@ static const struct qcom_cpufreq_soc_data msm8998_soc_data = {
+ 	},
+ };
+ 
++static int qcom_cpufreq_hw_osm_setup_660(struct device *cpu_dev,
++					  struct cpufreq_policy *policy,
++					  int cpu_count, int index);
++static int qcom_cpufreq_hw_setup_clocks_660(struct platform_device *pdev);
++
++static const struct qcom_cpufreq_soc_data sdm660_soc_data = {
++	.reg_enable = 0x4,
++	.reg_index = 0x150,
++	.reg_freq_lut = 0x154,
++	.reg_freq_lut_src_mask = LUT_SRC_8998,
++	.reg_volt_lut = 0x158,
++	.reg_current_vote = 0xb04,
++	.reg_perf_state = 0xf10,
++	.lut_row_size = 32,
++	.lut_max_entries = LUT_MAX_ENTRIES,
++	.clk_hw_div = 1,
++	.uses_tz = false,
++	.no_bw_votes = true,
++	.osm_setup = qcom_cpufreq_hw_osm_setup_660,
++	.setup_clocks = qcom_cpufreq_hw_setup_clocks_660,
++	.setup_regs = {
++		/* Physical offset for sequencer scm calls */
++		.reg_osm_sequencer = 0x300,
++
++		/* Frequency domain offsets */
++		.reg_override = 0x15c,
++		.reg_spare = 0x164,
++		.reg_cc_zero_behav = 0x0c,
++		.reg_spm_cc_hyst = 0x1c,
++		.reg_spm_cc_dcvs_dis = 0x20,
++		.reg_spm_core_ret_map = 0x24,
++		.reg_llm_freq_vote_hyst = 0x2c,
++		.reg_llm_volt_vote_hyst = 0x30,
++		.reg_llm_intf_dcvs_dis = 0x34,
++		.reg_seq1 = 0x48,
++		.reg_pdn_fsm_ctrl = 0x70,
++		.reg_cc_boost_timer = 0x74,
++		.reg_dcvs_boost_timer = 0x84,
++		.reg_ps_boost_timer = 0x94,
++		.boost_timer_reg_len = 0x4,
++		.reg_boost_sync_delay = 0xa0,
++		.reg_droop_ctrl = 0xa4,
++		.reg_droop_release_ctrl = 0xa8,
++		.reg_droop_unstall_ctrl = 0xac,
++		.reg_droop_wait_release_ctrl = 0xb0,
++		.reg_droop_timer_ctrl = 0xb8,
++		.reg_droop_sync_delay = 0xbc,
++		.reg_pll_override = 0xc0,
++		.reg_cycle_counter = 0xf00,
++	},
++};
++
+ static const struct qcom_cpufreq_soc_data epss_soc_data = {
+ 	.reg_enable = 0x0,
+ 	.reg_domain_state = 0x20,
+@@ -1365,6 +1484,7 @@ static const struct of_device_id qcom_cpufreq_hw_match[] = {
+ 	{ .compatible = "qcom,cpufreq-epss", .data = &epss_soc_data },
+ 	{ .compatible = "qcom,shikra-epss", .data = &shikra_epss_soc_data },
+ 	{ .compatible = "qcom,msm8998-cpufreq-hw", .data = &msm8998_soc_data },
++	{ .compatible = "qcom,sdm660-cpufreq-hw", .data = &sdm660_soc_data },
+ 	{}
+ };
+ MODULE_DEVICE_TABLE(of, qcom_cpufreq_hw_match);
+@@ -1577,6 +1697,318 @@ static int qcom_cpufreq_hw_osm_setup(struct device *cpu_dev,
+ 	return 0;
+ }
+ 
++/*
++ * SDM660 OSM programming, following clk-cpu-osm-660.c of the vendor kernel
++ * (TrustZone owned sequencer, no ACD) with its device tree configuration:
++ * OSM clock 200 MHz, CC up/down timers 1000 ns, retention cores treated as
++ * active, CC DCVS and LLM votes enabled with 327675 ns timers, and the boost,
++ * safe, power-save, droop, WFx and PC/RET FSMs enabled.
++ */
++#define OSM_660_CLK_RATE		200000000
++#define OSM_660_SEQ_MINUS_ONE		0xff
++#define OSM_660_MEM_ACC_LEVELS		3
++
++/* RCG of the OSM clock in APCS common: 200 MHz from GPLL0 at 300 MHz */
++#define OSM_660_RCG_CMD			0x0
++#define OSM_660_RCG_CMD_UPDATE		BIT(0)
++#define OSM_660_RCG_CMD_ROOT_OFF	BIT(31)
++#define OSM_660_RCG_CFG			0x4
++#define OSM_660_RCG_CFG_MASK		(GENMASK(4, 0) | GENMASK(10, 8) | \
++					 GENMASK(13, 12) | BIT(20))
++#define OSM_660_RCG_CFG_200MHZ		(FIELD_PREP(GENMASK(10, 8), 1) | \
++					 FIELD_PREP(GENMASK(4, 0), 2))
++
++static u32 osm_660_count_ns(u64 ns)
++{
++	return div_u64(ns * OSM_660_CLK_RATE, NSEC_PER_SEC);
++}
++
++static void osm_660_or(void __iomem *base, u32 reg, u32 val)
++{
++	writel(readl(base + reg) | val, base + reg);
++}
++
++/**
++ * qcom_cpufreq_hw_setup_clocks_660() - Set the SDM660 OSM clocks up
++ * @pdev: Platform device
++ *
++ * The L2 SAWs, which pass the CPRh voltage requests to the PMIC, must be
++ * configured first. LUT index 0 runs from the GPLL0 based "alternate" clock,
++ * which must be at 300 MHz, and the OSM itself runs at 200 MHz from it. This
++ * is done once, before any OSM register is written.
++ *
++ * Returns: Zero for success, otherwise negative number on errors.
++ */
++static int qcom_cpufreq_hw_setup_clocks_660(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *np;
++	void __iomem *rcg;
++	struct clk *clk;
++	u32 val;
++	int i, ret;
++
++	for (i = 0; (np = of_parse_phandle(dev->of_node, "qcom,saw", i)); i++) {
++		struct platform_device *saw = of_find_device_by_node(np);
++
++		of_node_put(np);
++		ret = saw ? device_is_bound(&saw->dev) : 0;
++		if (saw)
++			put_device(&saw->dev);
++		if (!ret)
++			return dev_err_probe(dev, -EPROBE_DEFER, "waiting for the L2 SAW\n");
++	}
++
++	rcg = devm_platform_ioremap_resource_byname(pdev, "osm-clk");
++	if (IS_ERR(rcg))
++		return dev_err_probe(dev, PTR_ERR(rcg), "Couldn't map the OSM clock\n");
++
++	if (readl(rcg + OSM_660_RCG_CMD) & OSM_660_RCG_CMD_ROOT_OFF)
++		return dev_err_probe(dev, -EIO, "OSM clock is off\n");
++
++	clk = devm_clk_get_enabled(dev, "alternate");
++	if (IS_ERR(clk))
++		return dev_err_probe(dev, PTR_ERR(clk), "Couldn't get the alternate clock\n");
++
++	ret = clk_set_rate(clk, 300000000);
++	if (ret)
++		return dev_err_probe(dev, ret, "Couldn't set the alternate clock to 300 MHz\n");
++
++	val = readl(rcg + OSM_660_RCG_CFG);
++	val &= ~OSM_660_RCG_CFG_MASK;
++	val |= OSM_660_RCG_CFG_200MHZ;
++	writel(val, rcg + OSM_660_RCG_CFG);
++
++	val = readl(rcg + OSM_660_RCG_CMD);
++	writel(val | OSM_660_RCG_CMD_UPDATE, rcg + OSM_660_RCG_CMD);
++
++	ret = readl_poll_timeout(rcg + OSM_660_RCG_CMD, val,
++				 !(val & OSM_660_RCG_CMD_UPDATE), 1, 500);
++	if (ret)
++		return dev_err_probe(dev, ret, "OSM clock update timed out\n");
++
++	dev_info(dev, "alternate clock %lu Hz, OSM clock CFG 0x%x\n",
++		 clk_get_rate(clk), readl(rcg + OSM_660_RCG_CFG));
++
++	return 0;
++}
++
++/**
++ * qcom_cpufreq_hw_osm_setup_660() - Program and enable an SDM660 OSM domain
++ * @cpu_dev:   CPU device
++ * @policy:    CPUFreq policy structure
++ * @cpu_count: Number of CPUs in the frequency domain
++ * @index:     Instance number (CPU cluster number)
++ *
++ * The CPRh of the cluster is programmed first, when the CPU attaches to its
++ * power domain while the parameters are generated. Then the lookup table,
++ * the policies and FSMs, and the TrustZone owned MEM-ACC and APM sequencer
++ * registers are written, index 0 is requested and the OSM is enabled. Any
++ * error leaves the OSM disabled.
++ *
++ * Returns: Zero for success, otherwise negative number on errors.
++ */
++static int qcom_cpufreq_hw_osm_setup_660(struct device *cpu_dev,
++					  struct cpufreq_policy *policy,
++					  int cpu_count, int index)
++{
++	struct platform_device *pdev = cpufreq_get_driver_data();
++	struct qcom_cpufreq_data *ddata = policy->driver_data;
++	const struct qcom_cpufreq_soc_data *sdata = qcom_cpufreq.soc_data;
++	const struct qcom_cpufreq_soc_setup_data *sregs = &sdata->setup_regs;
++	void __iomem *base = ddata->base;
++	struct qcom_cpufreq_hw_params *hw_tbl, *entry = NULL;
++	int level_map[OSM_660_MEM_ACC_LEVELS] = { 0 };
++	int apm_vc = -1, acc_vc = U8_MAX, thr[4], i, j, level, ret;
++	u32 apm_thr_vc, apm_pre_vc, apm_cross_vc, val;
++	char osm_resname[] = "osm-domainX";
++	struct resource *osm_rsrc;
++	u8 num_entries = 0;
++	phys_addr_t seq;
++
++	snprintf(osm_resname, sizeof(osm_resname), "osm-domain%d", index);
++	osm_rsrc = platform_get_resource_byname(pdev, IORESOURCE_MEM, osm_resname);
++	if (!osm_rsrc)
++		return -ENODEV;
++	seq = osm_rsrc->start + sregs->reg_osm_sequencer;
++
++	/* Programs the CPRh, which must be complete before the OSM runs */
++	ret = qcom_cpufreq_gen_params(cpu_dev, ddata, &hw_tbl, &apm_vc,
++				      &acc_vc, cpu_count, &num_entries);
++	if (ret)
++		return dev_err_probe(cpu_dev, ret, "Couldn't generate OSM parameters\n");
++
++	if (num_entries < 2 || acc_vc != U8_MAX) {
++		dev_err(cpu_dev, "Unsupported OSM parameters: %u entries, MEM-ACC corner %d\n",
++			num_entries, acc_vc);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	/* clk_osm_setup_cycle_counters(): OSM to XO ratio, XO edge */
++	val = BIT(0) | CYCLE_COUNTER_USE_XO_EDGE;
++	val |= FIELD_PREP(CYCLE_COUNTER_CLK_RATIO,
++			  OSM_660_CLK_RATE / xo_rate - 1);
++	writel(val, base + sregs->reg_cycle_counter);
++
++	/* clk_osm_setup_hw_table(): the last entry fills the rest of the LUT */
++	for (i = 0; i < LUT_MAX_ENTRIES; i++) {
++		int pos = i * sdata->lut_row_size;
++
++		entry = &hw_tbl[min_t(int, i, num_entries - 1)];
++		writel(i, base + sdata->reg_index + pos);
++		writel(entry->freq_lut_val, base + sdata->reg_freq_lut + pos);
++		writel(entry->volt_lut_val, base + sdata->reg_volt_lut + pos);
++		writel(entry->override_val, base + sregs->reg_override + pos);
++		writel(entry->spare_val, base + sregs->reg_spare + pos);
++
++		if (i < num_entries)
++			dev_info(cpu_dev, "Domain-%d LUT %d: freq 0x%08x volt 0x%08x override 0x%08x spare %u\n",
++				 index, i, entry->freq_lut_val,
++				 entry->volt_lut_val, entry->override_val,
++				 entry->spare_val);
++	}
++
++	/* clk_osm_set_cc_policy(): up/down timers, no PC override index */
++	osm_660_or(base, sregs->reg_spm_cc_hyst,
++		   FIELD_PREP(HYSTERESIS_UP_MASK, osm_660_count_ns(1000)));
++	osm_660_or(base, sregs->reg_spm_cc_hyst,
++		   FIELD_PREP(HYSTERESIS_DN_MASK, osm_660_count_ns(1000)));
++	writel(0, base + sregs->reg_cc_zero_behav);
++	writel(0, base + sregs->reg_spm_core_ret_map);
++	writel(0, base + sregs->reg_spm_cc_dcvs_dis);
++
++	/* clk_osm_set_llm_freq_policy() and clk_osm_set_llm_volt_policy() */
++	osm_660_or(base, sregs->reg_llm_freq_vote_hyst,
++		   FIELD_PREP(HYSTERESIS_UP_MASK, osm_660_count_ns(327675)));
++	osm_660_or(base, sregs->reg_llm_freq_vote_hyst,
++		   FIELD_PREP(HYSTERESIS_DN_MASK, osm_660_count_ns(327675)));
++	osm_660_or(base, sregs->reg_llm_intf_dcvs_dis, 0);
++	osm_660_or(base, sregs->reg_llm_volt_vote_hyst,
++		   FIELD_PREP(HYSTERESIS_UP_MASK, osm_660_count_ns(327675)));
++	osm_660_or(base, sregs->reg_llm_volt_vote_hyst,
++		   FIELD_PREP(HYSTERESIS_DN_MASK, osm_660_count_ns(327675)));
++	osm_660_or(base, sregs->reg_llm_intf_dcvs_dis, 0);
++
++	/* clk_osm_setup_fsms(): boost, safe and power-save FSMs */
++	for (i = 0; i < 3; i++) {
++		static const u8 en[] = { CC_BOOST_EN, DCVS_BOOST_EN, PS_BOOST_EN };
++		const u16 timer[] = { sregs->reg_cc_boost_timer,
++				      sregs->reg_dcvs_boost_timer,
++				      sregs->reg_ps_boost_timer };
++		u32 len = sregs->boost_timer_reg_len;
++
++		osm_660_or(base, sregs->reg_pdn_fsm_ctrl, en[i]);
++		osm_660_or(base, timer[i],
++			   FIELD_PREP(BOOST_TIMER_REG_LO, osm_660_count_ns(10000)) |
++			   FIELD_PREP(BOOST_TIMER_REG_HI, osm_660_count_ns(5000)));
++		osm_660_or(base, timer[i] + len,
++			   FIELD_PREP(BOOST_TIMER_REG_LO, osm_660_count_ns(10000)) |
++			   FIELD_PREP(BOOST_TIMER_REG_HI, osm_660_count_ns(10000)));
++		osm_660_or(base, timer[i] + 2 * len,
++			   FIELD_PREP(BOOST_TIMER_REG_LO, osm_660_count_ns(1000)));
++	}
++	writel(BOOST_SYNC_DELAY, base + sregs->reg_boost_sync_delay);
++
++	/* WFx, PC/RET and DCVS droop FSMs */
++	osm_660_or(base, sregs->reg_pdn_fsm_ctrl, WFX_DROOP_EN);
++	osm_660_or(base, sregs->reg_droop_unstall_ctrl,
++		   FIELD_PREP(DROOP_TIMER1, osm_660_count_ns(500)));
++	osm_660_or(base, sregs->reg_droop_wait_release_ctrl,
++		   FIELD_PREP(DROOP_TIMER1, osm_660_count_ns(250)));
++	osm_660_or(base, sregs->reg_pdn_fsm_ctrl, PC_RET_EXIT_DROOP_EN);
++	osm_660_or(base, sregs->reg_droop_unstall_ctrl,
++		   FIELD_PREP(DROOP_TIMER0, osm_660_count_ns(500)));
++	osm_660_or(base, sregs->reg_droop_wait_release_ctrl,
++		   FIELD_PREP(DROOP_TIMER0, osm_660_count_ns(250)));
++	osm_660_or(base, sregs->reg_pdn_fsm_ctrl, DCVS_DROOP_EN);
++	writel(1, base + sregs->reg_droop_sync_delay);
++	writel(osm_660_count_ns(5), base + sregs->reg_droop_release_ctrl);
++	writel(osm_660_count_ns(500), base + sregs->reg_droop_timer_ctrl);
++	osm_660_or(base, sregs->reg_droop_ctrl, DROOP_CTRL_VAL);
++	osm_660_or(base, sregs->reg_pll_override, PLL_OVERRIDE_DROOP_EN);
++
++	/*
++	 * clk_osm_program_mem_acc_regs(): the MEM-ACC thresholds are the
++	 * corners where the LUT spare data (MEM-ACC level) changes; missing
++	 * transitions stay at corner 0, as in the vendor driver.
++	 */
++	level = hw_tbl[0].spare_val;
++	for (i = 0, j = 0; i < num_entries; i++) {
++		if (level == OSM_660_MEM_ACC_LEVELS)
++			break;
++		if (hw_tbl[i].spare_val != level) {
++			if (j < OSM_660_MEM_ACC_LEVELS)
++				level_map[j++] = i - 1;
++			level = hw_tbl[i].spare_val;
++		}
++	}
++	thr[0] = level_map[0];
++	thr[1] = level_map[0] + 1;
++	thr[2] = level_map[1];
++	thr[3] = level_map[1] + 1;
++
++	for (i = 0; i < SEQ_MEM_ACC_MAX_LEVELS; i++) {
++		ret = qcom_scm_io_writel(SEQ_MEMACC_REG(seq, i), thr[i]);
++		if (ret)
++			goto out;
++	}
++
++	val = 0;
++	for (i = 0; i < num_entries; i++) {
++		if (thr[3] == i) {
++			val = FIELD_GET(LUT_L_VAL, hw_tbl[i].freq_lut_val);
++			ret = qcom_scm_io_writel(SEQUENCER_REG(seq, SEQ_MEM_ACC_LVAL), val);
++			if (ret)
++				goto out;
++		}
++	}
++
++	/*
++	 * clk_osm_resolve_crossover_corners() and clk_osm_apm_vc_setup(): the
++	 * APM threshold is the first corner at or above the APM threshold
++	 * voltage, the crossover corner is the extra CPRh corner after the
++	 * LUT corners.
++	 */
++	if (apm_vc >= 0) {
++		apm_thr_vc = apm_vc;
++		apm_pre_vc = apm_vc ? apm_vc - 1 : OSM_660_SEQ_MINUS_ONE;
++	} else {
++		apm_thr_vc = LUT_MAX_ENTRIES - 1;
++		apm_pre_vc = apm_thr_vc - 1;
++	}
++	apm_cross_vc = num_entries;
++
++	if (apm_thr_vc)
++		writel(apm_thr_vc, base + sregs->reg_seq1);
++	ret = qcom_scm_io_writel(SEQUENCER_REG(seq, SEQ_APM_CROSSOVER_VC), apm_cross_vc);
++	if (!ret)
++		ret = qcom_scm_io_writel(SEQUENCER_REG(seq, SEQ_APM_THRESH_VC), apm_thr_vc);
++	if (!ret)
++		ret = qcom_scm_io_writel(SEQUENCER_REG(seq, SEQ_APM_THRESH_PREVC), apm_pre_vc);
++	if (!ret)
++		ret = qcom_scm_io_writel(SEQUENCER_REG(seq, SEQ_APM_PARAM),
++					 0x39 | apm_thr_vc << 6);
++	if (ret)
++		goto out;
++
++	dev_info(cpu_dev, "Domain-%d: MEM-ACC corners %d-%d %d-%d L-val 0x%x, APM corner %u (previous %u, crossover %u)\n",
++		 index, thr[0], thr[1], thr[2], thr[3], val, apm_thr_vc,
++		 apm_pre_vc, apm_cross_vc);
++
++	/* Request index 0 (GPLL0 300 MHz), then enable the OSM */
++	writel(0, base + sdata->reg_perf_state);
++	udelay(OSM_BOOT_TIME_US);
++	writel(1, base + sdata->reg_enable);
++	readl(base + sdata->reg_enable);
++	udelay(OSM_BOOT_TIME_US);
++
++	dev_info(cpu_dev, "Domain-%d OSM enabled\n", index);
++out:
++	devm_kfree(&pdev->dev, hw_tbl);
++	return ret;
++}
++
+ static int qcom_cpufreq_hw_cpu_init(struct cpufreq_policy *policy)
+ {
+ 	struct platform_device *pdev = cpufreq_get_driver_data();
+@@ -1623,8 +2055,14 @@ static int qcom_cpufreq_hw_cpu_init(struct cpufreq_policy *policy)
+ 	 */
+ 	if (!qcom_cpufreq.soc_data->uses_tz &&
+ 	    !(readl_relaxed(data->base + qcom_cpufreq.soc_data->reg_enable) & 0x1)) {
+-		ret = qcom_cpufreq_hw_osm_setup(cpu_dev, policy, cpu_count, index);
++		if (qcom_cpufreq.soc_data->osm_setup)
++			ret = qcom_cpufreq.soc_data->osm_setup(cpu_dev, policy,
++							       cpu_count, index);
++		else
++			ret = qcom_cpufreq_hw_osm_setup(cpu_dev, policy,
++							cpu_count, index);
+ 		if (ret) {
++			qcom_cpufreq_hw_osm_release(data);
+ 			dev_err(dev, "Cannot setup the OSM for CPU%d: %d\n", policy->cpu, ret);
+ 			return ret;
+ 		}
+@@ -1775,6 +2213,12 @@ static int qcom_cpufreq_hw_driver_probe(struct platform_device *pdev)
+ 	xo_rate = clk_get_rate(clk);
+ 	clk_put(clk);
+ 
++	if (soc_data->setup_clocks) {
++		ret = soc_data->setup_clocks(pdev);
++		if (ret)
++			return ret;
++	}
++
+ 	clk = clk_get(dev, "alternate");
+ 	if (IS_ERR(clk))
+ 		return PTR_ERR(clk);

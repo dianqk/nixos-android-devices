@@ -1,0 +1,337 @@
+From: dianqk <dianqk@dianqk.net>
+Subject: [PATCH] t880: complete H264 and HEVC pictures in decode order
+
+VA clients own presentation ordering and require each submitted picture to
+complete without future input. Set output reorder depth to zero only for the
+T880 serializers. Preserve level-5.1 inferred H264 reference/DPB capacity and
+HEVC DPB/temporal inference, using consistent VPS/SPS ordering. Leave shared
+serializer defaults, slice payloads and reference semantics unchanged.
+
+Use natural asynchronous completion for the supported H264/HEVC profiles,
+including independent keys, fixed deadlines and explicit EOS restart. Test
+actual generated parameter sets, POC conversion payload preservation and all
+supported profiles against the production completion model.
+
+--- a/src/h264.cpp
++++ b/src/h264.cpp
+@@ -183,7 +183,8 @@
+ }
+ } // namespace
+ 
+-std::vector<uint8_t> h264_bitstream(VAProfile profile, const Picture &pic, H264State &state) {
++std::vector<uint8_t> h264_bitstream(VAProfile profile, const Picture &pic, H264State &state,
++                                    bool decode_order_output) {
+     check(pic.has_params && !pic.slices.empty() && pic.pending_slices.empty(),
+           "H264 picture missing parameters or slices", VA_STATUS_ERROR_INVALID_BUFFER);
+     const auto &p = pic.params;
+@@ -233,7 +234,34 @@
+         sps.bit(s.mb_adaptive_frame_field_flag);
+     sps.bit(s.direct_8x8_inference_flag);
+     sps.bit(0); // VA owns presentation cropping; coded pixels are retained.
+-    sps.bit(0); // VUI is absent from VA parameters; use the standard inferred DPB limit.
++    sps.bit(decode_order_output);
++    if (decode_order_output) {
++        // Level 5.1, Table A-1: retain the inferred reference/DPB capacity.
++        const uint64_t mb_width = uint64_t(p.picture_width_in_mbs_minus1) + 1;
++        const uint64_t mb_height = uint64_t(p.picture_height_in_mbs_minus1) + 1;
++        const uint64_t picture_mbs = mb_width * mb_height;
++        check(picture_mbs && picture_mbs <= 36864,
++              "H264 picture exceeds level 5.1 frame size", VA_STATUS_ERROR_INVALID_BUFFER);
++        const unsigned capacity = unsigned(std::min<uint64_t>(16, 184320 / picture_mbs));
++        check(capacity && p.num_ref_frames <= capacity,
++              "H264 references exceed level 5.1 DPB capacity", VA_STATUS_ERROR_INVALID_BUFFER);
++        sps.bit(0); // aspect_ratio_info_present_flag
++        sps.bit(0); // overscan_info_present_flag
++        sps.bit(0); // video_signal_type_present_flag
++        sps.bit(0); // chroma_loc_info_present_flag
++        sps.bit(0); // timing_info_present_flag
++        sps.bit(0); // nal_hrd_parameters_present_flag
++        sps.bit(0); // vcl_hrd_parameters_present_flag
++        sps.bit(0); // pic_struct_present_flag
++        sps.bit(1); // bitstream_restriction_flag
++        sps.bit(1); // inferred motion_vectors_over_pic_boundaries_flag
++        sps.ue(2); // inferred max_bytes_per_pic_denom
++        sps.ue(1); // inferred max_bits_per_mb_denom
++        sps.ue(16); // inferred log2_max_mv_length_horizontal
++        sps.ue(16); // inferred log2_max_mv_length_vertical
++        sps.ue(0); // VA clients own presentation ordering.
++        sps.ue(capacity);
++    }
+     std::vector<uint8_t> new_sps;
+     sps.nal(new_sps, 0x67);
+     if (new_sps != state.sps) {
+--- a/src/hevc.cpp
++++ b/src/hevc.cpp
+@@ -145,10 +145,10 @@
+     // VA omits temporal-layer PTL; allow every legal temporal_id (1..7).
+     b.bits(0, 16); // six absent sub-layer PTLs + two reserved 2-bit fields
+ }
+-void ordering(Bits &b, const VAPictureParameterBufferHEVC &p) {
++void ordering(Bits &b, const VAPictureParameterBufferHEVC &p, bool decode_order_output) {
+     b.bit(0);
+     b.ue(p.sps_max_dec_pic_buffering_minus1);
+-    b.ue(p.sps_max_dec_pic_buffering_minus1);
++    b.ue(decode_order_output ? 0 : p.sps_max_dec_pic_buffering_minus1);
+     b.ue(0);
+ }
+ void scaling_list(Bits &b, const uint8_t *values, unsigned side, unsigned dc, bool large) {
+@@ -417,7 +417,8 @@
+ }
+ } // namespace
+ 
+-std::vector<uint8_t> hevc_bitstream(VAProfile profile, const HevcPicture &pic, HevcState &state) {
++std::vector<uint8_t> hevc_bitstream(VAProfile profile, const HevcPicture &pic, HevcState &state,
++                                    bool decode_order_output) {
+     check(pic.has_params && !pic.slices.empty() && pic.pending_slices.empty(),
+           "HEVC picture missing parameters or slices", invalid);
+     check(pic.slices.front().bytes.size() >= 2, "truncated HEVC NAL", invalid);
+@@ -471,7 +472,7 @@
+     vps.bit(1);
+     vps.bits(65535, 16);
+     ptl(vps, profile_id);
+-    ordering(vps, p);
++    ordering(vps, p, decode_order_output);
+     vps.bits(0, 6);
+     vps.ue(0);
+     vps.bit(0);
+@@ -490,7 +491,7 @@
+     sps.ue(depth);
+     sps.ue(depth);
+     sps.ue(p.log2_max_pic_order_cnt_lsb_minus4);
+-    ordering(sps, p);
++    ordering(sps, p, decode_order_output);
+     sps.ue(p.log2_min_luma_coding_block_size_minus3);
+     sps.ue(p.log2_diff_max_min_luma_coding_block_size);
+     sps.ue(p.log2_min_transform_block_size_minus2);
+--- a/src/internal.hpp
++++ b/src/internal.hpp
+@@ -210,9 +210,10 @@
+ std::vector<uint8_t> av1_bitstream(const Av1Picture &picture, Av1State &state, unsigned width,
+                                   unsigned height, std::vector<uint8_t> *anchor = nullptr);
+ std::vector<uint8_t> vp9_bitstream(VAProfile profile, const Vp9Picture &picture);
+-std::vector<uint8_t> h264_bitstream(VAProfile profile, const Picture &picture, H264State &state);
++std::vector<uint8_t> h264_bitstream(VAProfile profile, const Picture &picture, H264State &state,
++                                    bool decode_order_output = false);
+ std::vector<uint8_t> hevc_bitstream(VAProfile profile, const HevcPicture &picture,
+-                                    HevcState &state);
++                                    HevcState &state, bool decode_order_output = false);
+ 
+ inline unsigned capture_pool_size(unsigned preferred, unsigned minimum, size_t buffer_size) {
+     check(minimum && minimum <= 64 && buffer_size, "invalid CAPTURE requirements");
+--- a/src/backend.cpp
++++ b/src/backend.cpp
+@@ -995,7 +995,7 @@
+             c->decoder->submit(bytes, target, anchor);
+         } else if (is_hevc(c->profile)) {
+             auto next_state = c->hevc;
+-            auto bytes = hevc_bitstream(c->internal_profile, c->hevc_picture, next_state);
++            auto bytes = hevc_bitstream(c->internal_profile, c->hevc_picture, next_state, d.t880);
+             std::vector<uint8_t> anchor;
+             if (d.t880) {
+                 unsigned type = (c->hevc_picture.slices.front().bytes[0] >> 1) & 63;
+@@ -1013,7 +1013,7 @@
+             c->hevc = std::move(next_state);
+         } else {
+             auto next_state = c->h264;
+-            auto bytes = h264_bitstream(c->profile, c->picture, next_state);
++            auto bytes = h264_bitstream(c->profile, c->picture, next_state, d.t880);
+             std::vector<uint8_t> anchor;
+             if (d.t880 && (c->picture.slices.front().bytes[0] & 31) == 5) {
+                 check(!next_state.sps.empty() && !next_state.pps.empty(),
+--- a/src/t880-decoder.cpp
++++ b/src/t880-decoder.cpp
+@@ -47,7 +47,9 @@
+ T880Decoder::T880Decoder(const std::string &device, unsigned width, unsigned height,
+                          VAProfile profile, unsigned rt_format, int render_fd)
+     : render_fd_(render_fd), width_(width), height_(height),
+-      display_without_lookahead_(is_av1(profile) || is_vp9(profile)) {
++      display_without_lookahead_(is_av1(profile) || is_vp9(profile) || is_hevc(profile) ||
++                                 profile == VAProfileH264ConstrainedBaseline ||
++                                 profile == VAProfileH264Main || profile == VAProfileH264High) {
+     check(rt_format == VA_RT_FORMAT_YUV420 && width >= 128 && height >= 128 && !(width & 1) &&
+           !(height & 1) && width <= 4096 && height <= 2176 &&
+           uint64_t(width) * height <= uint64_t(4096) * 2176,
+--- a/meson.build
++++ b/meson.build
+@@ -150,3 +150,11 @@
+ t880_presentation_test = executable('t880-presentation-test', 'tests/t880/presentation.cpp',
+   dependencies: [va, drm, threads], cpp_args: ['-UNDEBUG'])
+ test('T880 presentation allocation and ownership', t880_presentation_test)
++
++t880_h264_output_test = executable('t880-h264-output-test', 'tests/t880/h264-output.cpp',
++  dependencies: [va, threads], cpp_args: ['-UNDEBUG'])
++test('T880 H264 decode-order metadata', t880_h264_output_test)
++
++t880_hevc_output_test = executable('t880-hevc-output-test', 'tests/t880/hevc-output.cpp',
++  dependencies: [va, threads], cpp_args: ['-UNDEBUG'])
++test('T880 HEVC decode-order metadata', t880_hevc_output_test)
+--- /dev/null
++++ b/tests/t880/h264-output.cpp
+@@ -0,0 +1,66 @@
++// SPDX-License-Identifier: MIT
++#include "../../src/h264.cpp"
++#include <cassert>
++using namespace irisva;
++static unsigned restriction(const std::vector<uint8_t>& nal, bool wanted) {
++    Reader r(std::vector<uint8_t>(nal.begin()+4,nal.end()));
++    unsigned profile=r.bits(8); r.bits(8); assert(r.bits(8)==51); r.ue();
++    if(profile==100) { assert(r.ue()==1); assert(r.ue()==0 && r.ue()==0); r.bit(); assert(!r.bit()); }
++    r.ue(); unsigned poc=r.ue(); if(poc==0)r.ue();
++    r.ue(); r.bit(); r.ue(); r.ue(); assert(r.bit()); r.bit(); assert(!r.bit());
++    assert(r.bit()==wanted); if(!wanted)return 0;
++    for(unsigned i=0;i<8;i++)assert(!r.bit());
++    assert(r.bit() && r.bit()); assert(r.ue()==2 && r.ue()==1);
++    assert(r.ue()==16 && r.ue()==16); assert(r.ue()==0); return r.ue();
++}
++int main() {
++    for(auto profile:{VAProfileH264ConstrainedBaseline,VAProfileH264Main,VAProfileH264High})
++      for(auto geometry:{std::pair{20u,12u},std::pair{120u,68u},std::pair{256u,136u}}) {
++        Picture p; p.has_params=true; p.params.seq_fields.bits.chroma_format_idc=1;
++        p.params.seq_fields.bits.frame_mbs_only_flag=1;
++        p.params.picture_width_in_mbs_minus1=geometry.first-1;
++        p.params.picture_height_in_mbs_minus1=geometry.second-1;
++        p.params.num_ref_frames=4; p.slices.push_back({{}, {0x65,0xb8}});
++        H264State original,explicit_default,ordered;
++        auto a=h264_bitstream(profile,p,original);
++        assert(a==h264_bitstream(profile,p,explicit_default,false));
++        auto b=h264_bitstream(profile,p,ordered,true);
++        assert(a!=b); assert(!restriction(original.sps,false));
++        unsigned capacity=std::min(16u,184320/(geometry.first*geometry.second));
++        assert(restriction(ordered.sps,true)==capacity);
++        assert(original.pps==ordered.pps);
++        assert(std::equal(p.slices[0].bytes.rbegin(),p.slices[0].bytes.rend(),b.rbegin()));
++        p.params.num_ref_frames=capacity+1; H264State rejected; bool failed=false;
++        try{h264_bitstream(profile,p,rejected,true);}catch(const Error&){failed=true;} assert(failed);
++      }
++    // Existing POC type-1 conversion and CABAC/CAVLC payloads are identical
++    // with either output policy; only the generated SPS output restriction changes.
++    for(bool cabac:{false,true}) {
++        Picture p; p.has_params=true;p.params.seq_fields.bits.chroma_format_idc=1;
++        p.params.seq_fields.bits.frame_mbs_only_flag=1;
++        p.params.seq_fields.bits.pic_order_cnt_type=1;
++        p.params.seq_fields.bits.delta_pic_order_always_zero_flag=1;
++        p.params.pic_fields.bits.entropy_coding_mode_flag=cabac;
++        p.params.picture_width_in_mbs_minus1=19;p.params.picture_height_in_mbs_minus1=11;
++        p.params.num_ref_frames=4;p.params.CurrPic.TopFieldOrderCnt=6;
++        p.params.CurrPic.BottomFieldOrderCnt=6;
++        Bits bits;bits.ue(0);bits.ue(2);bits.ue(0);bits.bits(0,4);bits.ue(0);
++        Slice slice;slice.params.slice_data_bit_offset=bits.position()+8;
++        if(cabac)while(bits.position()&7)bits.bit(1);
++        bits.bits(0x1234,16);bits.nal(slice.bytes,0x65);
++        slice.bytes.erase(slice.bytes.begin(),slice.bytes.begin()+4);p.slices.push_back(slice);
++        H264State original,ordered;
++        auto a=h264_bitstream(VAProfileH264High,p,original,false);
++        auto b=h264_bitstream(VAProfileH264High,p,ordered,true);
++        assert(original.pps==ordered.pps);
++        size_t pa=original.sps.size(),pb=ordered.sps.size();
++        for(auto &[id,bytes]:original.pps){pa+=bytes.size();pb+=bytes.size();}
++        assert(std::vector<uint8_t>(a.begin()+pa,a.end())==std::vector<uint8_t>(b.begin()+pb,b.end()));
++        assert(restriction(ordered.sps,true)==16);
++    }
++    Picture p; p.has_params=true;p.params.seq_fields.bits.chroma_format_idc=1;
++    p.params.seq_fields.bits.frame_mbs_only_flag=1;
++    p.params.picture_width_in_mbs_minus1=65535;p.params.picture_height_in_mbs_minus1=65535;
++    p.slices.push_back({{}, {0x65,0xb8}}); H264State state;bool failed=false;
++    try{h264_bitstream(VAProfileH264High,p,state,true);}catch(const Error&){failed=true;}assert(failed);
++}
+--- /dev/null
++++ b/tests/t880/hevc-output.cpp
+@@ -0,0 +1,36 @@
++// SPDX-License-Identifier: MIT
++#include "../../src/hevc.cpp"
++#include <cassert>
++using namespace irisva;
++static void restriction(Reader &r,unsigned dpb,bool ordered) {
++    assert(!r.bit()); assert(r.ue()==dpb); assert(r.ue()==(ordered?0:dpb)); assert(r.ue()==0);
++}
++static void parameter_sets(const HevcState &state,unsigned dpb,bool ordered) {
++    Reader v(std::vector<uint8_t>(state.vps.begin()+4,state.vps.end()));
++    v.skip(4+2+6); assert(v.bits(3)==6); assert(v.bit());v.skip(16+112);
++    restriction(v,dpb,ordered);
++    Reader s(std::vector<uint8_t>(state.sps.begin()+4,state.sps.end()));
++    s.skip(4);assert(s.bits(3)==6);assert(s.bit());s.skip(112);
++    assert(s.ue()==0 && s.ue()==1);assert(s.ue()==1920 && s.ue()==1080);assert(!s.bit());
++    s.ue();s.ue();s.ue();restriction(s,dpb,ordered);
++}
++int main() {
++    for(unsigned dpb:{0u,4u,15u}) {
++        HevcPicture p; p.has_params=true;
++        p.params.pic_fields.bits.chroma_format_idc=1;
++        p.params.pic_width_in_luma_samples=1920;p.params.pic_height_in_luma_samples=1080;
++        p.params.sps_max_dec_pic_buffering_minus1=dpb;
++        for(auto &r:p.params.ReferenceFrames)r.picture_id=VA_INVALID_SURFACE;
++        HevcSlice slice; slice.params.LongSliceFlags.fields.slice_type=2;
++        slice.params.slice_data_byte_offset=3;slice.bytes={0x26,0x01,0xae,0x55};
++        p.slices.push_back(slice);
++        HevcState original,explicit_default,ordered;
++        auto a=hevc_bitstream(VAProfileHEVCMain,p,original);
++        assert(a==hevc_bitstream(VAProfileHEVCMain,p,explicit_default,false));
++        auto b=hevc_bitstream(VAProfileHEVCMain,p,ordered,true);
++        parameter_sets(original,dpb,false);parameter_sets(ordered,dpb,true);
++        assert(original.pps==ordered.pps);
++        assert(a.back()==b.back() && b.back()==0x55);
++        assert(dpb==0 ? a==b : a!=b);
++    }
++}
+--- a/tests/t880/replay.cpp
++++ b/tests/t880/replay.cpp
+@@ -53,6 +53,7 @@
+     if (f.expire) t880_test::Clock::offset += std::chrono::seconds(10);
+     if (f.display_after_polls && f.polls >= f.display_after_polls) {
+         f.display.insert(f.display.end(), f.decoded.begin(), f.decoded.end());
++        if (f.duplicate && !f.decoded.empty()) f.display.push_back(f.decoded.front());
+         f.decoded.clear();
+     }
+     return 0; }
+@@ -216,30 +217,10 @@
+ template<class F> void rejects(F action) { bool rejected = false;
+     try { action(); } catch (const Error &) { rejected = true; } if (!rejected) std::cerr << "missing rejection\n"; assert(rejected); }
+ int main() {
+-    for (auto profile : {VAProfileH264Main, VAProfileHEVCMain}) {
+-        f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
+-        T880Decoder d("fake", 160, 128, profile, VA_RT_FORMAT_YUV420, -1);
+-        auto a = surface(), b = surface(), c = surface();
+-        rejects([&] { d.submit({1}, a, {}); }); assert(f.accepted == 0);
+-        d.submit({1}, a, {7, 8, 1}); d.sync(a);
+-        assert(!a->pending && a->memory->map()[0] == 1);
+-        d.submit({2}, b, {}); d.sync(b);
+-        assert(a->memory->map()[0] == 1 && b->memory->map()[0] == 3);
+-        d.submit({3}, c, {}); d.sync(c);
+-        assert(a->memory->map()[0] == 1 && b->memory->map()[0] == 3 && c->memory->map()[0] == 6);
+-        assert(f.accepted == 6 && f.stops == 3 && f.resets == 2);
+-        for (unsigned i = 0; i < f.submitted.size(); ++i) assert(f.submitted[i] == i + 1);
+-        unsigned count = f.accepted;
+-        rejects([&] { d.submit(std::vector<uint8_t>(4u * 1024 * 1024 + 1), surface(), {}); });
+-        assert(f.accepted == count); // Limits fail before reset or QBUF.
+-        auto anchor = surface(); d.submit({4}, anchor, {9, 4}); d.sync(anchor);
+-        assert(f.accepted == count + 1 && a->memory->map()[0] == 1);
+-        d.finish();
+-    }
+     f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
+     {
+         T880Decoder d("fake", 160, 128, VAProfileHEVCMain, VA_RT_FORMAT_YUV420, -1);
+-        auto s = surface(); d.submit({1}, s, {1}); f.duplicate = true;
++        auto s = surface(); d.submit({1}, s, {1}); f.duplicate = true; f.display_after_polls = f.polls + 1;
+         rejects([&] { d.sync(s); });
+         rejects([&] { d.submit({2}, surface(), {}); });
+     }
+@@ -261,7 +242,7 @@
+     f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
+     {
+         T880Decoder d("fake", 160, 128, VAProfileH264Main, VA_RT_FORMAT_YUV420, -1);
+-        auto s = surface(); d.submit({1}, s, {1}); f.bad_payload = true;
++        auto s = surface(); d.submit({1}, s, {1}); f.bad_payload = true; f.display_after_polls = f.polls + 1;
+         rejects([&] { d.sync(s); }); assert(!s->pending && s->status != VA_STATUS_SUCCESS);
+     }
+     f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
+@@ -283,7 +264,9 @@
+         rejects([&] { d.submit({1}, surface(), {}); });
+         assert(f.accepted == accepted && f.resets == 0);
+     }
+-    for (auto natural_profile : {VAProfileAV1Profile0, VAProfileVP9Profile0}) {
++    for (auto natural_profile : {VAProfileAV1Profile0, VAProfileVP9Profile0,
++                                 VAProfileH264ConstrainedBaseline, VAProfileH264Main,
++                                 VAProfileH264High, VAProfileHEVCMain}) {
+     f = Fake{}; t880_test::Clock::offset = std::chrono::seconds(0);
+     {
+         T880Decoder d("fake", 160, 128, natural_profile, VA_RT_FORMAT_YUV420, -1);

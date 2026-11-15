@@ -1,7 +1,13 @@
 # v1.2 accepts the modem's /readonly/vendor firmware request paths.
 # Keep Nixpkgs' profile-path substitution unless a board opts out.
-{ tqftpserv, fetchFromGitHub }:
-tqftpserv.overrideAttrs (_: {
+{
+  tqftpserv,
+  fetchFromGitHub,
+  qrtr,
+  zstd,
+  systemdLibs,
+}:
+(tqftpserv.override { inherit qrtr zstd systemdLibs; }).overrideAttrs (_: {
   version = "1.2";
   src = fetchFromGitHub {
     owner = "linux-msm";

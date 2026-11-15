@@ -1,0 +1,32 @@
+From 722edc731c1bc6736b405468292b7485cc8e141e Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Tue, 20 Oct 2026 11:31:48 +0800
+Subject: [PATCH] Allow a start after a clean stop (md1:1)
+
+After the owner stops the modem, the state machine is gated again and
+/sys/kernel/ccci/boot reads md1:1; the vendor driver starts the modem from
+that state as from md1:0. Accept both as idle so the modem can be started
+again without a reboot; every other state is still refused.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/mtk_ccci_userspace/start_owner.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/mtk_ccci_userspace/start_owner.py b/src/mtk_ccci_userspace/start_owner.py
+index 946b54c..d455e3c 100644
+--- a/src/mtk_ccci_userspace/start_owner.py
++++ b/src/mtk_ccci_userspace/start_owner.py
+@@ -65,7 +65,8 @@ def preflight():
+     if hashlib.sha256(Path("/sys/kernel/notes").read_bytes()).hexdigest() != expected_notes:
+         raise RuntimeError("running kernel notes differ from the pinned board integration")
+     state = Path("/sys/kernel/ccci/boot").read_text().split("|", 1)[0].strip()
+-    if state != "md1:0":
++    # md1:0 never started since boot, md1:1 gated again after a clean stop
++    if state not in ("md1:0", "md1:1"):
+         raise RuntimeError(f"refusing to boot a non-idle or already-owned modem: {state}")
+     for name in ("ccci_monitor", "ccci_fs", "ccci_rpc", "ccci_ccb_ctrl"):
+         if not Path("/dev", name).exists():
+-- 
+2.55.0
+

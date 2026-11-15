@@ -1,0 +1,39 @@
+From: Armada <noreply@armada.local>
+Date: Thu, 25 Sep 2026 03:40:30 +0000
+Subject: [PATCH] arm64: dts: qcom: sm8650: add a PCIe suspend OPP
+
+Give pcie0 a suspend-only OPP so pcie-qcom keeps a nonzero DDR/LLCC
+sleep-set vote once the CPU subsystem collapses in s2idle. Without one,
+pcie-qcom votes 0/0 on the PCIe memory path during suspend; SM8550 and
+SM8750 reset instead of waking when nothing else votes DDR in the sleep
+set. Give SM8650 the same floor.
+
+Link: https://github.com/armada-os/armada/blob/c04b39f9fe97df042f42909d75819ccc7985f596/packages/kernel/patches/0527-arm64-dts-qcom-sm8650-add-a-pcie-suspend-opp.patch
+(armada 0527, added in commit 431bf573af94 by virtudude, "feat(kernel): cut
+s2idle power on SM8550 and SM8750 handhelds"; removed in 8dc0be9ad27c in favour of powering the
+PCIe GDSCs off, which reset Aurora in s2idle)
+
+Local changes (nixos-android-devices): regenerated against Linux 7.3 with
+git headers; unchanged otherwise.
+---
+diff --git a/arch/arm64/boot/dts/qcom/sm8650.dtsi b/arch/arm64/boot/dts/qcom/sm8650.dtsi
+--- a/arch/arm64/boot/dts/qcom/sm8650.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8650.dtsi
+@@ -3762,6 +3762,17 @@
+ 					opp-peak-kBps = <1969000 1>;
+ 					opp-level = <3>;
+ 				};
++
++				/*
++				 * Suspend-only: the synthetic opp-hz and missing opp-level
++				 * keep link-speed matching from selecting it.
++				 */
++				opp-suspend-1 {
++					opp-hz = /bits/ 64 <1>;
++					required-opps = <&rpmhpd_opp_low_svs>;
++					opp-peak-kBps = <1000 1>;
++					opp-suspend;
++				};
+ 			};
+ 
+ 			pcieport0: pcie@0 {

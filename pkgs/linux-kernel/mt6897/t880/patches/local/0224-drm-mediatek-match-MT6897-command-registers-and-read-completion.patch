@@ -1,0 +1,791 @@
+From 28ed76bacf31b1bd6bdabbee10ef8e5a59a56b72 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Mon, 9 Nov 2026 20:02:12 +0800
+Subject: [PATCH] drm/mediatek: match MT6897 command registers and read
+ completion
+
+MT6897 does not use shadow control, but inherits MT8186's register table
+and consequently writes FORCE_COMMIT/BYPASS_SHADOW at 0xc00. Give MT6897 an
+explicit map retaining its VM command and command queue offsets while
+omitting the unsupported shadow-control access.
+
+The selected OEM IRQ handler leaves RD_READY/RACK to the process reader.
+Match that ownership for polled command completion: enable only the owned
+non-read interrupt, acknowledge enabled status with a W0C write, and never
+wait on BUSY in hard IRQ context. Poll read-ready, acknowledge the reply
+once, then wait for idle with bounded error propagation.
+
+Retain the first failed transaction on its link, stop the command/video
+trigger and reject further pair transactions or video enable until a fresh
+power-on. Snapshot completion before stopping; distinguish a pre-idle
+failure from an issued command. Preserve legacy completion and the current
+payload/configuration/size RMW ordering. Add production-function tests for
+the target/legacy maps, IRQ ownership, read sequencing, timeouts, invalid
+replies and dual-link failure/reset behavior.
+
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_dsi.c#L11062
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_dsi.c#L2454
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/gpu/drm/mediatek/mediatek_v2/mtk_dsi.c#L7355
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/gpu/drm/mediatek/mtk_dsi.c            | 126 +++++++-
+ .../selftests/mtk_clk/dsi_routing_cases.c     | 286 ++++++++++++++++--
+ .../selftests/mtk_clk/test_dsi_routing.py     |  15 +-
+ 3 files changed, 382 insertions(+), 45 deletions(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_dsi.c b/drivers/gpu/drm/mediatek/mtk_dsi.c
+index ba7fca7fae..e787f9fecc 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dsi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dsi.c
+@@ -397,6 +397,8 @@ struct mtk_dsi {
+ 	struct clk *clk26m;
+ 	struct device *mmsys_dev;
+ 	bool power_ready;
++	/* First failed polled transaction; cleared only by a new power epoch. */
++	int cmd_error;
+ 	bool bridge_powered;
+ 	bool ddp_powered;
+ 	bool diag_pre_26m;
+@@ -500,6 +502,12 @@ static const u16 mtk_dsi_regs_mt8186[DSI_ADV_REG_MAX] = {
+ 	[DSI_CMDQ] = 0xd00,
+ };
+ 
++/* MT6897 does not use shadow control; do not inherit MT8186's offset. */
++static const u16 mtk_dsi_regs_mt6897[DSI_ADV_REG_MAX] = {
++	[DSI_VM_CMD_CON] = 0x200,
++	[DSI_CMDQ] = 0xd00,
++};
++
+ static const u16 mtk_dsi_regs_main_v2[DSI_MAIN_REG_MAX] = {
+ 	[DSI_START] = 0x00,
+ 	[DSI_INTEN] = 0x08,
+@@ -1364,15 +1372,16 @@ static void mtk_dsi_set_cmd_mode(struct mtk_dsi *dsi)
+ 
+ static void mtk_dsi_set_interrupt_enable(struct mtk_dsi *dsi)
+ {
+-	u32 inten = LPRX_RD_RDY_INT_FLAG | VM_DONE_INT_FLAG;
++	u32 inten = VM_DONE_INT_FLAG;
+ 
+ 	/*
+ 	 * The vendor MT6897 driver does not enable CMD_DONE: it polls the
+ 	 * engine until DSI_BUSY clears after starting a command. Keep that
+-	 * completion path only for the data that opts in.
++	 * completion path only for the data that opts in. Read-ready and RACK
++	 * are owned by the polled reader on that layout, not by the IRQ.
+ 	 */
+ 	if (!dsi->driver_data->poll_command_done)
+-		inten |= CMD_DONE_INT_FLAG;
++		inten |= CMD_DONE_INT_FLAG | LPRX_RD_RDY_INT_FLAG;
+ 
+ 	writel(inten, dsi->regs + dsi->driver_data->reg_main[DSI_INTEN]);
+ }
+@@ -1625,6 +1634,20 @@ static irqreturn_t mtk_dsi_irq(int irq, void *dev_id)
+ 	raw = readl(dsi->regs + reg_main[DSI_INTSTA]);
+ 	status = raw & flag;
+ 
++	if (dsi->driver_data->poll_command_done) {
++		/* MT6897's reader owns RD_READY/RACK; never wait in hard IRQ. */
++		status &= readl(dsi->regs + reg_main[DSI_INTEN]);
++		status &= VM_DONE_INT_FLAG;
++		if (!status)
++			return IRQ_NONE;
++
++		/* INTSTA is W0C: preserve flags arriving after the status read. */
++		writel(~status, dsi->regs + reg_main[DSI_INTSTA]);
++		mtk_dsi_irq_data_set(dsi, status);
++		wake_up_interruptible(&dsi->irq_wait_queue);
++		return IRQ_HANDLED;
++	}
++
+ 	if (status) {
+ 		if (dsi->config_clk && dsi->irq_trace_count < 8) {
+ 			dsi->irq_trace_count++;
+@@ -1684,6 +1707,7 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
+ 	if (++dsi->refcount != 1)
+ 		return 0;
+ 
++	WRITE_ONCE(dsi->cmd_error, 0);
+ 	WRITE_ONCE(dsi->diag_pre_26m, false);
+ 	WRITE_ONCE(dsi->diag_post_route, false);
+ 	WRITE_ONCE(dsi->diag_first_cmd, false);
+@@ -1904,6 +1928,13 @@ static void mtk_dsi_poweroff(struct mtk_dsi *dsi)
+ 
+ static void mtk_output_dsi_enable(struct mtk_dsi *dsi)
+ {
++	if (dsi->driver_data->poll_command_done &&
++	    (READ_ONCE(dsi->cmd_error) ||
++	     (dsi->slave && READ_ONCE(dsi->slave->cmd_error)))) {
++		drm_err(dsi->bridge.dev, "Refusing video after failed DSI command\n");
++		return;
++	}
++
+ 	if (dsi->enabled)
+ 		return;
+ 
+@@ -2350,6 +2381,25 @@ static int mtk_dsi_poll_for_idle(struct mtk_dsi *dsi)
+ 	return ret;
+ }
+ 
++/* MT6897 keeps BUSY asserted until software acknowledges the read reply. */
++static int mtk_dsi_poll_read_ready(struct mtk_dsi *dsi)
++{
++	const u16 *reg_main = dsi->driver_data->reg_main;
++	u32 val;
++	int ret;
++
++	ret = readl_poll_timeout(dsi->regs + reg_main[DSI_INTSTA], val,
++				 val & LPRX_RD_RDY_INT_FLAG, 1, 100000);
++	if (ret) {
++		drm_warn(dsi->bridge.dev, "polling dsi read ready timeout!\n");
++		return ret;
++	}
++
++	writel(~(u32)LPRX_RD_RDY_INT_FLAG, dsi->regs + reg_main[DSI_INTSTA]);
++	mtk_dsi_mask(dsi, reg_main[DSI_RACK], RACK, RACK);
++	return 0;
++}
++
+ static u32 mtk_dsi_recv_cnt(u8 type, u8 *read_data)
+ {
+ 	switch (type) {
+@@ -2426,6 +2476,22 @@ static void mtk_dsi_cmdq(struct mtk_dsi *dsi, const struct mipi_dsi_msg *msg)
+ 	}
+ }
+ 
++static void mtk_dsi_latch_cmd_error(struct mtk_dsi *dsi, int error)
++{
++	struct mtk_dsi *lead = dsi->master ?: dsi;
++
++	if (!dsi->driver_data->poll_command_done || error >= 0)
++		return;
++
++	if (!READ_ONCE(dsi->cmd_error))
++		WRITE_ONCE(dsi->cmd_error, error);
++	/* Do not retrigger a failed command or restore video over a bad link. */
++	mtk_dsi_stop(lead);
++	if (dsi != lead)
++		mtk_dsi_stop(dsi);
++	lead->enabled = false;
++}
++
+ static ssize_t mtk_dsi_host_send_cmd(struct mtk_dsi *dsi,
+ 				     const struct mipi_dsi_msg *msg, u8 flag)
+ {
+@@ -2433,7 +2499,21 @@ static ssize_t mtk_dsi_host_send_cmd(struct mtk_dsi *dsi,
+ 	bool poll_failed = false, irq_failed = false;
+ 	int ret;
+ 
+-	mtk_dsi_wait_for_idle(dsi);
++	if (dsi->driver_data->poll_command_done) {
++		ret = mtk_dsi_poll_for_idle(dsi);
++		if (ret) {
++			pre_intsta = readl(dsi->regs +
++					   dsi->driver_data->reg_main[DSI_INTSTA]);
++			mtk_dsi_record_cmd(dsi, msg, pre_intsta, pre_intsta,
++					   pre_intsta, ret);
++			mtk_dsi_latch_cmd_error(dsi, ret);
++			mtk_dsi_dump_cmd_failure(dsi, msg, ret,
++						"pre-idle-timeout", true);
++			return ret;
++		}
++	} else {
++		mtk_dsi_wait_for_idle(dsi);
++	}
+ 	mtk_dsi_irq_data_clear(dsi, flag);
+ 	pre_intsta = readl(dsi->regs +
+ 			   dsi->driver_data->reg_main[DSI_INTSTA]);
+@@ -2443,14 +2523,11 @@ static ssize_t mtk_dsi_host_send_cmd(struct mtk_dsi *dsi,
+ 				  dsi->driver_data->reg_main[DSI_INTSTA]);
+ 
+ 	if (dsi->driver_data->poll_command_done) {
+-		ret = mtk_dsi_poll_for_idle(dsi);
++		ret = MTK_DSI_HOST_IS_READ(msg->type) ?
++			mtk_dsi_poll_read_ready(dsi) : 0;
++		if (!ret)
++			ret = mtk_dsi_poll_for_idle(dsi);
+ 		poll_failed = ret != 0;
+-		if (!ret && MTK_DSI_HOST_IS_READ(msg->type) &&
+-		    !mtk_dsi_wait_for_irq_done(dsi, LPRX_RD_RDY_INT_FLAG,
+-					       2000)) {
+-			ret = -ETIME;
+-			irq_failed = true;
+-		}
+ 	} else {
+ 		if (!mtk_dsi_wait_for_irq_done(dsi, flag, 2000)) {
+ 			ret = -ETIME;
+@@ -2464,6 +2541,7 @@ static ssize_t mtk_dsi_host_send_cmd(struct mtk_dsi *dsi,
+ 				 dsi->driver_data->reg_main[DSI_INTSTA]);
+ 	mtk_dsi_record_cmd(dsi, msg, pre_intsta, post_start_intsta,
+ 			   post_done_intsta, ret);
++	mtk_dsi_latch_cmd_error(dsi, ret);
+ 	if (poll_failed)
+ 		mtk_dsi_dump_cmd_failure(dsi, msg, ret, "poll-timeout", true);
+ 	else if (irq_failed)
+@@ -2494,6 +2572,17 @@ static ssize_t mtk_dsi_host_transfer(struct mipi_dsi_host *host,
+ 	    (!READ_ONCE(dsi->power_ready) || !READ_ONCE(lead->power_ready)))
+ 		return -EIO;
+ 
++	if (dsi->driver_data->poll_command_done) {
++		ret = READ_ONCE(dsi->cmd_error) ?: READ_ONCE(lead->cmd_error);
++		if (!ret && lead->slave)
++			ret = READ_ONCE(lead->slave->cmd_error);
++		if (ret)
++			return ret;
++		if (MTK_DSI_HOST_IS_READ(msg->type) &&
++		    (!msg->rx_buf || !msg->rx_len))
++			return -EINVAL;
++	}
++
+ 	if (dsi->config_clk && !READ_ONCE(dsi->diag_first_cmd)) {
+ 		WRITE_ONCE(dsi->diag_first_cmd, true);
+ 		mtk_dsi_dump_regs(dsi, "first-command");
+@@ -2513,8 +2602,10 @@ static ssize_t mtk_dsi_host_transfer(struct mipi_dsi_host *host,
+ 				     lead->slave->driver_data->reg_main[DSI_CON_CTRL],
+ 				     DSI_DUAL_EN, 0);
+ 		}
+-		if (ret)
++		if (ret) {
++			mtk_dsi_latch_cmd_error(lead, ret);
+ 			goto restore_dsi_mode;
++		}
+ 	}
+ 
+ 	if (MTK_DSI_HOST_IS_READ(msg->type))
+@@ -2542,6 +2633,11 @@ static ssize_t mtk_dsi_host_transfer(struct mipi_dsi_host *host,
+ 					 dsi->driver_data->reg_main[DSI_RX_DATA0] + i);
+ 
+ 	recv_cnt = mtk_dsi_recv_cnt(read_data[0], read_data);
++	if (dsi->driver_data->poll_command_done && !recv_cnt) {
++		ret = -EPROTO;
++		mtk_dsi_latch_cmd_error(dsi, ret);
++		goto restore_dsi_mode;
++	}
+ 
+ 	if (recv_cnt > 2)
+ 		src_addr = &read_data[4];
+@@ -2561,7 +2657,7 @@ static ssize_t mtk_dsi_host_transfer(struct mipi_dsi_host *host,
+ 		 recv_cnt, *((u8 *)(msg->tx_buf)));
+ 
+ restore_dsi_mode:
+-	if (restore) {
++	if (restore && (!dsi->driver_data->poll_command_done || ret >= 0)) {
+ 		if (lead->slave) {
+ 			mtk_dsi_set_mode(lead->slave);
+ 			mtk_dsi_mask(lead->slave,
+@@ -2715,10 +2811,10 @@ static const struct mtk_dsi_tx_buf mt6897_dsi_tx_buf = {
+ 	.urgent_hi_us = 15,
+ };
+ 
+-/* MT6897: MT8186-style registers (VM_CMD at 0x200, CMDQ at 0xd00), no shadow */
++/* MT6897: VM_CMD at 0x200 and CMDQ at 0xd00, without shadow control. */
+ static const struct mtk_dsi_driver_data mt6897_dsi_driver_data = {
+ 	.reg_main = mtk_dsi_regs_main_v1,
+-	.reg_adv = mtk_dsi_regs_mt8186,
++	.reg_adv = mtk_dsi_regs_mt6897,
+ 	.max_link_rate_mbps = 2500,
+ 	.has_size_ctl = true,
+ 	.has_cphy = true,
+diff --git a/tools/testing/selftests/mtk_clk/dsi_routing_cases.c b/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
+index 6c4556abac..2071d7a992 100644
+--- a/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
++++ b/tools/testing/selftests/mtk_clk/dsi_routing_cases.c
+@@ -14,6 +14,8 @@ typedef uint32_t u32;
+ typedef uint64_t u64;
+ typedef int irqreturn_t;
+ #define IRQ_HANDLED 1
++#define IRQ_NONE 0
++#define DRM_INFO(...) ((void)0)
+ #define READ_ONCE(x) (x)
+ #define CMD_DONE_INT_FLAG 1
+ #define LPRX_RD_RDY_INT_FLAG 2
+@@ -48,6 +50,15 @@ static void test_log(const char *fmt, ...)
+ #define MODE 1
+ #define VM_DONE_INT_FLAG 4
+ #define DSI_SHADOW_DEBUG 0
++#define DSI_VM_CMD_CON 2
++#define DSI_ADV_REG_MAX 4
++#define MIPI_DSI_RX_GENERIC_SHORT_READ_RESPONSE_1BYTE 0x11
++#define MIPI_DSI_RX_DCS_SHORT_READ_RESPONSE_1BYTE 0x21
++#define MIPI_DSI_RX_GENERIC_SHORT_READ_RESPONSE_2BYTE 0x12
++#define MIPI_DSI_RX_DCS_SHORT_READ_RESPONSE_2BYTE 0x22
++#define MIPI_DSI_RX_GENERIC_LONG_READ_RESPONSE 0x1a
++#define MIPI_DSI_RX_DCS_LONG_READ_RESPONSE 0x1c
++#define MIPI_DSI_RX_ACKNOWLEDGE_AND_ERROR_REPORT 0x02
+ #define DSI_CON_CTRL 1
+ #define DSI_MODE_CTRL 2
+ #define DSI_TXRX_CTRL 3
+@@ -125,7 +136,8 @@ struct mtk_dsi_cmdq_write {
+ 	u32 old, new;
+ };
+ struct mtk_dsi_driver_data {
+-	u16 reg_adv[4], reg_main[16];
++	const u16 *reg_adv;
++	u16 reg_main[16];
+ 	bool tx_buf;
+ 	int dsi_sram_bytes;
+ 	bool reg_qos;
+@@ -158,7 +170,7 @@ struct mtk_dsi {
+ 	struct device *mmsys_dev;
+ 	struct phy *phy;
+ 	struct mtk_dsi *slave, *master;
+-	int refcount, format, lanes;
++	int refcount, format, lanes, cmd_error;
+ 	unsigned long hs_rate;
+ 	u32 data_rate, symbol_rate;
+ 	bool cphy, is_slave, power_ready, bridge_powered, ddp_powered,
+@@ -179,6 +191,14 @@ static int fail_at, calls, writes, route[2], event[256], n;
+ static int state_reads, reg_reads, timeout_ret;
+ static int poll_calls, idle_waits, irq_waits;
+ static u32 poll_intsta;
++static u32 poll_states[16];
++static int poll_state_count, poll_bus_count[16];
++static u32 *watched_read, *w0c_status, *arrive_on_read;
++static u32 arrive_bits;
++static int watched_reads;
++static u8 response[16];
++static int response_reads;
++static bool use_response;
+ struct mask_call { int reg, mask, value; };
+ static struct mask_call mask_calls[64];
+ static int mask_count;
+@@ -274,7 +294,6 @@ static struct mtk_dsi *bridge_to_dsi(struct drm_bridge *b)
+ 		writes++;                               \
+ 	}
+ NOOP(mtk_dsi_set_mode)
+-NOOP(mtk_dsi_start)
+ NOOP(mtk_dsi_enable)
+ NOOP(mtk_dsi_disable)
+ static int reset_engine_calls;
+@@ -287,7 +306,6 @@ static void mtk_dsi_reset_engine(struct mtk_dsi *d)
+ 		reset_engine_marks[reset_engine_calls] = mask_count;
+ 	reset_engine_calls++;
+ }
+-NOOP(mtk_dsi_stop)
+ NOOP(mtk_dsi_set_cmd_mode)
+ NOOP(mtk_dsi_phy_timconfig)
+ NOOP(mtk_dsi_config_tx_buf_v1)
+@@ -296,8 +314,6 @@ NOOP(mtk_dsi_set_vm_cmd)
+ NOOP(mtk_dsi_lane0_ulp_mode_enter)
+ NOOP(mtk_dsi_clk_ulp_mode_enter)
+ NOOP(mtk_dsi_lane_ready)
+-NOOP(mtk_output_dsi_enable)
+-NOOP(mtk_output_dsi_disable)
+ static void mtk_dsi_ps_control(struct mtk_dsi *d, bool enable)
+ {
+ 	writes++;
+@@ -322,6 +338,10 @@ static u32 last_read;
+ static u32 readl(u32 *p)
+ {
+ 	reg_reads++;
++	if (p == watched_read)
++		watched_reads++;
++	if (p == arrive_on_read)
++		*w0c_status |= arrive_bits;
+ 	last_read = p == stale_address ? stale_value : *p;
+ 	return last_read;
+ }
+@@ -329,9 +349,15 @@ static u32 readl(u32 *p)
+ #define wait_event_interruptible_timeout(q, cond, timeout) \
+ 	((void)(q), (void)(cond), (void)(timeout), irq_waits++, timeout_ret)
+ #define readl_poll_timeout(addr, val, cond, delay, timeout) \
+-	({ (void)(addr); (void)(delay); (void)(timeout); \
+-	   (val) = poll_intsta; poll_calls++; \
+-	   (cond) ? 0 : -ETIME; })
++	({ \
++		(void)(addr); (void)(delay); (void)(timeout); \
++		if (poll_calls < 16) \
++			poll_bus_count[poll_calls] = bus_count; \
++		(val) = poll_calls < poll_state_count ? \
++			poll_states[poll_calls] : poll_intsta; \
++		poll_calls++; \
++		(cond) ? 0 : -ETIMEDOUT; \
++	})
+ static void writel(u32 v, u32 *p)
+ {
+ 	if (bus_count < (int)ARRAY_SIZE(bus)) {
+@@ -339,7 +365,10 @@ static void writel(u32 v, u32 *p)
+ 		bus[bus_count].old = last_read;
+ 		bus[bus_count++].value = v;
+ 	}
+-	*p = v;
++	if (p == w0c_status)
++		*p &= v;
++	else
++		*p = v;
+ 	writes++;
+ }
+ #define msleep(x) ((void)0)
+@@ -356,13 +385,9 @@ static void wake_up_interruptible(void *q)
+ {
+ 	(void)q;
+ }
+-static ssize_t mtk_dsi_recv_cnt(u8 type, u8 *data)
+-{
+-	return 0;
+-}
+ static u8 readb(void *p)
+ {
+-	return *(u8 *)p;
++	return use_response ? response[response_reads++ % 16] : *(u8 *)p;
+ }
+ static void production_mask(struct mtk_dsi *, u32, u32, u32);
+ static void production_cmdq_mask(struct mtk_dsi *, const struct mipi_dsi_msg *,
+@@ -381,6 +406,9 @@ static void mtk_dsi_cmdq_mask(struct mtk_dsi *d, const struct mipi_dsi_msg *msg,
+ 	production_cmdq_mask(d, msg, reg, mask, value, kind);
+ }
+ 
++static void mtk_dsi_start(struct mtk_dsi *);
++static void mtk_dsi_stop(struct mtk_dsi *);
++
+ /* PRODUCTION */
+ 
+ 
+@@ -389,19 +417,19 @@ static struct device dev[2];
+ static const u8 tx_payload[] = { 0xfb, 0x01, 0x33, 0x03 };
+ static struct clk clocks[2][5];
+ static struct phy phys[2];
+-static u32 regs[2][0x171];
++static u32 regs[2][0x1000];
+ static const struct mtk_dsi_driver_data data = {
+-	.reg_adv = { 0, 0x10, 2, 3 },
++	.reg_adv = (const u16[]){ 0, 0x10, 2, 3 },
+ 	.reg_main = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }
+ };
+ static const struct mtk_dsi_driver_data poll_data = {
+-	.reg_adv = { 0, 0x10, 2, 3 },
++	.reg_adv = (const u16[]){ 0, 0x10, 2, 3 },
+ 	.reg_main = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
+ 	.poll_command_done = true,
+ 	.cmdq_long_packet_ctl = true,
+ };
+ static const struct mtk_dsi_driver_data v1_data = {
+-	.reg_adv = { 0, 0x10, 2, 3 },
++	.reg_adv = (const u16[]){ 0, 0x10, 2, 3 },
+ 	.reg_main = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
+ 	.tx_buf = true,
+ };
+@@ -416,6 +444,11 @@ static void setup(bool dual)
+ 	reset_engine_calls = 0;
+ 	log_count = dump_log_count = clk_rate_calls = 0;
+ 	poll_intsta = 0;
++	poll_state_count = 0;
++	watched_read = w0c_status = arrive_on_read = NULL;
++	watched_reads = response_reads = 0;
++	arrive_bits = 0;
++	use_response = false;
+ 	legacy = false;
+ 	for (int i = 0; i < 2; i++) {
+ 		dev[i] = (struct device){ .id = i, .data = &d[i] };
+@@ -527,6 +560,200 @@ static void test_cmdq_operands(void)
+ 	balanced();
+ }
+ 
++
++static void setup_polled(bool dual)
++{
++	setup(dual);
++	memset(regs, 0, sizeof(regs));
++	legacy = true;
++	for (int i = 0; i < 2; i++) {
++		d[i].driver_data = &poll_data;
++		d[i].power_ready = true;
++		d[i].diag_first_cmd = true;
++	}
++	if (dual) {
++		d[1].master = &d[0];
++		d[1].is_slave = true;
++	}
++}
++
++static void read_reply_states(void)
++{
++	poll_calls = 0;
++	poll_state_count = 3;
++	poll_states[0] = 0;
++	poll_states[1] = LPRX_RD_RDY_INT_FLAG | DSI_BUSY;
++	poll_states[2] = 0;
++	response_reads = 0;
++	use_response = true;
++	memset(response, 0, sizeof(response));
++	response[0] = MIPI_DSI_RX_DCS_SHORT_READ_RESPONSE_1BYTE;
++	response[1] = 0x9c;
++}
++
++static void test_polled_completion(void)
++{
++	struct mipi_dsi_msg write_msg = { .type = 5, .tx_len = 1,
++		.tx_buf = tx_payload };
++	u8 reply = 0;
++	struct mipi_dsi_msg read_msg = { .type = 1, .tx_len = 1,
++		.tx_buf = tx_payload, .rx_buf = &reply, .rx_len = 1 };
++	struct mtk_dsi_driver_data selected = poll_data;
++	int previous_writes;
++
++	/* Actual target mapping omits c00; existing mt8186 mapping retains it. */
++	setup(false);
++	selected.reg_adv = mtk_dsi_regs_mt6897;
++	selected.tx_buf = true;
++	d[0].driver_data = &selected;
++	watched_read = &regs[0][0xc00];
++	assert(!mtk_dsi_poweron(&d[0]));
++	assert(selected.reg_adv[DSI_CMDQ] == 0xd00);
++	assert(selected.reg_adv[DSI_VM_CMD_CON] == 0x200);
++	assert(!selected.reg_adv[DSI_SHADOW_DEBUG] && !watched_reads);
++	for (int i = 0; i < bus_count; i++)
++		assert(bus[i].address != watched_read);
++	mtk_dsi_poweroff(&d[0]);
++	balanced();
++	setup(false);
++	selected = v1_data;
++	selected.reg_adv = mtk_dsi_regs_mt8186;
++	d[0].driver_data = &selected;
++	watched_read = &regs[0][0xc00];
++	assert(!mtk_dsi_poweron(&d[0]));
++	assert(regs[0][0xc00] == (FORCE_COMMIT | BYPASS_SHADOW));
++	mtk_dsi_poweroff(&d[0]);
++	balanced();
++
++	/* The target IRQ never RACKs or waits, even with RD_READY and BUSY. */
++	setup_polled(false);
++	w0c_status = &regs[0][DSI_INTSTA];
++	regs[0][DSI_INTEN] = VM_DONE_INT_FLAG;
++	regs[0][DSI_INTSTA] = VM_DONE_INT_FLAG | LPRX_RD_RDY_INT_FLAG | DSI_BUSY;
++	assert(mtk_dsi_irq(0, &d[0]) == IRQ_HANDLED);
++	assert(d[0].irq_data == VM_DONE_INT_FLAG);
++	assert(regs[0][DSI_INTSTA] == (LPRX_RD_RDY_INT_FLAG | DSI_BUSY));
++	assert(!mask_count && !poll_calls && reg_reads == 2);
++	assert(bus_count == 1 && bus[0].value == ~(u32)VM_DONE_INT_FLAG);
++	setup_polled(false);
++	regs[0][DSI_INTSTA] = LPRX_RD_RDY_INT_FLAG | DSI_BUSY;
++	regs[0][DSI_INTEN] = LPRX_RD_RDY_INT_FLAG | VM_DONE_INT_FLAG;
++	assert(mtk_dsi_irq(0, &d[0]) == IRQ_NONE);
++	assert(!writes && !mask_count && !poll_calls);
++	setup_polled(false);
++	regs[0][DSI_INTSTA] = VM_DONE_INT_FLAG;
++	assert(mtk_dsi_irq(0, &d[0]) == IRQ_NONE);
++	assert(!writes && !d[0].irq_data);
++	setup_polled(false);
++	w0c_status = &regs[0][DSI_INTSTA];
++	arrive_on_read = &regs[0][DSI_INTEN];
++	arrive_bits = LPRX_RD_RDY_INT_FLAG;
++	regs[0][DSI_INTEN] = regs[0][DSI_INTSTA] = VM_DONE_INT_FLAG;
++	assert(mtk_dsi_irq(0, &d[0]) == IRQ_HANDLED);
++	assert(regs[0][DSI_INTSTA] == LPRX_RD_RDY_INT_FLAG);
++
++	/* Process read owns READY -> W0C -> one RACK -> idle, not an IRQ wait. */
++	setup_polled(true);
++	for (int link = 0; link < 2; link++) {
++		int first_bus = bus_count;
++		int ack = -1, rack = -1;
++
++		read_reply_states();
++		assert(mtk_dsi_host_transfer(&d[link].host, &read_msg) == 1);
++		assert(reply == 0x9c && poll_calls == 3 && !irq_waits);
++		for (int i = first_bus; i < bus_count; i++) {
++			if (bus[i].address == &regs[link][DSI_INTSTA])
++				ack = i;
++			if (bus[i].address == &regs[link][DSI_RACK]) {
++				assert(rack == -1);
++				rack = i;
++			}
++		}
++		assert(ack >= poll_bus_count[1] && rack > ack);
++		assert(poll_bus_count[2] > rack);
++		assert(!d[link].cmd_error);
++	}
++
++	/* READY timeout and post-RACK idle timeout retain their original errors. */
++	setup_polled(false);
++	assert(mtk_dsi_host_transfer(&d[0].host, &read_msg) == -ETIMEDOUT);
++	assert(poll_calls == 2 && d[0].cmd_error == -ETIMEDOUT);
++	assert(regs[0][DSI_START] == 0);
++	for (int i = 0; i < mask_count; i++)
++		assert(mask_calls[i].reg != DSI_RACK);
++	setup_polled(false);
++	read_reply_states();
++	poll_states[2] = DSI_BUSY;
++	assert(mtk_dsi_host_transfer(&d[0].host, &read_msg) == -ETIMEDOUT);
++	assert(poll_calls == 3 && !irq_waits && !reset_engine_calls);
++	assert(d[0].cmd_ring[0].start == 1 && regs[0][DSI_START] == 0);
++
++	/* Invalid/zero replies cannot become a successful get-power-mode read. */
++	setup_polled(false);
++	read_reply_states();
++	response[0] = MIPI_DSI_RX_ACKNOWLEDGE_AND_ERROR_REPORT;
++	assert(mtk_dsi_host_transfer(&d[0].host, &read_msg) == -EPROTO);
++	assert(d[0].cmd_error == -EPROTO && !d[0].enabled);
++	setup_polled(false);
++	read_reply_states();
++	response[0] = 0xff;
++	assert(mtk_dsi_host_transfer(&d[0].host, &read_msg) == -EPROTO);
++	setup_polled(false);
++	read_reply_states();
++	response[0] = MIPI_DSI_RX_DCS_SHORT_READ_RESPONSE_2BYTE;
++	assert(mtk_dsi_host_transfer(&d[0].host, &read_msg) == 1);
++	assert(reply == 0x9c && !d[0].cmd_error);
++	setup_polled(false);
++	read_msg.rx_buf = NULL;
++	assert(mtk_dsi_host_transfer(&d[0].host, &read_msg) == -EINVAL);
++	assert(!writes && !poll_calls && !d[0].cmd_error);
++	read_msg.rx_buf = &reply;
++	read_msg.rx_len = 0;
++	assert(mtk_dsi_host_transfer(&d[0].host, &read_msg) == -EINVAL);
++	assert(!writes && !poll_calls);
++	read_msg.rx_len = 1;
++
++	/* Pre-idle failure snapshots state but neither resets nor writes a queue. */
++	setup_polled(false);
++	poll_intsta = regs[0][DSI_INTSTA] = DSI_BUSY;
++	regs[0][DSI_START] = 1;
++	assert(mtk_dsi_host_transfer(&d[0].host, &write_msg) == -ETIMEDOUT);
++	assert(!d[0].cmdq_write_seq && !d[0].cmdq_write_count);
++	assert(!reset_engine_calls && d[0].cmd_ring_count == 1);
++	assert(d[0].cmd_ring[0].pre_intsta == DSI_BUSY);
++	assert(d[0].cmd_ring[0].start == 1 && regs[0][DSI_START] == 0);
++	previous_writes = writes;
++	assert(mtk_dsi_host_transfer(&d[0].host, &write_msg) == -ETIMEDOUT);
++	assert(writes == previous_writes);
++
++	/* Either link's error blocks the pair and atomic video start. */
++	setup_polled(true);
++	poll_intsta = DSI_BUSY;
++	assert(mtk_dsi_host_transfer(&d[1].host, &write_msg) == -ETIMEDOUT);
++	assert(!d[0].cmd_error && d[1].cmd_error == -ETIMEDOUT);
++	previous_writes = writes;
++	assert(mtk_dsi_host_transfer(&d[0].host, &write_msg) == -ETIMEDOUT);
++	mtk_output_dsi_enable(&d[0]);
++	assert(!d[0].enabled && writes == previous_writes);
++	d[0].refcount = 1;
++	assert(!mtk_dsi_poweron(&d[0]));
++	assert(d[1].cmd_error == -ETIMEDOUT);
++	d[0].refcount = 0;
++	d[0].power_ready = d[1].power_ready = false;
++	poll_intsta = 0;
++	assert(!mtk_dsi_poweron(&d[0]));
++	assert(!d[0].cmd_error && !d[1].cmd_error);
++	mtk_output_dsi_enable(&d[0]);
++	assert(d[0].enabled);
++	mtk_dsi_poweroff(&d[0]);
++	balanced();
++	setup_polled(true);
++	mtk_dsi_latch_cmd_error(&d[0], -EIO);
++	previous_writes = writes;
++	assert(mtk_dsi_host_transfer(&d[1].host, &write_msg) == -EIO);
++	assert(writes == previous_writes);
++}
++
+ int main(void)
+ {
+ 	test_cmdq_operands();
+@@ -621,33 +848,39 @@ int main(void)
+ 	timeout_ret = 1;
+ 	assert(mtk_dsi_host_send_cmd(&d[0], &write_msg,
+ 				     CMD_DONE_INT_FLAG) == 0);
+-	assert(idle_waits == 1 && poll_calls == 1 && irq_waits == 0);
++	assert(idle_waits == 0 && poll_calls == 2 && irq_waits == 0);
+ 	assert(log_count == 0 && d[0].cmd_ring_count == 1 &&
+ 	       d[0].cmd_ring_head == 1);
+ 	setup(false);
+ 	legacy = true;
+ 	d[0].driver_data = &poll_data;
+ 	poll_intsta = DSI_BUSY;
++	poll_state_count = 1;
++	poll_states[0] = 0;
+ 	assert(mtk_dsi_host_send_cmd(&d[0], &write_msg,
+-				     CMD_DONE_INT_FLAG) == -ETIME);
+-	assert(poll_calls == 1 && irq_waits == 0);
++				     CMD_DONE_INT_FLAG) == -ETIMEDOUT);
++	assert(poll_calls == 2 && irq_waits == 0);
+ 	assert(d[0].cmd_timeout_dumped && log_count > 0 &&
+ 	       dump_log_count > 0 && dump_log_count <= 32 &&
+ 	       d[0].cmd_ring_count == 1 &&
+-	       d[0].cmd_ring[0].result == -ETIME);
++	       d[0].cmd_ring[0].result == -ETIMEDOUT);
+ 	int dumped_logs = dump_log_count;
+ 	assert(mtk_dsi_host_send_cmd(&d[0], &write_msg,
+-				     CMD_DONE_INT_FLAG) == -ETIME);
++				     CMD_DONE_INT_FLAG) == -ETIMEDOUT);
+ 	assert(dump_log_count == dumped_logs);
+ 	setup(false);
+ 	legacy = true;
+ 	d[0].driver_data = &poll_data;
+ 	struct mipi_dsi_msg read_msg = { .type = 1, .tx_len = 0 };
+ 	timeout_ret = 1;
++	poll_state_count = 3;
++	poll_states[0] = 0;
++	poll_states[1] = LPRX_RD_RDY_INT_FLAG | DSI_BUSY;
++	poll_states[2] = 0;
+ 	assert(mtk_dsi_host_send_cmd(&d[0], &read_msg,
+ 				     CMD_DONE_INT_FLAG |
+ 				     LPRX_RD_RDY_INT_FLAG) == 0);
+-	assert(poll_calls == 1 && irq_waits == 1);
++	assert(poll_calls == 3 && irq_waits == 0);
+ 	setup(false);
+ 	legacy = true;
+ 	timeout_ret = 1;
+@@ -838,7 +1071,7 @@ int main(void)
+ 	d[0].driver_data = &poll_data;
+ 	mtk_dsi_set_interrupt_enable(&d[0]);
+ 	assert(regs[0][DSI_INTEN] ==
+-	       (LPRX_RD_RDY_INT_FLAG | VM_DONE_INT_FLAG));
++	       VM_DONE_INT_FLAG);
+ 	d[0].driver_data = &data;
+ 	mtk_dsi_set_interrupt_enable(&d[0]);
+ 	assert(regs[0][DSI_INTEN] ==
+@@ -851,5 +1084,6 @@ int main(void)
+ 	regs[0][DSI_INTSTA] = CMD_DONE_INT_FLAG;
+ 	assert(mtk_dsi_irq(0, &d[0]) == IRQ_HANDLED);
+ 	assert(d[0].irq_trace_count == 8);
++	test_polled_completion();
+ 	puts("DSI routing: dual-link acquisition failure sweep, ownership, context-loss replay, bounded state capture and polled-idle command completion passed");
+ }
+diff --git a/tools/testing/selftests/mtk_clk/test_dsi_routing.py b/tools/testing/selftests/mtk_clk/test_dsi_routing.py
+index 7e909af449..91e2843607 100755
+--- a/tools/testing/selftests/mtk_clk/test_dsi_routing.py
++++ b/tools/testing/selftests/mtk_clk/test_dsi_routing.py
+@@ -13,7 +13,7 @@ source = (repo / 'drivers/gpu/drm/mediatek/mtk_dsi.c').read_text()
+ 
+ 
+ def function(name, text=source):
+-    match = re.search(r'^(?:static )?(?:int|void|ssize_t|s32|u8|irqreturn_t)\s*' + name + r'\(', text, re.M)
++    match = re.search(r'^(?:static )?(?:int|void|ssize_t|s32|u8|u32|irqreturn_t)\s*' + name + r'\(', text, re.M)
+     start = match.start()
+     end = text.index('{', start) + 1
+     depth = 1
+@@ -23,7 +23,11 @@ def function(name, text=source):
+     return text[start:end]
+ 
+ 
+-production = '\n'.join(function(name).replace('static void mtk_dsi_mask(',
++tables = '\n'.join(re.search(
++    r'static const u16 ' + name + r'\[DSI_ADV_REG_MAX\] = \{.*?\n\};',
++    source, re.S).group(0) for name in
++    ['mtk_dsi_regs_mt8186', 'mtk_dsi_regs_mt6897'])
++production = tables + '\n' + '\n'.join(function(name).replace('static void mtk_dsi_mask(',
+     'static void production_mask(').replace('static void mtk_dsi_cmdq_mask(',
+     'static void production_cmdq_mask(') for name in [
+     'mtk_dsi_irq_data_set', 'mtk_dsi_irq_data_clear',
+@@ -32,7 +36,10 @@ production = '\n'.join(function(name).replace('static void mtk_dsi_mask(',
+     'mtk_dsi_dump_cmdq_writes',
+     'mtk_dsi_record_cmd', 'mtk_dsi_dump_ring', 'mtk_dsi_dump_cmd_failure',
+     'mtk_dsi_dump_clocks', 'mtk_dsi_wait_for_irq_done', 'mtk_dsi_irq',
+-    'mtk_dsi_poll_for_idle', 'mtk_dsi_cmdq', 'mtk_dsi_host_send_cmd',
++    'mtk_dsi_poll_for_idle', 'mtk_dsi_poll_read_ready', 'mtk_dsi_cmdq',
++    'mtk_dsi_latch_cmd_error', 'mtk_dsi_host_send_cmd',
++    'mtk_dsi_start', 'mtk_dsi_stop', 'mtk_output_dsi_enable',
++    'mtk_output_dsi_disable', 'mtk_dsi_recv_cnt',
+     'mtk_dsi_set_interrupt_enable', 'mtk_dsi_select_mm_reset',
+     'mtk_dsi_clear_cmdq',
+     'mtk_dsi_poweron', 'mtk_dsi_poweroff', 'mtk_dsi_bridge_atomic_disable',
+@@ -41,7 +48,7 @@ production = '\n'.join(function(name).replace('static void mtk_dsi_mask(',
+     'mtk_dsi_host_transfer'])
+ send_cmd = function('mtk_dsi_host_send_cmd')
+ assert send_cmd.index('poll_command_done') < send_cmd.index('mtk_dsi_poll_for_idle')
+-assert send_cmd.index('LPRX_RD_RDY_INT_FLAG') > send_cmd.index('mtk_dsi_poll_for_idle')
++assert send_cmd.index('mtk_dsi_poll_read_ready') < send_cmd.rindex('mtk_dsi_poll_for_idle')
+ assert 'dev_info' not in send_cmd
+ assert 'mtk_dsi_record_cmd' in send_cmd
+ assert 'mtk_dsi_dump_cmd_failure' in send_cmd
+-- 
+2.56.0
+

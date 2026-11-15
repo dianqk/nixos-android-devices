@@ -1,0 +1,138 @@
+From 3d69b8ad5fc53c61c32b12a5b60a78b36dfb07d5 Mon Sep 17 00:00:00 2001
+From: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Date: Tue, 14 Jul 2026 13:43:49 +0200
+Subject: [PATCH] soc: mediatek: mtk-mutex: Add new functions to add/remove
+ triggers
+
+Add new mtk_mutex_add_trigger() and mtk_mutex_remove_trigger() to
+replace, in the near future, their older style equivalents such as
+mtk_mutex_add_comp() and mtk_mutex_remove_comp() for the Display
+Controller related MuteX triggers.
+
+The same functions will be used to also replace the Media Data
+Path 3 (MDP3) specific mtk_mutex_write_mod(), unifying the MuteX
+handling across all of the currently supported multimedia-related
+drivers for MediaTek SoCs.
+
+While at it, this also takes into account the upcoming refactoring
+of mtk_mmsys and mediatek-drm, which are about to migrate to a new
+Component "Type -> Hardware ID" mapping, by adding a new function
+parameter "hw_inst_id" to support that.
+
+Acked-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Signed-off-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Link: https://patchwork.kernel.org/project/linux-mediatek/list/?series=1127365
+[dianqk: from the Huge Restructuring v2 series, applied to v7.3-rc6; rc6 drift resolved]
+---
+ drivers/soc/mediatek/mtk-mutex.c       | 60 ++++++++++++++++++++++++++
+ include/linux/soc/mediatek/mtk-mutex.h |  6 +++
+ 2 files changed, 66 insertions(+)
+
+diff --git a/drivers/soc/mediatek/mtk-mutex.c b/drivers/soc/mediatek/mtk-mutex.c
+index eb5d381ff5..ef8e77f7e2 100644
+--- a/drivers/soc/mediatek/mtk-mutex.c
++++ b/drivers/soc/mediatek/mtk-mutex.c
+@@ -887,6 +887,65 @@ void mtk_mutex_unprepare(struct mtk_mutex *mutex)
+ }
+ EXPORT_SYMBOL_GPL(mtk_mutex_unprepare);
+ 
++static enum mtk_mutex_sof_id mtk_mutex_get_sof_trig(enum mtk_ddp_comp_type type,
++						    unsigned int hw_inst_id)
++{
++	switch (type) {
++	case MTK_DISP_DSI:
++		return MUTEX_SOF_DSI0 + hw_inst_id;
++	case MTK_DISP_DPI:
++		return MUTEX_SOF_DPI0 + hw_inst_id;
++	case MTK_DISP_DP_INTF:
++		return MUTEX_SOF_DP_INTF0 + hw_inst_id;
++	default:
++		break;
++	}
++
++	return DDP_MUTEX_SOF_MAX;
++}
++
++void mtk_mutex_add_trigger(struct mtk_mutex *mutex, enum mtk_ddp_comp_type type,
++			   unsigned int hw_inst_id, unsigned int mtx_trig_id)
++{
++	struct mtk_mutex_ctx *ctx = container_of(mutex, struct mtk_mutex_ctx, mutex[mutex->id]);
++	enum mtk_mutex_sof_id sof_id = mtk_mutex_get_sof_trig(type, hw_inst_id);
++	const u32 offset = DISP_REG_MUTEX_MOD(ctx, mtx_trig_id, mutex->id);
++	u32 val;
++
++	if (sof_id < DDP_MUTEX_SOF_MAX) {
++		const u32 sof_offset = DISP_REG_MUTEX_SOF(ctx->data->mutex_sof_reg, mutex->id);
++
++		writel(ctx->data->mutex_sof[sof_id], ctx->regs + sof_offset);
++		return;
++	}
++
++	val = readl(ctx->regs + offset);
++	writel(val | BIT(mtx_trig_id % 32), ctx->regs + offset);
++}
++EXPORT_SYMBOL_NS_GPL(mtk_mutex_add_trigger, "MTK_MUTEX");
++
++void mtk_mutex_remove_trigger(struct mtk_mutex *mutex, enum mtk_ddp_comp_type type,
++			      unsigned int hw_inst_id, unsigned int mtx_trig_id)
++{
++	struct mtk_mutex_ctx *ctx = container_of(mutex, struct mtk_mutex_ctx, mutex[mutex->id]);
++	enum mtk_mutex_sof_id sof_id = mtk_mutex_get_sof_trig(type, hw_inst_id);
++	const u32 offset = DISP_REG_MUTEX_MOD(ctx, mtx_trig_id, mutex->id);
++	u32 val;
++
++	if (sof_id < DDP_MUTEX_SOF_MAX) {
++		const u32 sof_offset = DISP_REG_MUTEX_SOF(ctx->data->mutex_sof_reg, mutex->id);
++
++		val = readl(ctx->regs + sof_offset);
++		writel(val & ~ctx->data->mutex_sof[sof_id], ctx->regs + sof_offset);
++		return;
++	}
++
++	val = readl(ctx->regs + offset);
++	writel(val & ~BIT(mtx_trig_id % 32), ctx->regs + offset);
++}
++EXPORT_SYMBOL_NS_GPL(mtk_mutex_remove_trigger, "MTK_MUTEX");
++
++/* TODO: Legacy - Scheduled for removal */
+ void mtk_mutex_add_comp(struct mtk_mutex *mutex,
+ 			enum mtk_ddp_comp_id id)
+ {
+@@ -938,6 +997,7 @@ void mtk_mutex_add_comp(struct mtk_mutex *mutex,
+ }
+ EXPORT_SYMBOL_GPL(mtk_mutex_add_comp);
+ 
++/* TODO: Legacy - Scheduled for removal */
+ void mtk_mutex_remove_comp(struct mtk_mutex *mutex,
+ 			   enum mtk_ddp_comp_id id)
+ {
+diff --git a/include/linux/soc/mediatek/mtk-mutex.h b/include/linux/soc/mediatek/mtk-mutex.h
+index 635218e3ac..5368206dd6 100644
+--- a/include/linux/soc/mediatek/mtk-mutex.h
++++ b/include/linux/soc/mediatek/mtk-mutex.h
+@@ -67,16 +67,22 @@ enum mtk_mutex_sof_index {
+ 	MUTEX_SOF_IDX_MAX		/* ALWAYS keep at the end */
+ };
+ 
++enum mtk_ddp_comp_type;
++
+ struct mtk_mutex *mtk_mutex_get(struct device *dev);
+ int mtk_mutex_prepare(struct mtk_mutex *mutex);
+ void mtk_mutex_add_comp(struct mtk_mutex *mutex,
+ 			enum mtk_ddp_comp_id id);
++void mtk_mutex_add_trigger(struct mtk_mutex *mutex, enum mtk_ddp_comp_type type,
++			   unsigned int hw_inst_id, unsigned int mtx_trig_id);
+ void mtk_mutex_enable(struct mtk_mutex *mutex);
+ int mtk_mutex_enable_by_cmdq(struct mtk_mutex *mutex,
+ 			     void *pkt);
+ void mtk_mutex_disable(struct mtk_mutex *mutex);
+ void mtk_mutex_remove_comp(struct mtk_mutex *mutex,
+ 			   enum mtk_ddp_comp_id id);
++void mtk_mutex_remove_trigger(struct mtk_mutex *mutex, enum mtk_ddp_comp_type type,
++			      unsigned int hw_inst_id, unsigned int mtx_trig_id);
+ void mtk_mutex_unprepare(struct mtk_mutex *mutex);
+ void mtk_mutex_put(struct mtk_mutex *mutex);
+ void mtk_mutex_acquire(struct mtk_mutex *mutex);
+-- 
+2.56.0
+

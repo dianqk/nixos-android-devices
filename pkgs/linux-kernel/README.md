@@ -1,8 +1,8 @@
 # Device kernel configuration
 
 Each device has exactly one kernel, `devices.<device>.kernel`: the release
-provided by the locked Nixpkgs input (`linuxPackages_testing`, currently
-7.3-rc6) plus the device's ordered patch queue. The installed system and RAM
+provided by the locked Nixpkgs input (`linuxPackages_latest`, currently
+7.3.4) plus the device's ordered patch queue. The installed system and RAM
 recovery use the same kernel; there are no pinned or fallback kernel versions.
 The build platform is selected through the package outputs: under
 `x86_64-linux` everything cross-compiles for AArch64 (an x86_64-only machine
@@ -17,6 +17,19 @@ the queues: port every device queue to the new release (see the
 `expectedVersion`. The kernel's `patchQueueStatus` reports `expectedVersion`
 and `evaluatedVersion` for tooling. Evaluation success is not a build or
 deployment validation.
+
+All eight queues target 7.3.4. Dodge no longer carries the generic PHY
+module-reference race fix, included in 7.3.4 (stable `8a9f16b5237e`, upstream
+`090055ee6295`). FastRPC PDR subscriptions preserve the upstream reserved-memory
+helper; Clover/Polaris WLED IRQ-depth tracking uses upstream initial brightness;
+Polaris retains its ramoops reservation alongside the extended XBL region.
+Marble keeps both upstream restricted IOVA state and the secure encoder ARP pool,
+and its audio ownership patches coexist with upstream position-buffer UNMAP fixes.
+Retained patches keep their existing shared/board-owned paths and ordered lists.
+The 7.3.4 source preparation uses the same exact checked Nixpkgs plus local
+preparation contract as 7.3.1. Source replay and compilation do not establish
+hardware behavior; test changed kernel and graphics paths on each device.
+
 Configuration is applied in this order:
 
 1. The board's checked-in `configfile`.
@@ -38,6 +51,15 @@ sets/maps (part of the nf_tables core) and flow offload support are built in.
 This also covers the kernel facilities used by TUN auto-redirect. Enabling these
 capabilities does not install firewall rules or enable a proxy service.
 
+## Bluetooth profiles
+
+Every kernel with Bluetooth includes the shared
+[Bluetooth profile configuration](config/bluetooth.nix): RFCOMM (hands-free
+headset audio and serial profiles), BNEP (network tethering over Bluetooth)
+and HIDP (classic Bluetooth keyboards and mice). Kernels whose baseline does
+not select them build them as modules; a baseline that already selects them
+keeps its choice.
+
 ## Peripheral and pinctrl policy
 
 The configuration keeps USB-C/DP, USB hubs, USB networking, external storage,
@@ -56,6 +78,7 @@ the required pin controllers:
 | Polaris | `PINCTRL_SDM845` | WCD9340 GPIO in `drivers/gpio` | `PINCTRL_QCOM_SPMI_PMIC` |
 | Sheng | `PINCTRL_SM8550` | `PINCTRL_SM8550_LPASS_LPI` | `PINCTRL_QCOM_SPMI_PMIC` |
 | Clover | `PINCTRL_SDM660` | `PINCTRL_SDM660_LPASS_LPI` | `PINCTRL_QCOM_SPMI_PMIC` |
+| Marble | `PINCTRL_SM8475` | `PINCTRL_SM8450_LPASS_LPI` | `PINCTRL_QCOM_SPMI_PMIC` |
 
 Audio pinctrl also needs `PINCTRL_LPASS_LPI`; Asphalt uses the SM8450 audio
 controller compatible. Configuration checks do not establish hardware function.

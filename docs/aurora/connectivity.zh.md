@@ -13,7 +13,9 @@
 | 蓝牙 | BR/EDR 和 LE 配对、加密 L2CAP 数据及 GATT 读取可用；音频 profile、HID/PAN 及与 Wi-Fi 共存未验证 |
 | 蜂窝基带 | 实验性；见[蜂窝基带](#cellular-modem-experimental) |
 
-以上结果均以要求的原厂底包 OS1.0.3.0.UNACNXM（Android 14）为前提。
+以上结果最初在此前的 Android 14 底包（OS1.0.3.0.UNACNXM）上测得。在要求的
+OS3.0.308.0.WNACNXM（Android 16）底包上已重新核对 ADSP 电池/USB 信息、Type-C、
+Wi-Fi、蓝牙和移动数据；其他细节尚未重复验证。
 
 ## ADSP 与 Type-C
 
@@ -25,7 +27,17 @@ initrd，供内建 PAS 驱动使用。
 连接器图使用 OTG，默认 peripheral。固定 peripheral 模式不会注册 DWC3 角色开关，
 UCSI 会因此耗尽延迟探测重试次数。device/sink 角色、ACM/NCM 和电池读取可以同时
 工作；USB 主机模式尚不支持。电池上报会转换 Aurora 原厂的属性 ID 和电流符号。
-固件给出的 `power_now` 是常量，因此标记为不可用，而不是当作实测功率。USB 输入
+`usb_type` 与原厂驱动一样取自固件的适配器类型（高通 HVDCP 类型显示为 DCP，
+浮空充电器显示为 Unknown），`charge_counter` 从 mAh 换算为 µAh。固件给出的
+`power_now` 是常量，内阻值实为电池 ID 电阻，因此都不导出。`charge_control_end_threshold`
+低于 100 时会先启用固件的充电控制（原厂驱动也要求如此），设为 100 则关闭；
+`constant_charge_current` 是固件以 µA 为单位的充电电流上限，供可选的
+[按温度限制充电电流](../configuration.zh.md#按温度限制充电电流)使用。两者都会写入充电设置，
+尚未在硬件上验证。
+USB gadget 申请 900 mA（低于 SuperSpeed 时内核限制为 500 mA），DWC3 会像原厂
+eUSB2 PHY 一样把该电流作为输入电流上限报告给 `qcom-battmgr-usb`；否则 PC 端口会停留在
+固件未配置状态下的 100 mA 上限。ADSP 充电日志（含电流上限投票）可通过
+`echo 'file qcom_battmgr.c +p' > /sys/kernel/debug/dynamic_debug/control` 查看。USB 输入
 受限时，状态显示 `Charging` 的同时电池可能仍在净放电；应检查 `current_now`、
 `charge_counter`、温度和协商得到的输入上限。不要把输入上限提高到超出所连电源的
 能力。
@@ -182,7 +194,7 @@ Android 蓝牙地址，编码为六个小端字节。Nixpkgs 设备树 overlay �
 <a id="cellular-modem-experimental"></a>
 ## 蜂窝基带（实验性）
 
-板级 DT 启用 MPSS remoteproc、IPA v5.5 和静态 rmtfs 共享内存。原厂 Android 14 的
+板级 DT 启用 MPSS remoteproc、IPA v5.5 和静态 rmtfs 共享内存。原厂（Android 14 与 16）的
 基带保留区域与 `sm8650.dtsi` 一致。在实机上，MPSS 能够启动，QRTR 服务集合与
 Android 一致，ModemManager 能检测到 SIM 并注册到 LTE/5G NR，IPv4 和 IPv6 移动数据
 可用，短信可以收发。这需要下文的许可服务，包括 `license.qwesd`：缺少它们时，基带
@@ -191,7 +203,7 @@ Android 一致，ModemManager 能检测到 SIM 并注册到 LTE/5G NR，IPv4 和
 [QRTR HELLO 与服务通告修复](../../pkgs/linux-kernel/patches/qrtr-hello)，使基带在
 启动期间能找到 rmtfs 和 TFTP。
 
-在使用 Android 14 底包的已安装系统（而非 RAM recovery）中启用。共享选项见
+在使用要求底包的已安装系统（而非 RAM recovery）中启用。共享选项见
 [基带与 QTEE 服务](../modem.zh.md)。`hardware.aurora.modem` 向共享的
 `androidDevices.modem` 模块提供 Aurora 的 remoteproc、NV 分区、固件和许可服务，
 通用设置由后者负责：
@@ -212,7 +224,7 @@ androidDevices.modem = {
 | 固件 | 固件包中独立的 `modem` 输出：modem、modem DTB 和 IPA 拆分 MDT，以及基带的只读 TFTP 目录树。仅安装在根文件系统中，从不放入 recovery。 |
 | `modem-tqftpserv.service` | 从包含 `modem.mdt` 的目录提供 `/readonly/firmware/image/`；可写请求转到 `/var/lib/tqftpserv`。 |
 | `modem-rmtfs.service` | `rmtfs -P -v [-r]`：按分区标签提供 `modemst1`、`modemst2`、`fsg` 和 `fsc`。它不负责启动或停止 MPSS。 |
-| `modem-mpss.service` | 最多等待 `timeSyncTimeout`（120 s）直到系统时钟同步，然后在上述服务之后通过 remoteproc sysfs 启动 MPSS，并拉起 SIM 激活和 ModemManager。停止该服务时（包括关机时），仅当 MPSS 处于 `running` 状态才写入 `stop`；崩溃的 MPSS 保持原状。 |
+| `modem-mpss.service` | 最多等待 `timeSyncTimeout`（120 s）直到系统时钟同步或由 RTC 偏移恢复，然后在上述服务之后通过 remoteproc sysfs 启动 MPSS，并拉起 SIM 激活和 ModemManager。停止该服务时（包括关机时），仅当 MPSS 处于 `running` 状态才写入 `stop`；崩溃的 MPSS 保持原状。 |
 | `modem-sim-provision.service` | （`simProvisioning`，默认开启）检测到 USIM 10 s 后，若基带仍未激活主 GW provisioning 会话，则用 `qmicli` 为第一张 USIM 激活该会话；随后启动 ModemManager。 |
 | Smart Transmit 许可证（`license.enable`，默认开启） | `qtee-supplicant.service`（minkipc），写权限仅限 `/persist/data/pfm`；以及 `mink-modem-opener.service`，为基带的 QTEE 会话发布 QRTR 服务 5013。见 [QTEE](#qtee-与基带许可证)。 |
 | QRTR 名称服务与 PD mapper | 位于内核中（`net/qrtr/ns.c`、`QCOM_PD_MAPPER`）；无用户态守护进程。 |
@@ -283,9 +295,13 @@ mmcli -L
 需重启系统使其改动生效。MPSS 运行期间不要手动重启 `qtee-supplicant` 或
 `mink-modem-opener`；重启 supplicant 不会重启桥接程序。
 
-在 MPSS 启动前设置好时钟。RTC 不可用，因此时间来自 NTP；在时钟未设置时启动的
+在 MPSS 启动前设置好时钟。Linux 无法设置 PMIC RTC，因此时间来自 NTP，或在某次
+启动已同步后，来自 RTC 加上
+[`androidDevices.clock.rtcOffset`](../configuration.zh.md#只读-rtc-的系统时钟)
+保存的偏移（默认启用）；`modem-mpss.service` 接受两者之一。在时钟未设置时启动的
 MPSS 会在初始化中停滞（约 40 s 后出现 `DOG detects stalled initialization`）。
-没有网络时，启动会在超时后继续，因此离线手机应先设置时钟（`timedatectl set-time`）。
+没有网络且没有已保存偏移时，启动会在超时后继续，因此离线手机应先设置时钟
+（`timedatectl set-time`）。
 
 诊断时，`modemOpener.trace` 记录经过桥接程序的基带与 QTEE 之间的每次调用（方法
 编号、参数数量和大小、结果、耗时及对象释放），`modemOpener.transportTrace` 增加

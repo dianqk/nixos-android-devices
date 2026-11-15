@@ -1,0 +1,28 @@
+From e48f7e57d25b90796801487500b4053b07f05fcb Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Sun, 15 Nov 2026 13:49:14 +0800
+Subject: [PATCH 144/144] arm64: dts: qcom: sm8750: exclude the ADSP remote
+ heap from Linux RAM
+
+FastRPC assigns the complete ADSP remote heap to DSP VMIDs without taking it out of the CMA allocator. A reusable pool allows normal movable Linux pages to enter memory that HLOS can no longer access.
+
+On OnePlus 13, the old boot log reserves 0xf2c00000..0xf37fffff as reusable ADSP heap. The first clear_page external abort records PFN 0xf3400, inside that region. Six such aborts precede the recorded shutdown/display hang. Mark the heap no-map rather than suppressing memory initialization or IRQ errors. This fixes the demonstrated memory ownership fault; a separate DPU shutdown defect still needs clean-kernel validation.
+
+Link: https://lists.openwall.net/linux-kernel/2026/10/14/2096
+---
+ arch/arm64/boot/dts/qcom/sm8750.dtsi | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8750.dtsi b/arch/arm64/boot/dts/qcom/sm8750.dtsi
+index 20dc148c71..5a9f06881f 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8750.dtsi
+@@ -570,7 +570,7 @@ adsp_rpc_remote_heap_mem: adsp-rpc-remote-heap {
+ 			alloc-ranges = <0x0 0x00000000 0x0 0xffffffff>;
+ 			alignment = <0x0 0x400000>;
+ 			size = <0x0 0xc00000>;
+-			reusable;
++			no-map;
+ 		};
+ 	};
+ 

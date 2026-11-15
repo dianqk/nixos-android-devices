@@ -2,11 +2,11 @@
 
 [English](PATCHES.md) · [Polaris 设备索引](../../../../docs/polaris/README.zh.md)
 
-补丁集以 Linux 7.3-rc6 为目标；本设备的硬件结果基于此前的 7.x 内核取得。
+补丁集以 Linux 7.3 为目标；本设备的硬件结果基于此前的 7.x 内核取得。
 见[共享内核说明](../../README.zh.md)。
 
-内核包使用已锁定 Nixpkgs 输入中的 `linuxPackages_testing.kernel`，目标版本为
-Linux 7.3-rc6。[`series.nix`](series.nix)按应用顺序列出启用的补丁。
+内核包使用已锁定 Nixpkgs 输入中的 `linuxPackages_latest.kernel`，目标版本为
+Linux 7.3。[`series.nix`](series.nix)按应用顺序列出启用的补丁。
 构建结果包含 `qcom/sdm845-xiaomi-polaris.dtb` 和使用 LLVM 23 构建的
 Android 兼容 `Image.gz`。
 

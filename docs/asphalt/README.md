@@ -1,8 +1,8 @@
 # Lenovo Legion Y700 2023 (TB320FC) (asphalt)
 
-[中文](README.zh.md) · [All devices](../README.md) · [Hardware support](hardware.md)
+[中文](README.zh.md) · [All devices](../README.md) · [Support status](status.md) · [Hardware support](hardware.md)
 
-Support: Tier 2. See [support criteria](../README.md#support-tiers).
+Status: see the [hardware page](hardware.md) and [support status](status.md).
 
 ## Configure and install
 
@@ -24,8 +24,6 @@ its root/ESP and data; do not rerun destructive first-install preparation.
 
 ```nix
 {
-  androidDevices.usbSerial = "my-asphalt-01";
-  androidDevices.persistentImage.rootfs.label = "NIXOS";
   # Optional factory identity files:
   # hardware.asphalt.radio.wifiAddressFile = ./wifi-address;
   # hardware.asphalt.radio.bluetoothAddressFile = ./bluetooth-address;
@@ -65,16 +63,21 @@ The repository examples use `.#devices.asphalt.<role>`, for example `.#devices.a
 
 ## Firmware sources
 
-Device-specific firmware is fetched from a pinned upstream commit; this repository
-does not store its binary payloads.
+Device-specific firmware is fetched by hash from one release archive; this
+repository does not store its binary payloads.
 
-- Source: [dianqk/firmware-lenovo-asphalt at `207d466`](https://github.com/dianqk/firmware-lenovo-asphalt/tree/207d4668183032c1d9f196f195e9ecef98949d06).
+- Archive: [`asphalt-firmware-ZUI-17.0.339-20261115.tar.zst`](https://github.com/dianqk/nixos-android-devices/releases/download/firmware/asphalt-firmware-ZUI-17.0.339-20261115.tar.zst) (stock ZUI 17.0.339 vendor).
+- Layout: `lenovo/tb320fc/{firmware,audio,wifi}` and
+  `oneplus/negroni/WCN6855/hw2.1`, with a top-level `SHA256SUMS` and README.
 - Used for: Touch, GPU, audio, video, WCN6855 board data and OnePlus Wi-Fi firmware.
 
-The upstream repository documents the Lenovo Android image provenance, the
-OnePlus Wi-Fi source, and SHA256 checksums for its 41 files. Override the default
-Wi-Fi board data with `hardware.asphalt.wifiBoardFile` when needed; device
-addresses are supplied separately.
+The archive README records the Lenovo Android image provenance and the OnePlus
+Wi-Fi source; the build checks the 41 files against `SHA256SUMS`. To use your
+own copy, set `hardware.asphalt.firmwareSource` to
+`androidPackages.mkFirmwareArchive { name; url; hash; }` or a directory with the
+same layout. Override the default Wi-Fi board data with
+`hardware.asphalt.wifiBoardFile` when needed; device addresses are supplied
+separately.
 
 See the [firmware license notes](../README.md#firmware-sources-and-licensing) for generic firmware
 sources and licensing.

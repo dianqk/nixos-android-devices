@@ -19,7 +19,7 @@
 
 ## 已知限制
 
-打包的内核为 Nixpkgs Linux 7.3-rc6。本页硬件结果基于 7.3-rc5 补丁集取得。
+打包的内核为 Nixpkgs Linux 7.3。本页硬件结果基于 7.3-rc5 补丁集取得。
 见[内核补丁说明](../../pkgs/linux-kernel/sm8550/sheng/PATCHES.zh.md)。
 
 7.3 安装系统可用：无需关闭再开启 DSI 输出即可直接以 120 Hz 显示 3048×2032 桌面，
@@ -37,6 +37,11 @@ Wi-Fi 自动连接和扫描，以及通过 USB 和 Wi-Fi 的 SSH。应保留可�
 - 音频：六颗 CS35L43 功放全部绑定，ALSA 声卡提供两个播放 PCM 和一个录音 PCM，
   但没有 PipeWire 输出：声卡长名称与已安装 UCM 文件名不同，UCM 查找失败，
   只出现 Off/Pro Audio 配置。外放、录音和路由暂不可用。
+- 扬声器方向：模块为声卡 `XiaomiPad6SPro` 提供
+  [扬声器声道数据](../configuration.zh.md#随屏幕方向切换扬声器声道)。每颗功放的
+  `<amp> ASPRX1 Slot Position` 选择 slot 0（左）或 1（右）。`normal`（原生
+  3048×2032 横屏，T 功放位于左侧）和 `180`（交换 slot）已验证。`90` 和 `270`
+  未验证，在确认竖屏扬声器布局前沿用 `normal` 的设置。
 - 相机：libcamera 可拍摄前置 OV32D40 3264×2448 场景和后置 S5KJN1 4080×3060 彩条。
   后摄实景画质、自动对焦、闪光灯、色彩校准和深度传感器未验证。
 - Recovery 和普通系统可协商 10 Gb/s USB，持续吞吐量未测量。Recovery 需保留模块
@@ -52,3 +57,16 @@ Sheng 使用共享的正常系统 NCM、recovery ACM+NCM 策略。双角色和 T
 通过 `hardware.sheng.wifiMacAddress` 提供本机已知的出厂地址。
 `hardware.sheng.suspendWorkarounds.enable` 默认 `false`；显式启用后过滤
 未使用的唤醒源，并在休眠前后重新加载 `ath12k_wifi7`。最小示例尚未验证休眠可用。
+
+休眠只使用 `deep`（`hardware.sheng.suspend.memSleep`）。设备模块为共享的
+[唤醒策略](../configuration.zh.md#挂起唤醒源)声明唤醒源：`powerKey`、
+`rtc`、`cover`（gpio-keys：打开保护套通过霍尔开关唤醒，合上键盘保护套通过平板模式
+开关唤醒）、`usbPower`（USB 供电与 UCSI source 供电；插拔唤醒尚未确认）以及
+`wirelessCharging`（未测试）。例如只保留已确认的唤醒源：
+
+```nix
+androidDevices.power.wakeup = {
+  enable = true;
+  keep = [ "powerKey" "rtc" "cover" ];
+};
+```

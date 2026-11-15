@@ -1,0 +1,2131 @@
+From 9dc65fce6ceefe9c1807f3d57524bacc23a081c4 Mon Sep 17 00:00:00 2001
+From: dianqk <dianqk@dianqk.net>
+Date: Fri, 6 Nov 2026 10:00:00 +0800
+Subject: [PATCH] soc: mediatek: implement bounded MT6897 VCP transport
+
+Inspect the bootloader VCP metadata and implement bounded transport,
+secure reset/clock ordering, logger and explicit power ownership.
+Keep the imported codec source separate from this MT6897 platform layer.
+
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T13:17:01+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T13:29:28+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T13:57:45+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T14:39:23+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T15:24:11+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T15:35:47+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T15:42:36+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T16:39:05+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T17:25:12+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T17:27:31+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T17:35:56+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T17:49:07+08:00
+Original-Commit: local development history
+Original-Author: dianqk <dianqk@dianqk.net>
+Original-Date: 2026-11-03T18:31:58+08:00
+Link: https://github.com/MiCode/MTK_kernel_device_modules/tree/3c4ccd07d5624879555ec710c11bb8818e5cb5c6
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/misc/mediatek/vcp/rv/vcp_helper.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/misc/mediatek/vcp/rv/vcp_reg.h
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/misc/mediatek/vcp/rv/vcp_logger.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec/mtk_vcodec_dec.c
+Link: https://github.com/MiCode/MTK_kernel_device_modules/blob/3c4ccd07d5624879555ec710c11bb8818e5cb5c6/drivers/media/platform/mtk-vcodec/vdec/vdec_vcp_if.c
+Signed-off-by: dianqk <dianqk@dianqk.net>
+---
+ drivers/soc/mediatek/mtk-vcp-platform.h       |  165 ++
+ drivers/soc/mediatek/mtk-vcp.c                | 1503 +++++++++++++++++
+ include/linux/remoteproc/mtk_vcp.h            |   10 +-
+ include/linux/remoteproc/mtk_vcp_memory.h     |   15 +
+ .../testing/selftests/mtk_vcp/test_mt6897.py  |  319 ++++
+ 5 files changed, 2007 insertions(+), 5 deletions(-)
+ create mode 100644 drivers/soc/mediatek/mtk-vcp-platform.h
+ create mode 100644 drivers/soc/mediatek/mtk-vcp.c
+ create mode 100644 include/linux/remoteproc/mtk_vcp_memory.h
+ create mode 100644 tools/testing/selftests/mtk_vcp/test_mt6897.py
+
+diff --git a/drivers/soc/mediatek/mtk-vcp-platform.h b/drivers/soc/mediatek/mtk-vcp-platform.h
+new file mode 100644
+index 0000000000..a7a0b1461f
+--- /dev/null
++++ b/drivers/soc/mediatek/mtk-vcp-platform.h
+@@ -0,0 +1,165 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* VCP bootloader metadata and mailbox layouts; no hardware access here. */
++#ifndef __MTK_VCP_PLATFORM_H
++#define __MTK_VCP_PLATFORM_H
++#include <linux/build_bug.h>
++#include <linux/errno.h>
++#include <linux/stddef.h>
++#include <linux/types.h>
++#include <linux/byteorder/generic.h>
++
++/* Shared pointers encode only a 28-bit offset within one window. */
++static inline bool mt6897_vcp_dma_valid(u64 dma, u64 size)
++{
++	const u64 lower = 0x140000000ULL, upper = 0x1a0000000ULL;
++
++	return size && dma >= lower && dma < upper &&
++		size <= upper - dma && !(dma & 0xf) &&
++		(dma >> 28) == ((dma + size - 1) >> 28);
++}
++
++#define MTK_VCP_REGION_OFFSET 4
++#define MTK_VCP_LOADER_SIZE 0x2000
++#define MTK_VCP_TCM_SIZE 0x40000
++
++/* MediaTek vcp_helper.h, MiCode/MTK_kernel_device_modules
++ * 3c4ccd07d5624879555ec710c11bb8818e5cb5c6. The first 0x38 bytes are
++ * shared with MT6895; MT6897 adds the following six words.
++ */
++struct mtk_vcp_region_info {
++	__le32 loader_start, loader_size, firmware_start, firmware_size;
++	__le32 dram_start, dram_size, dram_backup_start, struct_size;
++	__le32 log_uart, task_context, vcpctl, regdump_start, regdump_size;
++	__le32 params_start, sramlog_buf_offset, sramlog_end_idx_offset;
++	__le32 sramlog_buf_maxlen, loader_start_pa, coredump_offset;
++	__le32 coredump_dram_offset;
++};
++static_assert(sizeof(struct mtk_vcp_region_info) == 0x50);
++static_assert(offsetof(struct mtk_vcp_region_info, struct_size) == 0x1c);
++
++/* vcp_logger.c: end is a u32 write-index slot, not the buffer end. */
++struct mtk_vcp_logger_info {
++	__le32 dram, buf, start, end, len;
++};
++struct mtk_vcp_logger_message {
++	__le32 cmd;
++	struct mtk_vcp_logger_info info;
++};
++struct mtk_vcp_logger_header {
++	__le32 magic, size, enable, info_offset, buffer_offset, buffer_size;
++	__le32 read_pos, write_pos;
++};
++static_assert(sizeof(struct mtk_vcp_logger_message) == 24);
++static_assert(sizeof(struct mtk_vcp_logger_header) == 32);
++#define MTK_VCP_LOGGER_RING_SIZE 0x100000
++
++static inline bool mtk_vcp_tcm_word_valid(u32 offset)
++{
++	return !(offset & 3) && offset <= MTK_VCP_TCM_SIZE - sizeof(u32);
++}
++
++static inline bool mtk_vcp_logger_valid(const struct mtk_vcp_logger_info *info,
++				      u32 loader_size)
++{
++	u32 buf = le32_to_cpu(info->buf), len = le32_to_cpu(info->len);
++	u32 end = le32_to_cpu(info->end);
++
++	return loader_size && loader_size <= MTK_VCP_TCM_SIZE &&
++		mtk_vcp_tcm_word_valid(le32_to_cpu(info->dram)) &&
++		le32_to_cpu(info->dram) >= loader_size &&
++		mtk_vcp_tcm_word_valid(le32_to_cpu(info->start)) &&
++		mtk_vcp_tcm_word_valid(end) && end >= loader_size &&
++		buf >= loader_size && buf < MTK_VCP_TCM_SIZE &&
++		len && len <= MTK_VCP_TCM_SIZE - buf;
++}
++
++/* Repeated identical INIT is idempotent; changed pointers are not accepted. */
++static inline bool mtk_vcp_logger_same(const struct mtk_vcp_logger_info *a,
++				     const struct mtk_vcp_logger_info *b)
++{
++	return a->dram == b->dram && a->buf == b->buf && a->start == b->start &&
++		a->end == b->end && a->len == b->len;
++}
++
++struct mtk_vcp_pin {
++	u8 mailbox, word, bit, words, channel;
++};
++struct mtk_vcp_platform {
++	u32 region_size;
++	u64 code_start, code_end;
++	struct mtk_vcp_pin dec_tx, dec_rx, enc_tx, enc_rx, ready0, ready1, logger_tx, logger_rx;
++	u32 reserved_sizes[10];
++};
++
++/* Pin offsets follow the vendor 64-bit mailbox allocator: all TX pins,
++ * then RX pins, each rounded up to two words. These are word offsets,
++ * never byte offsets. READY channel IDs alone do not identify a pin.
++ */
++static const struct mtk_vcp_platform mt6897_vcp_platform = {
++	.region_size = 0x50,
++	.code_start = 0x106000000ULL,
++	.code_end = 0x108000000ULL,
++	.dec_tx = { 0, 0, 0, 18, 0 },
++	.dec_rx = { 0, 18, 9, 18, 1 },
++	.enc_tx = { 2, 0, 0, 18, 16 },
++	.enc_rx = { 2, 22, 11, 18, 17 },
++	.ready0 = { 1, 26, 13, 1, 5 },
++	.ready1 = { 3, 30, 15, 1, 26 },
++	.logger_tx = { 3, 4, 2, 6, 22 },
++	.logger_rx = { 3, 24, 12, 6, 25 },
++	.reserved_sizes = {
++		0x78000, 0x12000, 0x180000, 0x400, 0x400,
++		0x400, 0x400, 0x100000, 0x1000, 0x1000,
++	},
++};
++
++static inline u64 mtk_vcp_unpack_iova(u32 packed)
++{
++	return (packed & ~0xfULL) | ((u64)(packed & 0xf) << 32);
++}
++
++static inline bool mtk_vcp_range_valid(u32 packed, u32 size, u64 lower, u64 upper)
++{
++	u64 start = mtk_vcp_unpack_iova(packed);
++
++	return lower < upper && size && start >= lower && start < upper &&
++	       size <= upper - start;
++}
++
++/* Call only on a CPU snapshot copied while the SRAM domain is powered.
++ * The caller supplies a separately verified IOVA aperture. The metadata
++ * cannot enlarge its own permitted address window. No reserved RAM is read.
++ */
++static inline int mtk_vcp_validate_region(const struct mtk_vcp_region_info *info,
++					size_t bytes, u32 expected_size,
++					u64 lower, u64 upper)
++{
++	u32 size;
++
++	if (expected_size != 0x38 && expected_size != 0x50)
++		return -EPROTONOSUPPORT;
++	if (bytes < expected_size)
++		return -EMSGSIZE;
++	size = le32_to_cpu(info->struct_size);
++	if (size != expected_size ||
++	    le32_to_cpu(info->loader_size) != MTK_VCP_LOADER_SIZE)
++		return -EPROTO;
++	if (!mtk_vcp_range_valid(le32_to_cpu(info->loader_start),
++				le32_to_cpu(info->loader_size), lower, upper) ||
++	    !mtk_vcp_range_valid(le32_to_cpu(info->firmware_start),
++				le32_to_cpu(info->firmware_size), lower, upper) ||
++	    !mtk_vcp_range_valid(le32_to_cpu(info->dram_start),
++				le32_to_cpu(info->dram_size), lower, upper) ||
++	    !mtk_vcp_range_valid(le32_to_cpu(info->dram_backup_start),
++				le32_to_cpu(info->dram_size), lower, upper))
++		return -ERANGE;
++	return 0;
++}
++/* Vendor hypervisor IOVA_TO_PHYS result, one NS/protected 32-bit half.
++ * Preserve the 35-bit physical address before shifting into the high word.
++ */
++static inline u64 mtk_vcp_shadow_pa(u32 value)
++{
++	return ((u64)(value & 7) << 32) | (value & 0xfffff000U);
++}
++#endif
+diff --git a/drivers/soc/mediatek/mtk-vcp.c b/drivers/soc/mediatek/mtk-vcp.c
+new file mode 100644
+index 0000000000..61f15ba396
+--- /dev/null
++++ b/drivers/soc/mediatek/mtk-vcp.c
+@@ -0,0 +1,1503 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Bootloader-owned MediaTek VCP transport.
++ *
++ * Register and clock ordering from MediaTek vcp_helper.c, MiCode
++ * MTK_kernel_device_modules 3c4ccd07d5624879555ec710c11bb8818e5cb5c6.
++ * Mailbox and coherent-memory helpers adapted from Silvia's MT6895 VCP
++ * driver, https://github.com/MT6895-Mainline/linux/commit/f1c0c8245d163fece46699612b8322d11e26348d
++ * Local changes: bootloader-owned lifecycle outside remoteproc, exclusive
++ * sessions, MT6897 mailbox/ABI, explicit two-domain PM, retained failure state.
++ * Inspection never releases reset or replaces firmware.
++ */
++#include <linux/arm-smccc.h>
++#include <linux/clk.h>
++#include <linux/completion.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <linux/iommu.h>
++#include <linux/iopoll.h>
++#include <linux/remoteproc/mtk_vcp.h>
++#include <linux/soc/mediatek/mtk_sip_svc.h>
++#include <linux/device.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/pm_domain.h>
++#include <linux/slab.h>
++#include <linux/sizes.h>
++#include <linux/sched/clock.h>
++
++#include "mtk-vcp-platform.h"
++#include "../../media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_mt6897_abi.h"
++
++#define VCP_CONTROL             MTK_SIP_SMC_CMD(0x52c)
++#define VCP_DAPC_CONTROL        MTK_SIP_SMC_CMD(0x52e)
++#define VCP_RESET_SET           2
++#define VCP_RESET_RELEASE       3
++#define VCP_TCM_SIZE            0x40000
++#define VCP_LOADER_SIZE         0x2000
++#define VCP_REGION_OFFSET       4
++#define VCP_REGION_SIZE         0x38
++#define VCP_MBOX_COUNT          5
++#define VCP_MBOX_SET            0x100
++#define VCP_MBOX_CLR            0x10c
++#define VCP_GIPC_SET            0x98
++#define VCP_SPM_CLR             0x94
++#define VCP_CORE_WDT            0x30
++#define VCP_CORE_SHM_ADDR       0x44
++#define VCP_CORE_SHM_SIZE       0x48
++#define VCP_CORE_REBOOT         0x54
++#define VCP_CORE_STATUS         0x70
++#define VCP_SHM_BASE MTK_VCP_SW_IOVA_START
++#define VCP_SHM_END MTK_VCP_SW_IOVA_END
++#define VCP_ENC_MEM_ALLOC 0x3003
++#define VCP_ENC_MEM_ALLOC_DONE 0x4003
++#define VCP_DEC_MEM_ALLOC 0xc005
++#define VCP_DEC_MEM_ALLOC_DONE 0xd005
++#define VCP_MEM_SHARED 6
++#define VCPDBG(fmt, ...) dev_dbg(vcp->dev, fmt, ##__VA_ARGS__)
++
++struct vcp_message {
++	__le32 id, len;
++	u8 data[MTK_VCP_IPI_MAX_PAYLOAD];
++};
++static_assert(sizeof(struct vcp_message) == 72);
++struct vcp_mbox {
++	struct mtk_vcp *vcp;
++	void __iomem *base;
++	unsigned int index;
++	int irq;
++	bool fault_disabled;
++};
++enum vcp_state { VCP_COLD, VCP_STARTING, VCP_RUNNING, VCP_STOPPING, VCP_PINNED };
++
++
++struct mtk_vcp {
++	struct device *dev;
++	const struct mtk_vcp_platform *platform;
++	void __iomem *sram, *cfg, *core;
++	struct vcp_mbox mbox[VCP_MBOX_COUNT];
++	struct mtk_vcp_mem mem[MTK_VCP_MEM_COUNT], codec_mem;
++	phys_addr_t code_pa_start, code_pa_end;
++	bool metadata_pinned;
++	struct completion ready, logger_ready;
++	struct mtk_vcp_logger_info logger_info;
++	bool logger_initialized;
++	/* Lock order: lifecycle lock, send_lock. IRQ callbacks use handler_lock
++	 * and may send; they must never acquire the lifecycle lock.
++	 */
++	struct mutex send_lock, handler_lock;
++	mtk_vcp_ipi_handler_t handler[MTK_VCP_CODEC_COUNT];
++	void *handler_priv[MTK_VCP_CODEC_COUNT];
++	const void *owner;
++	enum vcp_state state;
++	dma_addr_t shm_lower, shm_upper;
++	int wdt_irq, reserved_irq, boot_error;
++	int last_halt_error, trial_start, trial_stop;
++	unsigned long ready_seen;
++	bool powered, tx_enabled, reset_confirmed, security_enabled, irqs_enabled;
++	bool transport_available, wdt_fault_disabled, reserved_fault_disabled;
++	struct clk_bulk_data clocks[3];
++	struct dev_pm_domain_list *domains;
++	struct device *smi[2];
++	bool smi_active[2];
++	struct mutex lock;
++	int power_error;
++	struct mtk_vcp_region_info metadata;
++	bool metadata_valid;
++};
++
++/* The vendor reads this metadata before the first secure reset, while the
++ * bootloader-owned SRAM image is accessible. Never read protected DRAM or
++ * follow any address contained in the snapshot.
++ */
++static int mtk_vcp_snapshot(struct mtk_vcp *vcp, struct mtk_vcp_region_info *info)
++{
++	int ret, power_ret;
++
++	if (vcp->power_error)
++		return vcp->power_error;
++	ret = pm_runtime_resume_and_get(vcp->domains->pd_devs[0]);
++	if (ret < 0)
++		return ret;
++	ret = clk_bulk_prepare_enable(ARRAY_SIZE(vcp->clocks), vcp->clocks);
++	if (ret)
++		goto infra_off;
++	ret = pm_runtime_resume_and_get(vcp->domains->pd_devs[1]);
++	if (ret < 0)
++		goto clocks_off;
++	memcpy_fromio(info, vcp->sram + MTK_VCP_REGION_OFFSET, sizeof(*info));
++	power_ret = pm_runtime_put_sync(vcp->domains->pd_devs[1]);
++	if (power_ret < 0) {
++		/* Restore our ownership reference, retaining clocks and MM_INFRA
++		 * until reboot rather than retrying an uncertain power transition.
++		 */
++		pm_runtime_get_noresume(vcp->domains->pd_devs[1]);
++		ret = power_ret;
++		goto pinned;
++	}
++	ret = 0;
++clocks_off:
++	clk_bulk_disable_unprepare(ARRAY_SIZE(vcp->clocks), vcp->clocks);
++infra_off:
++	power_ret = pm_runtime_put_sync(vcp->domains->pd_devs[0]);
++	if (power_ret < 0) {
++		pm_runtime_get_noresume(vcp->domains->pd_devs[0]);
++		ret = power_ret;
++		goto pinned;
++	}
++	return ret;
++pinned:
++	vcp->power_error = ret;
++	__module_get(THIS_MODULE);
++	dev_err(vcp->dev,
++		"power release failed (%d); retain resources until reboot\n", ret);
++	return ret;
++}
++
++/* The secure reset can close SRAM access. Cache the validated bootloader
++ * snapshot before any lifecycle operation; never re-read it behind a reset.
++ */
++static int mtk_vcp_metadata(struct mtk_vcp *vcp, struct mtk_vcp_region_info *info)
++{
++	int ret;
++
++	if (vcp->metadata_valid) {
++		*info = vcp->metadata;
++		return 0;
++	}
++	ret = mtk_vcp_snapshot(vcp, info);
++	if (ret)
++		return ret;
++	ret = mtk_vcp_validate_region(info, sizeof(*info),
++				      vcp->platform->region_size,
++				      vcp->platform->code_start,
++				      vcp->platform->code_end);
++	if (ret)
++		return ret;
++	vcp->metadata = *info;
++	vcp->metadata_valid = true;
++	return 0;
++}
++
++static ssize_t metadata_show(struct device *dev, struct device_attribute *attr,
++			     char *buf)
++{
++	struct mtk_vcp *vcp = dev_get_drvdata(dev);
++	struct mtk_vcp_region_info info;
++	int ret;
++
++	mutex_lock(&vcp->lock);
++	ret = mtk_vcp_metadata(vcp, &info);
++	mutex_unlock(&vcp->lock);
++	if (ret)
++		return ret;
++	return sysfs_emit(buf,
++		"region_size=%#x\nloader=%#x size=%#x\nfirmware=%#x size=%#x\n"
++		"dram=%#x size=%#x backup=%#x\nloader_pa=%#x\n",
++		le32_to_cpu(info.struct_size), le32_to_cpu(info.loader_start),
++		le32_to_cpu(info.loader_size), le32_to_cpu(info.firmware_start),
++		le32_to_cpu(info.firmware_size), le32_to_cpu(info.dram_start),
++		le32_to_cpu(info.dram_size), le32_to_cpu(info.dram_backup_start),
++		le32_to_cpu(info.loader_start_pa));
++}
++static DEVICE_ATTR_ADMIN_RO(metadata);
++
++/* Read-only GenieZone shadow-table query, from vendor mtk_iommu.c
++ * mtee_iova_to_phys(), MiCode 3c4ccd07. Arguments are IOVA low/high and
++ * table ID 0; this neither installs mappings nor reads the pointed-to RAM.
++ */
++#define MTK_VCP_IOVA_TO_PHYS 0xbb00ffa6
++static ssize_t code_mappings_show(struct device *dev,
++				 struct device_attribute *attr, char *buf)
++{
++	struct mtk_vcp *vcp = dev_get_drvdata(dev);
++	struct mtk_vcp_region_info info;
++	struct arm_smccc_res res;
++	u64 start[4], size[4], iova, raw;
++	ssize_t written = 0;
++	unsigned int region, edge;
++	int ret;
++
++	mutex_lock(&vcp->lock);
++	ret = mtk_vcp_metadata(vcp, &info);
++	if (ret) {
++		written = ret;
++		goto out;
++	}
++	start[0] = mtk_vcp_unpack_iova(le32_to_cpu(info.loader_start));
++	start[1] = mtk_vcp_unpack_iova(le32_to_cpu(info.firmware_start));
++	start[2] = mtk_vcp_unpack_iova(le32_to_cpu(info.dram_start));
++	start[3] = mtk_vcp_unpack_iova(le32_to_cpu(info.dram_backup_start));
++	size[0] = le32_to_cpu(info.loader_size);
++	size[1] = le32_to_cpu(info.firmware_size);
++	size[2] = size[3] = le32_to_cpu(info.dram_size);
++	for (region = 0; region < 4; region++) {
++		for (edge = 0; edge < 2; edge++) {
++			u32 ns, protected;
++
++			/* Exactly eight validated first/last-page queries. */
++			iova = (start[region] + (edge ? size[region] - 1 : 0)) & ~0xfffULL;
++			arm_smccc_smc(MTK_VCP_IOVA_TO_PHYS, lower_32_bits(iova),
++				      upper_32_bits(iova), 0, 0, 0, 0, 0, &res);
++			raw = res.a0;
++			if ((long)res.a0 == SMCCC_RET_NOT_SUPPORTED ||
++			    raw == 0xffffffffULL) {
++				dev_err(dev, "shadow query unsupported: iova=%#llx raw=%#llx\n",
++					iova, raw);
++				written = -EOPNOTSUPP;
++				goto out;
++			}
++			ns = lower_32_bits(raw);
++			protected = upper_32_bits(raw);
++			written += sysfs_emit_at(buf, written,
++				"region=%u edge=%u iova=%#llx raw=%#llx "
++				"ns_pa=%#llx ns_type=%u ns_level=%u ns_sr=%u "
++				"prot_pa=%#llx prot_type=%u prot_level=%u prot_sr=%u\n",
++				region, edge, iova, raw, mtk_vcp_shadow_pa(ns),
++				(ns >> 8) & 3, (ns >> 10) & 3, (ns >> 3) & 31,
++				mtk_vcp_shadow_pa(protected), (protected >> 8) & 3,
++				(protected >> 10) & 3, (protected >> 3) & 31);
++		}
++	}
++out:
++	mutex_unlock(&vcp->lock);
++	return written;
++}
++static DEVICE_ATTR_ADMIN_RO(code_mappings);
++
++static ssize_t ready_trial_store(struct device *dev,
++	struct device_attribute *attr, const char *buf, size_t count);
++static DEVICE_ATTR(ready_trial, 0200, NULL, ready_trial_store);
++static ssize_t trial_result_show(struct device *dev,
++	struct device_attribute *attr, char *buf)
++{
++	struct mtk_vcp *vcp = dev_get_drvdata(dev);
++	ssize_t ret;
++
++	mutex_lock(&vcp->lock);
++	ret = sysfs_emit(buf, "start=%d stop=%d halt=%d state=%u ready_mask=%#lx\n",
++		vcp->trial_start, vcp->trial_stop, vcp->last_halt_error,
++		vcp->state, READ_ONCE(vcp->ready_seen));
++	mutex_unlock(&vcp->lock);
++	return ret;
++}
++static DEVICE_ATTR_ADMIN_RO(trial_result);
++
++static struct attribute *mtk_vcp_attrs[] = {
++	&dev_attr_ready_trial.attr,
++	&dev_attr_trial_result.attr,
++	&dev_attr_metadata.attr,
++	&dev_attr_code_mappings.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(mtk_vcp);
++
++static u32 vcp_pack_iova(dma_addr_t addr)
++{
++	return lower_32_bits(addr) | (upper_32_bits(addr) & 0xf);
++}
++
++static int vcp_smc(struct mtk_vcp *vcp, u32 function, u32 op, u32 arg)
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(function, op, arg, 0, 0, 0, 0, 0, &res);
++	VCPDBG("smc: function=%#x op=%u arg=%u -> %ld\n", function, op, arg,
++	       (long)res.a0);
++	if ((long)res.a0) {
++		dev_err(vcp->dev, "secure call %#x/%u failed: %ld\n",
++			function, op, (long)res.a0);
++		return -EIO;
++	}
++	return 0;
++}
++
++static void vcp_fault(struct mtk_vcp *vcp, int error);
++
++#define VCP_LOGGER_INIT 0x4c4f4701
++#define VCP_LOGGER_WAKEUP 0x4c4f4703
++
++/* MiCode vcp_logger.c init handler: publish the logger IOVA immediately.
++ * Do not send INIT from this mailbox thread: READY shares mailbox 3.
++ * Logging stays disabled; no ENABLE request or log consumer is installed.
++ */
++static void vcp_logger_receive(struct mtk_vcp *vcp, const void *payload)
++{
++	const struct mtk_vcp_logger_message *msg = payload;
++	const struct mtk_vcp_logger_info *info = &msg->info;
++	struct arm_smccc_res res;
++	u32 cmd = le32_to_cpu(msg->cmd);
++
++	if (cmd == VCP_LOGGER_WAKEUP)
++		return;
++	if (cmd != VCP_LOGGER_INIT ||
++	    !mtk_vcp_logger_valid(info, le32_to_cpu(vcp->metadata.loader_size)))
++		goto invalid;
++	if (vcp->logger_initialized) {
++		if (!mtk_vcp_logger_same(info, &vcp->logger_info))
++			goto invalid;
++		return;
++	}
++	arm_smccc_smc(VCP_CONTROL, 4, le32_to_cpu(info->buf),
++		      le32_to_cpu(info->end), le32_to_cpu(info->len), 0, 0, 0, &res);
++	if (res.a0) {
++		dev_err(vcp->dev, "logger SRAM setup failed: raw=%#lx/%#lx/%#lx/%#lx\n",
++			res.a0, res.a1, res.a2, res.a3);
++		vcp_fault(vcp, -EIO);
++		return;
++	}
++	writel(vcp_pack_iova(vcp->mem[2].dma), vcp->sram + le32_to_cpu(info->dram));
++	vcp->logger_info = *info;
++	WRITE_ONCE(vcp->logger_initialized, true);
++	dev_info(vcp->dev, "logger bootstrap: dram=%#x buf=%#x start=%#x end=%#x size=%#x\n",
++		le32_to_cpu(info->dram), le32_to_cpu(info->buf),
++		le32_to_cpu(info->start), le32_to_cpu(info->end), le32_to_cpu(info->len));
++	complete(&vcp->logger_ready);
++	return;
++invalid:
++	dev_err(vcp->dev, "invalid logger request cmd=%#x dram=%#x buf=%#x start=%#x end=%#x size=%#x\n",
++		cmd, le32_to_cpu(info->dram), le32_to_cpu(info->buf),
++		le32_to_cpu(info->start), le32_to_cpu(info->end), le32_to_cpu(info->len));
++	vcp_fault(vcp, -EPROTO);
++}
++
++/* Startup owns the lifecycle lock and sends only after READY. Both polls
++ * share the original four-second startup deadline; no work survives stop.
++ */
++static unsigned long vcp_startup_remaining(unsigned long deadline)
++{
++	long remaining = deadline - jiffies;
++
++	return remaining > 0 ? remaining : 0;
++}
++
++static int vcp_logger_notify(struct mtk_vcp *vcp, unsigned long deadline)
++{
++	const struct mtk_vcp_pin *pin = &vcp->platform->logger_tx;
++	void __iomem *base = vcp->mbox[pin->mailbox].base;
++	__le32 msg[6] = {};
++	u64 now = local_clock();
++	unsigned long remaining;
++	u32 status;
++	int ret;
++
++	msg[0] = cpu_to_le32(VCP_LOGGER_INIT);
++	msg[1] = cpu_to_le32(vcp_pack_iova(vcp->mem[2].dma));
++	msg[2] = cpu_to_le32(vcp->mem[2].size);
++	msg[3] = cpu_to_le32(upper_32_bits(now));
++	msg[4] = cpu_to_le32(lower_32_bits(now));
++	mutex_lock(&vcp->send_lock);
++	if (!vcp->tx_enabled) {
++		ret = -EHOSTDOWN;
++		goto out;
++	}
++	remaining = vcp_startup_remaining(deadline);
++	if (!remaining) {
++		ret = -ETIMEDOUT;
++		goto out;
++	}
++	ret = readl_poll_timeout(base + VCP_MBOX_SET, status,
++				!(status & BIT(pin->bit)), 50,
++				min_t(unsigned long, 100000, jiffies_to_usecs(remaining)));
++	if (ret)
++		goto out;
++	memcpy_toio(base + pin->word * sizeof(u32), msg, sizeof(msg));
++	wmb();
++	writel(BIT(pin->bit), base + VCP_MBOX_SET);
++	remaining = vcp_startup_remaining(deadline);
++	if (!remaining) {
++		ret = -ETIMEDOUT;
++		goto out;
++	}
++	ret = readl_poll_timeout(base + VCP_MBOX_SET, status,
++				!(status & BIT(pin->bit)), 50,
++				min_t(unsigned long, 100000, jiffies_to_usecs(remaining)));
++out:
++	mutex_unlock(&vcp->send_lock);
++	dev_info(vcp->dev, "logger INIT notification result %d\n", ret);
++	return ret;
++}
++
++/* MT6897 registers the same vendor handler for both READY channels. */
++static void vcp_ready(struct mtk_vcp *vcp, u32 size, bool ready1)
++{
++	VCPDBG("ready: ready1=%d tcm=%u\n", ready1, size);
++	if (size != VCP_TCM_SIZE) {
++		VCPDBG("ready: unexpected TCM size %u\n", size);
++		vcp_fault(vcp, -EPROTO);
++		return;
++	}
++	if (READ_ONCE(vcp->boot_error))
++		return;
++	if (!test_and_set_bit(ready1 + 1, &vcp->ready_seen))
++		dev_info(vcp->dev, "READY_%u received, TCM %#x\n", ready1, size);
++	if (test_and_set_bit(0, &vcp->ready_seen))
++		return;
++	writel(0xff, vcp->cfg + VCP_SPM_CLR);
++	VCPDBG("ready: firmware is up\n");
++	complete(&vcp->ready);
++}
++
++/* Shared bootstrap handling is source-defined before any codec instance.
++ * Only SHM type 6 is serviced here; other allocations belong to the decoder.
++ */
++static bool vcp_codec_shm_request(struct mtk_vcp *vcp, unsigned int codec,
++				const struct vcp_message *msg, u32 len)
++{
++	union { struct mt6897_venc_boot_mem enc; struct mt6897_vdec_mem_op dec; } reply;
++	bool enc = codec == MTK_VCP_ENCODER;
++	u32 id, type;
++	unsigned int sid = enc ? MTK_VCP_MEM_VENC : MTK_VCP_MEM_VDEC;
++	unsigned int pid = enc ? MTK_VCP_MEM_VENC_PROP : MTK_VCP_MEM_VDEC_PROP;
++	unsigned int lid = enc ? MTK_VCP_MEM_VENC_LOG : MTK_VCP_MEM_VDEC_LOG;
++	struct mtk_vcp_mem *mem = &vcp->mem[sid];
++	int ret;
++
++	memcpy(&id, msg->data, sizeof(id));
++	if (le32_to_cpu(id) != (enc ? VCP_ENC_MEM_ALLOC : VCP_DEC_MEM_ALLOC))
++		return false;
++	if (len != sizeof(reply))
++		goto invalid;
++	memcpy(&reply, msg->data, sizeof(reply));
++	type = le32_to_cpu(enc ? reply.enc.type : reply.dec.type);
++	if (type != VCP_MEM_SHARED)
++		return false;
++	if (enc) {
++		mt6897_venc_shm_reply(&reply.enc, mem->size, mem->dma,
++			(uintptr_t)mem->cpu, vcp_pack_iova(vcp->mem[pid].dma),
++			vcp_pack_iova(vcp->mem[lid].dma));
++	} else {
++		reply.dec.id = cpu_to_le32(VCP_DEC_MEM_ALLOC_DONE);
++		reply.dec.status = reply.dec.reserved = 0;
++		reply.dec.size = cpu_to_le32(mem->size);
++		reply.dec.iova = reply.dec.pa = cpu_to_le64(mem->dma);
++		reply.dec.va = cpu_to_le64((uintptr_t)mem->cpu);
++		reply.dec.vcp_addr[0] = cpu_to_le32(vcp_pack_iova(vcp->mem[pid].dma));
++		reply.dec.vcp_addr[1] = cpu_to_le32(vcp_pack_iova(vcp->mem[lid].dma));
++	}
++	ret = mtk_vcp_ipi_send(vcp, codec, &reply, sizeof(reply));
++	if (!ret)
++		return true;
++	vcp_fault(vcp, ret);
++	return true;
++invalid:
++	vcp_fault(vcp, -EPROTO);
++	return true;
++}
++
++static void vcp_codec_receive(struct mtk_vcp *vcp, unsigned int codec,
++			      const void *data)
++{
++	const struct vcp_message *msg = data;
++	u32 len = le32_to_cpu(msg->len);
++	u32 service = le32_to_cpu(msg->id);
++
++	VCPDBG("recv: codec%u service=%u len=%u\n", codec, service, len);
++	if ((codec == MTK_VCP_ENCODER ? service != 3 :
++	     (service != 1 && service != 2)) || len < sizeof(u32) ||
++	    len > sizeof(msg->data)) {
++		dev_warn_ratelimited(vcp->dev, "invalid codec%u message %u/%u\n",
++				     codec, le32_to_cpu(msg->id), len);
++		vcp_fault(vcp, -EPROTO);
++		return;
++	}
++	if (vcp_codec_shm_request(vcp, codec, msg, len))
++		return;
++	mutex_lock(&vcp->handler_lock);
++	if (vcp->handler[codec])
++		vcp->handler[codec](vcp->handler_priv[codec], msg->data, len);
++	else {
++		VCPDBG("recv: codec%u has no registered handler\n", codec);
++		dev_warn_ratelimited(vcp->dev,
++				     "codec%u request has no protocol handler\n", codec);
++		vcp_fault(vcp, -EPROTO);
++	}
++	mutex_unlock(&vcp->handler_lock);
++}
++
++static void vcp_fault(struct mtk_vcp *vcp, int error)
++{
++	WRITE_ONCE(vcp->boot_error, error);
++	mutex_lock(&vcp->send_lock);
++	vcp->tx_enabled = false;
++	mutex_unlock(&vcp->send_lock);
++	complete(&vcp->ready);
++	complete(&vcp->logger_ready);
++}
++
++static irqreturn_t vcp_mbox_irq(int irq, void *priv)
++{
++	struct vcp_mbox *mbox = priv;
++	struct mtk_vcp *vcp = mbox->vcp;
++	const struct mtk_vcp_pin *pins[] = { &vcp->platform->dec_rx,
++		&vcp->platform->enc_rx, &vcp->platform->ready0, &vcp->platform->ready1,
++		&vcp->platform->logger_rx };
++	u32 words[64], status, handled = 0;
++	unsigned int i;
++
++	status = readl(mbox->base + VCP_MBOX_CLR);
++	if (!status)
++		return IRQ_NONE;
++	__ioread32_copy(words, mbox->base, ARRAY_SIZE(words));
++	for (i = 0; i < ARRAY_SIZE(pins); i++) {
++		const struct mtk_vcp_pin *p = pins[i];
++
++		if (p->mailbox != mbox->index || !(status & BIT(p->bit)))
++			continue;
++		handled |= BIT(p->bit);
++	}
++	/* Acknowledge only understood snapshots. Unknown pins are retained and
++	 * this IRQ disabled, preventing both invented replies and IRQ storms.
++	 */
++	writel(handled, mbox->base + VCP_MBOX_CLR);
++	if (status & ~handled) {
++		dev_err(vcp->dev, "unexpected mailbox%u pins %#x; stop transport\n",
++			mbox->index, status & ~handled);
++		disable_irq_nosync(irq);
++		mbox->fault_disabled = true;
++		vcp_fault(vcp, -EPROTO);
++		return IRQ_HANDLED;
++	}
++	for (i = 0; i < ARRAY_SIZE(pins); i++) {
++		const struct mtk_vcp_pin *p = pins[i];
++
++		if (p->mailbox != mbox->index || !(handled & BIT(p->bit)))
++			continue;
++		if (i < 2)
++			vcp_codec_receive(vcp, i, &words[p->word]);
++		else if (i == 4)
++			vcp_logger_receive(vcp, &words[p->word]);
++		else
++			vcp_ready(vcp, le32_to_cpu((__force __le32)words[p->word]), i == 3);
++	}
++	return IRQ_HANDLED;
++}
++
++/* Both harts must finish their interrupt sequence before clearing WDT.
++ * This IRQ never performs shutdown or disables its own IRQ synchronously.
++ */
++static int vcp_wait_harts(struct mtk_vcp *vcp)
++{
++	u32 a, b;
++	return read_poll_timeout(readl, a,
++		(a == 0x34 && (b = readl(vcp->core + 0x58)) == 0x34),
++		10, 200000, false, vcp->core + VCP_CORE_REBOOT);
++}
++
++static irqreturn_t vcp_wdt_irq(int irq, void *priv)
++{
++	struct mtk_vcp *vcp = priv;
++
++	if (!(readl(vcp->core + VCP_CORE_WDT) & BIT(0)))
++		return IRQ_NONE;
++	if (!vcp_wait_harts(vcp)) {
++		udelay(10);
++		writel(BIT(0), vcp->core + VCP_CORE_WDT);
++	} else {
++		disable_irq_nosync(irq);
++		vcp->wdt_fault_disabled = true;
++		dev_err(vcp->dev, "watchdog two-hart handshake timed out\n");
++	}
++	vcp_fault(vcp, -EIO);
++	return IRQ_HANDLED;
++}
++
++/* Vendor IRQ 858 is a generic exception notification, even with WDT=0.
++ * There is no source-defined independent acknowledgement register. Keep it
++ * masked and fail the active transport; process shutdown owns secure reset.
++ */
++static irqreturn_t vcp_reserved_irq(int irq, void *priv)
++{
++	struct mtk_vcp *vcp = priv;
++
++	disable_irq_nosync(irq);
++	vcp->reserved_fault_disabled = true;
++	dev_err(vcp->dev, "reserved VCP exception IRQ\n");
++	vcp_fault(vcp, -EIO);
++	return IRQ_HANDLED;
++}
++
++static void vcp_disable_irqs(struct mtk_vcp *vcp)
++{
++	int i;
++
++	if (!vcp->irqs_enabled)
++		return;
++	for (i = 0; i < VCP_MBOX_COUNT; i++) {
++		/* disable_irq waits for the thread. Balance any additional
++		 * self-disable only afterwards, avoiding a race with its fault path.
++		 */
++		disable_irq(vcp->mbox[i].irq);
++		if (vcp->mbox[i].fault_disabled)
++			enable_irq(vcp->mbox[i].irq);
++		vcp->mbox[i].fault_disabled = false;
++	}
++	disable_irq(vcp->wdt_irq);
++	if (vcp->wdt_fault_disabled)
++		enable_irq(vcp->wdt_irq);
++	vcp->wdt_fault_disabled = false;
++	disable_irq(vcp->reserved_irq);
++	if (vcp->reserved_fault_disabled)
++		enable_irq(vcp->reserved_irq);
++	vcp->reserved_fault_disabled = false;
++	vcp->irqs_enabled = false;
++}
++
++static void vcp_free_memory(struct mtk_vcp *vcp)
++{
++	int i;
++
++	for (i = MTK_VCP_MEM_COUNT - 1; i >= 3; i--) {
++		struct mtk_vcp_mem *mem = &vcp->mem[i];
++
++		if (mem->cpu)
++			dma_free_coherent(vcp->dev, mem->size, mem->cpu, mem->dma);
++		mem->cpu = NULL;
++	}
++	if (vcp->codec_mem.cpu)
++		dma_free_coherent(vcp->dev, vcp->codec_mem.size,
++			vcp->codec_mem.cpu, vcp->codec_mem.dma);
++	memset(&vcp->codec_mem, 0, sizeof(vcp->codec_mem));
++	memset(vcp->mem, 0, sizeof(vcp->mem));
++}
++
++static int vcp_alloc_memory(struct mtk_vcp *vcp)
++{
++	size_t offset = 0;
++	unsigned int i;
++	int ret = -ENOMEM;
++
++	/* Vendor allocates VDEC + VENC + LOGGER as one contiguous buffer;
++	 * each public ID is a slice, not an independent DMA allocation.
++	 */
++	vcp->codec_mem.size = vcp->platform->reserved_sizes[0] +
++		vcp->platform->reserved_sizes[1] + vcp->platform->reserved_sizes[2];
++	vcp->codec_mem.cpu = dma_alloc_coherent(vcp->dev, vcp->codec_mem.size,
++		&vcp->codec_mem.dma, GFP_KERNEL);
++	if (!vcp->codec_mem.cpu)
++		return -ENOMEM;
++	if (!mt6897_vcp_dma_valid(vcp->codec_mem.dma, vcp->codec_mem.size)) {
++		ret = -ERANGE;
++		goto fail;
++	}
++	memset(vcp->codec_mem.cpu, 0, vcp->codec_mem.size);
++	vcp->shm_lower = vcp->codec_mem.dma;
++	vcp->shm_upper = vcp->shm_lower + vcp->codec_mem.size;
++	for (i = 0; i < MTK_VCP_MEM_COUNT; i++) {
++		struct mtk_vcp_mem *mem = &vcp->mem[i];
++
++		mem->size = vcp->platform->reserved_sizes[i];
++		if (i < 3) {
++			mem->cpu = vcp->codec_mem.cpu + offset;
++			mem->dma = vcp->codec_mem.dma + offset;
++			offset += mem->size;
++			continue;
++		}
++		mem->cpu = dma_alloc_coherent(vcp->dev, mem->size, &mem->dma, GFP_KERNEL);
++		if (!mem->cpu)
++			goto fail;
++		if (!mt6897_vcp_dma_valid(mem->dma, mem->size)) {
++			ret = -ERANGE;
++			goto fail;
++		}
++		memset(mem->cpu, 0, mem->size);
++		vcp->shm_lower = min(vcp->shm_lower, mem->dma);
++		vcp->shm_upper = max(vcp->shm_upper, mem->dma + mem->size);
++	}
++	if ((vcp->shm_lower >> 28) != ((vcp->shm_upper - 1) >> 28)) {
++		ret = -ERANGE;
++		goto fail;
++	}
++	if (vcp->mem[2].size <= sizeof(struct mtk_vcp_logger_header) + MTK_VCP_LOGGER_RING_SIZE) {
++		ret = -ENOSPC;
++		goto fail;
++	}
++	*(struct mtk_vcp_logger_header *)vcp->mem[2].cpu =
++		(struct mtk_vcp_logger_header) {
++			.magic = cpu_to_le32(0x504c5402), .size = cpu_to_le32(24),
++			.info_offset = cpu_to_le32(24), .buffer_offset = cpu_to_le32(32),
++			.buffer_size = cpu_to_le32(MTK_VCP_LOGGER_RING_SIZE),
++		};
++	return 0;
++fail:
++	vcp_free_memory(vcp);
++	return ret;
++}
++
++/* Verify every code page through the secure oracle, without installing a
++ * Linux mapping or assuming that the returned descriptor covers neighbours.
++ * The metadata is bounded to the independent 32 MiB LK window first.
++ */
++static int vcp_verify_code(struct mtk_vcp *vcp)
++{
++	const struct mtk_vcp_region_info *r = &vcp->metadata;
++	u32 starts[] = { r->loader_start, r->firmware_start, r->dram_start,
++			r->dram_backup_start };
++	u32 sizes[] = { r->loader_size, r->firmware_size, r->dram_size, r->dram_size };
++	unsigned int i;
++	u64 loader = mtk_vcp_unpack_iova(le32_to_cpu(r->loader_start));
++
++	if (le32_to_cpu(r->loader_start_pa) != vcp->code_pa_start)
++		return -EPROTO;
++	for (i = 0; i < ARRAY_SIZE(starts); i++) {
++		u64 start = mtk_vcp_unpack_iova(le32_to_cpu(starts[i]));
++		u64 end = start + le32_to_cpu(sizes[i]);
++		u64 page;
++
++		for (page = round_down(start, 4096); page < end; page += 4096) {
++			struct arm_smccc_res res;
++			u32 prot;
++
++			arm_smccc_smc(MTK_VCP_IOVA_TO_PHYS, lower_32_bits(page),
++				upper_32_bits(page), 0, 0, 0, 0, 0, &res);
++			if (res.a0 == ~0UL || res.a0 == 0xffffffffUL)
++				return -EOPNOTSUPP;
++			prot = upper_32_bits(res.a0);
++			/* Only the observed MT6897 protected ABI is supported. Never
++			 * derive an extent from its type/level fields.
++			 */
++			if (((prot >> 8) & 3) != 2 || ((prot >> 10) & 3) != 1 ||
++			    mtk_vcp_shadow_pa(prot) < vcp->code_pa_start ||
++			    mtk_vcp_shadow_pa(prot) >= vcp->code_pa_end ||
++			    page < loader ||
++			    mtk_vcp_shadow_pa(prot) != vcp->code_pa_start + page - loader) {
++				dev_err(vcp->dev, "unverified code page %#llx, oracle %#lx\n",
++					page, res.a0);
++				return -EPROTO;
++			}
++			if (!i && page == round_down(start, 4096) &&
++			    mtk_vcp_shadow_pa(prot) != le32_to_cpu(r->loader_start_pa))
++				return -EPROTO;
++			cond_resched();
++		}
++	}
++	return 0;
++}
++
++static void vcp_pin(struct mtk_vcp *vcp, int error)
++{
++	vcp->state = VCP_PINNED;
++	vcp->power_error = error ?: -EIO;
++	dev_err(vcp->dev, "unconfirmed VCP shutdown; retain DMA and power until reboot\n");
++}
++
++static int vcp_smi_off(struct mtk_vcp *vcp)
++{
++	int i, ret;
++
++	for (i = ARRAY_SIZE(vcp->smi) - 1; i >= 0; i--) {
++		if (!vcp->smi_active[i])
++			continue;
++		ret = pm_runtime_put_sync(vcp->smi[i]);
++		if (ret < 0) {
++			pm_runtime_get_noresume(vcp->smi[i]);
++			if (!vcp->powered)
++				__module_get(THIS_MODULE);
++			vcp_pin(vcp, ret);
++			return ret;
++		}
++		vcp->smi_active[i] = false;
++	}
++	return 0;
++}
++
++static int vcp_power_on(struct mtk_vcp *vcp)
++{
++	int ret;
++	unsigned int i;
++
++	ret = pm_runtime_resume_and_get(vcp->domains->pd_devs[0]);
++	if (ret < 0)
++		return ret;
++	ret = clk_bulk_prepare_enable(ARRAY_SIZE(vcp->clocks), vcp->clocks);
++	if (ret)
++		goto infra;
++	for (i = 0; i < ARRAY_SIZE(vcp->smi); i++) {
++		ret = pm_runtime_resume_and_get(vcp->smi[i]);
++		if (ret < 0)
++			goto smi;
++		vcp->smi_active[i] = true;
++	}
++	ret = pm_runtime_resume_and_get(vcp->domains->pd_devs[1]);
++	if (ret < 0)
++		goto smi;
++	__module_get(THIS_MODULE);
++	vcp->powered = true;
++	return 0;
++smi:
++	if (vcp_smi_off(vcp))
++		return vcp->power_error;
++	clk_bulk_disable_unprepare(ARRAY_SIZE(vcp->clocks), vcp->clocks);
++infra:
++	if (pm_runtime_put_sync(vcp->domains->pd_devs[0]) < 0) {
++		pm_runtime_get_noresume(vcp->domains->pd_devs[0]);
++		__module_get(THIS_MODULE);
++		vcp_pin(vcp, -EIO);
++	}
++	return ret;
++}
++
++static int vcp_power_off(struct mtk_vcp *vcp)
++{
++	int ret;
++
++	ret = pm_runtime_put_sync(vcp->domains->pd_devs[1]);
++	if (ret < 0) {
++		pm_runtime_get_noresume(vcp->domains->pd_devs[1]);
++		goto pin;
++	}
++	ret = vcp_smi_off(vcp);
++	if (ret)
++		return ret;
++	clk_bulk_disable_unprepare(ARRAY_SIZE(vcp->clocks), vcp->clocks);
++	ret = pm_runtime_put_sync(vcp->domains->pd_devs[0]);
++	if (ret < 0) {
++		pm_runtime_get_noresume(vcp->domains->pd_devs[0]);
++		goto pin;
++	}
++	vcp->powered = false;
++	module_put(THIS_MODULE);
++	return 0;
++pin:
++	vcp_pin(vcp, ret);
++	return ret;
++}
++
++static int vcp_assert_reset(struct mtk_vcp *vcp, bool graceful)
++{
++	int ret;
++
++	ret = vcp_smc(vcp, VCP_CONTROL, VCP_RESET_SET, graceful);
++	if (ret)
++		return ret;
++	vcp->reset_confirmed = true;
++	/* Vendor barrier precedes removal of DAPC access restrictions. */
++	dsb(sy);
++	if (vcp->security_enabled) {
++		ret = vcp_smc(vcp, VCP_DAPC_CONTROL, 0, 0);
++		if (!ret)
++			vcp->security_enabled = false;
++	}
++	return ret;
++}
++
++/* Called under lifecycle lock, never from an IRQ handler. */
++static int vcp_stop_locked(struct mtk_vcp *vcp, bool graceful)
++{
++	u32 value;
++	int ret = 0;
++
++	vcp->state = VCP_STOPPING;
++	mutex_lock(&vcp->send_lock);
++	vcp->tx_enabled = false;
++	mutex_unlock(&vcp->send_lock);
++	vcp_disable_irqs(vcp);
++	if (graceful) {
++		writel(BIT(13), vcp->cfg + VCP_GIPC_SET);
++		ret = vcp_wait_harts(vcp);
++		if (!ret)
++			udelay(10);
++		if (!ret)
++			ret = readl_poll_timeout(vcp->core + VCP_CORE_STATUS,
++				value, value == 7, 1000, 500000);
++	}
++	vcp->last_halt_error = ret;
++	if (ret)
++		dev_warn(vcp->dev, "graceful halt failed (%d); attempt forced secure reset\n", ret);
++	ret = vcp_assert_reset(vcp, graceful && !ret);
++	if (ret || !vcp->reset_confirmed || vcp->security_enabled) {
++		vcp_pin(vcp, ret);
++		return ret ?: -EIO;
++	}
++	vcp_free_memory(vcp);
++	ret = vcp_power_off(vcp);
++	if (!ret)
++		vcp->state = VCP_COLD;
++	return ret ?: vcp->last_halt_error;
++}
++
++int mtk_vcp_boot(struct mtk_vcp *vcp)
++{
++	struct mtk_vcp_region_info info;
++	unsigned int i;
++	unsigned long deadline, remaining;
++	int ret, stop_ret;
++
++	mutex_lock(&vcp->lock);
++	if (!vcp->transport_available || !vcp->owner) {
++		ret = -ENODEV;
++		goto out;
++	}
++	if (vcp->state != VCP_COLD || vcp->power_error) {
++		ret = vcp->power_error ?: -EBUSY;
++		goto out;
++	}
++	ret = mtk_vcp_metadata(vcp, &info);
++	if (ret)
++		goto out;
++	ret = vcp_verify_code(vcp);
++	if (ret)
++		goto out;
++	ret = vcp_power_on(vcp);
++	if (ret)
++		goto out;
++	vcp->state = VCP_STARTING;
++	/* Nothing has been published to firmware yet. */
++	vcp->reset_confirmed = true;
++	ret = vcp_alloc_memory(vcp);
++	if (ret)
++		goto unpublished;
++	reinit_completion(&vcp->ready);
++	reinit_completion(&vcp->logger_ready);
++	vcp->logger_initialized = false;
++	WRITE_ONCE(vcp->ready_seen, 0);
++	WRITE_ONCE(vcp->boot_error, 0);
++	/* A failed secure call may have partially changed ownership. Treat
++	 * security as active before issuing it and require confirmed reset.
++	 */
++	if (!vcp->metadata_pinned) {
++		/* Reset can close live metadata access. Preserve this one validated
++		 * cache and provider instance until reboot, including clean stops.
++		 */
++		__module_get(THIS_MODULE);
++		vcp->metadata_pinned = true;
++	}
++	vcp->security_enabled = true;
++	vcp->reset_confirmed = false;
++	ret = vcp_smc(vcp, VCP_DAPC_CONTROL, 1, 0);
++	if (ret)
++		goto stop;
++	/* Non-AO MT6897 first enable preserves the LK-loaded processor state:
++	 * vendor reset_vcp(0) publishes SHM and releases without RESET_SET.
++	 * DAPC may already have changed ownership, so reset stays unconfirmed. */
++	writel(vcp_pack_iova(vcp->shm_lower), vcp->core + VCP_CORE_SHM_ADDR);
++	writel(vcp->shm_upper - vcp->shm_lower, vcp->core + VCP_CORE_SHM_SIZE);
++	/* Vendor reset_vcp(): resynchronize the mux after publishing SHM,
++	 * immediately before releasing the processor. */
++	ret = clk_set_parent(vcp->clocks[2].clk, vcp->clocks[0].clk);
++	if (!ret)
++		ret = clk_set_parent(vcp->clocks[2].clk, vcp->clocks[1].clk);
++	if (ret)
++		goto stop;
++	/* Stale unknown pins are evidence of another service owner, not safe
++	 * to clear. Before first release require every mailbox to be idle.
++	 */
++	for (i = 0; i < VCP_MBOX_COUNT; i++) {
++		if (readl(vcp->mbox[i].base + VCP_MBOX_CLR)) {
++			ret = -EBUSY;
++			goto stop;
++		}
++	}
++	mutex_lock(&vcp->send_lock);
++	vcp->tx_enabled = true;
++	mutex_unlock(&vcp->send_lock);
++	for (i = 0; i < VCP_MBOX_COUNT; i++)
++		enable_irq(vcp->mbox[i].irq);
++	enable_irq(vcp->wdt_irq);
++	enable_irq(vcp->reserved_irq);
++	vcp->irqs_enabled = true;
++	vcp->reset_confirmed = false;
++	dma_wmb();
++	ret = vcp_smc(vcp, VCP_CONTROL, VCP_RESET_RELEASE, 1);
++	if (ret)
++		goto stop;
++	deadline = jiffies + msecs_to_jiffies(4000);
++	ret = wait_for_completion_timeout(&vcp->ready, msecs_to_jiffies(4000)) ?
++		READ_ONCE(vcp->boot_error) : -ETIMEDOUT;
++	if (!ret && !READ_ONCE(vcp->logger_initialized)) {
++		remaining = vcp_startup_remaining(deadline);
++		if (!remaining ||
++		    !wait_for_completion_timeout(&vcp->logger_ready, remaining))
++			ret = -ETIMEDOUT;
++	}
++	if (!ret)
++		ret = READ_ONCE(vcp->boot_error) ?: vcp_logger_notify(vcp, deadline);
++	if (!ret)
++		ret = READ_ONCE(vcp->boot_error);
++	if (!ret) {
++		vcp->state = VCP_RUNNING;
++		goto out;
++	}
++stop:
++	/* Capture only source-defined registers while clocks/domains are held.
++	 * Cleanup reset destroys the evidence of execution and pending IRQs.
++	 */
++	dev_err(vcp->dev,
++		"boot snapshot: reset=%#x shm=%#x/%#x harts=%#x/%#x status=%#x error=%d\n",
++		readl(vcp->core), readl(vcp->core + VCP_CORE_SHM_ADDR),
++		readl(vcp->core + VCP_CORE_SHM_SIZE),
++		readl(vcp->core + VCP_CORE_REBOOT),
++		readl(vcp->core + VCP_CORE_REBOOT + 4),
++		readl(vcp->core + VCP_CORE_STATUS), ret);
++	/* Source-defined read-only monitor/status words from rv/vcp_reg.h.
++	 * Do not call vcp_dump_last_regs wholesale: its trace helper writes
++	 * debug selectors and consumes SRAM outside this bounded snapshot.
++	 */
++	for (i = 0; i < 4; i++) {
++		u32 pc0 = readl(vcp->core + 0x80), lr0 = readl(vcp->core + 0x84);
++		u32 sp0 = readl(vcp->core + 0x88), pc1 = readl(vcp->core + 0x160);
++		u32 lr1 = readl(vcp->core + 0x164), sp1 = readl(vcp->core + 0x168);
++
++		dev_err(vcp->dev, "boot monitor%u: hart0 PC/LR/SP=%#x/%#x/%#x hart1=%#x/%#x/%#x\n",
++			i, pc0, lr0, sp0, pc1, lr1, sp1);
++		if (i < 3)
++			udelay(100);
++	}
++	dev_err(vcp->dev, "boot latches: hart0=%#x/%#x/%#x hart1=%#x/%#x/%#x\n",
++		readl(vcp->core + 0xd0), readl(vcp->core + 0xd4),
++		readl(vcp->core + 0xd8), readl(vcp->core + 0x170),
++		readl(vcp->core + 0x174), readl(vcp->core + 0x178));
++	dev_err(vcp->dev, "boot requests: %#x/%#x/%#x/%#x\n",
++		readl(vcp->core + 0x20), readl(vcp->core + 0x24),
++		readl(vcp->core + 0x28), readl(vcp->core + 0x2c));
++	dev_err(vcp->dev, "boot CFG: %#x/%#x/%#x/%#x/%#x\n",
++		readl(vcp->cfg), readl(vcp->cfg + 8),
++		readl(vcp->cfg + 0x1b0), readl(vcp->cfg + 0x1b8),
++		readl(vcp->cfg + 0x1bc));
++	for (i = 0; i < VCP_MBOX_COUNT; i++)
++		dev_err(vcp->dev, "boot mailbox%u: set=%#x pending=%#x\n", i,
++			readl(vcp->mbox[i].base + VCP_MBOX_SET),
++			readl(vcp->mbox[i].base + VCP_MBOX_CLR));
++	stop_ret = vcp_stop_locked(vcp, false);
++	dev_err(vcp->dev, "startup failed (%d), cleanup result %d\n", ret, stop_ret);
++	ret = stop_ret ?: ret;
++	goto out;
++unpublished:
++	vcp_free_memory(vcp);
++	stop_ret = vcp_power_off(vcp);
++	if (!stop_ret)
++		vcp->state = VCP_COLD;
++	ret = stop_ret ?: ret;
++out:
++	mutex_unlock(&vcp->lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mtk_vcp_boot);
++
++int mtk_vcp_shutdown(struct mtk_vcp *vcp)
++{
++	int ret;
++
++	mutex_lock(&vcp->lock);
++	if (vcp->state == VCP_COLD)
++		ret = 0;
++	else if (vcp->state == VCP_PINNED)
++		ret = vcp->power_error;
++	else
++		ret = vcp_stop_locked(vcp, !READ_ONCE(vcp->boot_error));
++	mutex_unlock(&vcp->lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mtk_vcp_shutdown);
++
++bool mtk_vcp_is_offline(struct mtk_vcp *vcp)
++{
++	bool offline;
++
++	mutex_lock(&vcp->lock);
++	offline = vcp->state == VCP_COLD && !vcp->powered;
++	mutex_unlock(&vcp->lock);
++	return offline;
++}
++EXPORT_SYMBOL_GPL(mtk_vcp_is_offline);
++
++int mtk_vcp_claim(struct mtk_vcp *vcp, const void *owner)
++{
++	int ret = 0;
++
++	if (!owner)
++		return -EINVAL;
++	mutex_lock(&vcp->lock);
++	if (vcp->owner || vcp->state != VCP_COLD)
++		ret = -EBUSY;
++	else
++		vcp->owner = owner;
++	mutex_unlock(&vcp->lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mtk_vcp_claim);
++
++void mtk_vcp_release(struct mtk_vcp *vcp, const void *owner)
++{
++	mutex_lock(&vcp->lock);
++	if (WARN_ON(vcp->owner != owner || vcp->state != VCP_COLD))
++		goto out;
++	vcp->owner = NULL;
++out:
++	mutex_unlock(&vcp->lock);
++}
++EXPORT_SYMBOL_GPL(mtk_vcp_release);
++
++struct mtk_vcp *mtk_vcp_get(struct device *dev)
++{
++	struct device_node *node;
++	struct platform_device *pdev;
++	struct mtk_vcp *vcp;
++
++	node = of_parse_phandle(dev->of_node, "mediatek,vcp", 0);
++	if (!node)
++		return ERR_PTR(-ENODEV);
++	pdev = of_find_device_by_node(node);
++	of_node_put(node);
++	if (!pdev)
++		return ERR_PTR(-EPROBE_DEFER);
++	vcp = platform_get_drvdata(pdev);
++	if (!device_is_bound(&pdev->dev) || !vcp || !try_module_get(THIS_MODULE)) {
++		put_device(&pdev->dev);
++		return ERR_PTR(-EPROBE_DEFER);
++	}
++	return vcp;
++}
++EXPORT_SYMBOL_GPL(mtk_vcp_get);
++
++void mtk_vcp_put(struct mtk_vcp *vcp)
++{
++	put_device(vcp->dev);
++	module_put(THIS_MODULE);
++}
++EXPORT_SYMBOL_GPL(mtk_vcp_put);
++
++/* Explicit diagnostic only; never called by probe, resume or a service. */
++static ssize_t ready_trial_store(struct device *dev,
++	struct device_attribute *attr, const char *buf, size_t count)
++{
++	struct mtk_vcp *vcp = dev_get_drvdata(dev);
++	int start, stop = 0, ret;
++
++	if (!sysfs_streq(buf, "1"))
++		return -EINVAL;
++	if (!vcp->transport_available)
++		return -ENODEV;
++	ret = mtk_vcp_claim(vcp, vcp);
++	if (ret)
++		return ret;
++	mutex_lock(&vcp->lock);
++	vcp->last_halt_error = 0;
++	mutex_unlock(&vcp->lock);
++	start = mtk_vcp_boot(vcp);
++	if (!start)
++		stop = mtk_vcp_shutdown(vcp);
++	dev_info(vcp->dev, "explicit READY trial: start=%d stop=%d\n", start, stop);
++	mutex_lock(&vcp->lock);
++	vcp->trial_start = start;
++	vcp->trial_stop = stop;
++	mutex_unlock(&vcp->lock);
++	if (mtk_vcp_is_offline(vcp))
++		mtk_vcp_release(vcp, vcp);
++	ret = start ?: stop;
++	return ret ?: count;
++}
++
++int mtk_vcp_alloc_workmem(struct mtk_vcp *vcp, size_t size, struct mtk_vcp_mem *mem)
++{
++	if (!mem || !size || size > VCP_SHM_END - VCP_SHM_BASE)
++		return -EINVAL;
++	if (!READ_ONCE(vcp->tx_enabled))
++		return -EHOSTDOWN;
++	mem->size = size;
++	mem->cpu = dma_alloc_coherent(vcp->dev, size, &mem->dma, GFP_KERNEL);
++	if (!mem->cpu)
++		return -ENOMEM;
++	if (!mtk_vcp_sw_dma_valid(mem->dma, size)) {
++		dma_free_coherent(vcp->dev, size, mem->cpu, mem->dma);
++		mem->cpu = NULL;
++		return -ERANGE;
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(mtk_vcp_alloc_workmem);
++
++void mtk_vcp_free_workmem(struct mtk_vcp *vcp, struct mtk_vcp_mem *mem)
++{
++	if (!READ_ONCE(vcp->tx_enabled) && !READ_ONCE(vcp->reset_confirmed)) {
++		dev_err(vcp->dev, "retain work memory after unconfirmed stop\n");
++		return;
++	}
++	if (mem->cpu)
++		dma_free_coherent(vcp->dev, mem->size, mem->cpu, mem->dma);
++	mem->cpu = NULL;
++}
++EXPORT_SYMBOL_GPL(mtk_vcp_free_workmem);
++
++int mtk_vcp_get_mem(struct mtk_vcp *vcp, unsigned int id, struct mtk_vcp_mem *mem)
++{
++	if (id >= MTK_VCP_MEM_COUNT)
++		return -EINVAL;
++	if (!READ_ONCE(vcp->tx_enabled))
++		return -EHOSTDOWN;
++	*mem = vcp->mem[id];
++	return 0;
++}
++EXPORT_SYMBOL_GPL(mtk_vcp_get_mem);
++
++int mtk_vcp_ipi_register(struct mtk_vcp *vcp, unsigned int codec,
++			 mtk_vcp_ipi_handler_t handler, void *priv)
++{
++	int ret = 0;
++
++	if (codec >= MTK_VCP_CODEC_COUNT || !handler)
++		return -EINVAL;
++	mutex_lock(&vcp->handler_lock);
++	if (vcp->handler[codec])
++		ret = -EBUSY;
++	else {
++		vcp->handler_priv[codec] = priv;
++		vcp->handler[codec] = handler;
++	}
++	mutex_unlock(&vcp->handler_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mtk_vcp_ipi_register);
++
++void mtk_vcp_ipi_unregister(struct mtk_vcp *vcp, unsigned int codec)
++{
++	if (codec >= MTK_VCP_CODEC_COUNT)
++		return;
++	mutex_lock(&vcp->handler_lock);
++	vcp->handler[codec] = NULL;
++	vcp->handler_priv[codec] = NULL;
++	mutex_unlock(&vcp->handler_lock);
++}
++EXPORT_SYMBOL_GPL(mtk_vcp_ipi_unregister);
++
++static int vcp_ipi_send(struct mtk_vcp *vcp, unsigned int codec,
++			u32 service, const void *data, size_t len)
++{
++	struct vcp_message msg = {};
++	void __iomem *base;
++	u32 status;
++	int ret;
++
++	if (codec >= MTK_VCP_CODEC_COUNT || !data || len < sizeof(u32) ||
++	    len > sizeof(msg.data))
++		return -EINVAL;
++	base = vcp->mbox[codec == MTK_VCP_ENCODER ? 2 : 0].base;
++	msg.id = cpu_to_le32(service);
++	msg.len = cpu_to_le32(len);
++	memcpy(msg.data, data, len);
++	VCPDBG("ipi: codec%u service=%u len=%zu\n", codec, service, len);
++	mutex_lock(&vcp->send_lock);
++	if (!vcp->tx_enabled) {
++		VCPDBG("ipi: transport is down\n");
++		ret = -EHOSTDOWN;
++		goto out;
++	}
++	ret = readl_poll_timeout(base + VCP_MBOX_SET, status, !(status & BIT(0)),
++				50, 100000);
++	if (ret)
++		goto out;
++	memcpy_toio(base, &msg, sizeof(msg));
++	/* Publish the mailbox payload before ringing the doorbell. */
++	wmb();
++	writel(BIT(0), base + VCP_MBOX_SET);
++	/* Transport receipt only; the codec backend must match the real RPC reply. */
++	ret = readl_poll_timeout(base + VCP_MBOX_SET, status, !(status & BIT(0)),
++				50, 100000);
++out:
++	mutex_unlock(&vcp->send_lock);
++	VCPDBG("ipi: service=%u -> %d\n", service, ret);
++	return ret;
++}
++int mtk_vcp_ipi_send(struct mtk_vcp *vcp, unsigned int codec,
++		     const void *data, size_t len)
++{
++	return vcp_ipi_send(vcp, codec, codec == MTK_VCP_ENCODER ? 3 : 1,
++			    data, len);
++}
++EXPORT_SYMBOL_GPL(mtk_vcp_ipi_send);
++
++int mtk_vcp_vdec_resource_send(struct mtk_vcp *vcp,
++			       const void *data, size_t len)
++{
++	/* FRAME_BUFFER uses the same mailbox pin but a separate FW service.
++	 * Its replies are delivered to the registered decoder handler.
++	 */
++	return vcp_ipi_send(vcp, MTK_VCP_DECODER, 2, data, len);
++}
++EXPORT_SYMBOL_GPL(mtk_vcp_vdec_resource_send);
++
++static void vcp_put_smi(void *data)
++{
++	put_device(data);
++}
++
++static int vcp_transport_probe(struct platform_device *pdev, struct mtk_vcp *vcp)
++{
++	struct device *dev = &pdev->dev;
++	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
++	struct device_node *memory;
++	struct reserved_mem *rmem;
++	unsigned int i;
++	int ret;
++
++	/* Inspection-only DTs remain supported. A transport DT must describe
++	 * its independent VIDEO_UP1 DMA stream and every required register/IRQ.
++	 */
++	if (!platform_get_resource_byname(pdev, IORESOURCE_MEM, "cfg"))
++		return 0;
++	if (!fwspec || fwspec->num_ids != 1 || fwspec->ids[0] != ((31 << 5) | 0) ||
++	    !iommu_get_domain_for_dev(dev))
++		return dev_err_probe(dev, -EINVAL, "VCP requires VIDEO_UP1 DMA domain\n");
++	memory = of_parse_phandle(dev->of_node, "memory-region", 0);
++	rmem = memory ? of_reserved_mem_lookup(memory) : NULL;
++	of_node_put(memory);
++	if (!rmem || !rmem->size || rmem->size > SZ_32M ||
++	    rmem->base > PHYS_ADDR_MAX - rmem->size)
++		return -EINVAL;
++	vcp->code_pa_start = rmem->base;
++	vcp->code_pa_end = rmem->base + rmem->size;
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(34));
++	if (ret)
++		return ret;
++	vcp->cfg = devm_platform_ioremap_resource_byname(pdev, "cfg");
++	if (IS_ERR(vcp->cfg))
++		return PTR_ERR(vcp->cfg);
++	vcp->core = devm_platform_ioremap_resource_byname(pdev, "core0");
++	if (IS_ERR(vcp->core))
++		return PTR_ERR(vcp->core);
++	for (i = 0; i < VCP_MBOX_COUNT; i++) {
++		struct vcp_mbox *mbox = &vcp->mbox[i];
++		char name[8];
++
++		snprintf(name, sizeof(name), "mbox%u", i);
++		mbox->vcp = vcp;
++		mbox->index = i;
++		mbox->base = devm_platform_ioremap_resource_byname(pdev, name);
++		if (IS_ERR(mbox->base))
++			return PTR_ERR(mbox->base);
++		mbox->irq = platform_get_irq_byname(pdev, name);
++		if (mbox->irq < 0)
++			return mbox->irq;
++		ret = devm_request_threaded_irq(dev, mbox->irq, NULL, vcp_mbox_irq,
++			IRQF_ONESHOT | IRQF_NO_AUTOEN, dev_name(dev), mbox);
++		if (ret)
++			return ret;
++	}
++	vcp->wdt_irq = platform_get_irq_byname(pdev, "wdt");
++	if (vcp->wdt_irq < 0)
++		return vcp->wdt_irq;
++	ret = devm_request_threaded_irq(dev, vcp->wdt_irq, NULL, vcp_wdt_irq,
++		IRQF_ONESHOT | IRQF_NO_AUTOEN, dev_name(dev), vcp);
++	if (ret)
++		return ret;
++	vcp->reserved_irq = platform_get_irq_byname(pdev, "reserved");
++	if (vcp->reserved_irq < 0)
++		return vcp->reserved_irq;
++	ret = devm_request_threaded_irq(dev, vcp->reserved_irq, NULL, vcp_reserved_irq,
++		IRQF_ONESHOT | IRQF_NO_AUTOEN, dev_name(dev), vcp);
++	if (ret)
++		return ret;
++	for (i = 0; i < ARRAY_SIZE(vcp->smi); i++) {
++		struct device_node *node = of_parse_phandle(dev->of_node, "mediatek,smi", i);
++		struct platform_device *smi = node ? of_find_device_by_node(node) : NULL;
++
++		of_node_put(node);
++		if (!smi)
++			return -EPROBE_DEFER;
++		if (!device_is_bound(&smi->dev)) {
++			put_device(&smi->dev);
++			return -EPROBE_DEFER;
++		}
++		vcp->smi[i] = &smi->dev;
++		ret = devm_add_action_or_reset(dev, vcp_put_smi, vcp->smi[i]);
++		if (ret)
++			return ret;
++	}
++	vcp->transport_available = true;
++	return 0;
++}
++
++static int mtk_vcp_suspend(struct device *dev)
++{
++	struct mtk_vcp *vcp = dev_get_drvdata(dev);
++	int ret;
++
++	mutex_lock(&vcp->lock);
++	ret = vcp->state == VCP_COLD && !vcp->power_error ? 0 : -EBUSY;
++	mutex_unlock(&vcp->lock);
++	return ret;
++}
++static DEFINE_SIMPLE_DEV_PM_OPS(mtk_vcp_pm_ops, mtk_vcp_suspend, NULL);
++
++static int mtk_vcp_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct mtk_vcp *vcp;
++	static const char * const pd_names[] = { "infra", "core" };
++	const struct dev_pm_domain_attach_data pd_data = {
++		.pd_names = pd_names,
++		.num_pd_names = ARRAY_SIZE(pd_names),
++		.pd_flags = PD_FLAG_NO_DEV_LINK,
++	};
++	struct resource *res;
++	int ret;
++
++	vcp = devm_kzalloc(dev, sizeof(*vcp), GFP_KERNEL);
++	if (!vcp)
++		return -ENOMEM;
++	vcp->dev = dev;
++	vcp->platform = of_device_get_match_data(dev);
++	if (!vcp->platform)
++		return -EINVAL;
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res || resource_size(res) < MTK_VCP_REGION_OFFSET +
++					 sizeof(struct mtk_vcp_region_info))
++		return -EINVAL;
++	vcp->sram = devm_ioremap_resource(dev, res);
++	if (IS_ERR(vcp->sram))
++		return PTR_ERR(vcp->sram);
++	/* Vendor order: reference clock, parent clock, then MMUP mux. */
++	vcp->clocks[0].id = "mmup-26m";
++	vcp->clocks[1].id = "mmup-clk";
++	vcp->clocks[2].id = "mmup-sel";
++	ret = devm_clk_bulk_get(dev, ARRAY_SIZE(vcp->clocks), vcp->clocks);
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot get VCP clocks\n");
++	/* Two real domains prevent the platform bus's single-domain attach
++	 * from powering the core at probe. No runtime-active device links:
++	 * inspection votes MM_INFRA, clocks, then MM_PROC explicitly.
++	 */
++	ret = devm_pm_domain_attach_list(dev, &pd_data, &vcp->domains);
++	if (ret < 0)
++		return dev_err_probe(dev, ret, "cannot attach VCP power domains\n");
++	if (ret != ARRAY_SIZE(pd_names))
++		return -EINVAL;
++	mutex_init(&vcp->lock);
++	mutex_init(&vcp->send_lock);
++	mutex_init(&vcp->handler_lock);
++	init_completion(&vcp->ready);
++	init_completion(&vcp->logger_ready);
++	ret = vcp_transport_probe(pdev, vcp);
++	if (ret)
++		return ret;
++	platform_set_drvdata(pdev, vcp);
++	return 0;
++}
++
++static const struct of_device_id mtk_vcp_match[] = {
++	{ .compatible = "mediatek,mt6897-vcp", .data = &mt6897_vcp_platform },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mtk_vcp_match);
++
++static struct platform_driver mtk_vcp_driver = {
++	.probe = mtk_vcp_probe,
++	.driver = {
++		.name = "mtk-vcp",
++		.of_match_table = mtk_vcp_match,
++		.dev_groups = mtk_vcp_groups,
++		.pm = pm_sleep_ptr(&mtk_vcp_pm_ops),
++		.suppress_bind_attrs = true,
++	},
++};
++module_platform_driver(mtk_vcp_driver);
++MODULE_DESCRIPTION("MediaTek bootloader-owned VCP transport");
++MODULE_LICENSE("GPL");
+diff --git a/include/linux/remoteproc/mtk_vcp.h b/include/linux/remoteproc/mtk_vcp.h
+index 6c5311f229..bc33e55c0b 100644
+--- a/include/linux/remoteproc/mtk_vcp.h
++++ b/include/linux/remoteproc/mtk_vcp.h
+@@ -2,6 +2,7 @@
+ #ifndef __LINUX_MTK_VCP_H
+ #define __LINUX_MTK_VCP_H
+ #include <linux/types.h>
++#include <linux/remoteproc/mtk_vcp_memory.h>
+ 
+ struct device;
+ struct mtk_vcp;
+@@ -22,6 +23,8 @@ enum mtk_vcp_mem_id {
+ 	MTK_VCP_MEM_VDEC_LOG,
+ 	MTK_VCP_MEM_VENC_LOG,
+ 	MTK_VCP_MEM_GCE,
++	MTK_VCP_MEM_MMDVFS,
++	MTK_VCP_MEM_MMQOS,
+ 	MTK_VCP_MEM_COUNT,
+ };
+ 
+@@ -35,11 +38,8 @@ struct mtk_vcp_mem {
+ typedef void (*mtk_vcp_ipi_handler_t)(void *priv, const void *data, size_t len);
+ struct mtk_vcp *mtk_vcp_get(struct device *dev);
+ void mtk_vcp_put(struct mtk_vcp *vcp);
+-/* Reserve the codec engine before boot. The VCP serves several codec
+- * instances at once, so this is a reference count: every successful claim
+- * must be paired with exactly one release. Keep the reservation across
+- * reset/DRC and failed cleanup; release only after firmware and codec DMA
+- * are confirmed stopped.
++/* Exclusively reserve this firmware transport before boot. Keep ownership
++ * across failed cleanup; release only after confirmed shutdown.
+  */
+ int mtk_vcp_claim(struct mtk_vcp *vcp, const void *owner);
+ void mtk_vcp_release(struct mtk_vcp *vcp, const void *owner);
+diff --git a/include/linux/remoteproc/mtk_vcp_memory.h b/include/linux/remoteproc/mtk_vcp_memory.h
+new file mode 100644
+index 0000000000..c1101c83b9
+--- /dev/null
++++ b/include/linux/remoteproc/mtk_vcp_memory.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __LINUX_MTK_VCP_MEMORY_H
++#define __LINUX_MTK_VCP_MEMORY_H
++#include <linux/types.h>
++
++/* MT6897 VIDEO_UP1 software DMA aperture, distinct from decoder hardware. */
++#define MTK_VCP_SW_IOVA_START 0x140000000ULL
++#define MTK_VCP_SW_IOVA_END   0x1a0000000ULL
++static inline bool mtk_vcp_sw_dma_valid(u64 address, u64 size)
++{
++	return size && address >= MTK_VCP_SW_IOVA_START &&
++		address < MTK_VCP_SW_IOVA_END && !(address & 0xf) &&
++		size <= MTK_VCP_SW_IOVA_END - address;
++}
++#endif
+diff --git a/tools/testing/selftests/mtk_vcp/test_mt6897.py b/tools/testing/selftests/mtk_vcp/test_mt6897.py
+new file mode 100644
+index 0000000000..a61878616e
+--- /dev/null
++++ b/tools/testing/selftests/mtk_vcp/test_mt6897.py
+@@ -0,0 +1,319 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Compile the actual MT6897 wire helpers and test them without hardware."""
++import os
++from pathlib import Path
++import re
++import shlex
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[4]
++headers = [
++    root / "drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_pixels.h",
++    root / "include/linux/remoteproc/mtk_vcp_memory.h",
++    root / "drivers/soc/mediatek/mtk-vcp-platform.h",
++    root / "drivers/media/platform/mediatek/vcodec/vcp/mtk_vcp_vdec_mt6897_abi.h",
++]
++preamble = r"""
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++#include <errno.h>
++#include <endian.h>
++#define static_assert _Static_assert
++typedef uint64_t u64;
++typedef uint32_t u32;
++typedef uint8_t u8;
++typedef uint64_t __le64;
++typedef uint32_t __le32;
++typedef uint16_t __le16;
++#define cpu_to_le32 htole32
++#define cpu_to_le64 htole64
++#define le32_to_cpu le32toh
++"""
++checks = r"""
++/* Generate tiles sequentially from coordinate-labelled pixels, then compare
++ * actual detiling against the independent linear coordinate oracle. Tails and
++ * destination guards stay outside the defined footprint.
++ */
++static unsigned char pixel(unsigned x, unsigned y) { return (x * 7 + y * 13) % 251; }
++static void test_mm21_pixels(void)
++{
++    for (unsigned tile_h=16; tile_h<=32; tile_h*=2) {
++        enum { stride=32, height=64, footprint=stride*height, guard=16, tail=37 };
++        unsigned char src[footprint+tail], dst[guard+footprint+guard];
++        size_t cursor=0;
++        memset(src,0xed,sizeof(src)); memset(dst,0xa7,sizeof(dst));
++        for (unsigned block_y=0; block_y<height; block_y+=tile_h)
++            for (unsigned block_x=0; block_x<stride; block_x+=16)
++                for (unsigned row=0; row<tile_h; row++)
++                    for (unsigned col=0; col<16; col++)
++                        src[cursor++]=pixel(block_x+col,block_y+row);
++        assert(cursor==footprint);
++        mtk_vcp_mm21_detile(dst+guard,src,stride,height,tile_h);
++        for (unsigned y=0; y<height; y++) for (unsigned x=0; x<stride; x++)
++            assert(dst[guard+y*stride+x]==pixel(x,y));
++        for (unsigned i=0; i<guard; i++) assert(dst[i]==0xa7 && dst[guard+footprint+i]==0xa7);
++        for (unsigned i=0; i<tail; i++) assert(src[footprint+i]==0xed);
++        /* An odd visible rectangle must remain a subset of the coded frame. */
++        assert(mtk_vcp_crop_valid(stride,height,3,5,17,19));
++        for (unsigned y=5; y<24; y++) for (unsigned x=3; x<20; x++)
++            assert(dst[guard+y*stride+x]==pixel(x,y));
++    }
++    assert(!mtk_vcp_mm21_valid(1920,1088,2121728,1060864,8));
++    assert(mtk_vcp_mm21_valid(1920,1088,2121728,1060864,0));
++    assert(mtk_vcp_mm21_valid(1920,1088,2088960,1044480,0));
++    assert(!mtk_vcp_mm21_valid(1920,1088,2088959,1044480,0));
++    assert(!mtk_vcp_mm21_valid(1920,1088,2088960,1044479,0));
++    assert(!mtk_vcp_mm21_valid(1920,1088,2121728,1060864,9));
++    assert(!mtk_vcp_mm21_valid(1921,1088,2121728,1060864,0));
++    assert(!mtk_vcp_mm21_valid(1920,1089,2121728,1060864,0));
++    assert(!mtk_vcp_mm21_valid(1920,1088,UINT32_MAX,UINT32_MAX,0));
++    assert(!mtk_vcp_mm21_valid(0,1088,2121728,1060864,0));
++    assert(!mtk_vcp_crop_valid(1920,1088,0,0,0,1080));
++    assert(!mtk_vcp_crop_valid(1920,1088,1,0,1920,1080));
++    assert(!mtk_vcp_crop_valid(1920,1088,0,9,1920,1080));
++    assert(!mtk_vcp_crop_valid(1920,1088,UINT32_MAX,0,1920,1080));
++}
++
++static void test_header_params(void)
++{
++    struct mt6897_vdec_params p, expected;
++    memset(&p, 0xa5, sizeof(p));
++    expected = p;
++    expected.width = 0;
++    expected.height = 0;
++    expected.changed = cpu_to_le32(0xa5a5a5a7);
++    mt6897_vdec_header_params(&p);
++    assert(!memcmp(&p, &expected, sizeof(p)));
++    mt6897_vdec_header_params(&p);
++    assert(!memcmp(&p, &expected, sizeof(p)));
++}
++
++static void test_logger(void)
++{
++    struct mtk_vcp_logger_info info = {
++        .dram=cpu_to_le32(0x3fffc), .buf=cpu_to_le32(0x3fffb),
++        .start=cpu_to_le32(0x3fff8), .end=cpu_to_le32(0x3fff4),
++        .len=cpu_to_le32(5),
++    }, copy = info;
++    assert(mtk_vcp_logger_valid(&info, 0x2000));
++    assert(mtk_vcp_logger_same(&info, &copy));
++    copy.len=cpu_to_le32(4);
++    assert(!mtk_vcp_logger_same(&info, &copy));
++    info.len=cpu_to_le32(6);
++    assert(!mtk_vcp_logger_valid(&info, 0x2000));
++    info.len=cpu_to_le32(UINT32_MAX);
++    assert(!mtk_vcp_logger_valid(&info, 0x2000));
++    info.len=0;
++    assert(!mtk_vcp_logger_valid(&info, 0x2000));
++    info.len=cpu_to_le32(5);
++    info.buf=cpu_to_le32(UINT32_MAX);
++    assert(!mtk_vcp_logger_valid(&info, 0x2000));
++    info=copy;
++    info.buf=cpu_to_le32(0x1fff);
++    assert(!mtk_vcp_logger_valid(&info, 0x2000));
++    info=copy;
++    info.dram=cpu_to_le32(0x1ffc);
++    assert(!mtk_vcp_logger_valid(&info, 0x2000));
++    info=copy;
++    info.end=cpu_to_le32(0x1ffc);
++    assert(!mtk_vcp_logger_valid(&info, 0x2000));
++    for (unsigned i=0; i<3; i++) {
++        info=copy;
++        if (i==0) info.dram=cpu_to_le32(0x3fffd);
++        if (i==1) info.start=cpu_to_le32(0x3fffa);
++        if (i==2) info.end=cpu_to_le32(0x3fff5);
++        assert(!mtk_vcp_logger_valid(&info, 0x2000));
++    }
++    assert(!mtk_vcp_logger_valid(&copy, 0));
++    assert(!mtk_vcp_logger_valid(&copy, 0x40001));
++}
++
++static void test_metadata(void)
++{
++    struct mtk_vcp_region_info r = {
++        .loader_start = cpu_to_le32(0x06000001),
++        .loader_size = cpu_to_le32(0x2000),
++        .firmware_start = cpu_to_le32(0x06002001),
++        .firmware_size = cpu_to_le32(0x40000),
++        .dram_start = cpu_to_le32(0x06100001),
++        .dram_size = cpu_to_le32(0x100000),
++        .dram_backup_start = cpu_to_le32(0x06200001),
++        .struct_size = cpu_to_le32(0x50),
++    };
++    const u64 lower = 0x106000000ULL, upper = 0x108000000ULL;
++    assert(mtk_vcp_unpack_iova(0x06000001) == lower);
++    assert(!mtk_vcp_validate_region(&r, sizeof(r), 0x50, lower, upper));
++    assert(mtk_vcp_validate_region(&r, sizeof(r), 0x54, lower, upper) == -EPROTONOSUPPORT);
++    for (size_t i = 0; i < sizeof(r); i++)
++        assert(mtk_vcp_validate_region(&r, i, 0x50, lower, upper) == -EMSGSIZE);
++    assert(mtk_vcp_validate_region(&r, sizeof(r), 0x38, lower, upper) == -EPROTO);
++    r.struct_size = cpu_to_le32(0x38);
++    assert(!mtk_vcp_validate_region(&r, 0x38, 0x38, lower, upper));
++    r.loader_size = 0;
++    assert(mtk_vcp_validate_region(&r, sizeof(r), 0x38, lower, upper) == -EPROTO);
++    r.loader_size = cpu_to_le32(0x2000);
++    r.dram_size = cpu_to_le32(UINT32_MAX);
++    assert(mtk_vcp_validate_region(&r, sizeof(r), 0x38, lower, upper) == -ERANGE);
++    r.dram_size = cpu_to_le32(0x100000);
++    r.dram_backup_start = cpu_to_le32(0x08000001);
++    assert(mtk_vcp_validate_region(&r, sizeof(r), 0x38, lower, upper) == -ERANGE);
++    assert(!mtk_vcp_range_valid(0x06000001, 0, lower, upper));
++    assert(!mtk_vcp_range_valid(0x06000001, 1, upper, lower));
++    assert(!mtk_vcp_range_valid(0x06000001, 1, lower + 16, upper));
++    assert(!mtk_vcp_range_valid(0xffffffff, UINT32_MAX, 0, 1ULL << 36));
++}
++
++static void test_serialization(void)
++{
++    struct mt6897_vdec_init init;
++    struct mt6897_vdec_query query;
++    struct mt6897_vdec_start start;
++    const u64 cookie = 0x1122334455667788ULL;
++    const u64 data_cookie = 0x8877665544332211ULL;
++    const u32 data[] = { 1, 2, 3, 4, 5, 0xabcdef01 };
++    const unsigned char init_expected[24] = {
++        0, 0xa0, 0, 0, 0x78, 0x56, 0x34, 0x12,
++        0, 0, 0, 0, 0, 0, 0, 0,
++        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
++    };
++    const unsigned char query_expected[40] = {
++        5, 0xa0, 0, 0, 0x78, 0x56, 0x34, 0x12,
++        0, 0, 0, 0, 0, 0, 0, 0,
++        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
++        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
++        8, 0, 0, 0, 0, 0, 0, 0,
++    };
++    memset(&init, 0xa5, sizeof(init));
++    memset(&query, 0xa5, sizeof(query));
++    memset(&start, 0xa5, sizeof(start));
++    mt6897_vdec_make_init(&init, 0x12345678, cookie);
++    mt6897_vdec_make_query(&query, 0x12345678, cookie, data_cookie, 8);
++    mt6897_vdec_make_start(&start, 0x12345678, data_cookie, data);
++    assert(!memcmp(&init, init_expected, sizeof(init)));
++    assert(!memcmp(&query, query_expected, sizeof(query)));
++    assert(start.instance == cpu_to_le64(data_cookie));
++    assert(start.id == cpu_to_le32(0xa001));
++    assert(start.ctx == cpu_to_le32(0x12345678));
++    for (unsigned i = 0; i < 6; i++)
++        assert(start.data[i] == cpu_to_le32(data[i]));
++}
++
++static void test_bootstrap(void)
++{
++    struct mt6897_venc_boot_mem reply;
++    const unsigned char expected[64] = {
++        3,0x40,0,0, 0x78,0x56,0x34,0x12,
++        0x88,0x77,0x66,0x55,0x44,0x33,0x22,0x11,
++        0,0,0,0, 0,0,0,0, 6,0,0,0, 0,0x20,1,0,
++        0,0x10,0,0x90,1,0,0,0, 0,0x10,0,0x90,1,0,0,0,
++        0x10,0x32,0x54,0x76,0x98,0xba,0xdc,0xfe,
++        0x21,0x43,0x65,0x87, 0x98,0xba,0xdc,0xfe,
++    };
++    memset(&reply, 0xa5, sizeof(reply));
++    reply.ctx = cpu_to_le32(0x12345678);
++    reply.cookie = cpu_to_le64(0x1122334455667788ULL);
++    mt6897_venc_shm_reply(&reply, 0x12000, 0x190001000ULL,
++                         0xfedcba9876543210ULL, 0x87654321, 0xfedcba98);
++    assert(!memcmp(&reply, expected, sizeof(reply)));
++    assert(mt6897_vcp_dma_valid(0x140000000ULL, 0x10000000));
++    assert(mt6897_vcp_dma_valid(0x19ffffff0ULL, 16));
++    assert(!mt6897_vcp_dma_valid(0x140000000ULL, 0));
++    assert(!mt6897_vcp_dma_valid(0x13ffffff0ULL, 16));
++    assert(!mt6897_vcp_dma_valid(0x1a0000000ULL, 16));
++    assert(!mt6897_vcp_dma_valid(0x140000001ULL, 16));
++    assert(!mt6897_vcp_dma_valid(0x14ffffff0ULL, 17));
++    assert(!mt6897_vcp_dma_valid(0x19ffffff0ULL, 17));
++    assert(!mt6897_vcp_dma_valid(0x140000000ULL, UINT64_MAX));
++    assert(!mt6897_vcp_dma_valid(UINT64_MAX - 15, 32));
++}
++
++/* Independent table allocator, directly from the MT6897 DTS send/recv
++ * ordering and vendor two-word rounding rule; compare production pins.
++ */
++struct table_pin { unsigned channel, mailbox, words; };
++static const struct table_pin sends[] = {
++    {0,0,18}, {2,1,2}, {3,1,2}, {9,1,2}, {11,1,2}, {13,1,2},
++    {15,1,4}, {16,2,18}, {18,2,4}, {20,3,2}, {21,3,2},
++    {22,3,6}, {23,3,2}, {28,4,4},
++};
++static const struct table_pin receives[] = {
++    {1,0,18}, {2,1,1}, {4,1,10}, {5,1,1}, {6,1,2}, {10,1,2},
++    {12,1,2}, {14,1,2}, {15,1,4}, {17,2,18}, {19,2,4},
++    {20,3,1}, {24,3,10}, {25,3,6}, {26,3,1}, {27,3,2}, {29,4,4},
++};
++static void check_pin(const struct mtk_vcp_pin *p, bool tx)
++{
++    unsigned offset = 0;
++    for (unsigned direction = 0; direction < 2; direction++) {
++        const struct table_pin *table = direction ? receives : sends;
++        size_t count = direction ? sizeof(receives)/sizeof(*table) : sizeof(sends)/sizeof(*table);
++        for (size_t i = 0; i < count; i++) {
++            if (table[i].mailbox != p->mailbox)
++                continue;
++            if (direction == !tx && table[i].channel == p->channel) {
++                assert(p->word == offset);
++                assert(p->bit == offset / 2);
++                assert(p->words == table[i].words);
++                return;
++            }
++            offset += (table[i].words + 1) / 2 * 2;
++        }
++    }
++    assert(!"missing pin");
++}
++int main(void)
++{
++    assert(mt6897_vdec_normal_aperture_valid(0, 0xff7fffffULL, true));
++    assert(mt6897_vdec_normal_aperture_valid(0, 0xffffffffULL, true));
++    assert(!mt6897_vdec_normal_aperture_valid(1, 0xff7fffffULL, true));
++    assert(!mt6897_vdec_normal_aperture_valid(0, 0x100000000ULL, true));
++    assert(!mt6897_vdec_normal_aperture_valid(0, 0xff7fffffULL, false));
++    assert(!mt6897_vdec_normal_aperture_valid(0, 0, true));
++    assert(mtk_vcp_sw_dma_valid(0x140000000ULL, 16));
++    assert(mtk_vcp_sw_dma_valid(0x19ffffff0ULL, 16));
++    assert(!mtk_vcp_sw_dma_valid(0x13ffffff0ULL, 16));
++    assert(!mtk_vcp_sw_dma_valid(0x1a0000000ULL, 16));
++    assert(!mtk_vcp_sw_dma_valid(0x19ffffff0ULL, 17));
++    assert(!mtk_vcp_sw_dma_valid(0x140000000ULL, UINT64_MAX));
++    assert(!mtk_vcp_sw_dma_valid(0xfffffffffffffff0ULL, 32));
++    assert(!mtk_vcp_sw_dma_valid(0x140000001ULL, 16));
++    assert(!mtk_vcp_sw_dma_valid(0x140000000ULL, 0));
++    test_mm21_pixels();
++    test_header_params();
++    test_logger();
++    test_metadata();
++    test_bootstrap();
++    assert(mtk_vcp_shadow_pa(0xf1234567U) == 0x7f1234000ULL);
++    assert(mtk_vcp_shadow_pa(0) == 0);
++    test_serialization();
++    check_pin(&mt6897_vcp_platform.dec_tx, true);
++    check_pin(&mt6897_vcp_platform.dec_rx, false);
++    check_pin(&mt6897_vcp_platform.enc_tx, true);
++    check_pin(&mt6897_vcp_platform.enc_rx, false);
++    check_pin(&mt6897_vcp_platform.ready0, false);
++    check_pin(&mt6897_vcp_platform.ready1, false);
++    check_pin(&mt6897_vcp_platform.logger_tx, true);
++    check_pin(&mt6897_vcp_platform.logger_rx, false);
++    return 0;
++}
++"""
++source = preamble + "\n".join(
++    re.sub(r"^#include.*$", "", header.read_text(), flags=re.MULTILINE)
++    for header in headers
++) + checks
++with tempfile.TemporaryDirectory(prefix="mt6897-vcp-") as temporary:
++    directory = Path(temporary)
++    cfile = directory / "test.c"
++    binary = directory / "test"
++    cfile.write_text(source)
++    command = shlex.split(os.environ.get("CC", "cc"))
++    subprocess.run(command + ["-D_DEFAULT_SOURCE", "-std=c11", "-Wall", "-Wextra",
++        "-Werror", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
++        str(cfile), "-o", str(binary)], check=True)
++    subprocess.run([str(binary)], check=True)
++print("PASS: MT6897 wire layout, serialization, metadata bounds and mailbox allocation")
+-- 
+2.56.0
+

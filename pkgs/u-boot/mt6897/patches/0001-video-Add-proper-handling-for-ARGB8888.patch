@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Igor Belwon <igor.belwon@mentallysanemainliners.org>
+Date: Fri, 26 Sep 2025 16:34:06 +0200
+Subject: [PATCH 01/11] video: Add proper handling for ARGB8888
+
+On some framebuffers (i.e MediaTek) the framebuffer comes with
+the display layer (ovl0) set as fully transparent by default.
+As such, writing the data with the fallback that was used, the
+display would simply stay black. With this, we are setting the
+pixel data to be fully opaque, which fixes the issue.
+
+Signed-off-by: Igor Belwon <igor.belwon@mentallysanemainliners.org>
+(cherry picked from commit 14228fbe2c580613b9f0f32c53007847d665ff22)
+---
+ drivers/video/simplefb.c     |  6 ++++--
+ drivers/video/video-uclass.c |  5 +++++
+ drivers/video/video_bmp.c    | 27 +++++++++++++++++++++++++++
+ include/video.h              |  1 +
+ 4 files changed, 37 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/video/simplefb.c b/drivers/video/simplefb.c
+index 56f1362aa2..527c48b562 100644
+--- a/drivers/video/simplefb.c
++++ b/drivers/video/simplefb.c
+@@ -85,10 +85,12 @@ static int simple_video_probe(struct udevice *dev)
+ 		   strcmp(format, "x8b8g8r8") == 0) {
+ 		uc_priv->bpix = VIDEO_BPP32;
+ 		uc_priv->format = VIDEO_X8B8G8R8;
+-	} else if (strcmp(format, "a8r8g8b8") == 0 ||
+-		   strcmp(format, "x8r8g8b8") == 0) {
++	} else if (strcmp(format, "x8r8g8b8") == 0) {
+ 		uc_priv->bpix = VIDEO_BPP32;
+ 		uc_priv->format = VIDEO_X8R8G8B8;
++	} else if (strcmp(format, "a8r8g8b8") == 0) {
++		uc_priv->bpix = VIDEO_BPP32;
++		uc_priv->format = VIDEO_ARGB8888;
+ 	} else if (strcmp(format, "a2r10g10b10") == 0 ||
+ 		   strcmp(format, "x2r10g10b10") == 0) {
+ 		uc_priv->bpix = VIDEO_BPP32;
+diff --git a/drivers/video/video-uclass.c b/drivers/video/video-uclass.c
+index 228d6bacc5..b716346949 100644
+--- a/drivers/video/video-uclass.c
++++ b/drivers/video/video-uclass.c
+@@ -354,6 +354,11 @@ u32 video_index_to_colour(struct video_priv *priv, enum colour_idx idx)
+ 				return (colours[idx].r << 24) |
+ 				       (colours[idx].g << 16) |
+ 				       (colours[idx].b << 8) | 0xff;
++			case VIDEO_ARGB8888:
++				return (0xff << 24) |
++				       (colours[idx].r << 16) |
++				       (colours[idx].g << 8) |
++				       (colours[idx].b);
+ 			default:
+ 				return (colours[idx].r << 16) |
+ 				       (colours[idx].g <<  8) |
+diff --git a/drivers/video/video_bmp.c b/drivers/video/video_bmp.c
+index 1f267d4581..f9909daa8d 100644
+--- a/drivers/video/video_bmp.c
++++ b/drivers/video/video_bmp.c
+@@ -53,6 +53,19 @@ static u32 get_bmp_col_rgba8888(struct bmp_color_table_entry *cte)
+ 		(cte->blue << 16U) | 0xff << 24U);
+ }
+ 
++/**
++ * get_bmp_col_argb8888() - Convert a colour-table entry into a argb8888 pixel value
++ *
++ * Return: value to write to the argb8888 frame buffer for this palette entry
++ */
++static u32 get_bmp_col_argb8888(struct bmp_color_table_entry *cte)
++{
++	return (0xff << 24U) |
++		(cte->red << 16U) |
++		(cte->green << 8U) |
++		(cte->blue);
++}
++
+ /**
+  * write_pix8() - Write a pixel from a BMP image into the framebuffer
+  *
+@@ -84,6 +97,8 @@ static void write_pix8(u8 *fb, uint bpix, enum video_format eformat,
+ 			*(u32 *)fb = get_bmp_col_x2r10g10b10(cte);
+ 		} else if (eformat == VIDEO_RGBA8888) {
+ 			*(u32 *)fb = get_bmp_col_rgba8888(cte);
++		} else if (eformat == VIDEO_ARGB8888) {
++			*(u32 *)fb = get_bmp_col_argb8888(cte);
+ 		} else {
+ 			*fb++ = cte->blue;
+ 			*fb++ = cte->green;
+@@ -405,6 +420,11 @@ int video_bmp_display(struct udevice *dev, ulong bmp_image, int x, int y,
+ 						*fb++ = (pix >> 16) & 0xff;
+ 						*fb++ = (pix >> 8) & 0xff;
+ 						*fb++ = 0xff;
++					} else if (eformat == VIDEO_ARGB8888) {
++						*fb++ = 0xff;
++						*fb++ = *bmap++;
++						*fb++ = *bmap++;
++						*fb++ = *bmap++;
+ 					} else {
+ 						*fb++ = *bmap++;
+ 						*fb++ = *bmap++;
+@@ -443,6 +463,13 @@ int video_bmp_display(struct udevice *dev, ulong bmp_image, int x, int y,
+ 						*fb++ = (pix >> 16) & 0xff;
+ 						*fb++ = (pix >> 8) & 0xff;
+ 						*fb++ = 0xff; /* opacity */
++					} else if (eformat == VIDEO_ARGB8888) {
++						u32 pix;
++
++						*fb++ = 0xff; /* opacity */
++						*fb++ = (pix >> 24) & 0xff;
++						*fb++ = (pix >> 16) & 0xff;
++						*fb++ = (pix >> 8) & 0xff;
+ 					} else {
+ 						*fb++ = *bmap++;
+ 						*fb++ = *bmap++;
+diff --git a/include/video.h b/include/video.h
+index 9ea6b67646..c074bddbda 100644
+--- a/include/video.h
++++ b/include/video.h
+@@ -63,6 +63,7 @@ enum video_log2_bpp {
+ 
+ enum video_format {
+ 	VIDEO_UNKNOWN,
++	VIDEO_ARGB8888,
+ 	VIDEO_RGBA8888,
+ 	VIDEO_X8B8G8R8,
+ 	VIDEO_X8R8G8B8,

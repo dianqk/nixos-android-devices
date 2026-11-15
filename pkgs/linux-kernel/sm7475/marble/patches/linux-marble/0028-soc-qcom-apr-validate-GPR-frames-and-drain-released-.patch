@@ -1,0 +1,81 @@
+From 8eaa966e89834cc664e4320cf09f3c70b3aa614a Mon Sep 17 00:00:00 2001
+From: Halhadus <eneshakans45@proton.me>
+Date: Wed, 14 Oct 2026 12:23:22 +0300
+Subject: [PATCH 28/46] soc: qcom: apr: validate GPR frames and drain released
+ ports
+
+Check the minimum GPR header and declared header span before accessing
+the packet. Initialize empty responses and provide synchronous dynamic
+port release so clients can drain callbacks before freeing their state.
+
+Signed-off-by: Halhadus <eneshakans45@proton.me>
+(cherry picked from commit b066128de9e75f413833bb5a6c346fb44d5e0f17)
+---
+ drivers/soc/qcom/apr.c       | 22 ++++++++++++++++++++--
+ include/linux/soc/qcom/apr.h |  1 +
+ 2 files changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/soc/qcom/apr.c b/drivers/soc/qcom/apr.c
+index ea7f83916d8d..cee82b390a87 100644
+--- a/drivers/soc/qcom/apr.c
++++ b/drivers/soc/qcom/apr.c
+@@ -87,6 +87,21 @@ void gpr_free_port(gpr_port_t *port)
+ }
+ EXPORT_SYMBOL_GPL(gpr_free_port);
+ 
++/* Must not be called from the packet router's receive callback/workqueue. */
++void gpr_free_port_sync(gpr_port_t *port)
++{
++	struct packet_router *gpr = port->pr;
++	unsigned long flags;
++
++	spin_lock_irqsave(&gpr->svcs_lock, flags);
++	idr_remove(&gpr->svcs_idr, port->id);
++	spin_unlock_irqrestore(&gpr->svcs_lock, flags);
++	/* A receive worker may have looked up the port before its removal. */
++	flush_workqueue(gpr->rxwq);
++	kfree(port);
++}
++EXPORT_SYMBOL_GPL(gpr_free_port_sync);
++
+ gpr_port_t *gpr_alloc_port(struct apr_device *gdev, struct device *dev,
+ 				gpr_port_cb cb,	void *priv)
+ {
+@@ -263,12 +278,14 @@ static int gpr_do_rx_callback(struct packet_router *gpr, struct apr_rx_buf *abuf
+ {
+ 	uint16_t hdr_size, ver;
+ 	struct pkt_router_svc *svc = NULL;
+-	struct gpr_resp_pkt resp;
++	struct gpr_resp_pkt resp = { };
+ 	struct gpr_hdr *hdr;
+ 	unsigned long flags;
+ 	void *buf = abuf->buf;
+ 	int len = abuf->len;
+ 
++	if (len < GPR_PKT_HEADER_BYTE_SIZE)
++		return -EINVAL;
+ 	hdr = buf;
+ 	ver = hdr->version;
+ 	if (ver > GPR_PKT_VER + 1)
+@@ -280,7 +297,8 @@ static int gpr_do_rx_callback(struct packet_router *gpr, struct apr_rx_buf *abuf
+ 		return -EINVAL;
+ 	}
+ 
+-	if (hdr->pkt_size < GPR_PKT_HEADER_BYTE_SIZE || hdr->pkt_size != len) {
++	if (hdr->pkt_size < GPR_PKT_HEADER_BYTE_SIZE || hdr->pkt_size != len ||
++	    hdr_size * 4 > len) {
+ 		dev_err(gpr->dev, "GPR: Wrong packet size\n");
+ 		return -EINVAL;
+ 	}
+diff --git a/include/linux/soc/qcom/apr.h b/include/linux/soc/qcom/apr.h
+index 909e84f84e0c..3f5957ef1529 100644
+--- a/include/linux/soc/qcom/apr.h
++++ b/include/linux/soc/qcom/apr.h
+@@ -191,6 +191,7 @@ int apr_send_pkt(struct apr_device *adev, struct apr_pkt *pkt);
+ gpr_port_t *gpr_alloc_port(gpr_device_t *gdev, struct device *dev,
+ 				gpr_port_cb cb, void *priv);
+ void gpr_free_port(gpr_port_t *port);
++void gpr_free_port_sync(gpr_port_t *port);
+ int gpr_send_port_pkt(gpr_port_t *port, const struct gpr_pkt *pkt);
+ int gpr_send_pkt(gpr_device_t *gdev, const struct gpr_pkt *pkt);
+ 
