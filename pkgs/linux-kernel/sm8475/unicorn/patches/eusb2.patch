@@ -1,0 +1,346 @@
+Subject: [PATCH] phy: support Unicorn PTN3222 eUSB2 setup
+
+Configure the PTN3222 reset and transmit controls and the optional Synopsys
+reference clock gate. Keep host and peripheral signal settings separate. Commit modes only after
+a successful repeater update; restore TX controls on a failed role change.
+
+diff --git a/Documentation/devicetree/bindings/phy/nxp,ptn3222.yaml b/Documentation/devicetree/bindings/phy/nxp,ptn3222.yaml
+--- a/Documentation/devicetree/bindings/phy/nxp,ptn3222.yaml
++++ b/Documentation/devicetree/bindings/phy/nxp,ptn3222.yaml
+@@ -28,6 +28,22 @@
+ 
+   reset-gpios: true
+ 
++  nxp,usb2-tx-control:
++    $ref: /schemas/types.yaml#/definitions/uint8-array
++    minItems: 2
++    maxItems: 2
++    description:
++      Board signal-integrity settings for USB2_TX_CONTROL1 (0x07) and
++      USB2_TX_CONTROL2 (0x08), in that order, for peripheral operation.
++
++  nxp,usb2-tx-control-host:
++    $ref: /schemas/types.yaml#/definitions/uint8-array
++    minItems: 2
++    maxItems: 2
++    description:
++      Board signal-integrity settings for USB2_TX_CONTROL1 (0x07) and
++      USB2_TX_CONTROL2 (0x08), in that order, for host operation.
++
+ required:
+   - compatible
+   - reg
+diff --git a/Documentation/devicetree/bindings/phy/qcom,snps-eusb2-phy.yaml b/Documentation/devicetree/bindings/phy/qcom,snps-eusb2-phy.yaml
+--- a/Documentation/devicetree/bindings/phy/qcom,snps-eusb2-phy.yaml
++++ b/Documentation/devicetree/bindings/phy/qcom,snps-eusb2-phy.yaml
+@@ -20,6 +20,7 @@
+               - qcom,eliza-snps-eusb2-phy
+               - qcom,milos-snps-eusb2-phy
+               - qcom,sar2130p-snps-eusb2-phy
++              - qcom,sm8475-snps-eusb2-phy
+               - qcom,sdx75-snps-eusb2-phy
+               - qcom,sm8650-snps-eusb2-phy
+               - qcom,x1e80100-snps-eusb2-phy
+@@ -33,12 +34,16 @@
+     const: 0
+ 
+   clocks:
++    minItems: 1
+     items:
+-      - description: ref
++      - description: Reference clock source
++      - description: Reference clock gate
+ 
+   clock-names:
++    minItems: 1
+     items:
+       - const: ref
++      - const: ref_aux
+ 
+   resets:
+     maxItems: 1
+@@ -66,24 +71,44 @@
+   - vdda12-supply
+   - resets
+ 
++allOf:
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: qcom,sm8475-snps-eusb2-phy
++    then:
++      properties:
++        clocks:
++          minItems: 2
++        clock-names:
++          minItems: 2
++    else:
++      properties:
++        clocks:
++          maxItems: 1
++        clock-names:
++          maxItems: 1
++
+ additionalProperties: false
+ 
+ examples:
+   - |
+-    #include <dt-bindings/clock/qcom,sm8550-gcc.h>
++    #include <dt-bindings/clock/qcom,gcc-sm8450.h>
+     #include <dt-bindings/clock/qcom,rpmh.h>
+-    #include <dt-bindings/clock/qcom,sm8550-tcsr.h>
+ 
+-    usb_1_hsphy: phy@88e3000 {
+-        compatible = "qcom,sm8550-snps-eusb2-phy";
++    phy@88e3000 {
++        compatible = "qcom,sm8475-snps-eusb2-phy",
++                     "qcom,sm8550-snps-eusb2-phy";
+         reg = <0x88e3000 0x154>;
+         #phy-cells = <0>;
+ 
+-        clocks = <&tcsrcc TCSR_USB2_CLKREF_EN>;
+-        clock-names = "ref";
++        clocks = <&rpmhcc RPMH_CXO_CLK>,
++                 <&gcc GCC_EUSB3_0_CLKREF_EN>;
++        clock-names = "ref", "ref_aux";
+ 
+-        vdd-supply = <&vreg_l1e_0p88>;
+-        vdda12-supply = <&vreg_l3e_1p2>;
++        vdd-supply = <&vreg_l5b_0p88>;
++        vdda12-supply = <&vreg_l10c_1p2>;
+ 
+         resets = <&gcc GCC_QUSB2PHY_PRIM_BCR>;
+     };
+diff --git a/drivers/phy/Kconfig b/drivers/phy/Kconfig
+--- a/drivers/phy/Kconfig
++++ b/drivers/phy/Kconfig
+@@ -130,6 +130,7 @@
+ 	depends on I2C
+ 	depends on OF
+ 	select GENERIC_PHY
++	select REGMAP_I2C
+ 	help
+ 	  Enable this to support NXP PTN3222 1-port eUSB2 to USB2 Redriver.
+ 	  This redriver performs translation between eUSB2 and USB2 signalling
+diff --git a/drivers/phy/phy-nxp-ptn3222.c b/drivers/phy/phy-nxp-ptn3222.c
+--- a/drivers/phy/phy-nxp-ptn3222.c
++++ b/drivers/phy/phy-nxp-ptn3222.c
+@@ -3,22 +3,85 @@
+  * Copyright (c) 2024, Linaro Limited
+  */
+ 
++#include <linux/delay.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/i2c.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/phy/phy.h>
++#include <linux/property.h>
+ #include <linux/regmap.h>
+ #include <linux/regulator/consumer.h>
+ 
+ #define NUM_SUPPLIES 2
++#define PTN3222_USB2_TX_CONTROL1 0x07
++#define PTN3222_USB2_TX_CONTROL2 0x08
+ 
+ struct ptn3222 {
+ 	struct i2c_client *client;
+ 	struct phy *phy;
+ 	struct gpio_desc *reset_gpio;
+ 	struct regulator_bulk_data *supplies;
+-};
++	struct regmap *regmap;
++	u8 tx_control[2];
++	u8 tx_control_host[2];
++	bool have_tx_control;
++	bool have_tx_control_host;
++	bool initialized;
++	enum phy_mode mode;
++};
++
++static int ptn3222_apply_tx_control(struct ptn3222 *ptn3222)
++{
++	const u8 *values = ptn3222->tx_control;
++	unsigned int old1, old2;
++	int ret, rollback1, rollback2;
++
++	if (ptn3222->mode == PHY_MODE_USB_HOST && ptn3222->have_tx_control_host)
++		values = ptn3222->tx_control_host;
++	else if (!ptn3222->have_tx_control)
++		return 0;
++
++	ret = regmap_read(ptn3222->regmap, PTN3222_USB2_TX_CONTROL1, &old1);
++	if (ret)
++		return ret;
++	ret = regmap_read(ptn3222->regmap, PTN3222_USB2_TX_CONTROL2, &old2);
++	if (ret)
++		return ret;
++
++	/* Preserve the order used by the vendor's signal-integrity settings. */
++	ret = regmap_write(ptn3222->regmap, PTN3222_USB2_TX_CONTROL2, values[1]);
++	if (!ret)
++		ret = regmap_write(ptn3222->regmap, PTN3222_USB2_TX_CONTROL1, values[0]);
++	if (!ret)
++		return 0;
++
++	/* Restore both registers: an I2C error may occur after either write. */
++	rollback2 = regmap_write(ptn3222->regmap, PTN3222_USB2_TX_CONTROL2, old2);
++	rollback1 = regmap_write(ptn3222->regmap, PTN3222_USB2_TX_CONTROL1, old1);
++	if (rollback1 || rollback2)
++		dev_err(&ptn3222->client->dev, "TX control rollback failed\n");
++	return ret;
++}
++
++static int ptn3222_set_mode(struct phy *phy, enum phy_mode mode, int submode)
++{
++	struct ptn3222 *ptn3222 = phy_get_drvdata(phy);
++
++	enum phy_mode previous = ptn3222->mode;
++	int ret = 0;
++
++	if (mode != PHY_MODE_USB_HOST && mode != PHY_MODE_USB_DEVICE &&
++	    mode != PHY_MODE_USB_OTG)
++		return -EINVAL;
++
++	ptn3222->mode = mode;
++	if (ptn3222->initialized)
++		ret = ptn3222_apply_tx_control(ptn3222);
++	if (ret)
++		ptn3222->mode = previous;
++	return ret;
++}
+ 
+ static int ptn3222_init(struct phy *phy)
+ {
+@@ -30,6 +93,16 @@
+ 		return ret;
+ 
+ 	gpiod_set_value_cansleep(ptn3222->reset_gpio, 0);
++	if (ptn3222->have_tx_control || ptn3222->have_tx_control_host) {
++		usleep_range(1000, 2000);
++		ret = ptn3222_apply_tx_control(ptn3222);
++		if (ret) {
++			gpiod_set_value_cansleep(ptn3222->reset_gpio, 1);
++			regulator_bulk_disable(NUM_SUPPLIES, ptn3222->supplies);
++			return ret;
++		}
++	}
++	ptn3222->initialized = true;
+ 
+ 	return 0;
+ }
+@@ -38,6 +111,7 @@
+ {
+ 	struct ptn3222 *ptn3222 = phy_get_drvdata(phy);
+ 
++	ptn3222->initialized = false;
+ 	gpiod_set_value_cansleep(ptn3222->reset_gpio, 1);
+ 
+ 	return regulator_bulk_disable(NUM_SUPPLIES, ptn3222->supplies);
+@@ -46,6 +120,7 @@
+ static const struct phy_ops ptn3222_ops = {
+ 	.init		= ptn3222_init,
+ 	.exit		= ptn3222_exit,
++	.set_mode	= ptn3222_set_mode,
+ 	.owner		= THIS_MODULE,
+ };
+ 
+@@ -59,6 +134,28 @@
+ 	}
+ };
+ 
++static const struct regmap_config ptn3222_regmap_config = {
++	.reg_bits = 8,
++	.val_bits = 8,
++	.max_register = 0xff,
++};
++
++static int ptn3222_read_tx_control(struct device *dev, const char *name,
++				 u8 *values, bool *present)
++{
++	int ret;
++
++	*present = device_property_present(dev, name);
++	if (!*present)
++		return 0;
++
++	ret = device_property_count_u8(dev, name);
++	if (ret != 2)
++		return dev_err_probe(dev, -EINVAL, "%s must contain two bytes\n", name);
++
++	return device_property_read_u8_array(dev, name, values, 2);
++}
++
+ static int ptn3222_probe(struct i2c_client *client)
+ {
+ 	struct device *dev = &client->dev;
+@@ -71,6 +168,22 @@
+ 		return -ENOMEM;
+ 
+ 	ptn3222->client = client;
++	ptn3222->mode = PHY_MODE_USB_DEVICE;
++
++	ret = ptn3222_read_tx_control(dev, "nxp,usb2-tx-control",
++				    ptn3222->tx_control, &ptn3222->have_tx_control);
++	if (ret)
++		return ret;
++	ret = ptn3222_read_tx_control(dev, "nxp,usb2-tx-control-host",
++				    ptn3222->tx_control_host,
++				    &ptn3222->have_tx_control_host);
++	if (ret)
++		return ret;
++	if (ptn3222->have_tx_control || ptn3222->have_tx_control_host) {
++		ptn3222->regmap = devm_regmap_init_i2c(client, &ptn3222_regmap_config);
++		if (IS_ERR(ptn3222->regmap))
++			return PTR_ERR(ptn3222->regmap);
++	}
+ 
+ 	ptn3222->reset_gpio = devm_gpiod_get_optional(dev, "reset",
+ 						      GPIOD_OUT_HIGH);
+diff --git a/drivers/phy/phy-snps-eusb2.c b/drivers/phy/phy-snps-eusb2.c
+--- a/drivers/phy/phy-snps-eusb2.c
++++ b/drivers/phy/phy-snps-eusb2.c
+@@ -180,9 +180,13 @@
+ {
+ 	struct snps_eusb2_hsphy *phy = phy_get_drvdata(p);
+ 
++	int ret;
++
++	ret = phy_set_mode_ext(phy->repeater, mode, submode);
++	if (ret)
++		return ret;
+ 	phy->mode = mode;
+-
+-	return phy_set_mode_ext(phy->repeater, mode, submode);
++	return 0;
+ }
+ 
+ static void snps_eusb2_hsphy_write_mask(void __iomem *base, u32 offset,
+@@ -444,6 +448,16 @@
+ 
+ static const char * const qcom_eusb2_hsphy_clock_names[] = {
+ 	"ref",
++};
++
++static const char * const sm8475_eusb2_hsphy_clock_names[] = {
++	"ref", "ref_aux",
++};
++
++static const struct snps_eusb2_phy_drvdata sm8475_snps_eusb2_phy = {
++	.phy_init	= qcom_snps_eusb2_hsphy_init,
++	.clk_names	= sm8475_eusb2_hsphy_clock_names,
++	.num_clks	= ARRAY_SIZE(sm8475_eusb2_hsphy_clock_names),
+ };
+ 
+ static const struct snps_eusb2_phy_drvdata sm8550_snps_eusb2_phy = {
+@@ -608,6 +622,9 @@
+ 
+ static const struct of_device_id snps_eusb2_hsphy_of_match_table[] = {
+ 	{
++		.compatible = "qcom,sm8475-snps-eusb2-phy",
++		.data = &sm8475_snps_eusb2_phy,
++	}, {
+ 		.compatible = "qcom,sm8550-snps-eusb2-phy",
+ 		.data = &sm8550_snps_eusb2_phy,
+ 	}, {

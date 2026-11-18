@@ -1,0 +1,971 @@
+Lifecycle and firmware-led role management for usb-signaller v0.4.2.
+
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,154 +1,59 @@
+-/*
+- * usb-signaller: replacement for usb-moded on mainline Linux Mobile devices
+- * Copyright (C) 2026 Dylan Van Assche
+- *
+- * This program is free software: you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License as published
+- * by the Free Software Foundation, either version 3 of the License, or
+- * (at your option) any later version.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+- * GNU General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License
+- * along with this program. If not, see <https://www.gnu.org/licenses/>.
+- */
+-#![allow(clippy::needless_return)]
+-#![allow(clippy::never_loop)]
+-#![allow(clippy::upper_case_acronyms)]
+-#![allow(clippy::too_many_arguments)]
+-
+-use anyhow::Result;
+-use std::process;
+-use tokio::signal;
+-use tokio::task::LocalSet;
+-use zbus::object_server::SignalEmitter;
+-
++// SPDX-License-Identifier: GPL-3.0-or-later
++#![allow(
++    clippy::needless_return,
++    clippy::never_loop,
++    clippy::upper_case_acronyms,
++    clippy::too_many_arguments
++)]
+ mod configuration;
+ mod dbus;
+ mod gadget;
++mod manager;
+ mod monitor;
+ mod service;
+ mod sysfs;
+ mod udc;
+ mod urs;
+ mod utils;
+-
+-use crate::configuration::Configuration;
+ use crate::dbus::{UsbModedDBus, create_usbmoded_connection};
+-use crate::monitor::monitor_usb_events;
+-use crate::udc::{UDC, discover_udcs};
+-use crate::urs::{URS, discover_urss};
++use anyhow::Result;
+ 
+ #[tokio::main]
+ async fn main() -> Result<()> {
+-    let mut has_hardware: bool = false;
+-
+-    println!("ℹ️  Pre-flight checks");
+-
+-    /* USB Role Switcher hardware detection */
+-    println!("🔍 Discovering URSs");
+-    for name in &discover_urss() {
+-        if let Ok(urs) = URS::load(name) {
+-            println!(" - Name: {}", urs.name);
+-            println!("   Role: {:?}", urs.role);
+-            if let Some(udc) = urs.udc {
+-                println!("\t  UDC: {}", udc.name);
+-            }
+-
+-            has_hardware = true;
+-        }
++    std::fs::create_dir_all("/run/usb-signaller")?;
++    let lock = std::fs::OpenOptions::new()
++        .write(true)
++        .create(true)
++        .truncate(false)
++        .open("/run/usb-signaller/manager.lock")?;
++    lock.try_lock()
++        .map_err(|e| anyhow::anyhow!("Another usb-signaller manager is running: {e}"))?;
++    if std::env::args().nth(1).as_deref() == Some("--cleanup") {
++        use crate::manager::Backend;
++        return manager::LinuxBackend::new().teardown();
+     }
+-
+-    /* USB Device Controller hardware detection */
+-    println!("🔍 Discovering UDCs");
+-    for name in &discover_udcs() {
+-        let udc = UDC::load(name)?;
+-        println!(" - Name: {}", udc.name);
+-        println!("   Enabled: {}", udc.enabled);
+-        println!("   Mode: {:?}", udc.mode);
+-        if let Some(gadget) = udc.gadget {
+-            println!("   Gadget: {}", gadget.name);
+-            println!(
+-                "     Vendor: {} ({})",
+-                gadget.manufacturer, gadget.id_vendor
+-            );
+-            println!("     Product: {} ({})", gadget.product, gadget.id_product);
+-            println!("     Serialnumber: {}", gadget.serialnumber);
+-            println!("     Functions:");
+-            for function in &gadget.functions {
+-                println!("       - {}", function.name);
+-            }
+-            println!("     Configurations:");
+-            for config in &gadget.configs {
+-                println!("       - {} ({})", config.name, config.configuration);
+-            }
+-        }
+-
+-        has_hardware = true;
++    let default = configuration::Configuration::get_default_mode()
++        .unwrap_or_else(|_| "developer_mode".into());
++    let worker = manager::start(manager::Mode::parse(&default)?);
++    let result = async {
++        let connection = create_usbmoded_connection().await?;
++        let local = tokio::task::LocalSet::new();
++        local
++            .run_until(async move {
++                tokio::task::spawn_local(async move {
++                    if let Err(error) = monitor::monitor_usb_events(connection).await {
++                        eprintln!("USB udev monitor: {error:#}; polling remains active");
++                    }
++                });
++                use tokio::signal::unix::{SignalKind, signal};
++                let mut term = signal(SignalKind::terminate())?;
++                tokio::select! { _ = term.recv() => {}, _ = tokio::signal::ctrl_c() => {} }
++                Ok::<(), anyhow::Error>(())
++            })
++            .await
+     }
+-
+-    /* Operating without URS or UDC is impossible, exit */
+-    if !has_hardware {
+-        eprintln!("❌ No USB Device Controller (UDC) or USB Role Switcher (URS) available.");
+-        eprintln!(
+-            "ℹ️  Verify if your device has the necessary hardware and kernel drivers available."
+-        );
+-        process::exit(1);
+-    }
+-
+-    println!("ℹ️  Running DBus server");
+-    /* Create DBus server */
+-    let connection = create_usbmoded_connection().await?;
+-
+-    /* Apply default mode if needed */
+-    if let Ok(default_mode) = Configuration::get_default_mode() {
+-        println!("ℹ️  Applying default mode: {default_mode}");
+-        let emitter = SignalEmitter::new(&connection.clone(), "/com/meego/usb_moded")?;
+-        if let Err(error) = UsbModedDBus::set_mode(&UsbModedDBus, &default_mode, emitter).await {
+-            return Err(error.into());
+-        };
+-    }
+-
+-    /* Spawn udev monitor as background task */
+-    let local = LocalSet::new();
+-    local
+-        .run_until(async move {
+-            let shutdown_connection = &connection.clone();
+-            tokio::task::spawn_local(async move {
+-                println!("ℹ️  Running udev monitor");
+-                if let Err(error) = monitor_usb_events(connection.clone()).await {
+-                    eprintln!("⚠️  Failed to monitor udev events: {error:?}");
+-                }
+-            });
+-
+-            /* Gracefull shutdown */
+-            #[cfg(unix)]
+-            {
+-                use tokio::signal::unix::{SignalKind, signal};
+-
+-                let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+-
+-                tokio::select! {
+-                    _ = sigterm.recv() => println!("ℹ️  Received SIGTERM"),
+-                    _ = signal::ctrl_c()  => println!("ℹ️  Received SIGINT (Ctrl+C)"),
+-                }
+-            }
+-
+-            /* Clean up */
+-            println!("ℹ️  Cleaning up!");
+-            let emitter =
+-                SignalEmitter::new(&shutdown_connection.clone(), "/com/meego/usb_moded").unwrap();
+-            if let Err(error) =
+-                UsbModedDBus::set_mode(&UsbModedDBus, "charging_only", emitter).await
+-            {
+-                eprintln!("⚠️  Failed to clean up before shutdown: {error:?}");
+-            };
+-        })
+-        .await;
+-
+-    println!("👋 Bye!");
+-    return Ok(());
++    .await;
++    manager::stop();
++    let _ = worker.join();
++    result
+ }
+--- a/src/dbus.rs
++++ b/src/dbus.rs
+@@ -1,228 +1,38 @@
++use crate::manager;
+ use anyhow::Result;
+-use std::string::String;
+-use tokio::time::{Duration, sleep};
++use std::collections::BTreeMap;
+ use zbus::{Connection, connection, interface, object_server::SignalEmitter};
+ 
+-use crate::udc::{UDC, discover_udcs};
+-use crate::urs::URSRole;
+-use crate::urs::{URS, discover_urss};
+-use crate::utils::{string_to_udcmode, udcmode_to_string};
+-
+ pub struct UsbModedDBus;
+-static MODE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+-
+ pub async fn create_usbmoded_connection() -> Result<Connection> {
+-    return Ok(connection::Builder::system()?
++    Ok(connection::Builder::system()?
+         .name("com.meego.usb_moded")?
+         .serve_at("/com/meego/usb_moded", UsbModedDBus)?
+         .build()
+-        .await?);
++        .await?)
+ }
+-
+ #[interface(name = "com.meego.usb_moded")]
+ impl UsbModedDBus {
+     #[zbus(signal, name = "sig_usb_event_ind")]
+     pub async fn sig_usb_event_ind(emitter: &SignalEmitter<'_>, event: String) -> zbus::Result<()>;
+ 
+     #[zbus(name = "set_mode")]
+-    pub async fn set_mode(
+-        &self,
+-        mode: &str,
+-        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+-    ) -> Result<String, zbus::fdo::Error> {
+-        let _guard = MODE_LOCK.lock().await;
+-        println!("ℹ️  DBus: set_mode({mode})");
+-        if let Ok(modes) = std::env::var("USB_SIGNALLER_MODES") {
+-            if !modes.split(',').any(|allowed| allowed == mode) {
+-                return Err(zbus::fdo::Error::InvalidArgs(format!("Unsupported mode: {mode}")));
+-            }
+-        }
+-
+-        /* Netboot mode may never be interrupted */
+-        if mode == "netboot_mode" {
+-            eprintln!("⚠️  Netboot mode cannot be changed");
+-            return Err(zbus::fdo::Error::Failed(
+-                "Netboot mode cannot be changed".into(),
+-            ));
+-        }
+-
+-        /* USB Role Switcher */
+-        for name in &discover_urss() {
+-            if URS::load(name).is_ok() {
+-                let role = match mode {
+-                    "host_mode" => URSRole::Host,
+-                    _ => URSRole::Device,
+-                };
+-
+-                /* Configure role */
+-                {
+-                    let urs = URS::set_role(&role)
+-                        .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+-                    println!("URS reconfigured:");
+-                    println!("  Name: {}", urs.name);
+-                    println!("  Role: {:?}", urs.role);
+-                    if let Some(udc) = urs.udc {
+-                        println!("  UDC: {}", udc.name);
+-                    }
+-                }
+-
+-                /* Host role doesn't require any UDC configuration, return here */
+-                if role == URSRole::Host {
+-                    /* Trigger show dialog */
+-                    if let Err(error) = emitter
+-                        .sig_usb_event_ind(String::from("mode_requested_show_dialog"))
+-                        .await
+-                    {
+-                        eprintln!("❌ Failed to emit signal to show dialog: {error}");
+-                    }
+-                    return Ok("host_mode".to_string());
+-                }
+-            }
+-        }
+-
+-        /* Role is device, process UDC */
+-        /* Determine the target mode enum before moving 'mode' */
+-        let target_mode = string_to_udcmode(mode);
+-
+-        /* Apply the mode to discovered UDCs */
+-        for name in &discover_udcs() {
+-            match UDC::load(name) {
+-                Ok(udc) => {
+-                    match UDC::set_mode(udc, target_mode.clone()) {
+-                        Ok(udc) => {
+-                            if udc.mode != target_mode {
+-                                return Err(zbus::fdo::Error::Failed(format!(
+-                                    "Requested {target_mode:?}, observed {:?}", udc.mode)));
+-                            }
+-                            println!("UDC reconfigured:");
+-                            println!("  Name: {}", udc.name);
+-                            println!("  Enabled: {}", udc.enabled);
+-                            println!("  Mode: {:?}", udc.mode);
+-                            if let Some(gadget) = udc.gadget {
+-                                println!("  Gadget: {}", gadget.name);
+-                            }
+-                            let return_str = udcmode_to_string(target_mode);
+-
+-                            /* Trigger show dialog */
+-                            if let Err(error) = emitter
+-                                .sig_usb_event_ind(String::from("mode_requested_show_dialog"))
+-                                .await
+-                            {
+-                                eprintln!("❌ Failed to emit signal to show dialog: {error}");
+-                            }
+-
+-                            return Ok(return_str.to_string());
+-                        }
+-                        Err(err) => {
+-                            eprintln!("❌ UDC reconfiguring failed: {err:?}");
+-                            return Err(zbus::fdo::Error::Failed(format!(
+-                                "UDC reconfiguring failed: {err:?}"
+-                            )));
+-                        }
+-                    };
+-                }
+-                Err(err) => {
+-                    eprintln!("❌ UDC loading failed: {err:?}");
+-                    return Err(zbus::fdo::Error::Failed(format!(
+-                        "UDC loading failed: {err:?}"
+-                    )));
+-                }
+-            };
+-        }
+-
+-        /* UDC failed so this must be an error */
+-        return Err(zbus::fdo::Error::Failed("UDC failed".to_string()));
++    pub async fn set_mode(&self, mode: &str) -> Result<String, zbus::fdo::Error> {
++        manager::request(mode).map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))
+     }
+-
++    #[zbus(name = "get_status")]
++    pub async fn get_status(&self) -> BTreeMap<String, String> {
++        manager::status()
++    }
+     #[zbus(name = "mode_request")]
+-    pub async fn mode_request(&self) -> Result<String, zbus::fdo::Error> {
+-        println!("ℹ️  DBus: mode_request()");
+-        /* Search for USB Role Switcher */
+-        for name in &discover_urss() {
+-            let mut skipped: bool = false;
+-            /* When the cable is plugged in, reading the URS immediately may give 'device'
+-             * as role. A few ms later, it may have switched to 'host', causing no UDC
+-             * to be present anymore. Retry in that case until role is stable
+-             */
+-            for _n in 1..10 {
+-                if let Ok(urs) = URS::load(name) {
+-                    let role = urs.role;
+-                    println!("Loaded URS: {} ({:?})", urs.name, role);
+-
+-                    match role {
+-                        /* Host role has no additional modes */
+-                        URSRole::Host => return Ok("host_mode".to_string()),
+-                        /* Load UDC associated with URS in device role */
+-                        URSRole::Device => {
+-                            if let Some(udc) = urs.udc {
+-                                let mode = udc.mode;
+-                                println!("URS (role Device) UDC: {mode:?}");
+-                                return Ok(udcmode_to_string(mode).to_string());
+-                            } else {
+-                                eprintln!(
+-                                    "⚠️  URS (role Device) has no UDC assigned yet, rereading role..."
+-                                );
+-                                sleep(Duration::from_millis(1000)).await;
+-                                continue;
+-                            }
+-                        }
+-                        URSRole::Unknown => {
+-                            eprintln!("❌ Unknown USB role, cannot proceed");
+-                            return Err(zbus::fdo::Error::Failed(
+-                                "Unknown USB role, cannot proceed".to_string(),
+-                            ));
+-                        }
+-                    }
+-                } else {
+-                    skipped = true;
+-                }
+-            }
+-
+-            if skipped {
+-                continue;
+-            }
+-
+-            return Err(zbus::fdo::Error::Failed(
+-                "URS Device has no UDC assigned".to_string(),
+-            ));
+-        }
+-
+-        /* No USB Role Switcher available, fallback to UDC only */
+-        for name in &discover_udcs() {
+-            println!("⚠️  Fallback to UDC-only mode, UDC: {name}");
+-            if let Ok(udc) = UDC::load(name) {
+-                let mode = udc.mode;
+-                return Ok(udcmode_to_string(mode).to_string());
+-            }
+-        }
+-
+-        /* Pre-flight checks enforces that the necessary hardware is present */
+-        eprintln!("❌ No USB Device Controler (UDC) or USB Role Switcher (URS) available!");
+-        return Err(zbus::fdo::Error::Failed(
+-            "No UDC or URS available!".to_string(),
+-        ));
++    pub async fn mode_request(&self) -> String {
++        manager::status()
++            .get("actual_mode")
++            .cloned()
++            .unwrap_or_else(|| "unknown_mode".into())
+     }
+-
+     #[zbus(name = "get_modes")]
+     pub async fn get_modes(&self) -> String {
+-        if let Ok(modes) = std::env::var("USB_SIGNALLER_MODES") {
+-            return modes;
+-        }
+-        /*
+-         * Netboot mode is never available for users.
+-         * Unknown and disconnected modes are internal modes.
+-         */
+-        let mut available_modes =
+-            String::from("developer_mode,tethering_mode,charging_only,mtp_ffs_mode");
+-
+-        /* USB Role Switcher is required for host mode */
+-        for name in &discover_urss() {
+-            if URS::load(name).is_ok() {
+-                available_modes.push_str(",host_mode");
+-                break;
+-            }
+-        }
+-
+-        return available_modes;
++        manager::modes()
+     }
+ }
+--- a/src/monitor.rs
++++ b/src/monitor.rs
+@@ -15,6 +15,7 @@
+     while let Some(event) = monitor.next().await {
+         let event = event?;
+ 
++        crate::manager::reconcile();
+         match event.event_type() {
+             EventType::Add => {
+                 println!("ℹ️  Cable connected (typec)");
+--- a/src/gadget.rs
++++ b/src/gadget.rs
+@@ -140,57 +140,16 @@
+         return configurations;
+     }
+ 
+-    fn wait_for_state(udc_name: &str, state: &str) -> anyhow::Result<()> {
+-        for _n in 1..30 {
+-            thread::sleep(Duration::from_millis(100));
+-            let value = sysfs_read(
+-                PathBuf::from(SYSFS_CLASS_BASE_PATH)
+-                    .join(UDC_PATH)
+-                    .join(udc_name)
+-                    .join(STATE_NODE),
+-            )?;
+-            if value == state {
+-                return Ok(());
+-            }
+-        }
+-
+-        return Err(anyhow::anyhow!(
+-            "Enabling/Disabling gadget failed, UDC did not enter '{state}' mode after 3s"
+-        ));
+-    }
+-
++    // Binding and enumeration are different states. No cable is a valid bind.
+     pub fn enable(gadget_name: &str, udc_name: &str) -> anyhow::Result<()> {
+-        sysfs_write(
+-            Self::configfs_base_path(gadget_name).join(UDC_NODE),
+-            udc_name,
+-        )?;
+-
+-        /*
+-         * Block until UDC enters 'configured' mode before considered enabled,
+-         * allow escaping when cable is unplugged.
+-         */
+-        match Self::wait_for_state(udc_name, "configured") {
+-            Ok(()) => {
+-                println!("UDC entered 'configured' state");
+-            }
+-            Err(_error) => {
+-                println!(
+-                    "Gadget enabled but not operational: UDC did not enter 'configured' state if cable is unplugged, assuming success"
+-                );
+-            }
+-        };
+-
+-        return Ok(());
++        sysfs_write(Self::configfs_base_path(gadget_name).join(UDC_NODE), udc_name)?;
++        anyhow::ensure!(sysfs_read(Self::configfs_base_path(gadget_name).join(UDC_NODE))? == udc_name,
++            "UDC binding was not retained");
++        Ok(())
+     }
+ 
+     pub fn disable(gadget_name: &str) -> anyhow::Result<()> {
+-        let udc_name = sysfs_read(Self::configfs_base_path(gadget_name).join(UDC_NODE))?;
+-        sysfs_write(Self::configfs_base_path(gadget_name).join(UDC_NODE), "\n")?;
+-
+-        /* Block until UDC enters 'not attached' mode before gadget is considered disabled */
+-        Self::wait_for_state(&udc_name, "not attached")?;
+-
+-        return Ok(());
++        sysfs_write(Self::configfs_base_path(gadget_name).join(UDC_NODE), "\n")
+     }
+ 
+     pub fn create(
+@@ -360,14 +319,12 @@
+     pub fn delete(gadget_name: &str) -> anyhow::Result<()> {
+         /* Remove configuration, linked functions, and configuration strings */
+         for entry in dir_entries(Self::configfs_base_path(gadget_name).join(CONFIGS_PATH)) {
+-            /* Configuration strings */
+-            sysfs_rm(
+-                Self::configfs_base_path(gadget_name)
+-                    .join(CONFIGS_PATH)
+-                    .join(&entry)
+-                    .join(STRINGS_PATH)
+-                    .join(LANGUAGE_PATH),
+-            )?;
++            /* A failed creation may not have installed the language yet. */
++            let language = Self::configfs_base_path(gadget_name)
++                .join(CONFIGS_PATH).join(&entry).join(STRINGS_PATH).join(LANGUAGE_PATH);
++            if language.exists() {
++                sysfs_rm(language)?;
++            }
+ 
+             /* Functions are symlinked into a configuration, remove them */
+             if let Ok(subentries) = read_dir(
+--- a/src/udc.rs
++++ b/src/udc.rs
+@@ -16,11 +16,9 @@
+  * along with this program. If not, see <https://www.gnu.org/licenses/>.
+  */
+ 
+-use crate::configuration::Configuration;
+ use crate::gadget::ConfigFsGadget;
+ use crate::gadget::discover_gadgets;
+-use crate::service::{service_start, service_stop};
+-use crate::sysfs::{sysfs_mount_functionfs, sysfs_read, sysfs_umount_functionfs, sysfs_write};
++use crate::sysfs::sysfs_read;
+ use crate::utils::dir_entries;
+ use std::path::PathBuf;
+ 
+@@ -74,23 +72,6 @@
+         return PathBuf::from("/dev/nbd0").exists();
+     }
+ 
+-    fn detect_tethering_mode() -> anyhow::Result<bool> {
+-        /* Tethering mode enables IP forwarding */
+-        let state = sysfs_read(
+-            PathBuf::from(SYSFS_PROC_BASE_PATH)
+-                .join(NET_PATH)
+-                .join(IPV4_PATH)
+-                .join(FORWARD_NODE),
+-        )?;
+-        if state == "0" {
+-            return Ok(false);
+-        } else if state == "1" {
+-            return Ok(true);
+-        }
+-
+-        unreachable!("IP forwarding state is either 0 or 1");
+-    }
+-
+     fn is_enabled(udc_name: &str) -> anyhow::Result<bool> {
+         let state = sysfs_read(
+             PathBuf::from(SYSFS_CLASS_BASE_PATH)
+@@ -103,352 +84,6 @@
+         } else {
+             return Ok(true);
+         }
+-    }
+-
+-    pub fn set_mode(udc: Self, mode: UDCMode) -> anyhow::Result<Self> {
+-        println!(
+-            "Setting mode of UDC {} from {:?} to {:?}",
+-            udc.name, udc.mode, mode
+-        );
+-
+-        /* Prevent setting the same mode */
+-        if udc.mode == mode {
+-            eprintln!(
+-                "⚠️  Already in requested mode: {:?}, ignoring request",
+-                udc.mode
+-            );
+-            let new_udc = UDC::load(&udc.name)?;
+-            return Ok(new_udc);
+-        }
+-
+-        /* Check if we are in readonly mode such as Netboot to prevent changing mode */
+-        if udc.mode == UDCMode::Netboot {
+-            eprintln!("⚠️  Cannot change read-only mode: {:?}", udc.mode);
+-            let new_udc = UDC::load(&udc.name)?;
+-            return Ok(new_udc);
+-        }
+-
+-        /* Prepare mode switch by creating new gadget with all configuration */
+-        println!("Preparing gadget mode switch");
+-        let name;
+-        let binding = sysfs_read(PathBuf::from(DEVICE_TREE_BASE_PATH).join(COMPATIBLE_NODE))?;
+-        let serial_override = std::env::var("USB_SIGNALLER_SERIAL").ok();
+-        let serialnumber = serial_override.as_deref().unwrap_or_else(|| binding
+-            .split("\0")
+-            .collect::<Vec<&str>>()
+-            .first()
+-            .map_or("usb-signaller", |v| v));
+-        let vendor;
+-        let product;
+-        let id_vendor;
+-        let id_product;
+-        let default_function;
+-        let configuration_description;
+-        let enable_acm = mode == UDCMode::Developer
+-            && std::env::var("USB_SIGNALLER_ACM").is_ok_and(|value| value == "1");
+-
+-        match mode {
+-            UDCMode::Developer => {
+-                name = "usb-signaller-developer";
+-                vendor = "Linux Foundation";
+-                product = if enable_acm { "NCM + ACM USB gadget (developer)" } else { "NCM USB gadget (developer)" };
+-                id_vendor = 0x1D6B; /* Linux Foundation */
+-                id_product = if enable_acm { 0x0104 } else { 0x0103 }; /* Composite or NCM */
+-                default_function = "ncm.usb0";
+-                configuration_description = "Developer mode";
+-            }
+-            UDCMode::Tethering => {
+-                name = "usb-signaller-tethering";
+-                vendor = "Linux Foundation";
+-                product = "NCM USB gadget (tethering)";
+-                id_vendor = 0x1D6B; /* Linux Foundation */
+-                id_product = 0x0103; /* NCM gadget */
+-                default_function = "ncm.usb0";
+-                configuration_description = "Tethering mode";
+-            }
+-            UDCMode::MTP => {
+-                name = "usb-signaller-mtp";
+-                vendor = "Linux Foundation";
+-                product = "FunctionFS USB gadget (MTP)";
+-                id_vendor = 0x1D6B; /* Linux Foundation */
+-                id_product = 0x0105; /* FunctionFS gadget */
+-                default_function = "ffs.mtp";
+-                configuration_description = "MTP mode";
+-            }
+-            UDCMode::Accessory => {
+-                name = "usb-signaller-accessory";
+-                vendor = "Google Inc.";
+-                product = "Android Open Accessory (accessory)";
+-                id_vendor = 0x18D1; /* Google Inc. */
+-                id_product = 0x2D00; /* Android Open Accessory (accessory) */
+-                default_function = "ffs.accessory";
+-                configuration_description = "Accessory mode";
+-            }
+-            UDCMode::Charging => {
+-                /* Disable current gadget and userspace services to enforce charging-only */
+-                if let Some(gadget) = udc.gadget {
+-                    /*
+-                     * Services: ignore errors since these services might
+-                     * not be running when starting up. Errors are logged.
+-                     */
+-                    match udc.mode {
+-                        UDCMode::Developer => {
+-                            let _ = service_stop("usb-signaller-developer-mode");
+-                        }
+-                        UDCMode::Tethering => {
+-                            let _ = service_stop("usb-signaller-tethering-mode");
+-                        }
+-                        UDCMode::MTP => {
+-                            /* FunctionFS requires to stop the daemon first after which an umount may happen */
+-                            let _ = service_stop("usb-signaller-mtp-mode");
+-                            let _ = sysfs_umount_functionfs("/dev/mtp");
+-                        }
+-                        _ => {
+-                            println!("No service needs to be ended for mode {mode:?}");
+-                        }
+-                    }
+-
+-                    /* Gadget */
+-                    let _ = ConfigFsGadget::disable(gadget.name.as_str());
+-                    ConfigFsGadget::delete(gadget.name.as_str())?;
+-                }
+-
+-                return UDC::load(&udc.name);
+-            }
+-            /* Mass storage (disk) and CD-ROM share the same mass_storage
+-             * gadget, like Developer and Tethering share the NCM gadget; they
+-             * differ only in the LUN 'cdrom' flag written below. The backing
+-             * image comes from the [mass_storage] config section, so bail out
+-             * early here if it is not set. */
+-            UDCMode::MassStorage | UDCMode::CdRom => {
+-                Configuration::get_storage_path()?;
+-                name = "usb-signaller-mass-storage";
+-                vendor = "Linux Foundation";
+-                product = "Mass Storage USB gadget";
+-                id_vendor = 0x1D6B; /* Linux Foundation */
+-                id_product = 0x0104; /* Multifunction Composite / storage */
+-                default_function = "mass_storage.0";
+-                configuration_description = "Mass storage mode";
+-            }
+-            UDCMode::Unknown => {
+-                return Err(anyhow::anyhow!("Cannot set UDC to mode 'Unknown'"));
+-            }
+-            UDCMode::Netboot => {
+-                return Err(anyhow::anyhow!("Cannot set UDC to readonly mode 'Netboot'"));
+-            }
+-        }
+-
+-        /* Create new gadget with new configuration */
+-        println!("Creating new gadget with requested configuration");
+-        let new_gadget = ConfigFsGadget::create(
+-            name,
+-            id_vendor,
+-            id_product,
+-            vendor,
+-            product,
+-            serialnumber,
+-            default_function,
+-            configuration_description,
+-            enable_acm,
+-        )?;
+-
+-        /* If all preparations went well, disable current gadget and enable new one */
+-        println!("Disabling current active gadget");
+-        if let Some(ref gadget) = udc.gadget {
+-            /*
+-             * Services: ignore errors since these services might
+-             * not be running when starting up. Errors are logged.
+-             */
+-            match udc.mode {
+-                UDCMode::Developer => {
+-                    let _ = service_stop("usb-signaller-developer-mode");
+-                }
+-                UDCMode::Tethering => {
+-                    let _ = service_stop("usb-signaller-tethering-mode");
+-                }
+-                UDCMode::MTP => {
+-                    /* FunctionFS requires to stop the daemon first after which an umount may happen */
+-                    let _ = service_stop("usb-signaller-mtp-mode");
+-                    let _ = sysfs_umount_functionfs("/dev/mtp");
+-                }
+-                _ => {
+-                    println!("No service needs to be ended for mode {mode:?}");
+-                }
+-            }
+-
+-            /* Disable gadget, if necessary */
+-            let _ = ConfigFsGadget::disable(gadget.name.as_str());
+-        }
+-
+-        /* If we get to this point, the new gadget is activated, remove the old gadget */
+-        if let Some(gadget) = udc.gadget {
+-            println!("Removing old gadget: {}", gadget.name);
+-            ConfigFsGadget::delete(gadget.name.as_str())?;
+-        }
+-
+-        /* Launch userspace services needed for gadget */
+-        println!("Launching userspace services and enable new gadget");
+-        match mode {
+-            UDCMode::Developer => {
+-                /* Enable gadget first */
+-                match ConfigFsGadget::enable(new_gadget.name.as_str(), &udc.name) {
+-                    Ok(()) => println!("Gadget enabled: {}", new_gadget.name),
+-                    Err(error) => {
+-                        eprintln!(
+-                            "❌ Failed to enable gadget: {} ({:?})",
+-                            new_gadget.name, error
+-                        );
+-                        let _ = ConfigFsGadget::disable(new_gadget.name.as_str());
+-                        ConfigFsGadget::delete(new_gadget.name.as_str())?;
+-                        let new_udc = UDC::load(&udc.name)?;
+-
+-                        return Ok(new_udc);
+-                    }
+-                };
+-
+-                /* Start userspace service */
+-                if let Ok(()) = service_start("usb-signaller-developer-mode") {
+-                    println!("Gadget userspace service started: {}", new_gadget.name);
+-                } else {
+-                    eprintln!("❌ Failed to start userspace service: {}", new_gadget.name);
+-                    let _ = ConfigFsGadget::disable(new_gadget.name.as_str());
+-                    ConfigFsGadget::delete(new_gadget.name.as_str())?;
+-                    let new_udc = UDC::load(&udc.name)?;
+-
+-                    return Ok(new_udc);
+-                }
+-            }
+-            UDCMode::Tethering => {
+-                /* Enable gadget first */
+-                match ConfigFsGadget::enable(new_gadget.name.as_str(), &udc.name) {
+-                    Ok(()) => println!("Gadget enabled: {}", new_gadget.name),
+-                    Err(error) => {
+-                        eprintln!(
+-                            "❌ Failed to enable gadget: {} ({:?})",
+-                            new_gadget.name, error
+-                        );
+-                        let _ = ConfigFsGadget::disable(new_gadget.name.as_str());
+-                        ConfigFsGadget::delete(new_gadget.name.as_str())?;
+-                        let new_udc = UDC::load(&udc.name)?;
+-
+-                        return Ok(new_udc);
+-                    }
+-                };
+-
+-                /* Start userspace service */
+-                if let Ok(()) = service_start("usb-signaller-tethering-mode") {
+-                    println!("Gadget userspace service started: {}", new_gadget.name);
+-                } else {
+-                    eprintln!("❌ Failed to start userspace service: {}", new_gadget.name);
+-                    let _ = ConfigFsGadget::disable(new_gadget.name.as_str());
+-                    ConfigFsGadget::delete(new_gadget.name.as_str())?;
+-                    let new_udc = UDC::load(&udc.name)?;
+-
+-                    return Ok(new_udc);
+-                }
+-            }
+-            UDCMode::MTP => {
+-                /* FunctionFS requires to mount first before the daemon starts */
+-                if let Ok(()) = sysfs_mount_functionfs("mtp", "/dev/mtp") {
+-                    println!("Gadget FunctionFS mounted: {}", new_gadget.name);
+-                } else {
+-                    eprintln!("❌ Failed to mount gadget FunctionFS: {}", new_gadget.name);
+-                    let _ = ConfigFsGadget::disable(new_gadget.name.as_str());
+-                    ConfigFsGadget::delete(new_gadget.name.as_str())?;
+-                    let new_udc = UDC::load(&udc.name)?;
+-
+-                    return Ok(new_udc);
+-                }
+-
+-                /* Start userspace service */
+-                if let Ok(()) = service_start("usb-signaller-mtp-mode") {
+-                    println!("Gadget userspace service started: {}", new_gadget.name);
+-                } else {
+-                    eprintln!("❌ Failed to start userspace service: {}", new_gadget.name);
+-                    let _ = ConfigFsGadget::disable(new_gadget.name.as_str());
+-                    ConfigFsGadget::delete(new_gadget.name.as_str())?;
+-                    let new_udc = UDC::load(&udc.name)?;
+-
+-                    return Ok(new_udc);
+-                }
+-
+-                /* Enable gadget now */
+-                match ConfigFsGadget::enable(new_gadget.name.as_str(), &udc.name) {
+-                    Ok(()) => println!("Gadget enabled: {}", new_gadget.name),
+-                    Err(error) => {
+-                        eprintln!(
+-                            "❌ Failed to enable gadget: {} ({:?})",
+-                            new_gadget.name, error
+-                        );
+-                        /* Stop userspace service */
+-                        let _ = service_stop("usb-signaller-mtp-mode");
+-
+-                        /* Unmount FunctionFS again */
+-                        let _ = sysfs_umount_functionfs("/dev/mtp");
+-
+-                        /* Remove new gadget */
+-                        let _ = ConfigFsGadget::disable(new_gadget.name.as_str());
+-                        ConfigFsGadget::delete(new_gadget.name.as_str())?;
+-                        let new_udc = UDC::load(&udc.name)?;
+-
+-                        return Ok(new_udc);
+-                    }
+-                };
+-            }
+-            UDCMode::MassStorage | UDCMode::CdRom => {
+-                /*
+-                 * Configure the LUN backing file. cdrom/ro/removable must be
+-                 * written before 'file', which activates the LUN. The image
+-                 * comes from the config; CD-ROM mode differs from plain mass
+-                 * storage only by the 'cdrom' flag.
+-                 */
+-                let image = Configuration::get_storage_path()?;
+-                let cdrom = mode == UDCMode::CdRom;
+-                let lun = PathBuf::from("/sys/kernel/config")
+-                    .join("usb_gadget")
+-                    .join(new_gadget.name.as_str())
+-                    .join("functions")
+-                    .join("mass_storage.0")
+-                    .join("lun.0");
+-
+-                let configure = || -> anyhow::Result<()> {
+-                    sysfs_write(lun.join("cdrom"), if cdrom { "1" } else { "0" })?;
+-                    sysfs_write(lun.join("ro"), "1")?;
+-                    sysfs_write(lun.join("removable"), "1")?;
+-                    /* Setting the file last exposes the medium read-only */
+-                    sysfs_write(lun.join("file"), image.as_str())?;
+-                    Ok(())
+-                };
+-
+-                if let Err(error) = configure() {
+-                    eprintln!("Failed to configure mass storage LUN: {error:?}");
+-                    let _ = ConfigFsGadget::disable(new_gadget.name.as_str());
+-                    ConfigFsGadget::delete(new_gadget.name.as_str())?;
+-                    return UDC::load(&udc.name);
+-                }
+-
+-                /* Enable gadget */
+-                match ConfigFsGadget::enable(new_gadget.name.as_str(), &udc.name) {
+-                    Ok(()) => println!("Gadget enabled: {}", new_gadget.name),
+-                    Err(error) => {
+-                        eprintln!("Failed to enable gadget: {} ({:?})", new_gadget.name, error);
+-                        let _ = ConfigFsGadget::disable(new_gadget.name.as_str());
+-                        ConfigFsGadget::delete(new_gadget.name.as_str())?;
+-                        let new_udc = UDC::load(&udc.name)?;
+-
+-                        return Ok(new_udc);
+-                    }
+-                };
+-            }
+-            _ => {
+-                println!("No service needs to be started for mode {mode:?}");
+-            }
+-        }
+-
+-        /* Update UDC structure */
+-        let new_udc = UDC::load(&udc.name)?;
+-
+-        return Ok(new_udc);
+     }
+ 
+     pub fn load(udc_name: &str) -> anyhow::Result<Self> {
+@@ -466,7 +101,8 @@
+                     /* USB Ethernet NCM gadget */
+                     if entry.configs[0].functions.iter().any(|function| function.name.starts_with("ncm.")) {
+                         /* Tethering mode allows IP forwarding such as using mobile data */
+-                        if Self::detect_tethering_mode()? {
++                        if entry.name == "usb-signaller-tethering"
++                            && PathBuf::from("/run/usb-signaller/tethering.ready").exists() {
+                             mode = UDCMode::Tethering;
+                         /* Netboot enforces the USB port into an readonly state */
+                         } else if Self::detect_netboot_mode() {
+--- a/src/urs.rs
++++ b/src/urs.rs
+@@ -16,7 +16,6 @@
+  * along with this program. If not, see <https://www.gnu.org/licenses/>.
+  */
+ 
+-use crate::gadget::{ConfigFsGadget, discover_gadgets};
+ use crate::sysfs::{sysfs_read, sysfs_write};
+ use crate::udc::UDC;
+ use crate::utils::dir_entries;
+@@ -126,11 +125,7 @@
+                         )?;
+                         Self::wait_for_role(&switch_name, "host")?;
+ 
+-                        println!("Cleaning up gadgets after switch to host role");
+-                        for gadget_name in discover_gadgets() {
+-                            ConfigFsGadget::delete(gadget_name.as_str())?;
+-                        }
+-
++                        // The serialized manager already removed only its owned gadgets.
+                         return URS::load(&switch_name);
+                     }
+                 },

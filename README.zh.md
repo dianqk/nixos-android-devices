@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-为八款高通和联发科手机、平板提供 NixOS 设备模块、内核和 U-Boot 固件。系统通过
+为九款高通和联发科手机、平板提供 NixOS 设备模块、内核和 U-Boot 固件。系统通过
 **U-Boot → systemd-boot → Linux** 启动，使用标准 NixOS 配置、更新和代际管理。
 
 ## 设备
@@ -17,6 +17,7 @@
 | Redmi Note 12 Turbo / POCO F5 | `marble` | [使用与安装](docs/marble/README.zh.md) |
 | 酷比魔方 iPlay 80 mini Ultra | `t880` | [使用与安装](docs/t880/README.zh.md) |
 | 一加 13 | `dodge` | [使用与安装](docs/dodge/README.zh.md) |
+| Xiaomi 12S Pro | `unicorn` | [使用与安装](docs/unicorn/README.zh.md) |
 
 各指南包含支持的硬件、存储约定、首次安装、更新、recovery 和已知限制。支持状态
 记录在各设备页中；本 README 不划分支持等级。

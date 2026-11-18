@@ -1,0 +1,25 @@
+Subject: [PATCH] usb: dwc3: stop generic peripheral DMA at OS handoff
+
+The generic peripheral driver provides a remove callback, but does not
+mark itself for active-DMA teardown. ExitBootServices therefore skips it,
+potentially leaving the controller writing events into U-Boot's buffer
+after control passes to the OS.
+
+Set DM_FLAG_ACTIVE_DMA so the existing remove path stops the gadget and
+cleans up its event buffers before handoff. Keep the wrapper unchanged so
+its clocks remain available during peripheral cleanup.
+
+Baseline: U-Boot v2026.10-rc5, a06e89ab05eaa2b8344d521319399333cd760ae5.
+Written and read back on Unicorn on 2026-11-14; the unchanged installed
+system booted twice. See docs/unicorn/display-runtime.zh.md for evidence.
+---
+--- a/drivers/usb/dwc3/dwc3-generic.c
++++ b/drivers/usb/dwc3/dwc3-generic.c
+@@ -212,6 +212,7 @@
+ };
+ 
+ U_BOOT_DRIVER(dwc3_generic_peripheral) = {
++	.flags = DM_FLAG_ACTIVE_DMA,
+ 	.name	= "dwc3-generic-peripheral",
+ 	.id	= UCLASS_USB_GADGET_GENERIC,
+ 	.of_to_plat = dwc3_generic_of_to_plat,

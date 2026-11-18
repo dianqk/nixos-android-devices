@@ -1,0 +1,4206 @@
+Subject: [PATCH] drm: support Unicorn L2S display and runtime refresh
+
+Implement the 1440x3200 DSC panel with 24/30/40/60/90/120 Hz modes,
+60 Hz preferred, and a fixed 1.36 Gbit/s-per-lane transfer budget.
+Preserve the OEM packet types, batching, TE scheduling and completion
+waits. Serialize optional active mode and panel idle transactions with
+power and brightness; both remain disabled by default. Generic VRR is
+not advertised. Retain error reporting without bring-up register dumps,
+BTA reads or diagnostic clock overrides.
+
+Command data and timing source:
+https://github.com/LineageOS/android_kernel_xiaomi_sm8450-devicetrees/blob/2e649a7f3e762903eedad43d8256b91e28b512d8/qcom/display/display/dsi-panel-l2s-38-0c-0a-dsc-cmd.dtsi
+
+diff --git a/Documentation/devicetree/bindings/display/panel/xiaomi,l2s-38-0c-0a.yaml b/Documentation/devicetree/bindings/display/panel/xiaomi,l2s-38-0c-0a.yaml
+new file mode 100644
+index 0000000..3c0fc60
+--- /dev/null
++++ b/Documentation/devicetree/bindings/display/panel/xiaomi,l2s-38-0c-0a.yaml
+@@ -0,0 +1,75 @@
++# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/display/panel/xiaomi,l2s-38-0c-0a.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Xiaomi L2S 38/0c/0a 1440x3200 AMOLED panel
++
++maintainers:
++  - dwuggh <dwuggh@gmail.com>
++
++description:
++  Four-lane MIPI DSI command-mode DSC panel used by Xiaomi 12S Pro.
++  The identifier distinguishes this panel from the alternative L2S
++  42/02/0b panel fitted to the same device model.
++
++allOf:
++  - $ref: panel-common.yaml#
++
++properties:
++  compatible:
++    const: xiaomi,l2s-38-0c-0a
++
++  reg:
++    maxItems: 1
++
++  vci-supply:
++    description: 3.0 V analog supply
++
++  vddio-supply:
++    description: 1.8 V I/O supply
++
++  vddd-supply:
++    description: 1.5 V digital supply
++
++  reset-gpios:
++    maxItems: 1
++    description: Active-low reset
++
++  port: true
++
++required:
++  - compatible
++  - reg
++  - vci-supply
++  - vddio-supply
++  - vddd-supply
++  - reset-gpios
++  - port
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/gpio/gpio.h>
++
++    dsi {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        panel@0 {
++            compatible = "xiaomi,l2s-38-0c-0a";
++            reg = <0>;
++            vci-supply = <&panel_vci>;
++            vddio-supply = <&panel_vddio>;
++            vddd-supply = <&panel_vddd>;
++            reset-gpios = <&tlmm 0 GPIO_ACTIVE_LOW>;
++
++            port {
++                panel_in: endpoint {
++                    remote-endpoint = <&mdss_dsi0_out>;
++                };
++            };
++        };
++    };
+diff --git a/drivers/gpu/drm/bridge/panel.c b/drivers/gpu/drm/bridge/panel.c
+index 02388a3..59aba63 100644
+--- a/drivers/gpu/drm/bridge/panel.c
++++ b/drivers/gpu/drm/bridge/panel.c
+@@ -123,8 +123,12 @@ static void panel_bridge_atomic_pre_enable(struct drm_bridge *bridge,
+ 		return;
+ 
+ 	old_crtc_state = drm_atomic_get_old_crtc_state(atomic_state, crtc);
+-	if (old_crtc_state && old_crtc_state->self_refresh_active)
++	if (old_crtc_state && old_crtc_state->self_refresh_active) {
++		if (panel_bridge->panel->funcs->idle_exit)
++			panel_bridge->panel->funcs->idle_exit(
++				panel_bridge->panel);
+ 		return;
++	}
+ 
+ 	drm_panel_prepare(panel_bridge->panel);
+ }
+@@ -161,8 +165,12 @@ static void panel_bridge_atomic_disable(struct drm_bridge *bridge,
+ 		return;
+ 
+ 	new_crtc_state = drm_atomic_get_new_crtc_state(atomic_state, crtc);
+-	if (new_crtc_state && new_crtc_state->self_refresh_active)
++	if (new_crtc_state && new_crtc_state->self_refresh_active) {
++		if (panel_bridge->panel->funcs->idle_enter)
++			panel_bridge->panel->funcs->idle_enter(
++				panel_bridge->panel);
+ 		return;
++	}
+ 
+ 	drm_panel_disable(panel_bridge->panel);
+ }
+@@ -205,7 +213,27 @@ static void panel_bridge_debugfs_init(struct drm_bridge *bridge,
+ 		panel->funcs->debugfs_init(panel, root);
+ }
+ 
++static int panel_bridge_atomic_check(struct drm_bridge *bridge,
++				     struct drm_bridge_state *bridge_state,
++				     struct drm_crtc_state *crtc_state,
++				     struct drm_connector_state *conn_state)
++{
++	struct drm_panel *panel = drm_bridge_to_panel_bridge(bridge)->panel;
++
++	/* Existing panels keep their previous connector-state behavior. */
++	if (!panel->funcs->idle_supported)
++		return 0;
++	conn_state->self_refresh_aware =
++		panel->funcs->idle_supported(panel, crtc_state);
++	if (conn_state->self_refresh_aware)
++		crtc_state->self_refresh_entry_delay_ms = 1000;
++	if (crtc_state->self_refresh_active && !conn_state->self_refresh_aware)
++		return -EINVAL;
++	return 0;
++}
++
+ static const struct drm_bridge_funcs panel_bridge_bridge_funcs = {
++	.atomic_check = panel_bridge_atomic_check,
+ 	.attach = panel_bridge_attach,
+ 	.detach = panel_bridge_detach,
+ 	.atomic_pre_enable = panel_bridge_atomic_pre_enable,
+@@ -233,6 +261,14 @@ bool drm_bridge_is_panel(const struct drm_bridge *bridge)
+ }
+ EXPORT_SYMBOL(drm_bridge_is_panel);
+ 
++struct drm_panel *drm_panel_bridge_get_panel(struct drm_bridge *bridge)
++{
++	if (!bridge || !drm_bridge_is_panel(bridge))
++		return NULL;
++	return drm_bridge_to_panel_bridge(bridge)->panel;
++}
++EXPORT_SYMBOL_GPL(drm_panel_bridge_get_panel);
++
+ /**
+  * drm_panel_bridge_add - Creates a &drm_bridge and &drm_connector that
+  * just calls the appropriate functions from &drm_panel.
+diff --git a/drivers/gpu/drm/drm_mipi_dsi.c b/drivers/gpu/drm/drm_mipi_dsi.c
+index 3ac1dd5..411bbfa 100644
+--- a/drivers/gpu/drm/drm_mipi_dsi.c
++++ b/drivers/gpu/drm/drm_mipi_dsi.c
+@@ -2079,3 +2079,21 @@ postcore_initcall(mipi_dsi_bus_init);
+ MODULE_AUTHOR("Andrzej Hajda <a.hajda@samsung.com>");
+ MODULE_DESCRIPTION("MIPI DSI Bus");
+ MODULE_LICENSE("GPL and additional rights");
++
++/**
++ * mipi_dsi_transfer_sequence - send explicit packets as a single transaction
++ * @dsi: DSI peripheral
++ * @cmds: Write commands with explicit flags, grouping and completion delays
++ * @count: Number of commands
++ *
++ * No implicit LP-mode flags are added. Unsupported hosts return -EOPNOTSUPP.
++ * Returns zero only after every DMA group and delay has completed.
++ */
++int mipi_dsi_transfer_sequence(struct mipi_dsi_device *dsi,
++			       const struct mipi_dsi_cmd *cmds, size_t count)
++{
++	if (!count || !cmds || !dsi->host->ops->transfer_sequence)
++		return -EOPNOTSUPP;
++	return dsi->host->ops->transfer_sequence(dsi->host, cmds, count);
++}
++EXPORT_SYMBOL_GPL(mipi_dsi_transfer_sequence);
+diff --git a/drivers/gpu/drm/drm_self_refresh_helper.c b/drivers/gpu/drm/drm_self_refresh_helper.c
+index 37ec7fb..1a6daf7 100644
+--- a/drivers/gpu/drm/drm_self_refresh_helper.c
++++ b/drivers/gpu/drm/drm_self_refresh_helper.c
+@@ -218,6 +218,7 @@ void drm_self_refresh_helper_alter_state(struct drm_atomic_commit *state)
+ 			 ewma_psr_time_read(&sr_data->exit_avg_ms)) * 2;
+ 		mutex_unlock(&sr_data->avg_mutex);
+ 
++		delay = max(delay, crtc_state->self_refresh_entry_delay_ms);
+ 		mod_delayed_work(system_percpu_wq, &sr_data->entry_work,
+ 				 msecs_to_jiffies(delay));
+ 	}
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+index 42d0a52..5430b2e 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -1169,6 +1169,7 @@ static struct drm_crtc_state *dpu_crtc_duplicate_state(struct drm_crtc *crtc)
+ 
+ 	/* duplicate base helper */
+ 	__drm_atomic_helper_crtc_duplicate_state(crtc, &cstate->base);
++	cstate->runtime_mode_changed = false;
+ 
+ 	return &cstate->base;
+ }
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
+index 6eaba56..aa94409 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
+@@ -207,6 +207,8 @@ struct dpu_crtc {
+  */
+ struct dpu_crtc_state {
+ 	struct drm_crtc_state base;
++	bool runtime_mode_changed;
++	struct drm_display_mode runtime_old_mode;
+ 
+ 	bool bw_control;
+ 	bool bw_split_vote;
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+index 1f20695..643ac00 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -31,7 +31,9 @@
+ #include "dpu_hw_cdm.h"
+ #include "dpu_formats.h"
+ #include "dpu_encoder_phys.h"
++#include <drm/drm_vblank.h>
+ #include "dpu_crtc.h"
++#include "dsi/dsi.h"
+ #include "dpu_trace.h"
+ #include "dpu_core_irq.h"
+ #include "disp/msm_disp_snapshot.h"
+@@ -2944,3 +2946,40 @@ void dpu_encoder_phys_init(struct dpu_encoder_phys *phys_enc,
+ 
+ 	init_waitqueue_head(&phys_enc->pending_kickoff_wq);
+ }
++
++static struct msm_dsi *dpu_encoder_runtime_dsi(struct drm_encoder *encoder)
++{
++	struct dpu_encoder_virt *enc = to_dpu_encoder_virt(encoder);
++	struct msm_drm_private *priv = encoder->dev->dev_private;
++	unsigned int id = enc->disp_info.h_tile_instance[0];
++	if (enc->disp_info.intf_type != INTF_DSI || enc->num_phys_encs != 1 ||
++	    enc->phys_encs[0]->intf_mode != INTF_MODE_CMD || id >= DSI_MAX)
++		return NULL;
++	return priv->kms->dsi[id];
++}
++
++bool dpu_encoder_runtime_mode_valid(struct drm_encoder *encoder,
++				    const struct drm_display_mode *old,
++				    const struct drm_display_mode *new)
++{
++	struct msm_dsi *dsi = dpu_encoder_runtime_dsi(encoder);
++	return dsi && msm_dsi_runtime_mode_valid(dsi, old, new);
++}
++
++int dpu_encoder_runtime_mode_set(struct drm_encoder *encoder,
++				 struct drm_crtc_state *state,
++				 const struct drm_display_mode *old)
++{
++	struct msm_dsi *dsi = dpu_encoder_runtime_dsi(encoder);
++	struct dpu_encoder_virt *enc = to_dpu_encoder_virt(encoder);
++	int ret;
++	if (!dsi)
++		return -EOPNOTSUPP;
++	ret = msm_dsi_runtime_mode_set(dsi, old, &state->adjusted_mode);
++	if (ret)
++		return ret;
++	enc->phys_encs[0]->cached_mode = state->adjusted_mode;
++	enc->phys_encs[0]->ops.runtime_mode_set(enc->phys_encs[0]);
++	drm_calc_timestamping_constants(state->crtc, &state->adjusted_mode);
++	return 0;
++}
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
+index 4942097..db074d8 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
+@@ -98,4 +98,11 @@ void dpu_encoder_cleanup_wb_job(struct drm_encoder *drm_enc,
+ bool dpu_encoder_is_valid_for_commit(struct drm_encoder *drm_enc);
+ 
+ void dpu_encoder_start_frame_done_timer(struct drm_encoder *drm_enc);
++bool dpu_encoder_runtime_mode_valid(struct drm_encoder *encoder,
++				    const struct drm_display_mode *old,
++				    const struct drm_display_mode *new);
++int dpu_encoder_runtime_mode_set(struct drm_encoder *encoder,
++				 struct drm_crtc_state *state,
++				 const struct drm_display_mode *old);
++
+ #endif /* __DPU_ENCODER_H__ */
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys.h
+index 61b22d9..777ed56 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys.h
+@@ -93,6 +93,7 @@ struct dpu_encoder_phys;
+  */
+ 
+ struct dpu_encoder_phys_ops {
++	void (*runtime_mode_set)(struct dpu_encoder_phys *encoder);
+ 	void (*prepare_commit)(struct dpu_encoder_phys *encoder);
+ 	bool (*is_master)(struct dpu_encoder_phys *encoder);
+ 	void (*atomic_mode_set)(struct dpu_encoder_phys *encoder,
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
+index 45079ee..4034425 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
+@@ -715,6 +715,7 @@ static void dpu_encoder_phys_cmd_init_ops(
+ {
+ 	ops->is_master = dpu_encoder_phys_cmd_is_master;
+ 	ops->atomic_mode_set = dpu_encoder_phys_cmd_atomic_mode_set;
++	ops->runtime_mode_set = dpu_encoder_phys_cmd_tearcheck_config;
+ 	ops->enable = dpu_encoder_phys_cmd_enable;
+ 	ops->disable = dpu_encoder_phys_cmd_disable;
+ 	ops->control_vblank_irq = dpu_encoder_phys_cmd_control_vblank_irq;
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+index da3556e..85350bd 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+@@ -462,6 +462,75 @@ static int dpu_kms_check_mode_changed(struct msm_kms *kms, struct drm_atomic_com
+ 	return 0;
+ }
+ 
++static int dpu_kms_check_runtime_mode(struct msm_kms *kms,
++				      struct drm_atomic_commit *state)
++{
++	struct drm_crtc_state *old, *new;
++	struct drm_crtc *crtc;
++	struct drm_encoder *encoder;
++	int i, count;
++	bool valid;
++
++	for_each_oldnew_crtc_in_state(state, crtc, old, new, i) {
++		struct dpu_crtc_state *cs = to_dpu_crtc_state(new);
++		cs->runtime_mode_changed = false;
++		if (!new->mode_changed || !old->active || !new->active ||
++		    old->self_refresh_active || new->self_refresh_active ||
++		    new->active_changed || new->connectors_changed ||
++		    new->color_mgmt_changed ||
++		    old->encoder_mask != new->encoder_mask ||
++		    drm_mode_equal(&old->mode, &new->mode))
++			continue;
++		count = 0;
++		valid = true;
++		drm_for_each_encoder_mask(encoder, crtc->dev,
++					  new->encoder_mask) {
++			count++;
++			if (!dpu_encoder_runtime_mode_valid(
++				    encoder, &old->adjusted_mode,
++				    &new->adjusted_mode))
++				valid = false;
++		}
++		if (count != 1 || !valid)
++			continue;
++		cs->runtime_old_mode = old->adjusted_mode;
++		cs->runtime_mode_changed = true;
++		new->mode_changed = false;
++		state->legacy_cursor_update = false;
++		state->async_update = false;
++	}
++	return 0;
++}
++
++static void dpu_kms_prepare_runtime_commit(struct msm_kms *kms,
++					   struct drm_atomic_commit *state)
++{
++	struct drm_crtc_state *new;
++	struct drm_crtc *crtc;
++	struct drm_encoder *encoder;
++	int i, ret;
++
++	for_each_new_crtc_in_state(state, crtc, new, i) {
++		struct dpu_crtc_state *cs = to_dpu_crtc_state(new);
++		if (!cs->runtime_mode_changed || new->mode_changed)
++			continue;
++		drm_for_each_encoder_mask(encoder, crtc->dev,
++					  new->encoder_mask) {
++			ret = dpu_encoder_runtime_mode_set(
++				encoder, new, &cs->runtime_old_mode);
++			if (ret) {
++				/* Resources were checked for the complete modeset before fast-path
++     * selection. Tail has not disabled anything yet: recover using it. */
++				DPU_ERROR(
++					"runtime mode transaction failed: %d; full modeset\n",
++					ret);
++				new->mode_changed = true;
++				cs->runtime_mode_changed = false;
++			}
++		}
++	}
++}
++
+ static void dpu_kms_flush_commit(struct msm_kms *kms, unsigned crtc_mask)
+ {
+ 	struct dpu_kms *dpu_kms = to_dpu_kms(kms);
+@@ -1067,23 +1136,25 @@ static void dpu_kms_mdp_snapshot(struct msm_disp_state *disp_state, struct msm_k
+ }
+ 
+ static const struct msm_kms_funcs kms_funcs = {
+-	.hw_init         = dpu_kms_hw_init,
+-	.irq_preinstall  = dpu_core_irq_preinstall,
++	.hw_init = dpu_kms_hw_init,
++	.irq_preinstall = dpu_core_irq_preinstall,
+ 	.irq_postinstall = dpu_irq_postinstall,
+-	.irq_uninstall   = dpu_core_irq_uninstall,
+-	.irq             = dpu_core_irq,
+-	.enable_commit   = dpu_kms_enable_commit,
+-	.disable_commit  = dpu_kms_disable_commit,
++	.irq_uninstall = dpu_core_irq_uninstall,
++	.irq = dpu_core_irq,
++	.enable_commit = dpu_kms_enable_commit,
++	.disable_commit = dpu_kms_disable_commit,
+ 	.check_mode_changed = dpu_kms_check_mode_changed,
+-	.flush_commit    = dpu_kms_flush_commit,
+-	.wait_flush      = dpu_kms_wait_flush,
++	.check_runtime_mode = dpu_kms_check_runtime_mode,
++	.prepare_commit = dpu_kms_prepare_runtime_commit,
++	.flush_commit = dpu_kms_flush_commit,
++	.wait_flush = dpu_kms_wait_flush,
+ 	.complete_commit = dpu_kms_complete_commit,
+-	.enable_vblank   = dpu_kms_enable_vblank,
+-	.disable_vblank  = dpu_kms_disable_vblank,
+-	.destroy         = dpu_kms_destroy,
+-	.snapshot        = dpu_kms_mdp_snapshot,
++	.enable_vblank = dpu_kms_enable_vblank,
++	.disable_vblank = dpu_kms_disable_vblank,
++	.destroy = dpu_kms_destroy,
++	.snapshot = dpu_kms_mdp_snapshot,
+ #ifdef CONFIG_DEBUG_FS
+-	.debugfs_init    = dpu_kms_debugfs_init,
++	.debugfs_init = dpu_kms_debugfs_init,
+ #endif
+ };
+ 
+diff --git a/drivers/gpu/drm/msm/dsi/dsi.h b/drivers/gpu/drm/msm/dsi/dsi.h
+index 93c028a..610b9b4 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi.h
++++ b/drivers/gpu/drm/msm/dsi/dsi.h
+@@ -56,6 +56,18 @@ int msm_dsi_manager_register(struct msm_dsi *msm_dsi);
+ void msm_dsi_manager_unregister(struct msm_dsi *msm_dsi);
+ void msm_dsi_manager_tpg_enable(void);
+ 
++bool msm_dsi_runtime_mode_valid(struct msm_dsi *dsi,
++				const struct drm_display_mode *old,
++				const struct drm_display_mode *new);
++int msm_dsi_runtime_mode_set(struct msm_dsi *dsi,
++			     const struct drm_display_mode *old,
++			     const struct drm_display_mode *new);
++bool msm_dsi_host_runtime_mode_valid(struct mipi_dsi_host *host,
++				     const struct drm_display_mode *old,
++				     const struct drm_display_mode *new);
++int msm_dsi_host_runtime_mode_set(struct mipi_dsi_host *host,
++				  const struct drm_display_mode *mode);
++
+ /* dsi host */
+ struct msm_dsi_host;
+ int msm_dsi_host_xfer_prepare(struct mipi_dsi_host *host,
+diff --git a/drivers/gpu/drm/msm/dsi/dsi_host.c b/drivers/gpu/drm/msm/dsi/dsi_host.c
+index c73a76c..7795c8f 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi_host.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_host.c
+@@ -129,6 +129,7 @@ struct msm_dsi_host {
+ 	struct clk *dsi_pll_pixel_clk;
+ 
+ 	unsigned long byte_clk_rate;
++	bool unicorn_panel;
+ 	bool byte_intf_clk_div_2;
+ 	unsigned long pixel_clk_rate;
+ 	unsigned long esc_clk_rate;
+@@ -144,6 +145,7 @@ struct msm_dsi_host {
+ 	struct completion video_comp;
+ 	struct mutex dev_mutex;
+ 	struct mutex cmd_mutex;
++	unsigned long cmd_hs_rate;
+ 	spinlock_t intr_lock; /* Protect interrupt ctrl register */
+ 
+ 	u32 err_work_state;
+@@ -650,13 +652,32 @@ static unsigned long dsi_get_pclk_rate(const struct drm_display_mode *mode,
+ 	return pclk_rate;
+ }
+ 
++/* Keep the pixel/byte ratio, including RGB101010, in mode validation too. */
++static unsigned long dsi_host_get_pclk_rate(struct msm_dsi_host *msm_host,
++		const struct drm_display_mode *mode, bool is_bonded_dsi)
++{
++	unsigned long rate = dsi_get_pclk_rate(mode, msm_host->dsc, is_bonded_dsi);
++	int bpp;
++
++	if (msm_host->cmd_hs_rate && !is_bonded_dsi && !msm_host->cphy_mode &&
++	    !(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO) && msm_host->lanes) {
++		bpp = mipi_dsi_pixel_format_to_bpp(msm_host->format);
++		if (bpp > 0)
++			return DIV_ROUND_UP_ULL((u64)msm_host->cmd_hs_rate *
++							msm_host->lanes,
++						bpp);
++	}
++
++	return rate;
++}
++
+ unsigned long dsi_byte_clk_get_rate(struct mipi_dsi_host *host, bool is_bonded_dsi,
+ 				    const struct drm_display_mode *mode)
+ {
+ 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+ 	u8 lanes = msm_host->lanes;
+ 	u32 bpp = mipi_dsi_pixel_format_to_bpp(msm_host->format);
+-	unsigned long pclk_rate = dsi_get_pclk_rate(mode, msm_host->dsc, is_bonded_dsi);
++	unsigned long pclk_rate = dsi_host_get_pclk_rate(msm_host, mode, is_bonded_dsi);
+ 	unsigned long pclk_bpp;
+ 
+ 	if (lanes == 0) {
+@@ -675,7 +696,7 @@ unsigned long dsi_byte_clk_get_rate(struct mipi_dsi_host *host, bool is_bonded_d
+ 
+ static void dsi_calc_pclk(struct msm_dsi_host *msm_host, bool is_bonded_dsi)
+ {
+-	msm_host->pixel_clk_rate = dsi_get_pclk_rate(msm_host->mode, msm_host->dsc, is_bonded_dsi);
++	msm_host->pixel_clk_rate = dsi_host_get_pclk_rate(msm_host, msm_host->mode, is_bonded_dsi);
+ 	msm_host->byte_clk_rate = dsi_byte_clk_get_rate(&msm_host->base, is_bonded_dsi,
+ 							msm_host->mode);
+ 
+@@ -1322,12 +1343,13 @@ void dsi_tx_buf_put_6g(struct msm_dsi_host *msm_host)
+ /*
+  * prepare cmd buffer to be txed
+  */
+-static int dsi_cmd_dma_add(struct msm_dsi_host *msm_host,
+-			   const struct mipi_dsi_msg *msg)
++static int dsi_cmd_dma_append(struct msm_dsi_host *msm_host,
++			      const struct mipi_dsi_msg *msg,
++			      unsigned int offset, bool last)
+ {
+ 	const struct msm_dsi_cfg_handler *cfg_hnd = msm_host->cfg_hnd;
+ 	struct mipi_dsi_packet packet;
+-	int len;
++	size_t len;
+ 	int ret;
+ 	u8 *data;
+ 
+@@ -1338,7 +1360,9 @@ static int dsi_cmd_dma_add(struct msm_dsi_host *msm_host,
+ 	}
+ 	len = (packet.size + 3) & (~0x3);
+ 
+-	if (len > msm_host->tx_size) {
++	if (msm_host->tx_size <= 0 ||
++	    offset > (unsigned int)msm_host->tx_size ||
++	    len > (unsigned int)msm_host->tx_size - offset) {
+ 		pr_err("%s: packet size is too big\n", __func__);
+ 		return -EINVAL;
+ 	}
+@@ -1350,11 +1374,12 @@ static int dsi_cmd_dma_add(struct msm_dsi_host *msm_host,
+ 		return ret;
+ 	}
+ 
++	data += offset;
+ 	/* MSM specific command format in memory */
+ 	data[0] = packet.header[1];
+ 	data[1] = packet.header[2];
+ 	data[2] = packet.header[0];
+-	data[3] = BIT(7); /* Last packet */
++	data[3] = last ? BIT(7) : 0;
+ 	if (mipi_dsi_packet_format_is_long(msg->type))
+ 		data[3] |= BIT(6);
+ 	if (msg->rx_buf && msg->rx_len)
+@@ -1529,7 +1554,7 @@ static int dsi_cmds2buf_tx(struct msm_dsi_host *msm_host,
+ 	int bllp_len = msm_host->mode->hdisplay *
+ 			mipi_dsi_pixel_format_to_bpp(msm_host->format) / 8;
+ 
+-	len = dsi_cmd_dma_add(msm_host, msg);
++	len = dsi_cmd_dma_append(msm_host, msg, 0, true);
+ 	if (len < 0) {
+ 		pr_err("%s: failed to add cmd type = 0x%x\n",
+ 			__func__,  msg->type);
+@@ -1718,6 +1743,9 @@ static int dsi_host_attach(struct mipi_dsi_host *host,
+ 	if (dsi->lanes > msm_host->num_data_lanes)
+ 		return -EINVAL;
+ 
++	msm_host->unicorn_panel = of_device_is_compatible(dsi->dev.of_node,
++						       "xiaomi,l2s-38-0c-0a");
++	msm_host->cmd_hs_rate = dsi->cmd_hs_rate;
+ 	msm_host->channel = dsi->channel;
+ 	msm_host->lanes = dsi->lanes;
+ 	msm_host->format = dsi->format;
+@@ -1787,7 +1815,116 @@ static ssize_t dsi_host_transfer(struct mipi_dsi_host *host,
+ 	return ret;
+ }
+ 
++/* SM8450 controller 2.5 scheduling, fixed OEM source dsi_ctrl_hw_2_2.c.
++ * dsi_read/write apply the 6G register shift, vendor offsets include it.
++ */
++#define DSI_RUNTIME_SCHED_CTRL2 0x100
++
++static int dsi_host_transfer_sequence(struct mipi_dsi_host *host,
++				      const struct mipi_dsi_cmd *cmds,
++				      size_t count)
++{
++	struct msm_dsi_host *h = to_msm_dsi_host(host);
++	struct msm_dsi *dsi = platform_get_drvdata(h->pdev);
++	struct mipi_dsi_msg msg;
++	unsigned int i, start = 0, offset = 0;
++	unsigned int group_flags = 0;
++	u32 old_trigger, old_schedule;
++	int ret = 0, len;
++	bool prepared = false;
++
++	/* This first user is deliberately limited to the verified single-link board. */
++	if (!h->unicorn_panel || h->id || h->cphy_mode ||
++	    (h->mode_flags & MIPI_DSI_MODE_VIDEO) || !h->cmd_hs_rate ||
++	    count > 256 || !count)
++		return -EOPNOTSUPP;
++	if (!h->power_on || !h->enabled || !h->mode)
++		return -EHOSTDOWN;
++	/* Validate complete groups before touching any register or sending a byte. */
++	for (i = 0; i < count; i++) {
++		const struct mipi_dsi_msg *m = &cmds[i].msg;
++		if (!m->tx_buf || !m->tx_len || m->rx_len || m->rx_buf ||
++		    m->channel != h->channel || cmds[i].delay_ms > 1000 ||
++		    (m->flags &
++		     ~(MIPI_DSI_MSG_USE_LPM | MIPI_DSI_MSG_CMD_DMA_SCHED |
++		       MIPI_DSI_MSG_BATCH_COMMAND)) ||
++		    (m->type != MIPI_DSI_DCS_SHORT_WRITE &&
++		     m->type != MIPI_DSI_DCS_SHORT_WRITE_PARAM &&
++		     m->type != MIPI_DSI_DCS_LONG_WRITE))
++			return -EINVAL;
++		if (i == start)
++			group_flags = m->flags & ~MIPI_DSI_MSG_BATCH_COMMAND;
++		if ((m->flags & ~MIPI_DSI_MSG_BATCH_COMMAND) != group_flags ||
++		    ((m->flags & MIPI_DSI_MSG_BATCH_COMMAND) &&
++		     cmds[i].delay_ms))
++			return -EINVAL;
++		if (!(m->flags & MIPI_DSI_MSG_BATCH_COMMAND))
++			start = i + 1;
++	}
++	if (start != count || dsi->id != 0)
++		return -EINVAL;
++	mutex_lock(&h->cmd_mutex);
++	if (!h->power_on || !h->enabled) {
++		ret = -EHOSTDOWN;
++		goto unlock_sequence;
++	}
++	for (i = 0; i < count; i++) {
++		bool last = !(cmds[i].msg.flags & MIPI_DSI_MSG_BATCH_COMMAND);
++		if (!offset) {
++			msg = cmds[i].msg;
++			msg.flags &= MIPI_DSI_MSG_USE_LPM;
++			ret = msm_dsi_host_xfer_prepare(host, &msg);
++			if (ret)
++				break;
++			prepared = true;
++			old_trigger = dsi_read(h, REG_DSI_TRIG_CTRL);
++			old_schedule = dsi_read(h, DSI_RUNTIME_SCHED_CTRL2);
++			if (cmds[i].msg.flags & MIPI_DSI_MSG_CMD_DMA_SCHED) {
++				/* Start at the first blanking line, with the OEM 50-line window. */
++				dsi_write(h, REG_DSI_TRIG_CTRL,
++					  (old_trigger & ~0xf) | 0xc);
++				dsi_write(h, DSI_RUNTIME_SCHED_CTRL2,
++					  (50 << 16) |
++						  (h->mode->vdisplay +
++						   h->mode->vsync_end -
++						   h->mode->vsync_start +
++						   h->mode->vtotal -
++						   h->mode->vsync_end + 1));
++			}
++		}
++		len = dsi_cmd_dma_append(h, &cmds[i].msg, offset, last);
++		if (len < 0) {
++			ret = len;
++			break;
++		}
++		offset += len;
++		if (!last)
++			continue;
++		ret = dsi_cmd_dma_tx(h, offset);
++		if (ret >= 0)
++			ret = (unsigned int)ret == offset ? 0 : -EIO;
++		dsi_write(h, REG_DSI_TRIG_CTRL, old_trigger);
++		dsi_write(h, DSI_RUNTIME_SCHED_CTRL2, old_schedule);
++		msm_dsi_host_xfer_restore(host, &msg);
++		prepared = false;
++		offset = 0;
++		if (ret)
++			break;
++		if (cmds[i].delay_ms)
++			msleep(cmds[i].delay_ms);
++	}
++	if (prepared) {
++		dsi_write(h, REG_DSI_TRIG_CTRL, old_trigger);
++		dsi_write(h, DSI_RUNTIME_SCHED_CTRL2, old_schedule);
++		msm_dsi_host_xfer_restore(host, &msg);
++	}
++unlock_sequence:
++	mutex_unlock(&h->cmd_mutex);
++	return ret;
++}
++
+ static const struct mipi_dsi_host_ops dsi_host_ops = {
++	.transfer_sequence = dsi_host_transfer_sequence,
+ 	.attach = dsi_host_attach,
+ 	.detach = dsi_host_detach,
+ 	.transfer = dsi_host_transfer,
+@@ -2200,6 +2337,7 @@ int msm_dsi_host_xfer_prepare(struct mipi_dsi_host *host,
+ {
+ 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+ 	const struct msm_dsi_cfg_handler *cfg_hnd = msm_host->cfg_hnd;
++	int ret;
+ 
+ 	/* TODO: make sure dsi_cmd_mdp is idle.
+ 	 * Since DSI6G v1.2.0, we can set DSI_TRIG_CTRL.BLOCK_DMA_WITHIN_FRAME
+@@ -2211,9 +2349,16 @@ int msm_dsi_host_xfer_prepare(struct mipi_dsi_host *host,
+ 	 * mdss interrupt is generated in mdp core clock domain
+ 	 * mdp clock need to be enabled to receive dsi interrupt
+ 	 */
+-	pm_runtime_get_sync(&msm_host->pdev->dev);
+-	cfg_hnd->ops->link_clk_set_rate(msm_host);
+-	cfg_hnd->ops->link_clk_enable(msm_host);
++	ret = pm_runtime_resume_and_get(&msm_host->pdev->dev);
++	if (ret < 0)
++		return ret;
++	ret = cfg_hnd->ops->link_clk_set_rate(msm_host);
++	if (!ret)
++		ret = cfg_hnd->ops->link_clk_enable(msm_host);
++	if (ret) {
++		pm_runtime_put(&msm_host->pdev->dev);
++		return ret;
++	}
+ 
+ 	/* TODO: vote for bus bandwidth */
+ 
+@@ -2617,18 +2762,15 @@ int msm_dsi_host_set_display_mode(struct mipi_dsi_host *host,
+ 				  const struct drm_display_mode *mode)
+ {
+ 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
++	struct drm_display_mode *copy;
+ 
+-	if (msm_host->mode) {
+-		drm_mode_destroy(msm_host->dev, msm_host->mode);
+-		msm_host->mode = NULL;
+-	}
+-
+-	msm_host->mode = drm_mode_duplicate(msm_host->dev, mode);
+-	if (!msm_host->mode) {
+-		pr_err("%s: cannot duplicate mode\n", __func__);
++	/* Keep the old timing usable if allocation fails after a panel command. */
++	copy = drm_mode_duplicate(msm_host->dev, mode);
++	if (!copy)
+ 		return -ENOMEM;
+-	}
+-
++	if (msm_host->mode)
++		drm_mode_destroy(msm_host->dev, msm_host->mode);
++	msm_host->mode = copy;
+ 	return 0;
+ }
+ 
+@@ -2742,3 +2884,28 @@ struct drm_dsc_config *msm_dsi_host_get_dsc_config(struct mipi_dsi_host *host)
+ 
+ 	return msm_host->dsc;
+ }
++
++bool msm_dsi_host_runtime_mode_valid(struct mipi_dsi_host *host,
++				     const struct drm_display_mode *old,
++				     const struct drm_display_mode *new)
++{
++	struct msm_dsi_host *h = to_msm_dsi_host(host);
++	return h->unicorn_panel && h->cmd_hs_rate && h->id == 0 &&
++	       !h->cphy_mode && !(h->mode_flags & MIPI_DSI_MODE_VIDEO) &&
++	       old->hdisplay == new->hdisplay &&
++	       old->vdisplay == new->vdisplay && old->flags == new->flags;
++}
++
++int msm_dsi_host_runtime_mode_set(struct mipi_dsi_host *host,
++				  const struct drm_display_mode *mode)
++{
++	struct msm_dsi_host *h = to_msm_dsi_host(host);
++	int ret;
++
++	mutex_lock(&h->cmd_mutex);
++	ret = msm_dsi_host_set_display_mode(host, mode);
++	if (!ret)
++		dsi_calc_pclk(h, false);
++	mutex_unlock(&h->cmd_mutex);
++	return ret;
++}
+diff --git a/drivers/gpu/drm/msm/dsi/dsi_manager.c b/drivers/gpu/drm/msm/dsi/dsi_manager.c
+index 959daa8..7c8de3b 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi_manager.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_manager.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "drm/drm_bridge_connector.h"
++#include <drm/drm_panel.h>
+ 
+ #include "msm_kms.h"
+ #include "dsi.h"
+@@ -619,3 +620,30 @@ const char *msm_dsi_get_te_source(struct msm_dsi *msm_dsi)
+ {
+ 	return msm_dsi->te_source;
+ }
++
++bool msm_dsi_runtime_mode_valid(struct msm_dsi *dsi,
++				const struct drm_display_mode *old,
++				const struct drm_display_mode *new)
++{
++	struct drm_panel *panel;
++	if (!dsi || IS_BONDED_DSI() ||
++	    !msm_dsi_host_runtime_mode_valid(dsi->host, old, new))
++		return false;
++	panel = drm_panel_bridge_get_panel(dsi->next_bridge);
++	return panel && panel->funcs->runtime_mode_valid &&
++	       panel->funcs->runtime_mode_valid(panel, old, new);
++}
++
++int msm_dsi_runtime_mode_set(struct msm_dsi *dsi,
++			     const struct drm_display_mode *old,
++			     const struct drm_display_mode *new)
++{
++	struct drm_panel *panel = drm_panel_bridge_get_panel(dsi->next_bridge);
++	int ret;
++	if (!panel || !panel->funcs->runtime_mode_set)
++		return -EOPNOTSUPP;
++	ret = panel->funcs->runtime_mode_set(panel, old, new);
++	if (ret)
++		return ret;
++	return msm_dsi_host_runtime_mode_set(dsi->host, new);
++}
+diff --git a/drivers/gpu/drm/msm/msm_atomic.c b/drivers/gpu/drm/msm/msm_atomic.c
+index a8babf1..e465d17 100644
+--- a/drivers/gpu/drm/msm/msm_atomic.c
++++ b/drivers/gpu/drm/msm/msm_atomic.c
+@@ -207,7 +207,10 @@ int msm_atomic_check(struct drm_device *dev, struct drm_atomic_commit *state)
+ 	if (ret)
+ 		return ret;
+ 
+-	return drm_atomic_helper_check(dev, state);
++	ret = drm_atomic_helper_check(dev, state);
++	if (!ret && kms && kms->funcs->check_runtime_mode)
++		ret = kms->funcs->check_runtime_mode(kms, state);
++	return ret;
+ }
+ 
+ void msm_atomic_commit_tail(struct drm_atomic_commit *state)
+diff --git a/drivers/gpu/drm/msm/msm_kms.h b/drivers/gpu/drm/msm/msm_kms.h
+index f25b31e..d50e662 100644
+--- a/drivers/gpu/drm/msm/msm_kms.h
++++ b/drivers/gpu/drm/msm/msm_kms.h
+@@ -67,6 +67,9 @@ struct msm_kms_funcs {
+ 	 * Verify if the commit requires a full modeset on one of CRTCs.
+ 	 */
+ 	int (*check_mode_changed)(struct msm_kms *kms, struct drm_atomic_commit *state);
++	/* Called after full atomic validation; may preserve compatible active pipes. */
++	int (*check_runtime_mode)(struct msm_kms *kms,
++				  struct drm_atomic_commit *state);
+ 
+ 	/**
+ 	 * Prepare for atomic commit.  This is called after any previous
+diff --git a/drivers/gpu/drm/panel/Kconfig b/drivers/gpu/drm/panel/Kconfig
+index cbdf7b8..74fb846 100644
+--- a/drivers/gpu/drm/panel/Kconfig
++++ b/drivers/gpu/drm/panel/Kconfig
+@@ -1406,6 +1406,17 @@ config DRM_PANEL_WIDECHIPS_WS2401
+ 	  480x800 display controller used in panels such as Samsung LMS380KF01.
+ 	  This display is used in the Samsung Galaxy Ace 2 GT-I8160 (Codina).
+ 
++config DRM_PANEL_XIAOMI_L2S_380C0A
++	tristate "Xiaomi 12S Pro L2S 38/0c/0a AMOLED panel"
++	depends on OF && GPIOLIB
++	depends on DRM_MIPI_DSI && BACKLIGHT_CLASS_DEVICE
++	select DRM_DISPLAY_DSC_HELPER
++	help
++	  Enable the 1440x3200 command-mode DSC panel identified as
++	  L2S 38/0c/0a on Xiaomi 12S Pro (unicorn).
++	  The driver provides a 60 Hz mode, panel power sequencing and
++	  DCS backlight control over a four-lane MIPI DSI interface.
++
+ config DRM_PANEL_XINPENG_XPP055C272
+ 	tristate "Xinpeng XPP055C272 panel driver"
+ 	depends on OF
+diff --git a/drivers/gpu/drm/panel/Makefile b/drivers/gpu/drm/panel/Makefile
+index 3b523cf..9b8bfc4 100644
+--- a/drivers/gpu/drm/panel/Makefile
++++ b/drivers/gpu/drm/panel/Makefile
+@@ -136,4 +136,5 @@ obj-$(CONFIG_DRM_PANEL_VISIONOX_RM692E5) += panel-visionox-rm692e5.o
+ obj-$(CONFIG_DRM_PANEL_VISIONOX_VTDR6130) += panel-visionox-vtdr6130.o
+ obj-$(CONFIG_DRM_PANEL_VISIONOX_R66451) += panel-visionox-r66451.o
+ obj-$(CONFIG_DRM_PANEL_WIDECHIPS_WS2401) += panel-widechips-ws2401.o
++obj-$(CONFIG_DRM_PANEL_XIAOMI_L2S_380C0A) += panel-xiaomi-l2s-380c0a.o
+ obj-$(CONFIG_DRM_PANEL_XINPENG_XPP055C272) += panel-xinpeng-xpp055c272.o
+diff --git a/drivers/gpu/drm/panel/panel-xiaomi-l2s-380c0a.c b/drivers/gpu/drm/panel/panel-xiaomi-l2s-380c0a.c
+new file mode 100644
+index 0000000..d1ca0e9
+--- /dev/null
++++ b/drivers/gpu/drm/panel/panel-xiaomi-l2s-380c0a.c
+@@ -0,0 +1,839 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Xiaomi 12S Pro L2S 38/0c/0a command-mode AMOLED panel.
++ * Initialization data from Xiaomi's unicorn downstream device tree.
++ */
++
++#include <linux/backlight.h>
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/regulator/consumer.h>
++
++#include <drm/display/drm_dsc.h>
++#include <drm/display/drm_dsc_helper.h>
++#include <drm/drm_connector.h>
++#include <drm/drm_atomic.h>
++#include <drm/drm_atomic_uapi.h>
++#include <drm/drm_vblank.h>
++#include <drm/drm_crtc.h>
++#include <drm/drm_mipi_dsi.h>
++#include <drm/drm_modes.h>
++#include <drm/drm_panel.h>
++#include <drm/drm_probe_helper.h>
++
++#include "panel-xiaomi-l2s-runtime.h"
++
++static bool seamless;
++module_param(seamless, bool, 0400);
++MODULE_PARM_DESC(seamless,
++		 "Experimental active switching between validated fixed modes");
++static unsigned int seamless_mask = BIT(0) | BIT(1);
++module_param(seamless_mask, uint, 0400);
++MODULE_PARM_DESC(seamless_mask,
++		 "Validated mode mask: 60,120,90,40,30,24 Hz are bits 0..5");
++static unsigned int idle_hz;
++module_param(idle_hz, uint, 0400);
++MODULE_PARM_DESC(idle_hz, "Experimental panel idle: 0 (off), 10 or 1 Hz");
++static bool vrr;
++module_param(vrr, bool, 0400);
++MODULE_PARM_DESC(
++	vrr,
++	"VRR capability request; unsupported until independently verified");
++
++struct l2s_panel {
++	struct drm_panel panel;
++	struct drm_connector *connector;
++	unsigned int refresh;
++	struct mipi_dsi_device *dsi;
++	struct drm_dsc_config dsc;
++	struct gpio_desc *reset;
++	struct regulator_bulk_data supplies[3];
++	struct mutex lock;
++	bool prepared;
++	bool enabled;
++	bool idle_active;
++	bool runtime_failed;
++	u64 mode_switches;
++	u64 idle_entries;
++	u64 idle_exits;
++	int runtime_error;
++};
++
++static inline struct l2s_panel *to_l2s_panel(struct drm_panel *panel)
++{
++	return container_of(panel, struct l2s_panel, panel);
++}
++
++/*
++ * The downstream modes all use 1.36 Gbit/s per lane and a 7300 us MDP
++ * transfer budget. In command mode, MSM represents transfer overhead in
++ * horizontal blanking (there are no horizontal wire-level porches).
++ * Keep the vendor vertical/TE timing and approximate its lane budget:
++ *   compressed active = ceil(1440 * 8 / 30) = 384
++ *   compressed total = ceil(1360000000 * 4 / (30 * 3256 * refresh))
++ *   htotal = 1440 + compressed total - 384
++ * Round the mode clock up to kHz; all six lane rates are within 0.2% of stock.
++ * These are full-modeset refresh choices, not seamless/adaptive-sync VRR.
++ * The vendor 10/1 Hz modes retain a 120 Hz host timing and are not exposed.
++ */
++static const struct drm_display_mode l2s_panel_modes[] = {
++	{ /* 60 Hz, compressed horizontal total 929. */
++		.clock = 387790,
++		.hdisplay = 1440, .hsync_start = 1472, .hsync_end = 1488,
++		.htotal = 1985,
++		.vdisplay = 3200, .vsync_start = 3224, .vsync_end = 3232,
++		.vtotal = 3256,
++		.width_mm = 70, .height_mm = 156,
++		.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
++	},
++	{ /* 120 Hz, compressed horizontal total 465. */
++		.clock = 594286,
++		.hdisplay = 1440, .hsync_start = 1472, .hsync_end = 1488,
++		.htotal = 1521,
++		.vdisplay = 3200, .vsync_start = 3224, .vsync_end = 3232,
++		.vtotal = 3256,
++		.width_mm = 70, .height_mm = 156,
++		.type = DRM_MODE_TYPE_DRIVER,
++	},
++	{ /* 90 Hz, compressed horizontal total 619. */
++		.clock = 490842,
++		.hdisplay = 1440, .hsync_start = 1472, .hsync_end = 1488,
++		.htotal = 1675,
++		.vdisplay = 3200, .vsync_start = 3224, .vsync_end = 3232,
++		.vtotal = 3256,
++		.width_mm = 70, .height_mm = 156,
++		.type = DRM_MODE_TYPE_DRIVER,
++	},
++	{ /* 40 Hz, compressed horizontal total 1393. */
++		.clock = 318958,
++		.hdisplay = 1440, .hsync_start = 1472, .hsync_end = 1488,
++		.htotal = 2449,
++		.vdisplay = 3200, .vsync_start = 3224, .vsync_end = 3232,
++		.vtotal = 3256,
++		.width_mm = 70, .height_mm = 156,
++		.type = DRM_MODE_TYPE_DRIVER,
++	},
++	{ /* 30 Hz, compressed horizontal total 1857. */
++		.clock = 284542,
++		.hdisplay = 1440, .hsync_start = 1472, .hsync_end = 1488,
++		.htotal = 2913,
++		.vdisplay = 3200, .vsync_start = 3224, .vsync_end = 3232,
++		.vtotal = 3256,
++		.width_mm = 70, .height_mm = 156,
++		.type = DRM_MODE_TYPE_DRIVER,
++	},
++	{ /* 24 Hz, compressed horizontal total 2321. */
++		.clock = 263893,
++		.hdisplay = 1440, .hsync_start = 1472, .hsync_end = 1488,
++		.htotal = 3377,
++		.vdisplay = 3200, .vsync_start = 3224, .vsync_end = 3232,
++		.vtotal = 3256,
++		.width_mm = 70, .height_mm = 156,
++		.type = DRM_MODE_TYPE_DRIVER,
++	},
++};
++
++/* panel_bridge prepare runs after the incoming atomic state is installed.
++ * Select it again on every full modeset/wake, before touching panel power.
++ */
++static int l2s_panel_get_current_mode(struct l2s_panel *ctx)
++{
++	struct drm_connector *connector = ctx->connector;
++	struct drm_crtc_state *state;
++	unsigned int i;
++
++	if (!connector || !connector->state || !connector->state->crtc)
++		return 0;
++	state = connector->state->crtc->state;
++	if (!state)
++		return -EINVAL;
++	for (i = 0; i < ARRAY_SIZE(l2s_panel_modes); i++) {
++		if (drm_mode_match(&state->mode, &l2s_panel_modes[i],
++				   DRM_MODE_MATCH_TIMINGS | DRM_MODE_MATCH_CLOCK |
++				   DRM_MODE_MATCH_FLAGS))
++			return i;
++	}
++	return -EINVAL;
++}
++
++static int l2s_runtime_send(struct l2s_panel *ctx, unsigned int old_hz,
++			    unsigned int new_hz)
++{
++	struct l2s_cmdset set = l2s_runtime_cmdset(old_hz, new_hz);
++	int ret;
++	if (!set.count)
++		return -EINVAL;
++	ret = mipi_dsi_transfer_sequence(ctx->dsi, set.cmds, set.count);
++	if (ret) {
++		ctx->runtime_failed = true;
++		ctx->runtime_error = ret;
++		dev_err(&ctx->dsi->dev, "runtime %u -> %u Hz failed: %d\n",
++			old_hz, new_hz, ret);
++	}
++	return ret;
++}
++
++static int l2s_runtime_mode_index(const struct drm_display_mode *mode)
++{
++	unsigned int i;
++	for (i = 0; i < ARRAY_SIZE(l2s_panel_modes); i++)
++		if (drm_mode_match(mode, &l2s_panel_modes[i],
++				   DRM_MODE_MATCH_TIMINGS |
++					   DRM_MODE_MATCH_CLOCK |
++					   DRM_MODE_MATCH_FLAGS))
++			return i;
++	return -EINVAL;
++}
++
++static bool l2s_runtime_mode_valid(struct drm_panel *panel,
++				   const struct drm_display_mode *old,
++				   const struct drm_display_mode *new)
++{
++	struct l2s_panel *ctx = to_l2s_panel(panel);
++	int a = l2s_runtime_mode_index(old), b = l2s_runtime_mode_index(new);
++	return seamless && !READ_ONCE(ctx->runtime_failed) && a >= 0 &&
++	       b >= 0 && a != b && (seamless_mask & BIT(a)) &&
++	       (seamless_mask & BIT(b));
++}
++
++static int l2s_runtime_mode_set(struct drm_panel *panel,
++				const struct drm_display_mode *old,
++				const struct drm_display_mode *new)
++{
++	struct l2s_panel *ctx = to_l2s_panel(panel);
++	struct drm_crtc *crtc = ctx->connector->state->crtc;
++	unsigned int hz = drm_mode_vrefresh(new);
++	int ret;
++
++	mutex_lock(&ctx->lock);
++	if (!ctx->prepared || !ctx->enabled || ctx->idle_active ||
++	    ctx->runtime_failed || ctx->refresh != drm_mode_vrefresh(old)) {
++		ret = -EBUSY;
++		goto out;
++	}
++	/* Raw OEM commands also schedule DMA at TE, not just a userspace sleep. */
++	ret = drm_crtc_vblank_get(crtc);
++	if (ret)
++		goto failed;
++	{
++		unsigned int seq = drm_crtc_vblank_count(crtc);
++		ret = wait_event_timeout(
++			crtc->dev->vblank[drm_crtc_index(crtc)].queue,
++			drm_crtc_vblank_count(crtc) != seq,
++			msecs_to_jiffies(100));
++	}
++	drm_crtc_vblank_put(crtc);
++	if (!ret) {
++		ret = -ETIMEDOUT;
++		goto failed;
++	}
++	ret = l2s_runtime_send(ctx, ctx->refresh, hz);
++	if (!ret) {
++		ctx->refresh = hz;
++		ctx->mode_switches++;
++	}
++	goto out;
++failed:
++	ctx->runtime_failed = true;
++	ctx->runtime_error = ret;
++out:
++	mutex_unlock(&ctx->lock);
++	return ret;
++}
++
++static bool l2s_idle_supported(struct drm_panel *panel,
++			       const struct drm_crtc_state *state)
++{
++	struct l2s_panel *ctx = to_l2s_panel(panel);
++	return idle_hz && state->enable && !state->vrr_enabled &&
++	       !READ_ONCE(ctx->runtime_failed) &&
++	       drm_mode_vrefresh(&state->mode) == 120;
++}
++
++static int l2s_idle_enter(struct drm_panel *panel)
++{
++	struct l2s_panel *ctx = to_l2s_panel(panel);
++	int ret = -EBUSY;
++	mutex_lock(&ctx->lock);
++	if (ctx->prepared && ctx->enabled && ctx->refresh == 120 &&
++	    !ctx->runtime_failed && !ctx->idle_active) {
++		ret = l2s_runtime_send(ctx, 120, idle_hz);
++		if (!ret) {
++			ctx->idle_active = true;
++			ctx->idle_entries++;
++		}
++	}
++	mutex_unlock(&ctx->lock);
++	return ret;
++}
++
++static int l2s_panel_prepare(struct drm_panel *panel);
++static int l2s_panel_enable(struct drm_panel *panel);
++static int l2s_panel_unprepare(struct drm_panel *panel);
++
++static int l2s_idle_exit(struct drm_panel *panel)
++{
++	struct l2s_panel *ctx = to_l2s_panel(panel);
++	int ret = 0;
++	mutex_lock(&ctx->lock);
++	if (ctx->idle_active) {
++		ret = l2s_runtime_send(ctx, idle_hz, 120);
++		ctx->idle_active = false;
++		if (!ret)
++			ctx->idle_exits++;
++	}
++	if (ctx->runtime_failed && ctx->prepared)
++		ret = ctx->runtime_error ?: -EIO;
++	mutex_unlock(&ctx->lock);
++	if (ret) {
++		int recovery;
++		/* Reinitialization keeps the original failure latched for diagnostics. */
++		l2s_panel_unprepare(panel);
++		recovery = l2s_panel_prepare(panel);
++		if (!recovery)
++			recovery = l2s_panel_enable(panel);
++		if (recovery)
++			dev_err(&ctx->dsi->dev, "idle recovery failed: %d\n",
++				recovery);
++	}
++	return ret;
++}
++
++/* A direct backlight update is not itself a KMS commit. Wake through DRM so
++ * host clocks, PHY and the first-frame path are restored before DCS access. */
++static int l2s_backlight_wake(struct l2s_panel *ctx)
++{
++	struct drm_modeset_acquire_ctx acquire;
++	struct drm_atomic_commit *state;
++	struct drm_crtc_state *cs;
++	struct drm_crtc *crtc;
++	int ret;
++
++	if (!READ_ONCE(ctx->idle_active))
++		return 0;
++	drm_modeset_acquire_init(&acquire, 0);
++	state = drm_atomic_commit_alloc(ctx->connector->dev);
++	if (!state) {
++		ret = -ENOMEM;
++		goto drop;
++	}
++retry:
++	state->acquire_ctx = &acquire;
++	ret = drm_modeset_lock(
++		&ctx->connector->dev->mode_config.connection_mutex, &acquire);
++	if (ret)
++		goto out;
++	crtc = ctx->connector->state->crtc;
++	if (!crtc) {
++		ret = -ENODEV;
++		goto out;
++	}
++	cs = drm_atomic_get_crtc_state(state, crtc);
++	if (IS_ERR(cs)) {
++		ret = PTR_ERR(cs);
++		goto out;
++	}
++	if (!cs->self_refresh_active) {
++		ret = 0;
++		goto out;
++	}
++	cs->active = true;
++	cs->self_refresh_active = false;
++	state->allow_modeset = true;
++	ret = drm_atomic_commit(state);
++out:
++	if (ret == -EDEADLK) {
++		drm_atomic_commit_clear(state);
++		ret = drm_modeset_backoff(&acquire);
++		if (!ret)
++			goto retry;
++	}
++	drm_atomic_commit_put(state);
++drop:
++	drm_modeset_drop_locks(&acquire);
++	drm_modeset_acquire_fini(&acquire);
++	return ret;
++}
++
++static int l2s_runtime_state_show(struct seq_file *s, void *unused)
++{
++	struct l2s_panel *ctx = s->private;
++	mutex_lock(&ctx->lock);
++	seq_printf(
++		s,
++		"refresh=%u\nidle_hz=%u\nidle_active=%u\nfailed=%u\nerror=%d\n"
++		"mode_switches=%llu\nidle_entries=%llu\nidle_exits=%llu\n"
++		"vrr_capable=0\n",
++		ctx->refresh, idle_hz, ctx->idle_active, ctx->runtime_failed,
++		ctx->runtime_error, ctx->mode_switches, ctx->idle_entries,
++		ctx->idle_exits);
++	mutex_unlock(&ctx->lock);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(l2s_runtime_state);
++
++static void l2s_runtime_debugfs_init(struct drm_panel *panel,
++				     struct dentry *root)
++{
++	debugfs_create_file("runtime_state", 0400, root, to_l2s_panel(panel),
++			    &l2s_runtime_state_fops);
++}
++
++static int l2s_panel_init(struct l2s_panel *ctx)
++{
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
++
++	/*
++	 * Preserve the vendor's initial 25-line-slice PPS. Like the vendor
++	 * driver, enable() replaces it with the calculated 50-line-slice PPS
++	 * after display-on, before the first frame.
++	 */
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x9e,
++					   0x11, 0x00, 0x00, 0xab, 0x30, 0x80, 0x0c, 0x80,
++					   0x05, 0xa0, 0x00, 0x19, 0x02, 0xd0, 0x02, 0xd0,
++					   0x02, 0x00, 0x02, 0x68, 0x00, 0x20, 0x02, 0xbe,
++					   0x00, 0x0a, 0x00, 0x0c, 0x04, 0x00, 0x03, 0x0d,
++					   0x18, 0x00, 0x10, 0xf0, 0x07, 0x10, 0x20, 0x00,
++					   0x06, 0x0f, 0x0f, 0x33, 0x0e, 0x1c, 0x2a, 0x38,
++					   0x46, 0x54, 0x62, 0x69, 0x70, 0x77, 0x79, 0x7b,
++					   0x7d, 0x7e, 0x01, 0x02, 0x22, 0x00, 0x2a, 0x40,
++					   0x2a, 0xbe, 0x3a, 0xfc, 0x3a, 0xfa, 0x3a, 0xf8,
++					   0x3b, 0x38, 0x3b, 0x78, 0x3b, 0xb6, 0x4b, 0xf6,
++					   0x4c, 0x34, 0x4c, 0x74, 0x5c, 0x74, 0x8c, 0xf4,
++					   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++					   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++					   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++					   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++					   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
++	/* WQHD initialization, including per-rate TE and DDIC settings. */
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x9d, 0x01);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x11);
++	mipi_dsi_msleep(&dsi_ctx, 120);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x35, 0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x2a, 0x00, 0x00, 0x05, 0x9f);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x2b, 0x00, 0x00, 0x0c, 0x7f);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc3, 0x0c);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	if (ctx->refresh == 120)
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb9, 0x41);
++	else
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb9, 0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x06, 0xb9);
++	if (ctx->refresh == 120)
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb9,
++					   0x0c, 0x9e, 0x0c, 0x9e, 0x00, 0x1d);
++	else
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb9,
++					   0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf7, 0x0f);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x08, 0xcb);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xcb, 0x27);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xbd, 0x21, 0x82);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x10, 0xbd);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xbd, 0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x21, 0xbd);
++	if (ctx->refresh == 120) {
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xbd,
++					   0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04,
++					   0x00, 0x05, 0x00, 0x07, 0x00, 0x0b, 0x00);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x61, 0xbd);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xbd,
++					   0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04,
++					   0x00, 0x1d);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x12, 0xbd);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xbd, 0x00);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x60, 0x00);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x16, 0xbd);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xbd, 0x00, 0x00);
++	} else {
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xbd,
++					   0x03, 0x00, 0x06, 0x00, 0x09, 0x00, 0x0c,
++					   0x00, 0x0f, 0x00, 0x15, 0x00, 0x21, 0x00);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x61, 0xbd);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xbd,
++					   0x04, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x10,
++					   0x00, 0x74);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x12, 0xbd);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xbd, 0x01);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x16, 0xbd);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xbd, 0x00, 0x00);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xbd, 0x21);
++		if (ctx->refresh == 90) {
++			mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x60, 0x00);
++			mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x08, 0xcb);
++			mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xcb, 0xa7);
++			mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x10, 0xbd);
++			mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xbd, 0x00);
++			mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xbd, 0x21, 0x82);
++			mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x60, 0x08);
++		} else {
++			u8 rate[] = { 0x60, 120 / ctx->refresh - 1 };
++
++			/* 60/40/30/24 Hz select 01/02/03/04 respectively. */
++			mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, rate, sizeof(rate));
++		}
++	}
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf7, 0x0f);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x0d, 0x63);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x63, 0x08);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x0c, 0x63);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x63, 0x20);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x53, 0x28);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x51, 0x00, 0x00);
++
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf7, 0x0f);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x47, 0xf4);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf4, 0x01);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xed, 0x47, 0x05, 0x20);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf1, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x22, 0xb9);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb9, 0xb1, 0xa1);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x05, 0xf2);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf2, 0x52);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf7, 0x0f);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf1, 0xa5, 0xa5);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xc3, 0x0c);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x02, 0x67, 0x1d);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x1d, 0x81);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x52, 0x1f);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x1f, 0x02);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x53, 0x1f);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x1f,
++					   0x07, 0x01, 0x00, 0x02, 0xb9, 0x02, 0xba, 0x07,
++					   0xa2, 0x07, 0xaa, 0x12, 0xc0, 0x12, 0xc1, 0x1a,
++					   0xba, 0x1b, 0xc0, 0x1f, 0xe0, 0x00, 0x53, 0x00,
++					   0xc3, 0x03, 0x43, 0x07, 0xa0, 0x07, 0xa1, 0x07,
++					   0xa2, 0x07, 0xa6, 0x07, 0xa8, 0x07, 0xaa, 0x07,
++					   0xac, 0x07, 0xae, 0x07, 0xb0, 0x07, 0xb2, 0x07,
++					   0xb4, 0x07, 0xb6, 0x00, 0x03, 0x00, 0xa4, 0x00,
++					   0xc0, 0x00, 0xd1, 0x01, 0x86, 0x03, 0xff, 0x07,
++					   0xff, 0x30, 0x30, 0x35, 0x40, 0x35, 0x30, 0x40,
++					   0x40, 0x35, 0x80, 0x80, 0x80, 0x0a, 0x0f, 0x14,
++					   0x18, 0x1e, 0x3a, 0x78, 0x80, 0x80, 0x80, 0x80,
++					   0x80, 0x80, 0x80, 0x80, 0x01, 0xb1);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x78, 0xbd);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xbd, 0x10);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf7, 0x0f);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++
++	return dsi_ctx.accum_err;
++}
++
++static void l2s_panel_power_off(struct l2s_panel *ctx)
++{
++	int i;
++
++	gpiod_set_value_cansleep(ctx->reset, 1);
++	for (i = ARRAY_SIZE(ctx->supplies) - 1; i >= 0; i--) {
++		regulator_disable(ctx->supplies[i].consumer);
++		usleep_range(1000, 2000);
++	}
++}
++
++static int l2s_panel_prepare(struct drm_panel *panel)
++{
++	struct l2s_panel *ctx = to_l2s_panel(panel);
++	int i, ret, mode;
++
++	mutex_lock(&ctx->lock);
++	mode = l2s_panel_get_current_mode(ctx);
++	if (mode < 0) {
++		ret = mode;
++		dev_err(&ctx->dsi->dev, "unsupported L2S display mode\n");
++		goto unlock;
++	}
++	ctx->refresh = drm_mode_vrefresh(&l2s_panel_modes[mode]);
++
++
++	/* Preserve downstream order and its 1 ms delay after each supply. */
++	for (i = 0; i < ARRAY_SIZE(ctx->supplies); i++) {
++		ret = regulator_enable(ctx->supplies[i].consumer);
++
++		if (ret) {
++			while (i--) {
++				regulator_disable(ctx->supplies[i].consumer);
++				usleep_range(1000, 2000);
++			}
++			goto unlock;
++		}
++		usleep_range(1000, 2000);
++	}
++
++	gpiod_set_value_cansleep(ctx->reset, 1);
++	usleep_range(1000, 2000);
++	gpiod_set_value_cansleep(ctx->reset, 0);
++	usleep_range(10000, 11000);
++
++	ret = l2s_panel_init(ctx);
++	if (ret)
++		l2s_panel_power_off(ctx);
++	else
++		ctx->prepared = true;
++unlock:
++	mutex_unlock(&ctx->lock);
++	return ret;
++}
++
++static void l2s_panel_post_on(struct l2s_panel *ctx,
++			      struct mipi_dsi_multi_context *dsi_ctx)
++{
++	if (ctx->refresh != 120)
++		return;
++
++	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xf0, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xbd, 0x23, 0x02);
++	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xb0, 0x00, 0x14, 0xbd);
++	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xbd, 0x01);
++	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xf7, 0x0f);
++	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xf0, 0xa5, 0xa5);
++}
++
++static int l2s_panel_enable(struct drm_panel *panel)
++{
++	struct l2s_panel *ctx = to_l2s_panel(panel);
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
++	struct drm_dsc_picture_parameter_set pps;
++
++	mutex_lock(&ctx->lock);
++	mipi_dsi_dcs_set_display_on_multi(&dsi_ctx);
++
++	l2s_panel_post_on(ctx, &dsi_ctx);
++	/* Match the PPS to the same configuration used by the DPU encoder. */
++	drm_dsc_pps_payload_pack(&pps, &ctx->dsc);
++	mipi_dsi_picture_parameter_set_multi(&dsi_ctx, &pps);
++
++
++	if (!dsi_ctx.accum_err) {
++		ctx->enabled = true;
++	}
++	mutex_unlock(&ctx->lock);
++
++	return dsi_ctx.accum_err;
++}
++
++static int l2s_panel_disable(struct drm_panel *panel)
++{
++	struct l2s_panel *ctx = to_l2s_panel(panel);
++	int ret;
++
++	mutex_lock(&ctx->lock);
++	ctx->enabled = false;
++	if (ctx->idle_active) {
++		mutex_unlock(&ctx->lock);
++		return 0;
++	}
++	ret = mipi_dsi_dcs_set_display_off(ctx->dsi);
++	msleep(20);
++	mutex_unlock(&ctx->lock);
++
++	return ret;
++}
++
++static int l2s_panel_unprepare(struct drm_panel *panel)
++{
++	struct l2s_panel *ctx = to_l2s_panel(panel);
++	int ret;
++
++	mutex_lock(&ctx->lock);
++	ret = ctx->idle_active ? 0 : mipi_dsi_dcs_enter_sleep_mode(ctx->dsi);
++	ctx->idle_active = false;
++	msleep(100);
++	ctx->prepared = false;
++	l2s_panel_power_off(ctx);
++	mutex_unlock(&ctx->lock);
++
++	return ret;
++}
++
++static int l2s_panel_get_modes(struct drm_panel *panel,
++			       struct drm_connector *connector)
++{
++	struct l2s_panel *ctx = to_l2s_panel(panel);
++	struct drm_display_mode *mode;
++	unsigned int i;
++
++	ctx->connector = connector;
++	for (i = 0; i < ARRAY_SIZE(l2s_panel_modes); i++) {
++		mode = drm_mode_duplicate(connector->dev, &l2s_panel_modes[i]);
++		if (!mode)
++			return -ENOMEM;
++		drm_mode_set_name(mode);
++		drm_mode_probed_add(connector, mode);
++	}
++	connector->display_info.width_mm = 70;
++	connector->display_info.height_mm = 156;
++	connector->display_info.bpc = 10;
++
++	return ARRAY_SIZE(l2s_panel_modes);
++}
++
++static const struct drm_panel_funcs l2s_panel_funcs = {
++	.runtime_mode_valid = l2s_runtime_mode_valid,
++	.runtime_mode_set = l2s_runtime_mode_set,
++	.idle_supported = l2s_idle_supported,
++	.idle_enter = l2s_idle_enter,
++	.idle_exit = l2s_idle_exit,
++	.debugfs_init = l2s_runtime_debugfs_init,
++	.prepare = l2s_panel_prepare,
++	.enable = l2s_panel_enable,
++	.disable = l2s_panel_disable,
++	.unprepare = l2s_panel_unprepare,
++	.get_modes = l2s_panel_get_modes,
++};
++
++static int l2s_panel_bl_update_status(struct backlight_device *bl)
++{
++	struct l2s_panel *ctx = bl_get_data(bl);
++	u16 brightness = backlight_get_brightness(bl);
++	unsigned long mode_flags;
++	int ret = 0;
++
++	if (READ_ONCE(ctx->idle_active)) {
++		if (backlight_is_blank(bl))
++			return 0;
++		ret = l2s_backlight_wake(ctx);
++		if (ret)
++			return ret;
++	}
++	mutex_lock(&ctx->lock);
++	if (!ctx->prepared)
++		goto unlock;
++
++	/* The vendor inverted-dbv flag means high byte first. */
++	mode_flags = ctx->dsi->mode_flags;
++	ctx->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
++	ret = mipi_dsi_dcs_set_display_brightness_large(ctx->dsi, brightness);
++
++	ctx->dsi->mode_flags = mode_flags;
++unlock:
++	mutex_unlock(&ctx->lock);
++	return ret;
++}
++
++static const struct backlight_ops l2s_panel_bl_ops = {
++	.update_status = l2s_panel_bl_update_status,
++};
++
++static int l2s_panel_probe(struct mipi_dsi_device *dsi)
++{
++	const struct backlight_properties props = {
++		.type = BACKLIGHT_RAW,
++		.brightness = 307,
++		.max_brightness = 2047,
++	};
++	struct device *dev = &dsi->dev;
++	struct l2s_panel *ctx;
++	int ret;
++
++	ctx = devm_drm_panel_alloc(dev, struct l2s_panel, panel,
++				   &l2s_panel_funcs, DRM_MODE_CONNECTOR_DSI);
++	if (IS_ERR(ctx))
++		return PTR_ERR(ctx);
++
++	if (idle_hz != 0 && idle_hz != 10 && idle_hz != 1)
++		return dev_err_probe(dev, -EINVAL,
++				     "idle_hz must be 0, 10 or 1\n");
++	if (seamless_mask & ~GENMASK(5, 0))
++		return dev_err_probe(dev, -EINVAL,
++				     "invalid seamless mode mask\n");
++	if (vrr)
++		dev_warn(
++			dev,
++			"VRR unavailable: arbitrary frame intervals not verified\n");
++	if (seamless || idle_hz)
++		dsi->cmd_hs_rate = 1360000000;
++	ctx->dsi = dsi;
++	mutex_init(&ctx->lock);
++	ctx->supplies[0].supply = "vci";
++	ctx->supplies[1].supply = "vddio";
++	ctx->supplies[2].supply = "vddd";
++	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(ctx->supplies),
++				      ctx->supplies);
++	if (ret)
++		return dev_err_probe(dev, ret, "Failed to get supplies\n");
++
++	ctx->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(ctx->reset))
++		return dev_err_probe(dev, PTR_ERR(ctx->reset),
++				     "Failed to get reset GPIO\n");
++
++	ctx->panel.prepare_prev_first = true;
++	ctx->panel.backlight = devm_backlight_device_register(dev, dev_name(dev),
++					dev, ctx, &l2s_panel_bl_ops, &props);
++	if (IS_ERR(ctx->panel.backlight))
++		return dev_err_probe(dev, PTR_ERR(ctx->panel.backlight),
++				     "Failed to register backlight\n");
++
++	dsi->lanes = 4;
++	dsi->format = MIPI_DSI_FMT_RGB101010;
++	/* Keep the clock lane stoppable between command-mode transfers. */
++	dsi->mode_flags = MIPI_DSI_MODE_LPM |
++		MIPI_DSI_CLOCK_NON_CONTINUOUS |
++		MIPI_DSI_MODE_DSC_ALL_SLICES_IN_PKT;
++	dsi->dsc = &ctx->dsc;
++	ctx->dsc.dsc_version_major = 1;
++	ctx->dsc.dsc_version_minor = 1;
++	ctx->dsc.slice_width = 720;
++	ctx->dsc.slice_height = 50;
++	ctx->dsc.slice_count = 2;
++	ctx->dsc.bits_per_component = 10;
++	ctx->dsc.bits_per_pixel = 8 << 4;
++	ctx->dsc.block_pred_enable = true;
++
++	mipi_dsi_set_drvdata(dsi, ctx);
++	drm_panel_add(&ctx->panel);
++	ret = devm_mipi_dsi_attach(dev, dsi);
++	if (ret) {
++		drm_panel_remove(&ctx->panel);
++		return dev_err_probe(dev, ret, "Failed to attach DSI\n");
++	}
++
++	return 0;
++}
++
++static void l2s_panel_remove(struct mipi_dsi_device *dsi)
++{
++	struct l2s_panel *ctx = mipi_dsi_get_drvdata(dsi);
++
++	drm_panel_remove(&ctx->panel);
++}
++
++static const struct of_device_id l2s_panel_of_match[] = {
++	{ .compatible = "xiaomi,l2s-38-0c-0a" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, l2s_panel_of_match);
++
++static struct mipi_dsi_driver l2s_panel_driver = {
++	.probe = l2s_panel_probe,
++	.remove = l2s_panel_remove,
++	.driver = {
++		.name = "panel-xiaomi-l2s-380c0a",
++		.of_match_table = l2s_panel_of_match,
++	},
++};
++module_mipi_dsi_driver(l2s_panel_driver);
++
++MODULE_DESCRIPTION("Xiaomi 12S Pro L2S 38/0c/0a AMOLED panel");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/gpu/drm/panel/panel-xiaomi-l2s-runtime.h b/drivers/gpu/drm/panel/panel-xiaomi-l2s-runtime.h
+new file mode 100644
+index 0000000..21949f8
+--- /dev/null
++++ b/drivers/gpu/drm/panel/panel-xiaomi-l2s-runtime.h
+@@ -0,0 +1,2348 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Runtime commands from L2S OEM devicetrees revision
++ * 2e649a7f3e762903eedad43d8256b91e28b512d8. */
++#ifndef PANEL_XIAOMI_L2S_RUNTIME_H
++#define PANEL_XIAOMI_L2S_RUNTIME_H
++struct l2s_cmdset {
++	const struct mipi_dsi_cmd *cmds;
++	unsigned int count;
++};
++static const struct mipi_dsi_cmd l2s_switch_60[] = {
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2a, 0x00, 0x00, 0x05, 0x9f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2b, 0x00, 0x00, 0x0c, 0x7f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xc3, 0x0c } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x15,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xb9, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x06, 0xb9 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 7,
++		   .tx_buf = (const u8[]){ 0xb9, 0x00, 0x00, 0x00, 0x00, 0x00,
++					   0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x08, 0xcb } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xcb, 0x27 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x21, 0x82 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x10, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x21, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 15,
++		   .tx_buf = (const u8[]){ 0xbd, 0x03, 0x00, 0x06, 0x00, 0x09,
++					   0x00, 0x0c, 0x00, 0x0f, 0x00, 0x15,
++					   0x00, 0x21, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x61, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 10,
++		   .tx_buf = (const u8[]){ 0xbd, 0x04, 0x00, 0x08, 0x00, 0x0c,
++					   0x00, 0x10, 0x00, 0x74 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x12, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x01 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x16, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x00, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x21 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0x60, 0x01 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x00,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++};
++static const struct mipi_dsi_cmd l2s_exit90_60[] = {
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2a, 0x00, 0x00, 0x05, 0x9f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2b, 0x00, 0x00, 0x0c, 0x7f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xc3, 0x0c } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0x60, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 5 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x08, 0xcb } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xcb, 0x27 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 5 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0x60, 0x01 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++};
++static const struct mipi_dsi_cmd l2s_switch_120[] = {
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2a, 0x00, 0x00, 0x05, 0x9f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2b, 0x00, 0x00, 0x0c, 0x7f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xc3, 0x0c } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x15,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xb9, 0x41 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x06, 0xb9 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 7,
++		   .tx_buf = (const u8[]){ 0xb9, 0x0c, 0x9e, 0x0c, 0x9e, 0x00,
++					   0x1d } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x08, 0xcb } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xcb, 0x27 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x23, 0x02 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x10, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x21, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 15,
++		   .tx_buf = (const u8[]){ 0xbd, 0x01, 0x00, 0x02, 0x00, 0x03,
++					   0x00, 0x04, 0x00, 0x05, 0x00, 0x07,
++					   0x00, 0x0b, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x61, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 10,
++		   .tx_buf = (const u8[]){ 0xbd, 0x01, 0x00, 0x02, 0x00, 0x03,
++					   0x00, 0x04, 0x00, 0x1d } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x12, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x14, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x01 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x16, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x00, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x00,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++};
++static const struct mipi_dsi_cmd l2s_exit90_120[] = {
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2a, 0x00, 0x00, 0x05, 0x9f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2b, 0x00, 0x00, 0x0c, 0x7f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xc3, 0x0c } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0x60, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 5 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x15,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xb9, 0x41 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x06, 0xb9 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 7,
++		   .tx_buf = (const u8[]){ 0xb9, 0x0c, 0x9e, 0x0c, 0x9e, 0x00,
++					   0x1d } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x23, 0x02 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x10, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x21, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 15,
++		   .tx_buf = (const u8[]){ 0xbd, 0x01, 0x00, 0x02, 0x00, 0x03,
++					   0x00, 0x04, 0x00, 0x05, 0x00, 0x07,
++					   0x00, 0x0b, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x61, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 10,
++		   .tx_buf = (const u8[]){ 0xbd, 0x01, 0x00, 0x02, 0x00, 0x03,
++					   0x00, 0x04, 0x00, 0x1d } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x12, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x14, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x01 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x16, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x00, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x08, 0xcb } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xcb, 0x27 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++};
++static const struct mipi_dsi_cmd l2s_switch_90[] = {
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2a, 0x00, 0x00, 0x05, 0x9f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2b, 0x00, 0x00, 0x0c, 0x7f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xc3, 0x0c } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x15,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xb9, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x06, 0xb9 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 7,
++		   .tx_buf = (const u8[]){ 0xb9, 0x00, 0x00, 0x00, 0x00, 0x00,
++					   0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x08, 0xcb } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xcb, 0x27 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x21, 0x82 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x10, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x21, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 15,
++		   .tx_buf = (const u8[]){ 0xbd, 0x03, 0x00, 0x06, 0x00, 0x09,
++					   0x00, 0x0c, 0x00, 0x0f, 0x00, 0x15,
++					   0x00, 0x21, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x61, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 10,
++		   .tx_buf = (const u8[]){ 0xbd, 0x04, 0x00, 0x08, 0x00, 0x0c,
++					   0x00, 0x10, 0x00, 0x74 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x12, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x01 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x16, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x00, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x21 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0x60, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 5 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x08, 0xcb } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xcb, 0xa7 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x10, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x21, 0x82 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0x60, 0x08 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++};
++static const struct mipi_dsi_cmd l2s_exit90_90[] = {
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x08, 0xcb } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xcb, 0x27 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x15,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xb9, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x06, 0xb9 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 7,
++		   .tx_buf = (const u8[]){ 0xb9, 0x00, 0x00, 0x00, 0x00, 0x00,
++					   0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x21, 0x82 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x10, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x21, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 15,
++		   .tx_buf = (const u8[]){ 0xbd, 0x03, 0x00, 0x06, 0x00, 0x09,
++					   0x00, 0x0c, 0x00, 0x0f, 0x00, 0x15,
++					   0x00, 0x21, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x61, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 10,
++		   .tx_buf = (const u8[]){ 0xbd, 0x04, 0x00, 0x08, 0x00, 0x0c,
++					   0x00, 0x10, 0x00, 0x74 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x12, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x01 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x16, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x00, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x21 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0x60, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 5 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2a, 0x00, 0x00, 0x05, 0x9f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2b, 0x00, 0x00, 0x0c, 0x7f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xc3, 0x0c } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x08, 0xcb } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xcb, 0xa7 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x10, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x21, 0x82 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0x60, 0x08 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++};
++static const struct mipi_dsi_cmd l2s_switch_40[] = {
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2a, 0x00, 0x00, 0x05, 0x9f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2b, 0x00, 0x00, 0x0c, 0x7f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xc3, 0x0c } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x15,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xb9, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x06, 0xb9 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 7,
++		   .tx_buf = (const u8[]){ 0xb9, 0x00, 0x00, 0x00, 0x00, 0x00,
++					   0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x08, 0xcb } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xcb, 0x27 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x21, 0x82 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x10, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x21, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 15,
++		   .tx_buf = (const u8[]){ 0xbd, 0x03, 0x00, 0x06, 0x00, 0x09,
++					   0x00, 0x0c, 0x00, 0x0f, 0x00, 0x15,
++					   0x00, 0x21, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x61, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 10,
++		   .tx_buf = (const u8[]){ 0xbd, 0x04, 0x00, 0x08, 0x00, 0x0c,
++					   0x00, 0x10, 0x00, 0x74 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x12, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x01 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x16, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x00, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x21 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0x60, 0x02 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x00,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++};
++static const struct mipi_dsi_cmd l2s_exit90_40[] = {
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2a, 0x00, 0x00, 0x05, 0x9f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2b, 0x00, 0x00, 0x0c, 0x7f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xc3, 0x0c } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0x60, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 5 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x08, 0xcb } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xcb, 0x27 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 5 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0x60, 0x02 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++};
++static const struct mipi_dsi_cmd l2s_switch_30[] = {
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2a, 0x00, 0x00, 0x05, 0x9f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2b, 0x00, 0x00, 0x0c, 0x7f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xc3, 0x0c } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x15,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xb9, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x06, 0xb9 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 7,
++		   .tx_buf = (const u8[]){ 0xb9, 0x00, 0x00, 0x00, 0x00, 0x00,
++					   0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x08, 0xcb } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xcb, 0x27 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x21, 0x82 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x10, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x21, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 15,
++		   .tx_buf = (const u8[]){ 0xbd, 0x03, 0x00, 0x06, 0x00, 0x09,
++					   0x00, 0x0c, 0x00, 0x0f, 0x00, 0x15,
++					   0x00, 0x21, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x61, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 10,
++		   .tx_buf = (const u8[]){ 0xbd, 0x04, 0x00, 0x08, 0x00, 0x0c,
++					   0x00, 0x10, 0x00, 0x74 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x12, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x01 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x16, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x00, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x21 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0x60, 0x03 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x00,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++};
++static const struct mipi_dsi_cmd l2s_exit90_30[] = {
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2a, 0x00, 0x00, 0x05, 0x9f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2b, 0x00, 0x00, 0x0c, 0x7f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xc3, 0x0c } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0x60, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 5 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x08, 0xcb } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xcb, 0x27 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 5 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0x60, 0x03 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++};
++static const struct mipi_dsi_cmd l2s_switch_24[] = {
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2a, 0x00, 0x00, 0x05, 0x9f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2b, 0x00, 0x00, 0x0c, 0x7f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xc3, 0x0c } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x15,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xb9, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x06, 0xb9 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 7,
++		   .tx_buf = (const u8[]){ 0xb9, 0x00, 0x00, 0x00, 0x00, 0x00,
++					   0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x08, 0xcb } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xcb, 0x27 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x21, 0x82 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x10, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x21, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 15,
++		   .tx_buf = (const u8[]){ 0xbd, 0x03, 0x00, 0x06, 0x00, 0x09,
++					   0x00, 0x0c, 0x00, 0x0f, 0x00, 0x15,
++					   0x00, 0x21, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x61, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 10,
++		   .tx_buf = (const u8[]){ 0xbd, 0x04, 0x00, 0x08, 0x00, 0x0c,
++					   0x00, 0x10, 0x00, 0x74 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x12, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x01 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x16, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x00, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x21 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0x60, 0x04 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x00,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++};
++static const struct mipi_dsi_cmd l2s_exit90_24[] = {
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2a, 0x00, 0x00, 0x05, 0x9f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2b, 0x00, 0x00, 0x0c, 0x7f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xc3, 0x0c } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0x60, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 5 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x08, 0xcb } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xcb, 0x27 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 5 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0x60, 0x04 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++};
++static const struct mipi_dsi_cmd l2s_switch_10[] = {
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2a, 0x00, 0x00, 0x05, 0x9f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2b, 0x00, 0x00, 0x0c, 0x7f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xc3, 0x0c } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x15,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xb9, 0x41 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x06, 0xb9 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 7,
++		   .tx_buf = (const u8[]){ 0xb9, 0x0c, 0x9e, 0x0c, 0x9e, 0x00,
++					   0x1d } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x08, 0xcb } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xcb, 0x27 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x23, 0x02 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x10, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x10 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x21, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 15,
++		   .tx_buf = (const u8[]){ 0xbd, 0x03, 0x00, 0x06, 0x00, 0x09,
++					   0x00, 0x0c, 0x00, 0x0f, 0x00, 0x15,
++					   0x00, 0x21, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x61, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 10,
++		   .tx_buf = (const u8[]){ 0xbd, 0x04, 0x00, 0x08, 0x00, 0x0c,
++					   0x00, 0x10, 0x00, 0x74 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x12, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x02 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x14, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x0b } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x16, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x03, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x00,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++};
++static const struct mipi_dsi_cmd l2s_exit90_10[] = {
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2a, 0x00, 0x00, 0x05, 0x9f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2b, 0x00, 0x00, 0x0c, 0x7f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xc3, 0x0c } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0x60, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 5 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x08, 0xcb } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xcb, 0x27 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 5 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x15,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xb9, 0x41 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x06, 0xb9 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 7,
++		   .tx_buf = (const u8[]){ 0xb9, 0x0c, 0x9e, 0x0c, 0x9e, 0x00,
++					   0x1d } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x08, 0xcb } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xcb, 0x27 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x23, 0x02 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x10, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x10 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x21, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 15,
++		   .tx_buf = (const u8[]){ 0xbd, 0x03, 0x00, 0x06, 0x00, 0x09,
++					   0x00, 0x0c, 0x00, 0x0f, 0x00, 0x15,
++					   0x00, 0x21, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x61, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 10,
++		   .tx_buf = (const u8[]){ 0xbd, 0x04, 0x00, 0x08, 0x00, 0x0c,
++					   0x00, 0x10, 0x00, 0x74 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x12, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x02 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x14, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x0b } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x16, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x03, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++};
++static const struct mipi_dsi_cmd l2s_switch_1[] = {
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2a, 0x00, 0x00, 0x05, 0x9f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2b, 0x00, 0x00, 0x0c, 0x7f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xc3, 0x0c } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x15,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xb9, 0x41 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x06, 0xb9 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 7,
++		   .tx_buf = (const u8[]){ 0xb9, 0x0c, 0x9e, 0x0c, 0x9e, 0x00,
++					   0x1d } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x08, 0xcb } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xcb, 0x27 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x23, 0x02 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x10, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x10 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x21, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 15,
++		   .tx_buf = (const u8[]){ 0xbd, 0x03, 0x00, 0x06, 0x00, 0x09,
++					   0x00, 0x0c, 0x00, 0x0f, 0x00, 0x15,
++					   0x00, 0x21, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x61, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 10,
++		   .tx_buf = (const u8[]){ 0xbd, 0x04, 0x00, 0x08, 0x00, 0x0c,
++					   0x00, 0x10, 0x00, 0x74 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x12, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x02 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x14, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x77 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x16, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x0f, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x40,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x00,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++};
++static const struct mipi_dsi_cmd l2s_exit90_1[] = {
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2a, 0x00, 0x00, 0x05, 0x9f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 5,
++		   .tx_buf = (const u8[]){ 0x2b, 0x00, 0x00, 0x0c, 0x7f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xc3, 0x0c } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0x60, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 5 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x08, 0xcb } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xcb, 0x27 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 5 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x15,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xb9, 0x41 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x06, 0xb9 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 7,
++		   .tx_buf = (const u8[]){ 0xb9, 0x0c, 0x9e, 0x0c, 0x9e, 0x00,
++					   0x1d } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0x5a, 0x5a } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x08, 0xcb } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xcb, 0x27 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x23, 0x02 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x10, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x10 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x21, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 15,
++		   .tx_buf = (const u8[]){ 0xbd, 0x03, 0x00, 0x06, 0x00, 0x09,
++					   0x00, 0x0c, 0x00, 0x0f, 0x00, 0x15,
++					   0x00, 0x21, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x61, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 10,
++		   .tx_buf = (const u8[]){ 0xbd, 0x04, 0x00, 0x08, 0x00, 0x0c,
++					   0x00, 0x10, 0x00, 0x74 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x12, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x02 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x14, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xbd, 0x77 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 4,
++		   .tx_buf = (const u8[]){ 0xb0, 0x00, 0x16, 0xbd } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xbd, 0x0f, 0x00 } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x60,
++		   .tx_len = 2,
++		   .tx_buf = (const u8[]){ 0xf7, 0x0f } },
++	  .delay_ms = 0 },
++	{ .msg = { .type = 0x39,
++		   .flags = 0x20,
++		   .tx_len = 3,
++		   .tx_buf = (const u8[]){ 0xf0, 0xa5, 0xa5 } },
++	  .delay_ms = 0 },
++};
++static struct l2s_cmdset l2s_runtime_cmdset(unsigned int old_hz,
++					    unsigned int new_hz)
++{
++#define L2S_SET(hz)                                                  \
++	case hz:                                                     \
++		return old_hz == 90 ?                                \
++			       (struct l2s_cmdset){                  \
++				       l2s_exit90_##hz,              \
++				       ARRAY_SIZE(l2s_exit90_##hz)   \
++			       } :                                   \
++			       (struct l2s_cmdset)                   \
++		{                                                    \
++			l2s_switch_##hz, ARRAY_SIZE(l2s_switch_##hz) \
++		}
++	switch (new_hz) {
++		L2S_SET(60);
++		L2S_SET(120);
++		L2S_SET(90);
++		L2S_SET(40);
++		L2S_SET(30);
++		L2S_SET(24);
++		L2S_SET(10);
++		L2S_SET(1);
++	default:
++		return (struct l2s_cmdset){};
++	}
++#undef L2S_SET
++}
++#endif
+diff --git a/include/drm/drm_bridge.h b/include/drm/drm_bridge.h
+index 58fff04..89cb925 100644
+--- a/include/drm/drm_bridge.h
++++ b/include/drm/drm_bridge.h
+@@ -1475,6 +1475,7 @@ void drm_bridge_hpd_notify(struct drm_bridge *bridge,
+ 
+ #ifdef CONFIG_DRM_PANEL_BRIDGE
+ bool drm_bridge_is_panel(const struct drm_bridge *bridge);
++struct drm_panel *drm_panel_bridge_get_panel(struct drm_bridge *bridge);
+ struct drm_bridge *drm_panel_bridge_add(struct drm_panel *panel);
+ struct drm_bridge *drm_panel_bridge_add_typed(struct drm_panel *panel,
+ 					      u32 connector_type);
+diff --git a/include/drm/drm_crtc.h b/include/drm/drm_crtc.h
+index 152349f..228db19 100644
+--- a/include/drm/drm_crtc.h
++++ b/include/drm/drm_crtc.h
+@@ -321,6 +321,8 @@ struct drm_crtc_state {
+ 	 * CRTC's can inspect this flag and determine the best course of action.
+ 	 */
+ 	bool self_refresh_active;
++	/* Minimum quiet time before self refresh; zero keeps adaptive delay. */
++	unsigned int self_refresh_entry_delay_ms;
+ 
+ 	/**
+ 	 * @scaling_filter:
+diff --git a/include/drm/drm_mipi_dsi.h b/include/drm/drm_mipi_dsi.h
+index 7ff4396..29737c4 100644
+--- a/include/drm/drm_mipi_dsi.h
++++ b/include/drm/drm_mipi_dsi.h
+@@ -87,6 +87,19 @@ int mipi_dsi_create_packet(struct mipi_dsi_packet *packet,
+  * perform these operations will first need to make sure it's been
+  * properly enabled.
+  */
++/**
++ * struct mipi_dsi_cmd - one command in an indivisible write sequence
++ * @msg: Explicit packet type, payload, channel and transport flags.
++ * @delay_ms: Delay after this command's DMA group has completed.
++ */
++struct mipi_dsi_cmd {
++	struct mipi_dsi_msg msg;
++	unsigned int delay_ms;
++};
++/* These flags are accepted only by transfer_sequence(), never transfer(). */
++#define MIPI_DSI_MSG_CMD_DMA_SCHED BIT(5)
++#define MIPI_DSI_MSG_BATCH_COMMAND BIT(6)
++
+ struct mipi_dsi_host_ops {
+ 	int (*attach)(struct mipi_dsi_host *host,
+ 		      struct mipi_dsi_device *dsi);
+@@ -94,6 +107,9 @@ struct mipi_dsi_host_ops {
+ 		      struct mipi_dsi_device *dsi);
+ 	ssize_t (*transfer)(struct mipi_dsi_host *host,
+ 			    const struct mipi_dsi_msg *msg);
++	/* Optional: complete all commands under one host lock; zero on success. */
++	int (*transfer_sequence)(struct mipi_dsi_host *host,
++				 const struct mipi_dsi_cmd *cmds, size_t count);
+ };
+ 
+ /**
+@@ -102,6 +118,9 @@ struct mipi_dsi_host_ops {
+  * @ops: DSI host operations
+  * @list: list management
+  */
++int mipi_dsi_transfer_sequence(struct mipi_dsi_device *dsi,
++			       const struct mipi_dsi_cmd *cmds, size_t count);
++
+ struct mipi_dsi_host {
+ 	struct device *dev;
+ 	const struct mipi_dsi_host_ops *ops;
+@@ -194,6 +213,8 @@ struct mipi_dsi_device {
+ 	unsigned int lanes;
+ 	enum mipi_dsi_pixel_format format;
+ 	unsigned long mode_flags;
++	/* Fixed command transfer lane rate, zero keeps mode-derived clocks. */
++	unsigned long cmd_hs_rate;
+ 	unsigned long hs_rate;
+ 	unsigned long lp_rate;
+ 	struct drm_dsc_config *dsc;
+diff --git a/include/drm/drm_panel.h b/include/drm/drm_panel.h
+index b873234..bad9283 100644
+--- a/include/drm/drm_panel.h
++++ b/include/drm/drm_panel.h
+@@ -34,6 +34,8 @@ struct backlight_device;
+ struct dentry;
+ struct device_node;
+ struct drm_connector;
++struct drm_display_mode;
++struct drm_crtc_state;
+ struct drm_panel_follower;
+ struct drm_panel;
+ struct display_timing;
+@@ -144,6 +146,17 @@ struct drm_panel_funcs {
+ 	 * Allows panels to create panels-specific debugfs files.
+ 	 */
+ 	void (*debugfs_init)(struct drm_panel *panel, struct dentry *root);
++	/* Optional active-mode transaction, serialized with brightness and power. */
++	bool (*runtime_mode_valid)(struct drm_panel *panel,
++				   const struct drm_display_mode *old,
++				   const struct drm_display_mode *new);
++	int (*runtime_mode_set)(struct drm_panel *panel,
++				const struct drm_display_mode *old,
++				const struct drm_display_mode *new);
++	bool (*idle_supported)(struct drm_panel *panel,
++			       const struct drm_crtc_state *state);
++	int (*idle_enter)(struct drm_panel *panel);
++	int (*idle_exit)(struct drm_panel *panel);
+ };
+ 
+ struct drm_panel_follower_funcs {

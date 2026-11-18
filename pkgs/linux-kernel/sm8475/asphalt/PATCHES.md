@@ -43,6 +43,8 @@ configuration is [`kernel.config`](kernel.config).
 | 0033 | `qcom,sm8475-ufshc` binding |
 | 0034 | SM8475 UFS turbo mode configuration above 300 MHz |
 | 0035 | SM8475 UFS operating points (75 and 850 MHz) with their CX levels |
+| 0036 | Coordinate UFS AXI/UniPro/ICE scaling and CX/MX requests; bootstrap ICE at 75 MHz/LOW_SVS |
+| [Shared OPP initialization](../../patches/ufs-opp-init-order.patch) | Apply the required performance state before initial clock increases |
 
 Build the kernel on an x86_64 or AArch64 Linux host with `nix build .#devices.asphalt.kernel`.
 For an x86_64 build, the derivation runs on x86_64 and produces an AArch64
@@ -70,6 +72,17 @@ and PCS values out of the HS-G4-only overlay into its base tables and adds
 f07317a8d57f) is now a shared Qualcomm patch. See the
 [UFS clock limit](../../../../docs/asphalt/hardware.md#ufs-clock-limit) for
 the measured behaviour.
+
+0036 extends those existing OPPs to nine clocks, adding ICE to the AXI/UniPro
+transition and MX as a second GCC parent. ICE starts at 75 MHz/LOW_SVS before
+its driver enables the clock. The host-level permanent NOM vote is removed;
+UFS OPPs request LOW_SVS or TURBO_L1 through the GDSC parents instead. The shared
+initialization fix obtains all clock handles before applying the initial OPP,
+raises the required performance state before clock rates, and tracks applied
+rates. Upstream's turbo compatible, controller timing and PHY sequence remain.
+This can change power consumption and storage stability during startup and
+frequency transitions; the maximum remains 850 MHz and no throughput increase
+is implied. See the [SM8475 guide](../README.md).
 
 ## Shared PCIe fix
 

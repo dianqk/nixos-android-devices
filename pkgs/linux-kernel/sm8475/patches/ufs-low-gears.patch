@@ -1,0 +1,37 @@
+Subject: [PATCH] phy: qcom: qmp-ufs: initialize SM8475 at low gears
+
+Apply the required G4 table overlay at G1-G3 as well, preserving register
+write order and the existing G4 path. Other platforms retain their tables.
+
+Fixes: ef2bd6c969830c7e42c23bcaf9d533db77420512
+
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-ufs.c b/drivers/phy/qualcomm/phy-qcom-qmp-ufs.c
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-ufs.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-ufs.c
+@@ -1176,6 +1176,8 @@
+ 	const struct qmp_phy_cfg_tbls tbls_hs_b;
+ 	/* Additional sequence for different HS Gears */
+ 	const struct qmp_phy_cfg_tbls tbls_hs_overlay[NUM_OVERLAY];
++	/* The base sequence requires an overlay even at lower gears */
++	bool needs_hs_overlay;
+ 
+ 	/* regulators to be requested */
+ 	const struct regulator_bulk_data *vreg_list;
+@@ -1721,6 +1723,7 @@
+ 
+ 	.offsets		= &qmp_ufs_offsets_v6,
+ 	.max_supported_gear	= UFS_HS_G4,
++	.needs_hs_overlay	= true,
+ 
+ 	.tbls = {
+ 		.serdes		= sm8475_ufsphy_serdes,
+@@ -2027,7 +2030,8 @@
+ 			return idx;
+ 
+ 		/* If no direct matching, the lowest gear is the best matching */
+-		if (max_gear < floor_max_gear) {
++		if (max_gear < floor_max_gear ||
++		    (cfg->needs_hs_overlay && ret < 0)) {
+ 			ret = idx;
+ 			floor_max_gear = max_gear;
+ 		}

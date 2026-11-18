@@ -116,6 +116,7 @@ Sheng 的 `hardware.sheng.{thp,pen-status}` 选项提供 `package`。
 | `sheng` | 小米平板 6S Pro |
 | `aurora` | 小米 14 Ultra |
 | `clover` | 小米平板 4 LTE（当前支持的变体） |
+| `unicorn` | Xiaomi 12S Pro |
 
 设备专用包使用 `devicePackages.devices.<代号>`，例如
 `devices.asphalt.firmware`、`devices.sheng.thp`；`usb-signaller` 等通用包保留在顶层。

@@ -1,0 +1,711 @@
+Subject: [PATCH] Input: support ST FingerTipS SPI multitouch
+
+Use the installed controller firmware for standard multitouch, including
+reset diagnostics, firmware information and contact preservation on unknown errors.
+Firmware flashing and calibration are not performed.
+
+diff --git a/Documentation/devicetree/bindings/input/touchscreen/xiaomi,unicorn-touchscreen.yaml b/Documentation/devicetree/bindings/input/touchscreen/xiaomi,unicorn-touchscreen.yaml
+new file mode 100644
+--- /dev/null
++++ b/Documentation/devicetree/bindings/input/touchscreen/xiaomi,unicorn-touchscreen.yaml
+@@ -0,0 +1,85 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/input/touchscreen/xiaomi,unicorn-touchscreen.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Xiaomi 12S Pro STMicroelectronics FingerTipS SPI touchscreen
++
++maintainers:
++  - dwuggh <dwuggh@gmail.com>
++
++description: |
++  The Xiaomi 12S Pro uses an STMicroelectronics FingerTipS controller over
++  four-wire SPI mode 0. Xiaomi's SALIXP firmware protocol reports ten contacts
++  with 16-bit coordinates at ten times the display resolution. This binding
++  describes the normal multitouch firmware, not Android host processing (THP).
++
++allOf:
++  - $ref: touchscreen.yaml#
++  - $ref: /schemas/spi/spi-peripheral-props.yaml#
++
++properties:
++  compatible:
++    const: xiaomi,unicorn-touchscreen
++
++  reg:
++    maxItems: 1
++
++  interrupts:
++    maxItems: 1
++
++  reset-gpios:
++    description: Active-low controller reset.
++    maxItems: 1
++
++  vdd-supply:
++    description: 1.8 V digital and SPI interface supply.
++
++  avdd-supply:
++    description: Analog supply.
++
++  spi-max-frequency:
++    maximum: 12000000
++
++  touchscreen-size-x:
++    const: 14400
++
++  touchscreen-size-y:
++    const: 32000
++
++required:
++  - compatible
++  - reg
++  - interrupts
++  - reset-gpios
++  - vdd-supply
++  - avdd-supply
++  - spi-max-frequency
++  - touchscreen-size-x
++  - touchscreen-size-y
++
++unevaluatedProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/gpio/gpio.h>
++    #include <dt-bindings/interrupt-controller/irq.h>
++
++    spi {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        touchscreen@0 {
++            compatible = "xiaomi,unicorn-touchscreen";
++            reg = <0>;
++            spi-max-frequency = <12000000>;
++            interrupt-parent = <&tlmm>;
++            interrupts = <21 IRQ_TYPE_LEVEL_LOW>;
++            reset-gpios = <&tlmm 20 GPIO_ACTIVE_LOW>;
++            vdd-supply = <&pm8350c_l2>;
++            avdd-supply = <&pm8350c_l9>;
++            touchscreen-size-x = <14400>;
++            touchscreen-size-y = <32000>;
++        };
++    };
+diff --git a/drivers/input/touchscreen/Kconfig b/drivers/input/touchscreen/Kconfig
+--- a/drivers/input/touchscreen/Kconfig
++++ b/drivers/input/touchscreen/Kconfig
+@@ -1240,6 +1240,19 @@
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called st1232_ts.
+ 
++config TOUCHSCREEN_ST_FTS_SPI
++	tristate "ST FingerTipS SPI touchscreen on Xiaomi 12S Pro"
++	depends on SPI
++	depends on OF && GPIOLIB
++	help
++	  Support the ST FingerTipS SPI controller and normal multitouch
++	  firmware used by the Xiaomi 12S Pro (unicorn). Existing controller
++	  firmware is required; firmware flashing and Android THP are not
++	  implemented.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called st-fts-spi.
++
+ config TOUCHSCREEN_STMFTS
+ 	tristate "STMicroelectronics STMFTS touchscreen"
+ 	depends on I2C
+diff --git a/drivers/input/touchscreen/Makefile b/drivers/input/touchscreen/Makefile
+--- a/drivers/input/touchscreen/Makefile
++++ b/drivers/input/touchscreen/Makefile
+@@ -82,6 +82,7 @@
+ obj-$(CONFIG_TOUCHSCREEN_SIS_I2C)	+= sis_i2c.o
+ obj-$(CONFIG_TOUCHSCREEN_ST1232)	+= st1232.o
+ obj-$(CONFIG_TOUCHSCREEN_STMFTS)	+= stmfts.o
++obj-$(CONFIG_TOUCHSCREEN_ST_FTS_SPI) += st-fts-spi.o
+ obj-$(CONFIG_TOUCHSCREEN_STMPE)		+= stmpe-ts.o
+ obj-$(CONFIG_TOUCHSCREEN_SUN4I)		+= sun4i-ts.o
+ obj-$(CONFIG_TOUCHSCREEN_SUR40)		+= sur40.o
+diff --git a/drivers/input/touchscreen/st-fts-spi.c b/drivers/input/touchscreen/st-fts-spi.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/input/touchscreen/st-fts-spi.c
+@@ -0,0 +1,576 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * ST FingerTipS SPI support for the Xiaomi 12S Pro (unicorn).
++ *
++ * Protocol and event decoding derived from the STMicroelectronics driver in
++ * MiCode/Xiaomi_Kernel_OpenSource, mayfly-s-oss, drivers/input/touchscreen/fts_spi.
++ * Copyright (C) 2016, STMicroelectronics Limited.
++ * Original author: Marco Cali <marco.cali@st.com>
++ *
++ * This driver uses the firmware already installed in the controller. It does
++ * not write flash, calibration or lockdown data, or implement Android THP.
++ */
++
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/input.h>
++#include <linux/input/mt.h>
++#include <linux/input/touchscreen.h>
++#include <linux/interrupt.h>
++#include <linux/jiffies.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/pm.h>
++#include <linux/regulator/consumer.h>
++#include <linux/spi/spi.h>
++#include <linux/unaligned.h>
++
++#define ST_FTS_READ_FIFO		0x87
++#define ST_FTS_READ_HW		0xfb
++#define ST_FTS_SCAN		0xa0
++#define ST_FTS_CHIP_ID_ADDR	0x20000000
++#define ST_FTS_SALIXP_ID		0x4036
++#define ST_FTS_EVENT_SIZE		8
++#define ST_FTS_FIFO_DEPTH		32
++#define ST_FTS_MAX_TOUCHES	10
++#define ST_FTS_READY		0x03
++#define ST_FTS_ENTER		0x10
++#define ST_FTS_MOTION		0x20
++#define ST_FTS_LEAVE		0x30
++#define ST_FTS_ERROR		0xf0
++#define ST_FTS_ERROR_WATCHDOG	0x06
++#define ST_FTS_ERROR_ESD		0xf0
++#define ST_FTS_MAX_RECOVERIES	3
++
++struct st_fts {
++	struct spi_device *spi;
++	struct input_dev *input;
++	struct touchscreen_properties prop;
++	struct gpio_desc *reset;
++	struct regulator *vdd;
++	struct regulator *avdd;
++	bool powered;
++	bool running;
++	bool irq_faulted;
++	bool skip_next_event;
++	unsigned int recovery_count;
++	u8 events[ST_FTS_FIFO_DEPTH * ST_FTS_EVENT_SIZE];
++	/* SPI DMA buffers must not share cache lines with unrelated state. */
++	u8 tx[8] ____cacheline_aligned;
++	u8 rx[ST_FTS_FIFO_DEPTH * ST_FTS_EVENT_SIZE + 1] ____cacheline_aligned;
++};
++
++/* Call with the IRQ disabled, or from the threaded IRQ handler. */
++static int st_fts_read(struct st_fts *ts, const u8 *cmd, size_t cmd_len,
++		       u8 *data, size_t len)
++{
++	struct spi_transfer xfers[] = {
++		{ .tx_buf = ts->tx, .len = cmd_len },
++		{
++			.rx_buf = ts->rx,
++			.len = len + 1,
++			.delay = { .value = 10, .unit = SPI_DELAY_UNIT_USECS },
++		},
++	};
++	int ret;
++
++	if (cmd_len > sizeof(ts->tx) || len + 1 > sizeof(ts->rx))
++		return -EINVAL;
++
++	memcpy(ts->tx, cmd, cmd_len);
++	ret = spi_sync_transfer(ts->spi, xfers, ARRAY_SIZE(xfers));
++	if (!ret)
++		memcpy(data, ts->rx + 1, len); /* First received byte is dummy. */
++
++	return ret;
++}
++
++/* Reset loads System Info automatically; stop before the die/UID at byte 32. */
++static void st_fts_log_fw_info(struct st_fts *ts)
++{
++	const u8 cmd[] = { 0xa7, 0x00, 0x00 };
++	u8 info[32];
++	int ret;
++
++	ret = st_fts_read(ts, cmd, sizeof(cmd), info, sizeof(info));
++	if (ret) {
++		dev_warn(&ts->spi->dev, "firmware summary read failed: %d\n", ret);
++		return;
++	}
++	if (info[0] != 0xa5 || info[1] != 0x01) {
++		dev_warn(&ts->spi->dev, "firmware summary unavailable\n");
++		return;
++	}
++
++	dev_info(&ts->spi->dev,
++		 "firmware %04x config %04x AFE %02x/%02x/%02x protocol %02x\n",
++		 get_unaligned_le16(&info[16]), get_unaligned_le16(&info[20]),
++		 info[28], info[29], info[30], info[31]);
++}
++
++static int st_fts_scan(struct st_fts *ts, bool enable)
++{
++	struct spi_transfer xfer = {
++		.tx_buf = ts->tx,
++		.len = 3,
++		.delay = { .value = 10, .unit = SPI_DELAY_UNIT_USECS },
++	};
++	int ret;
++
++	ts->tx[0] = ST_FTS_SCAN;
++	ts->tx[1] = 0x00; /* Active mode. */
++	ts->tx[2] = 0x00; /* Stop scanning before changing firmware mode. */
++	ret = spi_sync_transfer(ts->spi, &xfer, 1);
++	if (ret || !enable)
++		return ret;
++
++	/* Unicorn's THP-capable firmware must emit ordinary multitouch events. */
++	ts->tx[0] = 0xc0;
++	ts->tx[1] = 0x21;
++	ts->tx[2] = 0x01; /* Disable host processing; no flash/calibration write. */
++	ret = spi_sync_transfer(ts->spi, &xfer, 1);
++	if (ret)
++		return ret;
++
++	ts->tx[0] = ST_FTS_SCAN;
++	ts->tx[1] = 0x00;
++	ts->tx[2] = 0x01;
++	ret = spi_sync_transfer(ts->spi, &xfer, 1);
++	if (!ret)
++		msleep(12);
++	return ret;
++}
++
++static int st_fts_reset(struct st_fts *ts)
++{
++	const u8 cmd = ST_FTS_READ_FIFO;
++	unsigned long deadline;
++	u8 event[ST_FTS_EVENT_SIZE];
++	int ret;
++
++	gpiod_set_value_cansleep(ts->reset, 1);
++	usleep_range(10000, 11000);
++	gpiod_set_value_cansleep(ts->reset, 0);
++	ts->skip_next_event = false;
++	deadline = jiffies + msecs_to_jiffies(1000);
++
++	do {
++		usleep_range(5000, 6000);
++		ret = st_fts_read(ts, &cmd, sizeof(cmd), event, sizeof(event));
++		if (ret)
++			return ret;
++		if (event[0] == ST_FTS_READY)
++			return 0;
++		/* A booting controller can return 0xff until its firmware starts. */
++		if (event[0] == 0xf3) {
++			dev_err(&ts->spi->dev, "controller boot error: %*ph\n",
++				ST_FTS_EVENT_SIZE, event);
++			return -EIO;
++		}
++	} while (time_before(jiffies, deadline));
++
++	dev_err(&ts->spi->dev, "no controller-ready event; last FIFO: %*ph\n",
++		ST_FTS_EVENT_SIZE, event);
++	return -ETIMEDOUT;
++}
++
++static void st_fts_power_off(void *data)
++{
++	struct st_fts *ts = data;
++
++	if (!ts->powered)
++		return;
++
++	gpiod_set_value_cansleep(ts->reset, 1);
++	regulator_disable(ts->avdd);
++	regulator_disable(ts->vdd);
++	ts->powered = false;
++}
++
++static int st_fts_power_on(struct st_fts *ts)
++{
++	u8 cmd[5] = { ST_FTS_READ_HW };
++	u8 id[2];
++	int ret;
++
++	ret = regulator_enable(ts->vdd);
++	if (ret)
++		return ret;
++	usleep_range(1000, 2000);
++	ret = regulator_enable(ts->avdd);
++	if (ret) {
++		regulator_disable(ts->vdd);
++		return ret;
++	}
++	ts->powered = true;
++	usleep_range(3000, 4000);
++
++	ret = st_fts_reset(ts);
++	if (ret) {
++		int id_ret;
++
++		/* Read-only failure context; preserve the original reset error. */
++		put_unaligned_be32(ST_FTS_CHIP_ID_ADDR, &cmd[1]);
++		id_ret = st_fts_read(ts, cmd, sizeof(cmd), id, sizeof(id));
++		if (id_ret)
++			dev_err(&ts->spi->dev, "chip ID read failed: %d\n", id_ret);
++		else
++			dev_err(&ts->spi->dev, "chip ID after reset failure: %04x\n",
++				get_unaligned_le16(id));
++		goto power_off;
++	}
++
++	put_unaligned_be32(ST_FTS_CHIP_ID_ADDR, &cmd[1]);
++	ret = st_fts_read(ts, cmd, sizeof(cmd), id, sizeof(id));
++	if (ret)
++		goto power_off;
++	if (get_unaligned_le16(id) != ST_FTS_SALIXP_ID) {
++		dev_err(&ts->spi->dev, "unexpected chip ID: %04x\n",
++			get_unaligned_le16(id));
++		ret = -ENODEV;
++		goto power_off;
++	}
++
++	st_fts_log_fw_info(ts);
++	return 0;
++
++power_off:
++	st_fts_power_off(ts);
++	return ret;
++}
++
++static void st_fts_release_all(struct st_fts *ts)
++{
++	int slot;
++
++	for (slot = 0; slot < ST_FTS_MAX_TOUCHES; slot++) {
++		input_mt_slot(ts->input, slot);
++		input_mt_report_slot_state(ts->input, MT_TOOL_FINGER, false);
++	}
++	input_mt_sync_frame(ts->input);
++	input_sync(ts->input);
++}
++
++static void st_fts_report_touch(struct st_fts *ts, const u8 *event)
++{
++	unsigned int slot = event[1] >> 4;
++	unsigned int type = event[1] & 0x0f;
++	unsigned int x, y;
++	bool active = (event[0] & 0xf0) != ST_FTS_LEAVE;
++	unsigned int tool = type == 4 ? MT_TOOL_PALM : MT_TOOL_FINGER;
++
++	/* Invalid IDs and non-contact types must never index the MT slots. */
++	if (slot >= ST_FTS_MAX_TOUCHES)
++		return;
++	/* Hover is not exposed, but must release a previous contact in this slot. */
++	if (type == 5)
++		active = false;
++	if (active && type != 1 && type != 2 && type != 4)
++		return;
++
++	input_mt_slot(ts->input, slot);
++	input_mt_report_slot_state(ts->input, tool, active);
++	if (!active)
++		return;
++
++	/* unicorn firmware reports 16-bit little-endian, 10x coordinates. */
++	x = min_t(unsigned int, get_unaligned_le16(&event[2]), ts->prop.max_x);
++	y = min_t(unsigned int, get_unaligned_le16(&event[4]), ts->prop.max_y);
++	touchscreen_report_pos(ts->input, &ts->prop, x, y, true);
++	/* The six-bit contact diameters use 16 coordinate units per count. */
++	input_report_abs(ts->input, ABS_MT_TOUCH_MAJOR,
++			 (((event[0] & 0x0c) << 2) | (event[6] >> 4)) * 16);
++	input_report_abs(ts->input, ABS_MT_TOUCH_MINOR,
++			 (((event[7] & 0xc0) >> 2) | (event[6] & 0x0f)) * 16);
++}
++
++/* Successful recovery runs under the oneshot IRQ mask without changing depth. */
++static void st_fts_recover(struct st_fts *ts, u8 error)
++{
++	int ret;
++
++	st_fts_release_all(ts);
++	if (ts->recovery_count >= ST_FTS_MAX_RECOVERIES) {
++		ret = -ELOOP;
++		goto fault;
++	}
++	ts->recovery_count++;
++
++	if (error == ST_FTS_ERROR_ESD) {
++		st_fts_power_off(ts);
++		/* Keep reset asserted while the supply references are dropped. */
++		usleep_range(10000, 11000);
++		ret = st_fts_power_on(ts);
++	} else {
++		ret = st_fts_reset(ts);
++	}
++	if (ret)
++		goto fault;
++	ret = st_fts_scan(ts, true);
++	if (!ret)
++		return;
++
++fault:
++	dev_err(&ts->spi->dev,
++		"recovery failed (%d); close/reopen input or resume to retry\n", ret);
++	/* No further automatic reset attempts or IRQ storm after a hard failure. */
++	disable_irq_nosync(ts->spi->irq);
++	ts->irq_faulted = true;
++	st_fts_power_off(ts);
++}
++
++static irqreturn_t st_fts_irq(int irq, void *data)
++{
++	struct st_fts *ts = data;
++	const u8 cmd = ST_FTS_READ_FIFO;
++	unsigned int remaining, i;
++	u8 *event;
++	int ret;
++
++	ret = st_fts_read(ts, &cmd, sizeof(cmd), ts->events, ST_FTS_EVENT_SIZE);
++	if (ret)
++		goto io_error;
++	remaining = ts->events[7] & 0x1f;
++	if (remaining) {
++		ret = st_fts_read(ts, &cmd, sizeof(cmd),
++				  &ts->events[ST_FTS_EVENT_SIZE],
++				  remaining * ST_FTS_EVENT_SIZE);
++		if (ret)
++			goto io_error;
++	}
++
++	for (i = 0; i <= remaining; i++) {
++		event = &ts->events[i * ST_FTS_EVENT_SIZE];
++		if (ts->skip_next_event) {
++			ts->skip_next_event = false;
++			continue;
++		}
++		if (!event[0])
++			break;
++		if (event[0] == 0xff || (event[0] & 0x03) != 0x03) {
++			ret = -EPROTO;
++			goto io_error;
++		}
++		/* Vendor gesture 0x18 has a following non-event payload. */
++		if (event[0] == 0x53 && event[1] == 0x02 && event[2] == 0x18)
++			ts->skip_next_event = true;
++		if (event[0] == ST_FTS_READY) {
++			st_fts_release_all(ts);
++			ret = st_fts_scan(ts, true);
++			if (ret)
++				goto io_error;
++			continue;
++		}
++		switch (event[0] & 0xf0) {
++		case ST_FTS_ENTER:
++		case ST_FTS_MOTION:
++		case ST_FTS_LEAVE:
++			st_fts_report_touch(ts, event);
++			/* Preserve down/up transitions within a single FIFO batch. */
++			input_mt_sync_frame(ts->input);
++			input_sync(ts->input);
++			break;
++		case 0x40:
++			/* Echo is positive command evidence, never touch/identity data. */
++			if (event[0] == 0x43 && event[1] == 0x01 &&
++			    ((event[2] == ST_FTS_SCAN && event[3] == 0x00 &&
++			      event[4] <= 0x01) ||
++			     (event[2] == 0xc0 && event[3] == 0x21 &&
++			      event[4] == 0x01)))
++				dev_dbg(&ts->spi->dev, "firmware command echo: %02x %02x %02x\n",
++					event[2], event[3], event[4]);
++			break;
++		case ST_FTS_ERROR:
++			if (event[0] != 0xf3)
++				break;
++			dev_err_ratelimited(&ts->spi->dev, "controller error: %*ph\n",
++					    ST_FTS_EVENT_SIZE, event);
++			if (event[1] == ST_FTS_ERROR_ESD ||
++			    event[1] == ST_FTS_ERROR_WATCHDOG) {
++				st_fts_recover(ts, event[1]);
++				/* All remaining events belong to the pre-reset state. */
++				return IRQ_HANDLED;
++			}
++			/* Match vendor: only ESD/watchdog force contact release. */
++			break;
++		}
++	}
++	return IRQ_HANDLED;
++
++io_error:
++	dev_err_ratelimited(&ts->spi->dev, "FIFO transfer failed: %d\n", ret);
++	st_fts_release_all(ts);
++	/* Bound retries when a transport failure leaves the level IRQ asserted. */
++	msleep(20);
++	return IRQ_HANDLED;
++}
++
++static int st_fts_start(struct st_fts *ts)
++{
++	int ret;
++
++	if (!ts->powered) {
++		ret = st_fts_power_on(ts);
++		if (ret)
++			return ret;
++	}
++	ret = st_fts_reset(ts);
++	if (ret)
++		return ret;
++	ret = st_fts_scan(ts, true);
++	if (ret)
++		return ret;
++	ts->recovery_count = 0;
++	ts->running = true;
++	enable_irq(ts->spi->irq);
++	return 0;
++}
++
++static void st_fts_stop(struct st_fts *ts)
++{
++	if (!ts->running)
++		return;
++
++	disable_irq(ts->spi->irq);
++	ts->running = false;
++	/*
++	 * Recovery may have added a disable reference while we waited for the
++	 * threaded handler. Drop that reference, retaining this stop's disable.
++	 */
++	if (ts->irq_faulted) {
++		ts->irq_faulted = false;
++		enable_irq(ts->spi->irq);
++	}
++	if (ts->powered && st_fts_scan(ts, false))
++		dev_warn(&ts->spi->dev, "failed to stop scanning\n");
++	st_fts_release_all(ts);
++}
++
++static int st_fts_open(struct input_dev *input)
++{
++	return st_fts_start(input_get_drvdata(input));
++}
++
++static void st_fts_close(struct input_dev *input)
++{
++	st_fts_stop(input_get_drvdata(input));
++}
++
++static int st_fts_suspend(struct device *dev)
++{
++	struct st_fts *ts = dev_get_drvdata(dev);
++
++	guard(mutex)(&ts->input->mutex);
++	if (input_device_enabled(ts->input))
++		st_fts_stop(ts);
++	st_fts_power_off(ts);
++	return 0;
++}
++
++static int st_fts_resume(struct device *dev)
++{
++	struct st_fts *ts = dev_get_drvdata(dev);
++	int ret;
++
++	guard(mutex)(&ts->input->mutex);
++	ret = st_fts_power_on(ts);
++	if (ret)
++		return ret;
++	if (input_device_enabled(ts->input))
++		return st_fts_start(ts);
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(st_fts_pm_ops, st_fts_suspend, st_fts_resume);
++
++static int st_fts_probe(struct spi_device *spi)
++{
++	struct device *dev = &spi->dev;
++	struct st_fts *ts;
++	int ret;
++
++	if (spi->irq <= 0)
++		return dev_err_probe(dev, -EINVAL, "missing interrupt\n");
++	if (spi->mode & (SPI_CPOL | SPI_CPHA | SPI_3WIRE))
++		return dev_err_probe(dev, -EINVAL, "requires four-wire SPI mode 0\n");
++	spi->bits_per_word = 8;
++	spi->max_speed_hz = min(spi->max_speed_hz, 12000000U);
++	ret = spi_setup(spi);
++	if (ret)
++		return ret;
++
++	ts = devm_kzalloc(dev, sizeof(*ts), GFP_KERNEL);
++	if (!ts)
++		return -ENOMEM;
++	ts->spi = spi;
++	spi_set_drvdata(spi, ts);
++	ts->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(ts->reset))
++		return dev_err_probe(dev, PTR_ERR(ts->reset), "reset GPIO unavailable\n");
++	ts->vdd = devm_regulator_get(dev, "vdd");
++	if (IS_ERR(ts->vdd))
++		return dev_err_probe(dev, PTR_ERR(ts->vdd), "VDD supply unavailable\n");
++	ts->avdd = devm_regulator_get(dev, "avdd");
++	if (IS_ERR(ts->avdd))
++		return dev_err_probe(dev, PTR_ERR(ts->avdd), "AVDD supply unavailable\n");
++
++	ts->input = devm_input_allocate_device(dev);
++	if (!ts->input)
++		return -ENOMEM;
++	ts->input->name = "ST FTS Xiaomi 12S Pro touchscreen";
++	ts->input->id.bustype = BUS_SPI;
++	ts->input->open = st_fts_open;
++	ts->input->close = st_fts_close;
++	input_set_drvdata(ts->input, ts);
++	input_set_abs_params(ts->input, ABS_MT_POSITION_X, 0, 14399, 0, 0);
++	input_set_abs_params(ts->input, ABS_MT_POSITION_Y, 0, 31999, 0, 0);
++	input_set_abs_params(ts->input, ABS_MT_TOUCH_MAJOR, 0, 1008, 0, 0);
++	input_set_abs_params(ts->input, ABS_MT_TOUCH_MINOR, 0, 1008, 0, 0);
++	input_set_abs_params(ts->input, ABS_MT_TOOL_TYPE, 0, MT_TOOL_PALM, 0, 0);
++	touchscreen_parse_properties(ts->input, true, &ts->prop);
++	/* FIFO reports changes only: INPUT_MT_DROP_UNUSED would release fingers. */
++	ret = input_mt_init_slots(ts->input, ST_FTS_MAX_TOUCHES, INPUT_MT_DIRECT);
++	if (ret)
++		return ret;
++
++	ret = st_fts_power_on(ts);
++	if (ret)
++		return dev_err_probe(dev, ret, "controller initialization failed\n");
++	ret = devm_add_action_or_reset(dev, st_fts_power_off, ts);
++	if (ret)
++		return ret;
++	ret = devm_request_threaded_irq(dev, spi->irq, NULL, st_fts_irq,
++					IRQF_ONESHOT | IRQF_NO_AUTOEN,
++					dev_name(dev), ts);
++	if (ret)
++		return dev_err_probe(dev, ret, "IRQ request failed\n");
++
++	return input_register_device(ts->input);
++}
++
++static const struct of_device_id st_fts_of_match[] = {
++	{ .compatible = "xiaomi,unicorn-touchscreen" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, st_fts_of_match);
++
++static const struct spi_device_id st_fts_spi_ids[] = {
++	{ "unicorn-touchscreen" },
++	{ }
++};
++MODULE_DEVICE_TABLE(spi, st_fts_spi_ids);
++
++static struct spi_driver st_fts_driver = {
++	.probe = st_fts_probe,
++	.id_table = st_fts_spi_ids,
++	.driver = {
++		.name = "st-fts-spi",
++		.of_match_table = st_fts_of_match,
++		.pm = pm_sleep_ptr(&st_fts_pm_ops),
++	},
++};
++module_spi_driver(st_fts_driver);
++
++MODULE_DESCRIPTION("ST FingerTipS SPI touchscreen for Xiaomi 12S Pro");
++MODULE_LICENSE("GPL");

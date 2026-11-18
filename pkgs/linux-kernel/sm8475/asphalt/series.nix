@@ -41,6 +41,8 @@
   ./patches/local/0033-sm8475-ufs-dt-bindings.patch
   ./patches/local/0034-sm8475-ufs-turbo-mode.patch
   ./patches/local/0035-sm8475-ufs-opp-table.patch
+  ./patches/local/0036-sm8475-ufs-ice-mx-opps.patch
+  ../../patches/ufs-opp-init-order.patch
   ../../patches/iris-hfi-gen2-deblocking.patch
   ../../patches/iris-hfi-gen2-error-timestamps.patch
   ../../patches/iris-hfi-gen2-noshow.patch

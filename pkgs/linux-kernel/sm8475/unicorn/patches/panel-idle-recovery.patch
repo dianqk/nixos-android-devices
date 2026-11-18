@@ -1,0 +1,646 @@
+Subject: [PATCH] drm/panel: recover L2S idle with owned supplies and incoming mode
+
+Recover using the incoming mode and cached effective brightness. Track
+regulator references independently of preparation, so failed recovery and
+repeated teardown remain balanced. Retain the first runtime failure.
+
+Wake deferred backlight requests using the old CRTC state: duplication has
+already cleared SR in the new state. Run the commit outside update_lock to
+avoid inversion against KMS backlight callbacks, and drain work on removal.
+
+--- a/drivers/gpu/drm/panel/panel-xiaomi-l2s-380c0a.c
++++ b/drivers/gpu/drm/panel/panel-xiaomi-l2s-380c0a.c
+@@ -11,11 +11,13 @@
+ #include <linux/gpio/consumer.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
++#include <linux/workqueue.h>
+ #include <linux/regulator/consumer.h>
+ 
+ #include <drm/display/drm_dsc.h>
+ #include <drm/display/drm_dsc_helper.h>
+ #include <drm/drm_connector.h>
++#include <drm/drm_drv.h>
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_uapi.h>
+ #include <drm/drm_vblank.h>
+@@ -56,6 +58,13 @@
+ 	bool prepared;
+ 	bool enabled;
+ 	bool idle_active;
++	bool idle_requested;
++	unsigned int supplies_enabled;
++	u16 brightness;
++	int recovery_error;
++	int backlight_error;
++	struct work_struct backlight_work;
++	bool stopping;
+ 	bool runtime_failed;
+ 	u64 mode_switches;
+ 	u64 idle_entries;
+@@ -169,8 +178,10 @@
+ 		return -EINVAL;
+ 	ret = mipi_dsi_transfer_sequence(ctx->dsi, set.cmds, set.count);
+ 	if (ret) {
+-		ctx->runtime_failed = true;
+-		ctx->runtime_error = ret;
++		if (!ctx->runtime_failed) {
++			ctx->runtime_error = ret;
++			ctx->runtime_failed = true;
++		}
+ 		dev_err(&ctx->dsi->dev, "runtime %u -> %u Hz failed: %d\n",
+ 			old_hz, new_hz, ret);
+ 	}
+@@ -258,48 +269,102 @@
+ {
+ 	struct l2s_panel *ctx = to_l2s_panel(panel);
+ 	int ret = -EBUSY;
+-	mutex_lock(&ctx->lock);
+-	if (ctx->prepared && ctx->enabled && ctx->refresh == 120 &&
+-	    !ctx->runtime_failed && !ctx->idle_active) {
++
++	mutex_lock(&ctx->lock);
++	/* DRM may stop the CRTC even when the optional low-rate command fails. */
++	ctx->idle_requested = true;
++	if (ctx->idle_active) {
++		ret = 0;
++	} else if (ctx->prepared && ctx->enabled && ctx->refresh == 120 &&
++		   !ctx->runtime_failed) {
+ 		ret = l2s_runtime_send(ctx, 120, idle_hz);
+ 		if (!ret) {
+ 			ctx->idle_active = true;
+ 			ctx->idle_entries++;
+ 		}
+ 	}
+-	mutex_unlock(&ctx->lock);
+-	return ret;
+-}
+-
+-static int l2s_panel_prepare(struct drm_panel *panel);
+-static int l2s_panel_enable(struct drm_panel *panel);
+-static int l2s_panel_unprepare(struct drm_panel *panel);
++	if (ret && !ctx->runtime_failed) {
++		ctx->runtime_error = ret;
++		ctx->runtime_failed = true;
++	}
++	if (ret)
++		dev_err(&ctx->dsi->dev, "idle entry failed: %d; recover on wake\n", ret);
++	mutex_unlock(&ctx->lock);
++	return ret;
++}
++
++static int l2s_panel_prepare_locked(struct l2s_panel *ctx);
++static int l2s_panel_enable_locked(struct l2s_panel *ctx);
++static int l2s_panel_disable_locked(struct l2s_panel *ctx);
++static int l2s_panel_unprepare_locked(struct l2s_panel *ctx);
++
++/* Caller holds ctx->lock; never recurse into the backlight update lock. */
++static int l2s_write_brightness_locked(struct l2s_panel *ctx)
++{
++	unsigned long mode_flags = ctx->dsi->mode_flags;
++	int ret;
++
++	lockdep_assert_held(&ctx->lock);
++	ctx->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
++	ret = mipi_dsi_dcs_set_display_brightness_large(ctx->dsi, ctx->brightness);
++	ctx->dsi->mode_flags = mode_flags;
++	return ret;
++}
+ 
+ static int l2s_idle_exit(struct drm_panel *panel)
+ {
+ 	struct l2s_panel *ctx = to_l2s_panel(panel);
+-	int ret = 0;
+-	mutex_lock(&ctx->lock);
+-	if (ctx->idle_active) {
+-		ret = l2s_runtime_send(ctx, idle_hz, 120);
+-		ctx->idle_active = false;
+-		if (!ret)
+-			ctx->idle_exits++;
+-	}
+-	if (ctx->runtime_failed && ctx->prepared)
+-		ret = ctx->runtime_error ?: -EIO;
+-	mutex_unlock(&ctx->lock);
+-	if (ret) {
+-		int recovery;
+-		/* Reinitialization keeps the original failure latched for diagnostics. */
+-		l2s_panel_unprepare(panel);
+-		recovery = l2s_panel_prepare(panel);
+-		if (!recovery)
+-			recovery = l2s_panel_enable(panel);
+-		if (recovery)
+-			dev_err(&ctx->dsi->dev, "idle recovery failed: %d\n",
+-				recovery);
+-	}
++	int mode, ret;
++
++	mutex_lock(&ctx->lock);
++	mode = l2s_panel_get_current_mode(ctx);
++	if (mode < 0) {
++		ret = mode;
++		goto out;
++	}
++	if (ctx->idle_active && ctx->prepared && ctx->enabled &&
++	    !ctx->runtime_failed &&
++	    ctx->refresh == drm_mode_vrefresh(&l2s_panel_modes[mode])) {
++		ret = l2s_runtime_send(ctx, idle_hz, ctx->refresh);
++		if (!ret) {
++			ctx->idle_active = false;
++			ret = l2s_write_brightness_locked(ctx);
++			if (!ret) {
++				ctx->idle_requested = false;
++				ctx->idle_exits++;
++				goto out;
++			}
++			if (!ctx->runtime_failed) {
++				ctx->runtime_error = ret;
++				ctx->runtime_failed = true;
++			}
++		}
++	}
++
++	/* A changed mode or a partial command needs a complete panel reset.
++	 * All exposed modes share the WQHD command stream, DSC and lane rate.
++	 * Keep the DSI link retained by the bridge, and use the incoming mode.
++	 */
++	l2s_panel_disable_locked(ctx);
++	ret = l2s_panel_unprepare_locked(ctx);
++	if (ret)
++		goto out;
++	ret = l2s_panel_prepare_locked(ctx);
++	if (!ret)
++		ret = l2s_panel_enable_locked(ctx);
++	if (!ret)
++		ret = l2s_write_brightness_locked(ctx);
++	if (ret)
++		l2s_panel_unprepare_locked(ctx);
++out:
++	ctx->recovery_error = ret;
++	if (ret && !ctx->runtime_failed) {
++		ctx->runtime_error = ret;
++		ctx->runtime_failed = true;
++	}
++	if (ret)
++		dev_err(&ctx->dsi->dev, "idle recovery failed: %d\n", ret);
++	mutex_unlock(&ctx->lock);
+ 	return ret;
+ }
+ 
+@@ -309,14 +374,25 @@
+ {
+ 	struct drm_modeset_acquire_ctx acquire;
+ 	struct drm_atomic_commit *state;
+-	struct drm_crtc_state *cs;
++	struct drm_crtc_state *cs, *old_cs;
+ 	struct drm_crtc *crtc;
+-	int ret;
+-
+-	if (!READ_ONCE(ctx->idle_active))
+-		return 0;
++	struct drm_connector *connector;
++	int idx, ret;
++
++	mutex_lock(&ctx->lock);
++	connector = ctx->stopping ? NULL : ctx->connector;
++	if (connector)
++		drm_connector_get(connector);
++	mutex_unlock(&ctx->lock);
++	if (!connector)
++		return -ENODEV;
++	if (!drm_dev_enter(connector->dev, &idx)) {
++		ret = -ENODEV;
++		goto put_connector;
++	}
++
+ 	drm_modeset_acquire_init(&acquire, 0);
+-	state = drm_atomic_commit_alloc(ctx->connector->dev);
++	state = drm_atomic_commit_alloc(connector->dev);
+ 	if (!state) {
+ 		ret = -ENOMEM;
+ 		goto drop;
+@@ -324,12 +400,12 @@
+ retry:
+ 	state->acquire_ctx = &acquire;
+ 	ret = drm_modeset_lock(
+-		&ctx->connector->dev->mode_config.connection_mutex, &acquire);
++		&connector->dev->mode_config.connection_mutex, &acquire);
+ 	if (ret)
+ 		goto out;
+-	crtc = ctx->connector->state->crtc;
++	crtc = connector->state ? connector->state->crtc : NULL;
+ 	if (!crtc) {
+-		ret = -ENODEV;
++		ret = 0;
+ 		goto out;
+ 	}
+ 	cs = drm_atomic_get_crtc_state(state, crtc);
+@@ -337,7 +413,9 @@
+ 		ret = PTR_ERR(cs);
+ 		goto out;
+ 	}
+-	if (!cs->self_refresh_active) {
++	/* duplicate_state has already cleared SR in cs: inspect the old state. */
++	old_cs = drm_atomic_get_old_crtc_state(state, crtc);
++	if (!old_cs->self_refresh_active || !cs->enable) {
+ 		ret = 0;
+ 		goto out;
+ 	}
+@@ -345,6 +423,12 @@
+ 	cs->self_refresh_active = false;
+ 	state->allow_modeset = true;
+ 	ret = drm_atomic_commit(state);
++	if (!ret) {
++		mutex_lock(&ctx->lock);
++		if (!ctx->prepared || !ctx->enabled)
++			ret = ctx->recovery_error ?: -EIO;
++		mutex_unlock(&ctx->lock);
++	}
+ out:
+ 	if (ret == -EDEADLK) {
+ 		drm_atomic_commit_clear(state);
+@@ -356,7 +440,47 @@
+ drop:
+ 	drm_modeset_drop_locks(&acquire);
+ 	drm_modeset_acquire_fini(&acquire);
+-	return ret;
++	drm_dev_exit(idx);
++put_connector:
++	drm_connector_put(connector);
++	return ret;
++}
++
++
++/* Backlight update_status holds update_lock. KMS callbacks can take that lock,
++ * so do not acquire modeset locks or commit synchronously from update_status.
++ */
++static void l2s_backlight_work(struct work_struct *work)
++{
++	struct l2s_panel *ctx = container_of(work, struct l2s_panel, backlight_work);
++	int ret;
++
++	ret = l2s_backlight_wake(ctx);
++	mutex_lock(&ctx->lock);
++	if (!ret && !ctx->stopping && ctx->prepared && ctx->enabled &&
++	    !ctx->idle_requested)
++		ret = l2s_write_brightness_locked(ctx);
++	ctx->backlight_error = ret;
++	mutex_unlock(&ctx->lock);
++	if (ret)
++		dev_err(&ctx->dsi->dev, "backlight wake failed: %d\n", ret);
++}
++
++static void l2s_stop_backlight_work(void *data)
++{
++	struct l2s_panel *ctx = data;
++	struct drm_connector *connector;
++
++	mutex_lock(&ctx->lock);
++	ctx->stopping = true;
++	mutex_unlock(&ctx->lock);
++	cancel_work_sync(&ctx->backlight_work);
++	mutex_lock(&ctx->lock);
++	connector = ctx->connector;
++	ctx->connector = NULL;
++	mutex_unlock(&ctx->lock);
++	if (connector)
++		drm_connector_put(connector);
+ }
+ 
+ static int l2s_runtime_state_show(struct seq_file *s, void *unused)
+@@ -367,10 +491,12 @@
+ 		s,
+ 		"refresh=%u\nidle_hz=%u\nidle_active=%u\nfailed=%u\nerror=%d\n"
+ 		"mode_switches=%llu\nidle_entries=%llu\nidle_exits=%llu\n"
+-		"vrr_capable=0\n",
++		"idle_requested=%u\nprepared=%u\nenabled=%u\nsupplies_enabled=%#x\n"
++		"recovery_error=%d\nbacklight_error=%d\nvrr_capable=0\n",
+ 		ctx->refresh, idle_hz, ctx->idle_active, ctx->runtime_failed,
+ 		ctx->runtime_error, ctx->mode_switches, ctx->idle_entries,
+-		ctx->idle_exits);
++		ctx->idle_exits, ctx->idle_requested, ctx->prepared, ctx->enabled,
++		ctx->supplies_enabled, ctx->recovery_error, ctx->backlight_error);
+ 	mutex_unlock(&ctx->lock);
+ 	return 0;
+ }
+@@ -540,46 +666,57 @@
+ 	return dsi_ctx.accum_err;
+ }
+ 
+-static void l2s_panel_power_off(struct l2s_panel *ctx)
+-{
+-	int i;
+-
++static int l2s_panel_power_off(struct l2s_panel *ctx)
++{
++	int i, ret = 0, err;
++
++	lockdep_assert_held(&ctx->lock);
+ 	gpiod_set_value_cansleep(ctx->reset, 1);
++	ctx->prepared = false;
++	ctx->enabled = false;
++	ctx->idle_active = false;
++	ctx->idle_requested = false;
+ 	for (i = ARRAY_SIZE(ctx->supplies) - 1; i >= 0; i--) {
+-		regulator_disable(ctx->supplies[i].consumer);
++		if (!(ctx->supplies_enabled & BIT(i)))
++			continue;
++		err = regulator_disable(ctx->supplies[i].consumer);
++		if (err) {
++			if (!ret)
++				ret = err;
++			dev_err(&ctx->dsi->dev, "supply %d disable failed: %d\n", i, err);
++		} else {
++			ctx->supplies_enabled &= ~BIT(i);
++		}
+ 		usleep_range(1000, 2000);
+ 	}
+-}
+-
+-static int l2s_panel_prepare(struct drm_panel *panel)
+-{
+-	struct l2s_panel *ctx = to_l2s_panel(panel);
++	return ret;
++}
++
++static int l2s_panel_prepare_locked(struct l2s_panel *ctx)
++{
+ 	int i, ret, mode;
+ 
+-	mutex_lock(&ctx->lock);
++	lockdep_assert_held(&ctx->lock);
++	if (ctx->prepared)
++		return 0;
++	/* Retry only references left over from a failed regulator disable. */
++	if (ctx->supplies_enabled) {
++		ret = l2s_panel_power_off(ctx);
++		if (ret)
++			return ret;
++	}
+ 	mode = l2s_panel_get_current_mode(ctx);
+-	if (mode < 0) {
+-		ret = mode;
+-		dev_err(&ctx->dsi->dev, "unsupported L2S display mode\n");
+-		goto unlock;
+-	}
++	if (mode < 0)
++		return mode;
+ 	ctx->refresh = drm_mode_vrefresh(&l2s_panel_modes[mode]);
+ 
+-
+-	/* Preserve downstream order and its 1 ms delay after each supply. */
+ 	for (i = 0; i < ARRAY_SIZE(ctx->supplies); i++) {
+ 		ret = regulator_enable(ctx->supplies[i].consumer);
+-
+-		if (ret) {
+-			while (i--) {
+-				regulator_disable(ctx->supplies[i].consumer);
+-				usleep_range(1000, 2000);
+-			}
+-			goto unlock;
+-		}
++		if (ret)
++			goto power_off;
++		ctx->supplies_enabled |= BIT(i);
+ 		usleep_range(1000, 2000);
+ 	}
+-
+ 	gpiod_set_value_cansleep(ctx->reset, 1);
+ 	usleep_range(1000, 2000);
+ 	gpiod_set_value_cansleep(ctx->reset, 0);
+@@ -587,10 +724,21 @@
+ 
+ 	ret = l2s_panel_init(ctx);
+ 	if (ret)
+-		l2s_panel_power_off(ctx);
+-	else
+-		ctx->prepared = true;
+-unlock:
++		goto power_off;
++	ctx->prepared = true;
++	return 0;
++power_off:
++	l2s_panel_power_off(ctx);
++	return ret;
++}
++
++static int l2s_panel_prepare(struct drm_panel *panel)
++{
++	struct l2s_panel *ctx = to_l2s_panel(panel);
++	int ret;
++
++	mutex_lock(&ctx->lock);
++	ret = l2s_panel_prepare_locked(ctx);
+ 	mutex_unlock(&ctx->lock);
+ 	return ret;
+ }
+@@ -609,60 +757,91 @@
+ 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xf0, 0xa5, 0xa5);
+ }
+ 
+-static int l2s_panel_enable(struct drm_panel *panel)
+-{
+-	struct l2s_panel *ctx = to_l2s_panel(panel);
++static int l2s_panel_enable_locked(struct l2s_panel *ctx)
++{
+ 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
+ 	struct drm_dsc_picture_parameter_set pps;
+ 
+-	mutex_lock(&ctx->lock);
++	lockdep_assert_held(&ctx->lock);
++	if (ctx->enabled)
++		return 0;
++	if (!ctx->prepared)
++		return -EIO;
+ 	mipi_dsi_dcs_set_display_on_multi(&dsi_ctx);
+-
+ 	l2s_panel_post_on(ctx, &dsi_ctx);
+-	/* Match the PPS to the same configuration used by the DPU encoder. */
+ 	drm_dsc_pps_payload_pack(&pps, &ctx->dsc);
+ 	mipi_dsi_picture_parameter_set_multi(&dsi_ctx, &pps);
+-
+-
+-	if (!dsi_ctx.accum_err) {
++	if (!dsi_ctx.accum_err)
+ 		ctx->enabled = true;
+-	}
+-	mutex_unlock(&ctx->lock);
+-
+ 	return dsi_ctx.accum_err;
+ }
+ 
+-static int l2s_panel_disable(struct drm_panel *panel)
++static int l2s_panel_enable(struct drm_panel *panel)
+ {
+ 	struct l2s_panel *ctx = to_l2s_panel(panel);
+ 	int ret;
+ 
+ 	mutex_lock(&ctx->lock);
++	ret = l2s_panel_enable_locked(ctx);
++	mutex_unlock(&ctx->lock);
++	return ret;
++}
++
++static int l2s_panel_disable_locked(struct l2s_panel *ctx)
++{
++	int ret;
++
++	lockdep_assert_held(&ctx->lock);
++	if (!ctx->enabled)
++		return 0;
+ 	ctx->enabled = false;
+-	if (ctx->idle_active) {
+-		mutex_unlock(&ctx->lock);
+-		return 0;
+-	}
+-	ret = mipi_dsi_dcs_set_display_off(ctx->dsi);
+-	msleep(20);
+-	mutex_unlock(&ctx->lock);
+-
+-	return ret;
+-}
+-
+-static int l2s_panel_unprepare(struct drm_panel *panel)
++	if (!ctx->idle_active) {
++		ret = mipi_dsi_dcs_set_display_off(ctx->dsi);
++		if (ret)
++			dev_warn(&ctx->dsi->dev, "display-off failed: %d; powering off\n", ret);
++		msleep(20);
++	}
++	/* The next unprepare asserts reset and removes power even on DCS error. */
++	return 0;
++}
++
++static int l2s_panel_disable(struct drm_panel *panel)
+ {
+ 	struct l2s_panel *ctx = to_l2s_panel(panel);
+ 	int ret;
+ 
+ 	mutex_lock(&ctx->lock);
+-	ret = ctx->idle_active ? 0 : mipi_dsi_dcs_enter_sleep_mode(ctx->dsi);
+-	ctx->idle_active = false;
+-	msleep(100);
+-	ctx->prepared = false;
+-	l2s_panel_power_off(ctx);
+-	mutex_unlock(&ctx->lock);
+-
++	ret = l2s_panel_disable_locked(ctx);
++	mutex_unlock(&ctx->lock);
++	return ret;
++}
++
++static int l2s_panel_unprepare_locked(struct l2s_panel *ctx)
++{
++	int ret;
++
++	lockdep_assert_held(&ctx->lock);
++	if (ctx->prepared && !ctx->idle_active) {
++		ret = mipi_dsi_dcs_enter_sleep_mode(ctx->dsi);
++		if (ret)
++			dev_warn(&ctx->dsi->dev, "sleep command failed: %d; powering off\n", ret);
++	}
++	if (ctx->supplies_enabled)
++		msleep(100);
++	/* Report completed power-off, not the optional command's error. This
++	 * lets drm_panel_unprepare clear its prepared flag after power is gone.
++	 */
++	return l2s_panel_power_off(ctx);
++}
++
++static int l2s_panel_unprepare(struct drm_panel *panel)
++{
++	struct l2s_panel *ctx = to_l2s_panel(panel);
++	int ret;
++
++	mutex_lock(&ctx->lock);
++	ret = l2s_panel_unprepare_locked(ctx);
++	mutex_unlock(&ctx->lock);
+ 	return ret;
+ }
+ 
+@@ -671,9 +850,23 @@
+ {
+ 	struct l2s_panel *ctx = to_l2s_panel(panel);
+ 	struct drm_display_mode *mode;
++	struct drm_connector *old = NULL;
+ 	unsigned int i;
+ 
+-	ctx->connector = connector;
++	mutex_lock(&ctx->lock);
++	if (ctx->stopping) {
++		mutex_unlock(&ctx->lock);
++		return -ENODEV;
++	}
++	/* Keep the connector alive until all deferred backlight work is drained. */
++	if (ctx->connector != connector) {
++		old = ctx->connector;
++		drm_connector_get(connector);
++		ctx->connector = connector;
++	}
++	mutex_unlock(&ctx->lock);
++	if (old)
++		drm_connector_put(old);
+ 	for (i = 0; i < ARRAY_SIZE(l2s_panel_modes); i++) {
+ 		mode = drm_mode_duplicate(connector->dev, &l2s_panel_modes[i]);
+ 		if (!mode)
+@@ -706,27 +899,21 @@
+ {
+ 	struct l2s_panel *ctx = bl_get_data(bl);
+ 	u16 brightness = backlight_get_brightness(bl);
+-	unsigned long mode_flags;
+ 	int ret = 0;
+ 
+-	if (READ_ONCE(ctx->idle_active)) {
+-		if (backlight_is_blank(bl))
+-			return 0;
+-		ret = l2s_backlight_wake(ctx);
+-		if (ret)
+-			return ret;
+-	}
+-	mutex_lock(&ctx->lock);
+-	if (!ctx->prepared)
+-		goto unlock;
+-
+-	/* The vendor inverted-dbv flag means high byte first. */
+-	mode_flags = ctx->dsi->mode_flags;
+-	ctx->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+-	ret = mipi_dsi_dcs_set_display_brightness_large(ctx->dsi, brightness);
+-
+-	ctx->dsi->mode_flags = mode_flags;
+-unlock:
++	mutex_lock(&ctx->lock);
++	if (ctx->stopping) {
++		ret = -ENODEV;
++		goto out;
++	}
++	ctx->brightness = brightness;
++	if (ctx->idle_requested) {
++		if (!backlight_is_blank(bl))
++			schedule_work(&ctx->backlight_work);
++	} else if (ctx->prepared) {
++		ret = l2s_write_brightness_locked(ctx);
++	}
++out:
+ 	mutex_unlock(&ctx->lock);
+ 	return ret;
+ }
+@@ -764,7 +951,12 @@
+ 	if (seamless || idle_hz)
+ 		dsi->cmd_hs_rate = 1360000000;
+ 	ctx->dsi = dsi;
++	ctx->brightness = props.brightness;
+ 	mutex_init(&ctx->lock);
++	INIT_WORK(&ctx->backlight_work, l2s_backlight_work);
++	ret = devm_add_action_or_reset(dev, l2s_stop_backlight_work, ctx);
++	if (ret)
++		return ret;
+ 	ctx->supplies[0].supply = "vci";
+ 	ctx->supplies[1].supply = "vddio";
+ 	ctx->supplies[2].supply = "vddd";
+@@ -816,6 +1008,7 @@
+ {
+ 	struct l2s_panel *ctx = mipi_dsi_get_drvdata(dsi);
+ 
++	l2s_stop_backlight_work(ctx);
+ 	drm_panel_remove(&ctx->panel);
+ }
+ 

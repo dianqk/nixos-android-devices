@@ -85,6 +85,8 @@ fn preview_dimensions() -> io::Result<(usize, usize)> {
 }
 /// The result of the read-only `prepare-install --check` the screen runs to
 /// list the Android userdata sizes.
+pub(crate) const LINUX_ONLY_CHOICE: &str = "All userdata (erase Android)";
+
 pub(crate) struct UserdataCheck {
     pub choices: Result<Vec<String>, String>,
     /// The daemon task of the check ("Recovery task N" on stderr).
@@ -106,7 +108,7 @@ fn client_error(text: &str) -> Option<&str> {
 /// ("Android userdata choices: 64G 128G", or "none").
 pub(crate) fn parse_userdata_check(text: &str, success: bool) -> UserdataCheck {
     let task = client_task(text);
-    let choices: Vec<String> = text
+    let mut choices: Vec<String> = text
         .lines()
         .find_map(|l| l.strip_prefix("Android userdata choices:"))
         .map(|l| {
@@ -116,6 +118,12 @@ pub(crate) fn parse_userdata_check(text: &str, success: bool) -> UserdataCheck {
                 .collect()
         })
         .unwrap_or_default();
+    if text
+        .lines()
+        .any(|l| l == "Linux-only layout: entire userdata")
+    {
+        choices = vec![LINUX_ONLY_CHOICE.into()];
+    }
     let choices = if success && !choices.is_empty() {
         Ok(choices)
     } else {
@@ -183,6 +191,18 @@ pub(crate) fn action_result(contents: &str, success: bool, status: &str) -> Stri
 pub(crate) fn task_takes_over(session: u64, last: u64, own_check: Option<u64>) -> bool {
     session != last && Some(session) != own_check
 }
+pub(crate) fn prepare_args(chosen: &str, confirm: bool) -> Vec<&str> {
+    let flag = if confirm {
+        "--confirm-erase-userdata"
+    } else {
+        "--check"
+    };
+    if chosen == LINUX_ONLY_CHOICE {
+        vec![device::PREPARE_INSTALL, flag]
+    } else {
+        vec![device::PREPARE_INSTALL, "--android-userdata", chosen, flag]
+    }
+}
 fn start_action(
     cfg: &Profile,
     action: &str,
@@ -204,7 +224,7 @@ fn start_action(
     command.arg(action);
     if action == device::PREPARE_INSTALL {
         let size = chosen.ok_or_else(|| io::Error::other("no Android userdata size chosen"))?;
-        command.args(["--android-userdata", size, "--confirm-erase-userdata"]);
+        command.args(&prepare_args(size, true)[1..]);
     } else {
         command.arg("--confirm");
     }
@@ -414,15 +434,7 @@ pub(crate) fn run() -> io::Result<()> {
         }
         if let Some(size) = menu.chosen().map(String::from) {
             if menu.plan.is_empty() && !menu.error {
-                let check = run_check(
-                    &[
-                        device::PREPARE_INSTALL,
-                        "--android-userdata",
-                        &size,
-                        "--check",
-                    ],
-                    parse_plan_check,
-                );
+                let check = run_check(&prepare_args(&size, false), parse_plan_check);
                 own_check = check.task.or(own_check);
                 match check.choices {
                     Ok(plan) => menu.plan = plan,

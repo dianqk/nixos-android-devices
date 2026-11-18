@@ -1,0 +1,162 @@
+Subject: [PATCH] ufs: qcom: handle SM8475 controller timing
+
+Add the SM8475 compatible and derive link timing from the active clock
+and divider readback, including the turbo clock configuration.
+
+diff --git a/Documentation/devicetree/bindings/ufs/qcom,sc7180-ufshc.yaml b/Documentation/devicetree/bindings/ufs/qcom,sc7180-ufshc.yaml
+--- a/Documentation/devicetree/bindings/ufs/qcom,sc7180-ufshc.yaml
++++ b/Documentation/devicetree/bindings/ufs/qcom,sc7180-ufshc.yaml
+@@ -26,6 +26,7 @@
+           - qcom,sm8250-ufshc
+           - qcom,sm8350-ufshc
+           - qcom,sm8450-ufshc
++          - qcom,sm8475-ufshc
+           - qcom,sm8550-ufshc
+   required:
+     - compatible
+@@ -51,6 +52,7 @@
+               - qcom,sm8250-ufshc
+               - qcom,sm8350-ufshc
+               - qcom,sm8450-ufshc
++              - qcom,sm8475-ufshc
+               - qcom,sm8550-ufshc
+           - const: qcom,ufshc
+           - const: jedec,ufs-2.0
+diff --git a/drivers/ufs/host/ufs-qcom.c b/drivers/ufs/host/ufs-qcom.c
+--- a/drivers/ufs/host/ufs-qcom.c
++++ b/drivers/ufs/host/ufs-qcom.c
+@@ -41,6 +41,61 @@
+ 
+ #define UFS_ICE_SYNC_RST_SEL	BIT(3)
+ #define UFS_ICE_SYNC_RST_SW	BIT(4)
++
++static bool ufs_qcom_is_sm8475(struct ufs_hba *hba)
++{
++	return of_device_is_compatible(hba->dev->of_node, "qcom,sm8475-ufshc");
++}
++
++/* SM8475's turbo clocks count divided UniPro cycles, not input MHz. */
++static int ufs_qcom_sm8475_clk_cycles(u32 mhz, u32 *cycles_1us, u32 *cycles_40ns)
++{
++	switch (mhz) {
++	case 38:
++		*cycles_1us = 38;
++		*cycles_40ns = 2;
++		break;
++	case 75:
++		*cycles_1us = 75;
++		*cycles_40ns = 3;
++		break;
++	case 150:
++		*cycles_1us = 150;
++		*cycles_40ns = 6;
++		break;
++	case 300:
++	case 600:
++		*cycles_1us = 300;
++		*cycles_40ns = 12;
++		break;
++	case 807: /* ceil(806.4 MHz) */
++		*cycles_1us = 202;
++		*cycles_40ns = 9;
++		break;
++	case 850:
++		*cycles_1us = 213;
++		*cycles_40ns = 9;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int ufs_qcom_sm8475_set_clk_mode(struct ufs_hba *hba, bool turbo)
++{
++	u32 old = ufshcd_readl(hba, UFS_TEST_BUS_CTRL_2);
++	int ret;
++
++	/* Cape's HCI divider and UniPro clock gating change together. */
++	ufshcd_rmwl(hba, BIT(4), turbo ? BIT(4) : 0, UFS_TEST_BUS_CTRL_2);
++	ret = ufshcd_dme_rmw(hba, BIT(8), turbo ? BIT(8) : 0, PA_VS_CLK_CFG_REG);
++	if (ret)
++		ufshcd_rmwl(hba, BIT(4), old & BIT(4), UFS_TEST_BUS_CTRL_2);
++
++	return ret;
++}
+ 
+ enum {
+ 	TSTBUS_UAWM,
+@@ -693,6 +748,8 @@
+ 		clk_freq = DEFAULT_CLK_RATE_HZ;
+ 
+ 	core_clk_cycles_per_us = clk_freq / USEC_PER_SEC;
++	if (ufs_qcom_is_sm8475(hba) && clk_freq > 300 * HZ_PER_MHZ)
++		core_clk_cycles_per_us = DIV_ROUND_UP(core_clk_cycles_per_us, 2);
+ 	if (ufshcd_readl(hba, REG_UFS_SYS1CLK_1US) != core_clk_cycles_per_us) {
+ 		ufshcd_writel(hba, core_clk_cycles_per_us, REG_UFS_SYS1CLK_1US);
+ 		/*
+@@ -1734,7 +1791,7 @@
+  * and returns zero on success.
+  */
+ static int ufs_qcom_set_clk_40ns_cycles(struct ufs_hba *hba,
+-					u32 cycles_in_1us)
++					u32 cycles_in_1us, u32 sm8475_cycles)
+ {
+ 	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
+ 	u32 cycles_in_40ns;
+@@ -1748,6 +1805,10 @@
+ 	 */
+ 	if (host->hw_ver.major < 4)
+ 		return 0;
++	if (sm8475_cycles) {
++		cycles_in_40ns = sm8475_cycles;
++		goto program;
++	}
+ 
+ 	/*
+ 	 * Generic formulae for cycles_in_40ns = (freq_unipro/25) is not
+@@ -1785,6 +1846,7 @@
+ 		return -EINVAL;
+ 	}
+ 
++program:
+ 	err = ufshcd_dme_get(hba, UIC_ARG_MIB(PA_VS_CORE_CLK_40NS_CYCLES), &reg);
+ 	if (err)
+ 		return err;
+@@ -1801,6 +1863,7 @@
+ 	struct list_head *head = &hba->clk_list_head;
+ 	struct ufs_clk_info *clki;
+ 	u32 cycles_in_1us = 0;
++	u32 sm8475_cycles_40ns = 0;
+ 	u32 core_clk_ctrl_reg;
+ 	unsigned long clk_freq;
+ 	int err;
+@@ -1835,6 +1898,18 @@
+ 	}
+ 
+ set_core_clk_ctrl:
++	if (ufs_qcom_is_sm8475(hba)) {
++		bool turbo = cycles_in_1us > 300;
++
++		err = ufs_qcom_sm8475_clk_cycles(cycles_in_1us, &cycles_in_1us,
++						 &sm8475_cycles_40ns);
++		if (err)
++			return err;
++		err = ufs_qcom_sm8475_set_clk_mode(hba, turbo);
++		if (err)
++			return err;
++	}
++
+ 	err = ufshcd_dme_get(hba,
+ 			    UIC_ARG_MIB(DME_VS_CORE_CLK_CTRL),
+ 			    &core_clk_ctrl_reg);
+@@ -1864,7 +1939,7 @@
+ 		return err;
+ 
+ 	/* Configure unipro core clk 40ns attribute */
+-	return ufs_qcom_set_clk_40ns_cycles(hba, cycles_in_1us);
++	return ufs_qcom_set_clk_40ns_cycles(hba, cycles_in_1us, sm8475_cycles_40ns);
+ }
+ 
+ static int ufs_qcom_clk_scale_up_pre_change(struct ufs_hba *hba, unsigned long freq)

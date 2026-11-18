@@ -1,0 +1,609 @@
+Subject: [PATCH] power: sequencing: support Unicorn WLAN and Bluetooth
+
+Sequence the external supplies, RF clock and enable GPIOs shared by WLAN
+and Bluetooth. Bind the UART and PCI clients to the explicit sequencer.
+
+diff --git a/Documentation/devicetree/bindings/net/bluetooth/qcom,wcn6855-bt.yaml b/Documentation/devicetree/bindings/net/bluetooth/qcom,wcn6855-bt.yaml
+--- a/Documentation/devicetree/bindings/net/bluetooth/qcom,wcn6855-bt.yaml
++++ b/Documentation/devicetree/bindings/net/bluetooth/qcom,wcn6855-bt.yaml
+@@ -15,6 +15,12 @@
+   compatible:
+     enum:
+       - qcom,wcn6855-bt
++
++  power-sequencers:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description:
++      Board power sequencer controlling the external supplies and enable
++      signals, used instead of describing internal PMU regulator outputs.
+ 
+   enable-gpios:
+     maxItems: 1
+@@ -61,16 +67,22 @@
+ 
+ required:
+   - compatible
+-  - vddaon-supply
+-  - vddbtcmx-supply
+-  - vddrfa0p8-supply
+-  - vddrfa1p2-supply
+-  - vddrfa1p7-supply
+-  - vddrfacmn-supply
+-  - vddwlcx-supply
+-  - vddwlmx-supply
+ 
+ allOf:
++  - if:
++      not:
++        required:
++          - power-sequencers
++    then:
++      required:
++        - vddaon-supply
++        - vddbtcmx-supply
++        - vddrfa0p8-supply
++        - vddrfa1p2-supply
++        - vddrfa1p7-supply
++        - vddrfacmn-supply
++        - vddwlcx-supply
++        - vddwlmx-supply
+   - $ref: bluetooth-controller.yaml#
+   - $ref: qcom,bluetooth-common.yaml
+   - $ref: /schemas/serial/serial-peripheral-props.yaml#
+diff --git a/Documentation/devicetree/bindings/net/wireless/qcom,ath11k-pci.yaml b/Documentation/devicetree/bindings/net/wireless/qcom,ath11k-pci.yaml
+--- a/Documentation/devicetree/bindings/net/wireless/qcom,ath11k-pci.yaml
++++ b/Documentation/devicetree/bindings/net/wireless/qcom,ath11k-pci.yaml
+@@ -42,6 +42,12 @@
+       If present, a board or platform specific string used to lookup
+       usecase-specific firmware files for the device.
+ 
++  power-sequencers:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description:
++      Board power sequencer controlling the external supplies and enable
++      signals, used instead of describing internal PMU regulator outputs.
++
+   vddrfacmn-supply:
+     description: VDD_RFA_CMN supply regulator handle
+ 
+@@ -82,6 +88,9 @@
+         compatible:
+           contains:
+             const: pci17cb,1101
++      not:
++        required:
++          - power-sequencers
+     then:
+       required:
+         - vddrfacmn-supply
+@@ -98,6 +107,9 @@
+         compatible:
+           contains:
+             const: pci17cb,1103
++      not:
++        required:
++          - power-sequencers
+     then:
+       required:
+         - vddrfacmn-supply
+diff --git a/Documentation/devicetree/bindings/power/xiaomi,unicorn-radio-pwrseq.yaml b/Documentation/devicetree/bindings/power/xiaomi,unicorn-radio-pwrseq.yaml
+new file mode 100644
+--- /dev/null
++++ b/Documentation/devicetree/bindings/power/xiaomi,unicorn-radio-pwrseq.yaml
+@@ -0,0 +1,86 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/power/xiaomi,unicorn-radio-pwrseq.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Xiaomi 12S Pro external radio power sequencing
++
++maintainers:
++  - dwuggh <dwuggh@gmail.com>
++
++description: |
++  The Unicorn board supplies its QCA6490 WLAN/Bluetooth package through six
++  physical PMIC rails, a shared RF clock and WLAN_EN, BT_EN and XO selection
++  signals. This board-level provider describes those measured external
++  connections without inferring the package's internal regulator outputs.
++  Consumers refer to this node with their power-sequencers phandle.
++
++properties:
++  compatible:
++    const: xiaomi,unicorn-radio-pwrseq
++
++  clocks:
++    maxItems: 1
++
++  pinctrl-names:
++    items:
++      - const: default
++      - const: wlan-active
++      - const: wlan-sleep
++
++  pinctrl-0: true
++  pinctrl-1: true
++  pinctrl-2: true
++
++  wlan-enable-gpios:
++    maxItems: 1
++
++  bt-enable-gpios:
++    maxItems: 1
++
++  swctrl-gpios:
++    maxItems: 1
++    description: Input indicating the BT clock supply state.
++
++  xo-clk-gpios:
++    maxItems: 1
++    description: XO selection latch signal, asserted around either enable edge.
++
++  vddio-supply:
++    description: Shared PM8350 S10 1.8 V input.
++
++  vddasd-supply:
++    description: Shared PMR735A L7 2.8 V antenna switch supply.
++
++  vddwlan-aon-supply:
++    description: WLAN PMR735A S2 input.
++
++  vdddig-supply:
++    description: Shared PM8350 S11 input, also used by the BT AON and RF domains.
++
++  vddrfa1-supply:
++    description: Shared PM8350C S1 RF input.
++
++  vddrfa2-supply:
++    description: Shared PM8350 S12 RF input.
++
++required:
++  - compatible
++  - clocks
++  - pinctrl-names
++  - pinctrl-0
++  - pinctrl-1
++  - pinctrl-2
++  - wlan-enable-gpios
++  - bt-enable-gpios
++  - swctrl-gpios
++  - xo-clk-gpios
++  - vddio-supply
++  - vddasd-supply
++  - vddwlan-aon-supply
++  - vdddig-supply
++  - vddrfa1-supply
++  - vddrfa2-supply
++
++additionalProperties: false
+diff --git a/drivers/bluetooth/hci_qca.c b/drivers/bluetooth/hci_qca.c
+--- a/drivers/bluetooth/hci_qca.c
++++ b/drivers/bluetooth/hci_qca.c
+@@ -2470,10 +2470,15 @@
+ 			 * through the power sequence. In such cases, fall through
+ 			 * to follow the legacy flow.
+ 			 */
+-			if (IS_ERR(qcadev->bt_power->pwrseq))
++			if (IS_ERR(qcadev->bt_power->pwrseq)) {
++				if (device_property_present(&serdev->dev, "power-sequencers"))
++					return dev_err_probe(&serdev->dev,
++							     PTR_ERR(qcadev->bt_power->pwrseq),
++							     "Failed to get board power sequencer\n");
+ 				qcadev->bt_power->pwrseq = NULL;
+-			else
++			} else {
+ 				break;
++			}
+ 		}
+ 
+ 		qcadev->bt_power->dev = &serdev->dev;
+diff --git a/drivers/pci/pwrctrl/pci-pwrctrl-pwrseq.c b/drivers/pci/pwrctrl/pci-pwrctrl-pwrseq.c
+--- a/drivers/pci/pwrctrl/pci-pwrctrl-pwrseq.c
++++ b/drivers/pci/pwrctrl/pci-pwrctrl-pwrseq.c
+@@ -37,10 +37,11 @@
+ 	 * if we allow this driver to bind to one of such "incomplete" nodes,
+ 	 * we'll see a kernel log error about the indefinite probe deferral.
+ 	 *
+-	 * Check the existence of the regulator supply that exists on all
+-	 * WCN models before moving forward.
++	 * Accept either a PMU output regulator or an explicit board power
++	 * sequencer before moving forward.
+ 	 */
+-	if (!device_property_present(dev, "vddaon-supply"))
++	if (!device_property_present(dev, "vddaon-supply") &&
++	    !device_property_present(dev, "power-sequencers"))
+ 		return -ENODEV;
+ 
+ 	return 0;
+diff --git a/drivers/power/sequencing/Kconfig b/drivers/power/sequencing/Kconfig
+--- a/drivers/power/sequencing/Kconfig
++++ b/drivers/power/sequencing/Kconfig
+@@ -12,6 +12,15 @@
+ 	  If unsure, say no.
+ 
+ if POWER_SEQUENCING
++
++config POWER_SEQUENCING_XIAOMI_UNICORN
++	tristate "Xiaomi 12S Pro external radio power sequence"
++	depends on ARCH_QCOM && OF && REGULATOR && GPIOLIB && COMMON_CLK
++	help
++	  Control the measured external PMIC supplies, RF clock and enable
++	  GPIOs shared by WLAN and Bluetooth on the Xiaomi 12S Pro.
++	  Consumers use an explicit power-sequencers phandle, without
++	  requiring an inferred model of the radio package's internal rails.
+ 
+ config POWER_SEQUENCING_QCOM_WCN
+ 	tristate "Qualcomm WCN family PMU driver"
+diff --git a/drivers/power/sequencing/Makefile b/drivers/power/sequencing/Makefile
+--- a/drivers/power/sequencing/Makefile
++++ b/drivers/power/sequencing/Makefile
+@@ -6,3 +6,5 @@
+ obj-$(CONFIG_POWER_SEQUENCING_QCOM_WCN)	+= pwrseq-qcom-wcn.o
+ obj-$(CONFIG_POWER_SEQUENCING_TH1520_GPU) += pwrseq-thead-gpu.o
+ obj-$(CONFIG_POWER_SEQUENCING_PCIE_M2)	+= pwrseq-pcie-m2.o
++
++obj-$(CONFIG_POWER_SEQUENCING_XIAOMI_UNICORN) += pwrseq-xiaomi-unicorn.o
+diff --git a/drivers/power/sequencing/pwrseq-xiaomi-unicorn.c b/drivers/power/sequencing/pwrseq-xiaomi-unicorn.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/power/sequencing/pwrseq-xiaomi-unicorn.c
+@@ -0,0 +1,358 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Xiaomi 12S Pro radio board supply sequence, from its measured vendor DT. */
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pinctrl/consumer.h>
++#include <linux/pwrseq/provider.h>
++#include <linux/regulator/consumer.h>
++
++/* Physical PMIC rails, not inferred regulator outputs inside the WCN package. */
++enum unicorn_rail {
++	UNICORN_IO,
++	UNICORN_ASD,
++	UNICORN_WLAN_AON,
++	UNICORN_DIG,
++	UNICORN_RFA1,
++	UNICORN_RFA2,
++	UNICORN_NUM_RAILS,
++};
++
++struct unicorn_rail_config {
++	const char *name;
++	int min_uv;
++	int max_uv;
++};
++
++static const struct unicorn_rail_config unicorn_rails[] = {
++	[UNICORN_IO] = { "vddio", 1800000, 1800000 },
++	[UNICORN_ASD] = { "vddasd", 2800000, 2800000 },
++	[UNICORN_WLAN_AON] = { "vddwlan-aon", 1012000, 1040000 },
++	[UNICORN_DIG] = { "vdddig", 966000, 1170000 },
++	[UNICORN_RFA1] = { "vddrfa1", 1900000, 2024000 },
++	[UNICORN_RFA2] = { "vddrfa2", 1350000, 2024000 },
++};
++
++static const enum unicorn_rail unicorn_wlan_order[] = {
++	UNICORN_IO, UNICORN_ASD, UNICORN_WLAN_AON,
++	UNICORN_DIG, UNICORN_RFA1, UNICORN_RFA2,
++};
++
++/* The vendor's BT AON/DIG/RFACMN/RFA0P8 all reference the same S11B rail. */
++static const enum unicorn_rail unicorn_bt_order[] = {
++	UNICORN_IO, UNICORN_DIG, UNICORN_RFA1, UNICORN_RFA2, UNICORN_ASD,
++};
++
++struct unicorn_radio {
++	struct device *dev;
++	struct regulator *rails[UNICORN_NUM_RAILS];
++	unsigned int users[UNICORN_NUM_RAILS];
++	struct clk *clk;
++	struct gpio_desc *bt;
++	struct gpio_desc *wlan;
++	struct gpio_desc *xo;
++	struct gpio_desc *swctrl;
++	struct pinctrl *pins;
++	struct pinctrl_state *wlan_active;
++	struct pinctrl_state *wlan_sleep;
++};
++
++/* All target callbacks run under the power sequencing core's state_lock. */
++static int unicorn_rail_get(struct unicorn_radio *ctx, enum unicorn_rail rail)
++{
++	const struct unicorn_rail_config *cfg = &unicorn_rails[rail];
++	int ret;
++
++	if (!ctx->users[rail]) {
++		ret = regulator_set_voltage(ctx->rails[rail], cfg->min_uv, cfg->max_uv);
++		if (ret)
++			return ret;
++	}
++
++	ret = regulator_enable(ctx->rails[rail]);
++	if (ret) {
++		if (!ctx->users[rail])
++			regulator_set_voltage(ctx->rails[rail], 0, cfg->max_uv);
++		return ret;
++	}
++	ctx->users[rail]++;
++
++	return 0;
++}
++
++static int unicorn_rail_put(struct unicorn_radio *ctx, enum unicorn_rail rail)
++{
++	const struct unicorn_rail_config *cfg = &unicorn_rails[rail];
++	int ret;
++
++	if (WARN_ON(!ctx->users[rail]))
++		return -EINVAL;
++
++	ret = regulator_disable(ctx->rails[rail]);
++	if (ret)
++		return ret;
++
++	if (ctx->users[rail] == 1) {
++		ret = regulator_set_voltage(ctx->rails[rail], 0, cfg->max_uv);
++		if (ret) {
++			if (regulator_enable(ctx->rails[rail]))
++				dev_err(ctx->dev, "Failed to restore %s after unvote error\n",
++					cfg->name);
++			return ret;
++		}
++	}
++	ctx->users[rail]--;
++
++	return 0;
++}
++
++static int unicorn_gpio_on(struct unicorn_radio *ctx, bool bluetooth)
++{
++	int ret;
++
++	if (bluetooth) {
++		gpiod_set_value_cansleep(ctx->bt, 0);
++		msleep(50);
++	}
++
++	/* Both vendor paths require discharge time while the other radio is off. */
++	ret = gpiod_get_value_cansleep(bluetooth ? ctx->wlan : ctx->bt);
++	if (ret < 0)
++		return ret;
++	if (!ret)
++		msleep(100);
++
++	gpiod_set_value_cansleep(ctx->xo, 1);
++	usleep_range(100, 200);
++	if (!bluetooth) {
++		ret = pinctrl_select_state(ctx->pins, ctx->wlan_active);
++		if (ret) {
++			gpiod_set_value_cansleep(ctx->xo, 0);
++			return ret;
++		}
++	}
++	gpiod_set_value_cansleep(bluetooth ? ctx->bt : ctx->wlan, 1);
++	if (bluetooth) {
++		usleep_range(4000, 6000);
++	} else {
++		usleep_range(1000, 1100);
++		usleep_range(2000, 5000);
++	}
++	gpiod_set_value_cansleep(ctx->xo, 0);
++
++	if (bluetooth) {
++		msleep(50);
++		if (!gpiod_get_value_cansleep(ctx->swctrl))
++			dev_warn(ctx->dev, "BT SWCTRL is low after power-on\n");
++	}
++	return 0;
++}
++
++static int unicorn_gpio_off(struct unicorn_radio *ctx, bool bluetooth)
++{
++	gpiod_set_value_cansleep(bluetooth ? ctx->bt : ctx->wlan, 0);
++	if (bluetooth) {
++		msleep(100);
++		return 0;
++	}
++	return pinctrl_select_state(ctx->pins, ctx->wlan_sleep);
++}
++
++static int unicorn_radio_enable(struct pwrseq_device *pwrseq, bool bluetooth)
++{
++	struct unicorn_radio *ctx = pwrseq_device_get_drvdata(pwrseq);
++	const enum unicorn_rail *order = bluetooth ? unicorn_bt_order : unicorn_wlan_order;
++	int count = bluetooth ? ARRAY_SIZE(unicorn_bt_order) : ARRAY_SIZE(unicorn_wlan_order);
++	int i, ret;
++
++	for (i = 0; i < count; i++) {
++		ret = unicorn_rail_get(ctx, order[i]);
++		if (ret)
++			goto unwind;
++	}
++	ret = clk_prepare_enable(ctx->clk);
++	if (ret)
++		goto unwind;
++
++	ret = unicorn_gpio_on(ctx, bluetooth);
++	if (ret) {
++		clk_disable_unprepare(ctx->clk);
++		goto unwind;
++	}
++	return 0;
++
++unwind:
++	while (i--)
++		if (unicorn_rail_put(ctx, order[i]))
++			dev_err(ctx->dev, "Failed to unwind radio supply\n");
++	return ret;
++}
++
++static int unicorn_radio_disable(struct pwrseq_device *pwrseq, bool bluetooth)
++{
++	struct unicorn_radio *ctx = pwrseq_device_get_drvdata(pwrseq);
++	const enum unicorn_rail *order = bluetooth ? unicorn_bt_order : unicorn_wlan_order;
++	int count = bluetooth ? ARRAY_SIZE(unicorn_bt_order) : ARRAY_SIZE(unicorn_wlan_order);
++	int i, rail, ret;
++
++	ret = unicorn_gpio_off(ctx, bluetooth);
++	if (ret) {
++		if (unicorn_gpio_on(ctx, bluetooth))
++			dev_err(ctx->dev, "Failed to restore radio GPIO\n");
++		return ret;
++	}
++	clk_disable_unprepare(ctx->clk);
++	/* WLAN shuts down in reverse order; the vendor BT path walks forward. */
++	for (i = 0; i < count; i++) {
++		rail = order[bluetooth ? i : count - 1 - i];
++		ret = unicorn_rail_put(ctx, rail);
++		if (ret)
++			goto restore;
++	}
++	return 0;
++
++restore:
++	while (i--) {
++		rail = order[bluetooth ? i : count - 1 - i];
++		if (unicorn_rail_get(ctx, rail))
++			dev_err(ctx->dev, "Failed to restore radio supply\n");
++	}
++	if (clk_prepare_enable(ctx->clk))
++		dev_err(ctx->dev, "Failed to restore radio clock\n");
++	else if (unicorn_gpio_on(ctx, bluetooth))
++		dev_err(ctx->dev, "Failed to restore radio GPIO\n");
++	return ret;
++}
++
++static int unicorn_bt_enable(struct pwrseq_device *pwrseq)
++{
++	return unicorn_radio_enable(pwrseq, true);
++}
++
++static int unicorn_bt_disable(struct pwrseq_device *pwrseq)
++{
++	return unicorn_radio_disable(pwrseq, true);
++}
++
++static int unicorn_wlan_enable(struct pwrseq_device *pwrseq)
++{
++	return unicorn_radio_enable(pwrseq, false);
++}
++
++static int unicorn_wlan_disable(struct pwrseq_device *pwrseq)
++{
++	return unicorn_radio_disable(pwrseq, false);
++}
++
++static const struct pwrseq_unit_data unicorn_bt_unit = {
++	.name = "bluetooth-enable",
++	.enable = unicorn_bt_enable,
++	.disable = unicorn_bt_disable,
++};
++
++static const struct pwrseq_unit_data unicorn_wlan_unit = {
++	.name = "wlan-enable",
++	.enable = unicorn_wlan_enable,
++	.disable = unicorn_wlan_disable,
++};
++
++static const struct pwrseq_target_data unicorn_bt_target = {
++	.name = "bluetooth",
++	.unit = &unicorn_bt_unit,
++};
++
++static const struct pwrseq_target_data unicorn_wlan_target = {
++	.name = "wlan",
++	.unit = &unicorn_wlan_unit,
++};
++
++static const struct pwrseq_target_data *unicorn_targets[] = {
++	&unicorn_bt_target,
++	&unicorn_wlan_target,
++	NULL,
++};
++
++static int unicorn_radio_match(struct pwrseq_device *pwrseq, struct device *dev)
++{
++	struct unicorn_radio *ctx = pwrseq_device_get_drvdata(pwrseq);
++	struct device_node *node __free(device_node) = NULL;
++
++	node = of_parse_phandle(dev_of_node(dev), "power-sequencers", 0);
++	return node == dev_of_node(ctx->dev) ? PWRSEQ_MATCH_OK : PWRSEQ_NO_MATCH;
++}
++
++static int unicorn_radio_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct pwrseq_config config = {};
++	struct pwrseq_device *pwrseq;
++	struct unicorn_radio *ctx;
++	int i;
++
++	ctx = devm_kzalloc(dev, sizeof(*ctx), GFP_KERNEL);
++	if (!ctx)
++		return -ENOMEM;
++	ctx->dev = dev;
++
++	for (i = 0; i < UNICORN_NUM_RAILS; i++) {
++		ctx->rails[i] = devm_regulator_get_optional(dev, unicorn_rails[i].name);
++		if (IS_ERR(ctx->rails[i]))
++			return dev_err_probe(dev, PTR_ERR(ctx->rails[i]),
++					     "Failed to get %s\n", unicorn_rails[i].name);
++	}
++	ctx->clk = devm_clk_get(dev, NULL);
++	if (IS_ERR(ctx->clk))
++		return dev_err_probe(dev, PTR_ERR(ctx->clk), "Failed to get RF clock\n");
++
++	ctx->pins = devm_pinctrl_get(dev);
++	if (IS_ERR(ctx->pins))
++		return dev_err_probe(dev, PTR_ERR(ctx->pins), "Failed to get pinctrl\n");
++	ctx->wlan_active = pinctrl_lookup_state(ctx->pins, "wlan-active");
++	if (IS_ERR(ctx->wlan_active))
++		return dev_err_probe(dev, PTR_ERR(ctx->wlan_active), "No WLAN active state\n");
++	ctx->wlan_sleep = pinctrl_lookup_state(ctx->pins, "wlan-sleep");
++	if (IS_ERR(ctx->wlan_sleep))
++		return dev_err_probe(dev, PTR_ERR(ctx->wlan_sleep), "No WLAN sleep state\n");
++
++	ctx->bt = devm_gpiod_get(dev, "bt-enable", GPIOD_OUT_LOW);
++	if (IS_ERR(ctx->bt))
++		return dev_err_probe(dev, PTR_ERR(ctx->bt), "Failed to get BT_EN\n");
++	ctx->wlan = devm_gpiod_get(dev, "wlan-enable", GPIOD_OUT_LOW);
++	if (IS_ERR(ctx->wlan))
++		return dev_err_probe(dev, PTR_ERR(ctx->wlan), "Failed to get WLAN_EN\n");
++	ctx->xo = devm_gpiod_get(dev, "xo-clk", GPIOD_OUT_LOW);
++	if (IS_ERR(ctx->xo))
++		return dev_err_probe(dev, PTR_ERR(ctx->xo), "Failed to get XO selection\n");
++	ctx->swctrl = devm_gpiod_get(dev, "swctrl", GPIOD_IN);
++	if (IS_ERR(ctx->swctrl))
++		return dev_err_probe(dev, PTR_ERR(ctx->swctrl), "Failed to get SWCTRL\n");
++
++	config.parent = dev;
++	config.owner = THIS_MODULE;
++	config.drvdata = ctx;
++	config.match = unicorn_radio_match;
++	config.targets = unicorn_targets;
++	pwrseq = devm_pwrseq_device_register(dev, &config);
++	return PTR_ERR_OR_ZERO(pwrseq);
++}
++
++static const struct of_device_id unicorn_radio_of_match[] = {
++	{ .compatible = "xiaomi,unicorn-radio-pwrseq" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, unicorn_radio_of_match);
++
++static struct platform_driver unicorn_radio_driver = {
++	.probe = unicorn_radio_probe,
++	.driver = {
++		.name = "unicorn-radio-pwrseq",
++		.of_match_table = unicorn_radio_of_match,
++	},
++};
++module_platform_driver(unicorn_radio_driver);
++
++MODULE_DESCRIPTION("Xiaomi 12S Pro external radio power sequencing");
++MODULE_LICENSE("GPL");

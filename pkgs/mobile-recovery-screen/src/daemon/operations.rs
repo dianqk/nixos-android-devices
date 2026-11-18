@@ -208,7 +208,7 @@ fn repair_backup_gpt(j: &Job, check: bool) -> Result<String> {
     c.ram_gate_for_backup_repair(j)?;
     let firmware = if c.mediatek_a() { "boot_a" } else { "boot_b" };
     let mut targets: Vec<Device> = Vec::new();
-    for name in [firmware, "userdata"] {
+    for name in [firmware, if c.linux_only { "linux" } else { "userdata" }] {
         let d = c.partition_for_backup_repair(j, name)?;
         if targets.iter().all(|t| t.disk != d.disk) {
             targets.push(d);
@@ -218,7 +218,10 @@ fn repair_backup_gpt(j: &Job, check: bool) -> Result<String> {
         if t.gpt.partition("linux").is_err() {
             continue;
         }
-        if c.mediatek_a() {
+        if c.linux_only {
+            t.gpt
+                .check_linux_only_layout(c.esp_bytes, c.minimum_root_bytes)?;
+        } else if c.mediatek_a() {
             t.gpt
                 .check_userdata_layout(c.esp_size(), c.minimum_root_bytes)?;
         } else {
@@ -453,6 +456,7 @@ fn restore_source<'a>(pushed: &'a Path, original: &'a Path) -> Result<&'a Path> 
 fn rollback_scope<'a>(
     image: &'a [super::gpt::Partition],
     now: &[super::gpt::Partition],
+    linux_only: bool,
 ) -> Result<&'a super::gpt::Partition> {
     let user = image
         .iter()
@@ -465,14 +469,33 @@ fn rollback_scope<'a>(
             old.name
         );
     }
-    let current = now
-        .iter()
-        .find(|p| p.name == "userdata")
-        .context("the disk has no userdata")?;
-    ensure!(
-        current.start == user.start,
-        "rollback image userdata starts elsewhere than on the disk"
-    );
+    if linux_only {
+        ensure!(
+            !now.iter().any(|p| p.name == "userdata"),
+            "Linux-only disk still has userdata"
+        );
+        let esp = now
+            .iter()
+            .find(|p| p.name == "linux-boot")
+            .context("missing Linux ESP")?;
+        let root = now
+            .iter()
+            .find(|p| p.name == "linux")
+            .context("missing Linux root")?;
+        ensure!(
+            esp.start == user.start && esp.end + 1 == root.start && root.end == user.end,
+            "Linux partitions do not cover the saved userdata span"
+        );
+    } else {
+        let current = now
+            .iter()
+            .find(|p| p.name == "userdata")
+            .context("the disk has no userdata")?;
+        ensure!(
+            current.start == user.start,
+            "rollback image userdata starts elsewhere than on the disk"
+        );
+    }
     for p in now
         .iter()
         .filter(|p| p.name != "userdata" && !image.contains(p))
@@ -504,7 +527,14 @@ fn describe_snapshot(dir: &Path, what: &str) -> Result<String> {
 /// left alone.
 fn gpt_backup(j: &Job) -> Result<String> {
     ab_only(j, "gpt-backup")?;
-    let user = config(j).partition(j, "userdata")?;
+    let user = config(j).partition(
+        j,
+        if config(j).linux_only {
+            "super"
+        } else {
+            "userdata"
+        },
+    )?;
     let dir = PathBuf::from(format!("/run/mobile-recovery/gpt-current-{}", j.id));
     user.gpt.snapshot(&dir)?;
     describe_snapshot(&dir, "Current GPT saved in RAM")
@@ -516,11 +546,18 @@ fn gpt_backup(j: &Job) -> Result<String> {
 fn restore_gpt(j: &Job, check: bool) -> Result<String> {
     ab_only(j, "restore-gpt")?;
     config(j).ram_gate(j)?;
-    let misc = config(j).partition(j, "userdata")?;
+    let misc = config(j).partition(
+        j,
+        if config(j).linux_only {
+            "super"
+        } else {
+            "userdata"
+        },
+    )?;
     let source = restore_source(Path::new(GPT_RESTORE), Path::new(GPT_BACKUP))?;
     let image = super::gpt::load_snapshot(source, &misc.gpt)?;
     let (count, parts) = super::gpt::image_partitions(&image, super::gpt::SECTOR)?;
-    let user = rollback_scope(&parts, &misc.gpt.partitions)?;
+    let user = rollback_scope(&parts, &misc.gpt.partitions, config(j).linux_only)?;
     let plan = format!(
         "Restore the saved GPT from {} ({count} entries, userdata LBA {}-{}) on {}; current table has {} entries. Linux partitions and their data become unreachable.",
         source.display(),
@@ -617,10 +654,72 @@ fn prepare_userdata(j: &Job, check: bool, android: u64, offered: &str) -> Result
         split_epilogue(&saved)
     ))
 }
+/// Opt-in whole-userdata installation. Boot, firmware and metadata stay intact.
+fn prepare_linux_only(j: &Job, check: bool) -> Result<String> {
+    ab_only(j, "prepare-install; use format-root and prepare-boot")?;
+    config(j).ram_gate(j)?;
+    let user = config(j).partition(j, "userdata")?;
+    let parts = user
+        .gpt
+        .linux_only(config(j).esp_bytes, config(j).minimum_root_bytes)?;
+    let plan = format!("Linux-only layout: entire userdata\nPlan: Replace all Android userdata with a Linux ESP and root\n{}", describe_split(&user.gpt, &parts, user.gpt.entry_count(), &user.disk)?);
+    if check {
+        let saved = save_gpt_backup(Path::new(GPT_BACKUP), &File::open(&user.disk)?, &user.gpt)?;
+        return Ok(format!("{plan}\nDestroys ALL Android userdata; replaces its allocation with a Linux ESP and root. Preserves boot/recovery slots, super and metadata.\nCheck only; no partition or filesystem writes.\n{saved}\n{CHECK_NOTE}"));
+    }
+    config(j).ram_gate(j)?;
+    j.phase("Writing GPT; do not reboot", false)?;
+    let disk = exclusive(&user.disk)?;
+    let evidence = PathBuf::from(format!("/run/mobile-recovery/gpt-{}", j.id));
+    let saved = write_split_gpt(Path::new(GPT_BACKUP), &disk, &user.gpt, &evidence, |f| {
+        user.gpt.write_split(f, &parts)
+    })?;
+    reread(&disk)?;
+    drop(disk);
+    tool(j, "udevadm", &["settle"])?;
+    let layout = config(j).layout(j, false)?;
+    j.phase("Formatting Linux root and ESP", false)?;
+    tool(
+        j,
+        "mke2fs",
+        &[
+            "-F",
+            "-t",
+            "ext4",
+            "-m",
+            "0",
+            "-L",
+            &config(j).root_label,
+            layout.root.node.to_str().unwrap(),
+        ],
+    )?;
+    tool(
+        j,
+        "mkfs.fat",
+        &[
+            "-F",
+            "32",
+            "-n",
+            &config(j).boot_label,
+            layout.esp.node.to_str().unwrap(),
+        ],
+    )?;
+    sync();
+    config(j).layout(j, true)?;
+    fsck(j, &layout)?;
+    Ok(format!("Prepared ext4 root and FAT ESP; Android userdata allocation replaced. GPT evidence: {}. Install explicitly before Linux boot.\n{}",evidence.display(), split_epilogue(&saved)))
+}
 /// A/B devices: the user chooses how much of the userdata allocation Android
 /// keeps (32/64/128/256/512 GiB, offered when the Linux ESP and root keep at
 /// least 64 GiB); Linux gets the rest.
 fn prepare(j: &Job, check: bool, android: Option<u64>) -> Result<String> {
+    if config(j).linux_only {
+        ensure!(
+            android.is_none(),
+            "Linux-only installation does not retain Android userdata"
+        );
+        return prepare_linux_only(j, check);
+    }
     use super::gpt::MINIMUM_LINUX;
     ab_only(j, "prepare-install; use format-root and prepare-boot")?;
     let c = config(j);
@@ -2068,7 +2167,7 @@ mod tests {
         let image = super::super::gpt::load_snapshot(&dir, &now).unwrap();
         let (_, parts) =
             super::super::gpt::image_partitions(&image, super::super::gpt::SECTOR).unwrap();
-        rollback_scope(&parts, &now.partitions).unwrap();
+        rollback_scope(&parts, &now.partitions, false).unwrap();
         super::super::gpt::restore(&f, &image).unwrap();
         assert_eq!(Gpt::read(&f, size).unwrap(), g);
         // A matching saved copy (from a check or the host flow) is reused.
@@ -2142,6 +2241,33 @@ mod tests {
         );
     }
     #[test]
+    fn linux_only_rollback_requires_the_original_userdata_span() {
+        use super::super::gpt::Gpt;
+        let base = scratch("linux-only-rollback");
+        let disk = base.join("disk");
+        super::super::gpt::tests::write_marble_lun0(&disk);
+        let f = open_rw(&disk);
+        let g = Gpt::read(&f, f.metadata().unwrap().len()).unwrap();
+        let parts = g.linux_only(1 << 30, 16 << 30).unwrap();
+        let backup = base.join("original");
+        let evidence = base.join("evidence");
+        write_split_gpt(&backup, &f, &g, &evidence, |f| g.write_split(f, &parts)).unwrap();
+        let now = Gpt::read(&f, f.metadata().unwrap().len()).unwrap();
+        rollback_scope(&g.partitions, &now.partitions, true).unwrap();
+        assert!(rollback_scope(&g.partitions, &now.partitions, false).is_err());
+        let mut wrong = now.partitions.clone();
+        wrong
+            .iter_mut()
+            .find(|p| p.name == "linux-boot")
+            .unwrap()
+            .start += 256;
+        assert!(rollback_scope(&g.partitions, &wrong, true).is_err());
+        let mut foreign = now.partitions.clone();
+        foreign.iter_mut().find(|p| p.name == "super").unwrap().end -= 256;
+        assert!(rollback_scope(&g.partitions, &foreign, true).is_err());
+        fs::remove_dir_all(&base).unwrap();
+    }
+    #[test]
     fn ab_rollback_scope_only_accepts_the_userdata_span() {
         use super::super::gpt::{image_partitions, load_snapshot, Gpt, SECTOR};
         let base = scratch("ab-rollback");
@@ -2158,14 +2284,14 @@ mod tests {
         let image = load_snapshot(&dir, &split).unwrap();
         let (_, original) = image_partitions(&image, SECTOR).unwrap();
         assert_eq!(original, g.partitions);
-        let user = rollback_scope(&original, &split.partitions).unwrap();
+        let user = rollback_scope(&original, &split.partitions, false).unwrap();
         assert_eq!(user, g.partition("userdata").unwrap());
         let mut other = original.clone();
         other.iter_mut().find(|p| p.name == "super").unwrap().end -= 256;
-        assert!(rollback_scope(&other, &split.partitions).is_err());
+        assert!(rollback_scope(&other, &split.partitions, false).is_err());
         let mut foreign = split.partitions.clone();
         foreign.iter_mut().find(|p| p.name == "linux").unwrap().name = "data2".into();
-        assert!(rollback_scope(&original, &foreign).is_err());
+        assert!(rollback_scope(&original, &foreign, false).is_err());
         fs::remove_dir_all(&base).unwrap();
     }
     #[test]

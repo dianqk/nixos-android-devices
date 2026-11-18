@@ -1,0 +1,1451 @@
+Subject: [PATCH] arm64: dts: qcom: add Xiaomi 12S Pro
+
+Describe the board supplies, thermal zones, storage, USB and peripheral
+wiring. Each included functional description contains its final configuration.
+
+diff --git a/Documentation/devicetree/bindings/arm/qcom.yaml b/Documentation/devicetree/bindings/arm/qcom.yaml
+--- a/Documentation/devicetree/bindings/arm/qcom.yaml
++++ b/Documentation/devicetree/bindings/arm/qcom.yaml
+@@ -1128,6 +1128,10 @@
+               - sony,pdx223
+               - sony,pdx224
+           - const: qcom,sm8450
++
++      - items:
++          - const: xiaomi,unicorn
++          - const: qcom,sm8475
+ 
+       - items:
+           - enum:
+diff --git a/arch/arm64/boot/dts/qcom/Makefile b/arch/arm64/boot/dts/qcom/Makefile
+--- a/arch/arm64/boot/dts/qcom/Makefile
++++ b/arch/arm64/boot/dts/qcom/Makefile
+@@ -382,6 +382,8 @@
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8450-sony-xperia-nagara-pdx223.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8450-sony-xperia-nagara-pdx224.dtb
+ 
++dtb-$(CONFIG_ARCH_QCOM)	+= sm8475-xiaomi-unicorn.dtb
++
+ sm8550-hdk-display-card-dtbs	:= sm8550-hdk.dtb sm8550-hdk-display-card.dtbo
+ sm8550-hdk-display-card-rear-camera-card-dtbs	:= sm8550-hdk.dtb sm8550-hdk-display-card.dtbo sm8550-hdk-rear-camera-card.dtbo
+ sm8550-hdk-rear-camera-card-dtbs	:= sm8550-hdk.dtb sm8550-hdk-rear-camera-card.dtbo
+diff --git a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-audio.dtsi b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-audio.dtsi
+new file mode 100644
+--- /dev/null
++++ b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-audio.dtsi
+@@ -0,0 +1,108 @@
++// SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
++/* Xiaomi 12S Pro audio wiring, reconstructed from the running vendor DT. */
++
++#include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
++
++/ {
++	wcd938x: audio-codec {
++		/* Both WCD938x variants are identified by the driver at probe. */
++		compatible = "qcom,wcd9380-codec";
++		#sound-dai-cells = <1>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&unicorn_wcd_reset>;
++		reset-gpios = <&tlmm 43 GPIO_ACTIVE_LOW>;
++		vdd-buck-supply = <&pm8350_s10>;
++		vdd-rxtx-supply = <&pm8350_s10>;
++		vdd-io-supply = <&pm8350_s10>;
++		vdd-mic-bias-supply = <&vreg_bob>;
++		qcom,micbias1-microvolt = <2750000>;
++		qcom,micbias2-microvolt = <2750000>;
++		qcom,micbias3-microvolt = <2750000>;
++		qcom,micbias4-microvolt = <2750000>;
++		qcom,rx-device = <&wcd_rx>;
++		qcom,tx-device = <&wcd_tx>;
++		qcom,hphl-jack-type-normally-closed;
++		qcom,ground-jack-type-normally-closed;
++		qcom,mbhc-buttons-vthreshold-microvolt =
++			<75000 260000 500000 500000 500000 500000 500000 500000>;
++	};
++};
++
++&sound {
++	compatible = "qcom,sm8475-sndcard", "qcom,sm8450-sndcard";
++	model = "Xiaomi-12S-Pro";
++	audio-routing = "IN1_HPHL", "HPHL_OUT",
++			"IN2_HPHR", "HPHR_OUT",
++			"AMIC1", "MIC BIAS1",
++			"AMIC2", "MIC BIAS2",
++			"AMIC3", "MIC BIAS3",
++			"AMIC4", "MIC BIAS3",
++			"AMIC5", "MIC BIAS4",
++			"TX SWR_INPUT0", "ADC1_OUTPUT",
++			"TX SWR_INPUT1", "ADC2_OUTPUT",
++			"TX SWR_INPUT0", "ADC3_OUTPUT",
++			"TX SWR_INPUT1", "ADC4_OUTPUT";
++	status = "okay";
++
++	wcd-playback-dai-link {
++		link-name = "WCD Playback";
++		cpu {
++			sound-dai = <&q6apmbedai RX_CODEC_DMA_RX_0>;
++		};
++		codec {
++			sound-dai = <&wcd938x 0>, <&swr1 0>, <&rxmacro 0>;
++		};
++		platform {
++			sound-dai = <&q6apm>;
++		};
++	};
++
++	wcd-capture-dai-link {
++		link-name = "WCD Capture";
++		cpu {
++			sound-dai = <&q6apmbedai TX_CODEC_DMA_TX_3>;
++		};
++		codec {
++			sound-dai = <&wcd938x 1>, <&swr2 0>, <&txmacro 0>;
++		};
++		platform {
++			sound-dai = <&q6apm>;
++		};
++	};
++};
++
++&swr1 {
++	status = "okay";
++
++	wcd_rx: codec@0,4 {
++		compatible = "sdw20217010d00";
++		reg = <0 4>;
++		qcom,rx-port-mapping = <1 2 3 4 5>;
++	};
++};
++
++&swr2 {
++	status = "okay";
++
++	wcd_tx: codec@0,3 {
++		compatible = "sdw20217010d00";
++		reg = <0 3>;
++		qcom,tx-port-mapping = <1 1 2 3>;
++	};
++};
++
++&vamacro {
++	status = "okay";
++	qcom,dmic-sample-rate = <600000>;
++	vdd-micb-supply = <&pm8350_s10>;
++};
++
++&tlmm {
++	unicorn_wcd_reset: wcd-reset-state {
++		pins = "gpio43";
++		function = "gpio";
++		drive-strength = <16>;
++		bias-disable;
++	};
++
++};
+diff --git a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-camera.dtsi b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-camera.dtsi
+new file mode 100644
+--- /dev/null
++++ b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-camera.dtsi
+@@ -0,0 +1,64 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-3-Clause)
++/* Existing SoC CCI controllers only. Sensor identities and pipelines are separate. */
++&cci0 {
++	status = "okay";
++};
++
++&cci1 {
++	status = "okay";
++};
++
++/* Digital capture controller; physical PHYs and sensors remain disabled. */
++&camss {
++	status = "okay";
++};
++
++/* PM8008J regulator provider. No camera consumer or LDO boot request. */
++&i2c5 {
++	pm8008j: pmic@c {
++		compatible = "qcom,pm8008";
++		reg = <0xc>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&camera_pmic_enable_default>;
++		vdd-l1-l2-supply = <&pm8350_s12>;
++		vdd-l3-l4-supply = <&vreg_bob>;
++		vdd-l5-supply = <&pm8350c_s1>;
++		vdd-l6-supply = <&vreg_bob>;
++		vdd-l7-supply = <&vreg_bob>;
++
++		/* Name-only constraints: registration must not program voltages. */
++		regulators {
++			pm8008j_l1: ldo1 {
++				regulator-name = "pm8008j_l1";
++			};
++			pm8008j_l2: ldo2 {
++				regulator-name = "pm8008j_l2";
++			};
++			pm8008j_l3: ldo3 {
++				regulator-name = "pm8008j_l3";
++			};
++			pm8008j_l4: ldo4 {
++				regulator-name = "pm8008j_l4";
++			};
++			pm8008j_l5: ldo5 {
++				regulator-name = "pm8008j_l5";
++			};
++			pm8008j_l6: ldo6 {
++				regulator-name = "pm8008j_l6";
++			};
++			pm8008j_l7: ldo7 {
++				regulator-name = "pm8008j_l7";
++			};
++		};
++	};
++};
++
++&tlmm {
++	camera_pmic_enable_default: camera-pmic-enable-state {
++		pins = "gpio11";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++		output-high;
++	};
++};
+diff --git a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-display.dtsi b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-display.dtsi
+new file mode 100644
+--- /dev/null
++++ b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-display.dtsi
+@@ -0,0 +1,94 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/* Xiaomi 12S Pro display wiring, verified against the running vendor DT. */
++
++/ {
++	panel_vci: regulator-panel-vci {
++		compatible = "regulator-fixed";
++		regulator-name = "panel_vci";
++		regulator-min-microvolt = <3000000>;
++		regulator-max-microvolt = <3000000>;
++		gpio = <&tlmm 75 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++	};
++
++	panel_vddio: regulator-panel-vddio {
++		compatible = "regulator-fixed";
++		regulator-name = "panel_vddio";
++		regulator-min-microvolt = <1800000>;
++		regulator-max-microvolt = <1800000>;
++		gpio = <&tlmm 74 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++	};
++
++	panel_vddd: regulator-panel-vddd {
++		compatible = "regulator-fixed";
++		regulator-name = "panel_vddd";
++		regulator-min-microvolt = <1500000>;
++		regulator-max-microvolt = <1500000>;
++		gpio = <&tlmm 25 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++	};
++};
++
++&gpu {
++	compatible = "qcom,adreno-730.2", "qcom,adreno";
++	status = "okay";
++};
++
++&gpu_zap_shader {
++	firmware-name = "qcom/sm8475/xiaomi/unicorn/a730_zap.mdt";
++};
++
++&mdss {
++	status = "okay";
++};
++
++&mdss_dsi0 {
++	vdda-supply = <&pm8350c_l10>;
++	pinctrl-names = "default";
++	pinctrl-0 = <&panel_te_default>;
++	status = "okay";
++
++	panel: panel@0 {
++		compatible = "xiaomi,l2s-38-0c-0a";
++		reg = <0>;
++		vci-supply = <&panel_vci>;
++		vddio-supply = <&panel_vddio>;
++		vddd-supply = <&panel_vddd>;
++		reset-gpios = <&tlmm 0 GPIO_ACTIVE_LOW>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&panel_reset_default>;
++
++		port {
++			panel_in: endpoint {
++				remote-endpoint = <&mdss_dsi0_out>;
++			};
++		};
++	};
++};
++
++&mdss_dsi0_out {
++	remote-endpoint = <&panel_in>;
++	data-lanes = <0 1 2 3>;
++};
++
++&mdss_dsi0_phy {
++	vdds-supply = <&pm8350_l5>;
++	status = "okay";
++};
++
++&tlmm {
++	panel_reset_default: panel-reset-default-state {
++		pins = "gpio0";
++		function = "gpio";
++		drive-strength = <8>;
++		bias-disable;
++	};
++
++	panel_te_default: panel-te-default-state {
++		pins = "gpio86";
++		function = "mdp_vsync";
++		drive-strength = <2>;
++		bias-pull-down;
++	};
++};
+diff --git a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-dsp.dtsi b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-dsp.dtsi
+new file mode 100644
+--- /dev/null
++++ b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-dsp.dtsi
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
++/* Unicorn DSP firmware paths and PMIC battery transport. */
++/ {
++	pmic-glink {
++		compatible = "qcom,sm8450-pmic-glink", "qcom,pmic-glink";
++	};
++};
++
++&remoteproc_adsp {
++	firmware-name = "qcom/sm8475/xiaomi/unicorn/adsp.mdt";
++	status = "okay";
++};
++
++&remoteproc_slpi {
++	firmware-name = "qcom/sm8475/xiaomi/unicorn/slpi.mdt";
++	status = "okay";
++};
+diff --git a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-nfc.dtsi b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-nfc.dtsi
+new file mode 100644
+--- /dev/null
++++ b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-nfc.dtsi
+@@ -0,0 +1,43 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-3-Clause)
++/* Actual Unicorn qcom,sn-nci family/wiring; exact SN product remains unknown. */
++&i2c9 {
++	nfc@28 {
++		compatible = "qcom,sn-nci";
++		reg = <0x28>;
++		interrupts-extended = <&tlmm 46 IRQ_TYPE_LEVEL_HIGH>;
++		irq-gpios = <&tlmm 46 GPIO_ACTIVE_HIGH>;
++		enable-gpios = <&tlmm 34 GPIO_ACTIVE_HIGH>;
++		firmware-gpios = <&tlmm 45 GPIO_ACTIVE_HIGH>;
++		clock-request-gpios = <&tlmm 35 GPIO_ACTIVE_HIGH>;
++		vddio-supply = <&pm8350_s10>;
++		pinctrl-names = "default", "active", "sleep";
++		pinctrl-0 = <&unicorn_nfc_sleep>;
++		pinctrl-1 = <&unicorn_nfc_active_control &unicorn_nfc_active_irq>;
++		pinctrl-2 = <&unicorn_nfc_sleep>;
++	};
++};
++
++&tlmm {
++	unicorn_nfc_active_control: nfc-active-control-state {
++		pins = "gpio34", "gpio35", "gpio45";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++
++	unicorn_nfc_active_irq: nfc-active-irq-state {
++		pins = "gpio46";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-down;
++	};
++
++	/* Native38 measured input baseline, including VEN high after release. */
++	unicorn_nfc_sleep: nfc-sleep-state {
++		pins = "gpio34", "gpio35", "gpio45", "gpio46";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-down;
++		output-disable;
++	};
++};
+diff --git a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-peripherals.dtsi b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-peripherals.dtsi
+new file mode 100644
+--- /dev/null
++++ b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-peripherals.dtsi
+@@ -0,0 +1,62 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-3-Clause)
++
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/interrupt-controller/irq.h>
++
++&gpi_dma1 { status = "okay"; };
++&gpi_dma2 { status = "okay"; };
++&qupv3_id_1 { status = "okay"; };
++&qupv3_id_2 { status = "okay"; };
++
++&i2c18 {
++	clock-frequency = <400000>;
++	status = "okay";
++
++	haptics: vibrator@5a {
++		compatible = "xiaomi,unicorn-aw86927", "awinic,aw86927";
++		reg = <0x5a>;
++		interrupts-extended = <&tlmm 90 IRQ_TYPE_EDGE_FALLING>;
++		reset-gpios = <&tlmm 89 GPIO_ACTIVE_LOW>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&haptics_reset_default>, <&haptics_irq_default>;
++
++	};
++};
++
++&qup_spi13_cs {
++	drive-strength = <6>;
++	bias-disable;
++};
++
++&qup_spi13_data_clk {
++	drive-strength = <6>;
++	bias-disable;
++};
++
++&spi13 {
++	status = "okay";
++
++	/* The vendor driver streams the IR waveform directly over MOSI. */
++	irled@0 {
++		compatible = "ir-spi-led";
++		reg = <0>;
++		spi-max-frequency = <19200000>;
++		duty-cycle = /bits/ 8 <30>;
++	};
++};
++
++&tlmm {
++	haptics_reset_default: haptics-reset-default-state {
++		pins = "gpio89";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++
++	haptics_irq_default: haptics-irq-default-state {
++		pins = "gpio90";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-up;
++	};
++};
+diff --git a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-speakers.dtsi b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-speakers.dtsi
+new file mode 100644
+--- /dev/null
++++ b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-speakers.dtsi
+@@ -0,0 +1,170 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-3-Clause)
++/* Unicorn CS35L41 amplifiers and protected 96 kHz TDM transport. */
++
++&i2c15 {
++	status = "okay";
++
++	cs35l41_bottom: amplifier@40 {
++		compatible = "cirrus,cs35l41";
++		reg = <0x40>;
++		#sound-dai-cells = <1>;
++		interrupts-extended = <&tlmm 117 IRQ_TYPE_LEVEL_LOW>;
++		/* With ACTIVE_HIGH, driver LOW then HIGH asserts then releases reset. */
++		reset-gpios = <&tlmm 120 GPIO_ACTIVE_HIGH>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&unicorn_amp_bottom_reset &unicorn_amp_bottom_irq>;
++		sound-name-prefix = "B";
++		cirrus,subsystem-id = "xiaomi-unicorn";
++		cirrus,boost-type = <0>;
++		cirrus,boost-peak-milliamp = <4000>;
++		cirrus,boost-ind-nanohenry = <1000>;
++		cirrus,boost-cap-microfarad = <15>;
++		cirrus,asp-sdout-hiz = <3>;
++		cirrus,gpio2-src-select = <4>;
++		cirrus,gpio2-output-enable;
++	};
++
++	cs35l41_top: amplifier@43 {
++		compatible = "cirrus,cs35l41";
++		reg = <0x43>;
++		#sound-dai-cells = <1>;
++		interrupts-extended = <&tlmm 88 IRQ_TYPE_LEVEL_LOW>;
++		reset-gpios = <&tlmm 1 GPIO_ACTIVE_HIGH>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&unicorn_amp_top_reset &unicorn_amp_top_irq>;
++		sound-name-prefix = "T";
++		cirrus,subsystem-id = "xiaomi-unicorn";
++		cirrus,boost-type = <0>;
++		cirrus,boost-peak-milliamp = <4000>;
++		cirrus,boost-ind-nanohenry = <1000>;
++		cirrus,boost-cap-microfarad = <15>;
++		cirrus,asp-sdout-hiz = <3>;
++		cirrus,gpio2-src-select = <4>;
++		cirrus,gpio2-output-enable;
++	};
++};
++
++&qup_i2c15_data_clk {
++	drive-strength = <2>;
++	bias-pull-up;
++	/delete-property/ bias-disable;
++};
++
++&tlmm {
++	unicorn_amp_bottom_reset: amp-bottom-reset-state {
++		pins = "gpio120";
++		function = "gpio";
++		drive-strength = <16>;
++		bias-disable;
++		output-high;
++	};
++
++	unicorn_amp_top_reset: amp-top-reset-state {
++		pins = "gpio1";
++		function = "gpio";
++		drive-strength = <16>;
++		bias-disable;
++		output-high;
++	};
++
++	unicorn_amp_bottom_irq: amp-bottom-irq-state {
++		pins = "gpio117";
++		function = "gpio";
++		drive-strength = <2>;
++		output-disable;
++		bias-pull-up;
++	};
++
++	unicorn_amp_top_irq: amp-top-irq-state {
++		pins = "gpio88";
++		function = "gpio";
++		drive-strength = <2>;
++		output-disable;
++		bias-pull-up;
++	};
++};
++
++/* Expose the per-amplifier prefixed controls. */
++&sound {
++	aux-devs = <&cs35l41_top>, <&cs35l41_bottom>;
++};
++
++/*
++ * Unicorn TDM transport: 96 kHz, three channels in four 32-bit slots.
++ * GPIO52 is not a proven mute and is deliberately not acquired here.
++ * MainAMP endpoints have reversible card pin controls, initially disabled.
++ */
++
++&q6apmbedai {
++	#address-cells = <1>;
++	#size-cells = <0>;
++
++	dai@38 {
++		reg = <TERTIARY_TDM_RX_0>;
++		clocks = <&q6prmcc LPASS_CLK_ID_TER_TDM_IBIT
++			  LPASS_CLK_ATTRIBUTE_INVERT_COUPLE_NO>;
++		clock-names = "bclk";
++	};
++};
++
++&sound {
++	compatible = "xiaomi,unicorn-sndcard", "qcom,sm8450-sndcard";
++	pinctrl-names = "default", "tdm-active", "tdm-sleep";
++	pinctrl-0 = <&unicorn_tdm_sleep>;
++	pinctrl-1 = <&unicorn_tdm_clk &unicorn_tdm_ws
++		     &unicorn_tdm_data0 &unicorn_tdm_data1>;
++	pinctrl-2 = <&unicorn_tdm_sleep>;
++
++	speaker-playback-dai-link {
++		link-name = "Unicorn Protected Speaker Playback";
++		cpu {
++			sound-dai = <&q6apmbedai TERTIARY_TDM_RX_0>;
++		};
++		codec {
++			sound-dai = <&cs35l41_top 0>, <&cs35l41_bottom 0>;
++		};
++		platform {
++			sound-dai = <&q6apm>;
++		};
++	};
++};
++
++&tlmm {
++	unicorn_tdm_clk: unicorn-tdm-clock-state {
++		pins = "gpio121";
++		function = "mi2s2_sck";
++		drive-strength = <8>;
++		bias-disable;
++		output-high;
++	};
++
++	unicorn_tdm_ws: unicorn-tdm-ws-state {
++		pins = "gpio123";
++		function = "mi2s2_ws";
++		drive-strength = <8>;
++		bias-disable;
++		output-high;
++	};
++
++	unicorn_tdm_data0: unicorn-tdm-data0-state {
++		pins = "gpio122";
++		function = "mi2s2_data0";
++		drive-strength = <8>;
++		bias-disable;
++	};
++
++	unicorn_tdm_data1: unicorn-tdm-data1-state {
++		pins = "gpio124";
++		function = "mi2s2_data1";
++		drive-strength = <8>;
++		bias-pull-down;
++	};
++
++	unicorn_tdm_sleep: unicorn-tdm-sleep-state {
++		pins = "gpio121", "gpio122", "gpio123", "gpio124";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-down;
++		output-disable;
++	};
++};
+diff --git a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-thermal.dtsi b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-thermal.dtsi
+new file mode 100644
+--- /dev/null
++++ b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-thermal.dtsi
+@@ -0,0 +1,138 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* ADC channel numbers and scaling are from unicorn's running vendor DT. */
++&pmk8350_vadc {
++	pinctrl-names = "default";
++	pinctrl-0 = <&rear_tof_therm_default>;
++	status = "okay";
++
++	channel@3 {
++		reg = <0x3>;
++		label = "pmk8350_die_temp";
++	};
++
++	channel@103 {
++		reg = <0x103>;
++		label = "pm8350_die_temp";
++	};
++
++	channel@303 {
++		reg = <0x303>;
++		label = "pm8350b_die_temp";
++	};
++
++	channel@403 {
++		reg = <0x403>;
++		label = "pmr735a_die_temp";
++	};
++
++	channel@503 {
++		reg = <0x503>;
++		label = "pmr735b_die_temp";
++	};
++
++	channel@144 {
++		reg = <0x144>;
++		label = "pm8350_msm_therm";
++		qcom,ratiometric;
++		qcom,hw-settle-time = <200>;
++	};
++
++	channel@145 {
++		reg = <0x145>;
++		label = "pm8350_cam_flash_therm";
++		qcom,ratiometric;
++		qcom,hw-settle-time = <200>;
++	};
++
++	channel@146 {
++		reg = <0x146>;
++		label = "pm8350_hot_pocket_therm";
++		qcom,ratiometric;
++		qcom,hw-settle-time = <200>;
++	};
++
++	channel@34d {
++		reg = <0x34d>;
++		label = "pm8350_wide_rfc_therm";
++		qcom,ratiometric;
++		qcom,hw-settle-time = <200>;
++	};
++
++	channel@34b {
++		reg = <0x34b>;
++		label = "pm8350b_rear_tof_therm";
++		qcom,ratiometric;
++		qcom,hw-settle-time = <200>;
++	};
++
++	channel@44a {
++		reg = <0x44a>;
++		label = "pm8350b_usb_conn_therm";
++		qcom,ratiometric;
++		qcom,hw-settle-time = <200>;
++	};
++
++	channel@44b {
++		reg = <0x44b>;
++		label = "pm8350b_wl_chg_therm";
++		qcom,ratiometric;
++		qcom,hw-settle-time = <200>;
++	};
++
++	channel@44c {
++		reg = <0x44c>;
++		label = "pmk8350_wifi_therm";
++		qcom,ratiometric;
++		qcom,hw-settle-time = <200>;
++	};
++
++	channel@44 {
++		reg = <0x44>;
++		label = "pmk8350_xo_therm";
++		qcom,ratiometric;
++		qcom,hw-settle-time = <200>;
++	};
++};
++
++&pm8350b_gpios {
++	rear_tof_therm_default: rear-tof-therm-default-state {
++		pins = "gpio2";
++		function = "normal";
++		bias-high-impedance;
++	};
++};
++
++&pm8350_temp_alarm {
++	io-channels = <&pmk8350_vadc 0x103>;
++	io-channel-names = "thermal";
++};
++
++&pm8350b_temp_alarm {
++	io-channels = <&pmk8350_vadc 0x303>;
++	io-channel-names = "thermal";
++};
++
++&pmr735a_temp_alarm {
++	io-channels = <&pmk8350_vadc 0x403>;
++	io-channel-names = "thermal";
++};
++
++/ {
++	hwmon {
++		compatible = "iio-hwmon";
++		io-channels = <&pmk8350_vadc 0x3>,
++			      <&pmk8350_vadc 0x103>,
++			      <&pmk8350_vadc 0x303>,
++			      <&pmk8350_vadc 0x403>,
++			      <&pmk8350_vadc 0x503>,
++			      <&pmk8350_vadc 0x144>,
++			      <&pmk8350_vadc 0x145>,
++			      <&pmk8350_vadc 0x146>,
++			      <&pmk8350_vadc 0x34d>,
++			      <&pmk8350_vadc 0x34b>,
++			      <&pmk8350_vadc 0x44a>,
++			      <&pmk8350_vadc 0x44b>,
++			      <&pmk8350_vadc 0x44c>,
++			      <&pmk8350_vadc 0x44>;
++	};
++};
+diff --git a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-touch.dtsi b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-touch.dtsi
+new file mode 100644
+--- /dev/null
++++ b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-touch.dtsi
+@@ -0,0 +1,43 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-3-Clause)
++
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/interrupt-controller/irq.h>
++
++&spi4 {
++	status = "okay";
++
++	touchscreen: touchscreen@0 {
++		compatible = "xiaomi,unicorn-touchscreen";
++		reg = <0>;
++		spi-max-frequency = <12000000>;
++
++		interrupt-parent = <&tlmm>;
++		interrupts = <21 IRQ_TYPE_LEVEL_LOW>;
++		reset-gpios = <&tlmm 20 GPIO_ACTIVE_LOW>;
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&touch_irq_default>, <&touch_reset_default>;
++
++		vdd-supply = <&pm8350c_l2>;
++		avdd-supply = <&pm8350c_l9>;
++
++		touchscreen-size-x = <14400>;
++		touchscreen-size-y = <32000>;
++	};
++};
++
++&tlmm {
++	touch_irq_default: touch-irq-default-state {
++		pins = "gpio21";
++		function = "gpio";
++		drive-strength = <8>;
++		bias-pull-up;
++	};
++
++	touch_reset_default: touch-reset-default-state {
++		pins = "gpio20";
++		function = "gpio";
++		drive-strength = <8>;
++		bias-pull-up;
++	};
++};
+diff --git a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-wireless.dtsi b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-wireless.dtsi
+new file mode 100644
+--- /dev/null
++++ b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-wireless.dtsi
+@@ -0,0 +1,104 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Xiaomi 12S Pro PCIe0 and UART20 host wiring from the vendor board DT. */
++
++&pcie0 {
++	status = "okay";
++};
++
++&pcie0_phy {
++	vdda-phy-supply = <&pm8350_l5>;
++	vdda-pll-supply = <&pm8350c_l10>;
++
++	status = "okay";
++};
++
++&qupv3_id_2 {
++	status = "okay";
++};
++
++/* UART20 uses GPIO76 CTS, GPIO77 RTS, GPIO78 TX and GPIO79 RX. */
++&uart20 {
++	pinctrl-0 = <&uart20_default>;
++	pinctrl-names = "default";
++	status = "okay";
++
++	bluetooth {
++		compatible = "qcom,wcn6855-bt";
++		power-sequencers = <&unicorn_radio>;
++	};
++};
++
++&pcieport0 {
++	wifi@0 {
++		compatible = "pci17cb,1103";
++		reg = <0x10000 0 0 0 0>;
++		power-sequencers = <&unicorn_radio>;
++	};
++};
++
++/ {
++	unicorn_radio: radio-power-sequencer {
++		compatible = "xiaomi,unicorn-radio-pwrseq";
++		pinctrl-names = "default", "wlan-active", "wlan-sleep";
++		pinctrl-0 = <&unicorn_wlan_sleep>, <&unicorn_bt_sleep>;
++		pinctrl-1 = <&unicorn_wlan_active>;
++		pinctrl-2 = <&unicorn_wlan_sleep>;
++		wlan-enable-gpios = <&tlmm 80 GPIO_ACTIVE_HIGH>;
++		bt-enable-gpios = <&tlmm 81 GPIO_ACTIVE_HIGH>;
++		swctrl-gpios = <&tlmm 82 GPIO_ACTIVE_HIGH>;
++		xo-clk-gpios = <&tlmm 204 GPIO_ACTIVE_HIGH>;
++		clocks = <&rpmhcc RPMH_RF_CLK3>;
++		vddio-supply = <&pm8350_s10>;
++		vddasd-supply = <&pmr735a_l7>;
++		vddwlan-aon-supply = <&pmr735a_s2>;
++		vdddig-supply = <&pm8350_s11>;
++		vddrfa1-supply = <&pm8350c_s1>;
++		vddrfa2-supply = <&pm8350_s12>;
++	};
++};
++
++&tlmm {
++	unicorn_wlan_sleep: unicorn-wlan-sleep-state {
++		pins = "gpio80";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-down;
++	};
++
++	unicorn_wlan_active: unicorn-wlan-active-state {
++		pins = "gpio80";
++		function = "gpio";
++		drive-strength = <16>;
++		bias-pull-up;
++	};
++
++	unicorn_bt_sleep: unicorn-bt-sleep-state {
++		pins = "gpio81";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-down;
++	};
++
++	uart20_default: uart20-default-state {
++		cts-rx-pins {
++			pins = "gpio76", "gpio79";
++			function = "qup20";
++			drive-strength = <2>;
++			bias-disable;
++		};
++
++		rts-pins {
++			pins = "gpio77";
++			function = "qup20";
++			drive-strength = <2>;
++			bias-pull-down;
++		};
++
++		tx-pins {
++			pins = "gpio78";
++			function = "qup20";
++			drive-strength = <2>;
++			bias-pull-up;
++		};
++	};
++};
+diff --git a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn.dts b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn.dts
+new file mode 100644
+--- /dev/null
++++ b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn.dts
+@@ -0,0 +1,522 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Xiaomi 12S Pro (unicorn), board wiring from the running vendor DT. */
++/dts-v1/;
++
++#include <dt-bindings/input/input.h>
++#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
++#include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
++#include "sm8475.dtsi"
++#include "pm8350.dtsi"
++#include "pm8350b.dtsi"
++#include "pm8350c.dtsi"
++#include "pm8450.dtsi"
++#include "pmk8350.dtsi"
++#include "pmr735a.dtsi"
++#include "sm8475-xiaomi-unicorn-wireless.dtsi"
++
++/* These SM8450 reference reservations differ on unicorn. */
++/delete-node/ &adsp_mem;
++/delete-node/ &rmtfs_mem;
++/delete-node/ &xbl_ramdump_mem;
++/delete-node/ &xbl_sc_mem;
++/delete-node/ &oem_vm_mem;
++
++/ {
++	model = "Xiaomi 12S Pro";
++	compatible = "xiaomi,unicorn", "qcom,sm8475";
++	chassis-type = "handset";
++
++	aliases {
++		serial0 = &uart7;
++	};
++
++	chosen {
++		/* USB gadget console is configured by the initramfs. */
++	};
++
++	gpio-keys {
++		compatible = "gpio-keys";
++		pinctrl-names = "default";
++		pinctrl-0 = <&volume_up_default>;
++
++		key-volume-up {
++			label = "Volume Up";
++			linux,code = <KEY_VOLUMEUP>;
++			gpios = <&pm8350_gpios 6 GPIO_ACTIVE_LOW>;
++			debounce-interval = <15>;
++			wakeup-source;
++		};
++	};
++
++
++	vph_pwr: regulator-vph-pwr {
++		compatible = "regulator-fixed";
++		regulator-name = "vph_pwr";
++		regulator-min-microvolt = <3700000>;
++		regulator-max-microvolt = <3700000>;
++		regulator-always-on;
++	};
++
++	reserved-memory {
++
++		xbl_ramdump_mem: memory@a6b80000 {
++			reg = <0 0xa6b80000 0 0x280000>;
++			no-map;
++		};
++
++		adsp_mem: memory@9fd00000 {
++			reg = <0 0x9fd00000 0 0x3100000>;
++			no-map;
++		};
++
++		/* xbl_sc_mem2 in sm8450.dtsi already reserves 0xa6e00000. */
++		ramoops@a7000000 {
++			compatible = "ramoops";
++			reg = <0 0xa7000000 0 0x400000>;
++			console-size = <0x200000>;
++			pmsg-size = <0x200000>;
++		};
++
++		/* Bootloader scanout buffer; dimensions are not assumed. */
++		splash_region: memory@b8000000 {
++			reg = <0 0xb8000000 0 0x2b00000>;
++			no-map;
++		};
++
++		trusted_apps_mem: memory@ea000000 {
++			reg = <0 0xea000000 0 0x3900000>;
++			no-map;
++		};
++
++		trusted_apps_ext_mem: memory@ed900000 {
++			reg = <0 0xed900000 0 0x3b00000>;
++			no-map;
++		};
++	};
++};
++
++/* RAM banks are populated by the bootloader for the installed RAM SKU. */
++
++&apps_rsc {
++	regulators-0 {
++		compatible = "qcom,pm8350-rpmh-regulators";
++		qcom,pmic-id = "b";
++
++		pm8350_s10: smps10 {
++			regulator-name = "pm8350_s10";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++		};
++
++		pm8350_s11: smps11 {
++			regulator-name = "pm8350_s11";
++			regulator-min-microvolt = <966000>;
++			regulator-max-microvolt = <1170000>;
++		};
++
++		pm8350_s12: smps12 {
++			regulator-name = "pm8350_s12";
++			regulator-min-microvolt = <1350000>;
++			regulator-max-microvolt = <2024000>;
++		};
++
++		pm8350_l1: ldo1 {
++			regulator-name = "pm8350_l1";
++			regulator-min-microvolt = <830000>;
++			regulator-max-microvolt = <920000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pm8350_l2: ldo2 {
++			regulator-name = "pm8350_l2";
++			regulator-min-microvolt = <3075000>;
++			regulator-max-microvolt = <3300000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pm8350_l3: ldo3 {
++			regulator-name = "pm8350_l3";
++			regulator-min-microvolt = <870000>;
++			regulator-max-microvolt = <970000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pm8350_l5: ldo5 {
++			regulator-name = "pm8350_l5";
++			regulator-min-microvolt = <880000>;
++			regulator-max-microvolt = <958000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pm8350_l6: ldo6 {
++			regulator-name = "pm8350_l6";
++			regulator-min-microvolt = <1200000>;
++			regulator-max-microvolt = <1216000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pm8350_l7: ldo7 {
++			regulator-name = "pm8350_l7";
++			regulator-min-microvolt = <2400000>;
++			regulator-max-microvolt = <3544000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pm8350_l9: ldo9 {
++			regulator-name = "pm8350_l9";
++			regulator-min-microvolt = <1200000>;
++			regulator-max-microvolt = <1304000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++
++	regulators-1 {
++		compatible = "qcom,pm8350c-rpmh-regulators";
++		qcom,pmic-id = "c";
++
++		pm8350c_s1: smps1 {
++			regulator-name = "pm8350c_s1";
++			regulator-min-microvolt = <1900000>;
++			regulator-max-microvolt = <2024000>;
++		};
++
++		pm8350c_s10: smps10 {
++			regulator-name = "pm8350c_s10";
++			regulator-min-microvolt = <1052000>;
++			regulator-max-microvolt = <1170000>;
++		};
++
++		pm8350c_l1: ldo1 {
++			/* Firmware has no ldoc1 resource; no board consumers. */
++			status = "disabled";
++			regulator-name = "pm8350c_l1";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1980000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pm8350c_l2: ldo2 {
++			regulator-name = "pm8350c_l2";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pm8350c_l3: ldo3 {
++			regulator-name = "pm8350c_l3";
++			regulator-min-microvolt = <2700000>;
++			regulator-max-microvolt = <3544000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pm8350c_l4: ldo4 {
++			regulator-name = "pm8350c_l4";
++			regulator-min-microvolt = <1620000>;
++			regulator-max-microvolt = <3300000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pm8350c_l5: ldo5 {
++			regulator-name = "pm8350c_l5";
++			regulator-min-microvolt = <1620000>;
++			regulator-max-microvolt = <3300000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pm8350c_l6: ldo6 {
++			regulator-name = "pm8350c_l6";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <3544000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pm8350c_l7: ldo7 {
++			regulator-name = "pm8350c_l7";
++			regulator-min-microvolt = <3000000>;
++			regulator-max-microvolt = <3544000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pm8350c_l8: ldo8 {
++			regulator-name = "pm8350c_l8";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <2000000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pm8350c_l9: ldo9 {
++			regulator-name = "pm8350c_l9";
++			regulator-min-microvolt = <3224000>;
++			regulator-max-microvolt = <3224000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pm8350c_l10: ldo10 {
++			regulator-name = "pm8350c_l10";
++			regulator-min-microvolt = <1200000>;
++			regulator-max-microvolt = <1304000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pm8350c_l11: ldo11 {
++			regulator-name = "pm8350c_l11";
++			regulator-min-microvolt = <3008000>;
++			regulator-max-microvolt = <3008000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++			regulator-always-on;
++			regulator-boot-on;
++		};
++
++		pm8350c_l12: ldo12 {
++			regulator-name = "pm8350c_l12";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1980000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pm8350c_l13: ldo13 {
++			regulator-name = "pm8350c_l13";
++			regulator-min-microvolt = <2700000>;
++			regulator-max-microvolt = <3544000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		vreg_bob: pm8350c_bob: bob {
++			regulator-name = "pm8350c_bob";
++			regulator-min-microvolt = <3296000>;
++			regulator-max-microvolt = <3296000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_AUTO>;
++		};
++	};
++
++	regulators-2 {
++		compatible = "qcom,pm8450-rpmh-regulators";
++		qcom,pmic-id = "h";
++
++		pm8450_s3: smps3 {
++			regulator-name = "pm8450_s3";
++			regulator-min-microvolt = <470000>;
++			regulator-max-microvolt = <570000>;
++		};
++
++		pm8450_l2: ldo2 {
++			regulator-name = "pm8450_l2";
++			regulator-min-microvolt = <820000>;
++			regulator-max-microvolt = <958000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pm8450_l3: ldo3 {
++			regulator-name = "pm8450_l3";
++			regulator-min-microvolt = <866000>;
++			regulator-max-microvolt = <958000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pm8450_l4: ldo4 {
++			/* Firmware has no ldoh4 resource; no board consumers. */
++			status = "disabled";
++			regulator-name = "pm8450_l4";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1808000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++
++	regulators-3 {
++		compatible = "qcom,pmr735a-rpmh-regulators";
++		qcom,pmic-id = "e";
++
++		pmr735a_s2: smps2 {
++			regulator-name = "pmr735a_s2";
++			regulator-min-microvolt = <1012000>;
++			regulator-max-microvolt = <1040000>;
++		};
++
++		pmr735a_s3: smps3 {
++			regulator-name = "pmr735a_s3";
++			regulator-min-microvolt = <300000>;
++			regulator-max-microvolt = <2352000>;
++		};
++
++		pmr735a_l1: ldo1 {
++			regulator-name = "pmr735a_l1";
++			regulator-min-microvolt = <800000>;
++			regulator-max-microvolt = <880000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pmr735a_l2: ldo2 {
++			regulator-name = "pmr735a_l2";
++			regulator-min-microvolt = <480000>;
++			regulator-max-microvolt = <1200000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pmr735a_l3: ldo3 {
++			regulator-name = "pmr735a_l3";
++			regulator-min-microvolt = <1200000>;
++			regulator-max-microvolt = <1200000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pmr735a_l4: ldo4 {
++			regulator-name = "pmr735a_l4";
++			regulator-min-microvolt = <1776000>;
++			regulator-max-microvolt = <1776000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pmr735a_l5: ldo5 {
++			regulator-name = "pmr735a_l5";
++			regulator-min-microvolt = <880000>;
++			regulator-max-microvolt = <920000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pmr735a_l6: ldo6 {
++			regulator-name = "pmr735a_l6";
++			regulator-min-microvolt = <1200000>;
++			regulator-max-microvolt = <1200000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pmr735a_l7: ldo7 {
++			regulator-name = "pmr735a_l7";
++			regulator-min-microvolt = <2800000>;
++			regulator-max-microvolt = <2800000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++
++};
++
++&gpi_dma0 { status = "okay"; };
++
++
++
++&i2c5 {
++	clock-frequency = <100000>;
++	status = "okay";
++
++	eusb2_repeater: redriver@4f {
++		compatible = "nxp,ptn3222";
++		reg = <0x4f>;
++		#phy-cells = <0>;
++		vdd1v8-supply = <&pm8350_s10>;
++		vdd3v3-supply = <&pm8350_l2>;
++		reset-gpios = <&pm8350c_gpios 7 GPIO_ACTIVE_LOW>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&eusb2_reset_default>;
++		nxp,usb2-tx-control = /bits/ 8 <0x00 0x62>;
++		nxp,usb2-tx-control-host = /bits/ 8 <0x22 0x63>;
++	};
++};
++
++&pm8350_gpios {
++	volume_up_default: volume-up-default-state {
++		pins = "gpio6";
++		function = "normal";
++		input-enable;
++		bias-pull-up;
++		power-source = <1>;
++	};
++};
++
++&pm8350c_gpios {
++	eusb2_reset_default: eusb2-reset-default-state {
++		pins = "gpio7";
++		function = "normal";
++		bias-disable;
++		power-source = <1>;
++		qcom,drive-strength = <PMIC_GPIO_STRENGTH_MED>;
++	};
++};
++
++&pmk8350_rtc { status = "okay"; };
++
++&pon_pwrkey {
++	status = "okay";
++};
++
++&pon_resin {
++	linux,code = <KEY_VOLUMEDOWN>;
++	status = "okay";
++};
++
++&qupv3_id_0 { status = "okay"; };
++
++
++
++
++&scm {
++	/* Waitqueue fallback for firmware without WAITQ_GET_INFO support. */
++	interrupts = <GIC_SPI 930 IRQ_TYPE_EDGE_RISING>;
++};
++
++&tlmm {
++	/* Firmware-reserved GPIOs, from qcom,gpios-reserved in the live DT. */
++	gpio-reserved-ranges = <28 4>, <36 4>;
++};
++
++&ufs_mem_hc {
++	reset-gpios = <&tlmm 210 GPIO_ACTIVE_LOW>;
++	vcc-supply = <&pm8350_l7>;
++	vcc-max-microamp = <1100000>;
++	vccq-supply = <&pm8350_l9>;
++	vccq-max-microamp = <1200000>;
++	status = "okay";
++};
++
++&ufs_mem_phy {
++	vdda-phy-supply = <&pm8350_l5>;
++	vdda-pll-supply = <&pm8350c_l10>;
++	status = "okay";
++};
++
++&usb_1 {
++	/* The handset uses an external USB2 repeater, no wired USB3 path. */
++	qcom,select-utmi-as-pipe-clk;
++	dr_mode = "peripheral";
++	maximum-speed = "high-speed";
++	phys = <&usb_1_hsphy>;
++	phy-names = "usb2-phy";
++	status = "okay";
++};
++
++&usb_1_hsphy {
++	vdd-supply = <&pm8350_l5>;
++	vdda12-supply = <&pm8350c_l10>;
++	phys = <&eusb2_repeater>;
++	status = "okay";
++};
++
++
++
++
++
++
++
++#include "sm8475-xiaomi-unicorn-thermal.dtsi"
++
++
++
++#include "sm8475-xiaomi-unicorn-display.dtsi"
++#include "sm8475-xiaomi-unicorn-touch.dtsi"
++
++#include "sm8475-xiaomi-unicorn-dsp.dtsi"
++#include "sm8475-xiaomi-unicorn-audio.dtsi"
++
++#include "sm8475-xiaomi-unicorn-peripherals.dtsi"
++
++#include "sm8475-xiaomi-unicorn-camera.dtsi"
++
++#include "sm8475-xiaomi-unicorn-speakers.dtsi"
++
++/* NFC host bus; controller wiring is described in the NFC include. */
++&i2c9 {
++	clock-frequency = <1000000>;
++	status = "okay";
++};
++
++#include "sm8475-xiaomi-unicorn-nfc.dtsi"

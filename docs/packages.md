@@ -132,6 +132,7 @@ identifiers, rather than processor names or output roles:
 | `sheng` | Xiaomi Pad 6S Pro |
 | `aurora` | Xiaomi 14 Ultra |
 | `clover` | Xiaomi Mi Pad 4 LTE (the supported variant) |
+| `unicorn` | Xiaomi 12S Pro |
 
 Board packages live under `devicePackages.devices.<codename>`, for example
 `devices.asphalt.firmware` and `devices.sheng.thp`. Shared packages such as

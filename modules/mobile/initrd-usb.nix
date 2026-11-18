@@ -22,7 +22,25 @@ let
     set -eu
     g=${gadget}
     role=/sys/class/usb_role/${cfg.roleSwitch}/role
-    if test -e "$role"; then printf device > "$role"; fi
+    ${
+      if mobile.usb.signaller.followRole then
+        ''
+          port=/sys/class/typec/${mobile.usb.signaller.typecPort}
+          if test -e "$port-partner"; then
+            # UCSI owns the connected role; initrd must not undo its negotiation.
+            case "$(cat "$port/data_role")" in
+              *"[device]"*|device) ;;
+              *) echo 'Type-C is not in device role; recovery gadget remains unbound' >&2; exit 1 ;;
+            esac
+          elif test -e "$role" && test "$(cat "$role")" = none; then
+            printf device > "$role"
+          fi
+        ''
+      else
+        ''
+          if test -e "$role"; then printf device > "$role"; fi
+        ''
+    }
     for attempt in $(seq 1 200); do
       test ! -e /sys/class/udc/${mobile.usbController} || break
       sleep 0.1
@@ -307,6 +325,7 @@ in
         };
       };
       services.mobile-recovery-console = lib.mkIf cfg.acm.enable {
+        requires = [ "mobile-initrd-usb.service" ];
         wantedBy = [ (if mobile.recovery.enable then "mobile-recovery.target" else "initrd.target") ];
         after = [ "mobile-initrd-usb.service" ];
         before = [ "initrd-switch-root.target" ];

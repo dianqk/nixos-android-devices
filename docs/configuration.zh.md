@@ -1,6 +1,6 @@
 # 配置自己的系统
 
-设备专属选项统一使用 `hardware.<device>.*`，设备为 `asphalt`、`polaris`、`sheng`、`aurora`、`clover`、`marble`、`t880` 和 `dodge`；
+设备专属选项统一使用 `hardware.<device>.*`，设备为 `asphalt`、`polaris`、`sheng`、`aurora`、`clover`、`marble`、`t880`、`dodge` 和 `unicorn`；
 共享的启动、USB、recovery 等选项使用 `androidDevices.*`。
 
 [English](configuration.md) · [安装指南](README.zh.md) · [USB 连接](usb-signaller.zh.md)
@@ -115,7 +115,7 @@ system profile 变化。启动前须将完整 closure 部署到现有 ext4 根�
 ## 选择设备和系统角色
 
 `lib.mkSystem { device; buildSystem; modules; }` 返回标准 NixOS 配置。
-`device` 支持 `asphalt`、`polaris`、`sheng`、`aurora`、`clover`、`marble`、`t880` 和 `dodge`；`modules` 中放自己的
+`device` 支持 `asphalt`、`polaris`、`sheng`、`aurora`、`clover`、`marble`、`t880`、`dodge` 和 `unicorn`；`modules` 中放自己的
 NixOS 模块。可选参数 `specialArgs`、`overlays`、`nixpkgsConfig` 分别传递模块参数、
 包覆盖和 Nixpkgs 配置。
 
@@ -151,7 +151,7 @@ recovery 使用 [ACM/NCM 和 OpenSSH](recovery.zh.md)，不启动磁盘中的系
 imports = [ inputs.androidDevices.nixosModules.polaris ];
 ```
 
-其他设备将 `polaris` 替换为 `asphalt`、`sheng`、`aurora`、`clover`、`marble`、`t880` 或 `dodge`。无需额外导入
+其他设备将 `polaris` 替换为 `asphalt`、`sheng`、`aurora`、`clover`、`marble`、`t880`、`dodge` 或 `unicorn`。无需额外导入
 通用模块，也无需设置 `androidDevices.enable = true`。
 桌面策略及逐机身份由使用者提供。
 

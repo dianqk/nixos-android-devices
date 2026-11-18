@@ -13,6 +13,8 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
         nixpkgsConfig.allowUnfreePredicate =
           package:
           builtins.elem (lib.getName package) [
+            "unicorn-firmware"
+            "unicorn-firmware-zstd"
             "aurora-firmware"
             "aurora-firmware-zstd"
             "marble-firmware"
@@ -32,7 +34,7 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
     c = sheng.config;
   in
   {
-    storage = lib.genAttrs [ "asphalt" "sheng" "clover" "aurora" "marble" ] (
+    storage = lib.genAttrs [ "asphalt" "sheng" "clover" "aurora" "marble" "unicorn" ] (
       device:
       let
         s = make device [

@@ -26,8 +26,31 @@ let
         name
         initrd
         cmdline
-        dtbs
         ;
+      dtbs = map (
+        dtb:
+        if android.dtbProperties == { } then
+          dtb
+        else
+          androidPackages.packaging.runCommand "${cfg.deviceName}-loader.dtb"
+            {
+              nativeBuildInputs = [ androidPackages.buildPackages.dtc ];
+            }
+            (
+              ''
+                cp ${lib.escapeShellArg dtb} "$out"
+                chmod u+w "$out"
+              ''
+              + lib.concatStringsSep "\n" (
+                lib.mapAttrsToList (
+                  property: values:
+                  "fdtput -t x \"$out\" / ${lib.escapeShellArg property} ${
+                    lib.concatMapStringsSep " " lib.toHexString values
+                  }"
+                ) android.dtbProperties
+              )
+            )
+      ) dtbs;
       kernel = "${kernel}/${android.kernelFile}";
       inherit (android)
         headerVersion

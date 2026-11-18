@@ -1,0 +1,3598 @@
+Subject: [PATCH] media: unicorn: isolate sensor binding and add IMX707 C-PHY
+
+Identify OV32B40 with the OEM word read and log CCI message failures.
+Create media links and subdev nodes as each sensor binds, with scoped
+rollback and unbind cleanup. Keep chip identification mandatory at probe
+and every capture restart.
+
+Backport the generic C-PHY API and Qualcomm PHY plumbing from George
+Neacsu's v3 series (20261016-x1e-cphy-rfc-v3, patches 1-6). Adapt CAMSS
+to the pinned 7.3-rc6 interfaces and the SM8450 CSID 680 receiver.
+
+Use a distinct Unicorn PHY compatible with the OEM v2.1.3-xiaomi-l2s
+trio initialization, settle register count 30 and ordered CDR tables, not X1E's
+v2.1.2 C-PHY data. The stock IMX707 4096x3072 RAW10 mode and controls
+use three trios, with auxiliary DT0x30 filtered by CSID's DT0x2b match.
+
+Register provenance and hardware acceptance status are documented in
+docs/unicorn/camera.md in nixos-android-devices. This patch does not
+claim that the pre-existing OV32B40 NACK has been resolved on hardware.
+
+diff --git a/Documentation/devicetree/bindings/phy/qcom,x1e80100-csi2-phy.yaml b/Documentation/devicetree/bindings/phy/qcom,x1e80100-csi2-phy.yaml
+index 7c9015a..c7c4eae 100644
+--- a/Documentation/devicetree/bindings/phy/qcom,x1e80100-csi2-phy.yaml
++++ b/Documentation/devicetree/bindings/phy/qcom,x1e80100-csi2-phy.yaml
+@@ -17,6 +17,7 @@ description:
+ properties:
+   compatible:
+     oneOf:
++      - const: xiaomi,unicorn-csi2-phy
+       - const: qcom,x1e80100-csi2-phy
+       - items:
+           - enum:
+@@ -106,6 +107,22 @@ properties:
+               - data-lanes
+               - remote-endpoint
+ 
++            allOf:
++              - if:
++                  properties:
++                    bus-type:
++                      const: 1
++                  required:
++                    - bus-type
++                then:
++                  properties:
++                    data-lanes:
++                      maxItems: 3
++                      items:
++                        maximum: 3
++                    clock-lanes: false
++                    lane-polarities: false
++
+         allOf:
+           - if:
+               required:
+diff --git a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-camera.dtsi b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-camera.dtsi
+index 83f5659..91a035b 100644
+--- a/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-camera.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8475-xiaomi-unicorn-camera.dtsi
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: (GPL-2.0-only OR BSD-3-Clause)
+-/* Stock Unicorn routing and supplies; main IMX707 requires C-PHY support. */
++#include <dt-bindings/media/video-interfaces.h>
++/* Stock Unicorn routing, supplies and 19.2 MHz sensor modules. */
+ &cci0 {
+ 	status = "okay";
+ };
+@@ -51,9 +52,13 @@ pm8008j_l5: ldo5 {
+ 			};
+ 			pm8008j_l6: ldo6 {
+ 				regulator-name = "pm8008j_l6";
++				regulator-min-microvolt = <3104000>;
++				regulator-max-microvolt = <3104000>;
+ 			};
+ 			pm8008j_l7: ldo7 {
+ 				regulator-name = "pm8008j_l7";
++				regulator-min-microvolt = <3104000>;
++				regulator-max-microvolt = <3104000>;
+ 			};
+ 		};
+ 	};
+@@ -291,3 +296,102 @@ camera_front_reset: camera-front-reset-state {
+ 	};
+ 
+ };
++
++/ {
++	camera_main_avdd: regulator-camera-main-avdd {
++		compatible = "regulator-fixed";
++		regulator-name = "camera_main_avdd";
++		regulator-min-microvolt = <1860000>;
++		regulator-max-microvolt = <1860000>;
++		gpio = <&tlmm 70 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <100>;
++	};
++
++	camera_main_dvdd: regulator-camera-main-dvdd {
++		compatible = "regulator-fixed";
++		regulator-name = "camera_main_dvdd";
++		regulator-min-microvolt = <1250000>;
++		regulator-max-microvolt = <1250000>;
++		vin-supply = <&pm8350_s12>;
++		gpio = <&tlmm 2 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <100>;
++	};
++};
++
++&cci0_i2c1 {
++	status = "okay";
++	clock-frequency = <400000>;
++
++	camera_main: camera@10 {
++		compatible = "xiaomi,unicorn-imx707";
++		reg = <0x10>;
++		clocks = <&camcc CAM_CC_MCLK2_CLK>;
++		clock-frequency = <19200000>;
++		assigned-clocks = <&camcc CAM_CC_MCLK2_CLK>;
++		assigned-clock-rates = <19200000>;
++		pinctrl-names = "default", "sleep";
++		pinctrl-0 = <&cam2_default &camera_main_reset>;
++		pinctrl-1 = <&cam2_sleep &camera_main_reset>;
++		reset-gpios = <&tlmm 126 GPIO_ACTIVE_LOW>;
++		avdd-supply = <&camera_main_avdd>;
++		dvdd-supply = <&camera_main_dvdd>;
++		iovdd-supply = <&pm8008j_l5>;
++		afvdd-supply = <&pm8008j_l7>;
++		auxvdd-supply = <&pm8008j_l6>;
++		rotation = <90>;
++		orientation = <1>;
++
++		port {
++			camera_main_ep: endpoint {
++				remote-endpoint = <&csiphy2_in_ep>;
++				bus-type = <MEDIA_BUS_TYPE_CSI2_CPHY>;
++				data-lanes = <1 2 3>;
++				link-frequencies = /bits/ 64 <857600000>;
++			};
++		};
++	};
++};
++
++&csiphy2 {
++	compatible = "xiaomi,unicorn-csi2-phy";
++	status = "okay";
++};
++
++&csiphy2_in_ep {
++	remote-endpoint = <&camera_main_ep>;
++	bus-type = <MEDIA_BUS_TYPE_CSI2_CPHY>;
++	data-lanes = <1 2 3>;
++};
++
++&camss_csiphy2_inep {
++	bus-type = <MEDIA_BUS_TYPE_CSI2_CPHY>;
++	data-lanes = <1 2 3>;
++};
++
++&tlmm {
++	camera_main_reset: camera-main-reset-state {
++		pins = "gpio126";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++};
++
++/* Stock Unicorn MCLK signal drive strength; SoC defaults are 2 mA. */
++&cam2_default {
++	drive-strength = <4>;
++};
++
++&cam2_sleep {
++	drive-strength = <4>;
++};
++
++&cam5_default {
++	drive-strength = <4>;
++};
++
++&cam5_sleep {
++	drive-strength = <4>;
++};
+diff --git a/drivers/i2c/busses/i2c-qcom-cci.c b/drivers/i2c/busses/i2c-qcom-cci.c
+index 873e901..51f1175 100644
+--- a/drivers/i2c/busses/i2c-qcom-cci.c
++++ b/drivers/i2c/busses/i2c-qcom-cci.c
+@@ -438,8 +438,14 @@ static int cci_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
+ 					    msgs[i].addr, msgs[i].buf,
+ 					    msgs[i].len);
+ 
+-		if (ret < 0)
++		if (ret < 0) {
++			dev_err_ratelimited(cci->dev,
++				"master %u addr 0x%02x msg %d/%d %s len %u failed: %d\n",
++				cci_master->master, msgs[i].addr, i + 1, num,
++				msgs[i].flags & I2C_M_RD ? "read-data" : "write/address",
++				msgs[i].len, ret);
+ 			break;
++		}
+ 	}
+ 
+ 	if (!ret)
+diff --git a/drivers/media/i2c/Kconfig b/drivers/media/i2c/Kconfig
+index d3d658f..488a226 100644
+--- a/drivers/media/i2c/Kconfig
++++ b/drivers/media/i2c/Kconfig
+@@ -6,7 +6,7 @@
+ if VIDEO_DEV
+ 
+ config VIDEO_UNICORN_SENSORS
+-	tristate "Xiaomi 12S Pro S5KJN1 and OV32B40 camera modules"
++	tristate "Xiaomi 12S Pro S5KJN1, OV32B40 and IMX707 camera modules"
+ 	depends on I2C && VIDEO_DEV
+ 	select V4L2_CCI_I2C
+ 	select V4L2_FWNODE
+@@ -14,7 +14,7 @@ config VIDEO_UNICORN_SENSORS
+ 	help
+ 	  Native RAW10 capture for the Unicorn ultra-wide, telephoto and
+ 	  front camera modules using their stock 19.2 MHz mode settings.
+-	  The IMX707 main camera uses C-PHY and is not supported here.
++	  The IMX707 main camera uses the board-specific three-trio C-PHY receiver.
+ 
+ comment "IR I2C driver auto-selected by 'Autoselect ancillary drivers'"
+ 	depends on MEDIA_SUBDRV_AUTOSELECT && I2C && RC_CORE
+diff --git a/drivers/media/i2c/unicorn-imx707-regs.h b/drivers/media/i2c/unicorn-imx707-regs.h
+new file mode 100644
+index 0000000..a30f507
+--- /dev/null
++++ b/drivers/media/i2c/unicorn-imx707-regs.h
+@@ -0,0 +1,1135 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Generated by tools/unicorn-camera-tables.py; stock mode index 1.
++ * Source SHA-256: 4ab05c4d4d24856ed48e7f61845d1d025ac2ba3d8b5b7400ae2eb1346dee40fc
++ */
++
++static const struct unicorn_reg imx707_init[] = {
++	{ CCI_REG8(0x0136), 0x0013, 0 },
++	{ CCI_REG8(0x0137), 0x0033, 0 },
++	{ CCI_REG8(0x33f0), 0x0005, 0 },
++	{ CCI_REG8(0x33f1), 0x0003, 0 },
++	{ CCI_REG8(0x0111), 0x0003, 0 },
++	{ CCI_REG8(0x0101), 0x0003, 0 },
++	{ CCI_REG8(0x0106), 0x0001, 0 },
++	{ CCI_REG8(0x0350), 0x0001, 0 },
++	{ CCI_REG8(0x3a3e), 0x0001, 0 },
++	{ CCI_REG8(0x9dee), 0x00ca, 0 },
++	{ CCI_REG8(0x9e37), 0x00ca, 0 },
++	{ CCI_REG8(0x9dfc), 0x00cc, 0 },
++	{ CCI_REG8(0x9dfd), 0x00ca, 0 },
++	{ CCI_REG8(0x9e45), 0x00cc, 0 },
++	{ CCI_REG8(0x9e46), 0x00ca, 0 },
++	{ CCI_REG8(0x9e04), 0x00c9, 0 },
++	{ CCI_REG8(0x9e4d), 0x00c9, 0 },
++	{ CCI_REG8(0x9d78), 0x0051, 0 },
++	{ CCI_REG8(0x9d7a), 0x00ca, 0 },
++	{ CCI_REG8(0x9d7c), 0x0051, 0 },
++	{ CCI_REG8(0x9d7f), 0x0051, 0 },
++	{ CCI_REG8(0x9d81), 0x00ca, 0 },
++	{ CCI_REG8(0x9d83), 0x0051, 0 },
++	{ CCI_REG8(0xb161), 0x0006, 0 },
++	{ CCI_REG8(0xb162), 0x0006, 0 },
++	{ CCI_REG8(0xb163), 0x0006, 0 },
++	{ CCI_REG8(0xb164), 0x0006, 0 },
++	{ CCI_REG8(0xb165), 0x0006, 0 },
++	{ CCI_REG8(0xb166), 0x0006, 0 },
++	{ CCI_REG8(0xb167), 0x0006, 0 },
++	{ CCI_REG8(0xb168), 0x0006, 0 },
++	{ CCI_REG8(0xb169), 0x0009, 0 },
++	{ CCI_REG8(0xb16a), 0x0009, 0 },
++	{ CCI_REG8(0xb16b), 0x0009, 0 },
++	{ CCI_REG8(0xb16c), 0x0009, 0 },
++	{ CCI_REG8(0xb16d), 0x0009, 0 },
++	{ CCI_REG8(0xb16e), 0x0009, 0 },
++	{ CCI_REG8(0xb16f), 0x0009, 0 },
++	{ CCI_REG8(0xb170), 0x0009, 0 },
++	{ CCI_REG8(0xc2f4), 0x0032, 0 },
++	{ CCI_REG8(0xc305), 0x0032, 0 },
++	{ CCI_REG8(0xb478), 0x0008, 0 },
++	{ CCI_REG8(0xb30e), 0x0000, 0 },
++	{ CCI_REG8(0xb332), 0x0000, 0 },
++	{ CCI_REG8(0xa561), 0x00f4, 0 },
++	{ CCI_REG8(0xa58c), 0x00f4, 0 },
++	{ CCI_REG8(0x9be5), 0x0053, 0 },
++	{ CCI_REG8(0x9be4), 0x0000, 0 },
++	{ CCI_REG8(0x9bed), 0x003c, 0 },
++	{ CCI_REG8(0x9bec), 0x0000, 0 },
++	{ CCI_REG8(0xb800), 0x0010, 0 },
++	{ CCI_REG8(0xb801), 0x000c, 0 },
++	{ CCI_REG8(0xb802), 0x0009, 0 },
++	{ CCI_REG8(0xb804), 0x0009, 0 },
++	{ CCI_REG8(0xb806), 0x0009, 0 },
++	{ CCI_REG8(0xb807), 0x0009, 0 },
++	{ CCI_REG8(0xb80c), 0x001c, 0 },
++	{ CCI_REG8(0xb80d), 0x0010, 0 },
++	{ CCI_REG8(0xb80e), 0x000a, 0 },
++	{ CCI_REG8(0xb810), 0x000a, 0 },
++	{ CCI_REG8(0xb812), 0x000a, 0 },
++	{ CCI_REG8(0xb813), 0x000a, 0 },
++	{ CCI_REG8(0xb819), 0x0016, 0 },
++	{ CCI_REG8(0xb81a), 0x000c, 0 },
++	{ CCI_REG8(0xb81c), 0x000c, 0 },
++	{ CCI_REG8(0xb81e), 0x000c, 0 },
++	{ CCI_REG8(0xb81f), 0x000c, 0 },
++	{ CCI_REG8(0xb901), 0x00b4, 0 },
++	{ CCI_REG8(0xb900), 0x0000, 0 },
++	{ CCI_REG8(0xb923), 0x00f3, 0 },
++	{ CCI_REG8(0xb922), 0x0000, 0 },
++	{ CCI_REG8(0xb945), 0x00e6, 0 },
++	{ CCI_REG8(0xb944), 0x0000, 0 },
++	{ CCI_REG8(0xb967), 0x00b4, 0 },
++	{ CCI_REG8(0xb966), 0x0000, 0 },
++	{ CCI_REG8(0xb905), 0x00e1, 0 },
++	{ CCI_REG8(0xb904), 0x0000, 0 },
++	{ CCI_REG8(0xb927), 0x00e3, 0 },
++	{ CCI_REG8(0xb926), 0x0000, 0 },
++	{ CCI_REG8(0xb949), 0x00eb, 0 },
++	{ CCI_REG8(0xb948), 0x0000, 0 },
++	{ CCI_REG8(0xb96b), 0x00eb, 0 },
++	{ CCI_REG8(0xb96a), 0x0000, 0 },
++	{ CCI_REG8(0xb90b), 0x0076, 0 },
++	{ CCI_REG8(0xb90a), 0x0000, 0 },
++	{ CCI_REG8(0xb92d), 0x00b0, 0 },
++	{ CCI_REG8(0xb92c), 0x0000, 0 },
++	{ CCI_REG8(0xb94f), 0x00ea, 0 },
++	{ CCI_REG8(0xb94e), 0x0000, 0 },
++	{ CCI_REG8(0xb971), 0x00eb, 0 },
++	{ CCI_REG8(0xb970), 0x0000, 0 },
++	{ CCI_REG8(0xb98b), 0x00ee, 0 },
++	{ CCI_REG8(0xb98a), 0x0000, 0 },
++	{ CCI_REG8(0xb99b), 0x00d9, 0 },
++	{ CCI_REG8(0xb99a), 0x0000, 0 },
++	{ CCI_REG8(0xb907), 0x008c, 0 },
++	{ CCI_REG8(0xb906), 0x0000, 0 },
++	{ CCI_REG8(0xb929), 0x00c6, 0 },
++	{ CCI_REG8(0xb928), 0x0000, 0 },
++	{ CCI_REG8(0xb94b), 0x0006, 0 },
++	{ CCI_REG8(0xb94a), 0x0001, 0 },
++	{ CCI_REG8(0xb96d), 0x0004, 0 },
++	{ CCI_REG8(0xb96c), 0x0001, 0 },
++	{ CCI_REG8(0xb989), 0x0009, 0 },
++	{ CCI_REG8(0xb988), 0x0001, 0 },
++	{ CCI_REG8(0xb999), 0x00ef, 0 },
++	{ CCI_REG8(0xb998), 0x0000, 0 },
++	{ CCI_REG8(0xb913), 0x0049, 0 },
++	{ CCI_REG8(0xb912), 0x0000, 0 },
++	{ CCI_REG8(0xb935), 0x0066, 0 },
++	{ CCI_REG8(0xb934), 0x0000, 0 },
++	{ CCI_REG8(0xb957), 0x0097, 0 },
++	{ CCI_REG8(0xb956), 0x0000, 0 },
++	{ CCI_REG8(0xb979), 0x00a0, 0 },
++	{ CCI_REG8(0xb978), 0x0000, 0 },
++	{ CCI_REG8(0xb98f), 0x009e, 0 },
++	{ CCI_REG8(0xb98e), 0x0000, 0 },
++	{ CCI_REG8(0xb99f), 0x00aa, 0 },
++	{ CCI_REG8(0xb99e), 0x0000, 0 },
++	{ CCI_REG8(0xb90f), 0x0082, 0 },
++	{ CCI_REG8(0xb90e), 0x0000, 0 },
++	{ CCI_REG8(0xb931), 0x0098, 0 },
++	{ CCI_REG8(0xb930), 0x0000, 0 },
++	{ CCI_REG8(0xb953), 0x00bc, 0 },
++	{ CCI_REG8(0xb952), 0x0000, 0 },
++	{ CCI_REG8(0xb975), 0x00cf, 0 },
++	{ CCI_REG8(0xb974), 0x0000, 0 },
++	{ CCI_REG8(0xb98d), 0x00d3, 0 },
++	{ CCI_REG8(0xb98c), 0x0000, 0 },
++	{ CCI_REG8(0xb99d), 0x00be, 0 },
++	{ CCI_REG8(0xb99c), 0x0000, 0 },
++	{ CCI_REG8(0xb9a9), 0x0000, 0 },
++	{ CCI_REG8(0xb9a8), 0x0000, 0 },
++	{ CCI_REG8(0xb9ad), 0x0052, 0 },
++	{ CCI_REG8(0xb9ac), 0x0000, 0 },
++	{ CCI_REG8(0xb91b), 0x007d, 0 },
++	{ CCI_REG8(0xb91a), 0x0000, 0 },
++	{ CCI_REG8(0xb93d), 0x00b9, 0 },
++	{ CCI_REG8(0xb93c), 0x0000, 0 },
++	{ CCI_REG8(0xb95f), 0x00f2, 0 },
++	{ CCI_REG8(0xb95e), 0x0000, 0 },
++	{ CCI_REG8(0xb981), 0x00fa, 0 },
++	{ CCI_REG8(0xb980), 0x0000, 0 },
++	{ CCI_REG8(0xb995), 0x00fd, 0 },
++	{ CCI_REG8(0xb994), 0x0000, 0 },
++	{ CCI_REG8(0xb9a5), 0x00ea, 0 },
++	{ CCI_REG8(0xb9a4), 0x0000, 0 },
++	{ CCI_REG8(0xb91f), 0x0084, 0 },
++	{ CCI_REG8(0xb91e), 0x0000, 0 },
++	{ CCI_REG8(0xb941), 0x0097, 0 },
++	{ CCI_REG8(0xb940), 0x0000, 0 },
++	{ CCI_REG8(0xb963), 0x00ce, 0 },
++	{ CCI_REG8(0xb962), 0x0000, 0 },
++	{ CCI_REG8(0xb985), 0x00c8, 0 },
++	{ CCI_REG8(0xb984), 0x0000, 0 },
++	{ CCI_REG8(0xb997), 0x00be, 0 },
++	{ CCI_REG8(0xb996), 0x0000, 0 },
++	{ CCI_REG8(0xb9a7), 0x00ba, 0 },
++	{ CCI_REG8(0xb9a6), 0x0000, 0 },
++	{ CCI_REG8(0xb9b1), 0x00f6, 0 },
++	{ CCI_REG8(0xb9b0), 0x0000, 0 },
++	{ CCI_REG8(0xb9d3), 0x0005, 0 },
++	{ CCI_REG8(0xb9d2), 0x0001, 0 },
++	{ CCI_REG8(0xb9f5), 0x00bf, 0 },
++	{ CCI_REG8(0xb9f4), 0x0000, 0 },
++	{ CCI_REG8(0xba17), 0x0082, 0 },
++	{ CCI_REG8(0xba16), 0x0001, 0 },
++	{ CCI_REG8(0xb9b5), 0x0082, 0 },
++	{ CCI_REG8(0xb9b4), 0x0000, 0 },
++	{ CCI_REG8(0xb9d7), 0x0084, 0 },
++	{ CCI_REG8(0xb9d6), 0x0000, 0 },
++	{ CCI_REG8(0xb9f9), 0x00f8, 0 },
++	{ CCI_REG8(0xb9f8), 0x0000, 0 },
++	{ CCI_REG8(0xba1b), 0x007e, 0 },
++	{ CCI_REG8(0xba1a), 0x0001, 0 },
++	{ CCI_REG8(0xb9bb), 0x00ad, 0 },
++	{ CCI_REG8(0xb9ba), 0x0000, 0 },
++	{ CCI_REG8(0xb9dd), 0x00b6, 0 },
++	{ CCI_REG8(0xb9dc), 0x0000, 0 },
++	{ CCI_REG8(0xb9ff), 0x00fa, 0 },
++	{ CCI_REG8(0xb9fe), 0x0000, 0 },
++	{ CCI_REG8(0xba21), 0x00e6, 0 },
++	{ CCI_REG8(0xba20), 0x0000, 0 },
++	{ CCI_REG8(0xba3b), 0x0018, 0 },
++	{ CCI_REG8(0xba3a), 0x0001, 0 },
++	{ CCI_REG8(0xba4b), 0x007d, 0 },
++	{ CCI_REG8(0xba4a), 0x0001, 0 },
++	{ CCI_REG8(0xb9b7), 0x006f, 0 },
++	{ CCI_REG8(0xb9b6), 0x0000, 0 },
++	{ CCI_REG8(0xb9d9), 0x0006, 0 },
++	{ CCI_REG8(0xb9d8), 0x0001, 0 },
++	{ CCI_REG8(0xb9fb), 0x0064, 0 },
++	{ CCI_REG8(0xb9fa), 0x0001, 0 },
++	{ CCI_REG8(0xba1d), 0x005b, 0 },
++	{ CCI_REG8(0xba1c), 0x0001, 0 },
++	{ CCI_REG8(0xba39), 0x0022, 0 },
++	{ CCI_REG8(0xba38), 0x0001, 0 },
++	{ CCI_REG8(0xba49), 0x004c, 0 },
++	{ CCI_REG8(0xba48), 0x0001, 0 },
++	{ CCI_REG8(0xb9c3), 0x0054, 0 },
++	{ CCI_REG8(0xb9c2), 0x0000, 0 },
++	{ CCI_REG8(0xb9e5), 0x008c, 0 },
++	{ CCI_REG8(0xb9e4), 0x0000, 0 },
++	{ CCI_REG8(0xba07), 0x00ba, 0 },
++	{ CCI_REG8(0xba06), 0x0000, 0 },
++	{ CCI_REG8(0xba29), 0x00a4, 0 },
++	{ CCI_REG8(0xba28), 0x0000, 0 },
++	{ CCI_REG8(0xba3f), 0x00bc, 0 },
++	{ CCI_REG8(0xba3e), 0x0000, 0 },
++	{ CCI_REG8(0xba4f), 0x00cc, 0 },
++	{ CCI_REG8(0xba4e), 0x0000, 0 },
++	{ CCI_REG8(0xb9bf), 0x00c5, 0 },
++	{ CCI_REG8(0xb9be), 0x0000, 0 },
++	{ CCI_REG8(0xb9e1), 0x0078, 0 },
++	{ CCI_REG8(0xb9e0), 0x0000, 0 },
++	{ CCI_REG8(0xba03), 0x00d0, 0 },
++	{ CCI_REG8(0xba02), 0x0000, 0 },
++	{ CCI_REG8(0xba25), 0x0083, 0 },
++	{ CCI_REG8(0xba24), 0x0000, 0 },
++	{ CCI_REG8(0xba3d), 0x0076, 0 },
++	{ CCI_REG8(0xba3c), 0x0000, 0 },
++	{ CCI_REG8(0xba4d), 0x0083, 0 },
++	{ CCI_REG8(0xba4c), 0x0000, 0 },
++	{ CCI_REG8(0xba59), 0x009a, 0 },
++	{ CCI_REG8(0xba58), 0x0000, 0 },
++	{ CCI_REG8(0xba5d), 0x00f4, 0 },
++	{ CCI_REG8(0xba5c), 0x0000, 0 },
++	{ CCI_REG8(0xb9cb), 0x0022, 0 },
++	{ CCI_REG8(0xb9ca), 0x0000, 0 },
++	{ CCI_REG8(0xb9ed), 0x00bc, 0 },
++	{ CCI_REG8(0xb9ec), 0x0000, 0 },
++	{ CCI_REG8(0xba0f), 0x0048, 0 },
++	{ CCI_REG8(0xba0e), 0x0001, 0 },
++	{ CCI_REG8(0xba31), 0x0053, 0 },
++	{ CCI_REG8(0xba30), 0x0001, 0 },
++	{ CCI_REG8(0xba45), 0x004c, 0 },
++	{ CCI_REG8(0xba44), 0x0001, 0 },
++	{ CCI_REG8(0xba55), 0x0097, 0 },
++	{ CCI_REG8(0xba54), 0x0001, 0 },
++	{ CCI_REG8(0xb9cf), 0x0098, 0 },
++	{ CCI_REG8(0xb9ce), 0x0000, 0 },
++	{ CCI_REG8(0xb9f1), 0x0082, 0 },
++	{ CCI_REG8(0xb9f0), 0x0000, 0 },
++	{ CCI_REG8(0xba13), 0x00b9, 0 },
++	{ CCI_REG8(0xba12), 0x0000, 0 },
++	{ CCI_REG8(0xba35), 0x00ed, 0 },
++	{ CCI_REG8(0xba34), 0x0000, 0 },
++	{ CCI_REG8(0xba47), 0x00fa, 0 },
++	{ CCI_REG8(0xba46), 0x0000, 0 },
++	{ CCI_REG8(0xba57), 0x00eb, 0 },
++	{ CCI_REG8(0xba56), 0x0000, 0 },
++	{ CCI_REG8(0xbb6d), 0x0000, 0 },
++	{ CCI_REG8(0xbb6b), 0x000f, 0 },
++	{ CCI_REG8(0xbb71), 0x0000, 0 },
++	{ CCI_REG8(0xbb6f), 0x000f, 0 },
++	{ CCI_REG8(0xbbbe), 0x000f, 0 },
++	{ CCI_REG8(0xbb75), 0x0000, 0 },
++	{ CCI_REG8(0xb85c), 0x0009, 0 },
++	{ CCI_REG8(0xb868), 0x0009, 0 },
++	{ CCI_REG8(0xb871), 0x0009, 0 },
++	{ CCI_REG8(0xb877), 0x0009, 0 },
++	{ CCI_REG8(0xbd90), 0x00b9, 0 },
++	{ CCI_REG8(0xbd91), 0x0096, 0 },
++	{ CCI_REG8(0xbd92), 0x0096, 0 },
++	{ CCI_REG8(0xbd93), 0x00b9, 0 },
++	{ CCI_REG8(0xbd95), 0x00b9, 0 },
++	{ CCI_REG8(0xbd97), 0x006e, 0 },
++	{ CCI_REG8(0xbd99), 0x006e, 0 },
++	{ CCI_REG8(0xbd9d), 0x00be, 0 },
++	{ CCI_REG8(0xbd9f), 0x0069, 0 },
++	{ CCI_REG8(0xbda1), 0x00b4, 0 },
++	{ CCI_REG8(0xbda2), 0x00af, 0 },
++	{ CCI_REG8(0xbda3), 0x00af, 0 },
++	{ CCI_REG8(0xbda4), 0x00c3, 0 },
++	{ CCI_REG8(0xbda6), 0x00c3, 0 },
++	{ CCI_REG8(0xbda8), 0x0069, 0 },
++	{ CCI_REG8(0xbdaa), 0x005a, 0 },
++	{ CCI_REG8(0xbdae), 0x00c3, 0 },
++	{ CCI_REG8(0xbdb0), 0x005a, 0 },
++	{ CCI_REG8(0xb385), 0x000f, 0 },
++	{ CCI_REG8(0xb396), 0x000f, 0 },
++	{ CCI_REG8(0xc52f), 0x000c, 0 },
++	{ CCI_REG8(0xc540), 0x000c, 0 },
++	{ CCI_REG8(0xc551), 0x000c, 0 },
++	{ CCI_REG8(0xc562), 0x000c, 0 },
++	{ CCI_REG8(0x9ae1), 0x0008, 0 },
++	{ CCI_REG8(0x9ae0), 0x000d, 0 },
++	{ CCI_REG8(0xb383), 0x000f, 0 },
++	{ CCI_REG8(0xb394), 0x000f, 0 },
++	{ CCI_REG8(0xc52d), 0x000b, 0 },
++	{ CCI_REG8(0xc53e), 0x000b, 0 },
++	{ CCI_REG8(0xc54f), 0x000b, 0 },
++	{ CCI_REG8(0xc560), 0x000b, 0 },
++	{ CCI_REG8(0x9abd), 0x0065, 0 },
++	{ CCI_REG8(0x9abc), 0x0006, 0 },
++	{ CCI_REG8(0xb368), 0x0001, 0 },
++	{ CCI_REG8(0xb37a), 0x0001, 0 },
++	{ CCI_REG8(0xb38d), 0x000f, 0 },
++	{ CCI_REG8(0xb39e), 0x000f, 0 },
++	{ CCI_REG8(0x9a13), 0x0069, 0 },
++	{ CCI_REG8(0x9a12), 0x0001, 0 },
++	{ CCI_REG8(0x9a5b), 0x0069, 0 },
++	{ CCI_REG8(0x9a5a), 0x0001, 0 },
++	{ CCI_REG8(0x9a9b), 0x0069, 0 },
++	{ CCI_REG8(0x9a9a), 0x0001, 0 },
++	{ CCI_REG8(0x9abf), 0x0069, 0 },
++	{ CCI_REG8(0x9abe), 0x0001, 0 },
++	{ CCI_REG8(0x9aff), 0x0069, 0 },
++	{ CCI_REG8(0x9afe), 0x0001, 0 },
++	{ CCI_REG8(0x9b23), 0x0069, 0 },
++	{ CCI_REG8(0x9b22), 0x0001, 0 },
++	{ CCI_REG8(0x9b73), 0x0069, 0 },
++	{ CCI_REG8(0x9b72), 0x0001, 0 },
++	{ CCI_REG8(0x9bb3), 0x0069, 0 },
++	{ CCI_REG8(0x9bb2), 0x0001, 0 },
++	{ CCI_REG8(0x9bf3), 0x0069, 0 },
++	{ CCI_REG8(0x9bf2), 0x0001, 0 },
++	{ CCI_REG8(0x9c33), 0x0069, 0 },
++	{ CCI_REG8(0x9c32), 0x0001, 0 },
++	{ CCI_REG8(0x9a27), 0x00df, 0 },
++	{ CCI_REG8(0x9a26), 0x0000, 0 },
++	{ CCI_REG8(0x9a6f), 0x00df, 0 },
++	{ CCI_REG8(0x9a6e), 0x0000, 0 },
++	{ CCI_REG8(0x9aaf), 0x00df, 0 },
++	{ CCI_REG8(0x9aae), 0x0000, 0 },
++	{ CCI_REG8(0x9ad3), 0x00df, 0 },
++	{ CCI_REG8(0x9ad2), 0x0000, 0 },
++	{ CCI_REG8(0x9b13), 0x00df, 0 },
++	{ CCI_REG8(0x9b12), 0x0000, 0 },
++	{ CCI_REG8(0x9b37), 0x00df, 0 },
++	{ CCI_REG8(0x9b36), 0x0000, 0 },
++	{ CCI_REG8(0x9b87), 0x00df, 0 },
++	{ CCI_REG8(0x9b86), 0x0000, 0 },
++	{ CCI_REG8(0x9bc7), 0x00df, 0 },
++	{ CCI_REG8(0x9bc6), 0x0000, 0 },
++	{ CCI_REG8(0x9c47), 0x00df, 0 },
++	{ CCI_REG8(0x9c46), 0x0000, 0 },
++	{ CCI_REG8(0x9c07), 0x00df, 0 },
++	{ CCI_REG8(0x9c06), 0x0000, 0 },
++	{ CCI_REG8(0x9a35), 0x00c9, 0 },
++	{ CCI_REG8(0x9a34), 0x0006, 0 },
++	{ CCI_REG8(0x9a7d), 0x002b, 0 },
++	{ CCI_REG8(0x9a7c), 0x0009, 0 },
++	{ CCI_REG8(0x9b21), 0x0072, 0 },
++	{ CCI_REG8(0x9b20), 0x0006, 0 },
++	{ CCI_REG8(0x9b45), 0x002b, 0 },
++	{ CCI_REG8(0x9b44), 0x0009, 0 },
++	{ CCI_REG8(0x9b95), 0x0040, 0 },
++	{ CCI_REG8(0x9b94), 0x0009, 0 },
++	{ CCI_REG8(0x9bd5), 0x003f, 0 },
++	{ CCI_REG8(0x9bd4), 0x0009, 0 },
++	{ CCI_REG8(0x9c15), 0x0060, 0 },
++	{ CCI_REG8(0x9c14), 0x000d, 0 },
++	{ CCI_REG8(0x9c55), 0x0031, 0 },
++	{ CCI_REG8(0x9c54), 0x000d, 0 },
++	{ CCI_REG8(0xa6db), 0x00e1, 0 },
++	{ CCI_REG8(0xa6da), 0x0000, 0 },
++	{ CCI_REG8(0xa6dd), 0x00fd, 0 },
++	{ CCI_REG8(0xa6dc), 0x0001, 0 },
++	{ CCI_REG8(0xa6df), 0x00b6, 0 },
++	{ CCI_REG8(0xa6de), 0x0000, 0 },
++	{ CCI_REG8(0xa6e1), 0x00dc, 0 },
++	{ CCI_REG8(0xa6e0), 0x0001, 0 },
++	{ CCI_REG8(0xa6eb), 0x00c7, 0 },
++	{ CCI_REG8(0xa6ea), 0x0000, 0 },
++	{ CCI_REG8(0xa6ed), 0x00c6, 0 },
++	{ CCI_REG8(0xa6ec), 0x0001, 0 },
++	{ CCI_REG8(0xa6ef), 0x00a2, 0 },
++	{ CCI_REG8(0xa6ee), 0x0000, 0 },
++	{ CCI_REG8(0xa6f1), 0x00ac, 0 },
++	{ CCI_REG8(0xa6f0), 0x0001, 0 },
++	{ CCI_REG8(0xa6f3), 0x00cf, 0 },
++	{ CCI_REG8(0xa6f2), 0x0000, 0 },
++	{ CCI_REG8(0xa6f5), 0x00ce, 0 },
++	{ CCI_REG8(0xa6f4), 0x0001, 0 },
++	{ CCI_REG8(0xa6f7), 0x0090, 0 },
++	{ CCI_REG8(0xa6f6), 0x0000, 0 },
++	{ CCI_REG8(0xa6f9), 0x0099, 0 },
++	{ CCI_REG8(0xa6f8), 0x0001, 0 },
++	{ CCI_REG8(0xa6fb), 0x0017, 0 },
++	{ CCI_REG8(0xa6fa), 0x0002, 0 },
++	{ CCI_REG8(0xa6fd), 0x0016, 0 },
++	{ CCI_REG8(0xa6fc), 0x0003, 0 },
++	{ CCI_REG8(0xa6ff), 0x00ea, 0 },
++	{ CCI_REG8(0xa6fe), 0x0001, 0 },
++	{ CCI_REG8(0xa701), 0x00f4, 0 },
++	{ CCI_REG8(0xa700), 0x0002, 0 },
++	{ CCI_REG8(0xa703), 0x00d7, 0 },
++	{ CCI_REG8(0xa702), 0x0000, 0 },
++	{ CCI_REG8(0xa705), 0x00d6, 0 },
++	{ CCI_REG8(0xa704), 0x0001, 0 },
++	{ CCI_REG8(0xa707), 0x0095, 0 },
++	{ CCI_REG8(0xa706), 0x0000, 0 },
++	{ CCI_REG8(0xa709), 0x009e, 0 },
++	{ CCI_REG8(0xa708), 0x0001, 0 },
++	{ CCI_REG8(0xa70b), 0x00d7, 0 },
++	{ CCI_REG8(0xa70a), 0x0000, 0 },
++	{ CCI_REG8(0xa70d), 0x00d6, 0 },
++	{ CCI_REG8(0xa70c), 0x0001, 0 },
++	{ CCI_REG8(0xa70f), 0x00a2, 0 },
++	{ CCI_REG8(0xa70e), 0x0000, 0 },
++	{ CCI_REG8(0xa711), 0x00ac, 0 },
++	{ CCI_REG8(0xa710), 0x0001, 0 },
++	{ CCI_REG8(0xa713), 0x00fd, 0 },
++	{ CCI_REG8(0xa712), 0x0000, 0 },
++	{ CCI_REG8(0xa715), 0x0006, 0 },
++	{ CCI_REG8(0xa714), 0x0002, 0 },
++	{ CCI_REG8(0xa717), 0x0099, 0 },
++	{ CCI_REG8(0xa716), 0x0000, 0 },
++	{ CCI_REG8(0xa719), 0x00ad, 0 },
++	{ CCI_REG8(0xa718), 0x0001, 0 },
++	{ CCI_REG8(0xa71b), 0x0005, 0 },
++	{ CCI_REG8(0xa71a), 0x0001, 0 },
++	{ CCI_REG8(0xa71d), 0x000e, 0 },
++	{ CCI_REG8(0xa71c), 0x0002, 0 },
++	{ CCI_REG8(0xa71f), 0x0098, 0 },
++	{ CCI_REG8(0xa71e), 0x0000, 0 },
++	{ CCI_REG8(0xa721), 0x00ac, 0 },
++	{ CCI_REG8(0xa720), 0x0001, 0 },
++	{ CCI_REG8(0xa723), 0x0005, 0 },
++	{ CCI_REG8(0xa722), 0x0001, 0 },
++	{ CCI_REG8(0xa725), 0x005a, 0 },
++	{ CCI_REG8(0xa724), 0x0002, 0 },
++	{ CCI_REG8(0xa727), 0x005e, 0 },
++	{ CCI_REG8(0xa726), 0x0001, 0 },
++	{ CCI_REG8(0xa729), 0x0003, 0 },
++	{ CCI_REG8(0xa728), 0x0004, 0 },
++	{ CCI_REG8(0xa72b), 0x00eb, 0 },
++	{ CCI_REG8(0xa72a), 0x0000, 0 },
++	{ CCI_REG8(0xa72d), 0x0040, 0 },
++	{ CCI_REG8(0xa72c), 0x0002, 0 },
++	{ CCI_REG8(0xa72f), 0x005e, 0 },
++	{ CCI_REG8(0xa72e), 0x0001, 0 },
++	{ CCI_REG8(0xa731), 0x0003, 0 },
++	{ CCI_REG8(0xa730), 0x0004, 0 },
++	{ CCI_REG8(0x3a29), 0x00b4, 0 },
++	{ CCI_REG8(0x3a28), 0x0000, 0 },
++	{ CCI_REG8(0xba5b), 0x0000, 0 },
++	{ CCI_REG8(0xba5a), 0x0000, 0 },
++	{ CCI_REG8(0xba5f), 0x009b, 0 },
++	{ CCI_REG8(0xba5e), 0x0000, 0 },
++	{ CCI_REG8(0xbb15), 0x001f, 0 },
++	{ CCI_REG8(0xbb26), 0x001f, 0 },
++	{ CCI_REG8(0xbb37), 0x001f, 0 },
++	{ CCI_REG8(0xbb48), 0x001f, 0 },
++	{ CCI_REG8(0xbb55), 0x001f, 0 },
++	{ CCI_REG8(0xbb5d), 0x001f, 0 },
++	{ CCI_REG8(0xbb7e), 0x0000, 0 },
++	{ CCI_REG8(0xbb8f), 0x0000, 0 },
++	{ CCI_REG8(0xbba0), 0x0000, 0 },
++	{ CCI_REG8(0xbbad), 0x0000, 0 },
++	{ CCI_REG8(0xbbb5), 0x000f, 0 },
++	{ CCI_REG8(0xbb19), 0x001f, 0 },
++	{ CCI_REG8(0xbb2a), 0x0000, 0 },
++	{ CCI_REG8(0xbb3b), 0x0000, 0 },
++	{ CCI_REG8(0xbb4c), 0x0000, 0 },
++	{ CCI_REG8(0xbb57), 0x0005, 0 },
++	{ CCI_REG8(0xbb5f), 0x001f, 0 },
++	{ CCI_REG8(0xbb82), 0x0000, 0 },
++	{ CCI_REG8(0xbb93), 0x0002, 0 },
++	{ CCI_REG8(0xbba4), 0x0003, 0 },
++	{ CCI_REG8(0xbbaf), 0x0008, 0 },
++	{ CCI_REG8(0xbbb7), 0x000f, 0 },
++	{ CCI_REG8(0xbb12), 0x0006, 0 },
++	{ CCI_REG8(0xbb23), 0x0007, 0 },
++	{ CCI_REG8(0xbb34), 0x001f, 0 },
++	{ CCI_REG8(0xbb45), 0x001f, 0 },
++	{ CCI_REG8(0xbb6a), 0x0000, 0 },
++	{ CCI_REG8(0xbb7b), 0x0000, 0 },
++	{ CCI_REG8(0xbb8c), 0x0000, 0 },
++	{ CCI_REG8(0xbb9d), 0x000f, 0 },
++	{ CCI_REG8(0xbb13), 0x001f, 0 },
++	{ CCI_REG8(0xbb24), 0x001f, 0 },
++	{ CCI_REG8(0xbb35), 0x001f, 0 },
++	{ CCI_REG8(0xbb46), 0x001f, 0 },
++	{ CCI_REG8(0xbb54), 0x001f, 0 },
++	{ CCI_REG8(0xbb5c), 0x001f, 0 },
++	{ CCI_REG8(0xbb7c), 0x0000, 0 },
++	{ CCI_REG8(0xbb8d), 0x0000, 0 },
++	{ CCI_REG8(0xbb9e), 0x0000, 0 },
++	{ CCI_REG8(0xbbac), 0x0000, 0 },
++	{ CCI_REG8(0xbbb4), 0x000f, 0 },
++	{ CCI_REG8(0xbb17), 0x001f, 0 },
++	{ CCI_REG8(0xbb28), 0x001f, 0 },
++	{ CCI_REG8(0xbb39), 0x001f, 0 },
++	{ CCI_REG8(0xbb4a), 0x001f, 0 },
++	{ CCI_REG8(0xbb56), 0x001f, 0 },
++	{ CCI_REG8(0xbb5e), 0x001f, 0 },
++	{ CCI_REG8(0xbb80), 0x0000, 0 },
++	{ CCI_REG8(0xbb91), 0x0000, 0 },
++	{ CCI_REG8(0xbba2), 0x0000, 0 },
++	{ CCI_REG8(0xbbae), 0x0000, 0 },
++	{ CCI_REG8(0xbbb6), 0x000f, 0 },
++	{ CCI_REG8(0xbb1d), 0x001f, 0 },
++	{ CCI_REG8(0xbb2e), 0x001f, 0 },
++	{ CCI_REG8(0xbb3f), 0x001f, 0 },
++	{ CCI_REG8(0xbb50), 0x001f, 0 },
++	{ CCI_REG8(0xbb5a), 0x001f, 0 },
++	{ CCI_REG8(0xbb62), 0x001f, 0 },
++	{ CCI_REG8(0xbb86), 0x0000, 0 },
++	{ CCI_REG8(0xbb97), 0x0000, 0 },
++	{ CCI_REG8(0xbba8), 0x0000, 0 },
++	{ CCI_REG8(0xbbb2), 0x000f, 0 },
++	{ CCI_REG8(0xbbba), 0x0000, 0 },
++	{ CCI_REG8(0xbb1f), 0x001f, 0 },
++	{ CCI_REG8(0xbb30), 0x001f, 0 },
++	{ CCI_REG8(0xbb41), 0x001f, 0 },
++	{ CCI_REG8(0xbb52), 0x001f, 0 },
++	{ CCI_REG8(0xbb5b), 0x001f, 0 },
++	{ CCI_REG8(0xbb63), 0x001f, 0 },
++	{ CCI_REG8(0xbb77), 0x0000, 0 },
++	{ CCI_REG8(0xbb88), 0x0000, 0 },
++	{ CCI_REG8(0xbb99), 0x0000, 0 },
++	{ CCI_REG8(0xbbaa), 0x0000, 0 },
++	{ CCI_REG8(0xbbb3), 0x000f, 0 },
++	{ CCI_REG8(0xbbbb), 0x000f, 0 },
++	{ CCI_REG8(0xbb10), 0x001f, 0 },
++	{ CCI_REG8(0xbb21), 0x001f, 0 },
++	{ CCI_REG8(0xbb32), 0x001f, 0 },
++	{ CCI_REG8(0xbb43), 0x001f, 0 },
++	{ CCI_REG8(0xbb68), 0x000f, 0 },
++	{ CCI_REG8(0xbb79), 0x0000, 0 },
++	{ CCI_REG8(0xbb8a), 0x0000, 0 },
++	{ CCI_REG8(0xbb9b), 0x0000, 0 },
++	{ CCI_REG8(0xbb64), 0x0000, 0 },
++	{ CCI_REG8(0xbb66), 0x0000, 0 },
++	{ CCI_REG8(0xbbbc), 0x000f, 0 },
++	{ CCI_REG8(0xb9ab), 0x0000, 0 },
++	{ CCI_REG8(0xb9aa), 0x0000, 0 },
++	{ CCI_REG8(0xb9af), 0x0024, 0 },
++	{ CCI_REG8(0xb9ae), 0x0000, 0 },
++	{ CCI_REG8(0xbb65), 0x0000, 0 },
++	{ CCI_REG8(0xbb67), 0x0000, 0 },
++	{ CCI_REG8(0xbbbd), 0x0000, 0 },
++	{ CCI_REG8(0xbbbf), 0x0000, 0 },
++	{ CCI_REG8(0xb842), 0x0003, 0 },
++	{ CCI_REG8(0xb84e), 0x0003, 0 },
++	{ CCI_REG8(0xba93), 0x0010, 0 },
++	{ CCI_REG8(0xba95), 0x0014, 0 },
++	{ CCI_REG8(0xbaad), 0x0014, 0 },
++	{ CCI_REG8(0xbaac), 0x0015, 0 },
++	{ CCI_REG8(0xbaaf), 0x0015, 0 },
++	{ CCI_REG8(0xbaae), 0x0014, 0 },
++	{ CCI_REG8(0xbab6), 0x0006, 0 },
++	{ CCI_REG8(0xbab7), 0x0004, 0 },
++	{ CCI_REG8(0xbab2), 0x000e, 0 },
++	{ CCI_REG8(0xbab3), 0x000f, 0 },
++	{ CCI_REG8(0xbaeb), 0x0020, 0 },
++	{ CCI_REG8(0xbaed), 0x0007, 0 },
++	{ CCI_REG8(0xbb05), 0x0014, 0 },
++	{ CCI_REG8(0xbb04), 0x0020, 0 },
++	{ CCI_REG8(0xbb07), 0x0013, 0 },
++	{ CCI_REG8(0xbb06), 0x002e, 0 },
++	{ CCI_REG8(0xbb0e), 0x0013, 0 },
++	{ CCI_REG8(0xbb0f), 0x0004, 0 },
++	{ CCI_REG8(0xbb0a), 0x0025, 0 },
++	{ CCI_REG8(0xbb0b), 0x000c, 0 },
++	{ CCI_REG8(0x9d62), 0x0004, 0 },
++	{ CCI_REG8(0x9d63), 0x0005, 0 },
++	{ CCI_REG8(0x9d64), 0x0082, 0 },
++	{ CCI_REG8(0x9d65), 0x0083, 0 },
++	{ CCI_REG8(0x9ac7), 0x00cc, 0 },
++	{ CCI_REG8(0x9ac6), 0x0000, 0 },
++	{ CCI_REG8(0x9acd), 0x00c2, 0 },
++	{ CCI_REG8(0x9acc), 0x0000, 0 },
++	{ CCI_REG8(0x9ad1), 0x00fb, 0 },
++	{ CCI_REG8(0x9ad0), 0x0003, 0 },
++	{ CCI_REG8(0x9ad5), 0x002e, 0 },
++	{ CCI_REG8(0x9ad4), 0x0001, 0 },
++	{ CCI_REG8(0x9ad9), 0x00c2, 0 },
++	{ CCI_REG8(0x9ad8), 0x0000, 0 },
++	{ CCI_REG8(0x9af1), 0x000b, 0 },
++	{ CCI_REG8(0x9af0), 0x0001, 0 },
++	{ CCI_REG8(0x9af5), 0x00c2, 0 },
++	{ CCI_REG8(0x9af4), 0x0000, 0 },
++	{ CCI_REG8(0x9afb), 0x00fb, 0 },
++	{ CCI_REG8(0x9afa), 0x0003, 0 },
++	{ CCI_REG8(0xa73b), 0x004c, 0 },
++	{ CCI_REG8(0xa73a), 0x0002, 0 },
++	{ CCI_REG8(0xa73d), 0x0054, 0 },
++	{ CCI_REG8(0xa73c), 0x0003, 0 },
++	{ CCI_REG8(0xa747), 0x00f0, 0 },
++	{ CCI_REG8(0xa746), 0x0000, 0 },
++	{ CCI_REG8(0xa749), 0x0002, 0 },
++	{ CCI_REG8(0xa748), 0x0002, 0 },
++	{ CCI_REG8(0xba65), 0x001e, 0 },
++	{ CCI_REG8(0xba76), 0x001d, 0 },
++	{ CCI_REG8(0xba87), 0x001c, 0 },
++	{ CCI_REG8(0xba98), 0x0018, 0 },
++	{ CCI_REG8(0xbaa5), 0x0016, 0 },
++	{ CCI_REG8(0xbabd), 0x0002, 0 },
++	{ CCI_REG8(0xbace), 0x0005, 0 },
++	{ CCI_REG8(0xbadf), 0x0005, 0 },
++	{ CCI_REG8(0xbaf0), 0x0017, 0 },
++	{ CCI_REG8(0xbafd), 0x0014, 0 },
++	{ CCI_REG8(0x90c3), 0x0060, 0 },
++	{ CCI_REG8(0xb369), 0x0001, 0 },
++	{ CCI_REG8(0xb37b), 0x0001, 0 },
++	{ CCI_REG8(0xb384), 0x000f, 0 },
++	{ CCI_REG8(0xb386), 0x000f, 0 },
++	{ CCI_REG8(0xb38e), 0x000f, 0 },
++	{ CCI_REG8(0xb39f), 0x000f, 0 },
++	{ CCI_REG8(0xb395), 0x000f, 0 },
++	{ CCI_REG8(0xb397), 0x000f, 0 },
++	{ CCI_REG8(0xb803), 0x000c, 0 },
++	{ CCI_REG8(0xb908), 0x0001, 0 },
++	{ CCI_REG8(0xb909), 0x0006, 0 },
++	{ CCI_REG8(0xb90c), 0x0000, 0 },
++	{ CCI_REG8(0xb90d), 0x00ea, 0 },
++	{ CCI_REG8(0xb91c), 0x0000, 0 },
++	{ CCI_REG8(0xb91d), 0x00f2, 0 },
++	{ CCI_REG8(0xb92a), 0x0001, 0 },
++	{ CCI_REG8(0xb92b), 0x0004, 0 },
++	{ CCI_REG8(0xb92e), 0x0000, 0 },
++	{ CCI_REG8(0xb92f), 0x00eb, 0 },
++	{ CCI_REG8(0xb93e), 0x0000, 0 },
++	{ CCI_REG8(0xb93f), 0x00fa, 0 },
++	{ CCI_REG8(0xb94c), 0x0001, 0 },
++	{ CCI_REG8(0xb94d), 0x0009, 0 },
++	{ CCI_REG8(0xb950), 0x0000, 0 },
++	{ CCI_REG8(0xb951), 0x00ee, 0 },
++	{ CCI_REG8(0xb960), 0x0000, 0 },
++	{ CCI_REG8(0xb961), 0x00fd, 0 },
++	{ CCI_REG8(0xb96e), 0x0000, 0 },
++	{ CCI_REG8(0xb96f), 0x00ef, 0 },
++	{ CCI_REG8(0xb972), 0x0000, 0 },
++	{ CCI_REG8(0xb973), 0x00d9, 0 },
++	{ CCI_REG8(0xb982), 0x0000, 0 },
++	{ CCI_REG8(0xb983), 0x00ea, 0 },
++	{ CCI_REG8(0xb9b8), 0x0001, 0 },
++	{ CCI_REG8(0xb9b9), 0x0064, 0 },
++	{ CCI_REG8(0xb9bc), 0x0000, 0 },
++	{ CCI_REG8(0xb9bd), 0x00fa, 0 },
++	{ CCI_REG8(0xb9cc), 0x0001, 0 },
++	{ CCI_REG8(0xb9cd), 0x0048, 0 },
++	{ CCI_REG8(0xb9da), 0x0001, 0 },
++	{ CCI_REG8(0xb9db), 0x005b, 0 },
++	{ CCI_REG8(0xb9de), 0x0000, 0 },
++	{ CCI_REG8(0xb9df), 0x00e6, 0 },
++	{ CCI_REG8(0xb9ee), 0x0001, 0 },
++	{ CCI_REG8(0xb9ef), 0x0053, 0 },
++	{ CCI_REG8(0xb9fc), 0x0001, 0 },
++	{ CCI_REG8(0xb9fd), 0x0022, 0 },
++	{ CCI_REG8(0xba00), 0x0001, 0 },
++	{ CCI_REG8(0xba01), 0x0018, 0 },
++	{ CCI_REG8(0xba10), 0x0001, 0 },
++	{ CCI_REG8(0xba11), 0x004c, 0 },
++	{ CCI_REG8(0xba1e), 0x0001, 0 },
++	{ CCI_REG8(0xba1f), 0x004c, 0 },
++	{ CCI_REG8(0xba22), 0x0001, 0 },
++	{ CCI_REG8(0xba23), 0x007d, 0 },
++	{ CCI_REG8(0xba32), 0x0001, 0 },
++	{ CCI_REG8(0xba33), 0x0097, 0 },
++	{ CCI_REG8(0xba66), 0x001c, 0 },
++	{ CCI_REG8(0xba77), 0x0018, 0 },
++	{ CCI_REG8(0xba88), 0x0016, 0 },
++	{ CCI_REG8(0xba99), 0x0014, 0 },
++	{ CCI_REG8(0xbabe), 0x0005, 0 },
++	{ CCI_REG8(0xbacf), 0x0017, 0 },
++	{ CCI_REG8(0xbae0), 0x0014, 0 },
++	{ CCI_REG8(0xbaf1), 0x0014, 0 },
++	{ CCI_REG8(0xbb14), 0x001f, 0 },
++	{ CCI_REG8(0xbb16), 0x001f, 0 },
++	{ CCI_REG8(0xbb1e), 0x001f, 0 },
++	{ CCI_REG8(0xbb25), 0x001f, 0 },
++	{ CCI_REG8(0xbb27), 0x001f, 0 },
++	{ CCI_REG8(0xbb2f), 0x001f, 0 },
++	{ CCI_REG8(0xbb36), 0x001f, 0 },
++	{ CCI_REG8(0xbb38), 0x001f, 0 },
++	{ CCI_REG8(0xbb40), 0x001f, 0 },
++	{ CCI_REG8(0xbb47), 0x001f, 0 },
++	{ CCI_REG8(0xbb49), 0x001f, 0 },
++	{ CCI_REG8(0xbb51), 0x001f, 0 },
++	{ CCI_REG8(0xbb6c), 0x0000, 0 },
++	{ CCI_REG8(0xbb6e), 0x0000, 0 },
++	{ CCI_REG8(0xbb76), 0x0000, 0 },
++	{ CCI_REG8(0xbb7d), 0x0000, 0 },
++	{ CCI_REG8(0xbb7f), 0x0000, 0 },
++	{ CCI_REG8(0xbb87), 0x0000, 0 },
++	{ CCI_REG8(0xbb8e), 0x0000, 0 },
++	{ CCI_REG8(0xbb90), 0x0000, 0 },
++	{ CCI_REG8(0xbb98), 0x000f, 0 },
++	{ CCI_REG8(0xbb9f), 0x000f, 0 },
++	{ CCI_REG8(0xbba1), 0x000f, 0 },
++	{ CCI_REG8(0xbba9), 0x0000, 0 },
++	{ CCI_REG8(0xc52e), 0x000b, 0 },
++	{ CCI_REG8(0xc530), 0x000c, 0 },
++	{ CCI_REG8(0xc53f), 0x000b, 0 },
++	{ CCI_REG8(0xc541), 0x000c, 0 },
++	{ CCI_REG8(0x3a3e), 0x0000, 0 },
++	{ CCI_REG8(0x3078), 0x0000, 0 },
++	{ CCI_REG8(0x3079), 0x0030, 0 },
++	{ CCI_REG8(0x3032), 0x0004, 0 },
++	{ CCI_REG8(0x32dc), 0x0000, 0 },
++	{ CCI_REG8(0x33d3), 0x0004, 0 },
++	{ CCI_REG8(0x33d4), 0x0004, 0 },
++	{ CCI_REG8(0x33d5), 0x0000, 0 },
++	{ CCI_REG8(0x33d6), 0x0000, 0 },
++	{ CCI_REG8(0x33d7), 0x0040, 0 },
++	{ CCI_REG8(0x33d8), 0x0003, 0 },
++	{ CCI_REG8(0x33da), 0x0006, 0 },
++	{ CCI_REG8(0x33db), 0x0000, 0 },
++	{ CCI_REG8(0x33dc), 0x0000, 0 },
++	{ CCI_REG8(0x33dd), 0x0080, 0 },
++	{ CCI_REG8(0x33de), 0x0002, 0 },
++	{ CCI_REG8(0x33e0), 0x0008, 0 },
++	{ CCI_REG8(0x33e1), 0x0000, 0 },
++	{ CCI_REG8(0x33e2), 0x0001, 0 },
++	{ CCI_REG8(0x33e3), 0x0000, 0 },
++	{ CCI_REG8(0x33e4), 0x0001, 0 },
++	{ CCI_REG8(0x33e6), 0x000d, 0 },
++	{ CCI_REG8(0x33e7), 0x00fe, 0 },
++	{ CCI_REG8(0x33e8), 0x0003, 0 },
++	{ CCI_REG8(0x33e9), 0x00ff, 0 },
++	{ CCI_REG8(0x33ea), 0x0000, 0 },
++	{ CCI_REG8(0x33ec), 0x001d, 0 },
++	{ CCI_REG8(0x33ed), 0x00fc, 0 },
++	{ CCI_REG8(0x33ee), 0x0013, 0 },
++	{ CCI_REG8(0x33ef), 0x00fd, 0 },
++	{ CCI_REG8(0x3814), 0x0000, 0 },
++	{ CCI_REG8(0x3815), 0x0020, 0 },
++	{ CCI_REG8(0x3816), 0x0001, 0 },
++	{ CCI_REG8(0x3817), 0x0000, 0 },
++	{ CCI_REG8(0x3818), 0x0010, 0 },
++	{ CCI_REG8(0x3819), 0x0003, 0 },
++	{ CCI_REG8(0x381a), 0x0003, 0 },
++	{ CCI_REG8(0x381b), 0x0003, 0 },
++	{ CCI_REG8(0x381c), 0x000f, 0 },
++	{ CCI_REG8(0x381d), 0x000f, 0 },
++	{ CCI_REG8(0x381e), 0x000f, 0 },
++	{ CCI_REG8(0x381f), 0x000f, 0 },
++	{ CCI_REG8(0x3820), 0x000f, 0 },
++	{ CCI_REG8(0x439e), 0x0000, 0 },
++	{ CCI_REG8(0x439f), 0x0001, 0 },
++	{ CCI_REG8(0x4a30), 0x0004, 0 },
++	{ CCI_REG8(0x541e), 0x0001, 0 },
++	{ CCI_REG8(0x543c), 0x0000, 0 },
++	{ CCI_REG8(0x54ae), 0x0001, 0 },
++	{ CCI_REG8(0x582a), 0x0000, 0 },
++	{ CCI_REG8(0x9002), 0x000a, 0 },
++	{ CCI_REG8(0x9003), 0x000a, 0 },
++	{ CCI_REG8(0x9004), 0x0014, 0 },
++	{ CCI_REG8(0x9015), 0x0000, 0 },
++	{ CCI_REG8(0x9016), 0x0000, 0 },
++	{ CCI_REG8(0x9017), 0x0003, 0 },
++	{ CCI_REG8(0x901e), 0x0001, 0 },
++	{ CCI_REG8(0x9200), 0x00ff, 0 },
++	{ CCI_REG8(0x9201), 0x00ff, 0 },
++	{ CCI_REG8(0x9202), 0x00ff, 0 },
++	{ CCI_REG8(0x9203), 0x00ff, 0 },
++	{ CCI_REG8(0x9204), 0x00ff, 0 },
++	{ CCI_REG8(0x9205), 0x00ff, 0 },
++	{ CCI_REG8(0x9206), 0x00ff, 0 },
++	{ CCI_REG8(0x9207), 0x00ff, 0 },
++	{ CCI_REG8(0x9208), 0x00ff, 0 },
++	{ CCI_REG8(0x9209), 0x00ff, 0 },
++	{ CCI_REG8(0x920a), 0x00ff, 0 },
++	{ CCI_REG8(0x920b), 0x00ff, 0 },
++	{ CCI_REG8(0x920c), 0x00ff, 0 },
++	{ CCI_REG8(0x920d), 0x00ff, 0 },
++	{ CCI_REG8(0x920e), 0x00ff, 0 },
++	{ CCI_REG8(0x920f), 0x00ff, 0 },
++	{ CCI_REG8(0x9210), 0x00ff, 0 },
++	{ CCI_REG8(0x9211), 0x00ff, 0 },
++	{ CCI_REG8(0x9212), 0x00ff, 0 },
++	{ CCI_REG8(0x9213), 0x00ff, 0 },
++	{ CCI_REG8(0x9214), 0x00ff, 0 },
++	{ CCI_REG8(0x9215), 0x00ff, 0 },
++	{ CCI_REG8(0x9216), 0x00ff, 0 },
++	{ CCI_REG8(0x9217), 0x00ff, 0 },
++	{ CCI_REG8(0x9218), 0x00ff, 0 },
++	{ CCI_REG8(0x9219), 0x00ff, 0 },
++	{ CCI_REG8(0x921a), 0x00ff, 0 },
++	{ CCI_REG8(0x921b), 0x00ff, 0 },
++	{ CCI_REG8(0x921c), 0x00ff, 0 },
++	{ CCI_REG8(0x921d), 0x00ff, 0 },
++	{ CCI_REG8(0x921e), 0x00ff, 0 },
++	{ CCI_REG8(0x921f), 0x00ff, 0 },
++	{ CCI_REG8(0x9220), 0x00ff, 0 },
++	{ CCI_REG8(0x9221), 0x00ff, 0 },
++	{ CCI_REG8(0x9222), 0x00ff, 0 },
++	{ CCI_REG8(0x9223), 0x00ff, 0 },
++	{ CCI_REG8(0x9224), 0x00ff, 0 },
++	{ CCI_REG8(0x9225), 0x00ff, 0 },
++	{ CCI_REG8(0x9226), 0x00ff, 0 },
++	{ CCI_REG8(0x9227), 0x00ff, 0 },
++	{ CCI_REG8(0x9228), 0x00f3, 0 },
++	{ CCI_REG8(0x9229), 0x0004, 0 },
++	{ CCI_REG8(0x922a), 0x00f3, 0 },
++	{ CCI_REG8(0x922b), 0x0005, 0 },
++	{ CCI_REG8(0x922c), 0x00f3, 0 },
++	{ CCI_REG8(0x922d), 0x0022, 0 },
++	{ CCI_REG8(0x922e), 0x00f3, 0 },
++	{ CCI_REG8(0x922f), 0x0023, 0 },
++	{ CCI_REG8(0x9230), 0x00f3, 0 },
++	{ CCI_REG8(0x9231), 0x003e, 0 },
++	{ CCI_REG8(0x9232), 0x0097, 0 },
++	{ CCI_REG8(0x9233), 0x005a, 0 },
++	{ CCI_REG8(0x9234), 0x0097, 0 },
++	{ CCI_REG8(0x9235), 0x005b, 0 },
++	{ CCI_REG8(0x9236), 0x0097, 0 },
++	{ CCI_REG8(0x9237), 0x0059, 0 },
++	{ CCI_REG8(0x9238), 0x0099, 0 },
++	{ CCI_REG8(0x9239), 0x0055, 0 },
++	{ CCI_REG8(0x923a), 0x0099, 0 },
++	{ CCI_REG8(0x923b), 0x0056, 0 },
++	{ CCI_REG8(0x923c), 0x0099, 0 },
++	{ CCI_REG8(0x923d), 0x0057, 0 },
++	{ CCI_REG8(0x923e), 0x0099, 0 },
++	{ CCI_REG8(0x923f), 0x0058, 0 },
++	{ CCI_REG8(0x9240), 0x0099, 0 },
++	{ CCI_REG8(0x9241), 0x0059, 0 },
++	{ CCI_REG8(0x9242), 0x0043, 0 },
++	{ CCI_REG8(0x9243), 0x000a, 0 },
++	{ CCI_REG8(0x9250), 0x0024, 0 },
++	{ CCI_REG8(0x9251), 0x0005, 0 },
++	{ CCI_REG8(0x9252), 0x0023, 0 },
++	{ CCI_REG8(0x9253), 0x00df, 0 },
++	{ CCI_REG8(0x9254), 0x0024, 0 },
++	{ CCI_REG8(0x9255), 0x0072, 0 },
++	{ CCI_REG8(0xa11a), 0x0080, 0 },
++	{ CCI_REG8(0xa2e4), 0x0002, 0 },
++	{ CCI_REG8(0xa2e5), 0x0000, 0 },
++	{ CCI_REG8(0xa2e6), 0x0002, 0 },
++	{ CCI_REG8(0xa2e7), 0x0000, 0 },
++	{ CCI_REG8(0xb02c), 0x0001, 0 },
++	{ CCI_REG8(0xb02e), 0x000f, 0 },
++	{ CCI_REG8(0xb02f), 0x00ff, 0 },
++	{ CCI_REG8(0xb030), 0x0008, 0 },
++	{ CCI_REG8(0xb031), 0x00ff, 0 },
++	{ CCI_REG8(0xb036), 0x0007, 0 },
++	{ CCI_REG8(0xb037), 0x00ff, 0 },
++	{ CCI_REG8(0xb678), 0x002b, 0 },
++	{ CCI_REG8(0xb679), 0x00a0, 0 },
++	{ CCI_REG8(0xb67a), 0x0029, 0 },
++	{ CCI_REG8(0xb67b), 0x00d0, 0 },
++	{ CCI_REG8(0xb67c), 0x0022, 0 },
++	{ CCI_REG8(0xb67d), 0x00b0, 0 },
++	{ CCI_REG8(0xb67e), 0x0053, 0 },
++	{ CCI_REG8(0xb67f), 0x00e0, 0 },
++	{ CCI_REG8(0xb680), 0x0028, 0 },
++	{ CCI_REG8(0xb681), 0x00b0, 0 },
++	{ CCI_REG8(0xb682), 0x0037, 0 },
++	{ CCI_REG8(0xb683), 0x00b0, 0 },
++	{ CCI_REG8(0xb684), 0x007c, 0 },
++	{ CCI_REG8(0xb685), 0x00e0, 0 },
++	{ CCI_REG8(0xb686), 0x0029, 0 },
++	{ CCI_REG8(0xb687), 0x0030, 0 },
++	{ CCI_REG8(0xb688), 0x0023, 0 },
++	{ CCI_REG8(0xb689), 0x00b0, 0 },
++	{ CCI_REG8(0xb68a), 0x0053, 0 },
++	{ CCI_REG8(0xb68b), 0x00e0, 0 },
++	{ CCI_REG8(0xb68c), 0x0026, 0 },
++	{ CCI_REG8(0xb68d), 0x00b0, 0 },
++	{ CCI_REG8(0xb68e), 0x0055, 0 },
++	{ CCI_REG8(0xb68f), 0x0020, 0 },
++	{ CCI_REG8(0xb690), 0x0027, 0 },
++	{ CCI_REG8(0xb691), 0x0030, 0 },
++	{ CCI_REG8(0xb692), 0x0055, 0 },
++	{ CCI_REG8(0xb693), 0x0020, 0 },
++	{ CCI_REG8(0xb698), 0x002b, 0 },
++	{ CCI_REG8(0xb699), 0x00f0, 0 },
++	{ CCI_REG8(0xb69a), 0x0071, 0 },
++	{ CCI_REG8(0xb69b), 0x00c0, 0 },
++	{ CCI_REG8(0xb69c), 0x002a, 0 },
++	{ CCI_REG8(0xb69d), 0x0050, 0 },
++	{ CCI_REG8(0xb69e), 0x006e, 0 },
++	{ CCI_REG8(0xb69f), 0x00d0, 0 },
++	{ CCI_REG8(0xce90), 0x0000, 0 },
++	{ CCI_REG8(0xce91), 0x0000, 0 },
++	{ CCI_REG8(0x32d9), 0x0001, 0 },
++	{ CCI_REG8(0x975c), 0x0003, 0 },
++	{ CCI_REG8(0x9850), 0x0050, 0 },
++	{ CCI_REG8(0x9851), 0x003c, 0 },
++	{ CCI_REG8(0x9852), 0x0028, 0 },
++	{ CCI_REG8(0x9987), 0x000f, 0 },
++	{ CCI_REG8(0x9988), 0x000f, 0 },
++	{ CCI_REG8(0x9989), 0x000f, 0 },
++	{ CCI_REG8(0x998a), 0x000f, 0 },
++	{ CCI_REG8(0x998b), 0x000f, 0 },
++	{ CCI_REG8(0x9a48), 0x0004, 0 },
++	{ CCI_REG8(0xa2b4), 0x0003, 0 },
++	{ CCI_REG8(0xa2b5), 0x0000, 0 },
++	{ CCI_REG8(0xa2b6), 0x0002, 0 },
++	{ CCI_REG8(0xa2b7), 0x00c0, 0 },
++	{ CCI_REG8(0xa664), 0x0000, 0 },
++	{ CCI_REG8(0xa665), 0x0070, 0 },
++	{ CCI_REG8(0xa66a), 0x0000, 0 },
++	{ CCI_REG8(0xa66b), 0x0070, 0 },
++	{ CCI_REG8(0xa670), 0x0000, 0 },
++	{ CCI_REG8(0xa671), 0x0070, 0 },
++	{ CCI_REG8(0xa74a), 0x0000, 0 },
++	{ CCI_REG8(0xa74b), 0x001d, 0 },
++	{ CCI_REG8(0xa74c), 0x0000, 0 },
++	{ CCI_REG8(0xa74d), 0x001d, 0 },
++	{ CCI_REG8(0xa754), 0x0000, 0 },
++	{ CCI_REG8(0xa755), 0x0033, 0 },
++	{ CCI_REG8(0xa756), 0x0000, 0 },
++	{ CCI_REG8(0xa757), 0x0033, 0 },
++	{ CCI_REG8(0xa758), 0x0000, 0 },
++	{ CCI_REG8(0xa759), 0x0033, 0 },
++	{ CCI_REG8(0xa75c), 0x0000, 0 },
++	{ CCI_REG8(0xa75d), 0x001d, 0 },
++	{ CCI_REG8(0xa75e), 0x0000, 0 },
++	{ CCI_REG8(0xa75f), 0x001d, 0 },
++	{ CCI_REG8(0xa766), 0x0000, 0 },
++	{ CCI_REG8(0xa767), 0x0036, 0 },
++	{ CCI_REG8(0xa768), 0x0000, 0 },
++	{ CCI_REG8(0xa769), 0x0036, 0 },
++	{ CCI_REG8(0xa76a), 0x0000, 0 },
++	{ CCI_REG8(0xa76b), 0x0036, 0 },
++	{ CCI_REG8(0xa77a), 0x0000, 0 },
++	{ CCI_REG8(0xa77b), 0x0024, 0 },
++	{ CCI_REG8(0xa77c), 0x0000, 0 },
++	{ CCI_REG8(0xa77d), 0x0024, 0 },
++	{ CCI_REG8(0xa784), 0x0000, 0 },
++	{ CCI_REG8(0xa785), 0x0033, 0 },
++	{ CCI_REG8(0xa786), 0x0000, 0 },
++	{ CCI_REG8(0xa787), 0x0033, 0 },
++	{ CCI_REG8(0xa788), 0x0000, 0 },
++	{ CCI_REG8(0xa789), 0x0033, 0 },
++	{ CCI_REG8(0xa78c), 0x0000, 0 },
++	{ CCI_REG8(0xa78d), 0x0024, 0 },
++	{ CCI_REG8(0xa78e), 0x0000, 0 },
++	{ CCI_REG8(0xa78f), 0x0024, 0 },
++	{ CCI_REG8(0xa796), 0x0000, 0 },
++	{ CCI_REG8(0xa797), 0x0036, 0 },
++	{ CCI_REG8(0xa798), 0x0000, 0 },
++	{ CCI_REG8(0xa799), 0x0036, 0 },
++	{ CCI_REG8(0xa79a), 0x0000, 0 },
++	{ CCI_REG8(0xa79b), 0x0036, 0 },
++	{ CCI_REG8(0xaa05), 0x0005, 0 },
++	{ CCI_REG8(0xaa09), 0x0010, 0 },
++	{ CCI_REG8(0xaa0a), 0x0010, 0 },
++	{ CCI_REG8(0xaa0b), 0x0010, 0 },
++	{ CCI_REG8(0xaa11), 0x0005, 0 },
++	{ CCI_REG8(0xaa15), 0x0010, 0 },
++	{ CCI_REG8(0xaa16), 0x0010, 0 },
++	{ CCI_REG8(0xaa17), 0x0010, 0 },
++	{ CCI_REG8(0xaa1d), 0x0005, 0 },
++	{ CCI_REG8(0xaa29), 0x0005, 0 },
++	{ CCI_REG8(0xb013), 0x0000, 0 },
++	{ CCI_REG8(0xef4b), 0x00c0, 0 },
++	{ CCI_REG8(0xef4c), 0x00c0, 0 },
++	{ CCI_REG8(0xef4d), 0x00c0, 0 },
++	{ CCI_REG8(0xef4e), 0x00c0, 0 },
++	{ CCI_REG8(0xef4f), 0x00c0, 0 },
++	{ CCI_REG8(0xef50), 0x00c0, 0 },
++	{ CCI_REG8(0xef51), 0x00c0, 0 },
++	{ CCI_REG8(0xef52), 0x00c0, 0 },
++	{ CCI_REG8(0xef53), 0x00c0, 0 },
++	{ CCI_REG8(0xef54), 0x00c0, 0 },
++	{ CCI_REG8(0xef55), 0x00c0, 0 },
++	{ CCI_REG8(0xef56), 0x00c0, 0 },
++	{ CCI_REG8(0xef57), 0x00c0, 0 },
++	{ CCI_REG8(0xef58), 0x00c0, 0 },
++	{ CCI_REG8(0xef59), 0x00c0, 0 },
++	{ CCI_REG8(0xf27a), 0x00c0, 0 },
++	{ CCI_REG8(0xf27d), 0x00c0, 0 },
++	{ CCI_REG8(0xf280), 0x00c0, 0 },
++	{ CCI_REG8(0xf283), 0x00c0, 0 },
++	{ CCI_REG8(0xf286), 0x00c0, 0 },
++	{ CCI_REG8(0xf2a5), 0x00c0, 0 },
++	{ CCI_REG8(0xf2a6), 0x00c0, 0 },
++	{ CCI_REG8(0xf2a7), 0x00c0, 0 },
++	{ CCI_REG8(0xf2a8), 0x00c0, 0 },
++	{ CCI_REG8(0xf2a9), 0x00c0, 0 },
++	{ CCI_REG8(0xf2aa), 0x00c0, 0 },
++	{ CCI_REG8(0xf2ab), 0x00c0, 0 },
++	{ CCI_REG8(0xf2ac), 0x00c0, 0 },
++	{ CCI_REG8(0xf2ad), 0x00c0, 0 },
++	{ CCI_REG8(0xf2ae), 0x00c0, 0 },
++	{ CCI_REG8(0xf2af), 0x00c0, 0 },
++	{ CCI_REG8(0xf2b0), 0x00c0, 0 },
++	{ CCI_REG8(0xf2b1), 0x00c0, 0 },
++	{ CCI_REG8(0xf2b2), 0x00c0, 0 },
++	{ CCI_REG8(0xf2b3), 0x00c0, 0 },
++	{ CCI_REG8(0xf35c), 0x0001, 0 },
++	{ CCI_REG8(0xf503), 0x0014, 0 },
++	{ CCI_REG8(0xf504), 0x0014, 0 },
++	{ CCI_REG8(0xf505), 0x0014, 0 },
++	{ CCI_REG8(0xf506), 0x0014, 0 },
++	{ CCI_REG8(0xf507), 0x0014, 0 },
++	{ CCI_REG8(0xf508), 0x0014, 0 },
++	{ CCI_REG8(0xf509), 0x0014, 0 },
++	{ CCI_REG8(0xf50a), 0x0014, 0 },
++	{ CCI_REG8(0xf50b), 0x0014, 0 },
++	{ CCI_REG8(0xf50c), 0x0014, 0 },
++	{ CCI_REG8(0xf50d), 0x0014, 0 },
++	{ CCI_REG8(0xf50e), 0x0014, 0 },
++	{ CCI_REG8(0xf512), 0x0028, 0 },
++	{ CCI_REG8(0xf513), 0x0028, 0 },
++	{ CCI_REG8(0xf514), 0x0028, 0 },
++	{ CCI_REG8(0xf515), 0x0028, 0 },
++	{ CCI_REG8(0xf516), 0x0028, 0 },
++	{ CCI_REG8(0xf517), 0x0028, 0 },
++	{ CCI_REG8(0xf518), 0x0028, 0 },
++	{ CCI_REG8(0xf519), 0x0028, 0 },
++	{ CCI_REG8(0xf51a), 0x0028, 0 },
++	{ CCI_REG8(0xf51b), 0x0028, 0 },
++	{ CCI_REG8(0xf51c), 0x0028, 0 },
++	{ CCI_REG8(0xf51d), 0x0028, 0 },
++	{ CCI_REG8(0xf521), 0x0014, 0 },
++	{ CCI_REG8(0xf522), 0x0014, 0 },
++	{ CCI_REG8(0xf523), 0x0014, 0 },
++	{ CCI_REG8(0xf524), 0x0014, 0 },
++	{ CCI_REG8(0xf525), 0x0014, 0 },
++	{ CCI_REG8(0xf526), 0x0014, 0 },
++	{ CCI_REG8(0xf527), 0x0014, 0 },
++	{ CCI_REG8(0xf528), 0x0014, 0 },
++	{ CCI_REG8(0xf529), 0x0014, 0 },
++	{ CCI_REG8(0xf52a), 0x0014, 0 },
++	{ CCI_REG8(0xf52b), 0x0014, 0 },
++	{ CCI_REG8(0xf52c), 0x0014, 0 },
++	{ CCI_REG8(0xf532), 0x0005, 0 },
++	{ CCI_REG8(0xf535), 0x0005, 0 },
++	{ CCI_REG8(0xf538), 0x0005, 0 },
++	{ CCI_REG8(0xf53b), 0x0005, 0 },
++	{ CCI_REG8(0xf53f), 0x0014, 0 },
++	{ CCI_REG8(0xf540), 0x0014, 0 },
++	{ CCI_REG8(0xf541), 0x0014, 0 },
++	{ CCI_REG8(0xf542), 0x0014, 0 },
++	{ CCI_REG8(0xf543), 0x0014, 0 },
++	{ CCI_REG8(0xf544), 0x0014, 0 },
++	{ CCI_REG8(0xf545), 0x0014, 0 },
++	{ CCI_REG8(0xf546), 0x0014, 0 },
++	{ CCI_REG8(0xf547), 0x0014, 0 },
++	{ CCI_REG8(0xf548), 0x0014, 0 },
++	{ CCI_REG8(0xf549), 0x0014, 0 },
++	{ CCI_REG8(0xf54a), 0x0014, 0 },
++	{ CCI_REG8(0xf54e), 0x0028, 0 },
++	{ CCI_REG8(0xf54f), 0x0028, 0 },
++	{ CCI_REG8(0xf550), 0x0028, 0 },
++	{ CCI_REG8(0xf551), 0x0028, 0 },
++	{ CCI_REG8(0xf552), 0x0028, 0 },
++	{ CCI_REG8(0xf553), 0x0028, 0 },
++	{ CCI_REG8(0xf554), 0x0028, 0 },
++	{ CCI_REG8(0xf555), 0x0028, 0 },
++	{ CCI_REG8(0xf556), 0x0028, 0 },
++	{ CCI_REG8(0xf557), 0x0028, 0 },
++	{ CCI_REG8(0xf558), 0x0028, 0 },
++	{ CCI_REG8(0xf559), 0x0028, 0 },
++	{ CCI_REG8(0x0138), 0x0001, 0 },
++	{ CCI_REG8(0x0350), 0x0001, 0 },
++};
++
++static const struct unicorn_reg imx707_mode[] = {
++	{ CCI_REG8(0x0112), 0x000a, 0 },
++	{ CCI_REG8(0x0113), 0x000a, 0 },
++	{ CCI_REG8(0x0114), 0x0002, 0 },
++	{ CCI_REG8(0x0342), 0x0034, 0 },
++	{ CCI_REG8(0x0343), 0x00e0, 0 },
++	{ CCI_REG8(0x3102), 0x0000, 0 },
++	{ CCI_REG8(0x0340), 0x0019, 0 },
++	{ CCI_REG8(0x0341), 0x0032, 0 },
++	{ CCI_REG8(0x0344), 0x0000, 0 },
++	{ CCI_REG8(0x0345), 0x0000, 0 },
++	{ CCI_REG8(0x0346), 0x0000, 0 },
++	{ CCI_REG8(0x0347), 0x0000, 0 },
++	{ CCI_REG8(0x0348), 0x001f, 0 },
++	{ CCI_REG8(0x0349), 0x00ff, 0 },
++	{ CCI_REG8(0x034a), 0x0017, 0 },
++	{ CCI_REG8(0x034b), 0x00ff, 0 },
++	{ CCI_REG8(0x0220), 0x0062, 0 },
++	{ CCI_REG8(0x0221), 0x0011, 0 },
++	{ CCI_REG8(0x0900), 0x0001, 0 },
++	{ CCI_REG8(0x0901), 0x0022, 0 },
++	{ CCI_REG8(0x0902), 0x0008, 0 },
++	{ CCI_REG8(0x3004), 0x0003, 0 },
++	{ CCI_REG8(0x30d0), 0x000a, 0 },
++	{ CCI_REG8(0x30d8), 0x0004, 0 },
++	{ CCI_REG8(0x32de), 0x0000, 0 },
++	{ CCI_REG8(0x350c), 0x0000, 0 },
++	{ CCI_REG8(0x350d), 0x0000, 0 },
++	{ CCI_REG8(0x3821), 0x0001, 0 },
++	{ CCI_REG8(0x3828), 0x0000, 0 },
++	{ CCI_REG8(0x3829), 0x0001, 0 },
++	{ CCI_REG8(0x382a), 0x0001, 0 },
++	{ CCI_REG8(0x3920), 0x0001, 0 },
++	{ CCI_REG8(0x39a8), 0x0000, 0 },
++	{ CCI_REG8(0xb02d), 0x0001, 0 },
++	{ CCI_REG8(0x0408), 0x0000, 0 },
++	{ CCI_REG8(0x0409), 0x0000, 0 },
++	{ CCI_REG8(0x040a), 0x0000, 0 },
++	{ CCI_REG8(0x040b), 0x0000, 0 },
++	{ CCI_REG8(0x040c), 0x0010, 0 },
++	{ CCI_REG8(0x040d), 0x0000, 0 },
++	{ CCI_REG8(0x040e), 0x000c, 0 },
++	{ CCI_REG8(0x040f), 0x0000, 0 },
++	{ CCI_REG8(0x034c), 0x0010, 0 },
++	{ CCI_REG8(0x034d), 0x0000, 0 },
++	{ CCI_REG8(0x034e), 0x000c, 0 },
++	{ CCI_REG8(0x034f), 0x0000, 0 },
++	{ CCI_REG8(0x0301), 0x0005, 0 },
++	{ CCI_REG8(0x0303), 0x0002, 0 },
++	{ CCI_REG8(0x0305), 0x0003, 0 },
++	{ CCI_REG8(0x0306), 0x0001, 0 },
++	{ CCI_REG8(0x0307), 0x0000, 0 },
++	{ CCI_REG8(0x030b), 0x0002, 0 },
++	{ CCI_REG8(0x030d), 0x0003, 0 },
++	{ CCI_REG8(0x030e), 0x0002, 0 },
++	{ CCI_REG8(0x030f), 0x0018, 0 },
++	{ CCI_REG8(0x3289), 0x0000, 0 },
++	{ CCI_REG8(0x32d5), 0x0000, 0 },
++	{ CCI_REG8(0x32d6), 0x0000, 0 },
++	{ CCI_REG8(0x0202), 0x0018, 0 },
++	{ CCI_REG8(0x0203), 0x00d0, 0 },
++	{ CCI_REG8(0x0224), 0x0001, 0 },
++	{ CCI_REG8(0x0225), 0x00f4, 0 },
++	{ CCI_REG8(0x3116), 0x0001, 0 },
++	{ CCI_REG8(0x3117), 0x00f4, 0 },
++	{ CCI_REG8(0x0204), 0x0000, 0 },
++	{ CCI_REG8(0x0205), 0x0000, 0 },
++	{ CCI_REG8(0x0216), 0x0000, 0 },
++	{ CCI_REG8(0x0217), 0x0000, 0 },
++	{ CCI_REG8(0x0218), 0x0001, 0 },
++	{ CCI_REG8(0x0219), 0x0000, 0 },
++	{ CCI_REG8(0x020e), 0x0001, 0 },
++	{ CCI_REG8(0x020f), 0x0000, 0 },
++	{ CCI_REG8(0x3118), 0x0000, 0 },
++	{ CCI_REG8(0x3119), 0x0000, 0 },
++	{ CCI_REG8(0x311a), 0x0001, 0 },
++	{ CCI_REG8(0x311b), 0x0000, 0 },
++	{ CCI_REG8(0x0860), 0x0000, 0 },
++	{ CCI_REG8(0x0861), 0x0000, 0 },
++	{ CCI_REG8(0x0862), 0x0000, 0 },
++	{ CCI_REG8(0x0863), 0x0000, 0 },
++	{ CCI_REG8(0x309b), 0x0001, 0 },
++};
+diff --git a/drivers/media/i2c/unicorn-sensors.c b/drivers/media/i2c/unicorn-sensors.c
+index 527d811..b0152ef 100644
+--- a/drivers/media/i2c/unicorn-sensors.c
++++ b/drivers/media/i2c/unicorn-sensors.c
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+-/* Xiaomi 12S Pro D-PHY sensors: two S5KJN1 modules and OV32B40. */
++/* Xiaomi 12S Pro: S5KJN1, OV32B40 and three-trio C-PHY IMX707. */
+ 
+ #include <linux/clk.h>
+ #include <linux/delay.h>
+@@ -20,6 +20,7 @@ struct unicorn_reg {
+ };
+ 
+ #include "unicorn-sensor-regs.h"
++#include "unicorn-imx707-regs.h"
+ 
+ struct unicorn_sensor_info {
+ 	const char *name;
+@@ -29,6 +30,7 @@ struct unicorn_sensor_info {
+ 	u32 mode_count;
+ 	u32 chip_id_reg;
+ 	u32 chip_id;
++	u32 chip_id_mask;
+ 	u32 width, height, hts, vts, pixel_rate;
+ 	u32 code;
+ 	s64 link_freq;
+@@ -37,6 +39,7 @@ struct unicorn_sensor_info {
+ 	u32 gain_min, gain_max, gain_step;
+ 	struct v4l2_rect native, crop;
+ 	bool omnivision;
++	bool sony;
+ };
+ 
+ static const struct unicorn_sensor_info unicorn_s5kjn1 = {
+@@ -60,7 +63,7 @@ static const struct unicorn_sensor_info unicorn_ov32b40 = {
+ 	.name = "ov32b40-unicorn",
+ 	.init = ov32b40_init, .init_count = ARRAY_SIZE(ov32b40_init),
+ 	.mode = ov32b40_mode, .mode_count = ARRAY_SIZE(ov32b40_mode),
+-	.chip_id_reg = CCI_REG24(0x300a), .chip_id = 0x563242,
++	.chip_id_reg = CCI_REG16(0x300b), .chip_id = 0x3242,
+ 	.width = 3264, .height = 2448, .hts = 720 * 6, .vts = 5332,
+ 	/* OEM output clock; HTS is expressed in six-pixel units. */
+ 	.pixel_rate = 673920000, .link_freq = 842400000,
+@@ -75,6 +78,30 @@ static const struct unicorn_sensor_info unicorn_ov32b40 = {
+ 	.omnivision = true,
+ };
+ 
++static const struct unicorn_sensor_info unicorn_imx707 = {
++	.name = "imx707-unicorn",
++	.init = imx707_init, .init_count = ARRAY_SIZE(imx707_init),
++	.mode = imx707_mode, .mode_count = ARRAY_SIZE(imx707_mode),
++	/* OEM ID 0x70 after masking 0xfff0 and shifting by four. */
++	.chip_id_reg = CCI_REG16(0x0016), .chip_id = 0x0700,
++	.chip_id_mask = 0xfff0,
++	.width = 4096, .height = 3072, .hts = 13536, .vts = 6450,
++	/* VT: 19.2 MHz / 3 * 256 / 2 / 5 * 16; about 30.025 fps.
++	 * OP: 19.2 MHz / 3 * 536 / 2 = 1.7152 Gsym/s per trio.
++	 * V4L2 link frequency is half the C-PHY symbol rate.
++	 */
++	.pixel_rate = 2621440000U, .link_freq = 857600000,
++	.code = MEDIA_BUS_FMT_SRGGB10_1X10,
++	.exposure_reg = CCI_REG16(0x0202), .vts_reg = CCI_REG16(0x0340),
++	.gain_reg = CCI_REG16(0x0204),
++	.exposure_min = 1, .exposure_margin = 96, .exposure_default = 6352,
++	/* Gain = 1024 / (1024 - register), limited to the OEM's 64x. */
++	.gain_min = 0, .gain_max = 1008, .gain_step = 1,
++	.native = { .width = 8192, .height = 6144 },
++	.crop = { .width = 8192, .height = 6144 },
++	.sony = true,
++};
++
+ struct unicorn_sensor {
+ 	struct device *dev;
+ 	const struct unicorn_sensor_info *info;
+@@ -82,6 +109,7 @@ struct unicorn_sensor {
+ 	struct clk *clk;
+ 	struct gpio_desc *reset;
+ 	struct regulator *avdd, *dvdd, *iovdd;
++	struct regulator *afvdd, *auxvdd;
+ 	struct v4l2_subdev sd;
+ 	struct media_pad pad;
+ 	struct v4l2_ctrl_handler ctrls;
+@@ -110,10 +138,68 @@ static int unicorn_write_table(struct unicorn_sensor *sensor,
+ 	return 0;
+ }
+ 
++static int unicorn_sony_power_on(struct unicorn_sensor *sensor)
++{
++	int ret;
++
++	/* Sensor driver power-up (symbol 12), not the EEPROM's symbol 8613. */
++	gpiod_set_value_cansleep(sensor->reset, 1);
++	ret = regulator_enable(sensor->afvdd);
++	if (ret)
++		return ret;
++	usleep_range(10000, 11000);
++	ret = regulator_enable(sensor->avdd);
++	if (ret)
++		goto disable_afvdd;
++	ret = regulator_enable(sensor->dvdd);
++	if (ret)
++		goto disable_avdd;
++	ret = regulator_enable(sensor->iovdd);
++	if (ret)
++		goto disable_dvdd;
++	ret = regulator_enable(sensor->auxvdd);
++	if (ret)
++		goto disable_iovdd;
++	usleep_range(1000, 2000);
++	ret = clk_prepare_enable(sensor->clk);
++	if (ret)
++		goto disable_auxvdd;
++	usleep_range(1000, 2000);
++	gpiod_set_value_cansleep(sensor->reset, 0);
++	usleep_range(2000, 3000);
++	return 0;
++
++disable_auxvdd:
++	regulator_disable(sensor->auxvdd);
++disable_iovdd:
++	regulator_disable(sensor->iovdd);
++disable_dvdd:
++	regulator_disable(sensor->dvdd);
++disable_avdd:
++	regulator_disable(sensor->avdd);
++disable_afvdd:
++	regulator_disable(sensor->afvdd);
++	return ret;
++}
++
+ static int unicorn_power_off(struct device *dev)
+ {
+ 	struct unicorn_sensor *sensor = to_unicorn(dev_get_drvdata(dev));
+ 
++	if (sensor->info->sony) {
++		gpiod_set_value_cansleep(sensor->reset, 1);
++		usleep_range(2000, 3000);
++		clk_disable_unprepare(sensor->clk);
++		usleep_range(1000, 2000);
++		regulator_disable(sensor->auxvdd);
++		usleep_range(1000, 2000);
++		regulator_disable(sensor->iovdd);
++		regulator_disable(sensor->dvdd);
++		regulator_disable(sensor->avdd);
++		regulator_disable(sensor->afvdd);
++		usleep_range(5000, 6000);
++		return 0;
++	}
+ 	if (!sensor->info->omnivision) {
+ 		clk_disable_unprepare(sensor->clk);
+ 		usleep_range(1000, 2000);
+@@ -141,23 +227,32 @@ static int unicorn_power_on(struct device *dev)
+ 	struct unicorn_sensor *sensor = to_unicorn(dev_get_drvdata(dev));
+ 	int ret;
+ 
++	if (sensor->info->sony)
++		return unicorn_sony_power_on(sensor);
++	dev_dbg(dev, "power-on: reset asserted, MCLK %lu Hz\n", clk_get_rate(sensor->clk));
+ 	gpiod_set_value_cansleep(sensor->reset, 1);
+ 	usleep_range(1000, 2000);
+ 	/* Keep the stock order: JN1 I/O -> digital -> analog; OV analog -> I/O -> digital. */
+ 	if (sensor->info->omnivision) {
++		dev_dbg(dev, "power-on: enabling AVDD\n");
+ 		ret = regulator_enable(sensor->avdd);
+ 		if (ret)
+ 			return ret;
+ 		usleep_range(1000, 2000);
+ 	}
++	dev_dbg(dev, "power-on: enabling IOVDD\n");
+ 	ret = regulator_enable(sensor->iovdd);
+ 	if (ret)
+ 		goto disable_avdd;
+ 	usleep_range(1000, 2000);
++	dev_dbg(dev, "power-on: enabling DVDD\n");
+ 	ret = regulator_enable(sensor->dvdd);
+ 	if (ret)
+ 		goto disable_iovdd;
+-	usleep_range(5000, 6000);
++	if (sensor->info->omnivision)
++		usleep_range(1000, 2000);
++	else
++		usleep_range(5000, 6000);
+ 	if (!sensor->info->omnivision) {
+ 		ret = regulator_enable(sensor->avdd);
+ 		if (ret)
+@@ -166,6 +261,7 @@ static int unicorn_power_on(struct device *dev)
+ 		gpiod_set_value_cansleep(sensor->reset, 0);
+ 		usleep_range(5000, 6000);
+ 	}
++	dev_dbg(dev, "power-on: enabling MCLK\n");
+ 	ret = clk_prepare_enable(sensor->clk);
+ 	if (ret)
+ 		goto assert_reset;
+@@ -173,7 +269,14 @@ static int unicorn_power_on(struct device *dev)
+ 		usleep_range(1000, 2000);
+ 		gpiod_set_value_cansleep(sensor->reset, 0);
+ 	}
+-	usleep_range(10000, 11000);
++	if (sensor->info->omnivision)
++		usleep_range(5000, 6000);
++	else
++		usleep_range(10000, 11000);
++	dev_dbg(dev, "power-on: ready reset=%d AVDD=%d IOVDD=%d DVDD=%d uV\n",
++		gpiod_get_value_cansleep(sensor->reset),
++		regulator_get_voltage(sensor->avdd), regulator_get_voltage(sensor->iovdd),
++		regulator_get_voltage(sensor->dvdd));
+ 	return 0;
+ 
+ assert_reset:
+@@ -359,6 +462,22 @@ static int unicorn_get_selection(struct v4l2_subdev *sd,
+ 	}
+ }
+ 
++static int unicorn_identify(struct unicorn_sensor *sensor)
++{
++	u64 id;
++	int ret;
++
++	ret = cci_read(sensor->regmap, sensor->info->chip_id_reg, &id, NULL);
++	if (ret)
++		return dev_err_probe(sensor->dev, ret, "chip ID read failed\n");
++	if ((id & (sensor->info->chip_id_mask ?: 0xffffffffU)) != sensor->info->chip_id) {
++		dev_err(sensor->dev, "unexpected sensor ID 0x%llx\n", id);
++		return -ENODEV;
++	}
++	dev_dbg(sensor->dev, "identified sensor ID 0x%llx\n", id);
++	return 0;
++}
++
+ static int unicorn_enable_streams(struct v4l2_subdev *sd,
+ 				  struct v4l2_subdev_state *state,
+ 				  u32 pad, u64 streams_mask)
+@@ -370,17 +489,28 @@ static int unicorn_enable_streams(struct v4l2_subdev *sd,
+ 	ret = pm_runtime_resume_and_get(sensor->dev);
+ 	if (ret < 0)
+ 		return ret;
++	ret = unicorn_identify(sensor);
++	if (ret)
++		goto power_down;
+ 	ret = unicorn_write_table(sensor, info->init, info->init_count);
+ 	if (ret)
+ 		goto power_down;
+ 	ret = unicorn_write_table(sensor, info->mode, info->mode_count);
+ 	if (ret)
+ 		goto power_down;
+-	/* JN1 native GRBG order; do not silently set the OEM's 180-degree flip. */
++	/* Native Bayer order: disable the OEM 180-degree flip on JN1/IMX707. */
+ 	if (!info->omnivision)
+ 		cci_write(sensor->regmap, CCI_REG8(0x0101), 0, &ret);
+ 	if (ret)
+ 		goto power_down;
++	if (info->sony) {
++		cci_write(sensor->regmap, CCI_REG8(0x0350), 0, &ret);
++		if (ret)
++			goto power_down;
++	}
++	/* IMX707 also sends VC0/DT0x30 PDAF. CAMSS RDI is configured only
++	 * for VC0/DT0x2b; do not expose the auxiliary data as image pixels.
++	 */
+ 	ret = __v4l2_ctrl_handler_setup(&sensor->ctrls);
+ 	cci_write(sensor->regmap, CCI_REG8(0x0100), 1, &ret);
+ 	if (ret)
+@@ -438,7 +568,9 @@ static const struct media_entity_operations unicorn_entity_ops = {
+ 
+ static int unicorn_check_endpoint(struct unicorn_sensor *sensor)
+ {
+-	struct v4l2_fwnode_endpoint ep = { .bus_type = V4L2_MBUS_CSI2_DPHY };
++	struct v4l2_fwnode_endpoint ep = {
++		.bus_type = sensor->info->sony ? V4L2_MBUS_CSI2_CPHY : V4L2_MBUS_CSI2_DPHY,
++	};
+ 	struct fwnode_handle *fwnode;
+ 	unsigned long bitmap;
+ 	int ret;
+@@ -450,7 +582,7 @@ static int unicorn_check_endpoint(struct unicorn_sensor *sensor)
+ 	fwnode_handle_put(fwnode);
+ 	if (ret)
+ 		return ret;
+-	if (ep.bus.mipi_csi2.num_data_lanes != 4) {
++	if (ep.bus.mipi_csi2.num_data_lanes != (sensor->info->sony ? 3 : 4)) {
+ 		ret = -EINVAL;
+ 		goto out;
+ 	}
+@@ -465,7 +597,6 @@ static int unicorn_probe(struct i2c_client *client)
+ {
+ 	struct device *dev = &client->dev;
+ 	struct unicorn_sensor *sensor;
+-	u64 id;
+ 	int ret;
+ 
+ 	sensor = devm_kzalloc(dev, sizeof(*sensor), GFP_KERNEL);
+@@ -499,14 +630,18 @@ static int unicorn_probe(struct i2c_client *client)
+ 	sensor->iovdd = devm_regulator_get(dev, "iovdd");
+ 	if (IS_ERR(sensor->iovdd))
+ 		return dev_err_probe(dev, PTR_ERR(sensor->iovdd), "IOVDD\n");
++	if (sensor->info->sony) {
++		sensor->afvdd = devm_regulator_get(dev, "afvdd");
++		if (IS_ERR(sensor->afvdd))
++			return dev_err_probe(dev, PTR_ERR(sensor->afvdd), "AFVDD\n");
++		sensor->auxvdd = devm_regulator_get(dev, "auxvdd");
++		if (IS_ERR(sensor->auxvdd))
++			return dev_err_probe(dev, PTR_ERR(sensor->auxvdd), "AUXVDD\n");
++	}
+ 	ret = unicorn_power_on(dev);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "power on\n");
+-	ret = cci_read(sensor->regmap, sensor->info->chip_id_reg, &id, NULL);
+-	if (!ret && id != sensor->info->chip_id) {
+-		dev_err(dev, "unexpected sensor ID 0x%llx\n", id);
+-		ret = -ENODEV;
+-	}
++	ret = unicorn_identify(sensor);
+ 	if (ret)
+ 		goto power_off;
+ 	ret = unicorn_init_controls(sensor);
+@@ -572,6 +707,7 @@ static const struct dev_pm_ops unicorn_pm_ops = {
+ static const struct of_device_id unicorn_of_match[] = {
+ 	{ .compatible = "xiaomi,unicorn-s5kjn1", .data = &unicorn_s5kjn1 },
+ 	{ .compatible = "xiaomi,unicorn-ov32b40", .data = &unicorn_ov32b40 },
++	{ .compatible = "xiaomi,unicorn-imx707", .data = &unicorn_imx707 },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(of, unicorn_of_match);
+@@ -587,5 +723,5 @@ static struct i2c_driver unicorn_driver = {
+ };
+ module_i2c_driver(unicorn_driver);
+ 
+-MODULE_DESCRIPTION("Xiaomi 12S Pro S5KJN1 and OV32B40 sensors");
++MODULE_DESCRIPTION("Xiaomi 12S Pro S5KJN1, OV32B40 and IMX707 sensors");
+ MODULE_LICENSE("GPL");
+diff --git a/drivers/media/platform/qcom/camss/camss-csid-680.c b/drivers/media/platform/qcom/camss/camss-csid-680.c
+index 345a67c..fb0675f 100644
+--- a/drivers/media/platform/qcom/camss/camss-csid-680.c
++++ b/drivers/media/platform/qcom/camss/camss-csid-680.c
+@@ -192,6 +192,7 @@ static void __csid_configure_rx(struct csid_device *csid,
+ 	camss = csid->camss;
+ 	val = (phy->lane_cnt - 1) << CSI2_RX_CFG0_NUM_ACTIVE_LANES;
+ 	val |= phy->lane_assign << CSI2_RX_CFG0_DL0_INPUT_SEL;
++	val |= phy->cphy << CSI2_RX_CFG0_PHY_TYPE_SEL;
+ 
+ 	if (camss->tpg && csid->tpg_linked &&
+ 	    camss->tpg[phy->csiphy_id].testgen.mode != TPG_PAYLOAD_MODE_DISABLED) {
+diff --git a/drivers/media/platform/qcom/camss/camss-csid-gen2.c b/drivers/media/platform/qcom/camss/camss-csid-gen2.c
+index eadcb2f..2ccf706 100644
+--- a/drivers/media/platform/qcom/camss/camss-csid-gen2.c
++++ b/drivers/media/platform/qcom/camss/camss-csid-gen2.c
+@@ -183,6 +183,7 @@ static void __csid_configure_rx(struct csid_device *csid,
+ 	val = (lane_cnt - 1) << CSI2_RX_CFG0_NUM_ACTIVE_LANES;
+ 	val |= phy->lane_assign << CSI2_RX_CFG0_DL0_INPUT_SEL;
+ 	val |= phy->csiphy_id << CSI2_RX_CFG0_PHY_NUM_SEL;
++	val |= phy->cphy << CSI2_RX_CFG0_PHY_TYPE_SEL;
+ 	writel_relaxed(val, csid->base + CSID_CSI2_RX_CFG0);
+ 
+ 	val = 1 << CSI2_RX_CFG1_PACKET_ECC_CORRECTION_EN;
+diff --git a/drivers/media/platform/qcom/camss/camss-csid.c b/drivers/media/platform/qcom/camss/camss-csid.c
+index 48459b4..d87d0d1 100644
+--- a/drivers/media/platform/qcom/camss/camss-csid.c
++++ b/drivers/media/platform/qcom/camss/camss-csid.c
+@@ -1278,6 +1278,7 @@ static int csid_link_setup(struct media_entity *entity,
+ 			csid->phy.lane_cnt = tpg->res->lane_cnt;
+ 			csid->phy.csiphy_id = tpg->id;
+ 			csid->phy.lane_assign = csid_get_lane_assign(NULL, csid->phy.lane_cnt);
++			csid->phy.cphy = false;
+ 			csid->tpg_linked = true;
+ 		} else {
+ 			csiphy = v4l2_get_subdevdata(sd);
+@@ -1290,6 +1291,7 @@ static int csid_link_setup(struct media_entity *entity,
+ 			csid->phy.csiphy_id = csiphy->id;
+ 
+ 			lane_cfg = &csiphy->cfg.csi2->lane_cfg;
++			csid->phy.cphy = lane_cfg->bus_type == V4L2_MBUS_CSI2_CPHY;
+ 			csid->phy.lane_cnt = lane_cfg->num_data;
+ 			csid->phy.lane_assign = csid_get_lane_assign(lane_cfg, lane_cfg->num_data);
+ 			csid->tpg_linked = false;
+diff --git a/drivers/media/platform/qcom/camss/camss-csid.h b/drivers/media/platform/qcom/camss/camss-csid.h
+index 5296b10..1fbffff 100644
+--- a/drivers/media/platform/qcom/camss/camss-csid.h
++++ b/drivers/media/platform/qcom/camss/camss-csid.h
+@@ -65,6 +65,7 @@ struct csid_testgen_config {
+ };
+ 
+ struct csid_phy_config {
++	bool cphy;
+ 	u8 csiphy_id;
+ 	u8 lane_cnt;
+ 	u32 lane_assign;
+diff --git a/drivers/media/platform/qcom/camss/camss-csiphy.c b/drivers/media/platform/qcom/camss/camss-csiphy.c
+index 84317e3..90b61e8 100644
+--- a/drivers/media/platform/qcom/camss/camss-csiphy.c
++++ b/drivers/media/platform/qcom/camss/camss-csiphy.c
+@@ -327,47 +327,36 @@ static int csiphy_stream_on(struct csiphy_device *csiphy)
+ 	u8 bpp = csiphy_get_bpp(csiphy->res->formats->formats, csiphy->res->formats->nformats,
+ 				csiphy->fmt[MSM_CSIPHY_PAD_SINK].code);
+ 	struct csiphy_lanes_cfg *lncfg = &csiphy->cfg.csi2->lane_cfg;
+-	struct phy_configure_opts_mipi_dphy *dphy_cfg;
+-	union phy_configure_opts dphy_opts = { 0 };
+-	struct device *dev = csiphy->camss->dev;
+-	u8 num_lanes = lncfg->num_data;
++	union phy_configure_opts opts = { 0 };
++	bool cphy = lncfg->bus_type == V4L2_MBUS_CSI2_CPHY;
++	struct media_pad *sensor_pad;
+ 	s64 link_freq;
+ 	int ret;
+ 
+-	dphy_cfg = &dphy_opts.mipi_dphy;
+-
+-	link_freq = camss_get_link_freq(&csiphy->subdev.entity, bpp, num_lanes);
+-
+-	if (link_freq <= 0) {
+-		dev_err(dev,
+-			"Cannot get CSI2 transmitter's link frequency\n");
++	sensor_pad = camss_find_sensor_pad(&csiphy->subdev.entity);
++	if (!sensor_pad)
++		return -ENODEV;
++	/* C-PHY link_freq = symbol_rate / 2, 16 bits per 7 symbols per trio. */
++	link_freq = v4l2_get_link_freq(sensor_pad, cphy ? bpp * 7 : bpp,
++				      (cphy ? 32 : 2) * lncfg->num_data);
++	if (link_freq <= 0)
+ 		return -EINVAL;
+-	}
+ 
+-	ret = phy_mipi_dphy_get_default_config_for_hsclk(2 * link_freq, num_lanes,
+-							 dphy_cfg);
+-	if (ret < 0) {
+-		dev_err(dev, "Invalid config for link frequency %lld\n",
+-			link_freq);
++	if (cphy)
++		ret = phy_mipi_cphy_get_default_config_for_link_freq(link_freq,
++					lncfg->num_data, &opts.mipi_cphy);
++	else
++		ret = phy_mipi_dphy_get_default_config_for_hsclk(2 * link_freq,
++					lncfg->num_data, &opts.mipi_dphy);
++	if (ret)
+ 		return ret;
+-	}
+-
+-	ret = phy_set_mode(csiphy->phy, PHY_MODE_MIPI_DPHY);
+-	if (ret) {
+-		dev_err(dev, "Failed to set phy mode\n");
++	ret = phy_set_mode(csiphy->phy, cphy ? PHY_MODE_MIPI_CPHY : PHY_MODE_MIPI_DPHY);
++	if (ret)
++		return ret;
++	ret = phy_configure(csiphy->phy, &opts);
++	if (ret)
+ 		return ret;
+-	}
+-
+-	ret = phy_configure(csiphy->phy, &dphy_opts);
+-	if (ret) {
+-		dev_err(dev, "failed to configure MIPI D-PHY\n");
+-		goto error;
+-	}
+-
+ 	return phy_power_on(csiphy->phy);
+-
+-error:
+-	return ret;
+ }
+ 
+ /*
+diff --git a/drivers/media/platform/qcom/camss/camss-csiphy.h b/drivers/media/platform/qcom/camss/camss-csiphy.h
+index 8c3319f..6d9d83b 100644
+--- a/drivers/media/platform/qcom/camss/camss-csiphy.h
++++ b/drivers/media/platform/qcom/camss/camss-csiphy.h
+@@ -38,6 +38,7 @@ struct csiphy_lane {
+  */
+ struct csiphy_lanes_cfg {
+ 	int num_data;
++	enum v4l2_mbus_type bus_type;
+ 	struct csiphy_lane *data;
+ 	struct csiphy_lane clk;
+ };
+diff --git a/drivers/media/platform/qcom/camss/camss.c b/drivers/media/platform/qcom/camss/camss.c
+index c7fb372..8e90e51 100644
+--- a/drivers/media/platform/qcom/camss/camss.c
++++ b/drivers/media/platform/qcom/camss/camss.c
+@@ -4914,11 +4914,8 @@ static int camss_parse_endpoint_node(struct device *dev,
+ 	if (ret)
+ 		return ret;
+ 
+-	/*
+-	 * Most SoCs support both D-PHY and C-PHY standards, but currently only
+-	 * D-PHY is supported in the driver.
+-	 */
+-	if (vep.bus_type != V4L2_MBUS_CSI2_DPHY) {
++	if (vep.bus_type != V4L2_MBUS_CSI2_DPHY &&
++	    (vep.bus_type != V4L2_MBUS_CSI2_CPHY || !lane_base)) {
+ 		dev_err(dev, "Unsupported bus type %d\n", vep.bus_type);
+ 		return -EINVAL;
+ 	}
+@@ -4926,9 +4923,13 @@ static int camss_parse_endpoint_node(struct device *dev,
+ 	csd->interface.csiphy_id = vep.base.port;
+ 
+ 	mipi_csi2 = &vep.bus.mipi_csi2;
++	lncfg->bus_type = vep.bus_type;
+ 	lncfg->clk.pos = mipi_csi2->clock_lane;
+ 	lncfg->clk.pol = mipi_csi2->lane_polarities[0];
+ 	lncfg->num_data = mipi_csi2->num_data_lanes;
++	if (lncfg->num_data < 1 ||
++	    lncfg->num_data > (vep.bus_type == V4L2_MBUS_CSI2_CPHY ? 3 : 4))
++		return -EINVAL;
+ 
+ 	lncfg->data = devm_kcalloc(dev, lncfg->num_data, sizeof(*lncfg->data), GFP_KERNEL);
+ 	if (!lncfg->data)
+@@ -4937,11 +4938,14 @@ static int camss_parse_endpoint_node(struct device *dev,
+ 	for (i = 0; i < lncfg->num_data; i++) {
+ 		u8 lane = mipi_csi2->data_lanes[i];
+ 
+-		if (lane < lane_base || lane - lane_base >= MSM_CSIPHY_MAX_DATA_LANE) {
++		if (lane < lane_base ||
++		    lane - lane_base >= (vep.bus_type == V4L2_MBUS_CSI2_CPHY ? 3 : 4)) {
+ 			dev_err(dev, "invalid data-lane %u\n", lane);
+ 			return -EINVAL;
+ 		}
+ 
++		if (vep.bus_type == V4L2_MBUS_CSI2_CPHY && mipi_csi2->lane_polarities[i + 1])
++			return -EINVAL;
+ 		lncfg->data[i].pos = mipi_csi2->data_lanes[i] - lane_base;
+ 		lncfg->data[i].pol = mipi_csi2->lane_polarities[i + 1];
+ 	}
+@@ -5421,57 +5425,60 @@ static int camss_subdev_notifier_bound(struct v4l2_async_notifier *async,
+ 	struct camss *camss = container_of(async, struct camss, notifier);
+ 	struct camss_async_subdev *csd =
+ 		container_of(asd, struct camss_async_subdev, asd);
+-	u8 id = csd->interface.csiphy_id;
+-	struct csiphy_device *csiphy = &camss->csiphy[id];
++	struct csiphy_device *csiphy = &camss->csiphy[csd->interface.csiphy_id];
++	struct media_entity *sensor = &subdev->entity;
++	unsigned int pad;
++	int ret;
++
++	if (csiphy->cfg.csi2)
++		return -EBUSY;
++	for (pad = 0; pad < sensor->num_pads; pad++)
++		if (sensor->pads[pad].flags & MEDIA_PAD_FL_SOURCE)
++			break;
++	if (pad == sensor->num_pads)
++		return -EINVAL;
+ 
+ 	csiphy->cfg.csi2 = &csd->interface.csi2;
+ 	subdev->host_priv = csiphy;
++	ret = media_create_pad_link(sensor, pad, &csiphy->subdev.entity,
++				    MSM_CSIPHY_PAD_SINK,
++				    MEDIA_LNK_FL_IMMUTABLE | MEDIA_LNK_FL_ENABLED);
++	if (ret)
++		goto clear_binding;
+ 
+-	return 0;
++	/* A missing sensor must not hide the cameras that have already bound. */
++	ret = v4l2_device_register_subdev_nodes(&camss->v4l2_dev);
++	if (!ret)
++		return 0;
++	media_entity_remove_links(sensor);
++clear_binding:
++	csiphy->cfg.csi2 = NULL;
++	subdev->host_priv = NULL;
++	return ret;
+ }
+ 
+-static int camss_subdev_notifier_complete(struct v4l2_async_notifier *async)
++static void camss_subdev_notifier_unbind(struct v4l2_async_notifier *async,
++					struct v4l2_subdev *subdev,
++					struct v4l2_async_connection *asd)
+ {
+-	struct camss *camss = container_of(async, struct camss, notifier);
+-	struct v4l2_device *v4l2_dev = &camss->v4l2_dev;
+-	struct v4l2_subdev *sd;
+-
+-	list_for_each_entry(sd, &v4l2_dev->subdevs, list) {
+-		struct csiphy_device *csiphy = sd->host_priv;
+-		struct media_entity *input, *sensor;
+-		unsigned int i;
+-		int ret;
++	struct csiphy_device *csiphy = subdev->host_priv;
+ 
+-		if (!csiphy)
+-			continue;
+-
+-		input = &csiphy->subdev.entity;
+-		sensor = &sd->entity;
+-
+-		for (i = 0; i < sensor->num_pads; i++) {
+-			if (sensor->pads[i].flags & MEDIA_PAD_FL_SOURCE)
+-				break;
+-		}
+-		if (i == sensor->num_pads) {
+-			dev_err(camss->dev,
+-				"No source pad in external entity\n");
+-			return -EINVAL;
+-		}
++	media_entity_remove_links(&subdev->entity);
++	if (csiphy)
++		csiphy->cfg.csi2 = NULL;
++	subdev->host_priv = NULL;
++}
+ 
+-		ret = media_create_pad_link(sensor, i, input,
+-					    MSM_CSIPHY_PAD_SINK,
+-					    MEDIA_LNK_FL_IMMUTABLE | MEDIA_LNK_FL_ENABLED);
+-		if (ret < 0) {
+-			camss_link_err(camss, sensor->name, input->name, ret);
+-			return ret;
+-		}
+-	}
++static int camss_subdev_notifier_complete(struct v4l2_async_notifier *async)
++{
++	struct camss *camss = container_of(async, struct camss, notifier);
+ 
+ 	return v4l2_device_register_subdev_nodes(&camss->v4l2_dev);
+ }
+ 
+ static const struct v4l2_async_notifier_operations camss_subdev_notifier_ops = {
+ 	.bound = camss_subdev_notifier_bound,
++	.unbind = camss_subdev_notifier_unbind,
+ 	.complete = camss_subdev_notifier_complete,
+ };
+ 
+diff --git a/drivers/media/v4l2-core/v4l2-device.c b/drivers/media/v4l2-core/v4l2-device.c
+index 67e3073..55dc13b 100644
+--- a/drivers/media/v4l2-core/v4l2-device.c
++++ b/drivers/media/v4l2-core/v4l2-device.c
+@@ -192,9 +192,20 @@ int __v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev,
+ 					bool read_only)
+ {
+ 	struct video_device *vdev;
++	struct video_device **created;
+ 	struct v4l2_subdev *sd;
++	unsigned int count = 0, capacity = 0;
+ 	int err;
+ 
++	list_for_each_entry(sd, &v4l2_dev->subdevs, list)
++		if ((sd->flags & V4L2_SUBDEV_FL_HAS_DEVNODE) && !sd->devnode)
++			capacity++;
++	if (!capacity)
++		return 0;
++	created = kcalloc(capacity, sizeof(*created), GFP_KERNEL);
++	if (!created)
++		return -ENOMEM;
++
+ 	/* Register a device node for every subdev marked with the
+ 	 * V4L2_SUBDEV_FL_HAS_DEVNODE flag.
+ 	 */
+@@ -228,6 +239,7 @@ int __v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev,
+ 			kfree(vdev);
+ 			goto clean_up;
+ 		}
++		created[count++] = vdev;
+ #if defined(CONFIG_MEDIA_CONTROLLER)
+ 		sd->entity.info.dev.major = VIDEO_MAJOR;
+ 		sd->entity.info.dev.minor = vdev->minor;
+@@ -247,15 +259,17 @@ int __v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev,
+ 		}
+ #endif
+ 	}
++	kfree(created);
+ 	return 0;
+ 
+ clean_up:
+-	list_for_each_entry(sd, &v4l2_dev->subdevs, list) {
+-		if (!sd->devnode)
+-			break;
+-		video_unregister_device(sd->devnode);
++	while (count) {
++		vdev = created[--count];
++		sd = video_get_drvdata(vdev);
++		sd->devnode = NULL;
++		video_unregister_device(vdev);
+ 	}
+-
++	kfree(created);
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(__v4l2_device_register_subdev_nodes);
+diff --git a/drivers/phy/qualcomm/phy-qcom-mipi-csi2-3ph-dphy.c b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-3ph-dphy.c
+index 966d79c..759428f 100644
+--- a/drivers/phy/qualcomm/phy-qcom-mipi-csi2-3ph-dphy.c
++++ b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-3ph-dphy.c
+@@ -22,6 +22,7 @@
+ #define CSIPHY_3PH_CMN_CSI_COMMON_STATUSn(offset, n)	((offset) + 0xb0 + 0x4 * (n))
+ 
+ #define CSIPHY_2PH_LN_CSI_2PHASE_CTRL9n(n)		((0x200 * (n)) + 0x24)
++#define CSIPHY_LN_CTRLn(ln, n)			((0x200 * (ln)) + 0x4 * (n))
+ 
+ /*
+  * 3 phase CSI has 19 common status regs with only 0-10 being used
+@@ -42,9 +43,13 @@
+ #define CSI_CTRL_MAX					33
+ 
+ #define CSIPHY_DEFAULT_PARAMS				0
++#define CSIPHY_DNP_PARAMS				1
++#define CSIPHY_SETTLE_CNT_HIGHER_BYTE			3
+ #define CSIPHY_SETTLE_CNT_LOWER_BYTE			2
+ #define CSIPHY_SKEW_CAL					7
+ 
++#include "phy-qcom-mipi-csi2-l2s.h"
++
+ /* 4nm 2PH v 2.1.2 2p5Gbps 4 lane DPHY mode */
+ static const struct
+ mipi_csi2phy_lane_regs lane_regs_x1e80100[] = {
+@@ -161,6 +166,144 @@ mipi_csi2phy_lane_regs lane_regs_x1e80100[] = {
+ 	{.reg_addr = 0x0c64, .reg_data = 0x7f, .param_type = CSIPHY_SKEW_CAL},
+ };
+ 
++/* Qualcomm's 2.5 Gsps settings, from the GPL-2.0 cam_csiphy_2_1_2_hwreg.h */
++static const struct
++mipi_csi2phy_lane_regs lane_regs_v2_1_2_cphy[] = {
++	/* Power up lanes 3ph mode */
++	{.reg_addr = 0x101c, .reg_data = 0x7a, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = 0x1018, .reg_data = 0x01, .param_type = CSIPHY_DEFAULT_PARAMS},
++
++	/* datarate_212_2p5Gsps: AFE settings */
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 26), .reg_data = 0xf1, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 37), .reg_data = 0x01, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 34), .reg_data = 0x20, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 30), .reg_data = 0x20, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 27), .reg_data = 0x3d, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 35), .reg_data = 0x30, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 28), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 29), .reg_data = 0x03, .param_type = CSIPHY_DEFAULT_PARAMS},
++
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 26), .reg_data = 0xf1, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 37), .reg_data = 0x01, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 34), .reg_data = 0x20, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 30), .reg_data = 0x20, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 27), .reg_data = 0x3d, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 35), .reg_data = 0x30, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 28), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 29), .reg_data = 0x03, .param_type = CSIPHY_DEFAULT_PARAMS},
++
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 26), .reg_data = 0xf1, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 37), .reg_data = 0x01, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 34), .reg_data = 0x20, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 30), .reg_data = 0x20, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 27), .reg_data = 0x3d, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 35), .reg_data = 0x30, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 28), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 29), .reg_data = 0x03, .delay_us = 10,
++	 .param_type = CSIPHY_DEFAULT_PARAMS},
++
++	/* csiphy_3ph_v2_1_2_reg */
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 61), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 62), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 63), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 60), .reg_data = 0xef, .delay_us = 3,
++	 .param_type = CSIPHY_DEFAULT_PARAMS},
++
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 61), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 62), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 63), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 60), .reg_data = 0xef, .delay_us = 3,
++	 .param_type = CSIPHY_DEFAULT_PARAMS},
++
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 61), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 62), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 63), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 60), .reg_data = 0xef, .delay_us = 3,
++	 .param_type = CSIPHY_DEFAULT_PARAMS},
++
++	/* datarate_212_2p5Gsps, then csiphy_3ph_v2_1_2_reg */
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 3), .reg_data = 0x22,
++	 .param_type = CSIPHY_SETTLE_CNT_LOWER_BYTE},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 2), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 4), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 5), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 1), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 57), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 58), .reg_data = 0x7f, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 59), .reg_data = 0x7f, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 6), .reg_data = 0x3e, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 7), .reg_data = 0x41, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 8), .reg_data = 0x41, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 9), .reg_data = 0x7f, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 10), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 11), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 25), .reg_data = 0x01, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 17), .reg_data = 0xb2, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 68), .reg_data = 0x35, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 47), .reg_data = 0xd0, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 21), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 16), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 24), .reg_data = 0xa8, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 33), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(1, 36), .reg_data = 0x02, .param_type = CSIPHY_DEFAULT_PARAMS},
++
++	/* datarate_212_2p5Gsps, then csiphy_3ph_v2_1_2_reg */
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 3), .reg_data = 0x22,
++	 .param_type = CSIPHY_SETTLE_CNT_LOWER_BYTE},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 2), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 4), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 5), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 1), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 57), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 58), .reg_data = 0x7f, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 59), .reg_data = 0x7f, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 6), .reg_data = 0x3e, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 7), .reg_data = 0x41, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 8), .reg_data = 0x41, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 9), .reg_data = 0x7f, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 10), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 11), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 25), .reg_data = 0x01, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 17), .reg_data = 0xb2, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 68), .reg_data = 0x35, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 47), .reg_data = 0xd0, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 21), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 16), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 24), .reg_data = 0xa8, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 33), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(3, 36), .reg_data = 0x02, .param_type = CSIPHY_DEFAULT_PARAMS},
++
++	/* datarate_212_2p5Gsps, then csiphy_3ph_v2_1_2_reg */
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 3), .reg_data = 0x22,
++	 .param_type = CSIPHY_SETTLE_CNT_LOWER_BYTE},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 2), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 4), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 5), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 1), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 57), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 58), .reg_data = 0x7f, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 59), .reg_data = 0x7f, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 6), .reg_data = 0x3e, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 7), .reg_data = 0x41, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 8), .reg_data = 0x41, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 9), .reg_data = 0x7f, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 10), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 11), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 25), .reg_data = 0x01, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 17), .reg_data = 0xb2, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 68), .reg_data = 0x35, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 47), .reg_data = 0xd0, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 21), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 16), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 24), .reg_data = 0xa8, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 33), .reg_data = 0x00, .param_type = CSIPHY_DEFAULT_PARAMS},
++	{.reg_addr = CSIPHY_LN_CTRLn(5, 36), .reg_data = 0x02, .param_type = CSIPHY_DEFAULT_PARAMS},
++
++	/* csiphy_reset_exit_reg_2_1_2, 3PH */
++	{.reg_addr = 0x1000, .reg_data = 0x0e, .delay_us = 3048,
++	 .param_type = CSIPHY_DEFAULT_PARAMS},
++};
++
+ static inline const struct mipi_csi2phy_device_regs *
+ csi2phy_dev_to_regs(struct mipi_csi2phy_device *csi2phy)
+ {
+@@ -246,9 +389,18 @@ phy_qcom_mipi_csi2_gen2_config_lanes(struct mipi_csi2phy_device *csi2phy,
+ 				     u8 settle_cnt)
+ {
+ 	const struct mipi_csi2phy_device_regs *regs = csi2phy_dev_to_regs(csi2phy);
+-	const struct mipi_csi2phy_lane_regs *r = regs->init_seq;
+-	int i, array_size = regs->lane_array_size;
++	const struct mipi_csi2phy_lane_regs *r;
++	int array_size;
+ 	u32 val;
++	int i;
++
++	if (csi2phy->phy_mode == PHY_MODE_MIPI_CPHY) {
++		r = regs->cphy_init_seq;
++		array_size = regs->cphy_lane_array_size;
++	} else {
++		r = regs->dphy_init_seq;
++		array_size = regs->dphy_lane_array_size;
++	}
+ 
+ 	for (i = 0; i < array_size; i++, r++) {
+ 		switch (r->param_type) {
+@@ -264,38 +416,41 @@ phy_qcom_mipi_csi2_gen2_config_lanes(struct mipi_csi2phy_device *csi2phy,
+ 		}
+ 		writel(val, csi2phy->base + r->reg_addr);
+ 		if (r->delay_us)
+-			udelay(r->delay_us);
++			fsleep(r->delay_us);
+ 	}
+ }
+ 
+-static int phy_qcom_mipi_csi2_lanes_enable(struct mipi_csi2phy_device *csi2phy,
+-					   struct mipi_csi2phy_stream_cfg *cfg)
++/*
++ * CSI_COMMON_CTRL5 is a physical lane power-up bitmap:
++ * - Bits [0,2,4,6] → D-PHY data lanes(LN0, LN2, LN4, LN6)
++ * - Bits [1,3,5] → C-PHY trio lanes(LN1, LN3, LN5)
++ * - Bit [7] → D-PHY clock lane(LNCK) dedicated clock enable
++ */
++static u8 phy_qcom_mipi_csi2_lane_mask(struct mipi_csi2phy_device *csi2phy,
++				       struct mipi_csi2phy_stream_cfg *cfg)
+ {
+-	const struct mipi_csi2phy_device_regs *regs = csi2phy_dev_to_regs(csi2phy);
+ 	struct mipi_csi2phy_lanes_cfg *lane_cfg = &cfg->lane_cfg;
+-	u8 settle_cnt;
+-	u8 val;
++	u8 lane_mask = 0;
++	u8 offset = 0;
+ 	int i;
+ 
+-	if (cfg->link_freq <= 0)
+-		return -EINVAL;
+-
+-	settle_cnt = phy_qcom_mipi_csi2_settle_cnt_calc(cfg->link_freq, csi2phy->timer_clk_rate);
+-	if (!settle_cnt)
+-		return -ENODEV;
++	if (csi2phy->phy_mode == PHY_MODE_MIPI_CPHY)
++		offset = 1;
++	else
++		lane_mask = BIT(lane_cfg->clk.pos);
+ 
+-	/*
+-	 * CSI_COMMON_CTRL5 is a physical lane power-up bitmap:
+-	 * - Bits [0,2,4,6] → D-PHY data lanes(LN0, LN2, LN4, LN6)
+-	 * - Bits [1,3,5] → C-PHY trio lanes(LN1, LN3, LN5)
+-	 * - Bit [7] → D-PHY clock lane(LNCK) dedicated clock enable
+-	 */
+-	val = BIT(lane_cfg->clk.pos);
+ 	for (i = 0; i < cfg->num_data_lanes; i++)
+-		val |= BIT(lane_cfg->data[i].pos * 2);
++		lane_mask |= BIT(lane_cfg->data[i].pos * 2 + offset);
+ 
+-	writel(val, csi2phy->base +
+-	       CSIPHY_3PH_CMN_CSI_COMMON_CTRLn(regs->common_regs_offset, 5));
++	return lane_mask;
++}
++
++static void
++phy_qcom_mipi_csi2_dphy_lane_polarities(struct mipi_csi2phy_device *csi2phy,
++					struct mipi_csi2phy_stream_cfg *cfg)
++{
++	struct mipi_csi2phy_lanes_cfg *lane_cfg = &cfg->lane_cfg;
++	int i;
+ 
+ 	/* Lane configuration for polarity @ CSIPHY-base + CTRL9 */
+ 	for (i = 0; i < cfg->num_data_lanes; i++) {
+@@ -308,6 +463,103 @@ static int phy_qcom_mipi_csi2_lanes_enable(struct mipi_csi2phy_device *csi2phy,
+ 
+ 	if (lane_cfg->clk.pol)
+ 		writel(BIT(2), csi2phy->base + CSIPHY_2PH_LN_CSI_2PHASE_CTRL9n(lane_cfg->clk.pos));
++}
++
++static void l2s_write_regs(struct mipi_csi2phy_device *csi2phy,
++			   const struct mipi_csi2phy_lane_regs *regs,
++			   unsigned int count, u16 settle)
++{
++	unsigned int i;
++
++	for (i = 0; i < count; i++) {
++		u32 val = regs[i].reg_data;
++
++		switch (regs[i].param_type) {
++		case CSIPHY_DNP_PARAMS:
++			continue;
++		case CSIPHY_SETTLE_CNT_LOWER_BYTE:
++			val = settle & 0xff;
++			break;
++		case CSIPHY_SETTLE_CNT_HIGHER_BYTE:
++			val = settle >> 8;
++			break;
++		}
++		writel(val, csi2phy->base + regs[i].reg_addr);
++		if (regs[i].delay_us)
++			fsleep(regs[i].delay_us);
++	}
++}
++
++static int l2s_cphy_lanes_enable(struct mipi_csi2phy_device *csi2phy,
++				struct mipi_csi2phy_stream_cfg *cfg)
++{
++	const struct l2s_cphy_rate *rate = NULL;
++	u64 symbol_rate = 2 * cfg->link_freq;
++	unsigned int i;
++	u16 settle;
++
++	/* This board's OEM table and routing are for all three physical trios. */
++	if (cfg->num_data_lanes != 3 ||
++	    cfg->lane_cfg.data[0].pos != 0 ||
++	    cfg->lane_cfg.data[1].pos != 1 ||
++	    cfg->lane_cfg.data[2].pos != 2)
++		return -EINVAL;
++	/* OEM bandwidth ceilings use 2.28 bits/symbol (not exact 16/7).
++	 * Compare in symbol units so that rounding cannot select the next CDR.
++	 */
++	for (i = 0; i < ARRAY_SIZE(l2s_cphy_rates); i++)
++		if (symbol_rate * 228 <= l2s_cphy_rates[i].max_bps * 100) {
++			rate = &l2s_cphy_rates[i];
++			break;
++		}
++	if (!rate)
++		return -ERANGE;
++
++	/* CamX encodes settleTimeNs * 200000000; KMD divides by the same
++	 * factor. Despite its name, the stock field is the register count.
++	 */
++	settle = 30;
++	writel(0x2a, csi2phy->base + 0x1014);
++	writel(0, csi2phy->base + 0x1084);
++	writel(1, csi2phy->base + 0x1018);
++	writel(0x7a, csi2phy->base + 0x101c);
++	l2s_write_regs(csi2phy, rate->regs, ARRAY_SIZE(rate->regs), settle);
++	l2s_write_regs(csi2phy, lane_regs_l2s_cphy,
++		       ARRAY_SIZE(lane_regs_l2s_cphy), settle);
++	/* Reset exit for v2.1.3 three-phase mode; preserve its 3048 us delay. */
++	writel(0x0e, csi2phy->base + 0x1000);
++	fsleep(3048);
++	for (i = CSI_COMMON_STATUS_NUM; i < CSI_CTRL_STATUS_INDEX; i++)
++		writel(0, csi2phy->base + 0x1000 + i * 4);
++	dev_dbg(csi2phy->dev, "C-PHY %llu sym/s, CDR ceiling %llu b/s, settle %u\n",
++		symbol_rate, rate->max_bps, settle);
++	return 0;
++}
++
++static int phy_qcom_mipi_csi2_lanes_enable(struct mipi_csi2phy_device *csi2phy,
++					   struct mipi_csi2phy_stream_cfg *cfg)
++{
++	const struct mipi_csi2phy_device_regs *regs = csi2phy_dev_to_regs(csi2phy);
++	u8 settle_cnt;
++	u8 val;
++	int i;
++
++	if (cfg->link_freq <= 0)
++		return -EINVAL;
++
++	if (csi2phy->soc_cfg->l2s_cphy)
++		return l2s_cphy_lanes_enable(csi2phy, cfg);
++
++	settle_cnt = phy_qcom_mipi_csi2_settle_cnt_calc(cfg->link_freq, csi2phy->timer_clk_rate);
++	if (!settle_cnt)
++		return -ENODEV;
++
++	val = phy_qcom_mipi_csi2_lane_mask(csi2phy, cfg);
++	writel(val, csi2phy->base +
++	       CSIPHY_3PH_CMN_CSI_COMMON_CTRLn(regs->common_regs_offset, 5));
++
++	if (csi2phy->phy_mode == PHY_MODE_MIPI_DPHY)
++		phy_qcom_mipi_csi2_dphy_lane_polarities(csi2phy, cfg);
+ 
+ 	val = CSIPHY_3PH_CMN_CSI_COMMON_CTRL6_COMMON_PWRDN_B;
+ 	writel(val, csi2phy->base +
+@@ -372,8 +624,10 @@ static struct mipi_csi2_genpd x1e_genpds[] = {
+ const struct mipi_csi2phy_soc_cfg mipi_csi2_dphy_4nm_x1e = {
+ 	.ops = &phy_qcom_mipi_csi2_ops_3ph_1_0,
+ 	.reg_info = {
+-		.init_seq = lane_regs_x1e80100,
+-		.lane_array_size = ARRAY_SIZE(lane_regs_x1e80100),
++		.dphy_init_seq = lane_regs_x1e80100,
++		.dphy_lane_array_size = ARRAY_SIZE(lane_regs_x1e80100),
++		.cphy_init_seq = lane_regs_v2_1_2_cphy,
++		.cphy_lane_array_size = ARRAY_SIZE(lane_regs_v2_1_2_cphy),
+ 		.common_regs_offset = 0x1000,
+ 	},
+ 	.supply_names = (const char **)x1e_supplies,
+@@ -383,3 +637,18 @@ const struct mipi_csi2phy_soc_cfg mipi_csi2_dphy_4nm_x1e = {
+ 	.genpds = x1e_genpds,
+ 	.num_genpds = ARRAY_SIZE(x1e_genpds),
+ };
++
++/* The board-specific compatible has no X1E C-PHY fallback. */
++const struct mipi_csi2phy_soc_cfg mipi_csi2_cphy_l2s = {
++	.ops = &phy_qcom_mipi_csi2_ops_3ph_1_0,
++	.l2s_cphy = true,
++	.reg_info = {
++		.cphy_init_seq = lane_regs_l2s_cphy,
++		.cphy_lane_array_size = ARRAY_SIZE(lane_regs_l2s_cphy),
++		.common_regs_offset = 0x1000,
++	},
++	.clk_names = (const char **)x1e_clks,
++	.num_clk = ARRAY_SIZE(x1e_clks),
++	.genpds = x1e_genpds,
++	.num_genpds = ARRAY_SIZE(x1e_genpds),
++};
+diff --git a/drivers/phy/qualcomm/phy-qcom-mipi-csi2-core.c b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-core.c
+index bffa9a3..5d929bc 100644
+--- a/drivers/phy/qualcomm/phy-qcom-mipi-csi2-core.c
++++ b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-core.c
+@@ -96,6 +96,27 @@ phy_qcom_mipi_csi2_set_clock_rates(struct mipi_csi2phy_device *csi2phy,
+ 	return ret;
+ }
+ 
++static int
++phy_qcom_mipi_csi2_configure_cphy(struct mipi_csi2phy_device *csi2phy,
++				  struct phy_configure_opts_mipi_cphy *cphy_cfg)
++{
++	struct mipi_csi2phy_stream_cfg *stream_cfg = &csi2phy->stream_cfg;
++	int ret;
++
++	ret = phy_mipi_cphy_config_validate(cphy_cfg);
++	if (ret)
++		return ret;
++
++	if (cphy_cfg->trios != stream_cfg->num_data_lanes)
++		return -EINVAL;
++
++	if (csi2phy->soc_cfg->l2s_cphy && cphy_cfg->symbol_rate != 1715200000ULL)
++		return -EINVAL;
++	stream_cfg->link_freq = phy_mipi_cphy_link_freq(cphy_cfg);
++
++	return 0;
++}
++
+ static int phy_qcom_mipi_csi2_configure(struct phy *phy,
+ 					union phy_configure_opts *opts)
+ {
+@@ -104,6 +125,9 @@ static int phy_qcom_mipi_csi2_configure(struct phy *phy,
+ 	struct mipi_csi2phy_stream_cfg *stream_cfg = &csi2phy->stream_cfg;
+ 	int ret;
+ 
++	if (csi2phy->phy_mode == PHY_MODE_MIPI_CPHY)
++		return phy_qcom_mipi_csi2_configure_cphy(csi2phy, &opts->mipi_cphy);
++
+ 	ret = phy_mipi_dphy_config_validate(dphy_cfg);
+ 	if (ret)
+ 		return ret;
+@@ -125,10 +149,13 @@ static int phy_qcom_mipi_csi2_set_mode(struct phy *phy,
+ {
+ 	struct mipi_csi2phy_device *csi2phy = phy_get_drvdata(phy);
+ 
+-	if (mode != PHY_MODE_MIPI_DPHY)
++	if (mode != PHY_MODE_MIPI_DPHY && mode != PHY_MODE_MIPI_CPHY)
+ 		return -EOPNOTSUPP;
+ 
+-	csi2phy->phy_mode = mode;
++	/* The endpoint's bus-type sets the mode; only that one is accepted. */
++	if (mode != csi2phy->phy_mode)
++		return -EINVAL;
++
+ 	return 0;
+ }
+ 
+@@ -259,6 +286,8 @@ static int phy_qcom_mipi_csi2_parse_routing(struct mipi_csi2phy_device *csi2phy)
+ 	struct fwnode_handle *ep;
+ 	int num_polarities;
+ 	int num_data_lanes;
++	int max_lanes;
++	u32 used_lanes = 0;
+ 	u32 bus_type;
+ 	int i, ret;
+ 
+@@ -279,14 +308,30 @@ static int phy_qcom_mipi_csi2_parse_routing(struct mipi_csi2phy_device *csi2phy)
+ 	bus_type = MEDIA_BUS_TYPE_CSI2_DPHY;
+ 	fwnode_property_read_u32(ep, "bus-type", &bus_type);
+ 
+-	if (bus_type != MEDIA_BUS_TYPE_CSI2_DPHY) {
++	switch (bus_type) {
++	case MEDIA_BUS_TYPE_CSI2_DPHY:
++		if (csi2phy->soc_cfg->l2s_cphy) {
++			ret = -EOPNOTSUPP;
++			goto out_put;
++		}
++		csi2phy->phy_mode = PHY_MODE_MIPI_DPHY;
++		max_lanes = CSI2_MAX_DATA_LANES;
++		break;
++	case MEDIA_BUS_TYPE_CSI2_CPHY:
++		if (csi2phy->soc_cfg->reg_info.cphy_init_seq) {
++			csi2phy->phy_mode = PHY_MODE_MIPI_CPHY;
++			max_lanes = PHY_MIPI_CPHY_MAX_TRIOS;
++			break;
++		}
++		fallthrough;
++	default:
+ 		ret = -EOPNOTSUPP;
+ 		dev_err(dev, "Unsupported bus-type %u\n", bus_type);
+ 		goto out_put;
+ 	}
+ 
+ 	num_data_lanes = fwnode_property_count_u32(ep, "data-lanes");
+-	if (num_data_lanes < 1 || num_data_lanes > CSI2_MAX_DATA_LANES) {
++	if (num_data_lanes < 1 || num_data_lanes > max_lanes) {
+ 		ret = -EINVAL;
+ 		dev_err(dev, "Invalid data-lanes count: %d\n", num_data_lanes);
+ 		goto out_put;
+@@ -303,6 +348,11 @@ static int phy_qcom_mipi_csi2_parse_routing(struct mipi_csi2phy_device *csi2phy)
+ 	/* lane-polarities: optional, up to num_data_lanes + 1 entries */
+ 	memset(lane_polarities, 0x00, sizeof(lane_polarities));
+ 	num_polarities = fwnode_property_count_u32(ep, "lane-polarities");
++	if (num_polarities > 0 && bus_type == MEDIA_BUS_TYPE_CSI2_CPHY) {
++		ret = -EINVAL;
++		dev_err(dev, "lane-polarities do not apply to C-PHY\n");
++		goto out_put;
++	}
+ 	if (num_polarities > 0) {
+ 		if (num_polarities != stream_cfg->num_data_lanes + 1) {
+ 			ret = -EINVAL;
+@@ -323,12 +373,18 @@ static int phy_qcom_mipi_csi2_parse_routing(struct mipi_csi2phy_device *csi2phy)
+ 	csi2phy->stream_cfg.lane_cfg.clk.pol = lane_polarities[0];
+ 
+ 	for (i = 0; i < csi2phy->stream_cfg.num_data_lanes; i++) {
+-		if (data_lanes[i] < 1 || data_lanes[i] > CSI2_MAX_DATA_LANES) {
++		if (data_lanes[i] < 1 || data_lanes[i] > max_lanes) {
+ 			dev_err(dev, "Invalid lane %d\n", data_lanes[i]);
+ 			ret = -EINVAL;
+ 			goto out_put;
+ 		}
+ 
++		if (used_lanes & BIT(data_lanes[i])) {
++			ret = -EINVAL;
++			goto out_put;
++		}
++		used_lanes |= BIT(data_lanes[i]);
++
+ 		/* Convert data-lanes = <1 2 3 4> to bit positions */
+ 		csi2phy->stream_cfg.lane_cfg.data[i].pos = data_lanes[i] - 1;
+ 		csi2phy->stream_cfg.lane_cfg.data[i].pol = lane_polarities[i + 1];
+@@ -444,6 +500,7 @@ static int phy_qcom_mipi_csi2_probe(struct platform_device *pdev)
+ }
+ 
+ static const struct of_device_id phy_qcom_mipi_csi2_of_match_table[] = {
++	{ .compatible = "xiaomi,unicorn-csi2-phy", .data = &mipi_csi2_cphy_l2s },
+ 	{ .compatible	= "qcom,x1e80100-csi2-phy", .data = &mipi_csi2_dphy_4nm_x1e },
+ 	{ }
+ };
+diff --git a/drivers/phy/qualcomm/phy-qcom-mipi-csi2-l2s.h b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-l2s.h
+new file mode 100644
+index 0000000..d95152b
+--- /dev/null
++++ b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-l2s.h
+@@ -0,0 +1,856 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
++ * Copyright (c) 2021-2022 Qualcomm Innovation Center, Inc. All rights reserved.
++ * v2.1.3-xiaomi-l2s, camera-kernel 3b30ba7df6608c97c0ba2d55d679a6b5987c4c66.
++ * Source SHA-256: dfa067cd42e5f8a37383289965201a4cac1fa209a7e0305af477239cde2b78de
++ * Register order and delays retained, including the duplicate CDR ceiling.
++ */
++
++static const struct mipi_csi2phy_lane_regs lane_regs_l2s_cphy[] = {
++	{ 0x0268, 0xf1, 100, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0294, 0x09, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x02f4, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x02f8, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x02fc, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x02f0, 0x00, 2, CSIPHY_DEFAULT_PARAMS },
++	{ 0x02f0, 0xef, 100, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0204, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x020c, 0x10, 0, CSIPHY_SETTLE_CNT_LOWER_BYTE },
++	{ 0x0208, 0x00, 0, CSIPHY_SETTLE_CNT_HIGHER_BYTE },
++	{ 0x0210, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x02e4, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x02e8, 0x7f, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x02ec, 0x7f, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0218, 0x3e, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x021c, 0x41, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0220, 0x41, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0224, 0x7f, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0228, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x022c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0264, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0284, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0244, 0xb2, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0310, 0x35, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x02bc, 0xd0, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0254, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0240, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0260, 0xa8, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0668, 0xf1, 100, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0694, 0x09, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x06f4, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x06f8, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x06fc, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x06f0, 0x00, 2, CSIPHY_DEFAULT_PARAMS },
++	{ 0x06f0, 0xef, 100, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0604, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x060c, 0x10, 0, CSIPHY_SETTLE_CNT_LOWER_BYTE },
++	{ 0x0608, 0x00, 0, CSIPHY_SETTLE_CNT_HIGHER_BYTE },
++	{ 0x0610, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x06e4, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x06e8, 0x7f, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x06ec, 0x7f, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0618, 0x3e, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x061c, 0x41, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0620, 0x41, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0624, 0x7f, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0628, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x062c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0664, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0684, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0644, 0xb2, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0710, 0x35, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x06bc, 0xd0, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0654, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0640, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0660, 0xa8, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0a68, 0xf1, 100, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0a94, 0x09, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0af4, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0af8, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0afc, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0af0, 0x00, 2, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0af0, 0xef, 100, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0a04, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0a0c, 0x10, 0, CSIPHY_SETTLE_CNT_LOWER_BYTE },
++	{ 0x0a08, 0x00, 0, CSIPHY_SETTLE_CNT_HIGHER_BYTE },
++	{ 0x0a10, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0ae4, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0ae8, 0x7f, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0aec, 0x7f, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0a18, 0x3e, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0a1c, 0x41, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0a20, 0x41, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0a24, 0x7f, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0a28, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0a2c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0a64, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0a84, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0a44, 0xb2, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0b10, 0x35, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0abc, 0xd0, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0a54, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0a40, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0a60, 0xa8, 100, CSIPHY_DEFAULT_PARAMS },
++};
++
++struct l2s_cphy_rate {
++	u64 max_bps;
++	struct mipi_csi2phy_lane_regs regs[27];
++};
++
++static const struct l2s_cphy_rate l2s_cphy_rates[] = {
++	{ 228000000ULL, {
++		{ 0x0270, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x6b, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x6b, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x6b, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 456000000ULL, {
++		{ 0x0270, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x33, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x33, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x33, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 684000000ULL, {
++		{ 0x0270, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 912000000ULL, {
++		{ 0x0270, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 1140000000ULL, {
++		{ 0x0270, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 1368000000ULL, {
++		{ 0x0270, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 1596000000ULL, {
++		{ 0x0270, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 1824000000ULL, {
++		{ 0x0270, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x09, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x09, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x09, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 2052000000ULL, {
++		{ 0x0270, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x09, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x09, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x09, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 2280000000ULL, {
++		{ 0x0270, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x09, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x09, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x58, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x09, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 2736000000ULL, {
++		{ 0x0270, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x45, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x09, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x45, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x09, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x45, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x09, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 3420000000ULL, {
++		{ 0x0270, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x45, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x09, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x07, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x45, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x09, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x07, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x45, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x09, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 3876000000ULL, {
++		{ 0x0270, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x2e, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x09, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x2e, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x09, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x2e, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x09, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 4560000000ULL, {
++		{ 0x0270, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x2e, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0xf8, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x07, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x2e, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0xf8, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x07, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x2e, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0xf8, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x07, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 4788000000ULL, {
++		{ 0x0270, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 5358000000ULL, {
++		{ 0x0270, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 5700000000ULL, {
++		{ 0x0270, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 5928000000ULL, {
++		{ 0x0270, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x17, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x17, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x17, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 6384000000ULL, {
++		{ 0x0270, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x17, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x17, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x17, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 6840000000ULL, {
++		{ 0x0270, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x17, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0xf8, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x07, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x17, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0xf8, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x07, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x03, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x17, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0xf8, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x07, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 7524000000ULL, {
++		{ 0x0270, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x10, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x10, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x10, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 7980000000ULL, {
++		{ 0x0270, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x10, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x10, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x10, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 7980000000ULL, {
++		{ 0x0270, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x0c, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x0c, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x0c, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 10260000000ULL, {
++		{ 0x0270, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x06, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x06, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x06, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 11400000000ULL, {
++		{ 0x0270, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++	{ 13680000000ULL, {
++		{ 0x0270, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0274, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0278, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0288, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x028c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x026c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0290, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0214, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0670, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0674, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0678, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0688, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x068c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x066c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0690, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0614, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DNP_PARAMS },
++		{ 0x0a70, 0x01, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a74, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a78, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a88, 0x20, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a8c, 0x30, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a6c, 0x3d, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a90, 0x02, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x0a14, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++		{ 0x108c, 0x00, 0, CSIPHY_DEFAULT_PARAMS },
++	} },
++};
+diff --git a/drivers/phy/qualcomm/phy-qcom-mipi-csi2.h b/drivers/phy/qualcomm/phy-qcom-mipi-csi2.h
+index 7e55ae0..118d584 100644
+--- a/drivers/phy/qualcomm/phy-qcom-mipi-csi2.h
++++ b/drivers/phy/qualcomm/phy-qcom-mipi-csi2.h
+@@ -48,8 +48,10 @@ struct mipi_csi2phy_lane_regs {
+ };
+ 
+ struct mipi_csi2phy_device_regs {
+-	const struct mipi_csi2phy_lane_regs *init_seq;
+-	const int lane_array_size;
++	const struct mipi_csi2phy_lane_regs *dphy_init_seq;
++	const int dphy_lane_array_size;
++	const struct mipi_csi2phy_lane_regs *cphy_init_seq;
++	const int cphy_lane_array_size;
+ 	const u32 common_regs_offset;
+ };
+ 
+@@ -61,6 +63,7 @@ struct mipi_csi2_genpd {
+ struct mipi_csi2phy_soc_cfg {
+ 	const struct mipi_csi2phy_hw_ops *ops;
+ 	const struct mipi_csi2phy_device_regs reg_info;
++	bool l2s_cphy;
+ 
+ 	const char ** const supply_names;
+ 	const unsigned int num_supplies;
+@@ -93,5 +96,6 @@ struct mipi_csi2phy_device {
+ };
+ 
+ extern const struct mipi_csi2phy_soc_cfg mipi_csi2_dphy_4nm_x1e;
++extern const struct mipi_csi2phy_soc_cfg mipi_csi2_cphy_l2s;
+ 
+ #endif /* __PHY_QCOM_MIPI_CSI2_H__ */
+diff --git a/include/linux/phy/phy-mipi-cphy.h b/include/linux/phy/phy-mipi-cphy.h
+new file mode 100644
+index 0000000..673e62f
+--- /dev/null
++++ b/include/linux/phy/phy-mipi-cphy.h
+@@ -0,0 +1,89 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __PHY_MIPI_CPHY_H_
++#define __PHY_MIPI_CPHY_H_
++
++#include <linux/errno.h>
++#include <linux/types.h>
++
++#define PHY_MIPI_CPHY_MAX_TRIOS		3
++
++/**
++ * struct phy_configure_opts_mipi_cphy - MIPI C-PHY configuration set
++ *
++ * This structure is used to represent the configuration state of a
++ * MIPI C-PHY phy.
++ */
++struct phy_configure_opts_mipi_cphy {
++	/**
++	 * @symbol_rate:
++	 *
++	 * Symbol rate on each trio, in symbols per second.
++	 */
++	u64			symbol_rate;
++
++	/**
++	 * @trios:
++	 *
++	 * Number of active trios.
++	 */
++	u8			trios;
++};
++
++/**
++ * phy_mipi_cphy_config_validate() - Validate a MIPI C-PHY configuration
++ * @cfg: configuration to check
++ *
++ * Return: 0 if @cfg has a symbol rate and one to three trios, -EINVAL
++ * otherwise.
++ */
++static inline int
++phy_mipi_cphy_config_validate(const struct phy_configure_opts_mipi_cphy *cfg)
++{
++	if (!cfg->symbol_rate)
++		return -EINVAL;
++
++	if (cfg->trios < 1 || cfg->trios > PHY_MIPI_CPHY_MAX_TRIOS)
++		return -EINVAL;
++
++	return 0;
++}
++
++/**
++ * phy_mipi_cphy_get_default_config_for_link_freq() - C-PHY configuration
++ * from a link frequency
++ * @link_freq: link frequency in Hz
++ * @trios: number of active trios
++ * @cfg: configuration to fill
++ *
++ * A C-PHY link frequency is half the symbol rate on each trio, the
++ * convention V4L2 uses for the link frequency of a C-PHY transmitter.
++ *
++ * Return: 0 on success, -EINVAL if the resulting configuration is invalid.
++ */
++static inline int
++phy_mipi_cphy_get_default_config_for_link_freq(u64 link_freq,
++					       unsigned int trios,
++					       struct phy_configure_opts_mipi_cphy *cfg)
++{
++	if (trios > PHY_MIPI_CPHY_MAX_TRIOS || link_freq > (~0ULL >> 1))
++		return -EINVAL;
++
++	cfg->symbol_rate = link_freq * 2;
++	cfg->trios = trios;
++
++	return phy_mipi_cphy_config_validate(cfg);
++}
++
++/**
++ * phy_mipi_cphy_link_freq() - Link frequency of a MIPI C-PHY configuration
++ * @cfg: configuration
++ *
++ * Return: the link frequency in Hz, half the symbol rate on each trio.
++ */
++static inline u64
++phy_mipi_cphy_link_freq(const struct phy_configure_opts_mipi_cphy *cfg)
++{
++	return cfg->symbol_rate / 2;
++}
++
++#endif /* __PHY_MIPI_CPHY_H_ */
+diff --git a/include/linux/phy/phy.h b/include/linux/phy/phy.h
+index 14b924a..e999f63 100644
+--- a/include/linux/phy/phy.h
++++ b/include/linux/phy/phy.h
+@@ -20,6 +20,7 @@
+ #include <linux/phy/phy-hdmi.h>
+ #include <linux/phy/phy-lvds.h>
+ #include <linux/phy/phy-mipi-dphy.h>
++#include <linux/phy/phy-mipi-cphy.h>
+ 
+ struct phy;
+ 
+@@ -41,6 +42,7 @@ enum phy_mode {
+ 	PHY_MODE_PCIE,
+ 	PHY_MODE_ETHERNET,
+ 	PHY_MODE_MIPI_DPHY,
++	PHY_MODE_MIPI_CPHY,
+ 	PHY_MODE_SATA,
+ 	PHY_MODE_LVDS,
+ 	PHY_MODE_DP,
+@@ -67,6 +69,8 @@ union phy_notify {
+  *
+  * @mipi_dphy:	Configuration set applicable for phys supporting
+  *		the MIPI_DPHY phy mode.
++ * @mipi_cphy:	Configuration set applicable for phys supporting
++ *		the MIPI_CPHY phy mode.
+  * @dp:		Configuration set applicable for phys supporting
+  *		the DisplayPort protocol.
+  * @lvds:	Configuration set applicable for phys supporting
+@@ -76,6 +80,7 @@ union phy_notify {
+  */
+ union phy_configure_opts {
+ 	struct phy_configure_opts_mipi_dphy	mipi_dphy;
++	struct phy_configure_opts_mipi_cphy	mipi_cphy;
+ 	struct phy_configure_opts_dp		dp;
+ 	struct phy_configure_opts_lvds		lvds;
+ 	struct phy_configure_opts_hdmi		hdmi;

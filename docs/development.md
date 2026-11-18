@@ -2,6 +2,57 @@
 
 [Configuration guide](configuration.md) · [Kernel sources](../pkgs/linux-kernel/README.md) · [中文](development.zh.md)
 
+## just commands
+
+Run `just` to list the [justfile](../justfile) commands. They require Bash,
+enable Nix's `nix-command` / `flakes` features without replacing other settings,
+and keep `flake.lock` unchanged. `queue` also needs the tools listed below.
+
+```sh
+just devices
+just artifacts unicorn          # Available outputs
+just plan unicorn kernel        # Preview builds and downloads
+just drv unicorn kernel         # Evaluate the derivation path only
+just build unicorn kernel       # result-unicorn-kernel
+just build unicorn recovery     # result-unicorn-recovery
+just build unicorn              # Defaults to system
+just log unicorn kernel         # Read an available build log
+just size result-unicorn-system # Closure size of an existing build
+just eval --all-systems          # Evaluate both platforms without building
+just check-one public-api       # One host check
+just dev                        # Kernel development shell
+just tools                      # Android, deployment and kernel tools
+just queue --help
+```
+
+Replace `unicorn` and `kernel` with the intended device and artifact; nested
+names such as `minimal.system` work too. Output links use
+`result-<device>-<artifact>`. Append Nix options where needed, for example
+`just build unicorn kernel --max-jobs 1 --cores 8`. `just` also lists commands
+for logs, closure sizes and tools; `mobile` forwards arguments to
+[mobile-device](../pkgs/mobile-device/README.md).
+
+## Build iteration
+
+Keep locked inputs and useful outputs to reuse caches. Build only the artifact
+needed: system and recovery reuse the device kernel on the same build platform.
+Avoid frequent garbage collection of outputs needed for subsequent builds.
+Tune concurrent derivations (`--max-jobs`) and threads per build (`--cores`)
+together; see [Nix parallelism](https://nix.dev/manual/nix/stable/advanced-topics/cores-vs-jobs.html).
+For a kernel, start with `--max-jobs 1 --cores 8` and adjust for available
+memory and CPU capacity; setting both values to the CPU count oversubscribes it.
+Uncached native ARM jobs can use an [ARM remote builder](https://nix.dev/manual/nix/stable/advanced-topics/distributed-builds.html)
+to avoid QEMU compilation; native and cross-built project outputs have different caches.
+
+For kernel iteration, use `just dev` with prepared sources, the effective Nix
+kernel configuration and a separate persistent output directory per device:
+`make O=/absolute/build-dir CC='ccache clang' -j8 Image dtbs`. Check hits with
+`ccache -s`. Normal Nix builds cache complete outputs, not incremental object
+files; entering the shell does not enable ccache for them. Validate final
+checked-in inputs with the normal artifact build.
+
+## Evaluation and tests
+
 The public API, platform, native-userspace, module-boundary, direct-boot and release-configuration
 evaluations are registered in `checks` for both build platforms. `nix flake check` also runs
 host-only image/fastboot and storage regression tests; it never contacts a device.

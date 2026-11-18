@@ -1,0 +1,602 @@
+Subject: [PATCH] power: supply: qcom_battmgr: add Unicorn Xiaomi charging ABI
+
+Use the Unicorn property table and exact vendor scalar, VDM and 32-byte
+digest messages. Expose diagnostic properties read-only and keep policy in
+the optional service. Preserve firmware thermal protection.
+
+Reference: MiCode/Xiaomi_Kernel_OpenSource
+fa4513e61931e11a59e3f177ae590d4e090d7229
+drivers/power/supply/qti_battery_charger.c and vendor/unicorn_GKI.config.
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -6,6 +6,7 @@
+  */
+ #include <linux/auxiliary_bus.h>
+ #include <linux/devm-helpers.h>
++#include <linux/hex.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/nvmem-consumer.h>
+@@ -13,6 +14,8 @@
+ #include <linux/of_device.h>
+ #include <linux/power_supply.h>
+ #include <linux/property.h>
++#include <linux/spinlock.h>
++#include <linux/unaligned.h>
+ #include <linux/soc/qcom/pdr.h>
+ #include <linux/soc/qcom/pmic_glink.h>
+ #include <linux/math.h>
+@@ -109,6 +112,82 @@
+ #define CHARGE_CTRL_END_THR_MIN		55
+ #define CHARGE_CTRL_END_THR_MAX		100
+ #define CHARGE_CTRL_DELTA_SOC		5
++
++/* Unicorn ABI: MiCode mayfly-s-oss, fa4513e61931, qti_battery_charger.c.
++ * Keep this table independent of the SM8550/sheng firmware ABI.
++ */
++#define UNICORN_XM_GET			0x50
++#define UNICORN_XM_SET			0x51
++#define UNICORN_XM_VERIFY_DIGEST		0x01
++#define UNICORN_XM_CONNECTOR_TEMP		0x02
++#define UNICORN_XM_AUTHENTIC		0x03
++#define UNICORN_XM_REAL_TYPE		0x06
++#define UNICORN_XM_VERIFY_PROCESS	0x07
++#define UNICORN_XM_VDM_VERSION		0x08
++#define UNICORN_XM_VDM_VOLTAGE		0x09
++#define UNICORN_XM_VDM_TEMP		0x0a
++#define UNICORN_XM_VDM_SEED		0x0b
++#define UNICORN_XM_VDM_AUTH		0x0c
++#define UNICORN_XM_VDM_VERIFIED		0x0d
++#define UNICORN_XM_VDM_COMPENSATION	0x0e
++#define UNICORN_XM_VDM_REVERSE		0x0f
++#define UNICORN_XM_ADAPTER_ID		0x11
++#define UNICORN_XM_ADAPTER_SVID		0x12
++#define UNICORN_XM_PD_VERIFED		0x13
++#define UNICORN_XM_PDO2			0x14
++#define UNICORN_XM_UVDM_STATE		0x15
++#define UNICORN_XM_CP_CHIP_OK		0x16
++#define UNICORN_XM_CP_SLAVE_CHIP_OK	0x17
++#define UNICORN_XM_CP_BUS_CURRENT		0x18
++#define UNICORN_XM_CP_SLAVE_BUS_CURRENT	0x19
++#define UNICORN_XM_CP_BUS_VOLTAGE		0x1b
++#define UNICORN_XM_CP_BATTERY_VOLTAGE	0x1e
++#define UNICORN_XM_MASTER_SMB_ONLINE	0x1f
++#define UNICORN_XM_MASTER_SMB_IIN		0x20
++#define UNICORN_XM_SLAVE_SMB_ONLINE	0x21
++#define UNICORN_XM_SLAVE_SMB_IIN		0x22
++#define UNICORN_XM_FASTCHG_MODE		0x26
++#define UNICORN_XM_QUICK_CHARGE_TYPE	0x2a
++#define UNICORN_XM_APDO_MAX		0x2b
++#define UNICORN_XM_DIE_TEMP		0x2c
++#define UNICORN_XM_SLAVE_DIE_TEMP		0x2d
++#define UNICORN_XM_THERMAL_TEMP		0x56
++#define UNICORN_XM_FB_BLANK_STATE		0x57
++#define UNICORN_XM_SPORT_MODE		0x5a
++
++struct unicorn_xm_vdm {
++	struct pmic_glink_hdr hdr;
++	__le32 property;
++	__le32 data[4];
++};
++
++/* CONFIG_BQ_FUEL_GAUGE=y; CONFIG_BQ_FG_2S is absent on Unicorn. */
++struct unicorn_xm_digest {
++	struct pmic_glink_hdr hdr;
++	__le32 property;
++	u8 digest[32];
++	u8 slave;
++	u8 reserved[3];
++};
++
++enum unicorn_xm_reply {
++	UNICORN_XM_SCALAR,
++	UNICORN_XM_VDM,
++	UNICORN_XM_DIGEST,
++};
++
++struct unicorn_xm_state {
++	spinlock_t lock;
++	bool pending;
++	bool timed_out;
++	u32 opcode;
++	u32 property;
++	enum unicorn_xm_reply kind;
++	u32 value;
++	int error;
++	u8 data[32];
++	u32 generation;
++};
+ 
+ struct qcom_battmgr_enable_request {
+ 	struct pmic_glink_hdr hdr;
+@@ -319,6 +398,7 @@
+ 
+ 	enum qcom_battmgr_variant variant;
+ 	bool unicorn_abi;
++	struct unicorn_xm_state unicorn;
+ 
+ 	struct power_supply *ac_psy;
+ 	struct power_supply *bat_psy;
+@@ -452,8 +532,403 @@
+ 		request.property = cpu_to_le32(fw_property);
+ 	}
+ 
++	if (battmgr->unicorn_abi && opcode == BATTMGR_USB_PROPERTY_GET &&
++	    property == USB_TYPE)
++		request.property = cpu_to_le32(USB_ADAP_TYPE);
++
+ 	return qcom_battmgr_request(battmgr, &request, sizeof(request));
+ }
++
++/* All transfers share the upstream request mutex and completion. The callback
++ * additionally matches opcode, property and exact payload shape. There is no
++ * transaction ID in this ABI: after timeout, quarantine Xiaomi requests until
++ * the late reply has drained, or PDR announces a new firmware session.
++ */
++static int unicorn_xm_transfer(struct qcom_battmgr *battmgr, void *request,
++			       size_t len, u32 property, enum unicorn_xm_reply kind,
++			       u32 *value, u8 *data)
++{
++	struct unicorn_xm_state *xm = &battmgr->unicorn;
++	struct pmic_glink_hdr *hdr = request;
++	unsigned long flags;
++	int ret;
++
++	if (!battmgr->unicorn_abi)
++		return -EOPNOTSUPP;
++
++	mutex_lock(&battmgr->lock);
++	spin_lock_irqsave(&xm->lock, flags);
++	if (!battmgr->service_up || xm->timed_out) {
++		ret = -EAGAIN;
++		goto unlock;
++	}
++	xm->opcode = le32_to_cpu(hdr->opcode);
++	xm->property = property;
++	xm->kind = kind;
++	xm->pending = true;
++	xm->error = -EINPROGRESS;
++	reinit_completion(&battmgr->ack);
++	memset(xm->data, 0, sizeof(xm->data));
++	spin_unlock_irqrestore(&xm->lock, flags);
++
++	ret = pmic_glink_send(battmgr->client, request, len);
++	if (!ret && !wait_for_completion_timeout(&battmgr->ack, HZ))
++		ret = -ETIMEDOUT;
++
++	spin_lock_irqsave(&xm->lock, flags);
++	if (!xm->pending)
++		ret = xm->error;
++	if (ret == -ETIMEDOUT && xm->pending)
++		xm->timed_out = true;
++	xm->pending = false;
++	if (!ret) {
++		if (value)
++			*value = xm->value;
++		if (data)
++			memcpy(data, xm->data, kind == UNICORN_XM_VDM ? 16 : 32);
++	}
++unlock:
++	spin_unlock_irqrestore(&xm->lock, flags);
++	mutex_unlock(&battmgr->lock);
++	return ret;
++}
++
++static int unicorn_xm_scalar(struct qcom_battmgr *battmgr, u32 opcode,
++			     u32 property, u32 value, u32 *out)
++{
++	struct qcom_battmgr_property_request request = {
++		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
++		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
++		.hdr.opcode = cpu_to_le32(opcode),
++		.property = cpu_to_le32(property),
++		.value = cpu_to_le32(value),
++	};
++
++	return unicorn_xm_transfer(battmgr, &request, sizeof(request), property,
++				   UNICORN_XM_SCALAR, out, NULL);
++}
++
++static int unicorn_xm_vdm(struct qcom_battmgr *battmgr, u32 opcode,
++			  u32 property, const u8 *in, u8 *out)
++{
++	struct unicorn_xm_vdm request = {
++		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
++		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
++		.hdr.opcode = cpu_to_le32(opcode),
++		.property = cpu_to_le32(property),
++	};
++	int i;
++
++	/* Android parses hex bytes, swaps each u32, then sends little endian. */
++	if (in)
++		for (i = 0; i < 4; i++)
++			request.data[i] = cpu_to_le32(get_unaligned_be32(in + i * 4));
++
++	return unicorn_xm_transfer(battmgr, &request, sizeof(request), property,
++				   UNICORN_XM_VDM, NULL, out);
++}
++
++static int unicorn_xm_digest(struct qcom_battmgr *battmgr, u32 opcode,
++			     const u8 *in, u8 *out)
++{
++	struct unicorn_xm_digest request = {
++		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
++		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
++		.hdr.opcode = cpu_to_le32(opcode),
++		.property = cpu_to_le32(UNICORN_XM_VERIFY_DIGEST),
++	};
++
++	if (in)
++		memcpy(request.digest, in, sizeof(request.digest));
++
++	return unicorn_xm_transfer(battmgr, &request, sizeof(request),
++				   UNICORN_XM_VERIFY_DIGEST, UNICORN_XM_DIGEST,
++				   NULL, out);
++}
++
++static void unicorn_xm_callback(struct qcom_battmgr *battmgr,
++				const void *data, size_t len)
++{
++	const struct qcom_battmgr_message *resp = data;
++	const struct unicorn_xm_digest *digest = data;
++	struct unicorn_xm_state *xm = &battmgr->unicorn;
++	u32 opcode;
++	unsigned long flags;
++	u32 property;
++
++	if (len < sizeof(struct pmic_glink_hdr) + sizeof(__le32))
++		return;
++	if (le32_to_cpu(resp->hdr.owner) != PMIC_GLINK_OWNER_BATTMGR ||
++	    le32_to_cpu(resp->hdr.type) != PMIC_GLINK_REQ_RESP)
++		return;
++	opcode = le32_to_cpu(resp->hdr.opcode);
++	property = le32_to_cpu(resp->intval.property);
++
++	spin_lock_irqsave(&xm->lock, flags);
++	if (opcode != xm->opcode || property != xm->property)
++		goto out;
++	if (xm->timed_out) {
++		/* A malformed fragment cannot establish that the old reply drained. */
++		if ((len == sizeof(resp->hdr) + sizeof(resp->intval) &&
++		     (xm->kind == UNICORN_XM_SCALAR || opcode == UNICORN_XM_SET ||
++		      le32_to_cpu(resp->intval.result))) ||
++		    (xm->kind == UNICORN_XM_VDM && len == sizeof(struct unicorn_xm_vdm)) ||
++		    (xm->kind == UNICORN_XM_DIGEST && len == sizeof(*digest) && !digest->slave))
++			xm->timed_out = false;
++		goto out;
++	}
++	if (!xm->pending)
++		goto out;
++
++	xm->error = -EPROTO;
++	if (len == sizeof(resp->hdr) + sizeof(resp->intval)) {
++		/* Firmware errors always use the scalar reply, even for blobs. */
++		if (le32_to_cpu(resp->intval.result))
++			xm->error = -EREMOTEIO;
++		else if (opcode == UNICORN_XM_SET || xm->kind == UNICORN_XM_SCALAR) {
++			xm->value = le32_to_cpu(resp->intval.value);
++			xm->error = 0;
++		}
++	} else if (xm->kind == UNICORN_XM_VDM && len == sizeof(struct unicorn_xm_vdm)) {
++		memcpy(xm->data, &resp->intval.value, 16);
++		xm->error = 0;
++	} else if (xm->kind == UNICORN_XM_DIGEST && len == sizeof(*digest) &&
++		   !digest->slave) {
++		memcpy(xm->data, digest->digest, 32);
++		xm->error = 0;
++	}
++	xm->pending = false;
++	complete(&battmgr->ack);
++out:
++	spin_unlock_irqrestore(&xm->lock, flags);
++}
++
++struct unicorn_xm_attribute {
++	struct device_attribute attr;
++	u32 property;
++	bool hex;
++};
++
++static ssize_t unicorn_xm_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct unicorn_xm_attribute *a = container_of(attr, struct unicorn_xm_attribute, attr);
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++	u32 value;
++	int ret;
++
++	ret = unicorn_xm_scalar(battmgr, UNICORN_XM_GET, a->property, 0, &value);
++	if (ret)
++		return ret;
++	return a->hex ? sysfs_emit(buf, "%08x\n", value) :
++		       sysfs_emit(buf, "%d\n", (s32)value);
++}
++
++static ssize_t unicorn_xm_store(struct device *dev, struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	struct unicorn_xm_attribute *a = container_of(attr, struct unicorn_xm_attribute, attr);
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++	bool value;
++	int ret;
++
++	ret = kstrtobool(buf, &value);
++	if (ret)
++		return ret;
++	if (a->property == UNICORN_XM_SPORT_MODE && value)
++		return -EOPNOTSUPP;
++	ret = unicorn_xm_scalar(battmgr, UNICORN_XM_SET, a->property, value, NULL);
++	return ret ? ret : (ssize_t)count;
++}
++
++static ssize_t request_vdm_cmd_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++	u8 data[16];
++	u32 state, value;
++	int ret;
++
++	ret = unicorn_xm_scalar(battmgr, UNICORN_XM_GET, UNICORN_XM_UVDM_STATE, 0, &state);
++	if (ret)
++		return ret;
++	if (state == 5) {
++		ret = unicorn_xm_vdm(battmgr, UNICORN_XM_GET, UNICORN_XM_VDM_AUTH, NULL, data);
++		if (ret)
++			return ret;
++		return sysfs_emit(buf, "5,%08x%08x%08x%08x\n",
++			get_unaligned_le32(data), get_unaligned_le32(data + 4),
++			get_unaligned_le32(data + 8), get_unaligned_le32(data + 12));
++	}
++	if (state >= 1 && state <= 3) {
++		ret = unicorn_xm_scalar(battmgr, UNICORN_XM_GET,
++					UNICORN_XM_VDM_VERSION + state - 1, 0, &value);
++		if (ret)
++			return ret;
++		return sysfs_emit(buf, "%u,%u\n", state, value);
++	}
++	return sysfs_emit(buf, "%u,Null\n", state);
++}
++
++static ssize_t request_vdm_cmd_store(struct device *dev, struct device_attribute *attr,
++				     const char *buf, size_t count)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++	char payload[33];
++	u8 data[16];
++	unsigned int cmd;
++	int consumed = 0, ret;
++	size_t digits;
++
++	if (sscanf(buf, "%u,%32s%n", &cmd, payload, &consumed) != 2 ||
++	    ((size_t)consumed != count &&
++	     !((size_t)consumed == count - 1 && buf[consumed] == '\n')) ||
++	    cmd < 1 || cmd > 8)
++		return -EINVAL;
++	digits = strlen(payload);
++	if (cmd == 4 || cmd == 5 || cmd == 8) {
++		if (digits != 32 || hex2bin(data, payload, 16))
++			return -EINVAL;
++		ret = unicorn_xm_vdm(battmgr, UNICORN_XM_SET,
++				      UNICORN_XM_VDM_VERSION + cmd - 1, data, NULL);
++	} else {
++		if (cmd <= 3) {
++			if (strcmp(payload, "null"))
++				return -EINVAL;
++			memset(data, 0, sizeof(data));
++		} else if (digits != 8 || hex2bin(data, payload, 4) ||
++			   get_unaligned_le32(data) > 1) {
++			return -EINVAL;
++		}
++		ret = unicorn_xm_scalar(battmgr, UNICORN_XM_SET,
++					 UNICORN_XM_VDM_VERSION + cmd - 1,
++					 get_unaligned_le32(data), NULL);
++	}
++	return ret ? ret : (ssize_t)count;
++}
++static DEVICE_ATTR_RW(request_vdm_cmd);
++
++static ssize_t verify_digest_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++	u8 data[32];
++	char hex[65];
++	int ret;
++
++	ret = unicorn_xm_digest(battmgr, UNICORN_XM_GET, NULL, data);
++	if (ret)
++		return ret;
++	bin2hex(hex, data, sizeof(data));
++	hex[64] = '\0';
++	return sysfs_emit(buf, "%s\n", hex);
++}
++
++static ssize_t verify_digest_store(struct device *dev, struct device_attribute *attr,
++				   const char *buf, size_t count)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++	u8 data[32];
++	int ret;
++
++	if ((count != 64 && !(count == 65 && buf[64] == '\n')) || hex2bin(data, buf, 32))
++		return -EINVAL;
++	ret = unicorn_xm_digest(battmgr, UNICORN_XM_SET, data, NULL);
++	return ret ? ret : (ssize_t)count;
++}
++static DEVICE_ATTR_RW(verify_digest);
++
++static ssize_t firmware_generation_show(struct device *dev,
++					struct device_attribute *attr, char *buf)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%u\n", READ_ONCE(battmgr->unicorn.generation));
++}
++static DEVICE_ATTR_RO(firmware_generation);
++
++static ssize_t service_up_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%u\n", READ_ONCE(battmgr->service_up));
++}
++static DEVICE_ATTR_RO(service_up);
++
++#define UNICORN_RO(_name, _prop, _hex) \
++	static struct unicorn_xm_attribute unicorn_attr_##_name = { \
++		.attr = __ATTR(_name, 0444, unicorn_xm_show, NULL), \
++		.property = _prop, .hex = _hex, \
++	}
++#define UNICORN_RW(_name, _prop) \
++	static struct unicorn_xm_attribute unicorn_attr_##_name = { \
++		.attr = __ATTR(_name, 0644, unicorn_xm_show, unicorn_xm_store), \
++		.property = _prop, \
++	}
++
++UNICORN_RW(authentic, UNICORN_XM_AUTHENTIC);
++UNICORN_RW(pd_verifed, UNICORN_XM_PD_VERIFED);
++UNICORN_RW(verify_process, UNICORN_XM_VERIFY_PROCESS);
++UNICORN_RW(fb_blank_state, UNICORN_XM_FB_BLANK_STATE);
++UNICORN_RO(real_type, UNICORN_XM_REAL_TYPE, false);
++UNICORN_RO(adapter_id, UNICORN_XM_ADAPTER_ID, true);
++UNICORN_RO(adapter_svid, UNICORN_XM_ADAPTER_SVID, true);
++UNICORN_RO(pdo2, UNICORN_XM_PDO2, true);
++UNICORN_RO(apdo_max, UNICORN_XM_APDO_MAX, false);
++UNICORN_RO(fastchg_mode, UNICORN_XM_FASTCHG_MODE, false);
++UNICORN_RO(quick_charge_type, UNICORN_XM_QUICK_CHARGE_TYPE, false);
++UNICORN_RO(bq2597x_chip_ok, UNICORN_XM_CP_CHIP_OK, false);
++UNICORN_RO(bq2597x_slave_chip_ok, UNICORN_XM_CP_SLAVE_CHIP_OK, false);
++UNICORN_RO(bq2597x_bus_current, UNICORN_XM_CP_BUS_CURRENT, false);
++UNICORN_RO(bq2597x_slave_bus_current, UNICORN_XM_CP_SLAVE_BUS_CURRENT, false);
++UNICORN_RO(bq2597x_bus_voltage, UNICORN_XM_CP_BUS_VOLTAGE, false);
++UNICORN_RO(bq2597x_battery_voltage, UNICORN_XM_CP_BATTERY_VOLTAGE, false);
++UNICORN_RO(master_smb1396_online, UNICORN_XM_MASTER_SMB_ONLINE, false);
++UNICORN_RO(master_smb1396_iin, UNICORN_XM_MASTER_SMB_IIN, false);
++UNICORN_RO(slave_smb1396_online, UNICORN_XM_SLAVE_SMB_ONLINE, false);
++UNICORN_RO(slave_smb1396_iin, UNICORN_XM_SLAVE_SMB_IIN, false);
++UNICORN_RO(connector_temp, UNICORN_XM_CONNECTOR_TEMP, false);
++UNICORN_RO(die_temperature, UNICORN_XM_DIE_TEMP, false);
++UNICORN_RO(slave_die_temperature, UNICORN_XM_SLAVE_DIE_TEMP, false);
++UNICORN_RO(thermal_temp, UNICORN_XM_THERMAL_TEMP, false);
++/* The stock sport_mode userspace/thermal policy has not been reproduced. */
++UNICORN_RW(sport_mode, UNICORN_XM_SPORT_MODE);
++
++static struct attribute *unicorn_xm_attrs[] = {
++	&dev_attr_request_vdm_cmd.attr,
++	&dev_attr_verify_digest.attr,
++	&dev_attr_firmware_generation.attr,
++	&dev_attr_service_up.attr,
++	&unicorn_attr_authentic.attr.attr,
++	&unicorn_attr_pd_verifed.attr.attr,
++	&unicorn_attr_verify_process.attr.attr,
++	&unicorn_attr_fb_blank_state.attr.attr,
++	&unicorn_attr_real_type.attr.attr,
++	&unicorn_attr_adapter_id.attr.attr,
++	&unicorn_attr_adapter_svid.attr.attr,
++	&unicorn_attr_pdo2.attr.attr,
++	&unicorn_attr_apdo_max.attr.attr,
++	&unicorn_attr_fastchg_mode.attr.attr,
++	&unicorn_attr_quick_charge_type.attr.attr,
++	&unicorn_attr_bq2597x_chip_ok.attr.attr,
++	&unicorn_attr_bq2597x_slave_chip_ok.attr.attr,
++	&unicorn_attr_bq2597x_bus_current.attr.attr,
++	&unicorn_attr_bq2597x_slave_bus_current.attr.attr,
++	&unicorn_attr_bq2597x_bus_voltage.attr.attr,
++	&unicorn_attr_bq2597x_battery_voltage.attr.attr,
++	&unicorn_attr_master_smb1396_online.attr.attr,
++	&unicorn_attr_master_smb1396_iin.attr.attr,
++	&unicorn_attr_slave_smb1396_online.attr.attr,
++	&unicorn_attr_slave_smb1396_iin.attr.attr,
++	&unicorn_attr_connector_temp.attr.attr,
++	&unicorn_attr_die_temperature.attr.attr,
++	&unicorn_attr_slave_die_temperature.attr.attr,
++	&unicorn_attr_thermal_temp.attr.attr,
++	&unicorn_attr_sport_mode.attr.attr,
++	NULL,
++};
++
++static const struct attribute_group unicorn_xm_group = {
++	.name = "xiaomi",
++	.attrs = unicorn_xm_attrs,
++};
+ 
+ static int qcom_battmgr_update_status(struct qcom_battmgr *battmgr)
+ {
+@@ -1616,6 +2091,10 @@
+ 		case USB_INPUT_CURR_LIMIT:
+ 			battmgr->usb.current_limit = le32_to_cpu(resp->intval.value);
+ 			break;
++		case USB_ADAP_TYPE:
++			if (!battmgr->unicorn_abi)
++				break;
++			fallthrough;
+ 		case USB_TYPE:
+ 			val = le32_to_cpu(resp->intval.value);
+ 			battmgr->usb.usb_type = battmgr->unicorn_abi ?
+@@ -1678,7 +2157,20 @@
+ {
+ 	const struct pmic_glink_hdr *hdr = data;
+ 	struct qcom_battmgr *battmgr = priv;
+-	unsigned int opcode = le32_to_cpu(hdr->opcode);
++	unsigned int opcode;
++
++	if (len < sizeof(*hdr))
++		return;
++	opcode = le32_to_cpu(hdr->opcode);
++	if (battmgr->unicorn_abi) {
++		if (opcode == UNICORN_XM_GET || opcode == UNICORN_XM_SET) {
++			unicorn_xm_callback(battmgr, data, len);
++			return;
++		}
++		/* A late standard reply must not acknowledge a Xiaomi transfer. */
++		if (READ_ONCE(battmgr->unicorn.pending) && opcode != BATTMGR_NOTIFICATION)
++			return;
++	}
+ 
+ 	if (opcode == BATTMGR_NOTIFICATION)
+ 		qcom_battmgr_notification(battmgr, data, len);
+@@ -1709,6 +2201,21 @@
+ static void qcom_battmgr_pdr_notify(void *priv, int state)
+ {
+ 	struct qcom_battmgr *battmgr = priv;
++
++	if (battmgr->unicorn_abi) {
++		unsigned long flags;
++
++		spin_lock_irqsave(&battmgr->unicorn.lock, flags);
++		battmgr->unicorn.generation++;
++		battmgr->unicorn.timed_out = false;
++		if (battmgr->unicorn.pending) {
++			battmgr->unicorn.error = -ENOTCONN;
++			battmgr->unicorn.pending = false;
++			complete(&battmgr->ack);
++		}
++		WRITE_ONCE(battmgr->service_up, state == SERVREG_SERVICE_STATE_UP);
++		spin_unlock_irqrestore(&battmgr->unicorn.lock, flags);
++	}
+ 
+ 	if (state == SERVREG_SERVICE_STATE_UP) {
+ 		battmgr->service_up = true;
+@@ -1747,6 +2254,8 @@
+ 		return -ENOMEM;
+ 
+ 	battmgr->dev = dev;
++	dev_set_drvdata(dev, battmgr);
++	spin_lock_init(&battmgr->unicorn.lock);
+ 
+ 	psy_cfg.drv_data = battmgr;
+ 	psy_cfg.fwnode = dev_fwnode(&adev->dev);
+@@ -1836,6 +2345,12 @@
+ 	if (IS_ERR(battmgr->client))
+ 		return PTR_ERR(battmgr->client);
+ 
++	if (battmgr->unicorn_abi) {
++		ret = devm_device_add_group(dev, &unicorn_xm_group);
++		if (ret)
++			return ret;
++	}
++
+ 	pmic_glink_client_register(battmgr->client);
+ 
+ 	return 0;

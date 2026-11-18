@@ -2,6 +2,7 @@
 mod configuration;
 mod dbus;
 mod gadget;
+mod manager;
 mod service;
 mod sysfs;
 mod udc;

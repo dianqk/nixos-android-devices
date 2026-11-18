@@ -1,0 +1,50 @@
+Subject: [PATCH] regulator: qcom-rpmh: support BOB voltage votes
+
+Use the BOB voltage voting operations for the matching regulator hardware.
+
+diff --git a/drivers/regulator/qcom-rpmh-regulator.c b/drivers/regulator/qcom-rpmh-regulator.c
+--- a/drivers/regulator/qcom-rpmh-regulator.c
++++ b/drivers/regulator/qcom-rpmh-regulator.c
+@@ -481,6 +481,33 @@
+ 	.is_enabled		= rpmh_regulator_is_enabled,
+ };
+ 
++/*
++ * Unicorn's vendor DT fixes BOB at 3296 mV. RPMh takes millivolt votes, but
++ * pmic5_bob's generic 32 mV selector grid cannot represent that request.
++ * Keep every generic selector and add only this board's observed vote, in
++ * voltage order so selector comparisons retain their acknowledgement rules.
++ * This is an RPMh vote compatibility quirk, not a new physical voltage grid.
++ */
++static const struct linear_range unicorn_bob_ranges[] = {
++	REGULATOR_LINEAR_RANGE(3000000, 0, 9, 32000),
++	REGULATOR_LINEAR_RANGE(3296000, 10, 10, 0),
++	REGULATOR_LINEAR_RANGE(3320000, 11, 32, 32000),
++};
++
++static void rpmh_regulator_unicorn_bob_quirk(struct regulator_desc *desc,
++					  struct device *dev,
++					  struct device_node *node)
++{
++	if (!of_machine_is_compatible("xiaomi,unicorn") ||
++	    !of_device_is_compatible(dev->of_node, "qcom,pm8350c-rpmh-regulators") ||
++	    !of_node_name_eq(node, "bob"))
++		return;
++
++	desc->linear_ranges = unicorn_bob_ranges;
++	desc->n_linear_ranges = ARRAY_SIZE(unicorn_bob_ranges);
++	desc->n_voltages = 33;
++}
++
+ /**
+  * rpmh_regulator_init_vreg() - initialize all attributes of an rpmh-regulator
+  * @vreg:		Pointer to the individual rpmh-regulator resource
+@@ -548,6 +575,8 @@
+ 		vreg->rdesc.n_linear_ranges = rpmh_data->hw_data->n_linear_ranges;
+ 		vreg->rdesc.n_voltages = rpmh_data->hw_data->n_voltages;
+ 	}
++
++	rpmh_regulator_unicorn_bob_quirk(&vreg->rdesc, dev, node);
+ 
+ 	vreg->always_wait_for_ack = of_property_read_bool(node,
+ 						"qcom,always-wait-for-ack");

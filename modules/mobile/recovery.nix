@@ -110,6 +110,7 @@ in
       description = "Run the recovery display menu; disabling it keeps the full daemon and management interfaces.";
     };
     daemon = {
+      linuxOnly = lib.mkEnableOption "replace the entire userdata allocation with a Linux ESP and root";
       slotModel = lib.mkOption {
         type = lib.types.enum [
           "ab"
@@ -254,6 +255,10 @@ in
     (lib.mkIf cfg.enable {
       assertions = [
         {
+          assertion = !daemon.linuxOnly || daemon.slotModel == "ab";
+          message = "Whole-userdata preparation requires the A/B adapter.";
+        }
+        {
           assertion = cfg.minimal || cfg.extendedStorageTools;
           message = "Full recovery needs the extended storage tools.";
         }
@@ -311,6 +316,7 @@ in
               identity = deviceName;
               inherit (daemon) compatible controller;
               slot_model = daemon.slotModel;
+              linux_only = daemon.linuxOnly;
               firmware_compatible = daemon.firmwareCompatible;
               slot_metadata = daemon.slotMetadata;
               misc_bytes = daemon.miscBytes;

@@ -126,10 +126,22 @@ pub(crate) fn render(
             } else if menu.busy {
                 "Running action..."
             } else if let Some(size) = menu.chosen() {
-                question = format!("Erase userdata; keep {size} for Android?");
+                question = if size == crate::app::LINUX_ONLY_CHOICE {
+                    "Erase ALL Android userdata for Linux?".into()
+                } else {
+                    format!("Erase userdata; keep {size} for Android?")
+                };
                 &question
             } else if menu.choosing {
-                "Android userdata to keep (erased):"
+                if menu
+                    .choices
+                    .iter()
+                    .any(|c| c == crate::app::LINUX_ONLY_CHOICE)
+                {
+                    "Linux-only installation (erases Android data):"
+                } else {
+                    "Android userdata to keep (erased):"
+                }
             } else {
                 "Leave recovery? RAM data will be lost."
             },
@@ -147,7 +159,15 @@ pub(crate) fn render(
             }
             canvas.line(
                 12 + (menu.choices.len() + 1) * 2,
-                "Linux gets the rest of userdata.",
+                if menu
+                    .choices
+                    .iter()
+                    .any(|c| c == crate::app::LINUX_ONLY_CHOICE)
+                {
+                    "Linux uses the entire userdata allocation."
+                } else {
+                    "Linux gets the rest of userdata."
+                },
             );
         } else if menu.confirming {
             // The plan of the chosen size; the buttons follow it.

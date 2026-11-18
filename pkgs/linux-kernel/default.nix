@@ -29,7 +29,10 @@ let
   # The SoC family selects the shared patches and common configuration.
   family = boardSpecification.platform or "qualcomm";
   specification = builtins.removeAttrs boardSpecification [ "platform" ];
-  commonPatches = [ ./patches/ucsi-altmode-mux-owner.patch ];
+  commonPatches = [
+    ./patches/ucsi-altmode-mux-owner.patch
+    ./patches/usb-serial-failed-open.patch
+  ];
   familyPatches =
     {
       qualcomm = [

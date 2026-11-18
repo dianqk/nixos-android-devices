@@ -256,3 +256,11 @@ recovery prepare-boot --confirm
 [共享的 `install-initial` 流程](initial-install.zh.md)，用于已准备好的空根分区和
 FAT 启动分区。它安装 EFI 代际。固件使用[独立 U-Boot 流程](u-boot-install.zh.md)，
 之后显式重启。
+
+## 全部 userdata 的 Linux 布局
+
+`androidDevices.recovery.daemon.linuxOnly` 默认为 `false`，Unicorn 启用此选项。
+在支持的 A/B 设备上，它将全部 userdata 空间替换为 Linux ESP 和根分区，保留其他
+GPT 项，拒绝 `--android-userdata` 参数。CLI 和屏幕先显示只读计划，再明确确认
+清除数据。检查和实际写入路径均先在 RAM 保存原始 GPT；恢复前校验原 userdata
+边界及无关分区项。恢复 GPT 无法恢复已被覆盖的文件系统数据。其他设备保留原流程。

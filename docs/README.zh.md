@@ -18,6 +18,7 @@
 | Marble / Redmi Note 12 Turbo | 独立 1 GiB `linux-boot` | `linux` | 仅 `boot_b` | [设备指南](marble/README.zh.md) |
 | T880 / iPlay 80 mini Ultra | 未测量 | 未测量 | 未测量；仅实验性构建 | [设备指南](t880/README.zh.md) |
 | Dodge / 一加 13 | 独立 `linux-boot` ESP | `linux` | 仅 `boot_b`；同槽位启动选择 | [设备指南](dodge/README.zh.md) |
+| Unicorn / Xiaomi 12S Pro | 独立 1 GiB `linux-boot` | `linux`（全部 userdata） | `boot_b`；recovery 位于 `recovery_b` | [设备指南](unicorn/README.zh.md) |
 
 完整顺序见 [U-Boot 安装](u-boot-install.zh.md)。Dodge 同槽位产品见
 [boot-choice 指南](boot-choice.zh.md)。

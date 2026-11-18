@@ -1,0 +1,22 @@
+Subject: [PATCH] drm/msm/dpu: skip command commit waits before enabling
+
+msm_atomic_commit_tail() waits for the preceding flush before modeset enable.
+On an off-to-on transition the new CRTC state is active but the physical
+encoder remains disabled. Return the already-supported -EWOULDBLOCK before
+reading CTL state or entering the IRQ helper. Keep enabled-encoder waits and
+the helper's unexpected-disabled diagnostic unchanged.
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
+@@ -683,6 +683,10 @@
+ static int dpu_encoder_phys_cmd_wait_for_commit_done(
+ 		struct dpu_encoder_phys *phys_enc)
+ {
++	/* The pre-enable wait_flush has no previous commit to wait for. */
++	if (phys_enc->enable_state == DPU_ENC_DISABLED)
++		return -EWOULDBLOCK;
++
+ 	/* only required for master controller */
+ 	if (!dpu_encoder_phys_cmd_is_master(phys_enc))
+ 		return 0;

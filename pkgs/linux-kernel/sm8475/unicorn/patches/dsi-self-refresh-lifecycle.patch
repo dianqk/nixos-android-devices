@@ -1,0 +1,55 @@
+Subject: [PATCH] drm/msm/dsi: retain the command link across panel self refresh
+
+The panel bridge retains panel power in self refresh and sends DCS idle
+commands on entry/exit. Retain its DSI host, IRQ and PHY as well; otherwise
+SR -> off invokes the post-disable callback twice, unbalancing the PHY
+regulator/PM references and nesting disable_irq().
+
+--- a/drivers/gpu/drm/msm/dsi/dsi_manager.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_manager.c
+@@ -5,6 +5,7 @@
+ 
+ #include "drm/drm_bridge_connector.h"
+ #include <drm/drm_panel.h>
++#include <drm/drm_atomic.h>
+ 
+ #include "msm_kms.h"
+ #include "dsi.h"
+@@ -283,10 +284,18 @@
+ 	struct msm_dsi *msm_dsi = dsi_mgr_get_dsi(id);
+ 	struct msm_dsi *msm_dsi1 = dsi_mgr_get_dsi(DSI_1);
+ 	struct mipi_dsi_host *host = msm_dsi->host;
++	struct drm_crtc *crtc;
++	struct drm_crtc_state *crtc_state;
+ 	bool is_bonded_dsi = IS_BONDED_DSI();
+ 	int ret;
+ 
+ 	DBG("id=%d", id);
++
++	/* Keep the DSI host/PHY and IRQ alive while the panel self-refreshes. */
++	crtc = drm_atomic_get_new_crtc_for_encoder(commit, bridge->encoder);
++	crtc_state = crtc ? drm_atomic_get_old_crtc_state(commit, crtc) : NULL;
++	if (crtc_state && crtc_state->self_refresh_active)
++		return;
+ 
+ 	/* Do nothing with the host if it is slave-DSI in case of bonded DSI */
+ 	if (is_bonded_dsi && !IS_MASTER_DSI_LINK(id))
+@@ -340,10 +349,18 @@
+ 	struct msm_dsi *msm_dsi = dsi_mgr_get_dsi(id);
+ 	struct msm_dsi *msm_dsi1 = dsi_mgr_get_dsi(DSI_1);
+ 	struct mipi_dsi_host *host = msm_dsi->host;
++	struct drm_crtc *crtc;
++	struct drm_crtc_state *crtc_state;
+ 	bool is_bonded_dsi = IS_BONDED_DSI();
+ 	int ret;
+ 
+ 	DBG("id=%d", id);
++
++	/* Keep the DSI host/PHY and IRQ alive while the panel self-refreshes. */
++	crtc = drm_atomic_get_old_crtc_for_encoder(commit, bridge->encoder);
++	crtc_state = crtc ? drm_atomic_get_new_crtc_state(commit, crtc) : NULL;
++	if (crtc_state && crtc_state->self_refresh_active)
++		return;
+ 
+ 	/*
+ 	 * Do nothing with the host if it is slave-DSI in case of bonded DSI.

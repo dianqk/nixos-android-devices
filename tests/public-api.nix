@@ -8,6 +8,7 @@ let
     "clover"
     "sheng"
     "aurora"
+    "unicorn"
   ];
   # Experimental boards checked separately (no installed-system baseline).
   experimentalDevices = [
@@ -55,6 +56,8 @@ lib.genAttrs [ "aarch64-linux" "x86_64-linux" ] (
         config.allowUnfreePredicate =
           package:
           builtins.elem (lib.getName package) [
+            "unicorn-firmware"
+            "unicorn-firmware-zstd"
             "aurora-firmware"
             "aurora-firmware-zstd"
             "aurora-touch"

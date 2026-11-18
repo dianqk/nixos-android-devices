@@ -1,0 +1,619 @@
+Subject: [PATCH] NFC: support SN NCI normal-mode I2C transport
+
+Support standard reader-mode NCI commands with KEEP_CONFIG reset and
+checked supply, GPIO and I2C framing. Keep controller configuration intact.
+
+diff --git a/Documentation/devicetree/bindings/net/nfc/qcom,sn-nci.yaml b/Documentation/devicetree/bindings/net/nfc/qcom,sn-nci.yaml
+new file mode 100644
+--- /dev/null
++++ b/Documentation/devicetree/bindings/net/nfc/qcom,sn-nci.yaml
+@@ -0,0 +1,64 @@
++# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/net/nfc/qcom,sn-nci.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Qualcomm SN NCI normal-mode I2C interface
++
++maintainers:
++  - dwuggh <dwuggh@gmail.com>
++
++description: |
++  The existing qcom,sn-nci interface identifies a transport family, not an exact
++  SN controller model. This binding maps its known control lines to descriptor
++  GPIO names. The driver supports standard NCI reader commands with KEEP_CONFIG
++  resets; it provides no firmware-download, vendor, persistent-config or eSE API.
++  VDDIO is the existing 1.8V supply; source-backed requested load is 157mA. Clock request is
++  an input, not an AP clock-provider or rate request. VEN is shared with the eSE.
++
++properties:
++  compatible:
++    const: qcom,sn-nci
++  reg:
++    maxItems: 1
++  interrupts:
++    maxItems: 1
++  irq-gpios:
++    maxItems: 1
++    description: Active-high data-ready input, matching the level-high interrupt
++  enable-gpios:
++    maxItems: 1
++    description: Active-high VEN power/reset output, shared with the eSE
++  firmware-gpios:
++    maxItems: 1
++    description: Active-high download-request output, held low by this driver
++  clock-request-gpios:
++    maxItems: 1
++    description: Controller clock-request input, never driven by this driver
++  vddio-supply:
++    description: Existing 1.8V I/O supply
++  pinctrl-names:
++    items:
++      - const: default
++      - const: active
++      - const: sleep
++  pinctrl-0: true
++  pinctrl-1: true
++  pinctrl-2: true
++
++required:
++  - compatible
++  - reg
++  - interrupts
++  - irq-gpios
++  - enable-gpios
++  - firmware-gpios
++  - clock-request-gpios
++  - vddio-supply
++  - pinctrl-names
++  - pinctrl-0
++  - pinctrl-1
++  - pinctrl-2
++
++additionalProperties: false
+diff --git a/drivers/nfc/Kconfig b/drivers/nfc/Kconfig
+--- a/drivers/nfc/Kconfig
++++ b/drivers/nfc/Kconfig
+@@ -68,6 +68,16 @@
+ source "drivers/nfc/st21nfca/Kconfig"
+ source "drivers/nfc/st-nci/Kconfig"
+ source "drivers/nfc/nxp-nci/Kconfig"
++
++config NFC_SN_NCI_I2C
++	tristate "Normal NCI I2C transport for qcom,sn-nci"
++	depends on NFC_NCI && I2C && GPIOLIB && REGULATOR && PINCTRL
++	help
++	  Standard reader-mode NCI transport for the existing qcom,sn-nci
++	  interface. No vendor/download/eSE or persistent-configuration API.
++	  Exact controller model and RF operation require device validation.
++	  Registration does not start RF polling automatically.
++
+ source "drivers/nfc/s3fwrn5/Kconfig"
+ source "drivers/nfc/st95hf/Kconfig"
+ endmenu
+diff --git a/drivers/nfc/Makefile b/drivers/nfc/Makefile
+--- a/drivers/nfc/Makefile
++++ b/drivers/nfc/Makefile
+@@ -18,3 +18,5 @@
+ obj-$(CONFIG_NFC_S3FWRN5)	+= s3fwrn5/
+ obj-$(CONFIG_NFC_ST95HF)	+= st95hf/
+ obj-$(CONFIG_NFC_VIRTUAL_NCI)	+= virtual_ncidev.o
++
++obj-$(CONFIG_NFC_SN_NCI_I2C) += sn-nci-i2c.o
+diff --git a/drivers/nfc/sn-nci-i2c.c b/drivers/nfc/sn-nci-i2c.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/nfc/sn-nci-i2c.c
+@@ -0,0 +1,486 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * I2C framing derived from the NXP NCI driver:
++ * Copyright (C) 2014 NXP Semiconductors
++ * Copyright (C) 2012-2015 Intel Corporation
++ *
++ * Normal-mode NCI transport for the existing qcom,sn-nci interface.
++ * I2C framing follows drivers/nfc/nxp-nci/i2c.c. GPIO/power sequencing follows
++ * the fixed qti normal path; no download, vendor command or eSE interface.
++ * The compatible identifies the transport family, not an SN retail model.
++ */
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/interrupt.h>
++#include <linux/irq.h>
++#include <linux/module.h>
++#include <linux/nfc.h>
++#include <linux/pinctrl/consumer.h>
++#include <linux/regulator/consumer.h>
++#include <net/nfc/nci_core.h>
++
++#define SN_NCI_PROTOCOLS (NFC_PROTO_JEWEL_MASK | NFC_PROTO_MIFARE_MASK | \
++	NFC_PROTO_FELICA_MASK | NFC_PROTO_ISO14443_MASK | \
++	NFC_PROTO_ISO14443_B_MASK | NFC_PROTO_ISO15693_MASK)
++#define SN_NCI_VDDIO_UV 1800000
++#define SN_NCI_LOAD_UA 157000
++
++struct sn_nci {
++	struct i2c_client *client;
++	struct nci_dev *ndev;
++	struct gpio_desc *ven, *firm, *irq, *clkreq;
++	struct regulator *vddio;
++	struct pinctrl *pinctrl;
++	struct pinctrl_state *active, *sleep;
++	struct mutex lock;
++	bool opened, irq_enabled, supply_enabled, load_set, hardware_ready, registered;
++	unsigned int boot_ntfs;
++	int hard_fault;
++};
++
++/* gpio_direction_output returns an errno, unlike the void set-value API. */
++static int sn_nci_ven(struct sn_nci *phy, int value)
++{
++	int ret = gpiod_direction_output(phy->ven, value);
++
++	if (ret)
++		return ret;
++	usleep_range(10000, 11000);
++	ret = gpiod_get_value_cansleep(phy->ven);
++	if (ret < 0)
++		return ret;
++	return ret == value ? 0 : -EIO;
++}
++
++static int sn_nci_cold(struct sn_nci *phy)
++{
++	int ret, firm_ret;
++
++	ret = sn_nci_ven(phy, 0);
++	firm_ret = gpiod_direction_output(phy->firm, 0);
++	if (!firm_ret) {
++		firm_ret = gpiod_get_value_cansleep(phy->firm);
++		if (firm_ret > 0)
++			firm_ret = -EIO;
++	}
++	return ret ? ret : firm_ret;
++}
++
++/* No partial output enable before every GPIO, pinctrl and supply is owned. */
++static int sn_nci_hw_init(struct sn_nci *phy)
++{
++	int ret;
++
++	ret = regulator_set_load(phy->vddio, SN_NCI_LOAD_UA);
++	if (ret)
++		return ret;
++	phy->load_set = true;
++	ret = regulator_enable(phy->vddio);
++	if (ret)
++		return ret;
++	phy->supply_enabled = true;
++	ret = regulator_get_voltage(phy->vddio);
++	if (ret < 0)
++		return ret;
++	if (ret != SN_NCI_VDDIO_UV)
++		return -ERANGE;
++	ret = pinctrl_select_state(phy->pinctrl, phy->active);
++	if (ret)
++		return ret;
++	ret = gpiod_direction_input(phy->irq);
++	if (ret)
++		return ret;
++	ret = gpiod_direction_input(phy->clkreq);
++	if (ret)
++		return ret;
++	ret = gpiod_direction_output(phy->firm, 0);
++	if (ret)
++		return ret;
++	ret = sn_nci_cold(phy);
++	if (ret)
++		return ret;
++	phy->hardware_ready = true;
++	return 0;
++}
++
++static void sn_nci_hw_release(void *data)
++{
++	struct sn_nci *phy = data;
++	int ret;
++
++	/* The IRQ resource is released before this devres action. */
++	if (phy->supply_enabled) {
++		ret = sn_nci_cold(phy);
++		if (ret)
++			dev_err(&phy->client->dev, "cold restore failed: %d\n", ret);
++	}
++	ret = gpiod_direction_input(phy->ven);
++	if (ret)
++		dev_err(&phy->client->dev, "VEN input restore failed: %d\n", ret);
++	ret = gpiod_direction_input(phy->firm);
++	if (ret)
++		dev_err(&phy->client->dev, "FIRM input restore failed: %d\n", ret);
++	ret = pinctrl_select_state(phy->pinctrl, phy->sleep);
++	if (ret)
++		dev_err(&phy->client->dev, "sleep pin restore failed: %d\n", ret);
++	/* Input VEN can return high. Release is not proof of final power-off. */
++	if (phy->supply_enabled) {
++		ret = regulator_disable(phy->vddio);
++		if (ret)
++			dev_err(&phy->client->dev, "VDDIO release failed: %d\n", ret);
++		else
++			phy->supply_enabled = false;
++	}
++	if (phy->load_set) {
++		ret = regulator_set_load(phy->vddio, 0);
++		if (ret)
++			dev_err(&phy->client->dev, "VDDIO load release failed: %d\n", ret);
++		else
++			phy->load_set = false;
++	}
++	phy->hardware_ready = false;
++}
++
++static int sn_nci_open(struct nci_dev *ndev)
++{
++	struct sn_nci *phy = nci_get_drvdata(ndev);
++	int ret;
++
++	mutex_lock(&phy->lock);
++	if (phy->opened) {
++		ret = -EBUSY;
++		goto out;
++	}
++	if (!phy->hardware_ready) {
++		ret = -ENODEV;
++		goto out;
++	}
++	ret = sn_nci_cold(phy);
++	if (ret)
++		goto fail;
++	ret = sn_nci_ven(phy, 1);
++	if (ret)
++		goto fail;
++	ret = sn_nci_ven(phy, 0);
++	if (ret)
++		goto fail;
++	ret = sn_nci_ven(phy, 1);
++	if (ret)
++		goto fail;
++	phy->boot_ntfs = 0;
++	phy->hard_fault = 0;
++	phy->opened = true;
++	phy->irq_enabled = true;
++	mutex_unlock(&phy->lock);
++	enable_irq(phy->client->irq);
++	return 0;
++fail:
++	/* Best effort cold restoration; preserve the original failure. */
++	if (sn_nci_cold(phy))
++		dev_err(&phy->client->dev, "open cold cleanup failed\n");
++out:
++	mutex_unlock(&phy->lock);
++	return ret;
++}
++
++static int sn_nci_close(struct nci_dev *ndev)
++{
++	struct sn_nci *phy = nci_get_drvdata(ndev);
++	bool was_enabled;
++	int ret;
++
++	/* Never synchronize an IRQ while holding its handler's mutex. */
++	mutex_lock(&phy->lock);
++	was_enabled = phy->irq_enabled;
++	phy->irq_enabled = false;
++	phy->opened = false;
++	mutex_unlock(&phy->lock);
++	if (was_enabled)
++		disable_irq(phy->client->irq);
++	else
++		synchronize_irq(phy->client->irq);
++	mutex_lock(&phy->lock);
++	ret = sn_nci_cold(phy);
++	phy->hard_fault = 0;
++	mutex_unlock(&phy->lock);
++	return ret;
++}
++
++/* First implementation is standard reader mode, no persistent/vendor/SE API. */
++static int sn_nci_tx_allowed(const struct sk_buff *skb)
++{
++	const u8 *p = skb->data;
++	unsigned int mt, gid, oid;
++
++	if (skb->len < NCI_CTRL_HDR_SIZE || skb->len != p[2] + NCI_CTRL_HDR_SIZE)
++		return -EBADMSG;
++	mt = (p[0] >> 5) & 7;
++	if (mt == NCI_MT_DATA_PKT)
++		return (p[0] & 0xf) == NCI_STATIC_RF_CONN_ID ? 0 : -EOPNOTSUPP;
++	if (mt != NCI_MT_CMD_PKT || (p[0] & 0x10))
++		return -EOPNOTSUPP;
++	gid = p[0] & 0xf;
++	oid = p[1] & 0x3f;
++	if (p[1] & 0xc0)
++		return -EBADMSG;
++	if (gid == NCI_GID_CORE) {
++		if (oid == 0) /* CORE_RESET: keep existing configuration only. */
++			return skb->len == 4 && p[3] == 0 ? 0 : -EPERM;
++		if (oid == 1) /* Empty NCI1 INIT or disabled-feature NCI2 INIT. */
++			return skb->len == 3 || (skb->len == 5 && !p[3] && !p[4]) ? 0 : -EPERM;
++		if (oid == 3) /* CORE_GET_CONFIG, no writes. */
++			return 0;
++		return -EOPNOTSUPP;
++	}
++	if (gid == NCI_GID_RF_MGMT && (oid == 0 || oid == 3 || oid == 4 || oid == 6))
++		return 0; /* MAP, DISCOVER, SELECT, DEACTIVATE, only on explicit requests. */
++	return -EOPNOTSUPP;
++}
++
++static int sn_nci_send(struct nci_dev *ndev, struct sk_buff *skb)
++{
++	struct sn_nci *phy = nci_get_drvdata(ndev);
++	int ret = sn_nci_tx_allowed(skb);
++
++	if (ret)
++		goto free;
++	mutex_lock(&phy->lock);
++	if (!phy->opened)
++		ret = -ENETDOWN;
++	else if (phy->hard_fault)
++		ret = phy->hard_fault;
++	else {
++		ret = i2c_master_send(phy->client, skb->data, skb->len);
++		if (ret >= 0)
++			ret = (unsigned int)ret == skb->len ? 0 : -EREMOTEIO;
++		/* Fixed qti normal-ID path waits before its first reset reply read. */
++		if (!ret && skb->data[0] == 0x20 && skb->data[1] == 0)
++			usleep_range(10000, 11000);
++	}
++	mutex_unlock(&phy->lock);
++free:
++	if (ret)
++		dev_err(&phy->client->dev, "normal NCI send failed: %d\n", ret);
++	kfree_skb(skb);
++	return ret;
++}
++
++/* A power-on NTF must not prematurely complete the core's reset request. */
++static int sn_nci_filter_reset(struct sn_nci *phy, const struct sk_buff *skb)
++{
++	const u8 *p = skb->data;
++
++	if (skb->len < 3 || skb->len != p[2] + 3)
++		return -EBADMSG;
++	if ((p[0] >> 5) == 2 && !(p[0] & 0xf) && !(p[1] & 0x3f)) {
++		if (p[0] != 0x40 || p[1] || (p[2] != 1 && p[2] != 3))
++			return -EPROTO;
++		if (p[2] == 3 && ((p[4] != 0x10 && p[4] != 0x11) || p[5]))
++			return -EPROTO;
++		return 0;
++	}
++	if ((p[0] >> 5) != 3 || (p[0] & 0xf) || (p[1] & 0x3f))
++		return 0;
++	if (p[0] != 0x60 || p[1])
++		return -EPROTO;
++	if (p[2] < 2 || p[4] > 1)
++		return -EPROTO;
++	if (p[2] != 2 && (p[2] < 5 || p[7] + 5 != p[2]))
++		return -EPROTO;
++	if (p[3] == 1)
++		return ++phy->boot_ntfs <= 2 ? 1 : -EOVERFLOW;
++	if (p[2] < 5 || p[3] != 2 || p[4] ||
++	    (p[5] != 0x20 && p[5] != 0x21 && p[5] != 0x22))
++		return -EPROTO;
++	return 0;
++}
++
++static int sn_nci_read(struct sn_nci *phy, struct sk_buff **result)
++{
++	struct nci_ctrl_hdr header;
++	struct sk_buff *skb;
++	int ret;
++
++	ret = i2c_master_recv(phy->client, (u8 *)&header, sizeof(header));
++	if (ret < 0)
++		return ret;
++	if (ret != sizeof(header))
++		return -EBADMSG;
++	skb = alloc_skb(sizeof(header) + header.plen, GFP_KERNEL);
++	if (!skb)
++		return -ENOMEM;
++	skb_put_data(skb, &header, sizeof(header));
++	if (header.plen) {
++		ret = i2c_master_recv(phy->client, skb_put(skb, header.plen), header.plen);
++		if (ret < 0)
++			goto free;
++		if (ret != header.plen) {
++			ret = -EBADMSG;
++			goto free;
++		}
++	}
++	*result = skb;
++	return 0;
++free:
++	kfree_skb(skb);
++	return ret;
++}
++
++static irqreturn_t sn_nci_irq_thread(int irq, void *data)
++{
++	struct sn_nci *phy = data;
++	struct sk_buff *skb = NULL;
++	int ret;
++
++	mutex_lock(&phy->lock);
++	if (!phy->opened || phy->hard_fault)
++		goto out;
++	ret = gpiod_get_value_cansleep(phy->irq);
++	if (ret < 0)
++		goto fault;
++	if (!ret)
++		goto out;
++	ret = sn_nci_read(phy, &skb);
++	if (ret)
++		goto fault;
++	ret = sn_nci_filter_reset(phy, skb);
++	if (ret) {
++		kfree_skb(skb);
++		if (ret > 0)
++			goto out;
++		goto fault;
++	}
++	nci_recv_frame(phy->ndev, skb); /* Core consumes the skb on every return. */
++	goto out;
++fault:
++	phy->hard_fault = ret;
++	if (phy->irq_enabled) {
++		phy->irq_enabled = false;
++		disable_irq_nosync(irq);
++	}
++	dev_err(&phy->client->dev, "normal NCI receive failed: %d\n", ret);
++out:
++	mutex_unlock(&phy->lock);
++	return IRQ_HANDLED;
++}
++
++static const struct nci_ops sn_nci_ops = {
++	.open = sn_nci_open,
++	.close = sn_nci_close,
++	.send = sn_nci_send,
++};
++
++static int sn_nci_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct sn_nci *phy;
++	int ret;
++
++	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
++		return -EOPNOTSUPP;
++	if (irq_get_trigger_type(client->irq) != IRQ_TYPE_LEVEL_HIGH)
++		return dev_err_probe(dev, -EINVAL, "requires source-backed level-high IRQ\n");
++	phy = devm_kzalloc(dev, sizeof(struct sn_nci), GFP_KERNEL);
++	if (!phy)
++		return -ENOMEM;
++	phy->client = client;
++	mutex_init(&phy->lock);
++	i2c_set_clientdata(client, phy);
++	phy->vddio = devm_regulator_get(dev, "vddio");
++	if (IS_ERR(phy->vddio))
++		return dev_err_probe(dev, PTR_ERR(phy->vddio), "VDDIO unavailable\n");
++	phy->irq = devm_gpiod_get(dev, "irq", GPIOD_IN);
++	if (IS_ERR(phy->irq))
++		return PTR_ERR(phy->irq);
++	if (gpiod_to_irq(phy->irq) != client->irq)
++		return -EINVAL;
++	phy->clkreq = devm_gpiod_get(dev, "clock-request", GPIOD_IN);
++	if (IS_ERR(phy->clkreq))
++		return PTR_ERR(phy->clkreq);
++	phy->firm = devm_gpiod_get(dev, "firmware", GPIOD_ASIS);
++	if (IS_ERR(phy->firm))
++		return PTR_ERR(phy->firm);
++	phy->ven = devm_gpiod_get(dev, "enable", GPIOD_ASIS);
++	if (IS_ERR(phy->ven))
++		return PTR_ERR(phy->ven);
++	if (gpiod_is_active_low(phy->irq) || gpiod_is_active_low(phy->clkreq) ||
++	    gpiod_is_active_low(phy->firm) || gpiod_is_active_low(phy->ven))
++		return -EINVAL;
++	phy->pinctrl = devm_pinctrl_get(dev);
++	if (IS_ERR(phy->pinctrl))
++		return PTR_ERR(phy->pinctrl);
++	phy->active = pinctrl_lookup_state(phy->pinctrl, "active");
++	if (IS_ERR(phy->active))
++		return PTR_ERR(phy->active);
++	phy->sleep = pinctrl_lookup_state(phy->pinctrl, PINCTRL_STATE_SLEEP);
++	if (IS_ERR(phy->sleep))
++		return PTR_ERR(phy->sleep);
++	ret = devm_add_action_or_reset(dev, sn_nci_hw_release, phy);
++	if (ret)
++		return ret;
++	ret = sn_nci_hw_init(phy);
++	if (ret)
++		return dev_err_probe(dev, ret, "normal NCI resource setup failed\n");
++	phy->ndev = nci_allocate_device(&sn_nci_ops, SN_NCI_PROTOCOLS, 0, 0);
++	if (!phy->ndev)
++		return -ENOMEM;
++	phy->ndev->reset_keep_config = true;
++	nci_set_parent_dev(phy->ndev, dev);
++	nci_set_drvdata(phy->ndev, phy);
++	ret = devm_request_threaded_irq(dev, client->irq, NULL, sn_nci_irq_thread,
++		IRQF_TRIGGER_HIGH | IRQF_ONESHOT | IRQF_NO_AUTOEN, "sn-nci", phy);
++	if (ret)
++		goto free;
++	ret = nci_register_device(phy->ndev);
++	if (ret)
++		goto free;
++	phy->registered = true;
++	return 0;
++free:
++	nci_free_device(phy->ndev);
++	phy->ndev = NULL;
++	return ret;
++}
++
++static void sn_nci_remove(struct i2c_client *client)
++{
++	struct sn_nci *phy = i2c_get_clientdata(client);
++
++	/* No transport lock: unregister can call close and drain RX work. */
++	if (phy->registered) {
++		nci_unregister_device(phy->ndev);
++		phy->registered = false;
++	}
++	sn_nci_close(phy->ndev);
++	nci_free_device(phy->ndev);
++	phy->ndev = NULL;
++}
++
++static void sn_nci_shutdown(struct i2c_client *client)
++{
++	struct sn_nci *phy = i2c_get_clientdata(client);
++
++	/* Serialize with an in-flight open, including its final enable_irq(). */
++	if (phy->registered) {
++		nci_unregister_device(phy->ndev);
++		phy->registered = false;
++	}
++	sn_nci_close(phy->ndev);
++}
++
++static const struct of_device_id sn_nci_of_match[] = {
++	{ .compatible = "qcom,sn-nci" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, sn_nci_of_match);
++
++static struct i2c_driver sn_nci_driver = {
++	.driver = { .name = "sn-nci", .of_match_table = sn_nci_of_match },
++	.probe = sn_nci_probe,
++	.remove = sn_nci_remove,
++	.shutdown = sn_nci_shutdown,
++};
++module_i2c_driver(sn_nci_driver);
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Normal-mode NCI I2C transport for qcom,sn-nci");
+diff --git a/include/net/nfc/nci_core.h b/include/net/nfc/nci_core.h
+--- a/include/net/nfc/nci_core.h
++++ b/include/net/nfc/nci_core.h
+@@ -203,6 +203,8 @@
+ 
+ 	atomic_t		state;
+ 	unsigned long		flags;
++	/* Per-device policy; default false keeps all existing drivers unchanged. */
++	bool			reset_keep_config;
+ 
+ 	atomic_t		cmd_cnt;
+ 	__u8			cur_conn_id;
+diff --git a/net/nfc/nci/core.c b/net/nfc/nci/core.c
+--- a/net/nfc/nci/core.c
++++ b/net/nfc/nci/core.c
+@@ -163,7 +163,8 @@
+ {
+ 	struct nci_core_reset_cmd cmd;
+ 
+-	cmd.reset_type = NCI_RESET_TYPE_RESET_CONFIG;
++	cmd.reset_type = ndev->reset_keep_config ? NCI_RESET_TYPE_KEEP_CONFIG :
++			 NCI_RESET_TYPE_RESET_CONFIG;
+ 	nci_send_cmd(ndev, NCI_OP_CORE_RESET_CMD, 1, &cmd);
+ }
+ 

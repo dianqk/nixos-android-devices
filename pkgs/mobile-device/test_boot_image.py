@@ -167,7 +167,7 @@ class ImageValidation(unittest.TestCase):
 
 
     def test_boards_headers_and_compression(self):
-        for board in ['clover','polaris','asphalt','sheng','aurora']:
+        for board in ['clover','polaris','asphalt','sheng','aurora','unicorn']:
             for version in [0,1,2]:
                 for compressed in [True,False]:
                     with self.subTest(board=board, version=version, compressed=compressed):

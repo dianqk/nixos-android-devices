@@ -1,0 +1,181 @@
+Subject: [PATCH] ufs: qcom: vote SM8475 CX and MX corners while scaling clocks
+
+Use the existing UFS multi-clock OPP callback and GDSC parent performance
+propagation. The locked OEM cape GCC driver requires LOW_SVS at 75 MHz
+and TURBO_L1 at 850 MHz on both vdd_cx and vdd_mxa; the latter supply is
+mx.lvl in all RPMh sets, not the distinct active-only MX_AO supply.
+
+Scale ICE with AXI and UniPro so no independently enabled 300 MHz ICE
+clock outlives a LOW_SVS request. Give ICE a 75 MHz bootstrap default and
+its minimum active corner before its driver enables the clock. These
+assigned rates are initial defaults; UFS continues to scale dynamically.
+
+Keep each board timing compatible intact. Recognize 850 MHz as gear 4
+only on SM8475 machines, including boards retaining the SM8450 timing.
+Leave the SM8450 GCC domain count and UFS legacy path unchanged.
+
+diff --git a/drivers/ufs/host/ufs-qcom.c b/drivers/ufs/host/ufs-qcom.c
+--- a/drivers/ufs/host/ufs-qcom.c
++++ b/drivers/ufs/host/ufs-qcom.c
+@@ -2583,6 +2583,10 @@
+ 	case 403000000:
+ 		gear = UFS_HS_G5;
+ 		break;
++	case 850000000:
++		if (!of_machine_is_compatible("qcom,sm8475"))
++			return UFS_HS_DONT_CHANGE;
++		fallthrough;
+ 	case 300000000:
+ 		gear = UFS_HS_G4;
+ 		break;
+diff --git a/Documentation/devicetree/bindings/clock/qcom,gcc-sm8450.yaml b/Documentation/devicetree/bindings/clock/qcom,gcc-sm8450.yaml
+--- a/Documentation/devicetree/bindings/clock/qcom,gcc-sm8450.yaml
++++ b/Documentation/devicetree/bindings/clock/qcom,gcc-sm8450.yaml
+@@ -48,8 +48,10 @@
+     minItems: 2
+ 
+   power-domains:
++    minItems: 1
+     items:
+       - description: CX power domain
++      - description: MX power domain
+ 
+ required:
+   - compatible
+@@ -60,6 +62,19 @@
+ 
+ allOf:
+   - $ref: qcom,gcc.yaml#
++
++  - if:
++      properties:
++        compatible:
++          const: qcom,sm8475-gcc
++    then:
++      properties:
++        power-domains:
++          minItems: 2
++    else:
++      properties:
++        power-domains:
++          maxItems: 1
+ 
+ unevaluatedProperties: false
+ 
+diff --git a/Documentation/devicetree/bindings/ufs/qcom,sc7180-ufshc.yaml b/Documentation/devicetree/bindings/ufs/qcom,sc7180-ufshc.yaml
+--- a/Documentation/devicetree/bindings/ufs/qcom,sc7180-ufshc.yaml
++++ b/Documentation/devicetree/bindings/ufs/qcom,sc7180-ufshc.yaml
+@@ -66,7 +66,7 @@
+ 
+   clocks:
+     minItems: 7
+-    maxItems: 8
++    maxItems: 9
+ 
+   clock-names:
+     minItems: 7
+@@ -79,6 +79,7 @@
+       - const: tx_lane0_sync_clk
+       - const: rx_lane0_sync_clk
+       - const: rx_lane1_sync_clk
++      - const: ice_core_clk
+ 
+   qcom,ice:
+     $ref: /schemas/types.yaml#/definitions/phandle
+@@ -109,6 +110,21 @@
+           minItems: 8
+         clock-names:
+           minItems: 8
++
++  - if:
++      not:
++        properties:
++          compatible:
++            contains:
++              enum:
++                - qcom,sm8450-ufshc
++                - qcom,sm8475-ufshc
++    then:
++      properties:
++        clocks:
++          maxItems: 8
++        clock-names:
++          maxItems: 8
+ 
+ unevaluatedProperties: false
+ 
+diff --git a/Documentation/devicetree/bindings/crypto/qcom,inline-crypto-engine.yaml b/Documentation/devicetree/bindings/crypto/qcom,inline-crypto-engine.yaml
+--- a/Documentation/devicetree/bindings/crypto/qcom,inline-crypto-engine.yaml
++++ b/Documentation/devicetree/bindings/crypto/qcom,inline-crypto-engine.yaml
+@@ -45,6 +45,9 @@
+       - const: iface
+ 
+   power-domains:
++    maxItems: 1
++
++  required-opps:
+     maxItems: 1
+ 
+   operating-points-v2: true
+diff --git a/arch/arm64/boot/dts/qcom/sm8475.dtsi b/arch/arm64/boot/dts/qcom/sm8475.dtsi
+--- a/arch/arm64/boot/dts/qcom/sm8475.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8475.dtsi
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "sm8450.dtsi"
++#include "sm8475-ufs.dtsi"
+ 
+ /delete-node/ &usb_1_hsphy;
+ /delete-node/ &ufs_mem_phy;
+diff --git a/arch/arm64/boot/dts/qcom/sm8475-ufs.dtsi b/arch/arm64/boot/dts/qcom/sm8475-ufs.dtsi
+new file mode 100644
+--- /dev/null
++++ b/arch/arm64/boot/dts/qcom/sm8475-ufs.dtsi
+@@ -0,0 +1,46 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/* SM8475 UFS clocks share the CX and MX performance requirements. */
++
++&gcc {
++	power-domains = <&rpmhpd RPMHPD_CX>, <&rpmhpd RPMHPD_MX>;
++};
++
++&ice {
++	/* Bootstrap at the minimum OPP before the UFS consumer probes. */
++	assigned-clocks = <&gcc GCC_UFS_PHY_ICE_CORE_CLK>;
++	assigned-clock-rates = <75000000>;
++	required-opps = <&rpmhpd_opp_low_svs>;
++};
++
++&ufs_mem_hc {
++	/delete-property/ freq-table-hz;
++
++	clocks = <&gcc GCC_UFS_PHY_AXI_CLK>,
++		 <&gcc GCC_AGGRE_UFS_PHY_AXI_CLK>,
++		 <&gcc GCC_UFS_PHY_AHB_CLK>,
++		 <&gcc GCC_UFS_PHY_UNIPRO_CORE_CLK>,
++		 <&rpmhcc RPMH_CXO_CLK>,
++		 <&gcc GCC_UFS_PHY_TX_SYMBOL_0_CLK>,
++		 <&gcc GCC_UFS_PHY_RX_SYMBOL_0_CLK>,
++		 <&gcc GCC_UFS_PHY_RX_SYMBOL_1_CLK>,
++		 <&gcc GCC_UFS_PHY_ICE_CORE_CLK>;
++	clock-names = "core_clk", "bus_aggr_clk", "iface_clk",
++		      "core_clk_unipro", "ref_clk", "tx_lane0_sync_clk",
++		      "rx_lane0_sync_clk", "rx_lane1_sync_clk", "ice_core_clk";
++
++	operating-points-v2 = <&ufs_opp_table>;
++
++	ufs_opp_table: opp-table {
++		compatible = "operating-points-v2";
++
++		opp-75000000 {
++			opp-hz = /bits/ 64 <75000000 0 0 75000000 0 0 0 0 75000000>;
++			required-opps = <&rpmhpd_opp_low_svs>;
++		};
++
++		opp-850000000 {
++			opp-hz = /bits/ 64 <850000000 0 0 850000000 0 0 0 0 850000000>;
++			required-opps = <&rpmhpd_opp_turbo_l1>;
++		};
++	};
++};

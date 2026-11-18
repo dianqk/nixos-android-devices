@@ -11,6 +11,7 @@ import zlib
 
 
 BOARDS = {
+    'xiaomi,unicorn': 'unicorn',
     'xiaomi,clover': 'clover',
     'xiaomi,clover-lte': 'clover',
     'xiaomi,polaris': 'polaris',

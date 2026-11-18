@@ -1,0 +1,30 @@
+Subject: [PATCH] PCI: pwrctrl: honor explicit power sequencers
+
+Allow a device to describe its external power sequencer explicitly.
+
+diff --git a/drivers/pci/pwrctrl/core.c b/drivers/pci/pwrctrl/core.c
+--- a/drivers/pci/pwrctrl/core.c
++++ b/drivers/pci/pwrctrl/core.c
+@@ -145,9 +145,9 @@
+  *
+  * 1. Presence of compatible property with "pci" prefix to match against the
+  *    pwrctrl driver (AND)
+- * 2. At least one of the power supplies defined in the devicetree node of the
+- *    device (OR) in the remote endpoint parent node to indicate pwrctrl
+- *    requirement.
++ * 2. A power supply or an explicit power-sequencers link in the device node,
++ *    or a power supply in the remote endpoint parent node, to indicate the
++ *    pwrctrl requirement.
+  */
+ static bool pci_pwrctrl_is_required(struct device_node *np)
+ {
+@@ -162,7 +162,8 @@
+ 	if (!strstarts(compat, "pci"))
+ 		return false;
+ 
+-	if (of_pci_supply_present(np))
++	if (of_property_present(np, "power-sequencers") ||
++	    of_pci_supply_present(np))
+ 		return true;
+ 
+ 	if (of_graph_is_present(np)) {

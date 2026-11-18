@@ -59,14 +59,16 @@ RPM/RPMh、GDSC/PLL/APCS 和互连共享依赖由 Kconfig 处理。SoC 层还恢
 
 | 设备 | SoC 控制器 | 音频控制器 | PMIC 支持 |
 | --- | --- | --- | --- |
-| Asphalt | `PINCTRL_SM8475` | `PINCTRL_SM8450_LPASS_LPI` | `PINCTRL_QCOM_SPMI_PMIC` |
+| Asphalt / Unicorn | `PINCTRL_SM8475` | `PINCTRL_SM8450_LPASS_LPI` | `PINCTRL_QCOM_SPMI_PMIC` |
 | Polaris | `PINCTRL_SDM845` | `drivers/gpio` 中的 WCD9340 GPIO | `PINCTRL_QCOM_SPMI_PMIC` |
 | Sheng | `PINCTRL_SM8550` | `PINCTRL_SM8550_LPASS_LPI` | `PINCTRL_QCOM_SPMI_PMIC` |
 | Clover | `PINCTRL_SDM660` | `PINCTRL_SDM660_LPASS_LPI` | `PINCTRL_QCOM_SPMI_PMIC` |
 | Marble | `PINCTRL_SM8475` | `PINCTRL_SM8450_LPASS_LPI` | `PINCTRL_QCOM_SPMI_PMIC` |
 
-音频 pinctrl 还需要 `PINCTRL_LPASS_LPI`；Asphalt 使用 SM8450 音频控制器
-compatible。配置检查不能证明硬件功能；部署内核更改前，应在目标设备上验证
+音频 pinctrl 还需要 `PINCTRL_LPASS_LPI`；Asphalt 和 Unicorn 使用 SM8450 音频
+控制器 compatible。[Unicorn SM8475 队列](sm8475/README.zh.md) 独立维护，
+Asphalt 保留其上游队列。
+配置检查不能证明硬件功能；部署内核更改前，应在目标设备上验证
 显示、触控、存储、音频和外接设备。
 
 [English](README.md)

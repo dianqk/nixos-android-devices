@@ -1,0 +1,29 @@
+Subject: [PATCH] spi: geni: preserve multi-transfer status
+
+Preserve the controller transfer status across messages containing several transfers.
+
+diff --git a/drivers/spi/spi-geni-qcom.c b/drivers/spi/spi-geni-qcom.c
+--- a/drivers/spi/spi-geni-qcom.c
++++ b/drivers/spi/spi-geni-qcom.c
+@@ -400,8 +400,8 @@
+ 	struct spi_controller *spi = cb;
+ 	struct spi_geni_master *mas = spi_controller_get_devdata(spi);
+ 
+-	spi->cur_msg->status = -EIO;
+ 	if (result->result != DMA_TRANS_NOERROR) {
++		spi->cur_msg->status = -EIO;
+ 		dev_err(&spi->dev, "DMA txn failed: %d\n", result->result);
+ 		trace_geni_se_regs(&mas->se);
+ 		spi_finalize_current_transfer(spi);
+@@ -409,9 +409,10 @@
+ 	}
+ 
+ 	if (!result->residue) {
+-		spi->cur_msg->status = 0;
++		/* The SPI core completes the message after its last transfer. */
+ 		dev_dbg(&spi->dev, "DMA txn completed\n");
+ 	} else {
++		spi->cur_msg->status = -EIO;
+ 		dev_err(&spi->dev, "DMA xfer has pending: %d\n", result->residue);
+ 		trace_geni_se_regs(&mas->se);
+ 	}

@@ -1,0 +1,259 @@
+Subject: [PATCH] soc: qcom: support Unicorn DSP services and battery messages
+
+Describe the device PD services and decode the battery firmware property
+layout without changing charging policy.
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -9,6 +9,7 @@
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/nvmem-consumer.h>
++#include <linux/of.h>
+ #include <linux/of_device.h>
+ #include <linux/power_supply.h>
+ #include <linux/property.h>
+@@ -35,6 +36,7 @@
+ #define NOTIF_BAT_PROPERTY		0x30
+ #define NOTIF_USB_PROPERTY		0x32
+ #define NOTIF_WLS_PROPERTY		0x34
++#define NOTIF_XIAOMI_PROPERTY		0x50
+ #define NOTIF_BAT_STATUS		0x80
+ #define NOTIF_BAT_INFO			0x81
+ #define NOTIF_BAT_CHARGING_STATE	0x83
+@@ -74,6 +76,9 @@
+ #define BATT_CHG_CTRL_EN		24
+ #define BATT_CHG_CTRL_START_THR		25
+ #define BATT_CHG_CTRL_END_THR		26
++
++/* Android's constant-voltage charging state has no standard counterpart. */
++#define BATTMGR_UNICORN_CHARGE_TYPE_TAPER	50
+ 
+ #define BATTMGR_USB_PROPERTY_GET	0x32
+ #define BATTMGR_USB_PROPERTY_SET	0x33
+@@ -278,7 +283,7 @@
+ 	int power_now;
+ 	unsigned int voltage_now;
+ 	unsigned int voltage_ocv;
+-	unsigned int temperature;
++	int temperature;
+ 	unsigned int resistance;
+ 	unsigned int soh_percent;
+ 
+@@ -313,6 +318,7 @@
+ 	struct pmic_glink_client *client;
+ 
+ 	enum qcom_battmgr_variant variant;
++	bool unicorn_abi;
+ 
+ 	struct power_supply *ac_psy;
+ 	struct power_supply *bat_psy;
+@@ -359,6 +365,70 @@
+ 		return -ETIMEDOUT;
+ 
+ 	return battmgr->error;
++}
++
++/* Unicorn firmware inserts BATT_CONSTANT_CURRENT before BATT_TEMP. */
++static int qcom_battmgr_bat_prop_to_fw(unsigned int property)
++{
++	if (property > BATT_POWER_AVG)
++		return -EINVAL;
++
++	return property >= BATT_TEMP ? property + 1 : property;
++}
++
++static int qcom_battmgr_bat_prop_from_fw(unsigned int property)
++{
++	/* The inserted property is not exposed by this driver. */
++	if (property == BATT_TEMP || property > BATT_POWER_AVG + 1)
++		return -EINVAL;
++
++	return property > BATT_TEMP ? property - 1 : property;
++}
++
++static unsigned int qcom_battmgr_unicorn_health(unsigned int health)
++{
++	static const unsigned int health_map[] = {
++		POWER_SUPPLY_HEALTH_UNKNOWN,
++		POWER_SUPPLY_HEALTH_GOOD,
++		POWER_SUPPLY_HEALTH_OVERHEAT,
++		POWER_SUPPLY_HEALTH_DEAD,
++		POWER_SUPPLY_HEALTH_OVERVOLTAGE,
++		POWER_SUPPLY_HEALTH_UNSPEC_FAILURE,
++		POWER_SUPPLY_HEALTH_COLD,
++		POWER_SUPPLY_HEALTH_WATCHDOG_TIMER_EXPIRE,
++		POWER_SUPPLY_HEALTH_SAFETY_TIMER_EXPIRE,
++		POWER_SUPPLY_HEALTH_OVERCURRENT,
++		POWER_SUPPLY_HEALTH_CALIBRATION_REQUIRED,
++		POWER_SUPPLY_HEALTH_WARM,
++		POWER_SUPPLY_HEALTH_COOL,
++		POWER_SUPPLY_HEALTH_HOT,
++	};
++
++	if (health >= ARRAY_SIZE(health_map))
++		return POWER_SUPPLY_HEALTH_UNKNOWN;
++
++	return health_map[health];
++}
++
++static unsigned int qcom_battmgr_unicorn_usb_type(unsigned int type)
++{
++	static const unsigned int type_map[] = {
++		POWER_SUPPLY_USB_TYPE_UNKNOWN,
++		POWER_SUPPLY_USB_TYPE_SDP,
++		POWER_SUPPLY_USB_TYPE_DCP,
++		POWER_SUPPLY_USB_TYPE_CDP,
++		POWER_SUPPLY_USB_TYPE_ACA,
++		POWER_SUPPLY_USB_TYPE_C,
++		POWER_SUPPLY_USB_TYPE_PD,
++		POWER_SUPPLY_USB_TYPE_PD_DRP,
++		POWER_SUPPLY_USB_TYPE_PD_PPS,
++		POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID,
++	};
++
++	if (type >= ARRAY_SIZE(type_map))
++		return POWER_SUPPLY_USB_TYPE_UNKNOWN;
++
++	return type_map[type];
+ }
+ 
+ static int qcom_battmgr_request_property(struct qcom_battmgr *battmgr, int opcode,
+@@ -372,6 +442,15 @@
+ 		.property = cpu_to_le32(property),
+ 		.value = cpu_to_le32(value),
+ 	};
++	int fw_property;
++
++	if (battmgr->unicorn_abi && opcode == BATTMGR_BAT_PROPERTY_GET) {
++		fw_property = qcom_battmgr_bat_prop_to_fw(property);
++		if (fw_property < 0)
++			return fw_property;
++
++		request.property = cpu_to_le32(fw_property);
++	}
+ 
+ 	return qcom_battmgr_request(battmgr, &request, sizeof(request));
+ }
+@@ -1217,6 +1296,11 @@
+ 	case NOTIF_WLS_PROPERTY:
+ 		power_supply_changed(battmgr->wls_psy);
+ 		break;
++	case NOTIF_XIAOMI_PROPERTY:
++		/* These Xiaomi properties are not exported by this driver. */
++		if (battmgr->unicorn_abi)
++			break;
++		fallthrough;
+ 	default:
+ 		dev_err(battmgr->dev, "unknown notification: %#x\n", notification);
+ 		break;
+@@ -1372,6 +1456,7 @@
+ 	unsigned int opcode = le32_to_cpu(resp->hdr.opcode);
+ 	size_t payload_len = len - sizeof(struct pmic_glink_hdr);
+ 	unsigned int val;
++	int mapped_property;
+ 
+ 	if (payload_len < sizeof(__le32)) {
+ 		dev_warn(battmgr->dev, "invalid payload length for %#x: %zd\n",
+@@ -1382,6 +1467,16 @@
+ 	switch (opcode) {
+ 	case BATTMGR_BAT_PROPERTY_GET:
+ 		property = le32_to_cpu(resp->intval.property);
++		if (battmgr->unicorn_abi) {
++			mapped_property = qcom_battmgr_bat_prop_from_fw(property);
++			if (mapped_property < 0) {
++				dev_warn(battmgr->dev, "ignoring unsupported battery property %#x\n",
++					 property);
++				return;
++			}
++			property = mapped_property;
++		}
++
+ 		if (property == BATT_MODEL_NAME) {
+ 			if (payload_len != sizeof(resp->strval)) {
+ 				dev_warn(battmgr->dev,
+@@ -1409,13 +1504,18 @@
+ 			battmgr->status.status = le32_to_cpu(resp->intval.value);
+ 			break;
+ 		case BATT_HEALTH:
+-			battmgr->status.health = le32_to_cpu(resp->intval.value);
++			val = le32_to_cpu(resp->intval.value);
++			battmgr->status.health = battmgr->unicorn_abi ?
++				qcom_battmgr_unicorn_health(val) : val;
+ 			break;
+ 		case BATT_PRESENT:
+ 			battmgr->info.present = le32_to_cpu(resp->intval.value);
+ 			break;
+ 		case BATT_CHG_TYPE:
+-			battmgr->info.charge_type = le32_to_cpu(resp->intval.value);
++			val = le32_to_cpu(resp->intval.value);
++			battmgr->info.charge_type = battmgr->unicorn_abi &&
++				val == BATTMGR_UNICORN_CHARGE_TYPE_TAPER ?
++				POWER_SUPPLY_CHARGE_TYPE_UNKNOWN : val;
+ 			break;
+ 		case BATT_CAPACITY:
+ 			battmgr->status.percent = le32_to_cpu(resp->intval.value) / 100;
+@@ -1437,7 +1537,10 @@
+ 			break;
+ 		case BATT_TEMP:
+ 			val = le32_to_cpu(resp->intval.value);
+-			battmgr->status.temperature = DIV_ROUND_CLOSEST(val, 10);
++			if (battmgr->unicorn_abi)
++				battmgr->status.temperature = (s32)val / 10;
++			else
++				battmgr->status.temperature = DIV_ROUND_CLOSEST(val, 10);
+ 			break;
+ 		case BATT_TECHNOLOGY:
+ 			battmgr->info.technology = le32_to_cpu(resp->intval.value);
+@@ -1514,7 +1617,9 @@
+ 			battmgr->usb.current_limit = le32_to_cpu(resp->intval.value);
+ 			break;
+ 		case USB_TYPE:
+-			battmgr->usb.usb_type = le32_to_cpu(resp->intval.value);
++			val = le32_to_cpu(resp->intval.value);
++			battmgr->usb.usb_type = battmgr->unicorn_abi ?
++				qcom_battmgr_unicorn_usb_type(val) : val;
+ 			break;
+ 		default:
+ 			dev_warn(battmgr->dev, "unknown property %#x\n", property);
+@@ -1663,6 +1768,9 @@
+ 	else
+ 		battmgr->variant = QCOM_BATTMGR_SM8350;
+ 
++	battmgr->unicorn_abi = battmgr->variant == QCOM_BATTMGR_SM8350 &&
++					    of_machine_is_compatible("xiaomi,unicorn");
++
+ 	ret = qcom_battmgr_charge_control_thresholds_init(battmgr);
+ 	if (ret < 0)
+ 		return dev_err_probe(dev, ret,
+diff --git a/drivers/soc/qcom/qcom_pd_mapper.c b/drivers/soc/qcom/qcom_pd_mapper.c
+--- a/drivers/soc/qcom/qcom_pd_mapper.c
++++ b/drivers/soc/qcom/qcom_pd_mapper.c
+@@ -612,6 +612,18 @@
+ 	&adsp_charger_pd,
+ 	&adsp_sensor_pd,
+ 	&cdsp_root_pd,
++	NULL,
++};
++
++/* The installed Unicorn firmware does not advertise ADSP tms/pdr_enabled. */
++static const struct qcom_pdm_domain_data *xiaomi_unicorn_domains[] = {
++	&adsp_audio_pd,
++	&adsp_root_pd,
++	&adsp_charger_pd,
++	&cdsp_root_pd,
++	&mpss_root_pd_gps,
++	&slpi_root_pd,
++	&slpi_sensor_pd,
+ 	NULL,
+ };
+ 
+@@ -665,6 +677,7 @@
+ 	{ .compatible = "qcom,sm8750", .data = sm8550_domains, },
+ 	{ .compatible = "qcom,x1e80100", .data = x1e80100_domains, },
+ 	{ .compatible = "qcom,x1p42100", .data = x1e80100_domains, },
++	{ .compatible = "xiaomi,unicorn", .data = xiaomi_unicorn_domains, },
+ 	{},
+ };
+ 
