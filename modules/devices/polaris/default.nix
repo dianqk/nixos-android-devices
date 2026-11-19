@@ -16,6 +16,8 @@
     ./sensors.nix
     ./storage.nix
     ./audio.nix
+    ./desktop.nix
+    ./power.nix
     ./recovery.nix
   ];
   androidDevices = {
